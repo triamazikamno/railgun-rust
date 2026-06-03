@@ -151,7 +151,7 @@ pub(crate) async fn sync_txid_public_cache_to_graph_tip(
     }
 
     write_manifest(db, key, &manifest)?;
-    info!(
+    debug!(
         chain_id = key.chain_id,
         txid_version = key.txid_version,
         next_txid_index = manifest.next_txid_index,
