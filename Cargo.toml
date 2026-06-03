@@ -1,30 +1,14 @@
 [workspace]
 members = [
-    "bins/broadcaster",
-    "bins/db-cli",
-    "bins/poi-indexer",
-    "bins/vanity-address",
-    "bins/wallet",
-    "crates/config",
     "crates/core",
-    "crates/fees",
-    "crates/public-broadcaster-protocol",
     "crates/local-db",
-    "crates/ui",
-    "crates/wallet-ops",
-    "crates/railgun-ui",
-    "crates/broadcaster-monitor",
-    "crates/broadcaster-monitor-waku",
-    "crates/broadcaster-monitor-gpui",
-    "crates/railgun-wallet",
     "crates/merkletree",
     "crates/poi",
-    "crates/poi-indexer-core",
+    "crates/public-broadcaster-protocol",
+    "crates/railgun-wallet",
     "crates/sync-service",
     "crates/waku",
     "crates/waku-relay",
-    "crates/tx-submit",
-    "crates/service",
 ]
 resolver = "2"
 
