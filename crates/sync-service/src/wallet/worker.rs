@@ -63,7 +63,7 @@ pub(crate) fn spawn_wallet_worker(
         let mut backfill_complete_block: Option<u64> = None;
         let mut persist_state = WalletPersistState::default();
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
-        let poi_status_client = wallet_poi_status_client(http_client.as_ref());
+        let poi_status_client = wallet_poi_status_client(&cfg.poi_rpc_url, http_client.as_ref());
         let active_poi_list_keys = default_active_poi_list_keys();
         let mut last_live_tail_poll = Instant::now();
         let preloaded_poi_caches = if cfg.manage_local_poi_cache {

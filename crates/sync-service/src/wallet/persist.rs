@@ -30,12 +30,14 @@ pub(super) fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommit
 }
 
 pub(crate) fn wallet_poi_status_client(
+    poi_rpc_url: &Url,
     http_client: Option<&reqwest::Client>,
 ) -> Option<PoiRpcClient> {
-    let url = Url::parse(DEFAULT_WALLET_POI_RPC_URL).ok()?;
     Some(match http_client {
-        Some(http_client) => PoiRpcClient::with_http_client(url, http_client.clone()),
-        None => PoiRpcClient::new(url),
+        Some(http_client) => {
+            PoiRpcClient::with_http_client(poi_rpc_url.clone(), http_client.clone())
+        }
+        None => PoiRpcClient::new(poi_rpc_url.clone()),
     })
 }
 

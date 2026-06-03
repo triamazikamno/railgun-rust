@@ -383,6 +383,7 @@ pub struct WalletConfig {
     pub progress_tx: Option<SyncProgressSender>,
     pub cache_store: Option<Arc<dyn WalletCacheStore>>,
     pub poi_recovery_prover: Option<ProverService>,
+    pub poi_rpc_url: Url,
     pub poi_read_source: PoiReadSource,
     pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub manage_local_poi_cache: bool,

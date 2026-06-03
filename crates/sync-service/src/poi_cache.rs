@@ -7,10 +7,11 @@ use alloy::primitives::FixedBytes;
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use local_db::DbStore;
 use poi::cache::{PoiCache, PoiCacheIdentity};
-use poi::poi::{PoiRpcClient, default_active_poi_list_keys};
+use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
+use url::Url;
 
 use crate::poi_artifacts::{PersistedPoiArtifactCache, PoiArtifactIngestor, load_persisted_cache};
 use crate::types::{LocalPoiCaches, PoiArtifactSourceConfig};
@@ -29,6 +30,7 @@ struct ChainPoiCacheState {
 struct ChainPoiCacheLoop {
     db: Arc<DbStore>,
     http_client: Option<reqwest::Client>,
+    poi_rpc_url: Url,
     artifact_config: PoiArtifactSourceConfig,
     chain_id: u64,
     local_caches: LocalPoiCaches,
@@ -41,6 +43,7 @@ pub struct PoiCacheService {
     db: Arc<DbStore>,
     artifact_config: PoiArtifactSourceConfig,
     http_client: Option<reqwest::Client>,
+    poi_rpc_url: Url,
     chains: RwLock<HashMap<u64, ChainPoiCacheState>>,
     cancel: CancellationToken,
 }
@@ -56,9 +59,16 @@ impl PoiCacheService {
             db,
             artifact_config,
             http_client,
+            poi_rpc_url: default_poi_rpc_url(),
             chains: RwLock::new(HashMap::new()),
             cancel: CancellationToken::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_poi_rpc_url(mut self, poi_rpc_url: Url) -> Self {
+        self.poi_rpc_url = poi_rpc_url;
+        self
     }
 
     pub async fn start_chains(&self, chain_ids: impl IntoIterator<Item = u64>) {
@@ -97,6 +107,7 @@ impl PoiCacheService {
         spawn_chain_poi_cache_loop(ChainPoiCacheLoop {
             db: Arc::clone(&self.db),
             http_client: self.http_client.clone(),
+            poi_rpc_url: self.poi_rpc_url.clone(),
             artifact_config: self.artifact_config.clone(),
             chain_id,
             local_caches: Arc::clone(&local_caches),
@@ -118,6 +129,10 @@ impl PoiCacheService {
     pub fn shutdown(&self) {
         self.cancel.cancel();
     }
+}
+
+fn default_poi_rpc_url() -> Url {
+    Url::parse(DEFAULT_WALLET_POI_RPC_URL).expect("default POI RPC URL is valid")
 }
 
 impl Drop for PoiCacheService {
@@ -146,7 +161,7 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
     let live_tail_client = task
         .http_client
         .as_ref()
-        .and_then(|client| wallet_poi_status_client(Some(client)));
+        .and_then(|client| wallet_poi_status_client(&task.poi_rpc_url, Some(client)));
     let mut last_artifact_sync = Instant::now() - POI_ARTIFACT_CACHE_SYNC_INTERVAL;
     loop {
         let caches_available = chain_poi_caches_available_for_lists(
@@ -159,6 +174,7 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
             sync_chain_poi_artifact_caches(
                 task.db.as_ref(),
                 task.http_client.as_ref(),
+                &task.poi_rpc_url,
                 &task.artifact_config,
                 chain_id,
                 &task.local_caches,
@@ -183,6 +199,7 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
 async fn sync_chain_poi_artifact_caches(
     db: &DbStore,
     http_client: Option<&reqwest::Client>,
+    poi_rpc_url: &Url,
     artifact_config: &PoiArtifactSourceConfig,
     chain_id: u64,
     local_caches: &LocalPoiCaches,
@@ -193,7 +210,8 @@ async fn sync_chain_poi_artifact_caches(
         artifact_config.clone(),
         http_client.cloned().unwrap_or_else(reqwest::Client::new),
     );
-    let live_tail_client = http_client.and_then(|client| wallet_poi_status_client(Some(client)));
+    let live_tail_client =
+        http_client.and_then(|client| wallet_poi_status_client(poi_rpc_url, Some(client)));
     for list_key in active_list_keys {
         let identity =
             PoiCacheIdentity::new(EVM_CHAIN_TYPE, chain_id, DEFAULT_TXID_VERSION, *list_key);

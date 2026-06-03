@@ -36,9 +36,8 @@ use poi::artifacts::{SnapshotEvent, verify_poi_event};
 use poi::cache::{POI_EVENTS_PAGE_SIZE, PoiCache, PoiCacheError, PoiCacheIdentity};
 use poi::error::{PoiError, PoiRpcError};
 use poi::poi::{
-    BlindedCommitmentData, BlindedCommitmentType, DEFAULT_WALLET_POI_RPC_URL, PoiMerkleProof,
-    PoiRpcClient, PoiSyncedListEvent, SingleCommitmentProofContext, ValidatedRailgunTxidStatus,
-    default_active_poi_list_keys,
+    BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient, PoiSyncedListEvent,
+    SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
 };
 use railgun_wallet::scan::{
     CommitmentObservation, WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,

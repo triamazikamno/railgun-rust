@@ -17,7 +17,8 @@ pub(super) async fn sync_local_poi_caches(
         artifact_config.clone(),
         http_client.cloned().unwrap_or_else(reqwest::Client::new),
     );
-    let live_tail_client = http_client.and_then(|client| wallet_poi_status_client(Some(client)));
+    let live_tail_client =
+        http_client.and_then(|client| wallet_poi_status_client(&cfg.poi_rpc_url, Some(client)));
     for list_key in active_list_keys {
         let identity = PoiCacheIdentity::new(
             EVM_CHAIN_TYPE,

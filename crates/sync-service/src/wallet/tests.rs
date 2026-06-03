@@ -22,7 +22,8 @@ use super::{
     refresh_wallet_poi_statuses_selected_with_config, rewind_wallet_utxos,
     spawn_startup_artifact_poi_cache_warmup, spent_source_for_utxo, sync_live_poi_event_tail,
     verify_submitted_pending_output_pois, verify_submitted_pending_output_pois_with_config,
-    wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
+    wallet_poi_status_client, wallet_poi_status_refresh_needed,
+    wallet_poi_status_refresh_needed_for_selection,
 };
 use crate::txid_cache::{
     TxidPublicCacheKey, TxidPublicCacheTransaction, TxidPublicCachedTransaction,
@@ -54,8 +55,8 @@ use poi::artifacts::{ArtifactDescriptor, Manifest, ManifestEntry};
 use poi::cache::{PoiCache, PoiCacheIdentity};
 use poi::error::PoiError;
 use poi::poi::{
-    BlindedCommitmentData, PoiEventType, PoiRpcClient, PoiSyncedListEvent, SignedPoiEvent,
-    SingleCommitmentProofContext,
+    BlindedCommitmentData, DEFAULT_WALLET_POI_RPC_URL, PoiEventType, PoiRpcClient,
+    PoiSyncedListEvent, SignedPoiEvent, SingleCommitmentProofContext,
 };
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
@@ -117,6 +118,7 @@ fn wallet_config(nullifying_key: U256) -> WalletConfig {
         progress_tx: None,
         cache_store: None,
         poi_recovery_prover: None,
+        poi_rpc_url: Url::parse(DEFAULT_WALLET_POI_RPC_URL).expect("default POI RPC URL"),
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         manage_local_poi_cache: true,
@@ -1619,6 +1621,24 @@ async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_inges
         Some(&PoiStatus::Valid)
     );
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_poi_status_client_uses_configured_rpc_url() {
+    let list_key = FixedBytes::from([0x11; 32]);
+    let mock = spawn_poi_rpc(serde_json::json!({})).await;
+    let client = wallet_poi_status_client(&mock.url, None).expect("POI client");
+
+    client
+        .pois_per_list(DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, 1, &[list_key], &[])
+        .await
+        .expect("POI status request");
+
+    let request = mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("configured POI RPC request");
+    assert_eq!(request["method"], "ppoi_pois_per_list");
 }
 
 #[tokio::test]

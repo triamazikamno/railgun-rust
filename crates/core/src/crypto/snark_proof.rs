@@ -13,8 +13,6 @@ use alloy::primitives::U256;
 pub enum SnarkProofError {
     #[error("invalid POI circuit variant: {variant}")]
     InvalidVariant { variant: String },
-    #[error("fetch vkey failed: {0}")]
-    FetchVkey(#[from] reqwest::Error),
     #[error("parse vkey failed: {0}")]
     ParseVkey(#[from] serde_json::Error),
     #[error("G1 needs at least [x,y], got len={len}")]
@@ -85,25 +83,21 @@ impl VKeyJson {
     }
 }
 
-const IPFS_GATEWAY: &str = "https://ipfs-lb.com";
-const IPFS_HASH_ARTIFACTS_POI: &str = "QmZrP9zaZw2LwErT2yA6VpMWm65UdToQiKj4DtStVsUJHr";
+const POI_3X3_VKEY_JSON: &[u8] = include_bytes!("../../resources/poi/POI_3x3/vkey.json");
+const POI_13X13_VKEY_JSON: &[u8] = include_bytes!("../../resources/poi/POI_13x13/vkey.json");
 
-async fn fetch_poi_vkey_json(
-    max_inputs: usize,
-    max_outputs: usize,
-) -> Result<VKeyJson, SnarkProofError> {
+fn poi_vkey_bytes(max_inputs: usize, max_outputs: usize) -> Result<&'static [u8], SnarkProofError> {
     let variant = format!("POI_{max_inputs}x{max_outputs}");
-    if !(variant == "POI_3x3" || variant == "POI_13x13") {
-        return Err(SnarkProofError::InvalidVariant { variant });
+    match variant.as_str() {
+        "POI_3x3" => Ok(POI_3X3_VKEY_JSON),
+        "POI_13x13" => Ok(POI_13X13_VKEY_JSON),
+        _ => Err(SnarkProofError::InvalidVariant { variant }),
     }
+}
 
-    let url = format!("{IPFS_GATEWAY}/ipfs/{IPFS_HASH_ARTIFACTS_POI}/{variant}/vkey.json");
-
-    let response = reqwest::get(&url).await?;
-    let body = response.bytes().await?;
-    let vkey = serde_json::from_slice(&body)?;
-
-    Ok(vkey)
+fn load_poi_vkey_json(max_inputs: usize, max_outputs: usize) -> Result<VKeyJson, SnarkProofError> {
+    serde_json::from_slice(poi_vkey_bytes(max_inputs, max_outputs)?)
+        .map_err(SnarkProofError::ParseVkey)
 }
 
 fn fq_from_dec(u: U256) -> Fq {
@@ -281,15 +275,15 @@ pub struct Prover {
 impl Prover {
     pub async fn new() -> Result<Self, SnarkProofError> {
         Ok(Self {
-            pvk_3_3: Self::make_pvk(3, 3).await?,
-            pvk_13_13: Self::make_pvk(13, 13).await?,
+            pvk_3_3: Self::make_pvk(3, 3)?,
+            pvk_13_13: Self::make_pvk(13, 13)?,
         })
     }
-    async fn make_pvk(
+    fn make_pvk(
         max_inputs: usize,
         max_outputs: usize,
     ) -> Result<PreparedVerifyingKey<Bn254>, SnarkProofError> {
-        let vkey_json = fetch_poi_vkey_json(max_inputs, max_outputs).await?;
+        let vkey_json = load_poi_vkey_json(max_inputs, max_outputs)?;
         vkey_json
             .try_into_ark()
             .map(|vk| prepare_verifying_key(&vk))
@@ -347,5 +341,33 @@ impl Prover {
             .map_err(|_| SnarkProofError::VerifyFailed)?;
 
         Ok(ok)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    const POI_3X3_VKEY_SHA256: &str =
+        "92120a7dfda25cc56c79ce7047f2ff8596f4d96e95dcdc2ff4d599a5cdcf5c56";
+    const POI_13X13_VKEY_SHA256: &str =
+        "e89e11bc12d5aedcce861e1a1079b9f05c8e41cdf66a0019ed4c89e5d939a96b";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn embedded_poi_vkey_hashes_match_pinned_values() {
+        assert_eq!(sha256_hex(POI_3X3_VKEY_JSON), POI_3X3_VKEY_SHA256);
+        assert_eq!(sha256_hex(POI_13X13_VKEY_JSON), POI_13X13_VKEY_SHA256);
+    }
+
+    #[test]
+    fn embedded_poi_vkeys_prepare() {
+        Prover::make_pvk(3, 3).expect("prepare 3x3 vkey");
+        Prover::make_pvk(13, 13).expect("prepare 13x13 vkey");
     }
 }
