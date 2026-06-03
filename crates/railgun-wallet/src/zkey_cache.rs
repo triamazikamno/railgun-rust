@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use ark_bn254::{Bn254, Fr};
@@ -9,11 +9,12 @@ use ark_relations::utils::matrix::Matrix;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use local_db::{DbError, DbStore, ZkeyMeta};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const ZKEY_CACHE_MAGIC: &[u8; 8] = b"RZKCACHE";
 const ZKEY_CACHE_VERSION: u32 = 1;
-const ZKEY_CACHE_FORMAT_VERSION: u32 = 2;
+const ZKEY_CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ZkeyCacheError {
@@ -56,6 +57,9 @@ impl ZkeyCacheDbExt for DbStore {
         if meta.zkey_hash != expected_hash {
             return Ok(None);
         }
+        let Some(expected_cache_hash) = meta.cache_hash else {
+            return Ok(None);
+        };
 
         let path = self.resolve_path(&meta.relative_path);
         if !path.exists() {
@@ -63,6 +67,12 @@ impl ZkeyCacheDbExt for DbStore {
         }
 
         let mut file = File::open(path)?;
+        let cache_hash = reader_sha256(&mut file)?;
+        if cache_hash != expected_cache_hash {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(0))?;
+
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
         if &magic != ZKEY_CACHE_MAGIC {
@@ -74,7 +84,7 @@ impl ZkeyCacheDbExt for DbStore {
             return Err(ZkeyCacheError::VersionMismatch);
         }
 
-        let proving_key = ProvingKey::<Bn254>::deserialize_uncompressed_unchecked(&mut file)?;
+        let proving_key = ProvingKey::<Bn254>::deserialize_uncompressed(&mut file)?;
         let matrices = read_matrices(&mut file)?;
         Ok(Some((proving_key, matrices)))
     }
@@ -101,10 +111,13 @@ impl ZkeyCacheDbExt for DbStore {
             file.sync_all()?;
         }
         std::fs::rename(&tmp_path, &path)?;
+        let mut file = File::open(&path)?;
+        let cache_hash = reader_sha256(&mut file)?;
 
         let meta = ZkeyMeta {
             relative_path: relative,
             zkey_hash: expected_hash,
+            cache_hash: Some(cache_hash),
             format_version: ZKEY_CACHE_FORMAT_VERSION,
         };
         self.put_zkey_meta(variant, &meta)?;
@@ -152,7 +165,28 @@ pub fn zkey_cache_exists(
     if meta.format_version != ZKEY_CACHE_FORMAT_VERSION || meta.zkey_hash != expected_hash {
         return Ok(false);
     }
-    Ok(db.resolve_path(&meta.relative_path).exists())
+    let Some(expected_cache_hash) = meta.cache_hash else {
+        return Ok(false);
+    };
+    let path = db.resolve_path(&meta.relative_path);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    Ok(reader_sha256(&mut file)? == expected_cache_hash)
+}
+
+fn reader_sha256<R: Read>(reader: &mut R) -> Result<[u8; 32], ZkeyCacheError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn write_matrices<W: Write>(writer: &mut W, matrices: &NPIndex<Fr>) -> Result<(), ZkeyCacheError> {
@@ -213,11 +247,105 @@ fn read_matrix<R: Read>(reader: &mut R) -> Result<Matrix<Fr>, ZkeyCacheError> {
         let entry_count = reader.read_u64::<LittleEndian>()?;
         let mut row = Vec::with_capacity(entry_count as usize);
         for _ in 0..entry_count {
-            let coeff = Fr::deserialize_uncompressed_unchecked(&mut *reader)?;
+            let coeff = Fr::deserialize_uncompressed(&mut *reader)?;
             let idx = reader.read_u64::<LittleEndian>()?;
             row.push((coeff, idx as usize));
         }
         matrix.push(row);
     }
     Ok(matrix)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use local_db::{DbConfig, DbStore};
+
+    use super::{ZKEY_CACHE_FORMAT_VERSION, ZkeyCacheDbExt};
+
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_root() -> PathBuf {
+        let dir = std::env::temp_dir().join("railgun-wallet-zkey-cache-tests");
+        fs::create_dir_all(&dir).expect("create temp db dir");
+        let pid = std::process::id();
+        let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{pid}-{counter}"))
+    }
+
+    #[test]
+    fn zkey_cache_exists_rejects_tampered_cache_file() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        db.ensure_blob_dir("zkey").expect("create zkey blob dir");
+        let relative = DbStore::relative_blob_path("zkey", "tampered.ark");
+        let path = db.resolve_path(&relative);
+        fs::write(&path, b"tampered-cache").expect("write cache file");
+        let mut expected_hash = [0u8; 32];
+        expected_hash[0] = 42;
+
+        db.put_zkey_meta(
+            "tampered",
+            &local_db::ZkeyMeta {
+                relative_path: relative,
+                zkey_hash: expected_hash,
+                cache_hash: Some([7u8; 32]),
+                format_version: ZKEY_CACHE_FORMAT_VERSION,
+            },
+        )
+        .expect("write zkey meta");
+
+        assert!(
+            !super::zkey_cache_exists(&db, "tampered", expected_hash).expect("check zkey cache")
+        );
+        assert!(
+            db.load_zkey_cache("tampered", expected_hash)
+                .expect("load zkey cache")
+                .is_none()
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn zkey_cache_load_rejects_legacy_meta_without_cache_hash() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        db.ensure_blob_dir("zkey").expect("create zkey blob dir");
+        let relative = DbStore::relative_blob_path("zkey", "legacy.ark");
+        let path = db.resolve_path(&relative);
+        fs::write(&path, b"legacy-cache").expect("write cache file");
+        let mut expected_hash = [0u8; 32];
+        expected_hash[0] = 7;
+
+        db.put_zkey_meta(
+            "legacy",
+            &local_db::ZkeyMeta {
+                relative_path: relative,
+                zkey_hash: expected_hash,
+                cache_hash: None,
+                format_version: ZKEY_CACHE_FORMAT_VERSION,
+            },
+        )
+        .expect("write zkey meta");
+
+        assert!(
+            db.load_zkey_cache("legacy", expected_hash)
+                .expect("load zkey cache")
+                .is_none()
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
 }

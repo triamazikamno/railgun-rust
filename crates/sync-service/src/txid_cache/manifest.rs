@@ -85,6 +85,7 @@ pub(super) fn write_manifest(
             format_version: TXID_CACHE_FORMAT_VERSION,
             relative_path: DbStore::relative_blob_path(TXID_CACHE_BLOB_KIND, &name),
             content_hash: Sha256::digest(&bytes).into(),
+            source_hash: None,
             created_at: existing.map_or(now, |meta| meta.created_at),
             updated_at: now,
             last_block: None,

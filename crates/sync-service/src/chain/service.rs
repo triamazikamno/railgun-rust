@@ -11,7 +11,7 @@ impl ChainService {
         }
         let archive_provider = match chain.archive_rpc_url.as_ref() {
             Some(url) => Some(
-                build_provider(url)
+                build_provider_with_http_client(url, chain.http_client.as_ref())
                     .await
                     .map_err(ChainError::ProviderBuild)?,
             ),

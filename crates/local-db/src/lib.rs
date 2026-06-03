@@ -240,6 +240,8 @@ pub struct BlobMeta {
     pub format_version: u32,
     pub relative_path: String,
     pub content_hash: [u8; 32],
+    #[serde(default)]
+    pub source_hash: Option<[u8; 32]>,
     pub created_at: u64,
     pub updated_at: u64,
     pub last_block: Option<u64>,
@@ -257,6 +259,8 @@ pub struct MerkleForestMeta {
 pub struct ZkeyMeta {
     pub relative_path: String,
     pub zkey_hash: [u8; 32],
+    #[serde(default)]
+    pub cache_hash: Option<[u8; 32]>,
     pub format_version: u32,
 }
 

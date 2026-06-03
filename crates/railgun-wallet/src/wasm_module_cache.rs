@@ -10,7 +10,7 @@ use wasmer::{Module, Store};
 const WASM_MODULE_CACHE_KIND: &str = "wasm-module";
 const WASM_MODULE_CACHE_MAGIC: &[u8; 8] = b"RWMODCCH";
 const WASM_MODULE_CACHE_FILE_VERSION: u32 = 1;
-const WASM_MODULE_CACHE_FORMAT_VERSION: u32 = 1;
+const WASM_MODULE_CACHE_FORMAT_VERSION: u32 = 2;
 const WASM_MODULE_CACHE_ENGINE_VERSION: &str = "wasmer-6.1.0";
 
 #[derive(Debug, Error)]
@@ -93,10 +93,16 @@ pub fn wasm_module_cache_exists(
     let Some(meta) = db.get_blob_meta(WASM_MODULE_CACHE_KIND, &cache_id)? else {
         return Ok(false);
     };
-    if meta.format_version != WASM_MODULE_CACHE_FORMAT_VERSION || meta.content_hash != wasm_hash {
+    if !wasm_module_meta_matches(&meta, wasm_hash) {
         return Ok(false);
     }
-    Ok(db.resolve_path(&meta.relative_path).exists())
+    let path = db.resolve_path(&meta.relative_path);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let cache_bytes = std::fs::read(path)?;
+    let cache_hash: [u8; 32] = Sha256::digest(&cache_bytes).into();
+    Ok(meta.content_hash == cache_hash)
 }
 
 fn load_wasm_module_cache(
@@ -108,7 +114,7 @@ fn load_wasm_module_cache(
     let Some(meta) = db.get_blob_meta(WASM_MODULE_CACHE_KIND, cache_id)? else {
         return Ok(None);
     };
-    if meta.format_version != WASM_MODULE_CACHE_FORMAT_VERSION || meta.content_hash != wasm_hash {
+    if !wasm_module_meta_matches(&meta, wasm_hash) {
         return Ok(None);
     }
 
@@ -117,7 +123,13 @@ fn load_wasm_module_cache(
         return Ok(None);
     }
 
-    let mut file = File::open(path)?;
+    let cache_bytes = std::fs::read(path)?;
+    let cache_hash: [u8; 32] = Sha256::digest(&cache_bytes).into();
+    if meta.content_hash != cache_hash {
+        return Ok(None);
+    }
+
+    let mut file = std::io::Cursor::new(cache_bytes);
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)?;
     if &magic != WASM_MODULE_CACHE_MAGIC {
@@ -152,12 +164,15 @@ fn write_wasm_module_cache(
     let serialized = module
         .serialize()
         .map_err(|err| WasmModuleCacheError::Serialize(err.to_string()))?;
+    let mut cache_bytes = Vec::with_capacity(WASM_MODULE_CACHE_MAGIC.len() + 4 + serialized.len());
+    cache_bytes.write_all(WASM_MODULE_CACHE_MAGIC)?;
+    cache_bytes.write_all(&WASM_MODULE_CACHE_FILE_VERSION.to_le_bytes())?;
+    cache_bytes.write_all(serialized.as_ref())?;
+    let cache_hash: [u8; 32] = Sha256::digest(&cache_bytes).into();
 
     {
         let mut file = File::create(&tmp_path)?;
-        file.write_all(WASM_MODULE_CACHE_MAGIC)?;
-        file.write_all(&WASM_MODULE_CACHE_FILE_VERSION.to_le_bytes())?;
-        file.write_all(serialized.as_ref())?;
+        file.write_all(&cache_bytes)?;
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, &path)?;
@@ -172,13 +187,18 @@ fn write_wasm_module_cache(
         &BlobMeta {
             format_version: WASM_MODULE_CACHE_FORMAT_VERSION,
             relative_path: relative,
-            content_hash: wasm_hash,
+            content_hash: cache_hash,
+            source_hash: Some(wasm_hash),
             created_at,
             updated_at: now,
             last_block: None,
         },
     )?;
     Ok(())
+}
+
+fn wasm_module_meta_matches(meta: &BlobMeta, wasm_hash: [u8; 32]) -> bool {
+    meta.format_version == WASM_MODULE_CACHE_FORMAT_VERSION && meta.source_hash == Some(wasm_hash)
 }
 
 fn module_cache_id(variant: &str, compiler: &str) -> String {
@@ -260,6 +280,42 @@ mod tests {
             load_or_compile_wasm_module(Some(&db), &store, "test/variant", "default", wasm)
                 .expect("load cached module");
         assert!(second.cache_hit);
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn tampered_compiled_wasm_module_cache_is_regenerated() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let store = Store::default();
+        let wasm = b"\0asm\x01\0\0\0";
+
+        let first = load_or_compile_wasm_module(Some(&db), &store, "tamper", "default", wasm)
+            .expect("compile module");
+        assert!(!first.cache_hit);
+        drop(first);
+
+        let meta = db
+            .get_blob_meta(
+                WASM_MODULE_CACHE_KIND,
+                &module_cache_id("tamper", "default"),
+            )
+            .expect("read blob meta")
+            .expect("blob meta present");
+        let path = db.resolve_path(&meta.relative_path);
+        let mut bytes = fs::read(&path).expect("read cache bytes");
+        let last = bytes.last_mut().expect("cache bytes not empty");
+        *last ^= 0xff;
+        fs::write(&path, bytes).expect("tamper cache bytes");
+
+        let second = load_or_compile_wasm_module(Some(&db), &store, "tamper", "default", wasm)
+            .expect("regenerate module");
+        assert!(!second.cache_hit);
 
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
