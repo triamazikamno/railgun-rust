@@ -120,7 +120,7 @@ fn handle_relay_message(
     let hash = message.hash_key();
 
     if cache.contains(&hash) {
-        tracing::debug!(hash, "duplicate message, ignoring");
+        tracing::trace!(hash, "duplicate message, ignoring");
         return RelayMessageOutcome::Duplicate;
     }
     cache.put(hash, ());
@@ -489,7 +489,7 @@ impl Client {
                                                                 payload,
                                                                 ..Default::default()
                                                             };
-                                                            tracing::debug!(msg.content_topic, hash=msg.hash_key(), "received message from nwaku");
+                                                            tracing::trace!(msg.content_topic, hash=msg.hash_key(), "received message from nwaku");
                                                             if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
                                                                 return;
                                                             }

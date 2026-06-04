@@ -6,7 +6,7 @@ use tor_rtcompat::PreferredRuntime;
 
 use crate::discovery::DiscoveryConfig;
 
-pub type WakuTorClient = TorClient<PreferredRuntime>;
+pub type WakuTorClient = Arc<TorClient<PreferredRuntime>>;
 pub type WakuTorClientProvider = Arc<dyn Fn() -> Option<WakuTorClient> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
