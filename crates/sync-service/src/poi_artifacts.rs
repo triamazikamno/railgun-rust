@@ -33,8 +33,51 @@ impl PoiArtifactIngestor {
         now: SystemTime,
     ) -> Result<Manifest, PoiArtifactError> {
         let started = Instant::now();
-        let manifest_url = self.manifest_url()?;
-        let bytes = self.fetch_url(&manifest_url).await?;
+        let urls = self.manifest_urls()?;
+        let url_count = urls.len();
+        let mut last_error = None;
+        for (url_index, manifest_url) in urls.iter().enumerate() {
+            match self
+                .fetch_manifest_from_url(manifest_url, last_accepted_sequence, now)
+                .await
+            {
+                Ok((manifest, bytes)) => {
+                    debug!(
+                        url = %manifest_url,
+                        url_index,
+                        url_count,
+                        bytes,
+                        manifest_sequence = manifest.sequence,
+                        entries = manifest.entries.len(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "fetched POI artifact manifest"
+                    );
+                    return Ok(manifest);
+                }
+                Err(err) => {
+                    debug!(
+                        ?err,
+                        url = %manifest_url,
+                        url_index,
+                        url_count,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "POI artifact manifest candidate failed"
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(PoiArtifactError::NoGateways))
+    }
+
+    async fn fetch_manifest_from_url(
+        &self,
+        manifest_url: &Url,
+        last_accepted_sequence: Option<u64>,
+        now: SystemTime,
+    ) -> Result<(Manifest, usize), PoiArtifactError> {
+        let bytes = self.fetch_url(manifest_url).await?;
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(PoiArtifactError::Json)?;
         manifest.verify_trusted_signature(&fixed_bytes(&self.config.trusted_publisher_pubkey))?;
         validate_manifest_sequence(&manifest, last_accepted_sequence)?;
@@ -44,15 +87,7 @@ impl PoiArtifactIngestor {
             self.config.max_manifest_age,
             now,
         )?;
-        debug!(
-            url = %manifest_url,
-            bytes = bytes.len(),
-            manifest_sequence = manifest.sequence,
-            entries = manifest.entries.len(),
-            elapsed_ms = started.elapsed().as_millis(),
-            "fetched POI artifact manifest"
-        );
-        Ok(manifest)
+        Ok((manifest, bytes.len()))
     }
 
     pub(crate) async fn fetch_artifact(
@@ -325,27 +360,31 @@ impl PoiArtifactIngestor {
         }))
     }
 
-    fn manifest_url(&self) -> Result<Url, PoiArtifactError> {
+    fn manifest_urls(&self) -> Result<Vec<Url>, PoiArtifactError> {
         match &self.config.manifest_source {
-            PoiArtifactManifestSource::Url(url) => Ok(url.clone()),
-            PoiArtifactManifestSource::Cid(cid) => self.gateway_url("ipfs", cid),
-            PoiArtifactManifestSource::IpnsName(name) => self.gateway_url("ipns", name),
+            PoiArtifactManifestSource::Url(url) => Ok(vec![url.clone()]),
+            PoiArtifactManifestSource::Cid(cid) => self.gateway_urls("ipfs", cid),
+            PoiArtifactManifestSource::IpnsName(name) => self.gateway_urls("ipns", name),
         }
     }
 
     fn artifact_urls(&self, cid: &str) -> Result<Vec<Url>, PoiArtifactError> {
+        self.gateway_urls("ipfs", cid)
+    }
+
+    fn gateway_urls(
+        &self,
+        namespace: &'static str,
+        value: &str,
+    ) -> Result<Vec<Url>, PoiArtifactError> {
+        if self.config.gateway_urls.is_empty() {
+            return Err(PoiArtifactError::NoGateways);
+        }
         self.config
             .gateway_urls
             .iter()
-            .map(|gateway| gateway_url(gateway, "ipfs", cid))
+            .map(|gateway| gateway_url(gateway, namespace, value))
             .collect()
-    }
-
-    fn gateway_url(&self, namespace: &'static str, value: &str) -> Result<Url, PoiArtifactError> {
-        let Some(gateway) = self.config.gateway_urls.first() else {
-            return Err(PoiArtifactError::NoGateways);
-        };
-        gateway_url(gateway, namespace, value)
     }
 
     async fn fetch_first_available(&self, urls: &[Url]) -> Result<Vec<u8>, PoiArtifactError> {
@@ -790,6 +829,11 @@ fn prefixed_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+
+    use ed25519_dalek::SigningKey;
     use poi::artifacts::{SnapshotEvent, SnapshotHeader, snapshot::format};
 
     #[test]
@@ -816,6 +860,96 @@ mod tests {
         ));
         validate_manifest_freshness(&manifest, Some(1), Some(Duration::from_secs(1)), now)
             .expect("persisted sequence skips first-run freshness check");
+    }
+
+    #[tokio::test]
+    async fn manifest_fetch_tries_next_gateway_after_stale_candidate() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let stale = signed_manifest(&signing_key, 1_000, 1);
+        let fresh = signed_manifest(&signing_key, 9_500, 2);
+        let stale_server = spawn_manifest_server(200, serde_json::to_vec(&stale).expect("JSON"));
+        let fresh_server = spawn_manifest_server(200, serde_json::to_vec(&fresh).expect("JSON"));
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::IpnsName("manifest-name".to_string()),
+            vec![stale_server.url.clone(), fresh_server.url.clone()],
+            Some(Duration::from_secs(1)),
+        );
+
+        let manifest = ingestor
+            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
+            .await
+            .expect("fresh second manifest");
+
+        assert_eq!(manifest.sequence, 2);
+        assert_eq!(stale_server.request_path(), "/ipns/manifest-name");
+        assert_eq!(fresh_server.request_path(), "/ipns/manifest-name");
+    }
+
+    #[tokio::test]
+    async fn manifest_fetch_tries_next_gateway_after_fetch_failure() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let fresh = signed_manifest(&signing_key, 9_500, 2);
+        let failing_server = spawn_manifest_server(500, Vec::new());
+        let fresh_server = spawn_manifest_server(200, serde_json::to_vec(&fresh).expect("JSON"));
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Cid("manifest-cid".to_string()),
+            vec![failing_server.url.clone(), fresh_server.url.clone()],
+            Some(Duration::from_secs(1)),
+        );
+
+        let manifest = ingestor
+            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
+            .await
+            .expect("fresh second manifest");
+
+        assert_eq!(manifest.sequence, 2);
+        assert_eq!(failing_server.request_path(), "/ipfs/manifest-cid");
+        assert_eq!(fresh_server.request_path(), "/ipfs/manifest-cid");
+    }
+
+    #[tokio::test]
+    async fn manifest_fetch_reports_error_after_all_gateways_fail() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let first = spawn_manifest_server(500, Vec::new());
+        let second = spawn_manifest_server(500, Vec::new());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Cid("manifest-cid".to_string()),
+            vec![first.url.clone(), second.url.clone()],
+            None,
+        );
+
+        let error = ingestor
+            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
+            .await
+            .expect_err("all manifest candidates fail");
+
+        assert!(matches!(error, PoiArtifactError::HttpStatus { .. }));
+        assert_eq!(first.request_path(), "/ipfs/manifest-cid");
+        assert_eq!(second.request_path(), "/ipfs/manifest-cid");
+    }
+
+    #[tokio::test]
+    async fn explicit_manifest_url_does_not_require_gateways() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let fresh = signed_manifest(&signing_key, 9_500, 2);
+        let manifest_server = spawn_manifest_server(200, serde_json::to_vec(&fresh).expect("JSON"));
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(manifest_server.url.clone()),
+            Vec::new(),
+            Some(Duration::from_secs(1)),
+        );
+
+        let manifest = ingestor
+            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
+            .await
+            .expect("explicit manifest URL");
+
+        assert_eq!(manifest.sequence, 2);
+        assert_eq!(manifest_server.request_path(), "/");
     }
 
     #[test]
@@ -903,6 +1037,84 @@ mod tests {
 
     fn test_identity() -> PoiCacheIdentity {
         PoiCacheIdentity::new(0, 1, "V2_PoseidonMerkle", FixedBytes::from([0x11; 32]))
+    }
+
+    fn signed_manifest(signing_key: &SigningKey, issued_at_ms: u64, sequence: u64) -> Manifest {
+        let mut manifest = Manifest::new(2, issued_at_ms, sequence, String::new(), vec![]);
+        manifest.sign_manifest(signing_key).expect("sign manifest");
+        manifest
+    }
+
+    fn manifest_ingestor(
+        signing_key: &SigningKey,
+        manifest_source: PoiArtifactManifestSource,
+        gateway_urls: Vec<Url>,
+        max_manifest_age: Option<Duration>,
+    ) -> PoiArtifactIngestor {
+        PoiArtifactIngestor::new(
+            PoiArtifactSourceConfig {
+                trusted_publisher_pubkey: FixedBytes::from(signing_key.verifying_key().to_bytes()),
+                manifest_source,
+                gateway_urls,
+                max_manifest_age,
+            },
+            reqwest::Client::new(),
+        )
+    }
+
+    struct MockManifestServer {
+        url: Url,
+        requests: Receiver<String>,
+    }
+
+    impl MockManifestServer {
+        fn request_path(&self) -> String {
+            self.requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("manifest request path")
+        }
+    }
+
+    fn spawn_manifest_server(status: u16, body: Vec<u8>) -> MockManifestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind manifest server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("manifest server URL");
+        let (tx, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "manifest client closed before request headers");
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            let path = request_text
+                .split_whitespace()
+                .nth(1)
+                .expect("request path")
+                .to_string();
+            tx.send(path).expect("record request path");
+
+            let reason = if status == 200 { "OK" } else { "ERROR" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response headers");
+            stream.write_all(&body).expect("write response body");
+        });
+
+        MockManifestServer { url, requests }
     }
 
     fn test_entry(

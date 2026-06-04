@@ -267,7 +267,7 @@ async fn sync_chain_poi_artifact_caches(
                 let install_lock_wait_elapsed_ms = install_lock_started.elapsed().as_millis();
                 let installed = install_cache_if_not_behind(&mut caches, *list_key, cache);
                 drop(caches);
-                info!(
+                debug!(
                     chain_id,
                     list_key = %hex::encode(list_key),
                     manifest_sequence,
