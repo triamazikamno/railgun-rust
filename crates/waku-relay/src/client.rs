@@ -512,7 +512,7 @@ impl Client {
                             }
                             msg = fleet_rx.recv() => {
                                 if let Some(msg) = msg {
-                                    tracing::debug!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
+                                    tracing::trace!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
                                     if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
                                         return;
                                     }
