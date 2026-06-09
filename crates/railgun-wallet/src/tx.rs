@@ -13,7 +13,8 @@ use thiserror::Error;
 use ::poi::error::PoiRpcError;
 use ::poi::poi::{PoiMerkleProof, PoiRpcClient};
 use broadcaster_core::contracts::railgun::{
-    ActionData, BoundParams, CommitmentPreimage, SnarkProof, Transaction, relayCall, transactCall,
+    ActionData, BoundParams, CommitmentPreimage, SnarkProof, TokenTransfer, Transaction, relayCall,
+    transactCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};

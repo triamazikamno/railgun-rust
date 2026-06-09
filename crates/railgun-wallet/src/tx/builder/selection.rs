@@ -10,6 +10,9 @@ use super::super::{
     UnshieldSelectionInfo,
 };
 
+const MAX_ALTERNATE_BATCH_CANDIDATES: usize = 1024;
+const MAX_PARTIAL_SELECTION_CANDIDATES_PER_TREE: usize = 32;
+
 #[derive(Debug, Clone)]
 pub(super) struct UtxoSelection {
     pub(super) utxos: Vec<Utxo>,
@@ -140,29 +143,15 @@ pub fn unshield_selection_info_with_broadcaster_fee_token(
         );
     }
 
-    let fee_selection = select_fee_utxos(utxos, fee_token_address, fee_amount)?;
-    let max_spendable =
-        max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
-    let selection = select_batched_utxos_with_limit(
+    different_token_broadcaster_fee_selection_info(
         utxos,
         token_address,
+        fee_token_address,
         amount,
+        fee_amount,
         spend_up_to,
-        1,
-        1,
-        MAX_BATCH_TRANSACTIONS - 1,
-    )?;
-    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, false);
-    let fee_private_outputs = 1 + usize::from(fee_selection.total > fee_amount);
-
-    Ok(UnshieldSelectionInfo {
-        total: selection.total,
-        input_count: fee_selection.utxos.len() + selection.input_count(),
-        transaction_count: 1 + action_shape.transaction_count,
-        private_output_count: fee_private_outputs + action_shape.private_output_count,
-        public_output_count: action_shape.public_output_count,
-        max_spendable,
-    })
+        false,
+    )
 }
 
 pub fn unshield_selection_info_with_separate_broadcaster_fee_seed(
@@ -260,6 +249,26 @@ pub fn send_selection_info_with_broadcaster_fee_token(
         );
     }
 
+    different_token_broadcaster_fee_selection_info(
+        utxos,
+        token_address,
+        fee_token_address,
+        amount,
+        fee_amount,
+        spend_up_to,
+        true,
+    )
+}
+
+fn different_token_broadcaster_fee_selection_info(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_token_address: Address,
+    amount: U256,
+    fee_amount: U256,
+    spend_up_to: bool,
+    send: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
     let fee_selection = select_fee_utxos(utxos, fee_token_address, fee_amount)?;
     let max_spendable =
         max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
@@ -272,7 +281,7 @@ pub fn send_selection_info_with_broadcaster_fee_token(
         1,
         MAX_BATCH_TRANSACTIONS - 1,
     )?;
-    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, true);
+    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, send);
     let fee_private_outputs = 1 + usize::from(fee_selection.total > fee_amount);
 
     Ok(UnshieldSelectionInfo {
@@ -525,6 +534,60 @@ pub(super) fn select_batched_utxos_with_limit(
     Err(BuildError::InsufficientBalance(max_spendable))
 }
 
+pub(super) fn select_batched_utxo_candidates_with_limit(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+    max_transactions: usize,
+) -> Result<Vec<BatchUtxoSelection>, BuildError> {
+    let primary = select_batched_utxos_with_limit(
+        utxos,
+        token_address,
+        amount,
+        spend_up_to,
+        first_base_output_count,
+        continuation_base_output_count,
+        max_transactions,
+    )?;
+    let mut candidates = vec![primary];
+
+    if max_transactions == 0 {
+        return Ok(candidates);
+    }
+
+    for selection in single_transaction_selection_candidates(
+        utxos,
+        token_address,
+        amount,
+        first_base_output_count,
+    ) {
+        let total = selection.total;
+        push_unique_batch_candidate(
+            &mut candidates,
+            BatchUtxoSelection {
+                chunks: vec![selection],
+                total,
+            },
+        );
+    }
+
+    for selection in multi_transaction_selection_candidates(
+        utxos,
+        token_address,
+        amount,
+        first_base_output_count,
+        continuation_base_output_count,
+        max_transactions,
+    ) {
+        push_unique_batch_candidate(&mut candidates, selection);
+    }
+
+    Ok(candidates)
+}
+
 pub(super) fn select_fee_utxos(
     utxos: &[Utxo],
     fee_token_address: Address,
@@ -604,7 +667,7 @@ fn greedy_batched_selection(
     None
 }
 
-fn remove_selected_utxos(utxos: &mut Vec<Utxo>, selected: &[Utxo]) {
+pub(super) fn remove_selected_utxos(utxos: &mut Vec<Utxo>, selected: &[Utxo]) {
     utxos.retain(|utxo| {
         !selected
             .iter()
@@ -667,34 +730,232 @@ fn best_unshield_selection(
     best
 }
 
+fn single_transaction_selection_candidates(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    base_output_count: usize,
+) -> Vec<UtxoSelection> {
+    let mut candidates = Vec::new();
+    for input_count in 1..=max_inputs_for_base_outputs(base_output_count) {
+        candidates.extend(unshield_selection_candidates_for_input_count(
+            utxos,
+            token_address,
+            amount,
+            base_output_count,
+            input_count,
+        ));
+        if candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES {
+            candidates.truncate(MAX_ALTERNATE_BATCH_CANDIDATES);
+            break;
+        }
+    }
+    candidates
+}
+
+fn multi_transaction_selection_candidates(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+    max_transactions: usize,
+) -> Vec<BatchUtxoSelection> {
+    if max_transactions < 2 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut chunks = Vec::new();
+    collect_multi_transaction_selection_candidates(
+        utxos,
+        token_address,
+        amount,
+        first_base_output_count,
+        continuation_base_output_count,
+        max_transactions,
+        U256::ZERO,
+        &mut chunks,
+        &mut candidates,
+    );
+    candidates
+}
+
+fn collect_multi_transaction_selection_candidates(
+    utxos: &[Utxo],
+    token_address: Address,
+    remaining_amount: U256,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+    max_transactions: usize,
+    selected_total: U256,
+    chunks: &mut Vec<UtxoSelection>,
+    candidates: &mut Vec<BatchUtxoSelection>,
+) {
+    if chunks.len() == max_transactions || candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES {
+        return;
+    }
+
+    let base_output_count = if chunks.is_empty() {
+        first_base_output_count
+    } else {
+        continuation_base_output_count
+    };
+
+    for selection in single_transaction_selection_candidates(
+        utxos,
+        token_address,
+        remaining_amount,
+        base_output_count,
+    ) {
+        let mut candidate_chunks = chunks.clone();
+        let total = selected_total + selection.total;
+        candidate_chunks.push(selection);
+        push_unique_batch_candidate(
+            candidates,
+            BatchUtxoSelection {
+                chunks: candidate_chunks,
+                total,
+            },
+        );
+        if candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES {
+            return;
+        }
+    }
+
+    if chunks.len() + 1 == max_transactions {
+        return;
+    }
+
+    for selection in partial_transaction_selection_candidates(
+        utxos,
+        token_address,
+        remaining_amount,
+        base_output_count,
+    ) {
+        let mut remaining_utxos = utxos.to_vec();
+        remove_selected_utxos(&mut remaining_utxos, &selection.utxos);
+        let next_remaining_amount = remaining_amount - selection.total;
+        let next_selected_total = selected_total + selection.total;
+
+        chunks.push(selection);
+        collect_multi_transaction_selection_candidates(
+            &remaining_utxos,
+            token_address,
+            next_remaining_amount,
+            first_base_output_count,
+            continuation_base_output_count,
+            max_transactions,
+            next_selected_total,
+            chunks,
+            candidates,
+        );
+        chunks.pop();
+
+        if candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES {
+            return;
+        }
+    }
+}
+
+fn unshield_selection_candidates_for_input_count(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    base_output_count: usize,
+    input_count: usize,
+) -> Vec<UtxoSelection> {
+    let mut selections = Vec::new();
+    for mut candidates in token_utxos_by_tree(utxos, token_address).into_values() {
+        sort_search_candidates(&mut candidates);
+        let mut search = SelectionSearch::new(&candidates, amount, input_count, base_output_count);
+        search.run();
+        if let Some(selection) = search.best {
+            selections.push(selection);
+        }
+    }
+    selections.sort_by(|a, b| selection_amount_order(a, b, amount));
+    selections
+}
+
+fn selection_amount_order(a: &UtxoSelection, b: &UtxoSelection, amount: U256) -> Ordering {
+    let a_excess = a.total - amount;
+    let b_excess = b.total - amount;
+    a.utxos
+        .len()
+        .cmp(&b.utxos.len())
+        .then_with(|| a_excess.cmp(&b_excess))
+        .then_with(|| a.position_key().cmp(&b.position_key()))
+}
+
+fn push_unique_batch_candidate(
+    candidates: &mut Vec<BatchUtxoSelection>,
+    candidate: BatchUtxoSelection,
+) {
+    if candidates
+        .iter()
+        .any(|existing| batch_selection_key(existing) == batch_selection_key(&candidate))
+    {
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn batch_selection_key(selection: &BatchUtxoSelection) -> Vec<Vec<(u32, u64)>> {
+    selection
+        .chunks
+        .iter()
+        .map(UtxoSelection::position_key)
+        .collect()
+}
+
+fn partial_transaction_selection_candidates(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    base_output_count: usize,
+) -> Vec<UtxoSelection> {
+    if amount <= uint!(1_U256) {
+        return Vec::new();
+    }
+    let max_input_count = max_inputs_for_base_outputs(base_output_count);
+    if max_input_count == 0 {
+        return Vec::new();
+    }
+
+    let mut selections = Vec::new();
+    for mut candidates in token_utxos_by_tree(utxos, token_address).into_values() {
+        sort_search_candidates(&mut candidates);
+        let mut search = PartialSelectionSearch::new(
+            &candidates,
+            amount,
+            max_input_count,
+            MAX_PARTIAL_SELECTION_CANDIDATES_PER_TREE,
+        );
+        search.run();
+        selections.extend(search.selections);
+    }
+    selections.sort_by(selection_max_order);
+    selections.truncate(MAX_ALTERNATE_BATCH_CANDIDATES);
+    selections
+}
+
+fn selection_max_order(a: &UtxoSelection, b: &UtxoSelection) -> Ordering {
+    b.total
+        .cmp(&a.total)
+        .then_with(|| a.utxos.len().cmp(&b.utxos.len()))
+        .then_with(|| a.position_key().cmp(&b.position_key()))
+}
+
 fn best_partial_selection_below_amount(
     utxos: &[Utxo],
     token_address: Address,
     amount: U256,
     base_output_count: usize,
 ) -> Option<UtxoSelection> {
-    if amount <= uint!(1_U256) {
-        return None;
-    }
-    let max_input_count = max_inputs_for_base_outputs(base_output_count);
-    if max_input_count == 0 {
-        return None;
-    }
-
-    let mut best: Option<UtxoSelection> = None;
-    for mut candidates in token_utxos_by_tree(utxos, token_address).into_values() {
-        sort_search_candidates(&mut candidates);
-        let mut search = PartialSelectionSearch::new(&candidates, amount, max_input_count);
-        search.run();
-        if let Some(selection) = search.best
-            && best
-                .as_ref()
-                .is_none_or(|best| selection.is_better_max_than(best))
-        {
-            best = Some(selection);
-        }
-    }
-    best
+    partial_transaction_selection_candidates(utxos, token_address, amount, base_output_count)
+        .into_iter()
+        .next()
 }
 
 fn max_unshield_selection_with_output_count(
@@ -783,22 +1044,38 @@ fn normalize_selection(utxos: &mut [Utxo]) {
     utxos.sort_by_key(|utxo| (utxo.tree, utxo.position));
 }
 
+fn max_possible_from(candidates: &[Utxo], start: usize, remaining: usize) -> U256 {
+    candidates[start..]
+        .iter()
+        .take(remaining)
+        .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
+}
+
 struct PartialSelectionSearch<'a> {
     candidates: &'a [Utxo],
     amount: U256,
     max_input_count: usize,
+    selection_limit: usize,
     selected: Vec<usize>,
     best: Option<UtxoSelection>,
+    selections: Vec<UtxoSelection>,
 }
 
 impl<'a> PartialSelectionSearch<'a> {
-    fn new(candidates: &'a [Utxo], amount: U256, max_input_count: usize) -> Self {
+    fn new(
+        candidates: &'a [Utxo],
+        amount: U256,
+        max_input_count: usize,
+        selection_limit: usize,
+    ) -> Self {
         Self {
             candidates,
             amount,
             max_input_count,
+            selection_limit,
             selected: Vec::with_capacity(max_input_count),
             best: None,
+            selections: Vec::with_capacity(selection_limit),
         }
     }
 
@@ -812,7 +1089,16 @@ impl<'a> PartialSelectionSearch<'a> {
         }
         let remaining_slots = self.max_input_count - self.selected.len();
         if let Some(best) = &self.best
-            && total + self.max_possible_from(start, remaining_slots) <= best.total
+            && self.selection_limit <= 1
+            && total + max_possible_from(self.candidates, start, remaining_slots) <= best.total
+        {
+            return;
+        }
+        if self.selection_limit > 1
+            && self.selections.len() >= self.selection_limit
+            && self.selections.last().is_some_and(|selection| {
+                total + max_possible_from(self.candidates, start, remaining_slots) < selection.total
+            })
         {
             return;
         }
@@ -829,13 +1115,6 @@ impl<'a> PartialSelectionSearch<'a> {
         }
     }
 
-    fn max_possible_from(&self, start: usize, remaining_slots: usize) -> U256 {
-        self.candidates[start..]
-            .iter()
-            .take(remaining_slots)
-            .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
-    }
-
     fn record(&mut self, total: U256) {
         let mut utxos = self
             .selected
@@ -849,9 +1128,27 @@ impl<'a> PartialSelectionSearch<'a> {
             .as_ref()
             .is_none_or(|best| selection.is_better_max_than(best))
         {
-            self.best = Some(selection);
+            self.best = Some(selection.clone());
         }
+        push_unique_selection_candidate(&mut self.selections, selection, self.selection_limit);
     }
+}
+
+fn push_unique_selection_candidate(
+    candidates: &mut Vec<UtxoSelection>,
+    candidate: UtxoSelection,
+    limit: usize,
+) {
+    if limit == 0
+        || candidates
+            .iter()
+            .any(|existing| existing.position_key() == candidate.position_key())
+    {
+        return;
+    }
+    candidates.push(candidate);
+    candidates.sort_by(selection_max_order);
+    candidates.truncate(limit);
 }
 
 struct SelectionSearch<'a> {
@@ -898,7 +1195,7 @@ impl<'a> SelectionSearch<'a> {
         if !self.exact_only() && self.best.as_ref().is_some_and(|best| total >= best.total) {
             return;
         }
-        if total + self.max_possible_from(start, remaining) < self.amount {
+        if total + max_possible_from(self.candidates, start, remaining) < self.amount {
             return;
         }
 
@@ -920,13 +1217,6 @@ impl<'a> SelectionSearch<'a> {
             self.search(index + 1, remaining - 1, next_total);
             self.selected.pop();
         }
-    }
-
-    fn max_possible_from(&self, start: usize, remaining: usize) -> U256 {
-        self.candidates[start..]
-            .iter()
-            .take(remaining)
-            .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
     }
 
     fn exact_only(&self) -> bool {

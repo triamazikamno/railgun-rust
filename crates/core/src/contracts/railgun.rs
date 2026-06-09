@@ -285,11 +285,45 @@ impl CommitmentPreimage {
 
 impl TokenData {
     #[must_use]
+    pub fn erc20(token_address: Address) -> Self {
+        Self {
+            tokenType: 0,
+            tokenAddress: token_address,
+            tokenSubID: U256::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub fn base_native() -> Self {
+        Self::erc20(Address::ZERO)
+    }
+
+    #[must_use]
     pub fn id(&self) -> U256 {
         if self.tokenType == 0 {
             U256::from_be_slice(self.tokenAddress.as_slice())
         } else {
             hash_to_scalar(self.abi_encode())
+        }
+    }
+}
+
+impl TokenTransfer {
+    #[must_use]
+    pub fn erc20(token_address: Address, to: Address, value: U256) -> Self {
+        Self {
+            token: TokenData::erc20(token_address),
+            to,
+            value,
+        }
+    }
+
+    #[must_use]
+    pub fn base_native(to: Address, value: U256) -> Self {
+        Self {
+            token: TokenData::base_native(),
+            to,
+            value,
         }
     }
 }
@@ -304,6 +338,38 @@ impl LegacyCommitmentPreimage {
 }
 
 impl ActionData {
+    #[must_use]
+    pub fn require_success(random: FixedBytes<31>, min_gas_limit: U256, calls: Vec<Call>) -> Self {
+        Self {
+            random,
+            requireSuccess: true,
+            minGasLimit: min_gas_limit,
+            calls,
+        }
+    }
+
+    #[must_use]
+    pub fn unwrap_base_call(relay_adapt: Address, amount: U256) -> Call {
+        Call {
+            to: relay_adapt,
+            data: unwrapBaseCall { _amount: amount }.abi_encode().into(),
+            value: U256::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub fn transfer_call(relay_adapt: Address, transfers: Vec<TokenTransfer>) -> Call {
+        Call {
+            to: relay_adapt,
+            data: transferCall {
+                _transfers: transfers,
+            }
+            .abi_encode()
+            .into(),
+            value: U256::ZERO,
+        }
+    }
+
     #[must_use]
     pub fn unwrap_base(
         relay_adapt: Address,

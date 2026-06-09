@@ -94,6 +94,20 @@ pub struct UnshieldPlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct CompositeUnshieldPlan {
+    pub call: TransactionCall,
+    pub inputs: Vec<InputWitness>,
+    pub outputs: Vec<Note>,
+    pub chunks: Vec<TransactionPlanChunk>,
+    pub broadcaster_fee_note: Option<Note>,
+    pub unshield_outputs: Vec<CompositeUnshieldPlannedOutput>,
+    pub leg_metadata: Vec<CompositeUnshieldLegMetadata>,
+    pub private_output_roles: Vec<CompositePrivateOutputRole>,
+    pub action_data: Option<ActionData>,
+    pub shape: CompositePlanShape,
+}
+
+#[derive(Debug, Clone)]
 pub struct SendPlan {
     pub call: TransactionCall,
     pub tree_number: u32,
@@ -295,6 +309,108 @@ pub enum UnshieldMode {
     UnwrapBase,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeUnshieldRecipient {
+    Public(Address),
+    RelayAdapt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeUnshieldLegRole {
+    Primary,
+    NativeTopUp,
+    WrappedNativeOutput,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeUnshieldLeg {
+    pub token_address: Address,
+    pub amount: U256,
+    pub recipient: CompositeUnshieldRecipient,
+    pub role: CompositeUnshieldLegRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeRelayActionToken {
+    Erc20(Address),
+    BaseNative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeRelayAction {
+    UnwrapBase {
+        amount: U256,
+    },
+    Transfer {
+        token: CompositeRelayActionToken,
+        recipient: Address,
+        amount: U256,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeRelayActions {
+    pub min_gas_limit: U256,
+    pub calls: Vec<CompositeRelayAction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompositeUnshieldRequest {
+    pub legs: Vec<CompositeUnshieldLeg>,
+    pub relay_actions: Option<CompositeRelayActions>,
+    pub broadcaster_fee: Option<BroadcasterFeeOutput>,
+    pub min_gas_price: u128,
+    pub verify_proof: bool,
+    pub spend_up_to: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositePlanShape {
+    pub transaction_count: usize,
+    pub input_count: usize,
+    pub private_output_count: usize,
+    pub public_output_count: usize,
+    pub relay_call_count: usize,
+    pub uses_relay_adapt: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeUnshieldLegMetadata {
+    pub leg_index: usize,
+    pub token_address: Address,
+    pub requested_amount: U256,
+    pub recipient: CompositeUnshieldRecipient,
+    pub role: CompositeUnshieldLegRole,
+    pub transaction_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompositeUnshieldPlannedOutput {
+    pub leg_index: usize,
+    pub transaction_index: usize,
+    pub output_index: usize,
+    pub token_address: Address,
+    pub amount: U256,
+    pub recipient: CompositeUnshieldRecipient,
+    pub role: CompositeUnshieldLegRole,
+    pub note: Note,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositePrivateOutputRoleKind {
+    BroadcasterFee,
+    Change,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositePrivateOutputRole {
+    pub chunk_index: usize,
+    pub output_index: usize,
+    pub role: CompositePrivateOutputRoleKind,
+    pub token_address: Address,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BroadcasterFeeOutput {
     pub recipient: AddressData,
@@ -347,6 +463,77 @@ impl UnshieldRequest {
 
     pub(super) fn base_output_count(self) -> usize {
         1 + usize::from(self.same_token_broadcaster_fee().is_some())
+    }
+}
+
+impl CompositeUnshieldRecipient {
+    pub(super) fn unshield_to(self, relay_adapt_contract: Address) -> Address {
+        match self {
+            Self::Public(recipient) => recipient,
+            Self::RelayAdapt => relay_adapt_contract,
+        }
+    }
+
+    #[must_use]
+    pub const fn uses_relay_adapt(self) -> bool {
+        matches!(self, Self::RelayAdapt)
+    }
+}
+
+impl CompositeRelayActionToken {
+    #[must_use]
+    pub const fn token_address(self) -> Address {
+        match self {
+            Self::Erc20(address) => address,
+            Self::BaseNative => Address::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn transfer(self, recipient: Address, amount: U256) -> TokenTransfer {
+        match self {
+            Self::Erc20(token_address) => TokenTransfer::erc20(token_address, recipient, amount),
+            Self::BaseNative => TokenTransfer::base_native(recipient, amount),
+        }
+    }
+}
+
+impl CompositeRelayActions {
+    pub(super) fn action_data(
+        &self,
+        relay_adapt_contract: Address,
+        random: FixedBytes<31>,
+    ) -> Result<ActionData, BuildError> {
+        let mut calls = Vec::with_capacity(self.calls.len());
+        for action in &self.calls {
+            match *action {
+                CompositeRelayAction::UnwrapBase { amount } => {
+                    if amount.is_zero() {
+                        return Err(BuildError::InvalidRelayAdaptActionAmount);
+                    }
+                    calls.push(ActionData::unwrap_base_call(relay_adapt_contract, amount));
+                }
+                CompositeRelayAction::Transfer {
+                    token,
+                    recipient,
+                    amount,
+                } => {
+                    if amount.is_zero() {
+                        return Err(BuildError::InvalidRelayAdaptActionAmount);
+                    }
+                    calls.push(ActionData::transfer_call(
+                        relay_adapt_contract,
+                        vec![token.transfer(recipient, amount)],
+                    ));
+                }
+            }
+        }
+
+        Ok(ActionData::require_success(
+            random,
+            self.min_gas_limit,
+            calls,
+        ))
     }
 }
 

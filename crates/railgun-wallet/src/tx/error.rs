@@ -18,6 +18,16 @@ pub enum BuildError {
     MissingRoot,
     #[error("missing action data for unwrap")]
     MissingActionData,
+    #[error("composite unshield request must include at least one leg")]
+    EmptyCompositeUnshieldRequest,
+    #[error("RelayAdapt composite legs require at least one RelayAdapt action")]
+    MissingCompositeRelayActions,
+    #[error(
+        "composite unshield plan exceeds batch transaction limit: {requested} requested, max {max}"
+    )]
+    TooManyBatchTransactions { requested: usize, max: usize },
+    #[error("RelayAdapt action amount must be non-zero")]
+    InvalidRelayAdaptActionAmount,
     #[error("missing merkle proof for tree {tree} position {position}")]
     MissingProof { tree: u32, position: u64 },
     #[error("min gas price exceeds uint72: {0}")]
