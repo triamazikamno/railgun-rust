@@ -120,6 +120,7 @@ pub(super) fn validated_root_txid_index(
     Ok(root_txid_index)
 }
 
+#[cfg(test)]
 pub(crate) fn txid_public_transaction_for_recovered_output(
     db: &DbStore,
     key: TxidPublicCacheKey<'_>,
@@ -141,6 +142,7 @@ pub(crate) fn txid_public_transaction_for_recovered_output(
     Ok(row.into())
 }
 
+#[cfg(test)]
 pub(super) fn find_public_recovery_transaction_in_manifest(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,
@@ -160,6 +162,7 @@ pub(super) fn find_public_recovery_transaction_in_manifest(
     find_target_row_by_scan(manifest, db, tx_hash, output_commitment)
 }
 
+#[cfg(test)]
 pub(super) fn find_target_row_by_hash_index(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,
@@ -181,6 +184,7 @@ pub(super) fn find_target_row_by_hash_index(
     Ok(found.row)
 }
 
+#[cfg(test)]
 pub(super) fn find_target_row_by_scan(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,
@@ -197,6 +201,7 @@ pub(super) fn find_target_row_by_scan(
     found.row.ok_or(TxidPublicCacheError::MissingTarget)
 }
 
+#[cfg(test)]
 pub(super) fn find_target_row_in_page(
     manifest: &TxidPublicCacheManifest,
     page: &TxidPublicCachePage,
@@ -210,12 +215,14 @@ pub(super) fn find_target_row_in_page(
     Ok(found.row)
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct RecoveredOutputMatch {
     pub(super) row: Option<TxidPublicCacheRow>,
     pub(super) validated: bool,
 }
 
+#[cfg(test)]
 impl RecoveredOutputMatch {
     fn remember(
         &mut self,
@@ -248,6 +255,7 @@ impl RecoveredOutputMatch {
     }
 }
 
+#[cfg(test)]
 fn row_for_index_entry(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,

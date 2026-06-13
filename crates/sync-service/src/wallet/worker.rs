@@ -155,6 +155,16 @@ pub(crate) fn spawn_wallet_worker(
                     } else {
                         0
                     };
+                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                    debug!(
+                        cache_key = %cfg.cache_key,
+                        pending_completed = pending_verification.completed,
+                        pending_still_missing = pending_verification.pending,
+                        pending_errors = pending_verification.errors,
+                        "manual wallet POI refresh pending context verification complete"
+                    );
+                    worker_handle.notify_if_changed(changed);
+                    let recovery_started = Instant::now();
                     let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
                         db: db.as_ref(),
                         cfg: &cfg,
@@ -176,15 +186,14 @@ pub(crate) fn spawn_wallet_worker(
                         Some(client as &dyn PendingOutputPoiSubmitter),
                         force_submission_retry,
                     ).await;
-                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
                     debug!(
                         cache_key = %cfg.cache_key,
-                        pending_completed = pending_verification.completed,
-                        pending_still_missing = pending_verification.pending,
-                        pending_errors = pending_verification.errors,
-                        "manual wallet POI refresh pending context verification complete"
+                        recovered,
+                        force_submission_retry,
+                        elapsed_ms = recovery_started.elapsed().as_millis(),
+                        "manual wallet output POI recovery complete"
                     );
-                    worker_handle.notify_if_changed(changed);
+                    worker_handle.notify_if_changed(recovered > 0);
                 }
                 _ = tokio::time::sleep(WALLET_POI_REFRESH_INTERVAL), if poi_status_client.is_some() && backfill_complete_block.is_some() => {
                     let Some(client) = poi_status_client.as_ref() else {
@@ -255,6 +264,7 @@ pub(crate) fn spawn_wallet_worker(
                         db.as_ref(),
                         &active_poi_list_keys,
                     ).await;
+                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
                     recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
                         db: db.as_ref(),
                         cfg: &cfg,
@@ -273,7 +283,6 @@ pub(crate) fn spawn_wallet_worker(
                         Some(client as &dyn PendingOutputPoiSubmitter),
                         false,
                     ).await;
-                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
                     debug!(
                         cache_key = %cfg.cache_key,
                         pending_completed = pending_verification.completed,
@@ -565,6 +574,7 @@ pub(crate) fn spawn_wallet_worker(
                                         &active_poi_list_keys,
                                     )
                                     .await;
+                                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
                                     let output_recovery_started = Instant::now();
                                     let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
                                         db: db.as_ref(),
@@ -579,7 +589,6 @@ pub(crate) fn spawn_wallet_worker(
                                     }).await;
                                     let output_recovery_elapsed_ms =
                                         output_recovery_started.elapsed().as_millis();
-                                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
                                     worker_handle.notify_if_changed(recovered > 0);
                                     info!(
                                         cache_key = %cfg.cache_key,

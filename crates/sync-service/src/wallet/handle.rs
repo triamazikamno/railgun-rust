@@ -12,7 +12,6 @@ pub(super) const OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER: Duration =
     Duration::from_secs(24 * 60 * 60);
 pub(super) const PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(super) const OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES: u64 = 128;
-pub(super) const OUTPUT_POI_RECOVERY_TXID_GRAPH_PAGE_SIZE: usize = 10_000;
 pub(super) const OUTPUT_POI_RECOVERY_VERIFY_PROOF: bool = true;
 pub(super) const OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER: Duration = Duration::from_secs(5);
 pub(super) const EVM_CHAIN_TYPE: u8 = 0;

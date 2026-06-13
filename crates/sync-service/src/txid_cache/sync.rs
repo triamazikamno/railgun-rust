@@ -56,6 +56,16 @@ pub(crate) async fn sync_txid_public_cache(
         .validated_cached_txid_index
         .map_or(0, |index| index.saturating_add(1));
     let refresh_needed = refresh_start <= latest_validated_txid_index;
+    debug!(
+        chain_id = key.chain_id,
+        txid_version = key.txid_version,
+        latest_validated_txid_index,
+        validated_cached_txid_index = ?manifest.validated_cached_txid_index,
+        next_txid_index = manifest.next_txid_index,
+        refresh_start,
+        refresh_needed,
+        "TXID public cache sync started"
+    );
     if refresh_needed {
         let refresh = refresh_txid_public_cache_range(
             &mut manifest,
@@ -73,6 +83,7 @@ pub(crate) async fn sync_txid_public_cache(
     }
     while !refresh_needed && manifest.next_txid_index <= latest_validated_txid_index {
         let start_index = manifest.next_txid_index;
+        let page_started = std::time::Instant::now();
         let rows = client
             .fetch_public_txid_page(start_index, TXID_CACHE_PAGE_SIZE)
             .await?;
@@ -89,7 +100,11 @@ pub(crate) async fn sync_txid_public_cache(
             chain_id = key.chain_id,
             start_index,
             row_count,
+            latest_validated_txid_index,
+            validated_cached_txid_index = ?manifest.validated_cached_txid_index,
             next_txid_index = manifest.next_txid_index,
+            fetched_rows,
+            page_elapsed_ms = page_started.elapsed().as_millis(),
             "TXID public cache page synced"
         );
         if row_count < TXID_CACHE_PAGE_SIZE.get() as u64 {
@@ -102,8 +117,11 @@ pub(crate) async fn sync_txid_public_cache(
         chain_id = key.chain_id,
         txid_version = key.txid_version,
         latest_validated_txid_index,
+        validated_cached_txid_index = ?manifest.validated_cached_txid_index,
         next_txid_index = manifest.next_txid_index,
         fetched_rows,
+        refresh_start,
+        refresh_needed,
         elapsed_ms = started.elapsed().as_millis(),
         "TXID public cache sync complete"
     );
@@ -127,6 +145,7 @@ pub(crate) async fn sync_txid_public_cache_to_graph_tip(
     let mut fetched_rows = 0_u64;
     loop {
         let start_index = manifest.next_txid_index;
+        let page_started = std::time::Instant::now();
         let rows = client
             .fetch_public_txid_page(start_index, TXID_CACHE_PAGE_SIZE)
             .await?;
@@ -143,6 +162,8 @@ pub(crate) async fn sync_txid_public_cache_to_graph_tip(
             start_index,
             row_count,
             next_txid_index = manifest.next_txid_index,
+            fetched_rows,
+            page_elapsed_ms = page_started.elapsed().as_millis(),
             "TXID public cache background page synced"
         );
         if row_count < TXID_CACHE_PAGE_SIZE.get() as u64 {
@@ -162,26 +183,7 @@ pub(crate) async fn sync_txid_public_cache_to_graph_tip(
     Ok(fetched_rows)
 }
 
-pub(crate) async fn sync_txid_public_cache_until_recovered_output(
-    db: &DbStore,
-    endpoint: &Url,
-    http_client: Option<&reqwest::Client>,
-    key: TxidPublicCacheKey<'_>,
-    tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-) -> Result<TxidPublicCachedTransaction, TxidPublicCacheError> {
-    sync_txid_public_cache_until_recovered_output_with_page_size(
-        db,
-        endpoint,
-        http_client,
-        key,
-        tx_hash,
-        output_commitment,
-        TXID_CACHE_PAGE_SIZE,
-    )
-    .await
-}
-
+#[cfg(test)]
 pub(super) async fn sync_txid_public_cache_until_recovered_output_with_page_size(
     db: &DbStore,
     endpoint: &Url,
@@ -301,7 +303,9 @@ async fn refresh_txid_public_cache_range(
     let mut fetched_rows = 0_u64;
     let mut refreshed_to = None;
     let mut next_index = start_index;
+    let started = std::time::Instant::now();
     while next_index <= end_index {
+        let page_started = std::time::Instant::now();
         let remaining = end_index.saturating_sub(next_index).saturating_add(1);
         let limit = NonZeroUsize::new(remaining.min(TXID_CACHE_PAGE_SIZE.get() as u64) as usize)
             .expect("validated TXID refresh limit is non-zero");
@@ -318,7 +322,13 @@ async fn refresh_txid_public_cache_range(
             chain_id = key.chain_id,
             start_index = next_index,
             row_count,
+            fetched_rows,
+            refreshed_to = ?refreshed_to,
+            end_index,
+            remaining_rows = end_index.saturating_sub(refreshed_to.unwrap_or(next_index)),
             next_txid_index = manifest.next_txid_index,
+            page_elapsed_ms = page_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
             "TXID public cache validated page refreshed"
         );
         next_index = next_index.saturating_add(row_count);

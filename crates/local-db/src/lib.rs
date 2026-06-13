@@ -577,11 +577,23 @@ impl OutputPoiRecoveryRecord {
 
     #[must_use]
     pub fn retry_allowed(&self, now: u64, force_retry: bool) -> bool {
-        !self.status.is_permanent_skip()
-            && (force_retry
-                || self
-                    .next_retry_at
-                    .is_none_or(|next_retry_at| next_retry_at <= now))
+        if self.status == OutputPoiRecoveryStatus::Valid {
+            return false;
+        }
+        if self.status.is_permanent_skip()
+            && !(force_retry
+                && matches!(
+                    self.status,
+                    OutputPoiRecoveryStatus::UnsupportedShape
+                        | OutputPoiRecoveryStatus::MissingWalletOutputs
+                ))
+        {
+            return false;
+        }
+        force_retry
+            || self
+                .next_retry_at
+                .is_none_or(|next_retry_at| next_retry_at <= now)
     }
 
     #[must_use]

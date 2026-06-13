@@ -31,27 +31,31 @@ use index::*;
 use lookup::*;
 use manifest::*;
 use paths::*;
-use proof::*;
 use types::*;
 
 #[cfg(test)]
-use proof::{row_for_txid_index, txid_root_index_for_target};
+use proof::{
+    find_public_recovery_transaction_in_manifest, find_target_row_in_page, row_for_txid_index,
+    txid_root_index_for_target,
+};
 #[cfg(test)]
 use sync::{
     put_txid_public_latest_validated, sync_txid_public_cache_until_recovered_output_with_page_size,
 };
 
+#[cfg(test)]
+pub(crate) use proof::txid_public_transaction_for_recovered_output;
 pub(crate) use proof::{
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
-    txid_public_transaction_for_recovered_output,
 };
 pub(crate) use sync::{
     sync_txid_public_cache, sync_txid_public_cache_to_graph_tip,
-    sync_txid_public_cache_until_recovered_output, txid_public_cached_latest_validated,
+    txid_public_cached_latest_validated,
 };
+#[cfg(test)]
+pub(crate) use types::TxidPublicCachedTransaction;
 pub(crate) use types::{
-    TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheTransaction,
-    TxidPublicCachedTransaction, TxidPublicLatestValidated, TxidPublicProof,
+    TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated, TxidPublicProof,
 };
 
 #[cfg(test)]

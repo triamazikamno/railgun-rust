@@ -59,10 +59,10 @@ pub(crate) struct TxidPublicLatestValidated {
     pub merkleroot: Option<FixedBytes<32>>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct TxidPublicCachedTransaction {
     pub txid_index: u64,
-    pub txid_leaf_hash: FixedBytes<32>,
     pub transaction: TxidPublicCacheTransaction,
 }
 
@@ -123,11 +123,11 @@ pub(super) struct TxidPublicCacheRow {
     pub(super) transaction: TxidPublicCacheTransaction,
 }
 
+#[cfg(test)]
 impl From<TxidPublicCacheRow> for TxidPublicCachedTransaction {
     fn from(row: TxidPublicCacheRow) -> Self {
         Self {
             txid_index: row.txid_index,
-            txid_leaf_hash: row.txid_leaf_hash,
             transaction: row.transaction,
         }
     }
@@ -174,6 +174,7 @@ impl TxidPublicCacheTransaction {
             + u128::from(self.utxo_batch_start_position_out)
     }
 
+    #[cfg(test)]
     pub(crate) fn output_index(&self, output_commitment: FixedBytes<32>) -> Option<usize> {
         let output_commitment = U256::from_be_bytes(output_commitment.0);
         self.commitments

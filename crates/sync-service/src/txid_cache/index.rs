@@ -86,6 +86,7 @@ pub(super) fn clear_index_shards(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn index_entries_for_hash(
     db: &DbStore,
     key: TxidPublicCacheKey<'_>,
