@@ -2,6 +2,7 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -9,7 +10,7 @@ use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::sol_types::SolCall;
 use ruint::uint;
 
-use crate::contracts::railgun::{ActionData, Transaction, relayCall, transactCall};
+use crate::contracts::railgun::{ActionData, Transaction, executeCall, relayCall, transactCall};
 use crate::crypto::aes_gcm::{
     AesGcmError, decrypt_in_place_16b_iv, encrypt_in_place_16b_iv, split_iv_tag,
 };
@@ -92,7 +93,16 @@ pub struct BroadcasterRawParamsTransact {
     #[serde(rename = "chainID")]
     pub chain_id: u64,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transact_type: Option<BroadcasterTransactRequestType>,
+
     pub min_gas_price: Option<U256>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<U256>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<U256>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<BroadcasterAuthorization>,
 
     #[serde(rename = "feesID")]
     pub fees_id: Option<String>,
@@ -111,6 +121,30 @@ pub struct BroadcasterRawParamsTransact {
     pub pre_transaction_pois_per_txid_leaf_per_list:
         BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
     // pub dev_log: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum BroadcasterTransactRequestType {
+    #[serde(rename = "COMMON")]
+    Common,
+    #[serde(rename = "TX7702")]
+    Tx7702,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcasterAuthorization {
+    pub address: Address,
+    pub nonce: U256,
+    pub chain_id: U256,
+    pub signature: BroadcasterAuthorizationSignature,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BroadcasterAuthorizationSignature {
+    pub v: u64,
+    pub r: U256,
+    pub s: U256,
 }
 
 #[derive(Clone)]
@@ -202,10 +236,19 @@ impl SnarkJsProof {
     }
 }
 
-#[derive(Debug)]
 pub struct DecryptedTransact {
     pub shared_key: [u8; 32],
     pub params: BroadcasterRawParamsTransact,
+}
+
+impl fmt::Debug for DecryptedTransact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecryptedTransact")
+            .field("shared_key", &"<redacted>")
+            .field("params", &self.params)
+            .finish()
+    }
 }
 
 pub fn try_decrypt_transact_request(
@@ -483,6 +526,14 @@ pub fn parse_transact_calldata(
         (call._transactions, None)
     } else if let Ok(call) = relayCall::abi_decode(calldata) {
         (call._transactions, Some(call._actionData))
+    } else if let Ok(call) = executeCall::abi_decode(calldata) {
+        let action_data = ActionData {
+            random: FixedBytes::ZERO,
+            requireSuccess: call._actionData.requireSuccess,
+            minGasLimit: call._actionData.minGasLimit,
+            calls: call._actionData.calls,
+        };
+        (call._transactions, Some(action_data))
     } else {
         return Err(TransactError::UnknownFunctionCall {
             selector: hex::encode(&calldata[..4]),
@@ -564,12 +615,13 @@ pub fn parse_transact_calldata(
 #[cfg(test)]
 mod tests {
     use super::{
-        BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, PreTxPoi, SnarkJsProof, TransactError,
-        compute_railgun_txid, parse_transact_calldata, railgun_txid_leaf_hash,
+        BroadcasterRawParamsTransact, BroadcasterTransactRequestType, DEFAULT_TXID_VERSION,
+        PreTxPoi, SnarkJsProof, TransactError, compute_railgun_txid, parse_transact_calldata,
+        railgun_txid_leaf_hash,
     };
     use crate::contracts::railgun::{
-        BoundParams, CommitmentCiphertext, CommitmentPreimage, SnarkProof, TokenData, Transaction,
-        transactCall,
+        BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702ActionData,
+        SnarkProof, TokenData, Transaction, executeCall, transactCall,
     };
     use crate::crypto::aes_gcm::encrypt_in_place_16b_iv;
     use crate::crypto::railgun::{ViewingKeyData, derive_viewing_public_key};
@@ -691,7 +743,11 @@ mod tests {
         let params = BroadcasterRawParamsTransact {
             chain_type: 0,
             chain_id: 1,
+            transact_type: None,
             min_gas_price: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            authorization: None,
             fees_id: None,
             to: Address::ZERO,
             data: transactCall {
@@ -779,6 +835,77 @@ mod tests {
         assert_eq!(parsed.transactions[1].tx_nullifiers_len, 2);
         assert_eq!(parsed.transactions[1].tx_commitments_out_len, 2);
         assert_eq!(parsed.railgun_txid, parsed.transactions[0].railgun_txid);
+    }
+
+    #[test]
+    fn parse_transact_decodes_relay_adapt_7702_execute_wrapper() {
+        let viewing_key_data = sample_viewing_key_data();
+        let (_, transaction, _, fee_commitment, _) = sample_transaction_and_params(None);
+        let calldata = executeCall {
+            _transactions: vec![transaction],
+            _actionData: RelayAdapt7702ActionData {
+                requireSuccess: true,
+                minGasLimit: uint!(123_U256),
+                calls: vec![],
+            },
+            _signature: Bytes::from(vec![0x12, 0x34]),
+        }
+        .abi_encode();
+
+        assert_eq!(&calldata[..4], &[0xc6, 0x1e, 0x6b, 0x9d]);
+
+        let parsed = parse_transact_calldata(
+            &calldata,
+            &viewing_key_data.viewing_private_key,
+            viewing_key_data.master_public_key,
+            None,
+        )
+        .expect("parse 7702 execute calldata");
+
+        let action_data = parsed.action_data.expect("action data");
+        assert_eq!(parsed.fee_commitment, fee_commitment);
+        assert!(action_data.requireSuccess);
+        assert_eq!(action_data.minGasLimit, uint!(123_U256));
+        assert!(action_data.calls.is_empty());
+    }
+
+    #[test]
+    fn raw_params_deserializes_tx7702_fields() {
+        let params: BroadcasterRawParamsTransact = serde_json::from_value(serde_json::json!({
+            "chainType": 0,
+            "chainID": 1,
+            "transactType": "TX7702",
+            "maxFeePerGas": "134943801",
+            "maxPriorityFeePerGas": "10329316",
+            "feesID": null,
+            "to": "0x56daCb58fD9C6f654047908B573FcCd51652a33C",
+            "data": "0x",
+            "broadcasterViewingKey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "txidVersion": null,
+            "preTransactionPOIsPerTxidLeafPerList": {},
+            "authorization": {
+                "address": "0x2df3D82C06339387A4532C685daaF39A218Cf56E",
+                "nonce": "0",
+                "chainId": "1",
+                "signature": {
+                    "v": 27,
+                    "r": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "s": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                }
+            }
+        }))
+        .expect("deserialize tx7702 params");
+
+        assert_eq!(
+            params.transact_type,
+            Some(BroadcasterTransactRequestType::Tx7702)
+        );
+        assert_eq!(params.max_fee_per_gas, Some(uint!(134943801_U256)));
+        assert_eq!(params.max_priority_fee_per_gas, Some(uint!(10329316_U256)));
+        let authorization = params.authorization.expect("authorization");
+        assert_eq!(authorization.nonce, U256::ZERO);
+        assert_eq!(authorization.chain_id, U256::from(1));
+        assert_eq!(authorization.signature.v, 27);
     }
 
     #[test]

@@ -66,6 +66,13 @@ sol! {
         Call[] calls;
     }
 
+    #[derive(Debug)]
+    struct RelayAdapt7702ActionData {
+        bool requireSuccess;
+        uint256 minGasLimit;
+        Call[] calls;
+    }
+
     struct TokenTransfer {
         TokenData token;
         address to;
@@ -103,6 +110,7 @@ sol! {
 
     function transact(Transaction[] _transactions) payable;
     function relay(Transaction[] _transactions, ActionData _actionData) payable;
+    function execute(Transaction[] _transactions, RelayAdapt7702ActionData _actionData, bytes _signature) payable;
     function shield(ShieldRequest[] _shieldRequests);
 
     function unwrapBase(uint256 _amount);
