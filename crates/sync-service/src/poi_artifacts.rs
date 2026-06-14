@@ -6,15 +6,17 @@ use broadcaster_core::tree::normalize_tree_position;
 use local_db::{DbStore, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord};
 use poi::artifacts::{
     ArtifactDescriptor, BlockedShieldsArtifact, BlockedShieldsArtifactError, Manifest,
-    ManifestEntry, ManifestError, Snapshot, SnapshotError, SnapshotKind, SnapshotReader,
-    verify_blocked_shield, verify_poi_event,
+    ManifestEntry, ManifestError, Snapshot, SnapshotError, SnapshotEvent, SnapshotKind,
+    SnapshotReader, verify_blocked_shield, verify_poi_event,
 };
 use poi::cache::{PoiCache, PoiCacheError, PoiCacheIdentity};
-use poi::poi::{BlockedShield, SignedPoiEvent};
+use poi::error::PoiRpcError;
+use poi::poi::{BlockedShield, PoiRpcClient, SignedPoiEvent};
 use thiserror::Error;
 use tracing::debug;
 use url::Url;
 
+use crate::trustless_artifacts::{self, TrustlessArtifactError, TrustlessArtifactFetcher};
 use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
 
 pub(crate) struct PoiArtifactIngestor {
@@ -32,43 +34,31 @@ impl PoiArtifactIngestor {
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
     ) -> Result<Manifest, PoiArtifactError> {
-        let started = Instant::now();
-        let urls = self.manifest_urls()?;
-        let url_count = urls.len();
-        let mut last_error = None;
-        for (url_index, manifest_url) in urls.iter().enumerate() {
-            match self
-                .fetch_manifest_from_url(manifest_url, last_accepted_sequence, now)
-                .await
-            {
-                Ok((manifest, bytes)) => {
-                    debug!(
-                        url = %manifest_url,
-                        url_index,
-                        url_count,
-                        bytes,
-                        manifest_sequence = manifest.sequence,
-                        entries = manifest.entries.len(),
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "fetched POI artifact manifest"
-                    );
-                    return Ok(manifest);
-                }
-                Err(err) => {
-                    debug!(
-                        ?err,
-                        url = %manifest_url,
-                        url_index,
-                        url_count,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "POI artifact manifest candidate failed"
-                    );
-                    last_error = Some(err);
-                }
+        match &self.config.manifest_source {
+            PoiArtifactManifestSource::Url(url) => {
+                let started = Instant::now();
+                let (manifest, bytes) = self
+                    .fetch_manifest_from_url(url, last_accepted_sequence, now)
+                    .await?;
+                debug!(
+                    url = %url,
+                    bytes,
+                    manifest_sequence = manifest.sequence,
+                    entries = manifest.entries.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "fetched POI artifact manifest from explicit URL"
+                );
+                Ok(manifest)
+            }
+            PoiArtifactManifestSource::Cid(cid) => {
+                self.fetch_manifest_from_cid(cid, last_accepted_sequence, now)
+                    .await
+            }
+            PoiArtifactManifestSource::IpnsName(name) => {
+                self.fetch_manifest_from_ipns_name(name, last_accepted_sequence, now)
+                    .await
             }
         }
-
-        Err(last_error.unwrap_or(PoiArtifactError::NoGateways))
     }
 
     async fn fetch_manifest_from_url(
@@ -78,6 +68,101 @@ impl PoiArtifactIngestor {
         now: SystemTime,
     ) -> Result<(Manifest, usize), PoiArtifactError> {
         let bytes = self.fetch_url(manifest_url).await?;
+        self.verify_manifest_bytes(&bytes, last_accepted_sequence, now)
+    }
+
+    async fn fetch_manifest_from_cid(
+        &self,
+        cid: &str,
+        last_accepted_sequence: Option<u64>,
+        now: SystemTime,
+    ) -> Result<Manifest, PoiArtifactError> {
+        let started = Instant::now();
+        let bytes = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
+            .fetch_manifest_cid(cid)
+            .await?;
+        let (manifest, bytes_len) =
+            self.verify_manifest_bytes(&bytes, last_accepted_sequence, now)?;
+        debug!(
+            cid,
+            bytes = bytes_len,
+            manifest_sequence = manifest.sequence,
+            entries = manifest.entries.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "fetched trustless POI artifact manifest CID"
+        );
+        Ok(manifest)
+    }
+
+    async fn fetch_manifest_from_ipns_name(
+        &self,
+        name: &str,
+        last_accepted_sequence: Option<u64>,
+        now: SystemTime,
+    ) -> Result<Manifest, PoiArtifactError> {
+        let started = Instant::now();
+        let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
+        let candidates = fetcher.resolve_ipns_manifest_candidates(name, now).await?;
+        let candidate_count = candidates.len();
+        let mut last_error = None;
+        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+            match fetcher.fetch_manifest_cid(&candidate.cid.to_string()).await {
+                Ok(bytes) => {
+                    match self.verify_manifest_bytes(&bytes, last_accepted_sequence, now) {
+                        Ok((manifest, bytes_len)) => {
+                            debug!(
+                                ipns_name = name,
+                                cid = %candidate.cid,
+                                ipns_sequence = candidate.sequence,
+                                candidate_index,
+                                candidate_count,
+                                bytes = bytes_len,
+                                manifest_sequence = manifest.sequence,
+                                entries = manifest.entries.len(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "fetched trustless POI artifact manifest through verified IPNS"
+                            );
+                            return Ok(manifest);
+                        }
+                        Err(err) => {
+                            debug!(
+                                ?err,
+                                ipns_name = name,
+                                cid = %candidate.cid,
+                                ipns_sequence = candidate.sequence,
+                                candidate_index,
+                                candidate_count,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "verified IPNS manifest candidate failed manifest acceptance"
+                            );
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    debug!(
+                        ?err,
+                        ipns_name = name,
+                        cid = %candidate.cid,
+                        ipns_sequence = candidate.sequence,
+                        candidate_index,
+                        candidate_count,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "verified IPNS manifest CID fetch failed"
+                    );
+                    last_error = Some(PoiArtifactError::Trustless(err));
+                }
+            }
+        }
+        Err(last_error.unwrap_or(PoiArtifactError::NoGateways))
+    }
+
+    fn verify_manifest_bytes(
+        &self,
+        bytes: &[u8],
+        last_accepted_sequence: Option<u64>,
+        now: SystemTime,
+    ) -> Result<(Manifest, usize), PoiArtifactError> {
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(PoiArtifactError::Json)?;
         manifest.verify_trusted_signature(&fixed_bytes(&self.config.trusted_publisher_pubkey))?;
         validate_manifest_sequence(&manifest, last_accepted_sequence)?;
@@ -95,8 +180,9 @@ impl PoiArtifactIngestor {
         descriptor: &ArtifactDescriptor,
     ) -> Result<Vec<u8>, PoiArtifactError> {
         let started = Instant::now();
-        let urls = self.artifact_urls(&descriptor.cid)?;
-        let bytes = self.fetch_first_available(&urls).await?;
+        let bytes = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
+            .fetch_artifact_cid(&descriptor.cid, descriptor.byte_size)
+            .await?;
         descriptor.verify_bytes(&bytes)?;
         debug!(
             cid = %descriptor.cid,
@@ -154,7 +240,7 @@ impl PoiArtifactIngestor {
         for record in &blocked_records {
             verify_blocked_shield(record, &fixed_bytes(&identity.list_key))?;
         }
-        cache.apply_blocked_shields(&blocked_records)?;
+        cache.replace_blocked_shields(&blocked_records)?;
         let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
 
         let root_started = Instant::now();
@@ -191,32 +277,35 @@ impl PoiArtifactIngestor {
         })
     }
 
-    pub(crate) async fn refresh_persisted_cache(
+    pub(crate) async fn refresh_persisted_cache_with_proxy(
         &self,
         db: &DbStore,
         identity: PoiCacheIdentity,
         now: SystemTime,
+        proxy_client: Option<&PoiRpcClient>,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let load_started = Instant::now();
         let persisted = load_persisted_cache(db, &identity)?;
         let load_persisted_elapsed_ms = load_started.elapsed().as_millis();
-        self.refresh_persisted_cache_with_preloaded(
+        self.refresh_persisted_cache_with_preloaded_and_proxy(
             db,
             identity,
             persisted,
             load_persisted_elapsed_ms,
             now,
+            proxy_client,
         )
         .await
     }
 
-    pub(crate) async fn refresh_persisted_cache_with_preloaded(
+    pub(crate) async fn refresh_persisted_cache_with_preloaded_and_proxy(
         &self,
         db: &DbStore,
         identity: PoiCacheIdentity,
         persisted: Option<PersistedPoiArtifactCache>,
         load_persisted_elapsed_ms: u128,
         now: SystemTime,
+        proxy_client: Option<&PoiRpcClient>,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let started = Instant::now();
         let last_sequence = persisted
@@ -224,7 +313,13 @@ impl PoiArtifactIngestor {
             .map(|persisted| persisted.record.last_accepted_manifest_sequence);
         let refresh_started = Instant::now();
         let refresh = self
-            .refresh_verified_cache(identity.clone(), persisted, last_sequence, now)
+            .refresh_verified_cache(
+                identity.clone(),
+                persisted,
+                last_sequence,
+                now,
+                proxy_client,
+            )
             .await?;
         let refresh_elapsed_ms = refresh_started.elapsed().as_millis();
         let persist_started = Instant::now();
@@ -249,16 +344,47 @@ impl PoiArtifactIngestor {
         persisted: Option<PersistedPoiArtifactCache>,
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
+        proxy_client: Option<&PoiRpcClient>,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let manifest = self.fetch_manifest(last_accepted_sequence, now).await?;
         let entry = manifest_entry_for_identity(&manifest, &identity)?.clone();
 
-        if let Some(persisted) = persisted
-            && let Some(refresh) = self
-                .try_incremental_refresh(&identity, manifest.sequence, &entry, persisted)
+        if let Some(persisted) = persisted {
+            if let Some(refresh) =
+                try_reuse_matching_tip(&identity, manifest.sequence, &entry, &persisted)?
+            {
+                return Ok(refresh);
+            }
+
+            if let Some(refresh) = self
+                .try_incremental_refresh(&identity, manifest.sequence, &entry, &persisted)
                 .await?
-        {
-            return Ok(refresh);
+            {
+                return Ok(refresh);
+            }
+
+            if let Some(proxy_client) = proxy_client {
+                match self
+                    .try_artifact_suffix_merge(
+                        &identity,
+                        manifest.sequence,
+                        &entry,
+                        &persisted,
+                        proxy_client,
+                    )
+                    .await
+                {
+                    Ok(Some(refresh)) => return Ok(refresh),
+                    Ok(None) => {}
+                    Err(err) => debug!(
+                        ?err,
+                        chain_id = identity.chain_id,
+                        list_key = %hex::encode(identity.list_key),
+                        manifest_sequence = manifest.sequence,
+                        "artifact suffix POI cache merge skipped"
+                    ),
+                }
+            }
         }
 
         self.fetch_verified_cache_from_entry(identity, manifest.sequence, entry)
@@ -270,7 +396,7 @@ impl PoiArtifactIngestor {
         identity: &PoiCacheIdentity,
         manifest_sequence: u64,
         entry: &ManifestEntry,
-        persisted: PersistedPoiArtifactCache,
+        persisted: &PersistedPoiArtifactCache,
     ) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
         let started = Instant::now();
         if !descriptor_matches_record(&entry.base, &persisted.record.base_descriptor) {
@@ -286,7 +412,7 @@ impl PoiArtifactIngestor {
             return Ok(None);
         }
 
-        let mut cache = persisted.cache;
+        let mut cache = persisted.cache.clone();
         let mut next_start = persisted
             .record
             .current_tip_index
@@ -330,7 +456,7 @@ impl PoiArtifactIngestor {
             for record in &blocked_records {
                 verify_blocked_shield(record, &fixed_bytes(&identity.list_key))?;
             }
-            cache.apply_blocked_shields(&blocked_records)?;
+            cache.replace_blocked_shields(&blocked_records)?;
         }
         let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
 
@@ -360,58 +486,195 @@ impl PoiArtifactIngestor {
         }))
     }
 
-    fn manifest_urls(&self) -> Result<Vec<Url>, PoiArtifactError> {
-        match &self.config.manifest_source {
-            PoiArtifactManifestSource::Url(url) => Ok(vec![url.clone()]),
-            PoiArtifactManifestSource::Cid(cid) => self.gateway_urls("ipfs", cid),
-            PoiArtifactManifestSource::IpnsName(name) => self.gateway_urls("ipns", name),
-        }
-    }
-
-    fn artifact_urls(&self, cid: &str) -> Result<Vec<Url>, PoiArtifactError> {
-        self.gateway_urls("ipfs", cid)
-    }
-
-    fn gateway_urls(
+    async fn try_artifact_suffix_merge(
         &self,
-        namespace: &'static str,
-        value: &str,
-    ) -> Result<Vec<Url>, PoiArtifactError> {
-        if self.config.gateway_urls.is_empty() {
-            return Err(PoiArtifactError::NoGateways);
+        identity: &PoiCacheIdentity,
+        manifest_sequence: u64,
+        entry: &ManifestEntry,
+        persisted: &PersistedPoiArtifactCache,
+        proxy_client: &PoiRpcClient,
+    ) -> Result<Option<PoiArtifactRefresh>, ArtifactSuffixMergeError> {
+        let started = Instant::now();
+        let local_tip_index = persisted.record.current_tip_index;
+        let artifact_tip_index = entry.current_tip_index;
+        if local_tip_index >= artifact_tip_index {
+            return Ok(None);
         }
-        self.config
-            .gateway_urls
-            .iter()
-            .map(|gateway| gateway_url(gateway, namespace, value))
-            .collect()
+
+        let start_index = local_tip_index
+            .checked_add(1)
+            .ok_or(ArtifactSuffixMergeError::RangeOverflow)?;
+        let (start_tree, _) = normalize_tree_position(0, start_index);
+        let (artifact_tip_tree, _) = normalize_tree_position(0, artifact_tip_index);
+        if start_tree != artifact_tip_tree {
+            debug!(
+                chain_id = identity.chain_id,
+                list_key = %hex::encode(identity.list_key),
+                manifest_sequence,
+                start_index,
+                artifact_tip_index,
+                start_tree,
+                artifact_tip_tree,
+                "artifact suffix POI cache merge skipped across tree boundary"
+            );
+            return Ok(None);
+        }
+
+        let proxy_root_started = Instant::now();
+        let local_proxy_root =
+            proxy_validated_root_at(proxy_client, identity, local_tip_index).await?;
+        if local_proxy_root != persisted.record.current_tip_root {
+            return Ok(None);
+        }
+
+        let artifact_tip_root = FixedBytes::from(decode_fixed_hex::<32>(
+            "entry.current_tip_merkleroot",
+            &entry.current_tip_merkleroot,
+        )?);
+        let artifact_proxy_root =
+            proxy_validated_root_at(proxy_client, identity, artifact_tip_index).await?;
+        if artifact_proxy_root != artifact_tip_root {
+            return Ok(None);
+        }
+        let proxy_root_elapsed_ms = proxy_root_started.elapsed().as_millis();
+
+        let mut cache = persisted.cache.clone();
+        let artifact_started = Instant::now();
+        let outcome = self
+            .apply_artifact_suffix(identity, &mut cache, entry, local_tip_index)
+            .await?;
+        let artifact_elapsed_ms = artifact_started.elapsed().as_millis();
+
+        let root_started = Instant::now();
+        verify_manifest_root(&mut cache, entry)?;
+        cache.accept_current_roots();
+        let root_validation_elapsed_ms = root_started.elapsed().as_millis();
+
+        let blocked_started = Instant::now();
+        let mut blocked_records_count = 0_usize;
+        let blocked_refreshed = !descriptor_matches_record(
+            &entry.blocked_shields,
+            &persisted.record.blocked_shields_descriptor,
+        );
+        if blocked_refreshed {
+            blocked_records_count = self
+                .refresh_blocked_shields(identity, &entry.blocked_shields, &mut cache)
+                .await?;
+        }
+        let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
+
+        debug!(
+            chain_id = identity.chain_id,
+            list_key = %hex::encode(identity.list_key),
+            manifest_sequence,
+            local_tip_index,
+            artifact_tip_index,
+            base_events = outcome.base_events,
+            base_applied_events = outcome.base_applied_events,
+            delta_count = outcome.delta_count,
+            delta_events = outcome.delta_events,
+            delta_applied_events = outcome.delta_applied_events,
+            skipped_events = outcome.skipped_events,
+            blocked_refreshed,
+            blocked_records = blocked_records_count,
+            proxy_root_elapsed_ms,
+            artifact_elapsed_ms,
+            root_validation_elapsed_ms,
+            blocked_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "artifact suffix POI cache merge complete"
+        );
+
+        Ok(Some(PoiArtifactRefresh {
+            manifest_sequence,
+            cache,
+            entry: entry.clone(),
+        }))
     }
 
-    async fn fetch_first_available(&self, urls: &[Url]) -> Result<Vec<u8>, PoiArtifactError> {
-        if urls.is_empty() {
-            return Err(PoiArtifactError::NoGateways);
+    async fn apply_artifact_suffix(
+        &self,
+        identity: &PoiCacheIdentity,
+        cache: &mut PoiCache,
+        entry: &ManifestEntry,
+        local_tip_index: u64,
+    ) -> Result<ArtifactSuffixMergeOutcome, PoiArtifactError> {
+        let mut outcome = ArtifactSuffixMergeOutcome::default();
+        let list_key = fixed_bytes(&identity.list_key);
+        let mut expected_artifact_start = 0;
+        let mut expected_apply_index = local_tip_index
+            .checked_add(1)
+            .ok_or(PoiArtifactError::RangeOverflow)?;
+
+        let base_bytes = self.fetch_artifact(&entry.base).await?;
+        let base = SnapshotReader::read(&base_bytes)?;
+        expected_artifact_start = validate_snapshot(
+            &base,
+            identity,
+            entry,
+            SnapshotKind::Base,
+            expected_artifact_start,
+        )?;
+        outcome.base_events = base.events.len();
+        let applied =
+            apply_snapshot_suffix_events(cache, &base, &list_key, &mut expected_apply_index)?;
+        outcome.base_applied_events = applied;
+        outcome.skipped_events = outcome
+            .skipped_events
+            .saturating_add(base.events.len().saturating_sub(applied));
+
+        for delta_descriptor in &entry.deltas {
+            let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
+            let delta = SnapshotReader::read(&delta_bytes)?;
+            expected_artifact_start = validate_snapshot(
+                &delta,
+                identity,
+                entry,
+                SnapshotKind::Delta,
+                expected_artifact_start,
+            )?;
+            outcome.delta_count += 1;
+            outcome.delta_events = outcome.delta_events.saturating_add(delta.events.len());
+            let applied =
+                apply_snapshot_suffix_events(cache, &delta, &list_key, &mut expected_apply_index)?;
+            outcome.delta_applied_events = outcome.delta_applied_events.saturating_add(applied);
+            outcome.skipped_events = outcome
+                .skipped_events
+                .saturating_add(delta.events.len().saturating_sub(applied));
         }
-        let mut last_error = None;
-        for url in urls {
-            match self.fetch_url(url).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => last_error = Some(err),
-            }
+
+        let final_index = expected_apply_index
+            .checked_sub(1)
+            .ok_or(PoiArtifactError::RangeOverflow)?;
+        if final_index != entry.current_tip_index {
+            return Err(PoiArtifactError::ReplayTipMismatch {
+                expected: entry.current_tip_index,
+                actual: final_index,
+            });
         }
-        Err(last_error.unwrap_or(PoiArtifactError::NoGateways))
+
+        Ok(outcome)
+    }
+
+    async fn refresh_blocked_shields(
+        &self,
+        identity: &PoiCacheIdentity,
+        descriptor: &ArtifactDescriptor,
+        cache: &mut PoiCache,
+    ) -> Result<usize, PoiArtifactError> {
+        let blocked_bytes = self.fetch_artifact(descriptor).await?;
+        let blocked = BlockedShieldsArtifact::read(&blocked_bytes)?;
+        let blocked_records = validate_blocked_shields_artifact(&blocked, identity)?;
+        for record in &blocked_records {
+            verify_blocked_shield(record, &fixed_bytes(&identity.list_key))?;
+        }
+        cache.replace_blocked_shields(&blocked_records)?;
+        Ok(blocked_records.len())
     }
 
     async fn fetch_url(&self, url: &Url) -> Result<Vec<u8>, PoiArtifactError> {
         let started = Instant::now();
-        let response = self.client.get(url.clone()).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(PoiArtifactError::HttpStatus {
-                url: url.clone(),
-                status,
-            });
-        }
-        let bytes = response.bytes().await?.to_vec();
+        let bytes = trustless_artifacts::fetch_manifest_url(&self.client, url).await?;
         debug!(
             url = %url,
             bytes = bytes.len(),
@@ -439,17 +702,20 @@ pub(crate) struct PersistedPoiArtifactCache {
     pub(crate) cache: PoiCache,
 }
 
+#[derive(Debug, Default)]
+struct ArtifactSuffixMergeOutcome {
+    base_events: usize,
+    base_applied_events: usize,
+    delta_count: usize,
+    delta_events: usize,
+    delta_applied_events: usize,
+    skipped_events: usize,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum PoiArtifactError {
     #[error("POI artifact source has no gateway URLs configured")]
     NoGateways,
-    #[error("POI artifact HTTP request failed")]
-    Http(#[from] reqwest::Error),
-    #[error("POI artifact HTTP request to {url} returned {status}")]
-    HttpStatus {
-        url: Url,
-        status: reqwest::StatusCode,
-    },
     #[error("POI artifact manifest JSON decode failed")]
     Json(#[source] serde_json::Error),
     #[error("POI artifact manifest verification failed")]
@@ -460,6 +726,8 @@ pub(crate) enum PoiArtifactError {
     BlockedShieldsArtifact(#[from] BlockedShieldsArtifactError),
     #[error("POI artifact upstream signature verification failed")]
     Verify(#[from] poi::artifacts::VerifyError),
+    #[error("POI artifact trustless retrieval failed")]
+    Trustless(#[from] TrustlessArtifactError),
     #[error("POI artifact cache replay failed")]
     Cache(#[from] PoiCacheError),
     #[error("POI artifact cache persistence failed")]
@@ -497,10 +765,34 @@ pub(crate) enum PoiArtifactError {
     RangeOverflow,
     #[error("artifact replay tip mismatch: expected {expected}, got {actual}")]
     ReplayTipMismatch { expected: u64, actual: u64 },
+    #[error("artifact suffix event index mismatch: expected {expected}, got {actual}")]
+    ArtifactSuffixEventIndexMismatch { expected: u64, actual: u64 },
     #[error("replayed POI root missing for tree {tree_number}")]
     MissingReplayRoot { tree_number: u32 },
     #[error("replayed POI root mismatch: expected {expected}, got {actual}")]
     ReplayRootMismatch { expected: String, actual: String },
+}
+
+#[derive(Debug, Error)]
+enum ArtifactSuffixMergeError {
+    #[error("POI proxy request failed")]
+    Rpc(#[from] PoiRpcError),
+    #[error("POI artifact validation failed")]
+    Artifact(#[from] PoiArtifactError),
+    #[error("POI proxy root lookup missing event at index {index}")]
+    MissingProxyEvent { index: u64 },
+    #[error("POI proxy root lookup event index mismatch: expected {expected}, got {actual}")]
+    EventIndexMismatch { expected: u64, actual: u64 },
+    #[error("POI artifact suffix merge range overflow")]
+    RangeOverflow,
+    #[error("invalid hex in {field}: {value}")]
+    InvalidHex { field: &'static str, value: String },
+    #[error("{field} has {actual} bytes, expected {expected}")]
+    InvalidByteLen {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 pub(crate) fn load_persisted_cache(
@@ -650,14 +942,51 @@ fn verify_snapshot_events(
     list_key: &[u8; 32],
 ) -> Result<(), PoiArtifactError> {
     for event in &snapshot.events {
-        let signed = SignedPoiEvent {
-            index: event.event_index,
-            blinded_commitment: prefixed_hex(&event.blinded_commitment),
-            signature: hex::encode(event.signature),
-            event_type: event.event_type,
-        };
-        verify_poi_event(&signed, list_key)?;
+        verify_snapshot_event(event, list_key)?;
     }
+    Ok(())
+}
+
+fn apply_snapshot_suffix_events(
+    cache: &mut PoiCache,
+    snapshot: &Snapshot,
+    list_key: &[u8; 32],
+    expected_index: &mut u64,
+) -> Result<usize, PoiArtifactError> {
+    let mut suffix_events = Vec::new();
+    for event in &snapshot.events {
+        if event.event_index < *expected_index {
+            continue;
+        }
+        if event.event_index != *expected_index {
+            return Err(PoiArtifactError::ArtifactSuffixEventIndexMismatch {
+                expected: *expected_index,
+                actual: event.event_index,
+            });
+        }
+        verify_snapshot_event(event, list_key)?;
+        suffix_events.push(event.clone());
+        *expected_index = expected_index
+            .checked_add(1)
+            .ok_or(PoiArtifactError::RangeOverflow)?;
+    }
+    if !suffix_events.is_empty() {
+        cache.apply_verified_artifact_events(&suffix_events)?;
+    }
+    Ok(suffix_events.len())
+}
+
+fn verify_snapshot_event(
+    event: &SnapshotEvent,
+    list_key: &[u8; 32],
+) -> Result<(), PoiArtifactError> {
+    let signed = SignedPoiEvent {
+        index: event.event_index,
+        blinded_commitment: prefixed_hex(&event.blinded_commitment),
+        signature: hex::encode(event.signature),
+        event_type: event.event_type,
+    };
+    verify_poi_event(&signed, list_key)?;
     Ok(())
 }
 
@@ -717,23 +1046,85 @@ fn verify_manifest_root(
     Ok(())
 }
 
-fn gateway_url(
-    gateway: &Url,
-    namespace: &'static str,
-    value: &str,
-) -> Result<Url, PoiArtifactError> {
-    let mut url = gateway.clone();
-    let path = gateway.path().trim_end_matches('/');
-    let namespace_suffix = format!("/{namespace}");
-    let new_path = if path.ends_with(&namespace_suffix) {
-        format!("{path}/{value}")
-    } else if path.is_empty() {
-        format!("/{namespace}/{value}")
-    } else {
-        format!("{path}/{namespace}/{value}")
+fn try_reuse_matching_tip(
+    identity: &PoiCacheIdentity,
+    manifest_sequence: u64,
+    entry: &ManifestEntry,
+    persisted: &PersistedPoiArtifactCache,
+) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
+    let entry_tip_root = FixedBytes::from(decode_fixed_hex::<32>(
+        "entry.current_tip_merkleroot",
+        &entry.current_tip_merkleroot,
+    )?);
+    if persisted.record.current_tip_index == entry.current_tip_index
+        && persisted.record.current_tip_root == entry_tip_root
+        && descriptor_matches_record(
+            &entry.blocked_shields,
+            &persisted.record.blocked_shields_descriptor,
+        )
+    {
+        debug!(
+            chain_id = identity.chain_id,
+            list_key = %hex::encode(identity.list_key),
+            manifest_sequence,
+            tip_index = entry.current_tip_index,
+            "reusing persisted POI artifact cache with matching manifest tip root"
+        );
+        return Ok(Some(PoiArtifactRefresh {
+            manifest_sequence,
+            cache: persisted.cache.clone(),
+            entry: entry.clone(),
+        }));
+    }
+    Ok(None)
+}
+
+async fn proxy_validated_root_at(
+    client: &PoiRpcClient,
+    identity: &PoiCacheIdentity,
+    index: u64,
+) -> Result<FixedBytes<32>, ArtifactSuffixMergeError> {
+    let events = client
+        .poi_events(
+            &identity.txid_version,
+            identity.chain_type,
+            identity.chain_id,
+            &identity.list_key,
+            index,
+            index,
+        )
+        .await?;
+    let Some(event) = events.first() else {
+        return Err(ArtifactSuffixMergeError::MissingProxyEvent { index });
     };
-    url.set_path(&new_path);
-    Ok(url)
+    if event.signed_poi_event.index != index {
+        return Err(ArtifactSuffixMergeError::EventIndexMismatch {
+            expected: index,
+            actual: event.signed_poi_event.index,
+        });
+    }
+    decode_proxy_fixed_hex::<32>("validatedMerkleroot", &event.validated_merkleroot)
+        .map(FixedBytes::from)
+}
+
+fn decode_proxy_fixed_hex<const N: usize>(
+    field: &'static str,
+    value: &str,
+) -> Result<[u8; N], ArtifactSuffixMergeError> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value)).map_err(|_| {
+        ArtifactSuffixMergeError::InvalidHex {
+            field,
+            value: value.to_string(),
+        }
+    })?;
+    let actual = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| ArtifactSuffixMergeError::InvalidByteLen {
+            field,
+            expected: N,
+            actual,
+        })
 }
 
 fn require_scope_bytes(
@@ -833,8 +1224,15 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
 
-    use ed25519_dalek::SigningKey;
-    use poi::artifacts::{SnapshotEvent, SnapshotHeader, snapshot::format};
+    use cid::Cid;
+    use ed25519_dalek::{Signer, SigningKey};
+    use multihash_codetable::{Code, MultihashDigest};
+    use poi::artifacts::{
+        SnapshotEvent, SnapshotEventRecord, SnapshotHeader, SnapshotHeaderInput, SnapshotWriter,
+        snapshot::format,
+    };
+    use poi::poi::{PoiEventType, PoiStatus, PoiSyncedListEvent};
+    use serde_json::json;
 
     #[test]
     fn manifest_sequence_rollback_is_rejected() {
@@ -863,72 +1261,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_fetch_tries_next_gateway_after_stale_candidate() {
+    async fn explicit_manifest_url_reports_http_failure() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let stale = signed_manifest(&signing_key, 1_000, 1);
-        let fresh = signed_manifest(&signing_key, 9_500, 2);
-        let stale_server = spawn_manifest_server(200, serde_json::to_vec(&stale).expect("JSON"));
-        let fresh_server = spawn_manifest_server(200, serde_json::to_vec(&fresh).expect("JSON"));
-        let ingestor = manifest_ingestor(
-            &signing_key,
-            PoiArtifactManifestSource::IpnsName("manifest-name".to_string()),
-            vec![stale_server.url.clone(), fresh_server.url.clone()],
-            Some(Duration::from_secs(1)),
-        );
-
-        let manifest = ingestor
-            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
-            .await
-            .expect("fresh second manifest");
-
-        assert_eq!(manifest.sequence, 2);
-        assert_eq!(stale_server.request_path(), "/ipns/manifest-name");
-        assert_eq!(fresh_server.request_path(), "/ipns/manifest-name");
-    }
-
-    #[tokio::test]
-    async fn manifest_fetch_tries_next_gateway_after_fetch_failure() {
-        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let fresh = signed_manifest(&signing_key, 9_500, 2);
         let failing_server = spawn_manifest_server(500, Vec::new());
-        let fresh_server = spawn_manifest_server(200, serde_json::to_vec(&fresh).expect("JSON"));
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Cid("manifest-cid".to_string()),
-            vec![failing_server.url.clone(), fresh_server.url.clone()],
-            Some(Duration::from_secs(1)),
-        );
-
-        let manifest = ingestor
-            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
-            .await
-            .expect("fresh second manifest");
-
-        assert_eq!(manifest.sequence, 2);
-        assert_eq!(failing_server.request_path(), "/ipfs/manifest-cid");
-        assert_eq!(fresh_server.request_path(), "/ipfs/manifest-cid");
-    }
-
-    #[tokio::test]
-    async fn manifest_fetch_reports_error_after_all_gateways_fail() {
-        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let first = spawn_manifest_server(500, Vec::new());
-        let second = spawn_manifest_server(500, Vec::new());
-        let ingestor = manifest_ingestor(
-            &signing_key,
-            PoiArtifactManifestSource::Cid("manifest-cid".to_string()),
-            vec![first.url.clone(), second.url.clone()],
+            PoiArtifactManifestSource::Url(failing_server.url.clone()),
+            Vec::new(),
             None,
         );
 
         let error = ingestor
             .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
             .await
-            .expect_err("all manifest candidates fail");
+            .expect_err("manifest URL fails");
 
-        assert!(matches!(error, PoiArtifactError::HttpStatus { .. }));
-        assert_eq!(first.request_path(), "/ipfs/manifest-cid");
-        assert_eq!(second.request_path(), "/ipfs/manifest-cid");
+        assert!(matches!(
+            error,
+            PoiArtifactError::Trustless(TrustlessArtifactError::HttpStatus { .. })
+        ));
+        assert_eq!(failing_server.request_path(), "/");
     }
 
     #[tokio::test]
@@ -950,6 +1302,421 @@ mod tests {
 
         assert_eq!(manifest.sequence, 2);
         assert_eq!(manifest_server.request_path(), "/");
+    }
+
+    #[tokio::test]
+    async fn cid_manifest_fetch_uses_trustless_car() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let fresh = signed_manifest(&signing_key, 9_500, 2);
+        let manifest_bytes = serde_json::to_vec(&fresh).expect("manifest JSON");
+        let cid = raw_cid(&manifest_bytes);
+        let manifest_server =
+            spawn_manifest_server(200, raw_car_bytes(cid, &[(cid, manifest_bytes)]));
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Cid(cid.to_string()),
+            vec![manifest_server.url.clone()],
+            Some(Duration::from_secs(1)),
+        );
+
+        let manifest = ingestor
+            .fetch_manifest(None, UNIX_EPOCH + Duration::from_secs(10))
+            .await
+            .expect("trustless manifest CID");
+
+        assert_eq!(manifest.sequence, 2);
+        assert_eq!(
+            manifest_server.request_path(),
+            format!("/ipfs/{cid}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_fetch_uses_trustless_car_before_descriptor_verification() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let artifact_bytes = b"verified artifact bytes".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let artifact_server =
+            spawn_manifest_server(200, raw_car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
+            vec![artifact_server.url.clone()],
+            None,
+        );
+        let descriptor = ArtifactDescriptor::from_bytes(cid.to_string(), &artifact_bytes);
+
+        let fetched = ingestor
+            .fetch_artifact(&descriptor)
+            .await
+            .expect("trustless artifact CID");
+
+        assert_eq!(fetched, artifact_bytes);
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{cid}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_suffix_merge_applies_only_missing_artifact_events() {
+        let signing_key = SigningKey::from_bytes(&[13_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let mut events = vec![
+            signed_proxy_event(&signing_key, 0, 0x10, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 1, 0x11, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 2, 0x12, [0_u8; 32]),
+        ];
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&events[0])])
+            .expect("apply initial event");
+        let root_0 = root_for_tip(&mut cache, 0);
+        cache.accept_current_roots();
+
+        let mut expected = cache.clone();
+        expected
+            .apply_verified_artifact_events(&[
+                snapshot_event_from_proxy(&events[1]),
+                snapshot_event_from_proxy(&events[2]),
+            ])
+            .expect("apply expected events");
+        let root_2 = root_for_tip(&mut expected, 2);
+
+        events[0].validated_merkleroot = prefixed_hex(root_0.as_slice());
+        events[2].validated_merkleroot = prefixed_hex(root_2.as_slice());
+
+        let base_bytes =
+            snapshot_artifact_bytes(&identity, SnapshotKind::Base, 0, 2, &events, root_2);
+        let base_cid = raw_cid(&base_bytes);
+        let base_descriptor = ArtifactDescriptor::from_bytes(base_cid.to_string(), &base_bytes);
+        let artifact_server =
+            spawn_manifest_server(200, raw_car_bytes(base_cid, &[(base_cid, base_bytes)]));
+        let proxy = spawn_json_rpc(vec![
+            json_rpc_result(vec![events[0].clone()]),
+            json_rpc_result(vec![events[2].clone()]),
+        ]);
+        let client = PoiRpcClient::new(proxy.url.clone());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
+            vec![artifact_server.url.clone()],
+            None,
+        );
+        let mut entry = test_entry(&identity, 2, fixed_bytes(&root_2));
+        entry.base = base_descriptor;
+        entry.deltas = Vec::new();
+        let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
+
+        let refresh = ingestor
+            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .await
+            .expect("artifact suffix merge")
+            .expect("merge result");
+
+        assert_eq!(refresh.manifest_sequence, 5);
+        assert_eq!(refresh.entry.current_tip_index, 2);
+        assert_eq!(refresh.cache.progress().next_event_index, 3);
+        assert_eq!(root_for_tip(&mut refresh.cache.clone(), 2), root_2);
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_suffix_merge_applies_missing_delta_events() {
+        let signing_key = SigningKey::from_bytes(&[18_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let mut events = vec![
+            signed_proxy_event(&signing_key, 0, 0x10, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 1, 0x11, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 2, 0x12, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 3, 0x13, [0_u8; 32]),
+        ];
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[
+                snapshot_event_from_proxy(&events[0]),
+                snapshot_event_from_proxy(&events[1]),
+            ])
+            .expect("apply local events");
+        let root_1 = root_for_tip(&mut cache, 1);
+        cache.accept_current_roots();
+
+        let mut expected = cache.clone();
+        expected
+            .apply_verified_artifact_events(&[
+                snapshot_event_from_proxy(&events[2]),
+                snapshot_event_from_proxy(&events[3]),
+            ])
+            .expect("apply expected events");
+        let root_3 = root_for_tip(&mut expected, 3);
+
+        events[1].validated_merkleroot = prefixed_hex(root_1.as_slice());
+        events[3].validated_merkleroot = prefixed_hex(root_3.as_slice());
+
+        let base_bytes =
+            snapshot_artifact_bytes(&identity, SnapshotKind::Base, 0, 1, &events[0..=1], root_1);
+        let base_cid = raw_cid(&base_bytes);
+        let base_descriptor = ArtifactDescriptor::from_bytes(base_cid.to_string(), &base_bytes);
+        let delta_bytes =
+            snapshot_artifact_bytes(&identity, SnapshotKind::Delta, 2, 3, &events[2..=3], root_3);
+        let delta_cid = raw_cid(&delta_bytes);
+        let delta_descriptor = ArtifactDescriptor::from_bytes(delta_cid.to_string(), &delta_bytes);
+        let artifact_server = spawn_json_rpc(vec![
+            raw_car_bytes(base_cid, &[(base_cid, base_bytes)]),
+            raw_car_bytes(delta_cid, &[(delta_cid, delta_bytes)]),
+        ]);
+        let proxy = spawn_json_rpc(vec![
+            json_rpc_result(vec![events[1].clone()]),
+            json_rpc_result(vec![events[3].clone()]),
+        ]);
+        let client = PoiRpcClient::new(proxy.url.clone());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
+            vec![artifact_server.url.clone()],
+            None,
+        );
+        let mut entry = test_entry(&identity, 3, fixed_bytes(&root_3));
+        entry.base = base_descriptor;
+        entry.deltas = vec![delta_descriptor];
+        let persisted = persisted_cache(&identity, cache, 1, root_1, &entry);
+
+        let refresh = ingestor
+            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .await
+            .expect("artifact suffix merge")
+            .expect("merge result");
+
+        assert_eq!(refresh.cache.progress().next_event_index, 4);
+        assert_eq!(root_for_tip(&mut refresh.cache.clone(), 3), root_3);
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
+        );
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{delta_cid}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_suffix_merge_replaces_changed_blocked_shields() {
+        let signing_key = SigningKey::from_bytes(&[17_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let mut events = vec![
+            signed_proxy_event(&signing_key, 0, 0x10, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 1, 0x11, [0_u8; 32]),
+        ];
+        let blocked_commitment = FixedBytes::from([0x44; 32]);
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&events[0])])
+            .expect("apply initial event");
+        cache
+            .apply_blocked_shields(&[blocked_shield(blocked_commitment)])
+            .expect("apply old blocked shield");
+        assert_eq!(cache.status(&blocked_commitment), PoiStatus::ShieldBlocked);
+        let root_0 = root_for_tip(&mut cache, 0);
+        cache.accept_current_roots();
+
+        let mut expected = cache.clone();
+        expected
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&events[1])])
+            .expect("apply expected event");
+        let root_1 = root_for_tip(&mut expected, 1);
+        events[0].validated_merkleroot = prefixed_hex(root_0.as_slice());
+        events[1].validated_merkleroot = prefixed_hex(root_1.as_slice());
+
+        let base_bytes =
+            snapshot_artifact_bytes(&identity, SnapshotKind::Base, 0, 1, &events, root_1);
+        let base_cid = raw_cid(&base_bytes);
+        let base_descriptor = ArtifactDescriptor::from_bytes(base_cid.to_string(), &base_bytes);
+
+        let empty_blocked = BlockedShieldsArtifact::from_signed_records(
+            format::FORMAT_VERSION,
+            &fixed_bytes(&identity.list_key),
+            identity.chain_id,
+            identity.chain_type,
+            &[0_u8; 32],
+            &[],
+        );
+        let empty_blocked_bytes = empty_blocked.to_bytes().expect("blocked artifact bytes");
+        let empty_blocked_cid = raw_cid(&empty_blocked_bytes);
+        let empty_blocked_descriptor =
+            ArtifactDescriptor::from_bytes(empty_blocked_cid.to_string(), &empty_blocked_bytes);
+        let artifact_server = spawn_json_rpc(vec![
+            raw_car_bytes(base_cid, &[(base_cid, base_bytes)]),
+            raw_car_bytes(
+                empty_blocked_cid,
+                &[(empty_blocked_cid, empty_blocked_bytes)],
+            ),
+        ]);
+        let proxy = spawn_json_rpc(vec![
+            json_rpc_result(vec![events[0].clone()]),
+            json_rpc_result(vec![events[1].clone()]),
+        ]);
+        let client = PoiRpcClient::new(proxy.url.clone());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
+            vec![artifact_server.url.clone()],
+            None,
+        );
+        let mut entry = test_entry(&identity, 1, fixed_bytes(&root_1));
+        entry.base = base_descriptor;
+        entry.deltas = Vec::new();
+        entry.blocked_shields = empty_blocked_descriptor;
+        let mut persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
+        persisted.record.blocked_shields_descriptor = descriptor_record(&descriptor("old-blocked"));
+
+        let refresh = ingestor
+            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .await
+            .expect("artifact suffix merge")
+            .expect("merge result");
+
+        assert_eq!(
+            refresh.cache.status(&blocked_commitment),
+            PoiStatus::Missing
+        );
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
+        );
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{empty_blocked_cid}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_suffix_merge_skips_ranges_crossing_tree_boundary() {
+        let signing_key = SigningKey::from_bytes(&[16_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let local_tip_index = broadcaster_core::tree::TREE_LEAF_COUNT - 2;
+        let boundary_index = broadcaster_core::tree::TREE_LEAF_COUNT - 1;
+        let artifact_tip_index = broadcaster_core::tree::TREE_LEAF_COUNT;
+
+        let mut local_event = signed_proxy_event(&signing_key, local_tip_index, 0x10, [0_u8; 32]);
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&local_event)])
+            .expect("apply local event");
+        let local_root = root_for_tip(&mut cache, local_tip_index);
+        cache.accept_current_roots();
+
+        let mut boundary_event = signed_proxy_event(&signing_key, boundary_index, 0x22, [0x55; 32]);
+        let mut tip_event = signed_proxy_event(&signing_key, artifact_tip_index, 0x33, [0_u8; 32]);
+        let mut expected = cache.clone();
+        expected
+            .apply_verified_artifact_events(&[
+                snapshot_event_from_proxy(&boundary_event),
+                snapshot_event_from_proxy(&tip_event),
+            ])
+            .expect("apply expected events");
+        let artifact_tip_root = root_for_tip(&mut expected, artifact_tip_index);
+
+        local_event.validated_merkleroot = prefixed_hex(local_root.as_slice());
+        tip_event.validated_merkleroot = prefixed_hex(artifact_tip_root.as_slice());
+        boundary_event.validated_merkleroot = prefixed_hex(&[0x55; 32]);
+
+        let proxy = spawn_json_rpc(vec![
+            json_rpc_result(vec![local_event]),
+            json_rpc_result(vec![tip_event.clone()]),
+            json_rpc_result(vec![boundary_event, tip_event]),
+        ]);
+        let client = PoiRpcClient::new(proxy.url.clone());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(proxy.url.clone()),
+            Vec::new(),
+            None,
+        );
+        let entry = test_entry(
+            &identity,
+            artifact_tip_index,
+            fixed_bytes(&artifact_tip_root),
+        );
+        let persisted = persisted_cache(&identity, cache, local_tip_index, local_root, &entry);
+
+        let refresh = ingestor
+            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .await
+            .expect("artifact suffix merge decision");
+
+        assert!(refresh.is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_suffix_merge_skips_when_proxy_root_disagrees() {
+        let signing_key = SigningKey::from_bytes(&[14_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let mut event = signed_proxy_event(&signing_key, 0, 0x10, [0_u8; 32]);
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&event)])
+            .expect("apply initial event");
+        let root_0 = root_for_tip(&mut cache, 0);
+        cache.accept_current_roots();
+        event.validated_merkleroot = prefixed_hex(&[0x55; 32]);
+
+        let proxy = spawn_json_rpc(vec![json_rpc_result(vec![event])]);
+        let client = PoiRpcClient::new(proxy.url.clone());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(proxy.url.clone()),
+            Vec::new(),
+            None,
+        );
+        let entry = test_entry(&identity, 1, [0x66; 32]);
+        let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
+
+        let refresh = ingestor
+            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .await
+            .expect("artifact suffix merge result");
+
+        assert!(refresh.is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_suffix_merge_reports_proxy_request_failure_for_fallback() {
+        let signing_key = SigningKey::from_bytes(&[15_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let event = signed_proxy_event(&signing_key, 0, 0x10, [0_u8; 32]);
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&event)])
+            .expect("apply initial event");
+        let root_0 = root_for_tip(&mut cache, 0);
+        cache.accept_current_roots();
+
+        let proxy = spawn_status_server(500, Vec::new());
+        let client = PoiRpcClient::new(proxy.url.clone());
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(proxy.url.clone()),
+            Vec::new(),
+            None,
+        );
+        let entry = test_entry(&identity, 1, [0x66; 32]);
+        let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
+
+        let error = match ingestor
+            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .await
+        {
+            Ok(_) => panic!("proxy request failure"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ArtifactSuffixMergeError::Rpc(PoiRpcError::HttpStatus { .. })
+        ));
     }
 
     #[test]
@@ -1039,6 +1806,15 @@ mod tests {
         PoiCacheIdentity::new(0, 1, "V2_PoseidonMerkle", FixedBytes::from([0x11; 32]))
     }
 
+    fn signed_identity(signing_key: &SigningKey) -> PoiCacheIdentity {
+        PoiCacheIdentity::new(
+            0,
+            1,
+            "V2_PoseidonMerkle",
+            FixedBytes::from(signing_key.verifying_key().to_bytes()),
+        )
+    }
+
     fn signed_manifest(signing_key: &SigningKey, issued_at_ms: u64, sequence: u64) -> Manifest {
         let mut manifest = Manifest::new(2, issued_at_ms, sequence, String::new(), vec![]);
         manifest.sign_manifest(signing_key).expect("sign manifest");
@@ -1076,6 +1852,10 @@ mod tests {
     }
 
     fn spawn_manifest_server(status: u16, body: Vec<u8>) -> MockManifestServer {
+        spawn_status_server(status, body)
+    }
+
+    fn spawn_status_server(status: u16, body: Vec<u8>) -> MockManifestServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind manifest server");
         let url = Url::parse(&format!(
             "http://{}",
@@ -1117,6 +1897,49 @@ mod tests {
         MockManifestServer { url, requests }
     }
 
+    fn spawn_json_rpc(responses: Vec<Vec<u8>>) -> MockManifestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind JSON-RPC server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("JSON-RPC server URL");
+        let (tx, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    assert!(read > 0, "client closed before request headers");
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                let path = request_text
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("request path")
+                    .to_string();
+                tx.send(path).expect("record request path");
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response headers");
+                stream.write_all(&body).expect("write response body");
+            }
+        });
+
+        MockManifestServer { url, requests }
+    }
+
     fn test_entry(
         identity: &PoiCacheIdentity,
         current_tip_index: u64,
@@ -1139,6 +1962,202 @@ mod tests {
             sha256: prefixed_hex(&[0_u8; 32]),
             byte_size: 0,
         }
+    }
+
+    fn persisted_cache(
+        identity: &PoiCacheIdentity,
+        cache: PoiCache,
+        current_tip_index: u64,
+        current_tip_root: FixedBytes<32>,
+        entry: &ManifestEntry,
+    ) -> PersistedPoiArtifactCache {
+        PersistedPoiArtifactCache {
+            record: PoiArtifactCacheRecord {
+                chain_type: identity.chain_type,
+                chain_id: identity.chain_id,
+                txid_version: identity.txid_version.clone(),
+                list_key: identity.list_key,
+                last_accepted_manifest_sequence: 4,
+                base_descriptor: descriptor_record(&descriptor("old-base")),
+                applied_delta_descriptors: Vec::new(),
+                blocked_shields_descriptor: descriptor_record(&entry.blocked_shields),
+                current_tip_index,
+                current_tip_root,
+                cache_payload: cache.to_bytes().expect("cache bytes"),
+                updated_at: 0,
+            },
+            cache,
+        }
+    }
+
+    fn signed_proxy_event(
+        signing_key: &SigningKey,
+        index: u64,
+        commitment_byte: u8,
+        validated_root: [u8; 32],
+    ) -> PoiSyncedListEvent {
+        let blinded_commitment = prefixed_hex(&[commitment_byte; 32]);
+        let message = format!(
+            r#"{{"index":{index},"blindedCommitment":"{blinded_commitment}","type":"Transact"}}"#
+        );
+        let signature = signing_key.sign(message.as_bytes()).to_bytes();
+        PoiSyncedListEvent {
+            signed_poi_event: SignedPoiEvent {
+                index,
+                blinded_commitment,
+                signature: prefixed_hex(&signature),
+                event_type: PoiEventType::Transact,
+            },
+            validated_merkleroot: prefixed_hex(&validated_root),
+        }
+    }
+
+    fn blocked_shield(blinded_commitment: FixedBytes<32>) -> BlockedShield {
+        BlockedShield {
+            commitment_hash: prefixed_hex(&[0x55; 32]),
+            blinded_commitment: prefixed_hex(blinded_commitment.as_slice()),
+            block_reason: None,
+            signature: String::new(),
+        }
+    }
+
+    fn snapshot_event_from_proxy(event: &PoiSyncedListEvent) -> SnapshotEvent {
+        SnapshotEvent {
+            event_index: event.signed_poi_event.index,
+            blinded_commitment: decode_fixed_hex(
+                "signedPOIEvent.blindedCommitment",
+                &event.signed_poi_event.blinded_commitment,
+            )
+            .expect("commitment"),
+            signature: decode_fixed_hex(
+                "signedPOIEvent.signature",
+                &event.signed_poi_event.signature,
+            )
+            .expect("signature"),
+            event_type: event.signed_poi_event.event_type,
+        }
+    }
+
+    fn snapshot_record_from_proxy(event: &PoiSyncedListEvent) -> SnapshotEventRecord {
+        SnapshotEventRecord {
+            event_index: event.signed_poi_event.index,
+            blinded_commitment: decode_fixed_hex(
+                "signedPOIEvent.blindedCommitment",
+                &event.signed_poi_event.blinded_commitment,
+            )
+            .expect("commitment"),
+            signature: decode_fixed_hex(
+                "signedPOIEvent.signature",
+                &event.signed_poi_event.signature,
+            )
+            .expect("signature"),
+            event_type: event.signed_poi_event.event_type,
+        }
+    }
+
+    fn snapshot_artifact_bytes(
+        identity: &PoiCacheIdentity,
+        kind: SnapshotKind,
+        start_index: u64,
+        end_index: u64,
+        events: &[PoiSyncedListEvent],
+        tip_merkleroot: FixedBytes<32>,
+    ) -> Vec<u8> {
+        let records = events
+            .iter()
+            .map(snapshot_record_from_proxy)
+            .collect::<Vec<_>>();
+        let header = SnapshotHeaderInput {
+            list_key: fixed_bytes(&identity.list_key),
+            chain_id: identity.chain_id,
+            chain_type: identity.chain_type,
+            kind,
+            start_index,
+            end_index,
+            tip_merkleroot: fixed_bytes(&tip_merkleroot),
+            upstream_endpoint_hash: [0_u8; 32],
+            created_at_unix_seconds: 1_700_000_000,
+        };
+        SnapshotWriter::write(&header, &records).expect("snapshot artifact bytes")
+    }
+
+    fn root_for_tip(cache: &mut PoiCache, tip_index: u64) -> FixedBytes<32> {
+        let (tree_number, _) = normalize_tree_position(0, tip_index);
+        *cache
+            .current_roots()
+            .get(&tree_number)
+            .expect("tip tree root")
+    }
+
+    fn json_rpc_result<T: serde::Serialize>(result: T) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": result,
+        }))
+        .expect("JSON-RPC response")
+    }
+
+    fn raw_cid(bytes: &[u8]) -> Cid {
+        Cid::new_v1(0x55, Code::Sha2_256.digest(bytes))
+    }
+
+    fn raw_car_bytes(root: Cid, blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
+        let header = raw_car_header(root);
+        let mut car = Vec::new();
+        write_varint(header.len(), &mut car);
+        car.extend_from_slice(&header);
+        for (cid, block) in blocks {
+            let cid_bytes = cid.to_bytes();
+            write_varint(cid_bytes.len() + block.len(), &mut car);
+            car.extend_from_slice(&cid_bytes);
+            car.extend_from_slice(block);
+        }
+        car
+    }
+
+    fn raw_car_header(root: Cid) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.push(0xa2);
+        write_cbor_text("roots", &mut header);
+        header.push(0x81);
+        header.extend_from_slice(&[0xd8, 0x2a]);
+        let mut cid_link = vec![0_u8];
+        cid_link.extend_from_slice(&root.to_bytes());
+        write_cbor_bytes(&cid_link, &mut header);
+        write_cbor_text("version", &mut header);
+        header.push(0x01);
+        header
+    }
+
+    fn write_cbor_text(value: &str, out: &mut Vec<u8>) {
+        write_cbor_len(0x60, value.len(), out);
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn write_cbor_bytes(value: &[u8], out: &mut Vec<u8>) {
+        write_cbor_len(0x40, value.len(), out);
+        out.extend_from_slice(value);
+    }
+
+    fn write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
+        match len {
+            0..=23 => out.push(major | u8::try_from(len).expect("small len")),
+            24..=0xff => out.extend_from_slice(&[major | 24, u8::try_from(len).expect("u8 len")]),
+            0x100..=0xffff => {
+                out.push(major | 25);
+                out.extend_from_slice(&u16::try_from(len).expect("u16 len").to_be_bytes());
+            }
+            _ => panic!("fixture length too large"),
+        }
+    }
+
+    fn write_varint(mut value: usize, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((u8::try_from(value & 0x7f).expect("varint byte")) | 0x80);
+            value >>= 7;
+        }
+        out.push(u8::try_from(value).expect("varint final byte"));
     }
 
     fn snapshot(

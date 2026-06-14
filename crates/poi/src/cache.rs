@@ -346,6 +346,27 @@ impl PoiCache {
         Ok(blocked_shields.len())
     }
 
+    pub fn replace_blocked_shields(
+        &mut self,
+        blocked_shields: &[BlockedShield],
+    ) -> Result<usize, PoiCacheError> {
+        let previous = self
+            .snapshot
+            .blocked_shields_by_blinded_commitment
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        self.snapshot.blocked_shields_by_blinded_commitment.clear();
+        for blinded_commitment in previous {
+            if self.status(&blinded_commitment) == PoiStatus::ShieldBlocked {
+                self.snapshot
+                    .status_by_blinded_commitment
+                    .remove(&blinded_commitment);
+            }
+        }
+        self.apply_blocked_shields(blocked_shields)
+    }
+
     pub fn apply_verified_artifact_events(
         &mut self,
         events: &[SnapshotEvent],
@@ -924,6 +945,23 @@ mod tests {
         assert_eq!(loaded.position(&valid_commitment).unwrap().global_index, 0);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replacing_blocked_shields_removes_omitted_blocked_only_statuses() {
+        let mut cache = PoiCache::new(identity());
+        let removed = FixedBytes::from([0x22; 32]);
+        let retained = FixedBytes::from([0x33; 32]);
+        cache
+            .apply_blocked_shields(&[blocked(removed), blocked(retained)])
+            .expect("apply blocked shields");
+
+        cache
+            .replace_blocked_shields(&[blocked(retained)])
+            .expect("replace blocked shields");
+
+        assert_eq!(cache.status(&removed), PoiStatus::Missing);
+        assert_eq!(cache.status(&retained), PoiStatus::ShieldBlocked);
     }
 
     #[test]

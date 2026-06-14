@@ -11,13 +11,24 @@ alloy-provider = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 alloy-transport = { workspace = true }
 broadcaster-core = { path = "../core" }
+bytes = { workspace = true }
+chrono = { workspace = true }
+cid = { workspace = true }
+futures = { workspace = true }
+ipld-dagpb = { workspace = true }
+ipld-core = { workspace = true }
+libp2p-identity = { workspace = true }
 local-db = { path = "../local-db" }
 merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
+quick-protobuf = { workspace = true }
 railgun-wallet = { path = "../railgun-wallet" }
 reqwest = { workspace = true }
 rmp-serde = { workspace = true }
+rs-car = { workspace = true }
+rust-ipns = { workspace = true }
 serde = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -28,3 +39,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+multihash-codetable = { workspace = true }

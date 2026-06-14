@@ -2,6 +2,7 @@ mod chain;
 mod manager;
 pub(crate) mod poi_artifacts;
 mod poi_cache;
+mod trustless_artifacts;
 pub(crate) mod txid_cache;
 pub mod types;
 mod wallet;

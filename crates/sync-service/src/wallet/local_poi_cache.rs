@@ -31,17 +31,23 @@ pub(super) async fn sync_local_poi_caches(
         let preloaded_cache = preloaded_caches.remove(list_key);
         let artifact_refresh = if let Some(preloaded_cache) = preloaded_cache {
             ingestor
-                .refresh_persisted_cache_with_preloaded(
+                .refresh_persisted_cache_with_preloaded_and_proxy(
                     db,
                     identity.clone(),
                     Some(preloaded_cache),
                     0,
                     SystemTime::now(),
+                    live_tail_client.as_ref(),
                 )
                 .await
         } else {
             ingestor
-                .refresh_persisted_cache(db, identity.clone(), SystemTime::now())
+                .refresh_persisted_cache_with_proxy(
+                    db,
+                    identity.clone(),
+                    SystemTime::now(),
+                    live_tail_client.as_ref(),
+                )
                 .await
         };
         let artifact_refresh_elapsed_ms = artifact_refresh_started.elapsed().as_millis();
