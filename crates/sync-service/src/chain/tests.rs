@@ -2,7 +2,7 @@ use alloy::sol_types::SolEvent;
 
 use super::{
     CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletPageKind,
-    Nullified, Nullifiers, Shield, ShieldLegacyPreMar23, Transact,
+    Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, Transact,
     combined_log_event_signatures_for_range, complete_stream_checkpoint, forest_reorg_decision,
     indexed_wallet_page_kind, indexed_wallet_to_block, pending_tip_from_block,
     pending_tip_provider_covers_target, should_hedge_wallet_startup, wallet_backfill_from_block,
@@ -114,7 +114,7 @@ fn combined_log_event_signatures_cover_homogeneous_ranges() {
         .expect("legacy shield range can be combined");
     assert_eq!(legacy_shield.len(), 4);
     assert!(legacy_shield.contains(&Transact::SIGNATURE_HASH));
-    assert!(legacy_shield.contains(&ShieldLegacyPreMar23::SIGNATURE_HASH));
+    assert!(legacy_shield.contains(&RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH));
     assert!(legacy_shield.contains(&Nullifiers::SIGNATURE_HASH));
     assert!(legacy_shield.contains(&Nullified::SIGNATURE_HASH));
 

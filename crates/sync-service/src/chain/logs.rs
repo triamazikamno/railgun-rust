@@ -54,7 +54,7 @@ pub(super) async fn fetch_logs_for_range_with_provider(
             let legacy_shield_filter = Filter::new()
                 .select(v2_start..=legacy_shield_end)
                 .address(contract)
-                .event_signature(ShieldLegacyPreMar23::SIGNATURE_HASH);
+                .event_signature(RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH);
             let legacy_shield_logs = provider.get_logs(&legacy_shield_filter).await?;
             logs.extend(legacy_shield_logs);
         }
@@ -102,7 +102,7 @@ pub(super) fn combined_log_event_signatures_for_range(
     if to_block <= legacy_shield_block {
         return Some(vec![
             Transact::SIGNATURE_HASH,
-            ShieldLegacyPreMar23::SIGNATURE_HASH,
+            RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH,
             Nullifiers::SIGNATURE_HASH,
             Nullified::SIGNATURE_HASH,
         ]);

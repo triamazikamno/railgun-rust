@@ -7,8 +7,8 @@ use thiserror::Error;
 use crate::errors::SyncError;
 use crate::tree::MerkleForest;
 use types::{
-    CommitmentBatch, GeneratedCommitmentBatch, IntoCommitmentUpdates, Shield, ShieldLegacyPreMar23,
-    Transact,
+    CommitmentBatch, GeneratedCommitmentBatch, IntoCommitmentUpdates, RailgunLegacyShieldEvents,
+    Shield, Transact,
 };
 
 #[derive(Debug, Error)]
@@ -32,8 +32,8 @@ impl MerkleForest {
             } else if topic0 == Shield::SIGNATURE_HASH {
                 let event = Shield::decode_log(&raw_log.inner)?.data;
                 self.insert_updates(event.commitment_updates())?;
-            } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
-                let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
+            } else if topic0 == RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH {
+                let event = RailgunLegacyShieldEvents::Shield::decode_log(&raw_log.inner)?.data;
                 self.insert_updates(event.commitment_updates())?;
             } else if topic0 == CommitmentBatch::SIGNATURE_HASH {
                 let event = CommitmentBatch::decode_log(&raw_log.inner)?.data;

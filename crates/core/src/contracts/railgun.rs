@@ -133,12 +133,14 @@ sol! {
         uint256[] fees
     );
 
-    event ShieldLegacyPreMar23(
-        uint256 treeNumber,
-        uint256 startPosition,
-        CommitmentPreimage[] commitments,
-        ShieldCiphertext[] shieldCiphertext
-    );
+    interface RailgunLegacyShieldEvents {
+        event Shield(
+            uint256 treeNumber,
+            uint256 startPosition,
+            CommitmentPreimage[] commitments,
+            ShieldCiphertext[] shieldCiphertext
+        );
+    }
 
     event CommitmentBatch(
         uint256 treeNumber,
@@ -444,10 +446,12 @@ impl ActionData {
 
 #[cfg(test)]
 mod tests {
-    use crate::contracts::railgun::{ActionData, Call, RelayAdaptParamsInput};
+    use crate::contracts::railgun::{
+        ActionData, Call, RailgunLegacyShieldEvents, RelayAdaptParamsInput, Shield,
+    };
     use alloy::hex;
-    use alloy::primitives::{U256, address, keccak256};
-    use alloy::sol_types::SolValue;
+    use alloy::primitives::{FixedBytes, U256, address, keccak256};
+    use alloy::sol_types::{SolEvent, SolValue};
 
     #[test]
     fn test_adapt_params() {
@@ -488,6 +492,22 @@ mod tests {
         assert_eq!(
             hash,
             hex!("0x830b9e3899d14ee500b62572acd396d45f9f79084a342b7a4368e9a5d075bf6a")
+        );
+    }
+
+    #[test]
+    fn shield_event_topics_match_deployed_contract_eras() {
+        assert_eq!(
+            RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH,
+            FixedBytes::from(hex!(
+                "0xc3821e11e71307afd1d94a490660178ff37aefdd3c0514e5dd08937bd7024f34"
+            ))
+        );
+        assert_eq!(
+            Shield::SIGNATURE_HASH,
+            FixedBytes::from(hex!(
+                "0x3a5b9dc26075a3801a6ddccf95fec485bb7500a91b44cec1add984c21ee6db3b"
+            ))
         );
     }
 }

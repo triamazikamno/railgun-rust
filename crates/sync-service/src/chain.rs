@@ -28,8 +28,8 @@ use merkletree::quick::{
 };
 use merkletree::slow::CommitmentUpdateError;
 use merkletree::slow::types::{
-    CommitmentBatch, GeneratedCommitmentBatch, Nullified, Nullifiers, Shield, ShieldLegacyPreMar23,
-    Transact,
+    CommitmentBatch, GeneratedCommitmentBatch, Nullified, Nullifiers, RailgunLegacyShieldEvents,
+    Shield, Transact,
 };
 use merkletree::tree::MerkleForest;
 use railgun_wallet::UtxoSource;

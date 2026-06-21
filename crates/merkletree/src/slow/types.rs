@@ -2,8 +2,8 @@ use alloy::primitives::{FixedBytes, U256};
 
 pub use broadcaster_core::contracts::railgun::{
     CommitmentBatch, CommitmentCiphertext, CommitmentPreimage, GeneratedCommitmentBatch,
-    LegacyCommitmentCiphertext, LegacyCommitmentPreimage, Nullified, Nullifiers, Shield,
-    ShieldCiphertext, ShieldLegacyPreMar23, TokenData, Transact, Unshield,
+    LegacyCommitmentCiphertext, LegacyCommitmentPreimage, Nullified, Nullifiers,
+    RailgunLegacyShieldEvents, Shield, ShieldCiphertext, TokenData, Transact, Unshield,
 };
 use broadcaster_core::tree::normalize_tree_position;
 
@@ -84,7 +84,7 @@ impl<'a> IntoCommitmentUpdates<'a> for Shield {
     }
 }
 
-impl<'a> IntoCommitmentUpdates<'a> for ShieldLegacyPreMar23 {
+impl<'a> IntoCommitmentUpdates<'a> for RailgunLegacyShieldEvents::Shield {
     type Iter =
         std::iter::Map<std::slice::Iter<'a, CommitmentPreimage>, fn(&CommitmentPreimage) -> U256>;
 

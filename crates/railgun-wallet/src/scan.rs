@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use broadcaster_core::contracts::railgun::{
     CommitmentBatch, CommitmentPreimage, GeneratedCommitmentBatch, LegacyCommitmentPreimage,
-    Nullified, Nullifiers, Shield, ShieldCiphertext, ShieldLegacyPreMar23, Transact,
+    Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, ShieldCiphertext, Transact,
 };
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::crypto::shared_key::{shared_symmetric_key, shared_symmetric_key_legacy};
@@ -241,8 +241,8 @@ pub fn parse_wallet_delta_from_logs(
                 keys,
                 &mut output,
             );
-        } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
-            let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
+        } else if topic0 == RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH {
+            let event = RailgunLegacyShieldEvents::Shield::decode_log(&raw_log.inner)?.data;
 
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
