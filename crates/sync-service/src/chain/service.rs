@@ -5,9 +5,12 @@ impl ChainService {
         if chain.archive_until_block > 0
             && chain.archive_rpc_url.is_none()
             && chain.deployment_block <= chain.archive_until_block
-            && chain.quick_sync_endpoint.is_none()
         {
-            return Err(ChainError::ArchiveRpcRequired(chain.archive_until_block));
+            warn!(
+                chain_id = chain.chain_id,
+                archive_until_block = chain.archive_until_block,
+                "archive RPC URL not configured; using regular RPC providers for archive-range fallback"
+            );
         }
         let archive_provider = match chain.archive_rpc_url.as_ref() {
             Some(url) => Some(

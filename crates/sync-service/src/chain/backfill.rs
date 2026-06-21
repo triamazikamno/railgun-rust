@@ -355,7 +355,7 @@ impl ChainConfig {
         block_number: u64,
     ) -> Result<Option<[u8; 32]>, ChainError> {
         let provider = if self.archive_until_block > 0 && block_number <= self.archive_until_block {
-            archive_provider.ok_or(ChainError::ArchiveRpcRequired(self.archive_until_block))?
+            archive_provider.unwrap_or(provider)
         } else {
             provider
         };
@@ -372,7 +372,7 @@ impl ChainConfig {
         block_number: u64,
     ) -> Result<Option<u64>, ChainError> {
         let provider = if self.archive_until_block > 0 && block_number <= self.archive_until_block {
-            archive_provider.ok_or(ChainError::ArchiveRpcRequired(self.archive_until_block))?
+            archive_provider.unwrap_or(provider)
         } else {
             provider
         };
@@ -419,8 +419,7 @@ impl ChainConfig {
 
         if archive_until_block > 0 && from_block <= archive_until_block {
             let archive_end = to_block.min(archive_until_block);
-            let archive_provider =
-                archive_provider.ok_or(ChainError::ArchiveRpcRequired(archive_until_block))?;
+            let archive_provider = archive_provider.unwrap_or(provider);
             let archive_logs = fetch_logs_for_range_with_provider(
                 archive_provider,
                 self.contract,
@@ -452,5 +451,111 @@ impl ChainConfig {
         }
 
         Ok(logs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use serde_json::json;
+    use url::Url;
+
+    struct MockJsonRpc {
+        url: Url,
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[tokio::test]
+    async fn archive_range_log_fetch_uses_regular_rpc_when_archive_provider_missing() {
+        let mock = spawn_json_rpc_server(1);
+        let provider = build_provider_with_http_client(&mock.url, None)
+            .await
+            .expect("provider");
+        let mut chain = chain_config(mock.url.clone());
+        chain.deployment_block = 100;
+        chain.archive_until_block = 150;
+        chain.v2_start_block = 200;
+        chain.legacy_shield_block = 250;
+
+        let logs = chain
+            .fetch_logs_for_range(&provider, None, 100, 120)
+            .await
+            .expect("regular RPC should be used for archive range");
+
+        assert!(logs.is_empty());
+        assert_eq!(mock.requests.load(Ordering::SeqCst), 1);
+    }
+
+    fn chain_config(rpc_url: Url) -> ChainConfig {
+        ChainConfig {
+            chain_id: 1,
+            contract: Address::ZERO,
+            rpcs: Arc::new(QueryRpcPool::new(vec![rpc_url], Duration::from_secs(1))),
+            archive_rpc_url: None,
+            archive_until_block: 0,
+            deployment_block: 1,
+            v2_start_block: 1,
+            legacy_shield_block: 1,
+            block_range: 100,
+            indexed_wallet_block_range: 100,
+            poll_interval: Duration::from_secs(1),
+            finality_depth: 1,
+            quick_sync_endpoint: None,
+            indexed_artifact_source: None,
+            anchor_interval: 100,
+            anchor_retention: 2,
+            http_client: None,
+            progress_tx: None,
+        }
+    }
+
+    fn spawn_json_rpc_server(expected_requests: usize) -> MockJsonRpc {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock RPC");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("mock RPC URL");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming().take(expected_requests) {
+                let mut stream = stream.expect("accept mock RPC request");
+                let mut buffer = [0_u8; 8192];
+                let read = stream.read(&mut buffer).expect("read mock RPC request");
+                assert!(read > 0, "mock RPC connection closed before request");
+                server_requests.fetch_add(1, Ordering::SeqCst);
+
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let body_start = request.find("\r\n\r\n").map_or(read, |index| index + 4);
+                let request_body = &request[body_start..];
+                let id = serde_json::from_str::<serde_json::Value>(request_body)
+                    .ok()
+                    .and_then(|value| value.get("id").cloned())
+                    .unwrap_or_else(|| json!(1));
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": [],
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write mock RPC response");
+            }
+        });
+
+        MockJsonRpc { url, requests }
     }
 }
