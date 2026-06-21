@@ -781,6 +781,7 @@ fn multi_transaction_selection_candidates(
     candidates
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_multi_transaction_selection_candidates(
     utxos: &[Utxo],
     token_address: Address,

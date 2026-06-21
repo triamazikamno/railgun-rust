@@ -163,7 +163,7 @@ impl PoiArtifactIngestor {
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
     ) -> Result<(Manifest, usize), PoiArtifactError> {
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(PoiArtifactError::Json)?;
+        let manifest: Manifest = serde_json::from_slice(bytes).map_err(PoiArtifactError::Json)?;
         manifest.verify_trusted_signature(&fixed_bytes(&self.config.trusted_publisher_pubkey))?;
         validate_manifest_sequence(&manifest, last_accepted_sequence)?;
         validate_manifest_freshness(

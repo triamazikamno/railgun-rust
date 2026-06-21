@@ -196,6 +196,7 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
     info!(chain_id, "chain-scoped artifact POI cache service stopped");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_chain_poi_artifact_caches(
     db: &DbStore,
     http_client: Option<&reqwest::Client>,

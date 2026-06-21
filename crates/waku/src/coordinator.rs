@@ -1463,12 +1463,9 @@ mod tests {
     fn tor_discovery_retry_delay_backs_off_and_caps() {
         assert_eq!(tor_discovery_retry_delay(0), Duration::from_secs(10));
         assert_eq!(tor_discovery_retry_delay(1), Duration::from_secs(30));
-        assert_eq!(tor_discovery_retry_delay(2), Duration::from_secs(60));
-        assert_eq!(tor_discovery_retry_delay(3), Duration::from_secs(300));
-        assert_eq!(
-            tor_discovery_retry_delay(u32::MAX),
-            Duration::from_secs(300)
-        );
+        assert_eq!(tor_discovery_retry_delay(2), Duration::from_mins(1));
+        assert_eq!(tor_discovery_retry_delay(3), Duration::from_mins(5));
+        assert_eq!(tor_discovery_retry_delay(u32::MAX), Duration::from_mins(5));
     }
 
     #[test]

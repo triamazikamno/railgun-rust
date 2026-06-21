@@ -273,7 +273,7 @@ pub struct Prover {
 }
 
 impl Prover {
-    pub async fn new() -> Result<Self, SnarkProofError> {
+    pub fn new() -> Result<Self, SnarkProofError> {
         Ok(Self {
             pvk_3_3: Self::make_pvk(3, 3)?,
             pvk_13_13: Self::make_pvk(13, 13)?,

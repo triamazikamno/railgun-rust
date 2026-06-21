@@ -1726,6 +1726,7 @@ fn select_composite_leg_selections(
     Ok((selections, embedded_fee_leg_index))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_composite_leg_selections_inner(
     utxos: &[Utxo],
     legs: &[CompositeUnshieldLeg],

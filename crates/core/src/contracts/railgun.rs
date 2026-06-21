@@ -293,7 +293,7 @@ impl CommitmentPreimage {
 
 impl TokenData {
     #[must_use]
-    pub fn erc20(token_address: Address) -> Self {
+    pub const fn erc20(token_address: Address) -> Self {
         Self {
             tokenType: 0,
             tokenAddress: token_address,
@@ -302,7 +302,7 @@ impl TokenData {
     }
 
     #[must_use]
-    pub fn base_native() -> Self {
+    pub const fn base_native() -> Self {
         Self::erc20(Address::ZERO)
     }
 
@@ -318,7 +318,7 @@ impl TokenData {
 
 impl TokenTransfer {
     #[must_use]
-    pub fn erc20(token_address: Address, to: Address, value: U256) -> Self {
+    pub const fn erc20(token_address: Address, to: Address, value: U256) -> Self {
         Self {
             token: TokenData::erc20(token_address),
             to,
@@ -327,7 +327,7 @@ impl TokenTransfer {
     }
 
     #[must_use]
-    pub fn base_native(to: Address, value: U256) -> Self {
+    pub const fn base_native(to: Address, value: U256) -> Self {
         Self {
             token: TokenData::base_native(),
             to,
@@ -347,7 +347,11 @@ impl LegacyCommitmentPreimage {
 
 impl ActionData {
     #[must_use]
-    pub fn require_success(random: FixedBytes<31>, min_gas_limit: U256, calls: Vec<Call>) -> Self {
+    pub const fn require_success(
+        random: FixedBytes<31>,
+        min_gas_limit: U256,
+        calls: Vec<Call>,
+    ) -> Self {
         Self {
             random,
             requireSuccess: true,
