@@ -1,10 +1,10 @@
 use super::DiscoveredPeer;
 use super::error::EnrDecodeError;
+use crate::address_policy::with_peer_id;
 use alloy_rlp::Decodable;
 use bytes::Bytes;
 use enr::Enr;
 use enr::k256;
-use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identity};
 
 type DefaultEnr = Enr<k256::ecdsa::SigningKey>;
@@ -62,17 +62,11 @@ fn decode_enr(enr: &DefaultEnr) -> Result<DiscoveredPeer, EnrDecodeError> {
         addrs.extend(decode_multiaddrs(multiaddrs_bytes.as_ref()));
     }
 
-    // Add /p2p/<peer_id> encapsulation where missing.
-    let mut full_addrs = Vec::new();
-    for addr in addrs {
-        let has_p2p = addr.iter().any(|p| matches!(p, Protocol::P2p(_)));
-        if has_p2p {
-            full_addrs.push(addr);
-        } else {
-            let with_peer: Multiaddr = format!("{addr}/p2p/{peer_id}").parse().unwrap_or(addr);
-            full_addrs.push(with_peer);
-        }
-    }
+    // Trust the ENR identity over any stale trailing /p2p component embedded in multiaddrs.
+    let full_addrs = addrs
+        .into_iter()
+        .map(|addr| with_peer_id(&addr, peer_id))
+        .collect();
 
     Ok(DiscoveredPeer {
         peer_id,

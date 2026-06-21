@@ -1,4 +1,4 @@
-use crate::address_policy::retain_tor_safe_addrs;
+use crate::address_policy::{retain_tor_safe_addrs, with_peer_id, without_trailing_peer_id};
 use crate::config::{NodeConfig, WakuTransportProfile};
 use crate::discovery;
 use crate::discovery::DiscoveryConfig;
@@ -9,6 +9,7 @@ use crate::protocols;
 use crate::transport::{ReqId, TransportCmd, TransportEvent};
 use crate::types::OpId;
 use libp2p::request_response::OutboundFailure;
+use libp2p::swarm::DialError;
 use libp2p::{Multiaddr, PeerId};
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -178,6 +179,36 @@ impl PeerBook {
             })
             .collect()
     }
+}
+
+fn record_dial_failure(state: &mut PeerState, now: Instant) {
+    state.dial_failures = state.dial_failures.saturating_add(1);
+    let pow = state.dial_failures.min(8);
+    let backoff = Duration::from_secs(1 << pow);
+    state.next_dial_at = Some(now + backoff);
+}
+
+fn remap_wrong_peer_id(
+    book: &mut PeerBook,
+    expected_peer_id: PeerId,
+    obtained_peer_id: PeerId,
+    address: &Multiaddr,
+    now: Instant,
+) {
+    let dialed_addr = without_trailing_peer_id(address);
+    if let Some(state) = book.peers.get_mut(&expected_peer_id) {
+        state
+            .addrs
+            .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
+        record_dial_failure(state, now);
+    }
+
+    let remapped_addr = with_peer_id(address, obtained_peer_id);
+    let obtained_state = book.peers.entry(obtained_peer_id).or_default();
+    obtained_state
+        .addrs
+        .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
+    obtained_state.addrs.push(remapped_addr);
 }
 
 #[derive(Debug)]
@@ -804,24 +835,27 @@ impl NodeInner {
                         if suppress_backoff {
                             state.next_dial_at = None;
                         } else {
-                            state.dial_failures = state.dial_failures.saturating_add(1);
-                            let pow = state.dial_failures.min(8);
-                            let backoff = Duration::from_secs(1 << pow);
-                            state.next_dial_at = Some(Instant::now() + backoff);
+                            record_dial_failure(state, Instant::now());
                         }
                     }
                 }
                 self.maybe_dial();
             }
-            TransportEvent::DialError { peer_id } => {
-                debug!(%peer_id, "dial error");
+            TransportEvent::DialError { peer_id, error } => {
+                debug!(%peer_id, ?error, "dial error");
+                let now = Instant::now();
                 let mut book = self.peer_book.write();
                 book.dialing.remove(&peer_id);
-                if let Some(state) = book.peers.get_mut(&peer_id) {
-                    state.dial_failures = state.dial_failures.saturating_add(1);
-                    let pow = state.dial_failures.min(8);
-                    let backoff = Duration::from_secs(1 << pow);
-                    state.next_dial_at = Some(Instant::now() + backoff);
+                if let DialError::WrongPeerId { obtained, address } = error {
+                    debug!(
+                        expected_peer_id=%peer_id,
+                        obtained_peer_id=%obtained,
+                        %address,
+                        "remapping stale peer address to authenticated peer id"
+                    );
+                    remap_wrong_peer_id(&mut book, peer_id, obtained, &address, now);
+                } else if let Some(state) = book.peers.get_mut(&peer_id) {
+                    record_dial_failure(state, now);
                 }
             }
             TransportEvent::IdentifyReceived {
@@ -1421,6 +1455,10 @@ mod tests {
     use super::*;
     use crate::config::WakuConfig;
 
+    fn addr(value: &str) -> Multiaddr {
+        value.parse().expect("valid multiaddr")
+    }
+
     #[test]
     fn tor_discovery_retry_delay_backs_off_and_caps() {
         assert_eq!(tor_discovery_retry_delay(0), Duration::from_secs(10));
@@ -1431,6 +1469,46 @@ mod tests {
             tor_discovery_retry_delay(u32::MAX),
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn wrong_peer_id_remaps_address_to_authenticated_peer() {
+        let advertised_peer = PeerId::random();
+        let authenticated_peer = PeerId::random();
+        let stale_addr = addr(&format!(
+            "/ip4/45.76.230.253/tcp/30304/p2p/{advertised_peer}"
+        ));
+        let corrected_addr = addr(&format!(
+            "/ip4/45.76.230.253/tcp/30304/p2p/{authenticated_peer}"
+        ));
+        let dialed_addr = addr("/ip4/45.76.230.253/tcp/30304");
+        let mut book = PeerBook::default();
+
+        book.peers.entry(advertised_peer).or_default().addrs = vec![stale_addr.clone()];
+
+        remap_wrong_peer_id(
+            &mut book,
+            advertised_peer,
+            authenticated_peer,
+            &stale_addr,
+            Instant::now(),
+        );
+
+        let advertised_state = book.peers.get(&advertised_peer).expect("advertised peer");
+        assert!(
+            advertised_state
+                .addrs
+                .iter()
+                .all(|addr| without_trailing_peer_id(addr) != dialed_addr)
+        );
+        assert_eq!(advertised_state.dial_failures, 1);
+        assert!(advertised_state.next_dial_at.is_some());
+
+        let authenticated_state = book
+            .peers
+            .get(&authenticated_peer)
+            .expect("authenticated peer");
+        assert_eq!(authenticated_state.addrs, vec![corrected_addr]);
     }
 
     #[tokio::test]

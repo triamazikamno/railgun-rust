@@ -1,5 +1,21 @@
-use libp2p::Multiaddr;
 use libp2p::core::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId};
+
+#[must_use]
+pub(crate) fn without_trailing_peer_id(addr: &Multiaddr) -> Multiaddr {
+    let mut addr = addr.clone();
+    if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
+        addr.pop();
+    }
+    addr
+}
+
+#[must_use]
+pub(crate) fn with_peer_id(addr: &Multiaddr, peer_id: PeerId) -> Multiaddr {
+    let mut addr = without_trailing_peer_id(addr);
+    addr.push(Protocol::P2p(peer_id));
+    addr
+}
 
 #[must_use]
 pub(crate) fn tor_addr_rank(addr: &Multiaddr) -> Option<u8> {
@@ -67,6 +83,36 @@ mod tests {
 
     fn addr(value: &str) -> Multiaddr {
         value.parse().expect("valid multiaddr")
+    }
+
+    #[test]
+    fn with_peer_id_replaces_trailing_peer_id() {
+        let stale_peer = PeerId::random();
+        let authenticated_peer = PeerId::random();
+        let stale_addr = addr(&format!("/ip4/203.0.113.10/tcp/30304/p2p/{stale_peer}"));
+
+        assert_eq!(
+            with_peer_id(&stale_addr, authenticated_peer),
+            addr(&format!(
+                "/ip4/203.0.113.10/tcp/30304/p2p/{authenticated_peer}"
+            ))
+        );
+    }
+
+    #[test]
+    fn with_peer_id_preserves_relay_peer_id() {
+        let relay_peer = PeerId::random();
+        let destination_peer = PeerId::random();
+        let relayed_addr = addr(&format!(
+            "/ip4/203.0.113.10/tcp/30304/p2p/{relay_peer}/p2p-circuit"
+        ));
+
+        assert_eq!(
+            with_peer_id(&relayed_addr, destination_peer),
+            addr(&format!(
+                "/ip4/203.0.113.10/tcp/30304/p2p/{relay_peer}/p2p-circuit/p2p/{destination_peer}"
+            ))
+        );
     }
 
     #[test]

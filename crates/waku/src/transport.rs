@@ -17,7 +17,7 @@ use libp2p::identity;
 use libp2p::noise;
 use libp2p::ping;
 use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
-use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
+use libp2p::swarm::{DialError, NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::tcp;
 use libp2p::websocket;
 use libp2p::yamux;
@@ -92,6 +92,7 @@ pub(crate) enum TransportEvent {
     },
     DialError {
         peer_id: PeerId,
+        error: DialError,
     },
     IdentifyReceived {
         peer_id: PeerId,
@@ -265,7 +266,7 @@ impl Transport {
                 if let Err(e) = self.swarm.dial(opts) {
                     debug!(?peer_id, error=?e, "dial failed");
                     if event_tx
-                        .send(TransportEvent::DialError { peer_id })
+                        .send(TransportEvent::DialError { peer_id, error: e })
                         .await
                         .is_err()
                     {
@@ -378,8 +379,9 @@ impl Transport {
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id: Some(peer_id),
+                error,
                 ..
-            } => Some(TransportEvent::DialError { peer_id }),
+            } => Some(TransportEvent::DialError { peer_id, error }),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
