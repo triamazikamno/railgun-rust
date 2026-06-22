@@ -1492,6 +1492,7 @@ async fn indexed_artifacts_startup_warms_cache_even_when_status_refresh_not_need
         chain_id: 1,
         base: base_descriptor.clone(),
         deltas: Vec::new(),
+        retained_deltas: Vec::new(),
         blocked_shields: blocked_descriptor.clone(),
         current_tip_index: 0,
         current_tip_merkleroot: hex::encode_prefixed(expected_root),

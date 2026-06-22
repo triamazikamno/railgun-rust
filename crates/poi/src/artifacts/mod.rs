@@ -6,7 +6,9 @@ pub mod verify;
 pub use blocked::{
     BlockedShieldArtifactRecord, BlockedShieldsArtifact, BlockedShieldsArtifactError,
 };
-pub use manifest::{ArtifactDescriptor, Manifest, ManifestEntry, ManifestError};
+pub use manifest::{
+    ArtifactDescriptor, Manifest, ManifestEntry, ManifestError, RetainedDeltaDescriptor,
+};
 pub use snapshot::{
     Snapshot, SnapshotBlockedShield, SnapshotError, SnapshotEvent, SnapshotEventRecord,
     SnapshotHeader, SnapshotHeaderInput, SnapshotKind, SnapshotReader, SnapshotWriter,

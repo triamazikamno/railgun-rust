@@ -4,7 +4,7 @@ use crate::poi::PoiEventType;
 
 pub mod format {
     pub const MAGIC: &[u8; 8] = b"POISNAP\0";
-    pub const FORMAT_VERSION: u16 = 2;
+    pub const FORMAT_VERSION: u16 = 3;
 
     pub const MAGIC_OFFSET: usize = 0;
     pub const MAGIC_BYTES: usize = 8;
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_snapshot_header_has_no_bundle_signature() {
+    fn snapshot_header_has_no_bundle_signature() {
         let events = vec![event_record(0, 1, PoiEventType::Shield)];
         let bytes = SnapshotWriter::write(&header_input(0, 0, SnapshotKind::Base), &events)
             .expect("encode");

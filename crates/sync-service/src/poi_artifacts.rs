@@ -1950,6 +1950,7 @@ mod tests {
             chain_id: identity.chain_id,
             base: descriptor("base"),
             deltas: vec![descriptor("delta")],
+            retained_deltas: Vec::new(),
             blocked_shields: descriptor("blocked"),
             current_tip_index,
             current_tip_merkleroot: prefixed_hex(&current_tip_merkleroot),

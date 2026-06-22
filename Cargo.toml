@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/indexed-artifacts",
     "crates/local-db",
     "crates/merkletree",
     "crates/poi",
@@ -20,6 +21,7 @@ rust-version = "1.91"
 aes = "0.8"
 aes-gcm = "0.10"
 alloy = { version = "2", features = ["serde", "signer-mnemonic"] }
+alloy-primitives = { version = "1.6", features = ["serde"] }
 alloy-provider = "2"
 alloy-rpc-types-eth = "2"
 alloy-transport = "2"
@@ -86,6 +88,7 @@ async-trait = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 arti-client = "0.43"
 tor-rtcompat = "0.43"
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3

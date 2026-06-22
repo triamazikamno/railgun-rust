@@ -18,6 +18,7 @@ pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncProgressStage {
     SynchronizingCommitments,
+    PreparingUtxoIndex,
     IndexingUtxos,
 }
 
@@ -26,14 +27,25 @@ impl SyncProgressStage {
     pub const fn label(self) -> &'static str {
         match self {
             Self::SynchronizingCommitments => "Synchronizing commitments",
+            Self::PreparingUtxoIndex => "Preparing UTXO index",
             Self::IndexingUtxos => "Indexing UTXOs",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncProgressUnit {
+    Block,
+    ArtifactPreparation,
+    ArtifactChunk { completed: u64, total: u64 },
+    ArtifactApplied,
+    CommitmentTail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncProgressUpdate {
     pub stage: SyncProgressStage,
+    pub unit: SyncProgressUnit,
     pub start_block: u64,
     pub current_block: u64,
     pub target_block: u64,
@@ -47,8 +59,77 @@ impl SyncProgressUpdate {
         current_block: u64,
         target_block: u64,
     ) -> Self {
+        Self::with_unit(
+            stage,
+            SyncProgressUnit::Block,
+            start_block,
+            current_block,
+            target_block,
+        )
+    }
+
+    #[must_use]
+    pub const fn artifact_preparation(
+        stage: SyncProgressStage,
+        current_progress: u64,
+        target_progress: u64,
+    ) -> Self {
+        Self::with_unit(
+            stage,
+            SyncProgressUnit::ArtifactPreparation,
+            0,
+            current_progress,
+            target_progress,
+        )
+    }
+
+    #[must_use]
+    pub const fn artifact_chunk(
+        stage: SyncProgressStage,
+        current_progress: u64,
+        target_progress: u64,
+        completed_chunks: u64,
+        total_chunks: u64,
+    ) -> Self {
+        Self::with_unit(
+            stage,
+            SyncProgressUnit::ArtifactChunk {
+                completed: completed_chunks,
+                total: total_chunks,
+            },
+            0,
+            current_progress,
+            target_progress,
+        )
+    }
+
+    #[must_use]
+    pub const fn artifact_applied(stage: SyncProgressStage) -> Self {
+        Self::with_unit(stage, SyncProgressUnit::ArtifactApplied, 0, 100, 100)
+    }
+
+    #[must_use]
+    pub const fn commitment_tail(start_block: u64, current_block: u64, target_block: u64) -> Self {
+        Self::with_unit(
+            SyncProgressStage::SynchronizingCommitments,
+            SyncProgressUnit::CommitmentTail,
+            start_block,
+            current_block,
+            target_block,
+        )
+    }
+
+    #[must_use]
+    pub const fn with_unit(
+        stage: SyncProgressStage,
+        unit: SyncProgressUnit,
+        start_block: u64,
+        current_block: u64,
+        target_block: u64,
+    ) -> Self {
         Self {
             stage,
+            unit,
             start_block,
             current_block,
             target_block,
@@ -98,6 +179,23 @@ pub enum PoiReadSource {
     PoiProxy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedArtifactSourceConfig {
+    pub trusted_publisher_pubkey: FixedBytes<32>,
+    pub manifest_source: IndexedArtifactManifestSource,
+    pub gateway_urls: Vec<Url>,
+    pub max_manifest_age: Option<Duration>,
+    pub concurrency: usize,
+    pub max_in_flight_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexedArtifactManifestSource {
+    Url(Url),
+    Cid(String),
+    IpnsName(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChainKey {
     pub chain_id: u64,
@@ -119,6 +217,7 @@ pub struct ChainConfig {
     pub poll_interval: Duration,
     pub finality_depth: u64,
     pub quick_sync_endpoint: Option<Url>,
+    pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     pub anchor_interval: u64,
     pub anchor_retention: usize,
     /// Optional pre-configured HTTP client (e.g. with proxy support) for
@@ -392,7 +491,7 @@ pub struct WalletConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChainConfigDefaults, SyncProgressStage, SyncProgressUpdate};
+    use super::{ChainConfigDefaults, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate};
 
     #[test]
     fn default_indexed_wallet_ranges_are_chain_specific() {
@@ -446,6 +545,26 @@ mod tests {
             SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
 
         assert_eq!(progress.percent(), 25);
+    }
+
+    #[test]
+    fn sync_progress_percent_uses_chunk_distance_for_utxo_prep() {
+        let progress = SyncProgressUpdate::artifact_chunk(
+            SyncProgressStage::PreparingUtxoIndex,
+            25,
+            100,
+            3,
+            12,
+        );
+
+        assert_eq!(progress.percent(), 25);
+        assert_eq!(
+            progress.unit,
+            SyncProgressUnit::ArtifactChunk {
+                completed: 3,
+                total: 12
+            }
+        );
     }
 
     #[test]

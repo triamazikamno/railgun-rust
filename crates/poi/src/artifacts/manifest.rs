@@ -49,6 +49,32 @@ impl ArtifactDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedDeltaDescriptor {
+    #[serde(flatten)]
+    pub artifact: ArtifactDescriptor,
+    pub start_index: u64,
+    pub end_index: u64,
+    pub tip_merkleroot: String,
+}
+
+impl RetainedDeltaDescriptor {
+    #[must_use]
+    pub fn new(
+        artifact: ArtifactDescriptor,
+        start_index: u64,
+        end_index: u64,
+        tip_merkleroot: impl Into<String>,
+    ) -> Self {
+        Self {
+            artifact,
+            start_index,
+            end_index,
+            tip_merkleroot: tip_merkleroot.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u16,
     pub issued_at_ms: u64,
@@ -149,6 +175,8 @@ pub struct ManifestEntry {
     pub chain_id: u64,
     pub base: ArtifactDescriptor,
     pub deltas: Vec<ArtifactDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_deltas: Vec<RetainedDeltaDescriptor>,
     pub blocked_shields: ArtifactDescriptor,
     pub current_tip_index: u64,
     pub current_tip_merkleroot: String,
@@ -354,6 +382,40 @@ mod tests {
     }
 
     #[test]
+    fn manifest_signature_covers_retained_delta_descriptor() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let mut manifest = manifest(vec![entry("a", 1)]);
+        manifest.entries[0].retained_deltas = vec![RetainedDeltaDescriptor::new(
+            descriptor("retained", 1),
+            10,
+            19,
+            prefixed_hex(&[8_u8; 32]),
+        )];
+        manifest.sign_manifest(&signing_key).expect("sign manifest");
+
+        manifest.entries[0].retained_deltas[0].end_index += 1;
+
+        assert!(manifest.verify_signature().is_err());
+    }
+
+    #[test]
+    fn manifest_entry_defaults_missing_retained_deltas() {
+        let json = r#"{
+            "list_key":"0x01",
+            "chain_id":1,
+            "base":{"cid":"bafybase","sha256":"0x00","byte_size":0},
+            "deltas":[],
+            "blocked_shields":{"cid":"bafyblocked","sha256":"0x00","byte_size":0},
+            "current_tip_index":0,
+            "current_tip_merkleroot":"0x00"
+        }"#;
+
+        let entry: ManifestEntry = serde_json::from_str(json).expect("entry decodes");
+
+        assert!(entry.retained_deltas.is_empty());
+    }
+
+    #[test]
     fn loads_publisher_signing_key_from_hex_file() {
         let path = std::env::temp_dir().join(format!("poi-test-key-{}", std::process::id()));
         fs::write(&path, hex::encode([42_u8; 32])).expect("write key");
@@ -380,6 +442,7 @@ mod tests {
             chain_id,
             base: descriptor("base", chain_id),
             deltas: vec![descriptor("delta", chain_id)],
+            retained_deltas: Vec::new(),
             blocked_shields: descriptor("blocked", chain_id),
             current_tip_index: chain_id * 10,
             current_tip_merkleroot: format!("0x{chain_id:064x}"),

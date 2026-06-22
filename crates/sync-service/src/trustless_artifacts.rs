@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::str;
 use std::time::{Instant, SystemTime};
@@ -87,6 +88,13 @@ pub(crate) struct TrustlessArtifactFetcher<'a> {
     gateways: &'a [Url],
 }
 
+pub(crate) struct TrustlessArtifactFetchResult {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) gateway_host: String,
+    pub(crate) gateway_index: usize,
+    pub(crate) gateway_count: usize,
+}
+
 impl<'a> TrustlessArtifactFetcher<'a> {
     pub(crate) const fn new(client: &'a reqwest::Client, gateways: &'a [Url]) -> Self {
         Self { client, gateways }
@@ -99,6 +107,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         let cid = parse_cid(cid)?;
         self.fetch_cid_bytes(cid, RetrievalLimits::manifest(), "manifest")
             .await
+            .map(|result| result.bytes)
     }
 
     pub(crate) async fn fetch_artifact_cid(
@@ -106,6 +115,17 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         cid: &str,
         byte_size: u64,
     ) -> Result<Vec<u8>, TrustlessArtifactError> {
+        let cid = parse_cid(cid)?;
+        self.fetch_cid_bytes(cid, RetrievalLimits::artifact(byte_size)?, "artifact")
+            .await
+            .map(|result| result.bytes)
+    }
+
+    pub(crate) async fn fetch_artifact_cid_with_metadata(
+        &self,
+        cid: &str,
+        byte_size: u64,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         let cid = parse_cid(cid)?;
         self.fetch_cid_bytes(cid, RetrievalLimits::artifact(byte_size)?, "artifact")
             .await
@@ -177,7 +197,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             return Err(last_error.unwrap_or(TrustlessArtifactError::NoValidIpnsRecords));
         }
 
-        candidates.sort_by(|left, right| right.sequence.cmp(&left.sequence));
+        candidates.sort_by_key(|candidate| Reverse(candidate.sequence));
         candidates.dedup_by(|left, right| left.sequence == right.sequence && left.cid == right.cid);
         Ok(candidates)
     }
@@ -187,7 +207,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         cid: Cid,
         limits: RetrievalLimits,
         resource: &'static str,
-    ) -> Result<Vec<u8>, TrustlessArtifactError> {
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         if self.gateways.is_empty() {
             return Err(TrustlessArtifactError::NoGateways);
         }
@@ -228,7 +248,12 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                             "POI artifact CID gateway fetch succeeded after fallback"
                         );
                     }
-                    return Ok(bytes);
+                    return Ok(TrustlessArtifactFetchResult {
+                        bytes,
+                        gateway_host: gateway_host.to_string(),
+                        gateway_index,
+                        gateway_count,
+                    });
                 }
                 Err(err) => {
                     debug!(
@@ -753,8 +778,8 @@ fn verify_ipns_public_key_binding(
     let actual_peer_id = public_key.to_peer_id();
     if actual_peer_id != expected_peer_id {
         return Err(TrustlessArtifactError::IpnsPublicKeyMismatch {
-            expected: expected_peer_id,
-            actual: actual_peer_id,
+            expected: Box::new(expected_peer_id),
+            actual: Box::new(actual_peer_id),
         });
     }
     Ok(())
@@ -973,7 +998,10 @@ pub(crate) enum TrustlessArtifactError {
         source: libp2p_identity::DecodingError,
     },
     #[error("IPNS record public key peer ID {actual} does not match configured name {expected}")]
-    IpnsPublicKeyMismatch { expected: PeerId, actual: PeerId },
+    IpnsPublicKeyMismatch {
+        expected: Box<PeerId>,
+        actual: Box<PeerId>,
+    },
     #[error("no valid IPNS records were returned by configured gateways")]
     NoValidIpnsRecords,
 }
