@@ -1,13 +1,30 @@
-use alloy::sol_types::SolEvent;
+use std::collections::HashMap;
+use std::sync::Arc;
 
+use alloy::sol_types::SolEvent;
+use tokio::sync::mpsc;
+
+use super::service::wait_for_wallet_ready;
 use super::{
-    CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletPageKind,
-    Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, Transact,
-    combined_log_event_signatures_for_range, complete_stream_checkpoint, forest_reorg_decision,
-    indexed_wallet_page_kind, indexed_wallet_to_block, pending_tip_from_block,
-    pending_tip_provider_covers_target, should_hedge_wallet_startup, wallet_backfill_from_block,
-    wallet_reorg_backfill_from_block, wallet_startup_hedge_block_count, wallet_sync_target,
+    CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletArtifactProbe,
+    IndexedWalletPageKind, Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, Transact,
+    WalletBackfill, artifact_failure_can_fallback_to_squid,
+    combined_log_event_signatures_for_range, complete_stream_checkpoint, pending_tip_from_block,
+    pending_tip_provider_covers_target, send_wallet_startup_events, should_hedge_wallet_startup,
+    squid_tail_target_after_artifact, wallet_backfill_from_block, wallet_reorg_backfill_from_block,
+    wallet_startup_hedge_block_count, wallet_sync_target,
 };
+use crate::types::{BackfillEvent, LogBatch};
+
+fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
+    let (sender, _receiver) = mpsc::channel(1);
+    WalletBackfill {
+        from_block: 100,
+        target_block,
+        follow_safe_head,
+        sender,
+    }
+}
 
 #[test]
 fn complete_stream_checkpoint_uses_target_for_non_full_pages() {
@@ -27,6 +44,68 @@ fn complete_stream_checkpoint_stops_before_partial_final_block() {
 fn wallet_backfill_starts_after_indexed_checkpoint() {
     assert_eq!(wallet_backfill_from_block(99, 10), 100);
     assert_eq!(wallet_backfill_from_block(0, 10), 10);
+}
+
+#[test]
+fn open_ended_wallet_backfill_target_tracks_safe_head() {
+    let mut cursor = test_wallet_backfill(100, true);
+
+    cursor.refresh_target(105);
+    assert_eq!(cursor.target_block, 105);
+
+    cursor.refresh_target(103);
+    assert_eq!(cursor.target_block, 105);
+}
+
+#[test]
+fn fixed_wallet_backfill_target_does_not_follow_safe_head() {
+    let mut cursor = test_wallet_backfill(100, false);
+
+    cursor.refresh_target(105);
+
+    assert_eq!(cursor.target_block, 100);
+}
+
+#[test]
+fn zero_wallet_backfill_target_initializes_from_safe_head() {
+    let mut cursor = test_wallet_backfill(0, false);
+
+    cursor.refresh_target(105);
+
+    assert_eq!(cursor.target_block, 105);
+}
+
+#[test]
+fn indexed_wallet_artifact_target_uses_lesser_of_artifact_height_and_safe_head() {
+    let probe = IndexedWalletArtifactProbe {
+        latest_indexed_block: 150,
+        catalog_count: 1,
+    };
+
+    assert_eq!(probe.catch_up_target(200), 150);
+    assert_eq!(probe.catch_up_target(120), 120);
+}
+
+#[test]
+fn squid_tail_after_artifact_continues_only_when_squid_covers_more_blocks() {
+    assert_eq!(
+        squid_tail_target_after_artifact(151, 150, 200, 180),
+        Some(180)
+    );
+    assert_eq!(
+        squid_tail_target_after_artifact(151, 150, 200, 250),
+        Some(200)
+    );
+    assert_eq!(squid_tail_target_after_artifact(151, 150, 200, 150), None);
+    assert_eq!(squid_tail_target_after_artifact(201, 150, 200, 250), None);
+    assert_eq!(squid_tail_target_after_artifact(151, 200, 200, 250), None);
+}
+
+#[test]
+fn artifact_failure_falls_back_to_squid_only_before_checkpoint() {
+    assert!(artifact_failure_can_fallback_to_squid(true, 99, 99));
+    assert!(!artifact_failure_can_fallback_to_squid(true, 100, 99));
+    assert!(!artifact_failure_can_fallback_to_squid(false, 99, 99));
 }
 
 #[test]
@@ -65,15 +144,15 @@ fn wallet_sync_target_caps_to_debug_block() {
 #[test]
 fn forest_reorg_decision_skips_without_comparable_hashes() {
     assert_eq!(
-        forest_reorg_decision(100, 100, [0u8; 32], Some([1u8; 32])),
+        ForestReorgDecision::from_confirmed_hash(100, 100, [0u8; 32], Some([1u8; 32])),
         ForestReorgDecision::Skip
     );
     assert_eq!(
-        forest_reorg_decision(100, 99, [1u8; 32], Some([2u8; 32])),
+        ForestReorgDecision::from_confirmed_hash(100, 99, [1u8; 32], Some([2u8; 32])),
         ForestReorgDecision::Skip
     );
     assert_eq!(
-        forest_reorg_decision(100, 100, [1u8; 32], None),
+        ForestReorgDecision::from_confirmed_hash(100, 100, [1u8; 32], None),
         ForestReorgDecision::Skip
     );
 }
@@ -81,11 +160,11 @@ fn forest_reorg_decision_skips_without_comparable_hashes() {
 #[test]
 fn forest_reorg_decision_requires_confirmed_mismatch() {
     assert_eq!(
-        forest_reorg_decision(100, 100, [1u8; 32], Some([1u8; 32])),
+        ForestReorgDecision::from_confirmed_hash(100, 100, [1u8; 32], Some([1u8; 32])),
         ForestReorgDecision::Match
     );
     assert_eq!(
-        forest_reorg_decision(100, 100, [1u8; 32], Some([2u8; 32])),
+        ForestReorgDecision::from_confirmed_hash(100, 100, [1u8; 32], Some([2u8; 32])),
         ForestReorgDecision::Mismatch
     );
 }
@@ -93,11 +172,12 @@ fn forest_reorg_decision_requires_confirmed_mismatch() {
 #[test]
 fn wallet_startup_hedge_is_limited_to_one_rpc_range() {
     assert_eq!(wallet_startup_hedge_block_count(100, 10, 110), Some(10));
-    assert!(should_hedge_wallet_startup(100, 10, 110, 10));
-    assert!(!should_hedge_wallet_startup(100, 10, 111, 10));
-    assert!(!should_hedge_wallet_startup(100, 10, 0, 10));
-    assert!(!should_hedge_wallet_startup(100, 10, 110, 0));
-    assert!(!should_hedge_wallet_startup(110, 10, 110, 10));
+    assert!(should_hedge_wallet_startup(100, 10, 110, 10, false));
+    assert!(!should_hedge_wallet_startup(100, 10, 111, 10, false));
+    assert!(!should_hedge_wallet_startup(100, 10, 0, 10, false));
+    assert!(!should_hedge_wallet_startup(100, 10, 110, 0, false));
+    assert!(!should_hedge_wallet_startup(110, 10, 110, 10, false));
+    assert!(!should_hedge_wallet_startup(100, 10, 110, 10, true));
 }
 
 #[test]
@@ -136,34 +216,101 @@ fn combined_log_event_signatures_skip_boundary_crossing_ranges() {
 #[test]
 fn indexed_wallet_page_kind_is_legacy_only_before_v2_start() {
     assert_eq!(
-        indexed_wallet_page_kind(99, 100),
+        IndexedWalletPageKind::for_from_block(99, 100),
         IndexedWalletPageKind::Legacy
     );
     assert_eq!(
-        indexed_wallet_page_kind(100, 100),
+        IndexedWalletPageKind::for_from_block(100, 100),
         IndexedWalletPageKind::Modern
     );
     assert_eq!(
-        indexed_wallet_page_kind(99, 0),
+        IndexedWalletPageKind::for_from_block(99, 0),
         IndexedWalletPageKind::Modern
     );
 }
 
 #[test]
 fn indexed_wallet_to_block_splits_at_v2_start() {
-    assert_eq!(indexed_wallet_to_block(50, 200_000, 100, 300_000), 99);
-    assert_eq!(indexed_wallet_to_block(100, 200_000, 100, 300_000), 200_000);
-    assert_eq!(indexed_wallet_to_block(50, 60, 100, 300_000), 60);
+    assert_eq!(
+        IndexedWalletPageKind::Legacy.to_block(50, 200_000, 100, 300_000),
+        99
+    );
+    assert_eq!(
+        IndexedWalletPageKind::Modern.to_block(100, 200_000, 100, 300_000),
+        200_000
+    );
+    assert_eq!(
+        IndexedWalletPageKind::Legacy.to_block(50, 60, 100, 300_000),
+        60
+    );
 }
 
 #[test]
 fn indexed_wallet_to_block_uses_configured_range() {
     assert_eq!(
-        indexed_wallet_to_block(100, 10_000_000, 0, 1_000_000),
+        IndexedWalletPageKind::Modern.to_block(100, 10_000_000, 0, 1_000_000),
         1_000_099
     );
     assert_eq!(
-        indexed_wallet_to_block(100, 10_000_000, 0, 5_000_000),
+        IndexedWalletPageKind::Modern.to_block(100, 10_000_000, 0, 5_000_000),
         5_000_099
     );
+}
+
+#[tokio::test]
+async fn txid_background_waits_for_wallet_ready() {
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(wait_for_wallet_ready(ready_rx, cancel));
+
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+
+    ready_tx.send(true).expect("ready receiver");
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("ready wait completed")
+        .expect("ready task completed");
+    assert!(ready);
+}
+
+#[tokio::test]
+async fn txid_background_wait_exits_when_wallet_cancelled() {
+    let (_ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(wait_for_wallet_ready(ready_rx, cancel.clone()));
+
+    cancel.cancel();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("ready wait completed")
+        .expect("ready task completed");
+    assert!(!ready);
+}
+
+#[tokio::test]
+async fn wallet_startup_events_send_done_before_follow_safe_head_backfill_runs() {
+    let (sender, mut receiver) = mpsc::channel(4);
+    let batch = Arc::new(LogBatch {
+        from_block: 101,
+        to_block: 105,
+        logs: Vec::new(),
+        block_timestamps: HashMap::new(),
+        to_block_hash: None,
+    });
+
+    let sent =
+        send_wallet_startup_events("test", vec![BackfillEvent::Logs(batch)], Some(105), &sender)
+            .await;
+
+    assert!(sent);
+    let Some(BackfillEvent::Logs(batch)) = receiver.recv().await else {
+        panic!("startup logs should be sent first");
+    };
+    assert_eq!(batch.to_block, 105);
+    let Some(BackfillEvent::Done { last_block }) = receiver.recv().await else {
+        panic!("startup done should be sent after logs");
+    };
+    assert_eq!(last_block, 105);
+    assert!(receiver.try_recv().is_err());
 }

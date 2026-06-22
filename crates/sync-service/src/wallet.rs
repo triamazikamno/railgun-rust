@@ -52,13 +52,12 @@ use url::Url;
 
 use crate::poi_artifacts::{PersistedPoiArtifactCache, PoiArtifactIngestor, load_persisted_cache};
 use crate::txid_cache::{
-    TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated, sync_txid_public_cache,
-    txid_public_cached_latest_validated, txid_public_proof_for_recovered_output,
-    txid_public_proof_for_recovered_output_at_index,
+    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
+    txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
 use crate::types::{
-    BackfillEvent, PoiReadSource, SharedLogBatch, WalletCacheStore, WalletConfig,
-    WalletLocalPoiCaches,
+    BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch, WalletCacheStore,
+    WalletConfig, WalletLocalPoiCaches,
 };
 
 mod delta;

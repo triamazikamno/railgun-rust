@@ -13,6 +13,8 @@ use railgun_wallet::{ProverService, WalletUtxo};
 use tokio::sync::{RwLock, mpsc, watch};
 use url::Url;
 
+use crate::indexed_artifacts::{ChainScope, ChainType};
+
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +226,26 @@ pub struct ChainConfig {
     /// quick-sync and other internal HTTP requests.
     pub http_client: Option<reqwest::Client>,
     pub progress_tx: Option<SyncProgressSender>,
+}
+
+impl ChainConfig {
+    pub(crate) const fn indexed_artifact_scope(&self) -> ChainScope {
+        ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: self.chain_id,
+            railgun_contract: self.contract,
+        }
+    }
+
+    pub(crate) fn should_skip_merkle_artifact_catch_up(
+        &self,
+        from_block: u64,
+        safe_head: u64,
+    ) -> bool {
+        self.indexed_artifact_source.is_some()
+            && from_block <= safe_head
+            && safe_head.saturating_sub(from_block).saturating_add(1) <= self.block_range
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -610,6 +632,7 @@ pub enum BackfillRequest {
         cache_key: String,
         from_block: u64,
         to_block: u64,
+        follow_safe_head: bool,
         sender: mpsc::Sender<BackfillEvent>,
     },
     Reset {

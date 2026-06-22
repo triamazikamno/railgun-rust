@@ -186,6 +186,41 @@ impl MerkleForest {
         Ok(count)
     }
 
+    pub fn replace_tree_ordered_leaves<I>(
+        &mut self,
+        tree_number: u32,
+        leaf_count: u64,
+        leaves: I,
+    ) -> Result<usize, SyncError>
+    where
+        I: IntoIterator<Item = U256>,
+    {
+        if leaf_count > TREE_LEAF_COUNT {
+            return Err(SyncError::UnexpectedFormat(format!(
+                "merkle tree leaf count {leaf_count} exceeds capacity {TREE_LEAF_COUNT}"
+            )));
+        }
+        let leaf_count = usize::try_from(leaf_count).map_err(|_| {
+            SyncError::UnexpectedFormat("merkle tree leaf count overflows usize".to_string())
+        })?;
+        let mut tree = MerkleTree::default();
+        let mut count = 0;
+        for (position, leaf) in leaves.into_iter().take(leaf_count).enumerate() {
+            if leaf == MERKLE_ZERO_VALUE {
+                continue;
+            }
+            tree.insert(
+                u64::try_from(position).map_err(|_| {
+                    SyncError::UnexpectedFormat("merkle tree position overflows u64".to_string())
+                })?,
+                leaf,
+            )?;
+            count += 1;
+        }
+        self.trees.insert(tree_number, tree);
+        Ok(count)
+    }
+
     pub fn compute_roots(&mut self) {
         self.trees.par_iter_mut().for_each(|(_, tree)| {
             tree.compute_root();

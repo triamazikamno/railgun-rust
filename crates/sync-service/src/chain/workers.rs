@@ -276,10 +276,13 @@ pub(super) const fn pending_tip_provider_covers_target(
 }
 
 pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: CancellationToken) {
-    let Some(endpoint) = service.chain.quick_sync_endpoint.clone() else {
+    let endpoint = service.chain.quick_sync_endpoint.clone();
+    let indexed_artifact_source = service.chain.indexed_artifact_source.clone();
+    if endpoint.is_none() && indexed_artifact_source.is_none() {
         return;
-    };
+    }
     let chain_id = service.chain.chain_id;
+    let railgun_contract = service.chain.contract.to_string();
     let http_client = service.chain.http_client.clone();
     let db = service.db.clone();
     tokio::spawn(
@@ -290,9 +293,15 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
                     chain_id,
                     txid_version: DEFAULT_TXID_VERSION,
                 };
-                if let Err(err) =
-                    sync_txid_public_cache_to_graph_tip(&db, &endpoint, http_client.as_ref(), key)
-                        .await
+                let cache = TxidPublicCache::new(&db, key);
+                if let Err(err) = cache
+                    .sync_to_indexed_tip(
+                        endpoint.as_ref(),
+                        http_client.as_ref(),
+                        &railgun_contract,
+                        indexed_artifact_source.as_ref(),
+                    )
+                    .await
                 {
                     warn!(?err, chain_id, "TXID public cache background sync failed");
                 }
@@ -475,8 +484,8 @@ pub(super) fn spawn_backfill_loop(
                     _ = cancel.cancelled() => break,
                     Some(request) = backfill_rx.recv() => {
                         match request {
-                            BackfillRequest::Add { cache_key, from_block, to_block, sender } => {
-                                cursors.insert(cache_key, WalletBackfill { from_block, target_block: to_block, sender });
+                            BackfillRequest::Add { cache_key, from_block, to_block, follow_safe_head, sender } => {
+                                cursors.insert(cache_key, WalletBackfill { from_block, target_block: to_block, follow_safe_head, sender });
                             }
                             BackfillRequest::Reset { cache_key, from_block } => {
                                 if let Some(cursor) = cursors.get_mut(&cache_key) {
@@ -497,10 +506,8 @@ pub(super) fn spawn_backfill_loop(
             }
 
             let safe_head = *safe_head_rx.borrow();
-            if safe_head > 0 {
-                for cursor in cursors.values_mut().filter(|cursor| cursor.target_block == 0) {
-                    cursor.target_block = safe_head;
-                }
+            for cursor in cursors.values_mut() {
+                cursor.refresh_target(safe_head);
             }
 
             let done_keys: Vec<_> = cursors
@@ -618,6 +625,7 @@ pub(super) fn spawn_backfill_loop(
                     });
 
                     let keys: Vec<String> = cursors.keys().cloned().collect();
+                    let latest_safe_head = *safe_head_rx.borrow();
                     for key in keys {
                         if let Some(cursor) = cursors.get_mut(&key)
                             && cursor.from_block <= to_block
@@ -632,6 +640,7 @@ pub(super) fn spawn_backfill_loop(
                                 );
                             }
                             cursor.from_block = to_block.saturating_add(1);
+                            cursor.refresh_target(latest_safe_head);
                             if cursor.from_block > cursor.target_block {
                                 if let Err(err) = cursor
                                     .sender

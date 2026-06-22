@@ -24,7 +24,7 @@ use super::{
     wallet_poi_status_client, wallet_poi_status_refresh_needed,
     wallet_poi_status_refresh_needed_for_selection,
 };
-use crate::txid_cache::{TxidPublicCacheKey, sync_txid_public_cache};
+use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey, TxidPublicLatestValidated};
 use crate::types::{
     ChainKey, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, WalletCacheStore,
     WalletConfig,
@@ -1260,7 +1260,15 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
         chain_id: 1,
         txid_version: DEFAULT_TXID_VERSION,
     };
-    sync_txid_public_cache(&store, &graph_endpoint, None, cache_key, 0, None)
+    TxidPublicCache::new(&store, cache_key)
+        .sync(
+            &graph_endpoint,
+            None,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+        )
         .await
         .expect("seed public txid cache");
     let poi_mock = spawn_poi_rpc(serde_json::json!(false)).await;
@@ -1281,6 +1289,7 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
         cfg: &cfg,
         poi_client: &poi_client,
         http_client: None,
+        indexed_artifact_source: None,
         source_tx_hash: output.utxo.source.tx_hash,
         output_commitment: output.utxo.poi.commitment,
         recovery_chunk: &recovery_chunk,

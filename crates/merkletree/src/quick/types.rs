@@ -27,28 +27,6 @@ pub(crate) struct Commitment {
     pub hash: U256,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct Nullifier {
-    #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_64")]
-    pub id: FixedBytes<64>,
-    #[serde(rename = "blockNumber")]
-    pub block_number: U256,
-    #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct Unshield {
-    #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_36")]
-    pub id: FixedBytes<36>,
-    #[serde(rename = "blockNumber")]
-    pub block_number: U256,
-    #[serde(rename = "eventLogIndex")]
-    pub event_log_index: U256,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexedTransactCommitment {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_64")]
@@ -247,13 +225,6 @@ where
 }
 
 fn deserialize_indexed_fixed_bytes_32<'de, D>(deserializer: D) -> Result<FixedBytes<32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_indexed_fixed_bytes(deserializer)
-}
-
-fn deserialize_indexed_fixed_bytes_36<'de, D>(deserializer: D) -> Result<FixedBytes<36>, D::Error>
 where
     D: Deserializer<'de>,
 {

@@ -22,7 +22,10 @@ pub(crate) fn spawn_wallet_worker(
         db,
         rpcs,
         http_client,
+        indexed_artifact_source,
         forest,
+        backfill_tx,
+        backfill_sender,
     } = services;
     let cache_store = wallet_cache_store(&db, &cfg);
     let (ready_tx, ready_rx) = watch::channel(false);
@@ -61,6 +64,7 @@ pub(crate) fn spawn_wallet_worker(
         drop(snapshot);
 
         let mut backfill_complete_block: Option<u64> = None;
+        let mut live_receiver_lagged = false;
         let mut persist_state = WalletPersistState::default();
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = wallet_poi_status_client(&cfg.poi_rpc_url, http_client.as_ref());
@@ -170,6 +174,7 @@ pub(crate) fn spawn_wallet_worker(
                         cfg: &cfg,
                         rpcs: rpcs.as_ref(),
                         http_client: http_client.as_ref(),
+                        indexed_artifact_source: indexed_artifact_source.as_ref(),
                         forest: &forest,
                         utxos: &utxos,
                         client,
@@ -270,6 +275,7 @@ pub(crate) fn spawn_wallet_worker(
                         cfg: &cfg,
                         rpcs: rpcs.as_ref(),
                         http_client: http_client.as_ref(),
+                        indexed_artifact_source: indexed_artifact_source.as_ref(),
                         forest: &forest,
                         utxos: &utxos,
                         client,
@@ -581,6 +587,7 @@ pub(crate) fn spawn_wallet_worker(
                                         cfg: &cfg,
                                         rpcs: rpcs.as_ref(),
                                         http_client: http_client.as_ref(),
+                                        indexed_artifact_source: indexed_artifact_source.as_ref(),
                                         forest: &forest,
                                         utxos: &utxos,
                                         client,
@@ -644,6 +651,7 @@ pub(crate) fn spawn_wallet_worker(
                             }
                             worker_handle.notify_if_changed(changed);
                             backfill_complete_block = None;
+                            live_rx = live_rx.resubscribe();
                             if let Err(err) = ready_tx.send(false) {
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
                             }
@@ -660,7 +668,7 @@ pub(crate) fn spawn_wallet_worker(
                         }
                     }
                 }
-                result = live_rx.recv() => {
+                result = live_rx.recv(), if backfill_complete_block.is_some() => {
                     match result {
                         Ok(batch) => {
                             if cfg.sync_to_block.is_some() {
@@ -669,8 +677,44 @@ pub(crate) fn spawn_wallet_worker(
                             if backfill_complete_block.is_none()
                                 || batch.to_block <= last_scanned
                             {
+                                live_receiver_lagged = false;
                                 continue;
                             }
+                            let expected_from_block = last_scanned.saturating_add(1);
+                            if batch.from_block > expected_from_block {
+                                warn!(
+                                    cache_key = %cfg.cache_key,
+                                    expected_from_block,
+                                    batch_from_block = batch.from_block,
+                                    batch_to_block = batch.to_block,
+                                    live_receiver_lagged,
+                                    "wallet live log gap detected; requesting backfill"
+                                );
+                                match backfill_tx
+                                    .send(crate::types::BackfillRequest::Add {
+                                        cache_key: cfg.cache_key.clone(),
+                                        from_block: expected_from_block,
+                                        to_block: batch.to_block,
+                                        follow_safe_head: true,
+                                        sender: backfill_sender.clone(),
+                                    })
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        backfill_complete_block = None;
+                                        live_rx = live_rx.resubscribe();
+                                        if let Err(err) = ready_tx.send(false) {
+                                            debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(?err, cache_key = %cfg.cache_key, "failed to request wallet live gap backfill");
+                                    }
+                                }
+                                live_receiver_lagged = false;
+                                continue;
+                            }
+                            live_receiver_lagged = false;
                             if batch.logs.is_empty() {
                                 last_scanned = batch.to_block;
                                 worker_handle.set_last_scanned(last_scanned);
@@ -738,6 +782,7 @@ pub(crate) fn spawn_wallet_worker(
                                             cfg: &cfg,
                                             rpcs: rpcs.as_ref(),
                                             http_client: http_client.as_ref(),
+                                            indexed_artifact_source: indexed_artifact_source.as_ref(),
                                             forest: &forest,
                                             utxos: &utxos,
                                             client,
@@ -786,8 +831,9 @@ pub(crate) fn spawn_wallet_worker(
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            warn!(cache_key = %cfg.cache_key, "wallet live log receiver lagged");
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            live_receiver_lagged = true;
+                            warn!(cache_key = %cfg.cache_key, skipped, "wallet live log receiver lagged");
                         }
                     }
                 }
@@ -815,4 +861,224 @@ pub(super) fn dedupe_wallet_utxos(utxos: &mut Vec<WalletUtxo>) {
 fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
     let spent = utxos.iter().filter(|utxo| utxo.is_spent()).count();
     (utxos.len().saturating_sub(spent), spent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use alloy::primitives::{Address, U256};
+    use broadcaster_core::crypto::railgun::ViewingKeyData;
+    use broadcaster_core::query_rpc_pool::QueryRpcPool;
+    use local_db::{DbConfig, DbStore};
+    use merkletree::tree::MerkleForest;
+    use tokio::sync::{RwLock, broadcast, mpsc};
+    use url::Url;
+
+    use crate::types::{BackfillRequest, ChainKey, LogBatch, PoiReadSource, WalletConfig};
+
+    #[tokio::test]
+    async fn wallet_worker_applies_live_batch_queued_before_done() {
+        let root_dir = temp_db_root("wallet-worker-live-before-done");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+        live_tx
+            .send(Arc::new(LogBatch {
+                from_block: 101,
+                to_block: 101,
+                logs: Vec::new(),
+                block_timestamps: HashMap::new(),
+                to_block_hash: None,
+            }))
+            .expect("live receiver");
+        tokio::task::yield_now().await;
+        assert_eq!(handle.last_scanned(), 100);
+
+        backfill_tx
+            .send(BackfillEvent::Done { last_block: 100 })
+            .await
+            .expect("send backfill done");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() != 101 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued live batch applied after done");
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_requests_backfill_after_live_receiver_lag() {
+        let root_dir = temp_db_root("wallet-worker-live-lag-gap");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, mut backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+        for block in 101..=120 {
+            live_tx
+                .send(Arc::new(LogBatch {
+                    from_block: block,
+                    to_block: block,
+                    logs: Vec::new(),
+                    block_timestamps: HashMap::new(),
+                    to_block_hash: None,
+                }))
+                .expect("live receiver");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(handle.last_scanned(), 100);
+
+        backfill_tx
+            .send(BackfillEvent::Done { last_block: 100 })
+            .await
+            .expect("send backfill done");
+        let request = tokio::time::timeout(Duration::from_secs(1), backfill_request_rx.recv())
+            .await
+            .expect("live gap backfill requested")
+            .expect("backfill request channel open");
+        let BackfillRequest::Add {
+            cache_key,
+            from_block,
+            to_block,
+            follow_safe_head,
+            ..
+        } = request
+        else {
+            panic!("expected add backfill request");
+        };
+        assert_eq!(cache_key, "test");
+        assert_eq!(from_block, 101);
+        assert!(to_block > from_block);
+        assert!(follow_safe_head);
+        assert_eq!(handle.last_scanned(), 100);
+
+        backfill_tx
+            .send(BackfillEvent::Logs(Arc::new(LogBatch {
+                from_block,
+                to_block,
+                logs: Vec::new(),
+                block_timestamps: HashMap::new(),
+                to_block_hash: None,
+            })))
+            .await
+            .expect("send recovery backfill logs");
+        backfill_tx
+            .send(BackfillEvent::Done {
+                last_block: to_block,
+            })
+            .await
+            .expect("send recovery backfill done");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() != to_block {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery backfill applied");
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    fn wallet_config() -> WalletConfig {
+        WalletConfig {
+            chain: ChainKey {
+                chain_id: 1,
+                contract: Address::ZERO,
+            },
+            cache_key: "test".to_string(),
+            start_block: Some(0),
+            sync_to_block: None,
+            quick_sync_endpoint: None,
+            scan_keys: ViewingKeyData {
+                viewing_private_key: [0u8; 32],
+                viewing_public_key: [0u8; 32],
+                nullifying_key: U256::ZERO,
+                master_public_key: U256::ZERO,
+            },
+            spending_public_key: None,
+            progress_tx: None,
+            cache_store: None,
+            poi_recovery_prover: None,
+            poi_rpc_url: Url::parse("http://127.0.0.1:1").expect("poi rpc url"),
+            poi_read_source: PoiReadSource::PoiProxy,
+            local_poi_caches: None,
+            manage_local_poi_cache: false,
+            use_indexed_wallet_catch_up: true,
+        }
+    }
+
+    fn temp_db_root(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sync-service-{name}-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp db dir");
+        dir
+    }
 }

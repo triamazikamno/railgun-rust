@@ -1,7 +1,8 @@
 use super::*;
 mod public_cache;
 
-use public_cache::recovered_output_txid_data;
+#[cfg(not(test))]
+use public_cache::{PublicCacheTxidRecoveryRequest, recovered_output_txid_data_from_public_cache};
 #[cfg(test)]
 pub(super) use public_cache::{
     PublicCacheTxidRecoveryRequest, recovered_output_txid_data_from_public_cache,
@@ -27,6 +28,7 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
     pub(super) cfg: &'a WalletConfig,
     pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
+    pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(super) forest: &'a MerkleForest,
     pub(super) poi_client: &'a PoiRpcClient,
     pub(super) proof_source: &'a (dyn PoiMerkleProofSource + 'a),
@@ -267,29 +269,32 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         );
 
         let txid_data_started = Instant::now();
-        let txid_data = match recovered_output_txid_data(
-            request.db,
-            request.cfg,
-            request.poi_client,
-            request.http_client,
-            source_tx_hash,
-            output_commitment,
-            &recovery_chunk,
-        )
-        .await
-        {
-            Ok(txid_data) => txid_data,
-            Err(failure) => {
-                record_output_poi_recovery_failure(
-                    request.db,
-                    request.cfg,
-                    candidate,
-                    failure,
-                    now,
-                );
-                continue;
-            }
-        };
+        let txid_data =
+            match recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
+                db: request.db,
+                cfg: request.cfg,
+                poi_client: request.poi_client,
+                http_client: request.http_client,
+                indexed_artifact_source: request.indexed_artifact_source,
+                source_tx_hash,
+                output_commitment,
+                recovery_chunk: &recovery_chunk,
+                started: Instant::now(),
+            })
+            .await
+            {
+                Ok(txid_data) => txid_data,
+                Err(failure) => {
+                    record_output_poi_recovery_failure(
+                        request.db,
+                        request.cfg,
+                        candidate,
+                        failure,
+                        now,
+                    );
+                    continue;
+                }
+            };
         let txid_data_elapsed_ms = txid_data_started.elapsed().as_millis();
         debug!(
             cache_key = %request.cfg.cache_key,

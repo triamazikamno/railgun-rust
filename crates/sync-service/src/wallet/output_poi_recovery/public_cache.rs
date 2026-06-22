@@ -11,33 +11,11 @@ pub(in crate::wallet) struct PublicCacheTxidRecoveryRequest<'a> {
     pub(in crate::wallet) cfg: &'a WalletConfig,
     pub(in crate::wallet) poi_client: &'a PoiRpcClient,
     pub(in crate::wallet) http_client: Option<&'a reqwest::Client>,
+    pub(in crate::wallet) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(in crate::wallet) source_tx_hash: FixedBytes<32>,
     pub(in crate::wallet) output_commitment: FixedBytes<32>,
     pub(in crate::wallet) recovery_chunk: &'a RecoveryChunk,
     pub(in crate::wallet) started: Instant,
-}
-
-pub(super) async fn recovered_output_txid_data(
-    db: &DbStore,
-    cfg: &WalletConfig,
-    poi_client: &PoiRpcClient,
-    http_client: Option<&reqwest::Client>,
-    source_tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-    recovery_chunk: &RecoveryChunk,
-) -> Result<RecoveredOutputTxidData, RecoveryFailure> {
-    let started = Instant::now();
-    recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
-        db,
-        cfg,
-        poi_client,
-        http_client,
-        source_tx_hash,
-        output_commitment,
-        recovery_chunk,
-        started,
-    })
-    .await
 }
 
 pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
@@ -48,66 +26,73 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         cfg,
         poi_client,
         http_client,
+        indexed_artifact_source,
         source_tx_hash,
         output_commitment,
         recovery_chunk,
         started,
     } = request;
-    let Some(endpoint) = cfg.quick_sync_endpoint.as_ref() else {
+    let endpoint = cfg.quick_sync_endpoint.as_ref();
+    if endpoint.is_none() && indexed_artifact_source.is_none() {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::TxFetchFailed,
             "no quick-sync endpoint configured for TXID proof recovery",
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
-    };
+    }
     let cache_key = TxidPublicCacheKey {
         chain_type: EVM_CHAIN_TYPE,
         chain_id: cfg.chain.chain_id,
         txid_version: DEFAULT_TXID_VERSION,
     };
+    let cache = TxidPublicCache::new(db, cache_key);
     let latest_validated_started = Instant::now();
     let required_txid_index = recovery_chunk.target_txid_index.unwrap_or(0);
-    let (latest_validated_index, latest_validated_root, latest_validated_source) =
-        match txid_public_cached_latest_validated(db, cache_key)
-            .map_err(txid_public_cache_failure)?
-        {
-            Some(latest) if latest.txid_index >= required_txid_index => {
-                (latest.txid_index, latest.merkleroot, "cache")
-            }
-            _ => {
-                let latest_validated = poi_client
-                    .latest_validated_railgun_txid(
-                        DEFAULT_TXID_VERSION,
-                        EVM_CHAIN_TYPE,
-                        cfg.chain.chain_id,
+    let (latest_validated_index, latest_validated_root, latest_validated_source) = match cache
+        .cached_latest_validated()
+        .map_err(txid_public_cache_failure)?
+    {
+        Some(latest) if latest.txid_index >= required_txid_index => {
+            (latest.txid_index, latest.merkleroot, "cache")
+        }
+        _ => {
+            let latest_validated = poi_client
+                .latest_validated_railgun_txid(
+                    DEFAULT_TXID_VERSION,
+                    EVM_CHAIN_TYPE,
+                    cfg.chain.chain_id,
+                )
+                .await
+                .map_err(|err| {
+                    RecoveryFailure::retryable(
+                        OutputPoiRecoveryStatus::MissingMerkleProof,
+                        format!("fetch latest validated TXID failed: {err}"),
+                        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                     )
-                    .await
-                    .map_err(|err| {
-                        RecoveryFailure::retryable(
-                            OutputPoiRecoveryStatus::MissingMerkleProof,
-                            format!("fetch latest validated TXID failed: {err}"),
-                            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                        )
-                    })?;
-                let latest = TxidPublicLatestValidated {
-                    txid_index: latest_validated_txid_index(&latest_validated)?,
-                    merkleroot: latest_validated_txid_root(&latest_validated)?,
-                };
-                (latest.txid_index, latest.merkleroot, "rpc")
-            }
-        };
+                })?;
+            let latest = TxidPublicLatestValidated {
+                txid_index: latest_validated_txid_index(&latest_validated)?,
+                merkleroot: latest_validated_txid_root(&latest_validated)?,
+            };
+            (latest.txid_index, latest.merkleroot, "rpc")
+        }
+    };
     let latest_validated_elapsed_ms = latest_validated_started.elapsed().as_millis();
     let cache_sync_started = Instant::now();
-    sync_txid_public_cache(
-        db,
-        endpoint,
-        http_client,
-        cache_key,
-        latest_validated_index,
-        latest_validated_root,
-    )
-    .await
-    .map_err(txid_public_cache_failure)?;
+    let railgun_contract = cfg.chain.contract.to_string();
+    cache
+        .sync_with_artifact_source(
+            endpoint,
+            http_client,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: latest_validated_index,
+                merkleroot: latest_validated_root,
+            },
+            indexed_artifact_source,
+        )
+        .await
+        .map_err(txid_public_cache_failure)?;
     let cache_sync_elapsed_ms = cache_sync_started.elapsed().as_millis();
 
     let expected_leaf = railgun_txid_leaf_hash_with_output_start(
@@ -251,6 +236,7 @@ pub(super) fn txid_public_cache_failure(err: TxidPublicCacheError) -> RecoveryFa
         | TxidPublicCacheError::Encode(_)
         | TxidPublicCacheError::Decode(_)
         | TxidPublicCacheError::Sync(_)
+        | TxidPublicCacheError::Artifact(_)
         | TxidPublicCacheError::MetadataMismatch(_) => OutputPoiRecoveryStatus::TxFetchFailed,
     };
     let message = format!("TXID public cache failed: {err}");

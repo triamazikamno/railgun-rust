@@ -11,11 +11,11 @@ pub use railgun_indexed_artifacts::{
     DatasetDescriptorMetadata, INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
     INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION, INDEXED_ARTIFACT_CHUNK_MAGIC,
     INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION, INDEXED_ARTIFACT_MAX_COMPRESSED_CHUNK_BYTES,
-    IndexedArtifactCatalog, IndexedArtifactCatalogDescriptor, IndexedArtifactChainEntry,
-    IndexedArtifactChunkDescriptor, IndexedArtifactChunkEnvelope,
-    IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection, IndexedArtifactError,
-    IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind, IndexedDatasetKind,
-    LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm, format_scope, prefixed_hex,
+    IndexedArtifactCatalog, IndexedArtifactChainEntry, IndexedArtifactChunkEnvelope,
+    IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection, IndexedArtifactDescriptor,
+    IndexedArtifactError, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
+    IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm,
+    format_scope, prefixed_hex,
 };
 
 use crate::trustless_artifacts::{TrustlessArtifactError, TrustlessArtifactFetcher};
@@ -23,7 +23,7 @@ use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedIndexedArtifactChunk {
-    pub descriptor: IndexedArtifactChunkDescriptor,
+    pub descriptor: IndexedArtifactDescriptor,
     pub bytes: Vec<u8>,
 }
 
@@ -119,7 +119,7 @@ impl VerifiedIndexedArtifactChunkStager {
 
     fn validate_stage_descriptor(
         &self,
-        descriptor: &IndexedArtifactChunkDescriptor,
+        descriptor: &IndexedArtifactDescriptor,
     ) -> Result<(), IndexedArtifactManifestError> {
         if descriptor.dataset_kind != self.dataset_kind {
             return Err(IndexedArtifactManifestError::StagedChunkDatasetMismatch {
@@ -269,7 +269,7 @@ impl IndexedArtifactManifestClient {
 
     pub async fn fetch_catalog(
         &self,
-        descriptor: &IndexedArtifactCatalogDescriptor,
+        descriptor: &IndexedArtifactDescriptor,
     ) -> Result<IndexedArtifactCatalog, IndexedArtifactManifestError> {
         let started = Instant::now();
         let bytes = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
@@ -322,7 +322,7 @@ impl IndexedArtifactManifestClient {
 
     pub async fn fetch_chunks_bounded(
         &self,
-        descriptors: &[IndexedArtifactChunkDescriptor],
+        descriptors: &[IndexedArtifactDescriptor],
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError> {
         self.fetch_chunks_bounded_with_progress(descriptors, |_, _| {})
             .await
@@ -330,7 +330,7 @@ impl IndexedArtifactManifestClient {
 
     pub async fn fetch_chunks_bounded_with_progress<F>(
         &self,
-        descriptors: &[IndexedArtifactChunkDescriptor],
+        descriptors: &[IndexedArtifactDescriptor],
         mut on_chunk_verified: F,
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError>
     where
@@ -646,7 +646,7 @@ pub fn validate_manifest(
 }
 
 pub fn verify_catalog_bytes(
-    descriptor: &IndexedArtifactCatalogDescriptor,
+    descriptor: &IndexedArtifactDescriptor,
     bytes: &[u8],
 ) -> Result<IndexedArtifactCatalog, IndexedArtifactManifestError> {
     let actual_size =
@@ -692,7 +692,7 @@ pub fn verify_catalog_bytes(
 }
 
 pub fn verify_chunk_bytes(
-    descriptor: IndexedArtifactChunkDescriptor,
+    descriptor: IndexedArtifactDescriptor,
     bytes: Vec<u8>,
 ) -> Result<VerifiedIndexedArtifactChunk, IndexedArtifactManifestError> {
     let actual_size =
@@ -723,8 +723,8 @@ pub fn decode_indexed_artifact_chunk(
 }
 
 fn validate_chunk_descriptor_scope(
-    catalog: &IndexedArtifactCatalogDescriptor,
-    chunk: &IndexedArtifactChunkDescriptor,
+    catalog: &IndexedArtifactDescriptor,
+    chunk: &IndexedArtifactDescriptor,
 ) -> Result<(), IndexedArtifactManifestError> {
     if chunk.dataset_kind != catalog.dataset_kind {
         return Err(IndexedArtifactManifestError::CatalogChunkDatasetMismatch {
@@ -1765,7 +1765,7 @@ mod tests {
                     block_number: 100,
                     block_hash: FixedBytes::from([9_u8; 32]),
                 }],
-                catalogs: vec![IndexedArtifactCatalogDescriptor {
+                catalogs: vec![IndexedArtifactDescriptor {
                     dataset_kind: IndexedDatasetKind::WalletScan,
                     scope: scope.clone(),
                     range: IndexedArtifactRange {
@@ -1791,8 +1791,8 @@ mod tests {
         start: u64,
         end: u64,
         bytes: &[u8],
-    ) -> IndexedArtifactCatalogDescriptor {
-        IndexedArtifactCatalogDescriptor {
+    ) -> IndexedArtifactDescriptor {
+        IndexedArtifactDescriptor {
             dataset_kind: IndexedDatasetKind::WalletScan,
             scope,
             range: IndexedArtifactRange {
@@ -1810,8 +1810,8 @@ mod tests {
         }
     }
 
-    fn chunk_descriptor(scope: ChainScope, start: u64, end: u64) -> IndexedArtifactChunkDescriptor {
-        IndexedArtifactChunkDescriptor {
+    fn chunk_descriptor(scope: ChainScope, start: u64, end: u64) -> IndexedArtifactDescriptor {
+        IndexedArtifactDescriptor {
             dataset_kind: IndexedDatasetKind::WalletScan,
             scope,
             range: IndexedArtifactRange {
@@ -1832,7 +1832,7 @@ mod tests {
     fn descriptors_for_bytes(
         scope: ChainScope,
         chunks: &[Vec<u8>],
-    ) -> Vec<IndexedArtifactChunkDescriptor> {
+    ) -> Vec<IndexedArtifactDescriptor> {
         chunks
             .iter()
             .enumerate()
@@ -1849,8 +1849,8 @@ mod tests {
         end: u64,
         cid: Cid,
         bytes: &[u8],
-    ) -> IndexedArtifactChunkDescriptor {
-        IndexedArtifactChunkDescriptor {
+    ) -> IndexedArtifactDescriptor {
+        IndexedArtifactDescriptor {
             dataset_kind: IndexedDatasetKind::WalletScan,
             scope,
             range: IndexedArtifactRange {
@@ -1874,8 +1874,8 @@ mod tests {
         scope: ChainScope,
         start: u64,
         end: u64,
-    ) -> IndexedArtifactChunkDescriptor {
-        IndexedArtifactChunkDescriptor {
+    ) -> IndexedArtifactDescriptor {
+        IndexedArtifactDescriptor {
             dataset_kind,
             scope,
             range: IndexedArtifactRange {
@@ -1894,14 +1894,14 @@ mod tests {
     }
 
     fn verified_chunk(
-        descriptor: IndexedArtifactChunkDescriptor,
+        descriptor: IndexedArtifactDescriptor,
         bytes: Vec<u8>,
     ) -> VerifiedIndexedArtifactChunk {
         VerifiedIndexedArtifactChunk { descriptor, bytes }
     }
 
     fn responses_for_descriptors(
-        descriptors: &[IndexedArtifactChunkDescriptor],
+        descriptors: &[IndexedArtifactDescriptor],
         chunks: &[Vec<u8>],
         delay: Duration,
     ) -> HashMap<String, ChunkResponse> {

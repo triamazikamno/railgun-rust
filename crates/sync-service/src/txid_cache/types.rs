@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::indexed_artifacts::{ChainScope, ChainType};
+
 pub(super) const TXID_CACHE_BLOB_KIND: &str = "txid_public_cache";
 pub(super) const TXID_CACHE_FORMAT_VERSION: u32 = 2;
 pub(super) const TXID_CACHE_PAGE_SIZE: NonZeroUsize =
@@ -20,6 +22,8 @@ pub(crate) enum TxidPublicCacheError {
     Decode(#[from] rmp_serde::decode::Error),
     #[error("quick-sync error: {0}")]
     Sync(#[from] SyncError),
+    #[error("indexed artifact error: {0}")]
+    Artifact(#[from] crate::indexed_artifacts::IndexedArtifactManifestError),
     #[error("TXID public cache is not ready: next index {next_index}, required {required_index}")]
     CacheNotReady {
         next_index: u64,
@@ -44,6 +48,36 @@ pub(crate) struct TxidPublicCacheKey<'a> {
     pub chain_type: u8,
     pub chain_id: u64,
     pub txid_version: &'a str,
+}
+
+impl TxidPublicCacheKey<'_> {
+    pub(crate) fn artifact_scope(
+        self,
+        railgun_contract: &str,
+    ) -> Result<ChainScope, TxidPublicCacheError> {
+        let railgun_contract = railgun_contract.parse::<Address>().map_err(|err| {
+            TxidPublicCacheError::MetadataMismatch(format!(
+                "invalid railgun contract address: {err}"
+            ))
+        })?;
+        Ok(ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: self.chain_id,
+            railgun_contract,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TxidPublicCache<'a> {
+    pub(crate) db: &'a DbStore,
+    pub(crate) key: TxidPublicCacheKey<'a>,
+}
+
+impl<'a> TxidPublicCache<'a> {
+    pub(crate) const fn new(db: &'a DbStore, key: TxidPublicCacheKey<'a>) -> Self {
+        Self { db, key }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +133,69 @@ pub(super) struct TxidPublicCachePage {
     pub(super) format_version: u32,
     pub(super) start_index: u64,
     pub(super) rows: Vec<TxidPublicCacheRow>,
+}
+
+impl TryFrom<Vec<TxidPublicCacheRow>> for TxidPublicCachePage {
+    type Error = TxidPublicCacheError;
+
+    fn try_from(rows: Vec<TxidPublicCacheRow>) -> Result<Self, Self::Error> {
+        let Some(first) = rows.first() else {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "TXID public cache page cannot be empty".to_string(),
+            ));
+        };
+        Ok(Self {
+            format_version: TXID_CACHE_FORMAT_VERSION,
+            start_index: first.txid_index,
+            rows,
+        })
+    }
+}
+
+impl TxidPublicCachePage {
+    pub(super) fn from_indexed_transactions(
+        start_index: u64,
+        rows: Vec<IndexedRailgunTransaction>,
+    ) -> Self {
+        Self {
+            format_version: TXID_CACHE_FORMAT_VERSION,
+            start_index,
+            rows: rows
+                .into_iter()
+                .enumerate()
+                .map(|(offset, transaction)| {
+                    let txid_index = start_index + offset as u64;
+                    let txid_leaf_hash =
+                        FixedBytes::from(transaction.txid_leaf_hash().to_be_bytes::<32>());
+                    TxidPublicCacheRow {
+                        txid_index,
+                        txid_leaf_hash,
+                        transaction: transaction.into(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    pub(super) fn pages_from_rows(
+        rows: Vec<TxidPublicCacheRow>,
+    ) -> Result<Vec<Self>, TxidPublicCacheError> {
+        let page_size = TXID_CACHE_PAGE_SIZE.get();
+        let mut pages = Vec::with_capacity(rows.len().div_ceil(page_size));
+        let mut page_rows = Vec::with_capacity(page_size);
+        for row in rows {
+            page_rows.push(row);
+            if page_rows.len() == page_size {
+                let full_page_rows =
+                    std::mem::replace(&mut page_rows, Vec::with_capacity(page_size));
+                pages.push(full_page_rows.try_into()?);
+            }
+        }
+        if !page_rows.is_empty() {
+            pages.push(page_rows.try_into()?);
+        }
+        Ok(pages)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

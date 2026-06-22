@@ -45,7 +45,10 @@ pub(crate) struct WalletWorkerServices {
     pub db: Arc<DbStore>,
     pub rpcs: Arc<QueryRpcPool>,
     pub http_client: Option<reqwest::Client>,
+    pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     pub forest: Arc<RwLock<MerkleForest>>,
+    pub backfill_tx: mpsc::Sender<crate::types::BackfillRequest>,
+    pub backfill_sender: mpsc::Sender<BackfillEvent>,
 }
 
 pub(super) fn now_epoch_secs() -> u64 {
@@ -347,6 +350,7 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) cfg: &'a WalletConfig,
     pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
+    pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(super) forest: &'a Arc<RwLock<MerkleForest>>,
     pub(super) utxos: &'a Arc<RwLock<Vec<WalletUtxo>>>,
     pub(super) client: &'a PoiRpcClient,
@@ -396,6 +400,7 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
         cfg: run.cfg,
         rpcs: run.rpcs,
         http_client: run.http_client,
+        indexed_artifact_source: run.indexed_artifact_source,
         forest: &forest,
         poi_client: run.client,
         proof_source,

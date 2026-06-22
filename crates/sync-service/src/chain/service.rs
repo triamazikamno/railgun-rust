@@ -55,6 +55,7 @@ impl ChainService {
             wallets: RwLock::new(HashMap::new()),
             cancel: cancel.clone(),
             anchor_last: AtomicU64::new(last_anchor),
+            txid_public_cache_started: AtomicBool::new(false),
         });
 
         spawn_head_poller(service.clone(), rpcs.clone());
@@ -67,7 +68,6 @@ impl ChainService {
             snapshot_path,
             cancel.clone(),
         );
-        spawn_txid_public_cache_loop(service.clone(), cancel.clone());
         spawn_pending_tip_loop(
             service.clone(),
             rpcs.clone(),
@@ -107,6 +107,26 @@ impl ChainService {
             .map(|registration| registration.handle.clone())
     }
 
+    fn spawn_txid_public_cache_loop_once(self: &Arc<Self>) {
+        if self.txid_public_cache_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        spawn_txid_public_cache_loop(Arc::clone(self), self.cancel.clone());
+    }
+
+    fn spawn_txid_public_cache_loop_when_ready(
+        self: &Arc<Self>,
+        ready_rx: watch::Receiver<bool>,
+        cancel: CancellationToken,
+    ) {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            if wait_for_wallet_ready(ready_rx, cancel).await {
+                service.spawn_txid_public_cache_loop_once();
+            }
+        });
+    }
+
     pub async fn reset_wallet(
         &self,
         cache_key: &str,
@@ -136,6 +156,7 @@ impl ChainService {
                 cache_key: cache_key.to_string(),
                 from_block: reset_from,
                 to_block: sync_target,
+                follow_safe_head: sync_to_block.is_none(),
                 sender: backfill_sender,
             })
             .await?;
@@ -147,6 +168,9 @@ impl ChainService {
     pub async fn register_wallet(self: &Arc<Self>, cfg: WalletConfig) -> WalletHandle {
         let cache_key = cfg.cache_key.clone();
         if let Some(existing) = self.wallets.read().await.get(&cache_key) {
+            if *existing.handle.ready_rx.borrow() {
+                self.spawn_txid_public_cache_loop_once();
+            }
             return existing.handle.clone();
         }
 
@@ -171,6 +195,7 @@ impl ChainService {
             sync_to_block = ?cfg.sync_to_block,
             sync_target,
             indexed_wallet_catch_up = cfg.use_indexed_wallet_catch_up,
+            indexed_artifact_source = self.chain.indexed_artifact_source.is_some(),
             "registering wallet sync"
         );
 
@@ -193,7 +218,10 @@ impl ChainService {
                 db: self.db.clone(),
                 rpcs: self.chain.rpcs.clone(),
                 http_client: self.chain.http_client.clone(),
+                indexed_artifact_source: self.chain.indexed_artifact_source.clone(),
                 forest: self.forest.clone(),
+                backfill_tx: self.backfill_tx.clone(),
+                backfill_sender: backfill_sender.clone(),
             },
             cfg.clone(),
             live_rx,
@@ -202,6 +230,8 @@ impl ChainService {
             initial_utxos,
             last_scanned,
         );
+
+        self.spawn_txid_public_cache_loop_when_ready(handle.ready_rx.clone(), cancel.clone());
 
         self.wallets.write().await.insert(
             cache_key,
@@ -258,6 +288,7 @@ impl ChainService {
                     start_block,
                     checkpoint,
                     sync_target,
+                    catch_up_cfg.sync_to_block.is_none(),
                     backfill_sender,
                 )
                 .await;
@@ -272,6 +303,7 @@ impl ChainService {
         start_block: u64,
         last_scanned: u64,
         sync_target: u64,
+        follow_safe_head: bool,
         backfill_sender: mpsc::Sender<BackfillEvent>,
     ) {
         let from_block = wallet_backfill_from_block(last_scanned, start_block);
@@ -279,7 +311,7 @@ impl ChainService {
         // When safe_head has not been set yet (still 0) we cannot tell whether
         // the wallet is caught up, so we always enqueue a backfill request and
         // let the backfill loop wait for safe_head to become available.
-        let needs_backfill = sync_target == 0 || from_block <= sync_target;
+        let needs_backfill = follow_safe_head || sync_target == 0 || from_block <= sync_target;
 
         if needs_backfill {
             if self
@@ -288,6 +320,7 @@ impl ChainService {
                     cache_key: cache_key.to_string(),
                     from_block,
                     to_block: sync_target,
+                    follow_safe_head,
                     sender: backfill_sender.clone(),
                 })
                 .await
@@ -329,6 +362,7 @@ impl ChainService {
                 start_block,
                 sync_target,
                 self.chain.block_range,
+                self.chain.indexed_artifact_source.is_some(),
             )
         {
             return false;
@@ -393,18 +427,33 @@ impl ChainService {
                     hedge_cancel.cancel();
                     rpc_handle.abort();
                     indexed_handle.abort();
+                    let follow_safe_head = cfg.sync_to_block.is_none();
+                    let winner = candidate.strategy;
+                    let candidate_elapsed_ms = candidate.elapsed_ms;
                     let sent = send_wallet_startup_events(
                         &cfg.cache_key,
                         candidate.events,
-                        sync_target,
+                        Some(sync_target),
                         &backfill_sender,
                     )
                     .await;
+                    if sent && follow_safe_head {
+                        self.enqueue_wallet_backfill(
+                            &cfg.cache_key,
+                            start_block,
+                            sync_target,
+                            sync_target,
+                            true,
+                            backfill_sender.clone(),
+                        )
+                        .await;
+                    }
                     info!(
                         cache_key = %cfg.cache_key,
-                        winner = candidate.strategy.as_str(),
+                        winner = winner.as_str(),
                         reported_by = strategy.as_str(),
-                        candidate_elapsed_ms = candidate.elapsed_ms,
+                        candidate_elapsed_ms,
+                        follow_safe_head,
                         elapsed_ms = started.elapsed().as_millis(),
                         cancelled_loser = true,
                         sent,
@@ -529,8 +578,9 @@ impl ChainService {
                 return Err(WalletStartupSyncError::Cancelled);
             }
             let page_started = Instant::now();
-            let page_kind = indexed_wallet_page_kind(from_block, self.chain.v2_start_block);
-            let to_block = indexed_wallet_to_block(
+            let page_kind =
+                IndexedWalletPageKind::for_from_block(from_block, self.chain.v2_start_block);
+            let to_block = page_kind.to_block(
                 from_block,
                 target,
                 self.chain.v2_start_block,
@@ -539,7 +589,7 @@ impl ChainService {
             let fetch_started = Instant::now();
             let page = wait_or_cancel(
                 &cancel,
-                fetch_indexed_wallet_page(&client, page_kind, from_block, to_block),
+                IndexedWalletPage::fetch(&client, page_kind, from_block, to_block),
             )
             .await??;
             let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
@@ -718,6 +768,54 @@ impl ChainService {
         Ok(vec![BackfillEvent::Logs(batch)])
     }
 
+    async fn probe_squid_indexed_wallet_source(
+        &self,
+        cfg: &WalletConfig,
+    ) -> Option<(QuickSyncClient, u64)> {
+        let Some(endpoint) = self.chain.quick_sync_endpoint.clone() else {
+            debug!(cache_key = %cfg.cache_key, "no indexed endpoint configured; using RPC wallet backfill");
+            return None;
+        };
+        let client = match self.chain.http_client.clone() {
+            Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
+            None => QuickSyncClient::new(endpoint),
+        };
+        let probe_started = Instant::now();
+        let probe = match client.probe_indexed_wallet_support().await {
+            Ok(probe) => probe,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %cfg.cache_key,
+                    "indexed wallet probe failed; using RPC backfill"
+                );
+                return None;
+            }
+        };
+        debug!(
+            cache_key = %cfg.cache_key,
+            elapsed_ms = probe_started.elapsed().as_millis(),
+            "indexed wallet probe complete"
+        );
+        Some((client, probe.height))
+    }
+
+    async fn probe_squid_tail_after_artifact(
+        &self,
+        cfg: &WalletConfig,
+        from_block: u64,
+        artifact_target: u64,
+        safe_head: u64,
+    ) -> Option<(QuickSyncClient, u64, u64)> {
+        if artifact_target >= safe_head {
+            return None;
+        }
+        let (client, height) = self.probe_squid_indexed_wallet_source(cfg).await?;
+        let target =
+            squid_tail_target_after_artifact(from_block, artifact_target, safe_head, height)?;
+        Some((client, height, target))
+    }
+
     pub async fn unregister_wallet(&self, cache_key: &str) {
         if let Some((_key, registration)) = self.wallets.write().await.remove_entry(cache_key) {
             registration.cancel.cancel();
@@ -751,42 +849,80 @@ impl ChainService {
             debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
             return last_scanned;
         }
-        let Some(endpoint) = self.chain.quick_sync_endpoint.clone() else {
-            debug!(cache_key = %cfg.cache_key, "no indexed endpoint configured; using RPC wallet backfill");
-            return last_scanned;
-        };
-        let client = match self.chain.http_client.clone() {
-            Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
-            None => QuickSyncClient::new(endpoint),
-        };
-        let catch_up_started = Instant::now();
-        let probe_started = Instant::now();
-        let probe = match client.probe_indexed_wallet_support().await {
-            Ok(probe) => probe,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    cache_key = %cfg.cache_key,
-                    "indexed wallet probe failed; using RPC backfill"
-                );
-                return last_scanned;
-            }
-        };
-        debug!(
-            cache_key = %cfg.cache_key,
-            elapsed_ms = probe_started.elapsed().as_millis(),
-            "indexed wallet probe complete"
-        );
-        let target = probe.height.min(safe_head);
-        let mut from_block = last_scanned.saturating_add(1).max(start_block);
-        let progress_start = from_block;
+        let from_block = last_scanned.saturating_add(1).max(start_block);
         let progress_tx = cfg
             .progress_tx
             .clone()
             .or_else(|| self.chain.progress_tx.clone());
+        let mut artifact_session = None;
+        if self.chain.indexed_artifact_source.is_some() {
+            let artifact_session_started = Instant::now();
+            match IndexedWalletArtifactSession::prepare(
+                &self.chain,
+                from_block,
+                safe_head,
+                progress_tx.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(session)) => {
+                    debug!(
+                        cache_key = %cfg.cache_key,
+                        from_block,
+                        safe_head,
+                        latest_indexed_block = session.latest_indexed_block(),
+                        catalog_count = session.catalog_count(),
+                        chunk_count = session.chunk_count(),
+                        elapsed_ms = artifact_session_started.elapsed().as_millis(),
+                        "indexed wallet artifact session prepared"
+                    );
+                    artifact_session = Some(session);
+                }
+                Ok(None) => {
+                    debug!(
+                        cache_key = %cfg.cache_key,
+                        from_block,
+                        safe_head,
+                        elapsed_ms = artifact_session_started.elapsed().as_millis(),
+                        "indexed wallet artifact session unavailable"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        cache_key = %cfg.cache_key,
+                        from_block,
+                        safe_head,
+                        elapsed_ms = artifact_session_started.elapsed().as_millis(),
+                        "indexed wallet artifact session failed; falling back to configured indexed sources"
+                    );
+                }
+            }
+        }
+        let catch_up_started = Instant::now();
+        let mut squid_client = None;
+        let mut using_artifact = artifact_session.is_some();
+        let (mut indexed_source, mut indexed_height, mut target) = if let Some(session) =
+            artifact_session.as_ref()
+        {
+            (
+                "artifact",
+                session.latest_indexed_block(),
+                session.probe().catch_up_target(safe_head),
+            )
+        } else {
+            let Some((client, height)) = self.probe_squid_indexed_wallet_source(cfg).await else {
+                return last_scanned;
+            };
+            squid_client = Some(client);
+            ("squid", height, height.min(safe_head))
+        };
+        let mut from_block = from_block;
+        let progress_start = from_block;
         info!(
             cache_key = %cfg.cache_key,
-            indexed_height = probe.height,
+            indexed_source,
+            indexed_height,
             safe_head,
             from_block,
             target,
@@ -794,12 +930,39 @@ impl ChainService {
             "indexed wallet catch-up target"
         );
         if from_block > target {
-            debug!(
-                cache_key = %cfg.cache_key,
-                elapsed_ms = catch_up_started.elapsed().as_millis(),
-                "indexed wallet catch-up skipped; cache already at target"
-            );
-            return last_scanned;
+            let squid_tail = if using_artifact {
+                self.probe_squid_tail_after_artifact(cfg, from_block, target, safe_head)
+                    .await
+            } else {
+                None
+            };
+            if let Some((client, height, squid_target)) = squid_tail {
+                let artifact_target = target;
+                squid_client = Some(client);
+                artifact_session = None;
+                using_artifact = false;
+                indexed_source = "squid";
+                indexed_height = height;
+                target = squid_target;
+                info!(
+                    cache_key = %cfg.cache_key,
+                    indexed_source,
+                    indexed_height,
+                    safe_head,
+                    from_block,
+                    artifact_target,
+                    target,
+                    indexed_block_range = self.chain.indexed_wallet_block_range,
+                    "indexed wallet artifact tail target"
+                );
+            } else {
+                debug!(
+                    cache_key = %cfg.cache_key,
+                    elapsed_ms = catch_up_started.elapsed().as_millis(),
+                    "indexed wallet catch-up skipped; cache already at target"
+                );
+                return last_scanned;
+            }
         }
         send_sync_progress(
             progress_tx.as_ref(),
@@ -813,32 +976,149 @@ impl ChainService {
 
         let cache_store = wallet_cache_store(&self.db, cfg);
         let mut checkpoint = last_scanned;
-        while from_block <= target {
+        loop {
+            if from_block > target {
+                let squid_tail = if using_artifact {
+                    self.probe_squid_tail_after_artifact(cfg, from_block, target, safe_head)
+                        .await
+                } else {
+                    None
+                };
+                let Some((client, height, squid_target)) = squid_tail else {
+                    break;
+                };
+                let artifact_target = target;
+                squid_client = Some(client);
+                artifact_session = None;
+                using_artifact = false;
+                indexed_source = "squid";
+                indexed_height = height;
+                target = squid_target;
+                info!(
+                    cache_key = %cfg.cache_key,
+                    indexed_source,
+                    indexed_height,
+                    safe_head,
+                    from_block,
+                    artifact_target,
+                    target,
+                    indexed_block_range = self.chain.indexed_wallet_block_range,
+                    "indexed wallet artifact tail target"
+                );
+                send_sync_progress(
+                    progress_tx.as_ref(),
+                    SyncProgressUpdate::new(
+                        SyncProgressStage::IndexingUtxos,
+                        progress_start,
+                        from_block,
+                        target,
+                    ),
+                );
+                continue;
+            }
             if cancel.is_cancelled() {
                 return checkpoint;
             }
             let page_started = Instant::now();
-            let page_kind = indexed_wallet_page_kind(from_block, self.chain.v2_start_block);
-            let to_block = indexed_wallet_to_block(
+            let page_kind =
+                IndexedWalletPageKind::for_from_block(from_block, self.chain.v2_start_block);
+            let to_block = page_kind.to_block(
                 from_block,
                 target,
                 self.chain.v2_start_block,
                 self.chain.indexed_wallet_block_range,
             );
             let fetch_started = Instant::now();
-            let page =
-                match fetch_indexed_wallet_page(&client, page_kind, from_block, to_block).await {
-                    Ok(page) => page,
-                    Err(err) => {
+            let page_result = if using_artifact {
+                match artifact_session
+                    .as_ref()
+                    .expect("artifact session is configured for artifact catch-up")
+                    .page_for_block_range(from_block, to_block)
+                {
+                    Ok(Some(page)) => Ok(page),
+                    Ok(None) => Err(SyncError::UnexpectedFormat(
+                        "indexed wallet artifact page unavailable".to_string(),
+                    )),
+                    Err(err) => Err(err),
+                }
+            } else {
+                IndexedWalletPage::fetch(
+                    squid_client
+                        .as_ref()
+                        .expect("squid client is configured for squid catch-up"),
+                    page_kind,
+                    from_block,
+                    to_block,
+                )
+                .await
+            };
+            let page = match page_result {
+                Ok(page) => page,
+                Err(err) => {
+                    if artifact_failure_can_fallback_to_squid(
+                        using_artifact,
+                        checkpoint,
+                        last_scanned,
+                    ) {
                         warn!(
                             ?err,
                             cache_key = %cfg.cache_key,
                             fallback_from = checkpoint,
-                            "indexed wallet catch-up page failed; using RPC backfill"
+                            "indexed wallet artifact page failed before checkpoint; falling back to Squid"
                         );
-                        return checkpoint;
+                        let Some((client, height)) =
+                            self.probe_squid_indexed_wallet_source(cfg).await
+                        else {
+                            return checkpoint;
+                        };
+                        squid_client = Some(client);
+                        artifact_session = None;
+                        using_artifact = false;
+                        indexed_source = "squid";
+                        indexed_height = height;
+                        target = height.min(safe_head);
+                        info!(
+                            cache_key = %cfg.cache_key,
+                            indexed_source,
+                            indexed_height,
+                            safe_head,
+                            from_block,
+                            target,
+                            indexed_block_range = self.chain.indexed_wallet_block_range,
+                            "indexed wallet fallback target"
+                        );
+                        if from_block > target {
+                            debug!(
+                                cache_key = %cfg.cache_key,
+                                indexed_source,
+                                indexed_height,
+                                target,
+                                elapsed_ms = catch_up_started.elapsed().as_millis(),
+                                "indexed wallet fallback skipped; cache already at target"
+                            );
+                            return checkpoint;
+                        }
+                        send_sync_progress(
+                            progress_tx.as_ref(),
+                            SyncProgressUpdate::new(
+                                SyncProgressStage::IndexingUtxos,
+                                progress_start,
+                                from_block,
+                                target,
+                            ),
+                        );
+                        continue;
                     }
-                };
+                    warn!(
+                        ?err,
+                        cache_key = %cfg.cache_key,
+                        indexed_source,
+                        fallback_from = checkpoint,
+                        "indexed wallet catch-up page failed; using RPC backfill"
+                    );
+                    return checkpoint;
+                }
+            };
             let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
             if cancel.is_cancelled() {
                 return checkpoint;
@@ -904,6 +1184,7 @@ impl ChainService {
             checkpoint = page.checkpoint_block;
             debug!(
                 cache_key = %cfg.cache_key,
+                indexed_source,
                 page_kind = page_kind.as_str(),
                 from_block,
                 to_block,
@@ -957,6 +1238,25 @@ impl ChainService {
             ),
         );
         checkpoint
+    }
+}
+
+pub(super) async fn wait_for_wallet_ready(
+    mut ready_rx: watch::Receiver<bool>,
+    cancel: CancellationToken,
+) -> bool {
+    loop {
+        if *ready_rx.borrow() {
+            return !cancel.is_cancelled();
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            changed = ready_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            },
+        }
     }
 }
 

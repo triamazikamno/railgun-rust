@@ -14,6 +14,13 @@ use broadcaster_core::crypto::shared_key::{shared_symmetric_key, shared_symmetri
 use broadcaster_core::notes::{Note, decrypt_legacy_random, decrypt_shield_random};
 use broadcaster_core::tree::normalize_tree_position;
 use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource};
+use merkletree::quick::{
+    IndexedLegacyEncryptedCommitment as QuickIndexedLegacyEncryptedCommitment,
+    IndexedLegacyGeneratedCommitment as QuickIndexedLegacyGeneratedCommitment,
+    IndexedNullifier as QuickIndexedNullifier,
+    IndexedShieldCommitment as QuickIndexedShieldCommitment,
+    IndexedTransactCommitment as QuickIndexedTransactCommitment,
+};
 
 #[derive(Debug, Error)]
 pub enum WalletScanError {
@@ -58,6 +65,24 @@ pub struct IndexedTransactCommitmentInput {
     pub source: UtxoSource,
 }
 
+impl From<QuickIndexedTransactCommitment> for IndexedTransactCommitmentInput {
+    fn from(value: QuickIndexedTransactCommitment) -> Self {
+        Self {
+            tree_number: value.tree_number.to(),
+            tree_position: value.tree_position.to(),
+            hash: value.hash,
+            ciphertext: value.ciphertext.ciphertext,
+            blinded_sender_viewing_key: value.ciphertext.blinded_sender_viewing_key,
+            memo: value.ciphertext.memo,
+            source: indexed_source(
+                value.transaction_hash,
+                value.block_number,
+                value.block_timestamp,
+            ),
+        }
+    }
+}
+
 impl IndexedTransactCommitmentInput {
     fn scan(&self, keys: &WalletScanKeys) -> Option<Utxo> {
         let (tree, position) = normalize_tree_position(self.tree_number, self.tree_position);
@@ -95,11 +120,44 @@ pub struct IndexedShieldCommitmentInput {
     pub source: UtxoSource,
 }
 
+impl From<QuickIndexedShieldCommitment> for IndexedShieldCommitmentInput {
+    fn from(value: QuickIndexedShieldCommitment) -> Self {
+        Self {
+            tree_number: value.tree_number.to(),
+            tree_position: value.tree_position.to(),
+            preimage: value.preimage.into(),
+            shield_ciphertext: ShieldCiphertext {
+                encryptedBundle: value.encrypted_bundle,
+                shieldKey: value.shield_key,
+            },
+            source: indexed_source(
+                value.transaction_hash,
+                value.block_number,
+                value.block_timestamp,
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexedNullifierInput {
     pub tree_number: u32,
     pub nullifier: U256,
     pub source: UtxoSource,
+}
+
+impl From<QuickIndexedNullifier> for IndexedNullifierInput {
+    fn from(value: QuickIndexedNullifier) -> Self {
+        Self {
+            tree_number: value.tree_number.to(),
+            nullifier: value.nullifier,
+            source: indexed_source(
+                value.transaction_hash,
+                value.block_number,
+                value.block_timestamp,
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -111,6 +169,24 @@ pub struct IndexedLegacyEncryptedCommitmentInput {
     pub ephemeral_keys: [FixedBytes<32>; 2],
     pub memo: Vec<FixedBytes<32>>,
     pub source: UtxoSource,
+}
+
+impl From<QuickIndexedLegacyEncryptedCommitment> for IndexedLegacyEncryptedCommitmentInput {
+    fn from(value: QuickIndexedLegacyEncryptedCommitment) -> Self {
+        Self {
+            tree_number: value.tree_number.to(),
+            tree_position: value.tree_position.to(),
+            hash: value.hash,
+            ciphertext: value.ciphertext.ciphertext,
+            ephemeral_keys: value.ciphertext.ephemeral_keys,
+            memo: value.ciphertext.memo,
+            source: indexed_source(
+                value.transaction_hash,
+                value.block_number,
+                value.block_timestamp,
+            ),
+        }
+    }
 }
 
 impl IndexedLegacyEncryptedCommitmentInput {
@@ -149,6 +225,22 @@ pub struct IndexedLegacyGeneratedCommitmentInput {
     pub source: UtxoSource,
 }
 
+impl From<QuickIndexedLegacyGeneratedCommitment> for IndexedLegacyGeneratedCommitmentInput {
+    fn from(value: QuickIndexedLegacyGeneratedCommitment) -> Self {
+        Self {
+            tree_number: value.tree_number.to(),
+            tree_position: value.tree_position.to(),
+            preimage: value.preimage.into(),
+            encrypted_random: value.encrypted_random,
+            source: indexed_source(
+                value.transaction_hash,
+                value.block_number,
+                value.block_timestamp,
+            ),
+        }
+    }
+}
+
 impl IndexedLegacyGeneratedCommitmentInput {
     fn scan(&self, keys: &WalletScanKeys) -> Option<Utxo> {
         let random = decrypt_legacy_random(
@@ -175,6 +267,18 @@ impl IndexedLegacyGeneratedCommitmentInput {
             self.source.clone(),
             UtxoCommitmentKind::Shield,
         ))
+    }
+}
+
+fn indexed_source(
+    tx_hash: FixedBytes<32>,
+    block_number: U256,
+    block_timestamp: U256,
+) -> UtxoSource {
+    UtxoSource {
+        tx_hash,
+        block_number: block_number.to(),
+        block_timestamp: block_timestamp.to(),
     }
 }
 

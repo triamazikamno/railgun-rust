@@ -10,6 +10,25 @@ pub(super) enum ForestReorgDecision {
     Mismatch,
 }
 
+impl ForestReorgDecision {
+    pub(super) fn from_confirmed_hash(
+        last_processed: u64,
+        meta_last_block: u64,
+        stored_hash: [u8; 32],
+        confirmed_current_hash: Option<[u8; 32]>,
+    ) -> Self {
+        if stored_hash == [0u8; 32] || meta_last_block != last_processed {
+            return Self::Skip;
+        }
+
+        match confirmed_current_hash {
+            Some(current_hash) if current_hash == stored_hash => Self::Match,
+            Some(_) => Self::Mismatch,
+            None => Self::Skip,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IndexedWalletPageKind {
     Legacy,
@@ -17,10 +36,35 @@ pub(super) enum IndexedWalletPageKind {
 }
 
 impl IndexedWalletPageKind {
+    pub(super) const fn for_from_block(from_block: u64, v2_start_block: u64) -> Self {
+        if v2_start_block > 0 && from_block < v2_start_block {
+            Self::Legacy
+        } else {
+            Self::Modern
+        }
+    }
+
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
             Self::Modern => "modern",
+        }
+    }
+
+    pub(super) fn to_block(
+        self,
+        from_block: u64,
+        target: u64,
+        v2_start_block: u64,
+        indexed_wallet_block_range: u64,
+    ) -> u64 {
+        let range_end = std::cmp::min(
+            from_block.saturating_add(indexed_wallet_block_range.saturating_sub(1)),
+            target,
+        );
+        match self {
+            Self::Legacy if v2_start_block > 0 => range_end.min(v2_start_block.saturating_sub(1)),
+            Self::Legacy | Self::Modern => range_end,
         }
     }
 }
@@ -186,4 +230,5 @@ pub struct ChainService {
     pub(super) wallets: RwLock<HashMap<String, WalletRegistration>>,
     pub(super) cancel: CancellationToken,
     pub(super) anchor_last: AtomicU64,
+    pub(super) txid_public_cache_started: AtomicBool,
 }

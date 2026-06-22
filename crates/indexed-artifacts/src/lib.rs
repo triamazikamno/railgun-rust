@@ -51,7 +51,7 @@ impl IndexedArtifactManifest {
         let mut chains = self.chains.clone();
         for chain in &mut chains {
             chain.latest_indexed.sort_by(cmp_latest_indexed_height);
-            chain.catalogs.sort_by(cmp_catalog_descriptor);
+            chain.catalogs.sort_by(cmp_descriptor);
         }
         chains.sort_by(cmp_chain_entry);
 
@@ -161,7 +161,7 @@ pub enum PublisherKeyAlgorithm {
 pub struct IndexedArtifactChainEntry {
     pub scope: ChainScope,
     pub latest_indexed: Vec<LatestIndexedHeight>,
-    pub catalogs: Vec<IndexedArtifactCatalogDescriptor>,
+    pub catalogs: Vec<IndexedArtifactDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +194,7 @@ pub enum IndexedDatasetKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexedArtifactCatalogDescriptor {
+pub struct IndexedArtifactDescriptor {
     pub dataset_kind: IndexedDatasetKind,
     pub scope: ChainScope,
     pub range: IndexedArtifactRange,
@@ -207,18 +207,28 @@ pub struct IndexedArtifactCatalogDescriptor {
     pub metadata: DatasetDescriptorMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexedArtifactChunkDescriptor {
-    pub dataset_kind: IndexedDatasetKind,
-    pub scope: ChainScope,
-    pub range: IndexedArtifactRange,
-    pub row_count: u64,
-    pub cid: String,
-    pub sha256: FixedBytes<32>,
-    pub byte_size: u64,
-    pub encoding_version: u16,
-    pub compression: CompressionAlgorithm,
-    pub metadata: DatasetDescriptorMetadata,
+impl IndexedArtifactDescriptor {
+    #[must_use]
+    pub fn matches(
+        &self,
+        dataset_kind: IndexedDatasetKind,
+        scope: &ChainScope,
+        range_kind: IndexedArtifactRangeKind,
+    ) -> bool {
+        self.dataset_kind == dataset_kind && self.scope == *scope && self.range.kind == range_kind
+    }
+
+    #[must_use]
+    pub fn matches_range(
+        &self,
+        dataset_kind: IndexedDatasetKind,
+        scope: &ChainScope,
+        range_kind: IndexedArtifactRangeKind,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        self.matches(dataset_kind, scope, range_kind) && self.range.intersects(start, end)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +236,7 @@ pub struct IndexedArtifactCatalog {
     pub format_version: u16,
     pub dataset_kind: IndexedDatasetKind,
     pub scope: ChainScope,
-    pub chunks: Vec<IndexedArtifactChunkDescriptor>,
+    pub chunks: Vec<IndexedArtifactDescriptor>,
 }
 
 impl IndexedArtifactCatalog {
@@ -234,7 +244,7 @@ impl IndexedArtifactCatalog {
     pub const fn new(
         dataset_kind: IndexedDatasetKind,
         scope: ChainScope,
-        chunks: Vec<IndexedArtifactChunkDescriptor>,
+        chunks: Vec<IndexedArtifactDescriptor>,
     ) -> Self {
         Self {
             format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
@@ -246,7 +256,7 @@ impl IndexedArtifactCatalog {
 
     pub fn deterministic_body_bytes(&self) -> Result<Vec<u8>, IndexedArtifactError> {
         let mut chunks = self.chunks.clone();
-        chunks.sort_by(cmp_chunk_descriptor);
+        chunks.sort_by(cmp_descriptor);
         let body = IndexedArtifactCatalogBody {
             format_version: self.format_version,
             dataset_kind: self.dataset_kind,
@@ -262,7 +272,7 @@ struct IndexedArtifactCatalogBody<'a> {
     format_version: u16,
     dataset_kind: IndexedDatasetKind,
     scope: &'a ChainScope,
-    chunks: Vec<IndexedArtifactChunkDescriptor>,
+    chunks: Vec<IndexedArtifactDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +280,13 @@ pub struct IndexedArtifactRange {
     pub kind: IndexedArtifactRangeKind,
     pub start: u64,
     pub end: u64,
+}
+
+impl IndexedArtifactRange {
+    #[must_use]
+    pub const fn intersects(&self, start: u64, end: u64) -> bool {
+        self.start <= self.end && start <= end && self.start <= end && start <= self.end
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,7 +534,7 @@ pub fn encode_chunk_bytes(
 }
 
 pub fn decode_chunk_bytes(
-    descriptor: &IndexedArtifactChunkDescriptor,
+    descriptor: &IndexedArtifactDescriptor,
     bytes: &[u8],
 ) -> Result<ChunkEnvelope, ChunkError> {
     if descriptor.byte_size > MAX_COMPRESSED_CHUNK_BYTES {
@@ -835,7 +852,7 @@ pub enum ChunkError {
 }
 
 fn validate_descriptor_matches_header(
-    descriptor: &IndexedArtifactChunkDescriptor,
+    descriptor: &IndexedArtifactDescriptor,
     header: &ChunkEnvelopeHeader,
 ) -> Result<(), ChunkError> {
     if descriptor.encoding_version != header.format_version {
@@ -1017,28 +1034,7 @@ fn cmp_latest_indexed_height(left: &LatestIndexedHeight, right: &LatestIndexedHe
         .then_with(|| left.block_hash.as_slice().cmp(right.block_hash.as_slice()))
 }
 
-fn cmp_catalog_descriptor(
-    left: &IndexedArtifactCatalogDescriptor,
-    right: &IndexedArtifactCatalogDescriptor,
-) -> Ordering {
-    cmp_descriptor_parts(
-        left.dataset_kind,
-        &left.scope,
-        &left.range,
-        left.row_count,
-        &left.cid,
-        right.dataset_kind,
-        &right.scope,
-        &right.range,
-        right.row_count,
-        &right.cid,
-    )
-}
-
-fn cmp_chunk_descriptor(
-    left: &IndexedArtifactChunkDescriptor,
-    right: &IndexedArtifactChunkDescriptor,
-) -> Ordering {
+fn cmp_descriptor(left: &IndexedArtifactDescriptor, right: &IndexedArtifactDescriptor) -> Ordering {
     cmp_descriptor_parts(
         left.dataset_kind,
         &left.scope,
@@ -1105,10 +1101,12 @@ const fn range_kind_order(value: IndexedArtifactRangeKind) -> u8 {
     }
 }
 
+#[must_use]
 pub fn prefixed_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
+#[must_use]
 pub fn format_scope(scope: &ChainScope) -> String {
     format!(
         "{:?}:{}:{}",
@@ -1149,7 +1147,7 @@ mod tests {
 
     #[test]
     fn typed_fields_serialize_as_lowercase_prefixed_hex() {
-        let descriptor = IndexedArtifactChunkDescriptor {
+        let descriptor = IndexedArtifactDescriptor {
             dataset_kind: IndexedDatasetKind::PublicTxid,
             scope: scope(),
             range: IndexedArtifactRange {
@@ -1179,6 +1177,92 @@ mod tests {
         ));
         assert!(json.contains(
             "\"root\":\"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\""
+        ));
+    }
+
+    #[test]
+    fn range_intersection_is_inclusive() {
+        let range = range(IndexedArtifactRangeKind::Block, 10, 20);
+
+        assert!(range.intersects(0, 10));
+        assert!(range.intersects(20, 30));
+        assert!(range.intersects(12, 18));
+        assert!(!range.intersects(0, 9));
+        assert!(!range.intersects(21, 30));
+    }
+
+    #[test]
+    fn range_intersection_rejects_inverted_ranges() {
+        assert!(!range(IndexedArtifactRangeKind::Block, 10, 20).intersects(21, 20));
+        assert!(!range(IndexedArtifactRangeKind::Block, 20, 10).intersects(0, 30));
+    }
+
+    #[test]
+    fn descriptor_matches_dataset_scope_and_range_kind() {
+        let scope = scope();
+        let mut other_scope = scope.clone();
+        other_scope.chain_id = 2;
+        let descriptor = descriptor(
+            IndexedDatasetKind::PublicTxid,
+            scope.clone(),
+            IndexedArtifactRangeKind::TxidIndex,
+            10,
+            20,
+        );
+
+        assert!(descriptor.matches(
+            IndexedDatasetKind::PublicTxid,
+            &scope,
+            IndexedArtifactRangeKind::TxidIndex,
+        ));
+        assert!(!descriptor.matches(
+            IndexedDatasetKind::WalletScan,
+            &scope,
+            IndexedArtifactRangeKind::TxidIndex,
+        ));
+        assert!(!descriptor.matches(
+            IndexedDatasetKind::PublicTxid,
+            &scope,
+            IndexedArtifactRangeKind::Block,
+        ));
+        assert!(!descriptor.matches(
+            IndexedDatasetKind::PublicTxid,
+            &other_scope,
+            IndexedArtifactRangeKind::TxidIndex,
+        ));
+    }
+
+    #[test]
+    fn descriptor_matches_range_requires_identity_and_intersection() {
+        let scope = scope();
+        let descriptor = descriptor(
+            IndexedDatasetKind::WalletScan,
+            scope.clone(),
+            IndexedArtifactRangeKind::Block,
+            10,
+            20,
+        );
+
+        assert!(descriptor.matches_range(
+            IndexedDatasetKind::WalletScan,
+            &scope,
+            IndexedArtifactRangeKind::Block,
+            20,
+            30,
+        ));
+        assert!(!descriptor.matches_range(
+            IndexedDatasetKind::WalletScan,
+            &scope,
+            IndexedArtifactRangeKind::Block,
+            21,
+            30,
+        ));
+        assert!(!descriptor.matches_range(
+            IndexedDatasetKind::WalletScan,
+            &scope,
+            IndexedArtifactRangeKind::TxidIndex,
+            10,
+            20,
         ));
     }
 
@@ -1263,5 +1347,26 @@ mod tests {
 
     fn range(kind: IndexedArtifactRangeKind, start: u64, end: u64) -> IndexedArtifactRange {
         IndexedArtifactRange { kind, start, end }
+    }
+
+    fn descriptor(
+        dataset_kind: IndexedDatasetKind,
+        scope: ChainScope,
+        range_kind: IndexedArtifactRangeKind,
+        start: u64,
+        end: u64,
+    ) -> IndexedArtifactDescriptor {
+        IndexedArtifactDescriptor {
+            dataset_kind,
+            scope,
+            range: range(range_kind, start, end),
+            row_count: end.saturating_sub(start).saturating_add(1),
+            cid: "bafy".to_string(),
+            sha256: FixedBytes::from([0xab; 32]),
+            byte_size: 10,
+            encoding_version: CHUNK_FORMAT_VERSION,
+            compression: CompressionAlgorithm::Zstd,
+            metadata: DatasetDescriptorMetadata::default(),
+        }
     }
 }

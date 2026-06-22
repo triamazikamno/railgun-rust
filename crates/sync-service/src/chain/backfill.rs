@@ -3,7 +3,21 @@ use super::*;
 pub(super) struct WalletBackfill {
     pub(super) from_block: u64,
     pub(super) target_block: u64,
+    pub(super) follow_safe_head: bool,
     pub(super) sender: mpsc::Sender<BackfillEvent>,
+}
+
+impl WalletBackfill {
+    pub(super) fn refresh_target(&mut self, safe_head: u64) {
+        if safe_head == 0 {
+            return;
+        }
+        if self.follow_safe_head {
+            self.target_block = self.target_block.max(safe_head);
+        } else if self.target_block == 0 {
+            self.target_block = safe_head;
+        }
+    }
 }
 
 impl ChainService {
@@ -110,6 +124,7 @@ impl ChainService {
                     cache_key: cache_key.clone(),
                     from_block,
                     to_block: sync_target,
+                    follow_safe_head: registration.sync_to_block.is_none(),
                     sender: registration.backfill_sender.clone(),
                 })
                 .await
@@ -160,7 +175,12 @@ impl ChainService {
             .chain
             .fetch_confirmed_block_hash(provider, archive_provider, last_processed)
             .await?;
-        match forest_reorg_decision(last_processed, meta.last_block, meta.hash, current_hash) {
+        match ForestReorgDecision::from_confirmed_hash(
+            last_processed,
+            meta.last_block,
+            meta.hash,
+            current_hash,
+        ) {
             ForestReorgDecision::Skip => {
                 debug!(
                     chain_id = self.chain.chain_id,

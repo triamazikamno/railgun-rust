@@ -273,9 +273,6 @@ enum FilterOp {
         pubsub_topic: String,
         batch_id: u64,
     },
-    #[allow(dead_code)]
-    Ping,
-    #[allow(dead_code)]
     SubscribeOnPeer {
         sub_id: SubId,
     },
@@ -1319,11 +1316,6 @@ impl NodeInner {
                         .subscriptions
                         .retain(|_, sub| sub.pubsub_topic != pubsub_topic);
                 });
-            }
-            FilterOp::Ping => {
-                if let Err(error) = result {
-                    warn!(%peer_id, ?error, "filter ping failed");
-                }
             }
             FilterOp::SubscribeOnPeer { sub_id } => match result_status {
                 Ok(()) => {

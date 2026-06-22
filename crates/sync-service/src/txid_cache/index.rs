@@ -13,19 +13,18 @@ pub(super) fn write_blob_file(
     Ok(())
 }
 
-pub(super) fn read_page(
-    db: &DbStore,
-    page_ref: &TxidPublicCachePageRef,
-) -> Result<TxidPublicCachePage, TxidPublicCacheError> {
-    let bytes = fs::read(db.resolve_path(&page_ref.relative_path))?;
-    let page: TxidPublicCachePage = rmp_serde::from_slice(&bytes)?;
-    if page.format_version != TXID_CACHE_FORMAT_VERSION || page.start_index != page_ref.start_index
-    {
-        return Err(TxidPublicCacheError::MetadataMismatch(
-            "page metadata mismatch".to_string(),
-        ));
+impl TxidPublicCachePageRef {
+    pub(super) fn read(&self, db: &DbStore) -> Result<TxidPublicCachePage, TxidPublicCacheError> {
+        let bytes = fs::read(db.resolve_path(&self.relative_path))?;
+        let page: TxidPublicCachePage = rmp_serde::from_slice(&bytes)?;
+        if page.format_version != TXID_CACHE_FORMAT_VERSION || page.start_index != self.start_index
+        {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "page metadata mismatch".to_string(),
+            ));
+        }
+        Ok(page)
     }
-    Ok(page)
 }
 
 pub(super) fn update_index_for_page(
@@ -65,7 +64,7 @@ pub(super) fn rebuild_index_for_manifest(
 ) -> Result<(), TxidPublicCacheError> {
     clear_index_shards(db, key)?;
     for page_ref in &manifest.pages {
-        let page = read_page(db, page_ref)?;
+        let page = page_ref.read(db)?;
         update_index_for_page(db, key, &page)?;
     }
     Ok(())

@@ -1,4 +1,4 @@
-use crate::txid_cache::{TxidPublicCacheKey, sync_txid_public_cache_to_graph_tip};
+use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, SyncProgressSender,
     SyncProgressStage, SyncProgressUpdate, WalletConfig,
@@ -22,9 +22,7 @@ use local_db::DbStore;
 use merkletree::errors::SyncError;
 use merkletree::persist::{MerkleForestSnapshot, PersistError, SNAPSHOT_VERSION};
 use merkletree::quick::{
-    DEFAULT_PAGE_SIZE, IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment,
-    IndexedNullifier, IndexedShieldCommitment, IndexedTransactCommitment, QuickSyncClient,
-    QuickSyncConfig, run_quick_sync_into_with_progress,
+    DEFAULT_PAGE_SIZE, QuickSyncClient, QuickSyncConfig, run_quick_sync_into_with_progress,
 };
 use merkletree::slow::CommitmentUpdateError;
 use merkletree::slow::types::{
@@ -43,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +51,7 @@ mod backfill;
 mod forest_db;
 mod indexed_wallet;
 mod logs;
+mod merkle_artifacts;
 mod service;
 mod types;
 mod workers;
@@ -61,10 +60,30 @@ use backfill::*;
 use forest_db::*;
 use indexed_wallet::*;
 use logs::*;
+use merkle_artifacts::*;
 use types::*;
 use workers::*;
 
 pub use types::{ChainError, ChainHandle, ChainService};
+
+fn artifact_chunk_progress(
+    completed_chunks: usize,
+    total_chunks: usize,
+    start_progress: u64,
+    done_progress: u64,
+) -> u64 {
+    let total = u64::try_from(total_chunks).unwrap_or(u64::MAX);
+    if total == 0 {
+        return done_progress;
+    }
+    let completed = u64::try_from(completed_chunks).unwrap_or(total).min(total);
+    start_progress.saturating_add(
+        done_progress
+            .saturating_sub(start_progress)
+            .saturating_mul(completed)
+            / total,
+    )
+}
 
 #[cfg(test)]
 mod tests;

@@ -7,6 +7,7 @@ use types::Commitment;
 
 use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
 
+use crate::errors::SyncError;
 use crate::sync::{SyncProgress, SyncResult};
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroUsize;
@@ -115,17 +116,36 @@ where
         }
 
         let mut max_block_seen = commitment_cursor;
-        let mut max_block_in_range = None;
+        for commitment in &commitments {
+            let block_number: u64 = commitment.block_number.to();
+            max_block_seen = max_block_seen.max(block_number);
+        }
+        let page_is_full = commitment_count >= page_size_value;
+        let process_through_block = if page_is_full {
+            if max_block_seen == commitment_cursor {
+                return Err(SyncError::UnexpectedFormat(format!(
+                    "commitment quick-sync page did not advance past block {commitment_cursor}; page size {page_size_value} may split one block"
+                )));
+            }
+            max_block_seen.saturating_sub(1)
+        } else {
+            end_block.unwrap_or(u64::MAX)
+        };
+        let process_through_block = end_block.map_or(process_through_block, |end_block| {
+            process_through_block.min(end_block)
+        });
+        let mut max_processed_block = None;
         let mut batch_map: BTreeMap<(u32, u64), Vec<Commitment>> = BTreeMap::new();
         for commitment in commitments {
             let block_number: u64 = commitment.block_number.to();
-            max_block_seen = max_block_seen.max(block_number);
-            if let Some(end_block) = end_block
-                && block_number > end_block
-            {
+            if block_number > process_through_block {
                 continue;
             }
-            max_block_in_range = Some(max_block_in_range.unwrap_or(block_number).max(block_number));
+            max_processed_block = Some(
+                max_processed_block
+                    .unwrap_or(block_number)
+                    .max(block_number),
+            );
             if !commitment_ids.insert(commitment.id) {
                 continue;
             }
@@ -151,7 +171,7 @@ where
             }
         }
 
-        if let Some(block) = max_block_in_range {
+        if let Some(block) = max_processed_block {
             latest_commitment_block = latest_commitment_block.max(block);
             latest_block = latest_block.max(block);
         }
@@ -168,11 +188,11 @@ where
             commitments: total_commitments,
         });
 
-        if commitment_count < page_size_value {
+        if !page_is_full {
             break;
         }
         if let Some(end_block) = end_block
-            && max_block_seen >= end_block
+            && max_block_seen > end_block
         {
             break;
         }
@@ -546,5 +566,39 @@ mod tests {
         assert_eq!(progress.latest_commitment_block, 20);
         assert_eq!(forest.leaf_at(0, 1), Some(uint!(4_U256)));
         assert_eq!(forest.leaf_at(0, 2), Some(uint!(5_U256)));
+    }
+
+    #[tokio::test]
+    async fn quick_sync_refetches_full_page_target_block_before_advancing() {
+        let mock = spawn_graphql(vec![
+            r#"{"data":{"commitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","treeNumber":"0","treePosition":"0","batchStartTreePosition":"0","blockNumber":"19","hash":"5"},{"id":"0x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222","treeNumber":"0","treePosition":"1","batchStartTreePosition":"1","blockNumber":"19","hash":"6"},{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","treeNumber":"0","treePosition":"2","batchStartTreePosition":"2","blockNumber":"20","hash":"7"}]}}"#,
+            r#"{"data":{"commitments":[{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","treeNumber":"0","treePosition":"2","batchStartTreePosition":"2","blockNumber":"20","hash":"7"},{"id":"0x44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444","treeNumber":"0","treePosition":"3","batchStartTreePosition":"3","blockNumber":"20","hash":"8"}]}}"#,
+        ]);
+        let mut forest = MerkleForest::new();
+
+        let progress = run_quick_sync_into(
+            &mut forest,
+            QuickSyncConfig {
+                endpoint: mock.url,
+                start_block: 19,
+                end_block: Some(20),
+                page_size: NonZeroUsize::new(3).unwrap(),
+                http_client: None,
+            },
+        )
+        .await
+        .expect("quick sync should refetch target block");
+
+        assert_eq!(progress.latest_commitment_block, 20);
+        assert_eq!(progress.commitments, 4);
+        assert_eq!(forest.leaf_at(0, 0), Some(uint!(5_U256)));
+        assert_eq!(forest.leaf_at(0, 1), Some(uint!(6_U256)));
+        assert_eq!(forest.leaf_at(0, 2), Some(uint!(7_U256)));
+        assert_eq!(forest.leaf_at(0, 3), Some(uint!(8_U256)));
+        let first_request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second_request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(first_request.contains(r#""blockNumber":"19""#));
+        assert!(second_request.contains(r#""blockNumber":"20""#));
+        assert!(mock.requests.try_recv().is_err());
     }
 }
