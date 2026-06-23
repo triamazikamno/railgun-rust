@@ -17,8 +17,7 @@ pub(super) async fn sync_local_poi_caches(
         artifact_config.clone(),
         http_client.cloned().unwrap_or_else(reqwest::Client::new),
     );
-    let live_tail_client =
-        http_client.and_then(|client| wallet_poi_status_client(&cfg.poi_rpc_url, Some(client)));
+    let live_tail_client = wallet_poi_status_client(&cfg.poi_rpc_url, http_client);
     for list_key in active_list_keys {
         let identity = PoiCacheIdentity::new(
             EVM_CHAIN_TYPE,
@@ -28,28 +27,15 @@ pub(super) async fn sync_local_poi_caches(
         );
         let sync_started = Instant::now();
         let artifact_refresh_started = Instant::now();
-        let preloaded_cache = preloaded_caches.remove(list_key);
-        let artifact_refresh = if let Some(preloaded_cache) = preloaded_cache {
-            ingestor
-                .refresh_persisted_cache_with_preloaded_and_proxy(
-                    db,
-                    identity.clone(),
-                    Some(preloaded_cache),
-                    0,
-                    SystemTime::now(),
-                    live_tail_client.as_ref(),
-                )
-                .await
-        } else {
-            ingestor
-                .refresh_persisted_cache_with_proxy(
-                    db,
-                    identity.clone(),
-                    SystemTime::now(),
-                    live_tail_client.as_ref(),
-                )
-                .await
-        };
+        let artifact_refresh = ingestor
+            .refresh_persisted_cache_with_optional_preloaded_and_proxy(
+                db,
+                identity.clone(),
+                preloaded_caches.remove(list_key),
+                SystemTime::now(),
+                live_tail_client.as_ref(),
+            )
+            .await;
         let artifact_refresh_elapsed_ms = artifact_refresh_started.elapsed().as_millis();
         match artifact_refresh {
             Ok(refresh) => {
@@ -58,8 +44,11 @@ pub(super) async fn sync_local_poi_caches(
                 let mut cache = refresh.cache;
                 let live_tail_started = Instant::now();
                 let live_tail = if let Some(client) = live_tail_client.as_ref() {
-                    match sync_live_poi_event_tail(client, &mut cache).await {
-                        Ok(outcome) => Some(outcome),
+                    match live_tail_candidate_cache(client, &cache).await {
+                        Ok((tailed_cache, outcome)) => {
+                            cache = tailed_cache;
+                            Some(outcome)
+                        }
                         Err(err) => {
                             warn!(
                                 ?err,
@@ -116,16 +105,19 @@ pub(super) async fn sync_local_poi_caches(
                 match load_persisted_cache(db, &identity) {
                     Ok(Some(persisted)) => {
                         let mut cache = persisted.cache;
-                        if let Some(client) = live_tail_client.as_ref()
-                            && let Err(err) = sync_live_poi_event_tail(client, &mut cache).await
-                        {
-                            warn!(
-                                ?err,
-                                cache_key = %cfg.cache_key,
-                                chain_id = cfg.chain.chain_id,
-                                list_key = %hex::encode(list_key),
-                                "live POI event tail failed after artifact refresh error"
-                            );
+                        if let Some(client) = live_tail_client.as_ref() {
+                            match live_tail_candidate_cache(client, &cache).await {
+                                Ok((tailed_cache, _outcome)) => {
+                                    cache = tailed_cache;
+                                }
+                                Err(err) => warn!(
+                                    ?err,
+                                    cache_key = %cfg.cache_key,
+                                    chain_id = cfg.chain.chain_id,
+                                    list_key = %hex::encode(list_key),
+                                    "live POI event tail failed after artifact refresh error"
+                                ),
+                            }
                         }
                         local_caches.write().await.insert(*list_key, cache);
                     }

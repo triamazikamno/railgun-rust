@@ -351,7 +351,7 @@ impl ChunkEnvelope {
             })?;
         let end = start
             .checked_add(length)
-            .ok_or(ChunkError::SectionOutOfBounds {
+            .ok_or_else(|| ChunkError::SectionOutOfBounds {
                 section_id,
                 offset: section.offset,
                 byte_length: section.byte_length,
@@ -359,7 +359,7 @@ impl ChunkEnvelope {
             })?;
         self.payload
             .get(start..end)
-            .ok_or(ChunkError::SectionOutOfBounds {
+            .ok_or_else(|| ChunkError::SectionOutOfBounds {
                 section_id,
                 offset: section.offset,
                 byte_length: section.byte_length,

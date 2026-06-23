@@ -1098,7 +1098,7 @@ impl PoiRpcClient {
         list_key: &FixedBytes<32>,
         start_index: u64,
         end_index: u64,
-    ) -> Result<Vec<String>, PoiRpcError> {
+    ) -> Result<Vec<U256>, PoiRpcError> {
         self.send_request(
             POI_MERKLETREE_LEAVES_METHOD,
             Self::poi_merkletree_leaves_params(

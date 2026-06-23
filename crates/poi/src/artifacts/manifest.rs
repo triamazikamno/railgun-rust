@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+const PUBLISHER_PUBKEY_FIELD: &str = "publisher_pubkey";
+const PUBLISHER_SIGNING_KEY_FIELD: &str = "publisher signing key";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDescriptor {
     pub cid: String,
@@ -134,7 +137,7 @@ impl Manifest {
     }
 
     pub fn verify_signature(&self) -> Result<(), ManifestError> {
-        let pubkey_bytes = decode_fixed_hex::<32>("publisher_pubkey", &self.publisher_pubkey)?;
+        let pubkey_bytes = decode_fixed_hex::<32>(PUBLISHER_PUBKEY_FIELD, &self.publisher_pubkey)?;
         self.verify_signature_with_key(&pubkey_bytes)
     }
 
@@ -142,7 +145,7 @@ impl Manifest {
         &self,
         trusted_publisher_pubkey: &[u8; 32],
     ) -> Result<(), ManifestError> {
-        let pubkey_bytes = decode_fixed_hex::<32>("publisher_pubkey", &self.publisher_pubkey)?;
+        let pubkey_bytes = decode_fixed_hex::<32>(PUBLISHER_PUBKEY_FIELD, &self.publisher_pubkey)?;
         if &pubkey_bytes != trusted_publisher_pubkey {
             return Err(ManifestError::PublisherKeyMismatch {
                 expected: prefixed_hex(trusted_publisher_pubkey),
@@ -194,12 +197,12 @@ struct ManifestBody<'a> {
 pub fn load_publisher_signing_key(path: impl AsRef<Path>) -> Result<SigningKey, ManifestError> {
     let data = fs::read(path).map_err(ManifestError::KeyRead)?;
     if data.len() == 32 {
-        let bytes = fixed_slice::<32>("publisher signing key", &data)?;
+        let bytes = fixed_slice::<32>(PUBLISHER_SIGNING_KEY_FIELD, &data)?;
         return Ok(SigningKey::from_bytes(&bytes));
     }
 
     let text = std::str::from_utf8(&data).map_err(ManifestError::KeyUtf8)?;
-    let bytes = decode_fixed_hex::<32>("publisher signing key", text.trim())?;
+    let bytes = decode_fixed_hex::<32>(PUBLISHER_SIGNING_KEY_FIELD, text.trim())?;
     Ok(SigningKey::from_bytes(&bytes))
 }
 

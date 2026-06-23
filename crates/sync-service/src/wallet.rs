@@ -14,7 +14,7 @@ use broadcaster_core::crypto::aes_gcm::{decrypt_in_place_16b_iv, split_iv_tag};
 use broadcaster_core::crypto::shared_key::shared_symmetric_key;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{DEFAULT_TXID_VERSION, railgun_txid_leaf_hash_with_output_start};
-use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
+use broadcaster_core::tree::TREE_LEAF_COUNT;
 use merkletree::tree::{DenseMerkleTree, MerkleForest};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
@@ -33,11 +33,11 @@ use local_db::{
     DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
 };
-use poi::artifacts::{SnapshotEvent, verify_poi_event};
-use poi::cache::{POI_EVENTS_PAGE_SIZE, PoiCache, PoiCacheError, PoiCacheIdentity};
+use poi::artifacts::SnapshotEvent;
+use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError, PoiCacheIdentity};
 use poi::error::{PoiError, PoiRpcError};
 use poi::poi::{
-    BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient, PoiSyncedListEvent,
+    BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient,
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
 };
 use railgun_wallet::scan::{
@@ -83,7 +83,9 @@ pub(crate) use delta::{apply_wallet_delta_to_vec, pending_overlay_from_delta};
 pub use handle::{WalletHandle, WalletPendingOverlay, WalletPendingSpent};
 pub(crate) use pending_output_poi::process_pending_output_poi_observations;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
-pub(crate) use poi_refresh::{LivePoiTailError, LivePoiTailOutcome, sync_live_poi_event_tail};
+#[cfg(test)]
+pub(crate) use poi_refresh::LivePoiTailError;
+pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
 pub(crate) use worker::{spawn_wallet_worker, wallet_cache_store};
 

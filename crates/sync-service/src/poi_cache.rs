@@ -16,7 +16,7 @@ use url::Url;
 use crate::poi_artifacts::{PersistedPoiArtifactCache, PoiArtifactIngestor, load_persisted_cache};
 use crate::types::{LocalPoiCaches, PoiArtifactSourceConfig};
 use crate::wallet::{
-    LivePoiTailError, LivePoiTailOutcome, sync_live_poi_event_tail, wallet_poi_status_client,
+    live_tail_candidate_cache, sync_live_poi_event_tail, wallet_poi_status_client,
 };
 
 const EVM_CHAIN_TYPE: u8 = 0;
@@ -158,10 +158,7 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
         list_count = task.active_list_keys.len(),
         "starting chain-scoped artifact POI cache service"
     );
-    let live_tail_client = task
-        .http_client
-        .as_ref()
-        .and_then(|client| wallet_poi_status_client(&task.poi_rpc_url, Some(client)));
+    let live_tail_client = wallet_poi_status_client(&task.poi_rpc_url, task.http_client.as_ref());
     let mut last_artifact_sync = Instant::now() - POI_ARTIFACT_CACHE_SYNC_INTERVAL;
     loop {
         let caches_available = chain_poi_caches_available_for_lists(
@@ -211,35 +208,21 @@ async fn sync_chain_poi_artifact_caches(
         artifact_config.clone(),
         http_client.cloned().unwrap_or_else(reqwest::Client::new),
     );
-    let live_tail_client =
-        http_client.and_then(|client| wallet_poi_status_client(poi_rpc_url, Some(client)));
+    let live_tail_client = wallet_poi_status_client(poi_rpc_url, http_client);
     for list_key in active_list_keys {
         let identity =
             PoiCacheIdentity::new(EVM_CHAIN_TYPE, chain_id, DEFAULT_TXID_VERSION, *list_key);
         let sync_started = Instant::now();
         let artifact_refresh_started = Instant::now();
-        let preloaded_cache = preloaded_caches.remove(list_key);
-        let artifact_refresh = if let Some(preloaded_cache) = preloaded_cache {
-            ingestor
-                .refresh_persisted_cache_with_preloaded_and_proxy(
-                    db,
-                    identity.clone(),
-                    Some(preloaded_cache),
-                    0,
-                    SystemTime::now(),
-                    live_tail_client.as_ref(),
-                )
-                .await
-        } else {
-            ingestor
-                .refresh_persisted_cache_with_proxy(
-                    db,
-                    identity.clone(),
-                    SystemTime::now(),
-                    live_tail_client.as_ref(),
-                )
-                .await
-        };
+        let artifact_refresh = ingestor
+            .refresh_persisted_cache_with_optional_preloaded_and_proxy(
+                db,
+                identity.clone(),
+                preloaded_caches.remove(list_key),
+                SystemTime::now(),
+                live_tail_client.as_ref(),
+            )
+            .await;
         let artifact_refresh_elapsed_ms = artifact_refresh_started.elapsed().as_millis();
         match artifact_refresh {
             Ok(refresh) => {
@@ -341,15 +324,6 @@ async fn sync_chain_poi_artifact_caches(
             }
         }
     }
-}
-
-async fn live_tail_candidate_cache(
-    client: &PoiRpcClient,
-    cache: &PoiCache,
-) -> Result<(PoiCache, LivePoiTailOutcome), LivePoiTailError> {
-    let mut tailed_cache = cache.clone();
-    let outcome = sync_live_poi_event_tail(client, &mut tailed_cache).await?;
-    Ok((tailed_cache, outcome))
 }
 
 fn install_cache_if_not_behind(
@@ -520,14 +494,12 @@ mod tests {
     };
     use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
     use crate::wallet::LivePoiTailError;
-    use alloy::hex;
-    use alloy::primitives::FixedBytes;
+    use alloy::primitives::{FixedBytes, U256};
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
-    use ed25519_dalek::{Signer, SigningKey};
     use local_db::{DbConfig, DbStore};
     use poi::artifacts::SnapshotEvent;
     use poi::cache::{PoiCache, PoiCacheIdentity};
-    use poi::poi::{PoiEventType, PoiRpcClient, PoiSyncedListEvent, SignedPoiEvent};
+    use poi::poi::{PoiEventType, PoiRpcClient};
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
@@ -582,26 +554,7 @@ mod tests {
         cache
     }
 
-    fn signed_event(
-        signing_key: &SigningKey,
-        index: u64,
-        blinded_commitment: FixedBytes<32>,
-    ) -> SignedPoiEvent {
-        let mut event = SignedPoiEvent {
-            index,
-            blinded_commitment: hex::encode_prefixed(blinded_commitment),
-            signature: String::new(),
-            event_type: PoiEventType::Transact,
-        };
-        event.signature = hex::encode(
-            signing_key
-                .sign(&poi::artifacts::verify::canonical_poi_event_message(&event))
-                .to_bytes(),
-        );
-        event
-    }
-
-    fn spawn_poi_rpc(result: serde_json::Value) -> MockPoiRpc {
+    fn spawn_poi_rpc_sequence(results: Vec<serde_json::Value>) -> MockPoiRpc {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock POI RPC");
         let url = Url::parse(&format!(
             "http://{}",
@@ -610,32 +563,35 @@ mod tests {
         .expect("mock POI RPC URL");
         let (tx, requests) = mpsc::channel();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let mut bytes = Vec::new();
-            let mut buf = [0_u8; 1024];
-            let (body_start, content_length) = loop {
-                let read = stream.read(&mut buf).expect("read request");
-                assert!(read > 0, "mock POI RPC closed before request body");
-                bytes.extend_from_slice(&buf[..read]);
-                if let Some(lengths) = http_body_bounds(&bytes) {
-                    break lengths;
-                }
-            };
-            let body = &bytes[body_start..body_start + content_length];
-            let request: serde_json::Value = serde_json::from_slice(body).expect("request JSON");
-            tx.send(request.clone()).expect("record request");
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request["id"].clone(),
-                "result": result,
-            })
-            .to_string();
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                response.len()
-            );
-            stream.write_all(headers.as_bytes()).expect("write headers");
-            stream.write_all(response.as_bytes()).expect("write body");
+            for result in results {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut bytes = Vec::new();
+                let mut buf = [0_u8; 1024];
+                let (body_start, content_length) = loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    assert!(read > 0, "mock POI RPC closed before request body");
+                    bytes.extend_from_slice(&buf[..read]);
+                    if let Some(lengths) = http_body_bounds(&bytes) {
+                        break lengths;
+                    }
+                };
+                let body = &bytes[body_start..body_start + content_length];
+                let request: serde_json::Value =
+                    serde_json::from_slice(body).expect("request JSON");
+                tx.send(request.clone()).expect("record request");
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"].clone(),
+                    "result": result,
+                })
+                .to_string();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response.len()
+                );
+                stream.write_all(headers.as_bytes()).expect("write headers");
+                stream.write_all(response.as_bytes()).expect("write body");
+            }
         });
         MockPoiRpc { url, requests }
     }
@@ -700,32 +656,35 @@ mod tests {
 
     #[tokio::test]
     async fn failed_live_tail_candidate_does_not_mutate_artifact_cache() {
-        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
-        let list_key = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let list_key = FixedBytes::from([7_u8; 32]);
         let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
         let artifact_commitment = FixedBytes::from([0x22; 32]);
         let tailed_commitment = FixedBytes::from([0x33; 32]);
         let cache = cache_with_events(identity, &[snapshot_event(0, artifact_commitment)]);
         let original_next_event_index = cache.progress().next_event_index;
-        let event = signed_event(&signing_key, 1, tailed_commitment);
-        let events = vec![PoiSyncedListEvent {
-            signed_poi_event: event,
-            validated_merkleroot: hex::encode_prefixed(FixedBytes::from([0xff; 32])),
-        }];
-        let mock = spawn_poi_rpc(serde_json::to_value(events).expect("events JSON"));
+        let leaves = vec![U256::from_be_bytes(tailed_commitment.0)];
+        let mock = spawn_poi_rpc_sequence(vec![
+            serde_json::to_value(leaves).expect("leaves JSON"),
+            serde_json::json!(false),
+        ]);
         let client = PoiRpcClient::new(mock.url.clone());
 
         let err = live_tail_candidate_cache(&client, &cache)
             .await
-            .expect_err("root mismatch should reject candidate cache");
+            .expect_err("root validation rejection should reject candidate cache");
 
-        assert!(matches!(err, LivePoiTailError::RootMismatch { .. }));
+        assert!(matches!(err, LivePoiTailError::RootRejected));
         assert_eq!(cache.progress().next_event_index, original_next_event_index);
         assert!(cache.position(&tailed_commitment).is_none());
         let request = mock
             .requests
             .recv_timeout(Duration::from_secs(2))
-            .expect("remote event request");
-        assert_eq!(request["method"], "ppoi_poi_events");
+            .expect("remote leaf request");
+        assert_eq!(request["method"], "ppoi_poi_merkletree_leaves");
+        let request = mock
+            .requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("remote root validation request");
+        assert_eq!(request["method"], "ppoi_validate_poi_merkleroots");
     }
 }

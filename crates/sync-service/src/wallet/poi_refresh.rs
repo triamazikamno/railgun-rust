@@ -1,4 +1,5 @@
 use super::*;
+use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 
 pub(super) async fn refresh_wallet_poi_statuses_selected(
     client: &dyn PoiStatusReader,
@@ -122,30 +123,12 @@ pub(crate) struct LivePoiTailOutcome {
 pub(crate) enum LivePoiTailError {
     #[error("live POI tail request failed")]
     Rpc(#[from] PoiRpcError),
-    #[error("live POI event signature verification failed")]
-    Verify(#[from] poi::artifacts::VerifyError),
     #[error("live POI cache update failed")]
     Cache(#[from] PoiCacheError),
-    #[error("live POI event index mismatch: expected {expected}, got {actual}")]
-    EventIndexMismatch { expected: u64, actual: u64 },
     #[error("live POI event range overflow")]
     RangeOverflow,
-    #[error("invalid hex in {field}: {value}")]
-    InvalidHex { field: &'static str, value: String },
-    #[error("{field} has {actual} bytes, expected {expected}")]
-    InvalidByteLen {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
-    },
-    #[error("live POI root missing for tree {tree_number}")]
-    MissingRoot { tree_number: u32 },
-    #[error("live POI root mismatch for tree {tree_number}: expected {expected}, got {actual}")]
-    RootMismatch {
-        tree_number: u32,
-        expected: String,
-        actual: String,
-    },
+    #[error("live POI roots were rejected by the POI RPC")]
+    RootRejected,
 }
 
 pub(crate) async fn sync_live_poi_event_tail(
@@ -165,10 +148,10 @@ pub(crate) async fn sync_live_poi_event_tail(
     loop {
         let start_index = outcome.next_event_index;
         let end_index = start_index
-            .checked_add(POI_EVENTS_PAGE_SIZE - 1)
+            .checked_add(POI_MERKLETREE_LEAVES_PAGE_SIZE)
             .ok_or(LivePoiTailError::RangeOverflow)?;
-        let events = client
-            .poi_events(
+        let leaves = client
+            .poi_merkletree_leaves(
                 &identity.txid_version,
                 identity.chain_type,
                 identity.chain_id,
@@ -177,103 +160,63 @@ pub(crate) async fn sync_live_poi_event_tail(
                 end_index,
             )
             .await?;
-        if events.is_empty() {
+        let leaves = trim_zero_padding(&leaves);
+        if leaves.is_empty() {
             break;
         }
-        let returned = events.len();
-        apply_live_poi_events(cache, &identity.list_key, start_index, &events)?;
+        let returned = leaves.len();
+        apply_live_poi_leaves(cache, start_index, leaves)?;
         outcome.events += returned;
         outcome.pages += 1;
         outcome.next_event_index = cache.progress().next_event_index;
-        if returned < POI_EVENTS_PAGE_SIZE as usize {
+        if returned < POI_MERKLETREE_LEAVES_PAGE_SIZE as usize {
             break;
         }
+    }
+
+    if outcome.events > 0 && !cache.validate_roots(client).await? {
+        return Err(LivePoiTailError::RootRejected);
     }
 
     Ok(outcome)
 }
 
-pub(super) fn apply_live_poi_events(
+pub(crate) async fn live_tail_candidate_cache(
+    client: &PoiRpcClient,
+    cache: &PoiCache,
+) -> Result<(PoiCache, LivePoiTailOutcome), LivePoiTailError> {
+    let mut tailed_cache = cache.clone();
+    let outcome = sync_live_poi_event_tail(client, &mut tailed_cache).await?;
+    Ok((tailed_cache, outcome))
+}
+
+pub(super) fn apply_live_poi_leaves(
     cache: &mut PoiCache,
-    list_key: &FixedBytes<32>,
     start_index: u64,
-    events: &[PoiSyncedListEvent],
+    leaves: &[U256],
 ) -> Result<(), LivePoiTailError> {
-    let mut expected_index = start_index;
-    let mut snapshot_events = Vec::with_capacity(events.len());
-    let mut expected_roots = BTreeMap::new();
-    let list_key_bytes = fixed_bytes(list_key);
-    for event in events {
-        if event.signed_poi_event.index != expected_index {
-            return Err(LivePoiTailError::EventIndexMismatch {
-                expected: expected_index,
-                actual: event.signed_poi_event.index,
-            });
-        }
-        verify_poi_event(&event.signed_poi_event, &list_key_bytes)?;
-        let blinded_commitment = decode_hex_array::<32>(
-            "signedPOIEvent.blindedCommitment",
-            &event.signed_poi_event.blinded_commitment,
-        )?;
-        let signature = decode_hex_array::<64>(
-            "signedPOIEvent.signature",
-            &event.signed_poi_event.signature,
-        )?;
-        let (tree_number, _) = normalize_tree_position(0, event.signed_poi_event.index);
-        expected_roots.insert(
-            tree_number,
-            decode_hex_array::<32>("validatedMerkleroot", &event.validated_merkleroot)?,
-        );
-        snapshot_events.push(SnapshotEvent {
-            event_index: event.signed_poi_event.index,
-            blinded_commitment,
-            signature,
-            event_type: event.signed_poi_event.event_type,
-        });
-        expected_index = expected_index
-            .checked_add(1)
+    let mut snapshot_events = Vec::with_capacity(leaves.len());
+    for (offset, leaf) in leaves.iter().enumerate() {
+        let event_index = start_index
+            .checked_add(offset as u64)
             .ok_or(LivePoiTailError::RangeOverflow)?;
+        snapshot_events.push(SnapshotEvent {
+            event_index,
+            blinded_commitment: leaf.to_be_bytes::<32>(),
+            signature: [0; 64],
+            event_type: poi::poi::PoiEventType::Shield,
+        });
     }
     cache.apply_verified_artifact_events(&snapshot_events)?;
-    let actual_roots = cache.current_roots();
-    for (tree_number, expected_root) in expected_roots {
-        let actual_root = actual_roots
-            .get(&tree_number)
-            .ok_or(LivePoiTailError::MissingRoot { tree_number })?;
-        if *actual_root != expected_root {
-            return Err(LivePoiTailError::RootMismatch {
-                tree_number,
-                expected: hex::encode_prefixed(expected_root),
-                actual: hex::encode_prefixed(actual_root),
-            });
-        }
-    }
-    cache.accept_current_roots();
     Ok(())
 }
 
-pub(super) fn decode_hex_array<const N: usize>(
-    field: &'static str,
-    value: &str,
-) -> Result<[u8; N], LivePoiTailError> {
-    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value)).map_err(|_| {
-        LivePoiTailError::InvalidHex {
-            field,
-            value: value.to_string(),
+pub(super) fn trim_zero_padding(leaves: &[U256]) -> &[U256] {
+    let zero_leaf = MERKLE_ZERO_VALUE;
+    for (index, leaf) in leaves.iter().enumerate() {
+        if *leaf == zero_leaf {
+            return &leaves[..index];
         }
-    })?;
-    let actual = bytes.len();
-    bytes
-        .try_into()
-        .map_err(|_| LivePoiTailError::InvalidByteLen {
-            field,
-            expected: N,
-            actual,
-        })
-}
-
-pub(super) fn fixed_bytes<const N: usize>(value: &FixedBytes<N>) -> [u8; N] {
-    let mut bytes = [0_u8; N];
-    bytes.copy_from_slice(value.as_slice());
-    bytes
+    }
+    leaves
 }

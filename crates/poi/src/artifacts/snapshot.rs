@@ -138,41 +138,11 @@ impl SnapshotHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotEventRecord {
-    pub event_index: u64,
-    pub blinded_commitment: [u8; 32],
-    pub signature: [u8; 64],
-    pub event_type: PoiEventType,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotEvent {
     pub event_index: u64,
     pub blinded_commitment: [u8; 32],
     pub signature: [u8; 64],
     pub event_type: PoiEventType,
-}
-
-impl From<SnapshotEventRecord> for SnapshotEvent {
-    fn from(record: SnapshotEventRecord) -> Self {
-        Self {
-            event_index: record.event_index,
-            blinded_commitment: record.blinded_commitment,
-            signature: record.signature,
-            event_type: record.event_type,
-        }
-    }
-}
-
-impl From<&SnapshotEventRecord> for SnapshotEvent {
-    fn from(record: &SnapshotEventRecord) -> Self {
-        Self {
-            event_index: record.event_index,
-            blinded_commitment: record.blinded_commitment,
-            signature: record.signature,
-            event_type: record.event_type,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +165,7 @@ pub struct SnapshotWriter;
 impl SnapshotWriter {
     pub fn write(
         header: &SnapshotHeaderInput,
-        events: &[SnapshotEventRecord],
+        events: &[SnapshotEvent],
     ) -> Result<Vec<u8>, SnapshotError> {
         validate_event_range(header, events)?;
         let event_count = u64::try_from(events.len()).map_err(|_| SnapshotError::CountOverflow)?;
@@ -366,7 +336,7 @@ fn read_header(bytes: &[u8]) -> Result<SnapshotHeader, SnapshotError> {
 
 fn validate_event_range(
     header: &SnapshotHeaderInput,
-    events: &[SnapshotEventRecord],
+    events: &[SnapshotEvent],
 ) -> Result<(), SnapshotError> {
     if events.is_empty() {
         return Ok(());
@@ -675,8 +645,8 @@ mod tests {
         }
     }
 
-    fn event_record(event_index: u64, byte: u8, event_type: PoiEventType) -> SnapshotEventRecord {
-        SnapshotEventRecord {
+    fn event_record(event_index: u64, byte: u8, event_type: PoiEventType) -> SnapshotEvent {
+        SnapshotEvent {
             event_index,
             blinded_commitment: [byte; 32],
             signature: [byte + 10; 64],

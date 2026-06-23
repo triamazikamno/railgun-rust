@@ -10,7 +10,7 @@ pub use manifest::{
     ArtifactDescriptor, Manifest, ManifestEntry, ManifestError, RetainedDeltaDescriptor,
 };
 pub use snapshot::{
-    Snapshot, SnapshotBlockedShield, SnapshotError, SnapshotEvent, SnapshotEventRecord,
-    SnapshotHeader, SnapshotHeaderInput, SnapshotKind, SnapshotReader, SnapshotWriter,
+    Snapshot, SnapshotBlockedShield, SnapshotError, SnapshotEvent, SnapshotHeader,
+    SnapshotHeaderInput, SnapshotKind, SnapshotReader, SnapshotWriter,
 };
 pub use verify::{VerifyError, verify_blocked_shield, verify_poi_event};

@@ -283,22 +283,21 @@ impl PoiCache {
     pub fn apply_poi_leaves(
         &mut self,
         start_index: u64,
-        leaves: &[String],
+        leaves: &[U256],
     ) -> Result<usize, PoiCacheError> {
         let mut inserted = 0usize;
         for (offset, leaf) in leaves.iter().enumerate() {
             let global_index = start_index
                 .checked_add(offset as u64)
                 .ok_or(PoiCacheError::RangeOverflow)?;
-            let leaf = parse_u256_hex(leaf, "poiMerkletreeLeaf")?;
-            if leaf != U256::ZERO {
+            if *leaf != U256::ZERO {
                 let (tree_number, tree_position) = normalize_tree_position(0, global_index);
                 self.snapshot.forest.insert_leaf(MerkleTreeUpdate {
                     tree_number,
                     tree_position,
-                    hash: leaf,
+                    hash: *leaf,
                 })?;
-                let blinded_commitment = fixed_from_u256(leaf);
+                let blinded_commitment = fixed_from_u256(*leaf);
                 self.snapshot.position_by_blinded_commitment.insert(
                     blinded_commitment,
                     PoiCachePosition {
@@ -924,7 +923,7 @@ mod tests {
         let mut cache = PoiCache::new(identity());
         let valid_commitment = FixedBytes::from([0x22; 32]);
         let blocked_commitment = FixedBytes::from([0x33; 32]);
-        let leaves = vec![hex::encode_prefixed(valid_commitment)];
+        let leaves = vec![U256::from_be_bytes(valid_commitment.0)];
 
         cache
             .apply_poi_events(&[event(0, valid_commitment)])
@@ -968,7 +967,7 @@ mod tests {
     fn proof_generation_fails_closed_until_roots_are_validated() {
         let mut cache = PoiCache::new(identity());
         let blinded_commitment = FixedBytes::from([0x22; 32]);
-        let leaves = vec![hex::encode_prefixed(blinded_commitment)];
+        let leaves = vec![U256::from_be_bytes(blinded_commitment.0)];
         cache.apply_poi_leaves(0, &leaves).unwrap();
 
         let missing_validation = cache
@@ -1010,7 +1009,7 @@ mod tests {
         let leaves = commitments
             .iter()
             .copied()
-            .map(hex::encode_prefixed)
+            .map(|commitment| U256::from_be_bytes(commitment.0))
             .collect::<Vec<_>>();
         cache.apply_poi_leaves(0, &leaves).unwrap();
         let roots = cache.current_roots();
@@ -1060,7 +1059,7 @@ mod tests {
         let present = FixedBytes::from([0x22; 32]);
         let missing = FixedBytes::from([0x33; 32]);
         cache
-            .apply_poi_leaves(0, &[hex::encode_prefixed(present)])
+            .apply_poi_leaves(0, &[U256::from_be_bytes(present.0)])
             .unwrap();
         let roots = cache.current_roots();
         cache.snapshot.progress.root_validation = PoiCacheRootValidation::Validated { roots };
