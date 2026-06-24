@@ -16,7 +16,6 @@ chrono = { workspace = true }
 cid = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures = { workspace = true }
-hex = { workspace = true }
 ipld-dagpb = { workspace = true }
 ipld-core = { workspace = true }
 libp2p-identity = { workspace = true }

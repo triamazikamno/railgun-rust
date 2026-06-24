@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
-use alloy::uint;
+use alloy::{hex, uint};
 use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::keys::EddsaSignature;

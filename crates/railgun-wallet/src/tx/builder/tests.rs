@@ -236,12 +236,12 @@ fn sample_poi_merkle_proofs(blinded_commitments: &[FixedBytes<32>]) -> Vec<PoiMe
         .iter()
         .enumerate()
         .map(|(index, blinded_commitment)| PoiMerkleProof {
-            leaf: hex::encode_prefixed(blinded_commitment),
+            leaf: U256::from_be_bytes(blinded_commitment.0),
             elements: (0..TREE_DEPTH)
-                .map(|level| format!("0x{:064x}", index + level + 1))
+                .map(|level| U256::from(u64::try_from(index + level + 1).expect("proof level")))
                 .collect(),
-            indices: format!("0x{index:064x}"),
-            root: format!("0x{:064x}", 100 + index),
+            indices: U256::from(u64::try_from(index).expect("proof index")),
+            root: U256::from(u64::try_from(100 + index).expect("proof root")),
         })
         .collect()
 }

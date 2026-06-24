@@ -1,3 +1,4 @@
+use alloy::primitives::FixedBytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -6,10 +7,10 @@ use crate::poi::SignedBlockedShield;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedShieldsArtifact {
     pub format_version: u16,
-    pub list_key: String,
+    pub list_key: FixedBytes<32>,
     pub chain_id: u64,
     pub chain_type: u8,
-    pub upstream_endpoint_hash: String,
+    pub upstream_endpoint_hash: FixedBytes<32>,
     pub blocked_shields: Vec<BlockedShieldArtifactRecord>,
 }
 
@@ -31,10 +32,10 @@ impl BlockedShieldsArtifact {
 
         Self {
             format_version,
-            list_key: prefixed_hex(list_key),
+            list_key: FixedBytes::from(*list_key),
             chain_id,
             chain_type,
-            upstream_endpoint_hash: prefixed_hex(upstream_endpoint_hash),
+            upstream_endpoint_hash: FixedBytes::from(*upstream_endpoint_hash),
             blocked_shields,
         }
     }
@@ -108,13 +109,10 @@ pub enum BlockedShieldsArtifactError {
     Json(#[from] serde_json::Error),
 }
 
-fn prefixed_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::hex;
 
     #[test]
     fn artifact_bytes_are_deterministic_and_sorted() {
@@ -135,11 +133,11 @@ mod tests {
 
         assert_eq!(
             decoded.blocked_shields[0].blinded_commitment,
-            prefixed_hex(&[1; 32])
+            hex::encode_prefixed([1; 32])
         );
         assert_eq!(
             decoded.blocked_shields[1].blinded_commitment,
-            prefixed_hex(&[2; 32])
+            hex::encode_prefixed([2; 32])
         );
         assert_eq!(decoded.to_bytes().expect("re-encode artifact"), bytes);
     }
@@ -164,10 +162,10 @@ mod tests {
 
     fn blocked_shield(byte: u8, block_reason: Option<&str>) -> SignedBlockedShield {
         SignedBlockedShield {
-            commitment_hash: prefixed_hex(&[byte + 10; 32]),
-            blinded_commitment: prefixed_hex(&[byte; 32]),
+            commitment_hash: hex::encode_prefixed([byte + 10; 32]),
+            blinded_commitment: hex::encode_prefixed([byte; 32]),
             block_reason: block_reason.map(ToString::to_string),
-            signature: prefixed_hex(&[byte + 20; 64]),
+            signature: hex::encode_prefixed([byte + 20; 64]),
         }
     }
 }

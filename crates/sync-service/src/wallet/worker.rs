@@ -696,6 +696,8 @@ pub(crate) fn spawn_wallet_worker(
                                         from_block: expected_from_block,
                                         to_block: batch.to_block,
                                         follow_safe_head: true,
+                                        progress_start_block: expected_from_block,
+                                        progress_tx: cfg.progress_tx.clone(),
                                         sender: backfill_sender.clone(),
                                     })
                                     .await

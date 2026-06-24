@@ -21,7 +21,6 @@ brotli = "8.0.2"
 broadcaster-core = { path = "../core" }
 color-eyre = "0.6"
 curve25519-dalek = { workspace = true }
-hex = { workspace = true }
 hmac = { workspace = true }
 merkletree = { path = "../merkletree" }
 local-db = { path = "../local-db" }

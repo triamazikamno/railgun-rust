@@ -1,3 +1,4 @@
+use alloy::hex;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use thiserror::Error;
 
@@ -24,10 +25,11 @@ pub fn verify_blocked_shield(
 
 #[must_use]
 pub fn canonical_poi_event_message(event: &SignedPoiEvent) -> Vec<u8> {
+    let blinded_commitment = hex::encode_prefixed(event.blinded_commitment.as_slice());
     format!(
         r#"{{"index":{},"blindedCommitment":"{}","type":"{}"}}"#,
         event.index,
-        event.blinded_commitment,
+        blinded_commitment,
         event_type_str(event.event_type)
     )
     .into_bytes()
@@ -88,6 +90,7 @@ pub enum VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::FixedBytes;
     use ed25519_dalek::{Signer, SigningKey};
 
     const ACTIVE_LIST_KEY: [u8; 32] = [
@@ -106,12 +109,15 @@ mod tests {
         SigningKey::from_bytes(&[7_u8; 32])
     }
 
+    fn fixed_hex(value: &str) -> FixedBytes<32> {
+        FixedBytes::from_slice(&decode_hex(value).expect("hex"))
+    }
+
     fn signed_event(event_type: PoiEventType) -> SignedPoiEvent {
         let signing_key = signing_key();
         let mut event = SignedPoiEvent {
             index: 42,
-            blinded_commitment:
-                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            blinded_commitment: FixedBytes::from([0x11; 32]),
             signature: String::new(),
             event_type,
         };
@@ -149,7 +155,7 @@ mod tests {
     ) -> SignedPoiEvent {
         SignedPoiEvent {
             index,
-            blinded_commitment: blinded_commitment.to_string(),
+            blinded_commitment: fixed_hex(blinded_commitment),
             signature: signature.to_string(),
             event_type,
         }
@@ -279,7 +285,7 @@ mod tests {
             "99cb342afb3ebc952119d93552647d5f2d3d8867c5797745e461bd42e48fa7974cfbd1af863cb68523a3bc318f6e70acd6dadc7d1aa0641aabde1332ace3580a",
             PoiEventType::Shield,
         );
-        let blinded_commitment = &event.blinded_commitment;
+        let blinded_commitment = hex::encode_prefixed(event.blinded_commitment.as_slice());
         let index = event.index;
         let event_type = event_type_str(event.event_type);
         let swapped_message = format!(

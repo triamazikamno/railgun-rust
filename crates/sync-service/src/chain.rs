@@ -16,7 +16,7 @@ use alloy_rpc_types_eth::{Filter, Log};
 use alloy_transport::TransportError;
 use async_trait::async_trait;
 use broadcaster_core::provider::build_provider_with_http_client;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use local_db::DbStore;
 use merkletree::errors::SyncError;

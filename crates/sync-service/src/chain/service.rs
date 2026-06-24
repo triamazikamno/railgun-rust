@@ -22,10 +22,12 @@ impl ChainService {
         };
 
         let rpcs = chain.rpcs.clone();
-        let rpc = rpcs
+        let fallback_rpc = rpcs
             .random_provider()
             .ok_or_else(|| ChainError::NoHealthyRpc)?;
-        let (initial_head, initial_safe_head) = fetch_initial_head(&chain, &rpc.provider).await;
+        let (rpc, initial_head, initial_safe_head) = fetch_initial_head(&chain, rpcs.as_ref())
+            .await
+            .unwrap_or((fallback_rpc, 0, 0));
 
         let (forest, last_processed, snapshot_path, last_anchor) = db
             .load_or_initialize_forest(
@@ -132,13 +134,18 @@ impl ChainService {
         cache_key: &str,
         from_block: Option<u64>,
     ) -> Result<(), ChainError> {
-        let (backfill_sender, start_block, sync_to_block) = {
+        let (backfill_sender, start_block, sync_to_block, progress_tx) = {
             let wallets = self.wallets.read().await;
             let registration = wallets.get(cache_key).ok_or(ChainError::WalletNotFound)?;
             (
                 registration.backfill_sender.clone(),
                 registration.start_block,
                 registration.sync_to_block,
+                registration
+                    .cfg
+                    .progress_tx
+                    .clone()
+                    .or_else(|| self.chain.progress_tx.clone()),
             )
         };
 
@@ -157,6 +164,8 @@ impl ChainService {
                 from_block: reset_from,
                 to_block: sync_target,
                 follow_safe_head: sync_to_block.is_none(),
+                progress_start_block: reset_from,
+                progress_tx,
                 sender: backfill_sender,
             })
             .await?;
@@ -250,6 +259,17 @@ impl ChainService {
         let catch_up_handle = handle.clone();
         let catch_up_cancel = cancel;
         tokio::spawn(async move {
+            let Some(sync_target) = wait_for_startup_sync_target(
+                service.safe_head_tx.subscribe(),
+                catch_up_cfg.sync_to_block,
+                sync_target,
+                &catch_up_cancel,
+            )
+            .await
+            else {
+                return;
+            };
+
             if service
                 .hedged_wallet_startup_sync(
                     &catch_up_cfg,
@@ -284,7 +304,7 @@ impl ChainService {
             }
             service
                 .enqueue_wallet_backfill(
-                    &catch_up_cfg.cache_key,
+                    &catch_up_cfg,
                     start_block,
                     checkpoint,
                     sync_target,
@@ -299,7 +319,7 @@ impl ChainService {
 
     async fn enqueue_wallet_backfill(
         &self,
-        cache_key: &str,
+        cfg: &WalletConfig,
         start_block: u64,
         last_scanned: u64,
         sync_target: u64,
@@ -314,20 +334,26 @@ impl ChainService {
         let needs_backfill = follow_safe_head || sync_target == 0 || from_block <= sync_target;
 
         if needs_backfill {
+            let progress_tx = cfg
+                .progress_tx
+                .clone()
+                .or_else(|| self.chain.progress_tx.clone());
             if self
                 .backfill_tx
                 .send(BackfillRequest::Add {
-                    cache_key: cache_key.to_string(),
+                    cache_key: cfg.cache_key.clone(),
                     from_block,
                     to_block: sync_target,
                     follow_safe_head,
+                    progress_start_block: from_block,
+                    progress_tx,
                     sender: backfill_sender.clone(),
                 })
                 .await
                 .is_err()
             {
                 warn!(
-                    cache_key,
+                    cache_key = %cfg.cache_key,
                     "backfill loop unavailable, sending done as fallback"
                 );
                 let _ = backfill_sender
@@ -342,7 +368,7 @@ impl ChainService {
             })
             .await
         {
-            debug!(?err, cache_key, "failed to send backfill done");
+            debug!(?err, cache_key = %cfg.cache_key, "failed to send backfill done");
         }
     }
 
@@ -439,7 +465,7 @@ impl ChainService {
                     .await;
                     if sent && follow_safe_head {
                         self.enqueue_wallet_backfill(
-                            &cfg.cache_key,
+                            cfg,
                             start_block,
                             sync_target,
                             sync_target,
@@ -1260,25 +1286,70 @@ pub(super) async fn wait_for_wallet_ready(
     }
 }
 
-async fn fetch_initial_head(chain: &ChainConfig, provider: &DynProvider) -> (u64, u64) {
-    for attempt in 0..3u32 {
-        match provider.get_block_number().await {
+pub(super) async fn wait_for_startup_sync_target(
+    mut safe_head_rx: watch::Receiver<u64>,
+    sync_to_block: Option<u64>,
+    current_target: u64,
+    cancel: &CancellationToken,
+) -> Option<u64> {
+    if current_target > 0 || sync_to_block.is_some() {
+        return Some(current_target);
+    }
+    loop {
+        let safe_head = *safe_head_rx.borrow();
+        if safe_head > 0 {
+            return Some(wallet_sync_target(safe_head, sync_to_block));
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            changed = safe_head_rx.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+            },
+        }
+    }
+}
+
+async fn fetch_initial_head(
+    chain: &ChainConfig,
+    rpcs: &QueryRpcPool,
+) -> Option<(ProviderHandle, u64, u64)> {
+    let attempts = rpcs.len().max(3);
+    for attempt in 0..attempts {
+        let Some(rpc) = rpcs.random_provider() else {
+            warn!(
+                attempt,
+                "no healthy rpc providers available for initial block number"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+        match rpc.provider.get_block_number().await {
             Ok(head) => {
                 let safe_head = head
                     .saturating_sub(chain.finality_depth)
                     .max(chain.deployment_block);
-                return (head, safe_head);
+                return Some((rpc, head, safe_head));
             }
             Err(err) => {
                 warn!(
                     ?err,
-                    attempt, "failed to fetch initial block number, retrying..."
+                    attempt,
+                    rpc = rpc.url.as_str(),
+                    "failed to fetch initial block number, retrying..."
                 );
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                rpcs.mark_bad_provider(&rpc);
+                if attempt + 1 < attempts {
+                    let backoff_power = match attempt {
+                        0 => 0,
+                        1 => 1,
+                        _ => 2,
+                    };
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(backoff_power))).await;
                 }
             }
         }
     }
-    (0, 0)
+    None
 }

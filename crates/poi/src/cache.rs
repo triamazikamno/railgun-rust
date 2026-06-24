@@ -264,10 +264,7 @@ impl PoiCache {
         events: &[PoiSyncedListEvent],
     ) -> Result<usize, PoiCacheError> {
         for event in events {
-            let blinded_commitment = parse_fixed_hex(
-                &event.signed_poi_event.blinded_commitment,
-                "signedPOIEvent.blindedCommitment",
-            )?;
+            let blinded_commitment = event.signed_poi_event.blinded_commitment;
             self.snapshot
                 .status_by_blinded_commitment
                 .insert(blinded_commitment, PoiStatus::Valid);
@@ -297,7 +294,7 @@ impl PoiCache {
                     tree_position,
                     hash: *leaf,
                 })?;
-                let blinded_commitment = fixed_from_u256(*leaf);
+                let blinded_commitment = FixedBytes::from(leaf.to_be_bytes::<32>());
                 self.snapshot.position_by_blinded_commitment.insert(
                     blinded_commitment,
                     PoiCachePosition {
@@ -380,7 +377,7 @@ impl PoiCache {
                 tree_position,
                 hash: leaf,
             })?;
-            let blinded_commitment = fixed_from_u256(leaf);
+            let blinded_commitment = FixedBytes::from(leaf.to_be_bytes::<32>());
             self.snapshot.position_by_blinded_commitment.insert(
                 blinded_commitment,
                 PoiCachePosition {
@@ -701,7 +698,7 @@ fn validate_poi_merkle_proof_leaf(
     proof: &MerkleProof,
     blinded_commitment: &FixedBytes<32>,
 ) -> Result<(), PoiCacheError> {
-    let leaf = fixed_from_u256(proof.leaf);
+    let leaf = FixedBytes::from(proof.leaf.to_be_bytes::<32>());
     if leaf != *blinded_commitment {
         return Err(PoiCacheError::LeafMismatch {
             blinded_commitment: *blinded_commitment,
@@ -721,35 +718,22 @@ fn dense_tree_counts(positions: &[(FixedBytes<32>, PoiCachePosition)]) -> BTreeM
 
 fn poi_merkle_proof_from_cache(proof: &MerkleProof) -> PoiMerkleProof {
     PoiMerkleProof {
-        leaf: encode_u256_prefixed(proof.leaf),
-        elements: proof
-            .path_elements
-            .iter()
-            .copied()
-            .map(encode_u256_prefixed)
-            .collect(),
-        indices: format!("0x{:064x}", U256::from(proof.leaf_index)),
-        root: encode_u256_prefixed(proof.root),
+        leaf: proof.leaf,
+        elements: proof.path_elements.to_vec(),
+        indices: U256::from(proof.leaf_index),
+        root: proof.root,
     }
-}
-
-fn fixed_from_u256(value: U256) -> FixedBytes<32> {
-    FixedBytes::from(value.to_be_bytes::<32>())
 }
 
 fn fixed_roots(roots: BTreeMap<u32, U256>) -> BTreeMap<u32, FixedBytes<32>> {
     roots
         .into_iter()
-        .map(|(tree, root)| (tree, fixed_from_u256(root)))
+        .map(|(tree, root)| (tree, FixedBytes::from(root.to_be_bytes::<32>())))
         .collect()
 }
 
-fn encode_u256_prefixed(value: U256) -> String {
-    hex::encode_prefixed(fixed_from_u256(value))
-}
-
 fn parse_fixed_hex(value: &str, field: &'static str) -> Result<FixedBytes<32>, PoiCacheError> {
-    parse_u256_hex(value, field).map(fixed_from_u256)
+    parse_u256_hex(value, field).map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
 }
 
 fn parse_u256_hex(value: &str, field: &'static str) -> Result<U256, PoiCacheError> {
@@ -833,7 +817,7 @@ mod tests {
         PoiSyncedListEvent {
             signed_poi_event: SignedPoiEvent {
                 index,
-                blinded_commitment: hex::encode_prefixed(blinded_commitment),
+                blinded_commitment,
                 signature: "signature".to_string(),
                 event_type: PoiEventType::Shield,
             },
@@ -982,12 +966,9 @@ mod tests {
         cache.snapshot.progress.root_validation = PoiCacheRootValidation::Validated { roots };
         let proofs = cache.poi_merkle_proofs(&[blinded_commitment]).unwrap();
         assert_eq!(proofs.len(), 1);
-        assert_eq!(proofs[0].leaf, hex::encode_prefixed(blinded_commitment));
+        assert_eq!(proofs[0].leaf, U256::from_be_bytes(blinded_commitment.0));
         assert_eq!(proofs[0].elements.len(), broadcaster_core::tree::TREE_DEPTH);
-        assert_eq!(
-            proofs[0].indices,
-            "0x0000000000000000000000000000000000000000000000000000000000000000"
-        );
+        assert_eq!(proofs[0].indices, U256::ZERO);
 
         let roots = cache.current_roots();
         cache.snapshot.progress.root_validation = PoiCacheRootValidation::Invalid { roots };

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use alloy::hex;
 use futures::{StreamExt, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -15,7 +16,7 @@ pub use railgun_indexed_artifacts::{
     IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection, IndexedArtifactDescriptor,
     IndexedArtifactError, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
     IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm,
-    format_scope, prefixed_hex,
+    format_scope,
 };
 
 use crate::trustless_artifacts::{TrustlessArtifactError, TrustlessArtifactFetcher};
@@ -662,8 +663,8 @@ pub fn verify_catalog_bytes(
     if actual_hash.as_slice() != descriptor.sha256.as_slice() {
         return Err(IndexedArtifactManifestError::ArtifactHashMismatch {
             cid: descriptor.cid.clone(),
-            expected: prefixed_hex(descriptor.sha256.as_slice()),
-            actual: prefixed_hex(&actual_hash),
+            expected: hex::encode_prefixed(descriptor.sha256.as_slice()),
+            actual: hex::encode_prefixed(actual_hash),
         });
     }
 
@@ -708,8 +709,8 @@ pub fn verify_chunk_bytes(
     if actual_hash.as_slice() != descriptor.sha256.as_slice() {
         return Err(IndexedArtifactManifestError::ArtifactHashMismatch {
             cid: descriptor.cid,
-            expected: prefixed_hex(descriptor.sha256.as_slice()),
-            actual: prefixed_hex(&actual_hash),
+            expected: hex::encode_prefixed(descriptor.sha256.as_slice()),
+            actual: hex::encode_prefixed(actual_hash),
         });
     }
     Ok(VerifiedIndexedArtifactChunk { descriptor, bytes })
@@ -800,7 +801,7 @@ fn validate_manifest_scope(
         .find(|entry| entry.scope == *expected_scope)
         .ok_or_else(|| IndexedArtifactManifestError::MissingChainScope {
             chain_id: expected_scope.chain_id,
-            railgun_contract: prefixed_hex(expected_scope.railgun_contract.as_slice()),
+            railgun_contract: hex::encode_prefixed(expected_scope.railgun_contract.as_slice()),
         })?;
     for catalog in &chain.catalogs {
         if catalog.scope != chain.scope {
@@ -1758,7 +1759,7 @@ mod tests {
         IndexedArtifactManifest::new(
             issued_at_ms,
             10,
-            PublisherIdentity::ed25519(""),
+            PublisherIdentity::ed25519(FixedBytes::ZERO),
             vec![IndexedArtifactChainEntry {
                 latest_indexed: vec![LatestIndexedHeight {
                     dataset_kind: IndexedDatasetKind::WalletScan,

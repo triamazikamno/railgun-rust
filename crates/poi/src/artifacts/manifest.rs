@@ -1,18 +1,19 @@
 use std::fs;
 use std::path::Path;
 
+use alloy::hex;
+use alloy::primitives::FixedBytes;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const PUBLISHER_PUBKEY_FIELD: &str = "publisher_pubkey";
 const PUBLISHER_SIGNING_KEY_FIELD: &str = "publisher signing key";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDescriptor {
     pub cid: String,
-    pub sha256: String,
+    pub sha256: FixedBytes<32>,
     pub byte_size: u64,
 }
 
@@ -21,7 +22,7 @@ impl ArtifactDescriptor {
     pub fn from_bytes(cid: impl Into<String>, bytes: &[u8]) -> Self {
         Self {
             cid: cid.into(),
-            sha256: prefixed_hex(&content_hash(bytes)),
+            sha256: FixedBytes::from(content_hash(bytes)),
             byte_size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         }
     }
@@ -37,13 +38,13 @@ impl ArtifactDescriptor {
             });
         }
 
-        let expected = decode_fixed_hex::<32>("artifact sha256", &self.sha256)?;
-        let actual = content_hash(bytes);
+        let expected = self.sha256;
+        let actual = FixedBytes::from(content_hash(bytes));
         if actual != expected {
             return Err(ManifestError::ArtifactHashMismatch {
                 cid: self.cid.clone(),
-                expected: self.sha256.clone(),
-                actual: prefixed_hex(&actual),
+                expected: hex::encode_prefixed(expected.as_slice()),
+                actual: hex::encode_prefixed(actual.as_slice()),
             });
         }
 
@@ -57,7 +58,7 @@ pub struct RetainedDeltaDescriptor {
     pub artifact: ArtifactDescriptor,
     pub start_index: u64,
     pub end_index: u64,
-    pub tip_merkleroot: String,
+    pub tip_merkleroot: FixedBytes<32>,
 }
 
 impl RetainedDeltaDescriptor {
@@ -66,13 +67,13 @@ impl RetainedDeltaDescriptor {
         artifact: ArtifactDescriptor,
         start_index: u64,
         end_index: u64,
-        tip_merkleroot: impl Into<String>,
+        tip_merkleroot: FixedBytes<32>,
     ) -> Self {
         Self {
             artifact,
             start_index,
             end_index,
-            tip_merkleroot: tip_merkleroot.into(),
+            tip_merkleroot,
         }
     }
 }
@@ -82,9 +83,9 @@ pub struct Manifest {
     pub format_version: u16,
     pub issued_at_ms: u64,
     pub sequence: u64,
-    pub publisher_pubkey: String,
+    pub publisher_pubkey: FixedBytes<32>,
     pub entries: Vec<ManifestEntry>,
-    pub publisher_signature: Option<String>,
+    pub publisher_signature: Option<FixedBytes<64>>,
 }
 
 impl Manifest {
@@ -93,7 +94,7 @@ impl Manifest {
         format_version: u16,
         issued_at_ms: u64,
         sequence: u64,
-        publisher_pubkey: String,
+        publisher_pubkey: FixedBytes<32>,
         entries: Vec<ManifestEntry>,
     ) -> Self {
         Self {
@@ -118,7 +119,7 @@ impl Manifest {
             format_version: self.format_version,
             issued_at_ms: self.issued_at_ms,
             sequence: self.sequence,
-            publisher_pubkey: &self.publisher_pubkey,
+            publisher_pubkey: self.publisher_pubkey,
             entries,
         };
         serde_json::to_vec(&body).map_err(ManifestError::Json)
@@ -130,26 +131,24 @@ impl Manifest {
     }
 
     pub fn sign_manifest(&mut self, signing_key: &SigningKey) -> Result<(), ManifestError> {
-        self.publisher_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+        self.publisher_pubkey = FixedBytes::from(signing_key.verifying_key().to_bytes());
         let body_bytes = self.deterministic_body_bytes()?;
-        self.publisher_signature = Some(hex::encode(Self::sign(&body_bytes, signing_key)));
+        self.publisher_signature = Some(FixedBytes::from(Self::sign(&body_bytes, signing_key)));
         Ok(())
     }
 
     pub fn verify_signature(&self) -> Result<(), ManifestError> {
-        let pubkey_bytes = decode_fixed_hex::<32>(PUBLISHER_PUBKEY_FIELD, &self.publisher_pubkey)?;
-        self.verify_signature_with_key(&pubkey_bytes)
+        self.verify_signature_with_key(&self.publisher_pubkey.0)
     }
 
     pub fn verify_trusted_signature(
         &self,
         trusted_publisher_pubkey: &[u8; 32],
     ) -> Result<(), ManifestError> {
-        let pubkey_bytes = decode_fixed_hex::<32>(PUBLISHER_PUBKEY_FIELD, &self.publisher_pubkey)?;
-        if &pubkey_bytes != trusted_publisher_pubkey {
+        if self.publisher_pubkey.as_slice() != trusted_publisher_pubkey.as_slice() {
             return Err(ManifestError::PublisherKeyMismatch {
-                expected: prefixed_hex(trusted_publisher_pubkey),
-                actual: prefixed_hex(&pubkey_bytes),
+                expected: hex::encode_prefixed(trusted_publisher_pubkey),
+                actual: hex::encode_prefixed(self.publisher_pubkey.as_slice()),
             });
         }
 
@@ -157,15 +156,13 @@ impl Manifest {
     }
 
     fn verify_signature_with_key(&self, pubkey_bytes: &[u8; 32]) -> Result<(), ManifestError> {
-        let signature_bytes = decode_fixed_hex::<64>(
-            "publisher_signature",
-            self.publisher_signature
-                .as_deref()
-                .ok_or(ManifestError::MissingPublisherSignature)?,
-        )?;
+        let signature_bytes = self
+            .publisher_signature
+            .as_ref()
+            .ok_or(ManifestError::MissingPublisherSignature)?;
         let verifying_key =
             VerifyingKey::from_bytes(pubkey_bytes).map_err(ManifestError::PublicKey)?;
-        let signature = Signature::from_bytes(&signature_bytes);
+        let signature = Signature::from_bytes(&signature_bytes.0);
         verifying_key
             .verify(&self.deterministic_body_bytes()?, &signature)
             .map_err(ManifestError::Signature)
@@ -174,7 +171,7 @@ impl Manifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
-    pub list_key: String,
+    pub list_key: FixedBytes<32>,
     pub chain_id: u64,
     pub base: ArtifactDescriptor,
     pub deltas: Vec<ArtifactDescriptor>,
@@ -182,15 +179,15 @@ pub struct ManifestEntry {
     pub retained_deltas: Vec<RetainedDeltaDescriptor>,
     pub blocked_shields: ArtifactDescriptor,
     pub current_tip_index: u64,
-    pub current_tip_merkleroot: String,
+    pub current_tip_merkleroot: FixedBytes<32>,
 }
 
 #[derive(Serialize)]
-struct ManifestBody<'a> {
+struct ManifestBody {
     format_version: u16,
     issued_at_ms: u64,
     sequence: u64,
-    publisher_pubkey: &'a str,
+    publisher_pubkey: FixedBytes<32>,
     entries: Vec<ManifestEntry>,
 }
 
@@ -275,10 +272,6 @@ fn fixed_slice<const N: usize>(
     })
 }
 
-fn prefixed_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,10 +303,10 @@ mod tests {
 
     #[test]
     fn manifest_body_bytes_are_deterministic() {
-        let mut first = manifest(vec![entry("b", 2), entry("a", 1)]);
-        let mut second = manifest(vec![entry("a", 1), entry("b", 2)]);
-        first.publisher_signature = Some("ignored".to_string());
-        second.publisher_signature = Some("different".to_string());
+        let mut first = manifest(vec![entry(2, 2), entry(1, 1)]);
+        let mut second = manifest(vec![entry(1, 1), entry(2, 2)]);
+        first.publisher_signature = Some(FixedBytes::from([1_u8; 64]));
+        second.publisher_signature = Some(FixedBytes::from([2_u8; 64]));
 
         assert_eq!(
             first.deterministic_body_bytes().expect("first body"),
@@ -324,7 +317,7 @@ mod tests {
     #[test]
     fn manifest_signature_verifies_with_publisher_pubkey() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let mut manifest = manifest(vec![entry("a", 1)]);
+        let mut manifest = manifest(vec![entry(1, 1)]);
 
         manifest.sign_manifest(&signing_key).expect("sign manifest");
 
@@ -337,7 +330,7 @@ mod tests {
     #[test]
     fn manifest_signature_rejects_untrusted_publisher_pubkey() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let mut manifest = manifest(vec![entry("a", 1)]);
+        let mut manifest = manifest(vec![entry(1, 1)]);
         manifest.sign_manifest(&signing_key).expect("sign manifest");
 
         assert!(matches!(
@@ -349,7 +342,7 @@ mod tests {
     #[test]
     fn manifest_signature_covers_sequence_and_issued_at_ms() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let mut manifest = manifest(vec![entry("a", 1)]);
+        let mut manifest = manifest(vec![entry(1, 1)]);
         manifest.sign_manifest(&signing_key).expect("sign manifest");
 
         manifest.sequence += 1;
@@ -364,7 +357,7 @@ mod tests {
     fn manifest_signature_covers_artifact_descriptor_fields() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
         for mutate in [mutate_cid, mutate_sha256, mutate_byte_size] {
-            let mut manifest = manifest(vec![entry("a", 1)]);
+            let mut manifest = manifest(vec![entry(1, 1)]);
             manifest.sign_manifest(&signing_key).expect("sign manifest");
 
             mutate(&mut manifest.entries[0].base);
@@ -376,10 +369,10 @@ mod tests {
     #[test]
     fn manifest_signature_covers_blocked_shields_descriptor() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let mut manifest = manifest(vec![entry("a", 1)]);
+        let mut manifest = manifest(vec![entry(1, 1)]);
         manifest.sign_manifest(&signing_key).expect("sign manifest");
 
-        manifest.entries[0].blocked_shields.sha256 = prefixed_hex(&[9_u8; 32]);
+        manifest.entries[0].blocked_shields.sha256 = FixedBytes::from([9_u8; 32]);
 
         assert!(manifest.verify_signature().is_err());
     }
@@ -387,12 +380,12 @@ mod tests {
     #[test]
     fn manifest_signature_covers_retained_delta_descriptor() {
         let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-        let mut manifest = manifest(vec![entry("a", 1)]);
+        let mut manifest = manifest(vec![entry(1, 1)]);
         manifest.entries[0].retained_deltas = vec![RetainedDeltaDescriptor::new(
             descriptor("retained", 1),
             10,
             19,
-            prefixed_hex(&[8_u8; 32]),
+            FixedBytes::from([8_u8; 32]),
         )];
         manifest.sign_manifest(&signing_key).expect("sign manifest");
 
@@ -404,13 +397,13 @@ mod tests {
     #[test]
     fn manifest_entry_defaults_missing_retained_deltas() {
         let json = r#"{
-            "list_key":"0x01",
+            "list_key":"0x0101010101010101010101010101010101010101010101010101010101010101",
             "chain_id":1,
-            "base":{"cid":"bafybase","sha256":"0x00","byte_size":0},
+            "base":{"cid":"bafybase","sha256":"0x0000000000000000000000000000000000000000000000000000000000000000","byte_size":0},
             "deltas":[],
-            "blocked_shields":{"cid":"bafyblocked","sha256":"0x00","byte_size":0},
+            "blocked_shields":{"cid":"bafyblocked","sha256":"0x0000000000000000000000000000000000000000000000000000000000000000","byte_size":0},
             "current_tip_index":0,
-            "current_tip_merkleroot":"0x00"
+            "current_tip_merkleroot":"0x0000000000000000000000000000000000000000000000000000000000000000"
         }"#;
 
         let entry: ManifestEntry = serde_json::from_str(json).expect("entry decodes");
@@ -434,30 +427,36 @@ mod tests {
             2,
             1_767_225_600_000,
             1_767_225_600_000,
-            "publisher".to_string(),
+            FixedBytes::ZERO,
             entries,
         )
     }
 
-    fn entry(list_key: &str, chain_id: u64) -> ManifestEntry {
+    fn entry(list_key_byte: u8, chain_id: u64) -> ManifestEntry {
         ManifestEntry {
-            list_key: list_key.to_string(),
+            list_key: FixedBytes::from([list_key_byte; 32]),
             chain_id,
             base: descriptor("base", chain_id),
             deltas: vec![descriptor("delta", chain_id)],
             retained_deltas: Vec::new(),
             blocked_shields: descriptor("blocked", chain_id),
             current_tip_index: chain_id * 10,
-            current_tip_merkleroot: format!("0x{chain_id:064x}"),
+            current_tip_merkleroot: fixed_from_u64(chain_id),
         }
     }
 
     fn descriptor(kind: &str, chain_id: u64) -> ArtifactDescriptor {
         ArtifactDescriptor {
             cid: format!("bafy{kind}{chain_id}"),
-            sha256: format!("0x{chain_id:064x}"),
+            sha256: fixed_from_u64(chain_id),
             byte_size: chain_id * 100,
         }
+    }
+
+    fn fixed_from_u64(value: u64) -> FixedBytes<32> {
+        let mut bytes = [0_u8; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        FixedBytes::from(bytes)
     }
 
     fn mutate_cid(descriptor: &mut ArtifactDescriptor) {
@@ -465,7 +464,7 @@ mod tests {
     }
 
     fn mutate_sha256(descriptor: &mut ArtifactDescriptor) {
-        descriptor.sha256 = prefixed_hex(&[7_u8; 32]);
+        descriptor.sha256 = FixedBytes::from([7_u8; 32]);
     }
 
     fn mutate_byte_size(descriptor: &mut ArtifactDescriptor) {

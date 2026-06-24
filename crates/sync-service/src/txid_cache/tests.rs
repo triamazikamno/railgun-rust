@@ -2309,7 +2309,7 @@ fn signed_artifact_source(
     let mut manifest = IndexedArtifactManifest::new(
         1_700_000_000_000,
         1,
-        PublisherIdentity::ed25519(""),
+        PublisherIdentity::ed25519(FixedBytes::ZERO),
         vec![IndexedArtifactChainEntry {
             scope: scope.clone(),
             latest_indexed: vec![LatestIndexedHeight {

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
+#[cfg(test)]
 use alloy::primitives::FixedBytes;
 use broadcaster_core::tree::normalize_tree_position;
 use local_db::{DbStore, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord};
@@ -19,7 +20,6 @@ use crate::trustless_artifacts::{self, TrustlessArtifactError, TrustlessArtifact
 use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
 
 const BLOCKED_SHIELDS_LIST_KEY_FIELD: &str = "blocked_shields.list_key";
-const ENTRY_CURRENT_TIP_MERKLEROOT_FIELD: &str = "entry.current_tip_merkleroot";
 const ENTRY_LIST_KEY_FIELD: &str = "entry.list_key";
 
 pub(crate) struct PoiArtifactIngestor {
@@ -767,8 +767,10 @@ pub(crate) enum PoiArtifactError {
     ManifestIssuedInFuture,
     #[error("manifest does not contain entry for chain_id={chain_id} list_key={list_key}")]
     MissingManifestEntry { chain_id: u64, list_key: String },
+    #[cfg(test)]
     #[error("invalid hex in {field}: {value}")]
     InvalidHex { field: &'static str, value: String },
+    #[cfg(test)]
     #[error("{field} has {actual} bytes, expected {expected}")]
     InvalidByteLen {
         field: &'static str,
@@ -830,10 +832,6 @@ pub(crate) fn persist_refresh(
     identity: &PoiCacheIdentity,
     refresh: &PoiArtifactRefresh,
 ) -> Result<(), PoiArtifactError> {
-    let current_tip_root = FixedBytes::from(decode_fixed_hex::<32>(
-        ENTRY_CURRENT_TIP_MERKLEROOT_FIELD,
-        &refresh.entry.current_tip_merkleroot,
-    )?);
     let record = PoiArtifactCacheRecord {
         chain_type: identity.chain_type,
         chain_id: identity.chain_id,
@@ -844,7 +842,7 @@ pub(crate) fn persist_refresh(
         applied_delta_descriptors: refresh.entry.deltas.iter().map(descriptor_record).collect(),
         blocked_shields_descriptor: descriptor_record(&refresh.entry.blocked_shields),
         current_tip_index: refresh.entry.current_tip_index,
-        current_tip_root,
+        current_tip_root: refresh.entry.current_tip_merkleroot,
         cache_payload: refresh.cache.to_bytes()?,
         updated_at: 0,
     };
@@ -894,16 +892,13 @@ fn manifest_entry_for_identity<'a>(
     identity: &PoiCacheIdentity,
 ) -> Result<&'a ManifestEntry, PoiArtifactError> {
     for entry in &manifest.entries {
-        let list_key = decode_fixed_hex::<32>(ENTRY_LIST_KEY_FIELD, &entry.list_key)?;
-        if entry.chain_id == identity.chain_id
-            && list_key.as_slice() == identity.list_key.as_slice()
-        {
+        if entry.chain_id == identity.chain_id && entry.list_key == identity.list_key {
             return Ok(entry);
         }
     }
     Err(PoiArtifactError::MissingManifestEntry {
         chain_id: identity.chain_id,
-        list_key: hex::encode(identity.list_key),
+        list_key: hex::encode_prefixed(identity.list_key.as_slice()),
     })
 }
 
@@ -933,8 +928,11 @@ fn validate_snapshot(
         snapshot.header.chain_type,
         identity.chain_type,
     )?;
-    let entry_list_key = decode_fixed_hex::<32>(ENTRY_LIST_KEY_FIELD, &entry.list_key)?;
-    require_scope_bytes(ENTRY_LIST_KEY_FIELD, &entry_list_key, &identity.list_key.0)?;
+    require_scope_bytes(
+        ENTRY_LIST_KEY_FIELD,
+        &entry.list_key.0,
+        &identity.list_key.0,
+    )?;
     require_scope_value("entry.chain_id", entry.chain_id, identity.chain_id)?;
 
     snapshot
@@ -980,10 +978,9 @@ fn validate_blocked_shields_artifact(
         artifact.format_version,
         poi::artifacts::snapshot::format::FORMAT_VERSION,
     )?;
-    let list_key = decode_fixed_hex::<32>(BLOCKED_SHIELDS_LIST_KEY_FIELD, &artifact.list_key)?;
     require_scope_bytes(
         BLOCKED_SHIELDS_LIST_KEY_FIELD,
-        &list_key,
+        &artifact.list_key.0,
         &identity.list_key.0,
     )?;
     require_scope_value(
@@ -1008,10 +1005,7 @@ fn verify_manifest_root(
     cache: &mut PoiCache,
     entry: &ManifestEntry,
 ) -> Result<(), PoiArtifactError> {
-    let expected_root = FixedBytes::from(decode_fixed_hex::<32>(
-        ENTRY_CURRENT_TIP_MERKLEROOT_FIELD,
-        &entry.current_tip_merkleroot,
-    )?);
+    let expected_root = entry.current_tip_merkleroot;
     let (tree_number, _) = normalize_tree_position(0, entry.current_tip_index);
     let roots = cache.current_roots();
     let actual = roots
@@ -1020,8 +1014,8 @@ fn verify_manifest_root(
         .ok_or(PoiArtifactError::MissingReplayRoot { tree_number })?;
     if actual != expected_root {
         return Err(PoiArtifactError::ReplayRootMismatch {
-            expected: prefixed_hex(expected_root.as_slice()),
-            actual: prefixed_hex(actual.as_slice()),
+            expected: hex::encode_prefixed(expected_root.as_slice()),
+            actual: hex::encode_prefixed(actual.as_slice()),
         });
     }
     Ok(())
@@ -1033,10 +1027,7 @@ fn try_reuse_matching_tip(
     entry: &ManifestEntry,
     persisted: &PersistedPoiArtifactCache,
 ) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
-    let entry_tip_root = FixedBytes::from(decode_fixed_hex::<32>(
-        ENTRY_CURRENT_TIP_MERKLEROOT_FIELD,
-        &entry.current_tip_merkleroot,
-    )?);
+    let entry_tip_root = entry.current_tip_merkleroot;
     if persisted.record.current_tip_index == entry.current_tip_index
         && persisted.record.current_tip_root == entry_tip_root
         && descriptor_matches_record(
@@ -1070,8 +1061,8 @@ fn require_scope_bytes(
     }
     Err(PoiArtifactError::SnapshotScopeMismatch {
         field,
-        expected: prefixed_hex(expected),
-        actual: prefixed_hex(actual),
+        expected: hex::encode_prefixed(expected),
+        actual: hex::encode_prefixed(actual),
     })
 }
 
@@ -1093,6 +1084,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn decode_fixed_hex<const N: usize>(
     field: &'static str,
     value: &str,
@@ -1115,7 +1107,7 @@ fn decode_fixed_hex<const N: usize>(
 fn descriptor_record(descriptor: &ArtifactDescriptor) -> PoiArtifactDescriptorRecord {
     PoiArtifactDescriptorRecord {
         cid: descriptor.cid.clone(),
-        sha256: descriptor.sha256.clone(),
+        sha256: hex::encode_prefixed(descriptor.sha256.as_slice()),
         byte_size: descriptor.byte_size,
     }
 }
@@ -1125,7 +1117,7 @@ fn descriptor_matches_record(
     record: &PoiArtifactDescriptorRecord,
 ) -> bool {
     descriptor.cid == record.cid
-        && descriptor.sha256 == record.sha256
+        && hex::encode_prefixed(descriptor.sha256.as_slice()) == record.sha256
         && descriptor.byte_size == record.byte_size
 }
 
@@ -1138,10 +1130,6 @@ fn common_delta_prefix_len(
         .zip(descriptors.iter())
         .take_while(|(record, descriptor)| descriptor_matches_record(descriptor, record))
         .count()
-}
-
-fn prefixed_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
 }
 
 #[cfg(test)]
@@ -1162,7 +1150,7 @@ mod tests {
 
     #[test]
     fn manifest_sequence_rollback_is_rejected() {
-        let manifest = Manifest::new(2, 1_700_000_000_000, 4, "publisher".to_string(), vec![]);
+        let manifest = Manifest::new(2, 1_700_000_000_000, 4, FixedBytes::ZERO, vec![]);
 
         assert!(matches!(
             validate_manifest_sequence(&manifest, Some(5)),
@@ -1175,7 +1163,7 @@ mod tests {
 
     #[test]
     fn stale_first_run_manifest_is_rejected() {
-        let manifest = Manifest::new(2, 1_000, 1, "publisher".to_string(), vec![]);
+        let manifest = Manifest::new(2, 1_000, 1, FixedBytes::ZERO, vec![]);
         let now = UNIX_EPOCH + Duration::from_secs(10);
 
         assert!(matches!(
@@ -1309,8 +1297,8 @@ mod tests {
             .expect("apply expected events");
         let root_2 = root_for_tip(&mut expected, 2);
 
-        events[0].validated_merkleroot = prefixed_hex(root_0.as_slice());
-        events[2].validated_merkleroot = prefixed_hex(root_2.as_slice());
+        events[0].validated_merkleroot = hex::encode_prefixed(root_0.as_slice());
+        events[2].validated_merkleroot = hex::encode_prefixed(root_2.as_slice());
 
         let base_bytes =
             snapshot_artifact_bytes(&identity, SnapshotKind::Base, 0, 2, &events, root_2);
@@ -1376,8 +1364,8 @@ mod tests {
             .expect("apply expected events");
         let root_3 = root_for_tip(&mut expected, 3);
 
-        events[1].validated_merkleroot = prefixed_hex(root_1.as_slice());
-        events[3].validated_merkleroot = prefixed_hex(root_3.as_slice());
+        events[1].validated_merkleroot = hex::encode_prefixed(root_1.as_slice());
+        events[3].validated_merkleroot = hex::encode_prefixed(root_3.as_slice());
 
         let base_bytes =
             snapshot_artifact_bytes(&identity, SnapshotKind::Base, 0, 1, &events[0..=1], root_1);
@@ -1447,8 +1435,8 @@ mod tests {
             .apply_verified_artifact_events(&[snapshot_event_from_proxy(&events[1])])
             .expect("apply expected event");
         let root_1 = root_for_tip(&mut expected, 1);
-        events[0].validated_merkleroot = prefixed_hex(root_0.as_slice());
-        events[1].validated_merkleroot = prefixed_hex(root_1.as_slice());
+        events[0].validated_merkleroot = hex::encode_prefixed(root_0.as_slice());
+        events[1].validated_merkleroot = hex::encode_prefixed(root_1.as_slice());
 
         let base_bytes =
             snapshot_artifact_bytes(&identity, SnapshotKind::Base, 0, 1, &events, root_1);
@@ -1536,9 +1524,9 @@ mod tests {
             .expect("apply expected events");
         let artifact_tip_root = root_for_tip(&mut expected, artifact_tip_index);
 
-        local_event.validated_merkleroot = prefixed_hex(local_root.as_slice());
-        tip_event.validated_merkleroot = prefixed_hex(artifact_tip_root.as_slice());
-        boundary_event.validated_merkleroot = prefixed_hex(&[0x55; 32]);
+        local_event.validated_merkleroot = hex::encode_prefixed(local_root.as_slice());
+        tip_event.validated_merkleroot = hex::encode_prefixed(artifact_tip_root.as_slice());
+        boundary_event.validated_merkleroot = hex::encode_prefixed([0x55; 32]);
 
         let proxy = spawn_json_rpc(Vec::new());
         let client = PoiRpcClient::new(proxy.url.clone());
@@ -1764,7 +1752,7 @@ mod tests {
     }
 
     fn signed_manifest(signing_key: &SigningKey, issued_at_ms: u64, sequence: u64) -> Manifest {
-        let mut manifest = Manifest::new(2, issued_at_ms, sequence, String::new(), vec![]);
+        let mut manifest = Manifest::new(2, issued_at_ms, sequence, FixedBytes::ZERO, vec![]);
         manifest.sign_manifest(signing_key).expect("sign manifest");
         manifest
     }
@@ -1894,21 +1882,21 @@ mod tests {
         current_tip_merkleroot: [u8; 32],
     ) -> ManifestEntry {
         ManifestEntry {
-            list_key: prefixed_hex(identity.list_key.as_slice()),
+            list_key: identity.list_key,
             chain_id: identity.chain_id,
             base: descriptor("base"),
             deltas: vec![descriptor("delta")],
             retained_deltas: Vec::new(),
             blocked_shields: descriptor("blocked"),
             current_tip_index,
-            current_tip_merkleroot: prefixed_hex(&current_tip_merkleroot),
+            current_tip_merkleroot: FixedBytes::from(current_tip_merkleroot),
         }
     }
 
     fn descriptor(cid: &str) -> ArtifactDescriptor {
         ArtifactDescriptor {
             cid: cid.to_string(),
-            sha256: prefixed_hex(&[0_u8; 32]),
+            sha256: FixedBytes::ZERO,
             byte_size: 0,
         }
     }
@@ -1945,26 +1933,27 @@ mod tests {
         commitment_byte: u8,
         validated_root: [u8; 32],
     ) -> PoiSyncedListEvent {
-        let blinded_commitment = prefixed_hex(&[commitment_byte; 32]);
+        let blinded_commitment = FixedBytes::from([commitment_byte; 32]);
+        let blinded_commitment_hex = hex::encode_prefixed(blinded_commitment.as_slice());
         let message = format!(
-            r#"{{"index":{index},"blindedCommitment":"{blinded_commitment}","type":"Transact"}}"#
+            r#"{{"index":{index},"blindedCommitment":"{blinded_commitment_hex}","type":"Transact"}}"#
         );
         let signature = signing_key.sign(message.as_bytes()).to_bytes();
         PoiSyncedListEvent {
             signed_poi_event: SignedPoiEvent {
                 index,
                 blinded_commitment,
-                signature: prefixed_hex(&signature),
+                signature: hex::encode_prefixed(signature),
                 event_type: PoiEventType::Transact,
             },
-            validated_merkleroot: prefixed_hex(&validated_root),
+            validated_merkleroot: hex::encode_prefixed(validated_root),
         }
     }
 
     fn blocked_shield(blinded_commitment: FixedBytes<32>) -> BlockedShield {
         BlockedShield {
-            commitment_hash: prefixed_hex(&[0x55; 32]),
-            blinded_commitment: prefixed_hex(blinded_commitment.as_slice()),
+            commitment_hash: hex::encode_prefixed([0x55; 32]),
+            blinded_commitment: hex::encode_prefixed(blinded_commitment.as_slice()),
             block_reason: None,
             signature: String::new(),
         }
@@ -1973,11 +1962,7 @@ mod tests {
     fn snapshot_event_from_proxy(event: &PoiSyncedListEvent) -> SnapshotEvent {
         SnapshotEvent {
             event_index: event.signed_poi_event.index,
-            blinded_commitment: decode_fixed_hex(
-                "signedPOIEvent.blindedCommitment",
-                &event.signed_poi_event.blinded_commitment,
-            )
-            .expect("commitment"),
+            blinded_commitment: event.signed_poi_event.blinded_commitment.0,
             signature: decode_fixed_hex(
                 "signedPOIEvent.signature",
                 &event.signed_poi_event.signature,

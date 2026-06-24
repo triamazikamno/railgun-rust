@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy::sol_types::SolEvent;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
-use super::service::wait_for_wallet_ready;
+use super::service::{wait_for_startup_sync_target, wait_for_wallet_ready};
 use super::{
     CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletArtifactProbe,
     IndexedWalletPageKind, Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, Transact,
@@ -14,7 +15,7 @@ use super::{
     squid_tail_target_after_artifact, wallet_backfill_from_block, wallet_reorg_backfill_from_block,
     wallet_startup_hedge_block_count, wallet_sync_target,
 };
-use crate::types::{BackfillEvent, LogBatch};
+use crate::types::{BackfillEvent, LogBatch, SyncProgressStage};
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
@@ -22,6 +23,8 @@ fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBack
         from_block: 100,
         target_block,
         follow_safe_head,
+        progress_start_block: 100,
+        progress_tx: None,
         sender,
     }
 }
@@ -73,6 +76,54 @@ fn zero_wallet_backfill_target_initializes_from_safe_head() {
     cursor.refresh_target(105);
 
     assert_eq!(cursor.target_block, 105);
+}
+
+#[test]
+fn wallet_backfill_progress_tracks_cursor_range() {
+    let (sender, _receiver) = mpsc::channel(1);
+    let (progress_tx, progress_rx) = watch::channel(None);
+    let mut cursor = WalletBackfill {
+        from_block: 100,
+        target_block: 0,
+        follow_safe_head: false,
+        progress_start_block: 100,
+        progress_tx: Some(progress_tx),
+        sender,
+    };
+
+    cursor.send_progress(100);
+    assert!(progress_rx.borrow().is_none());
+
+    cursor.refresh_target(200);
+    cursor.send_progress(150);
+
+    let progress = (*progress_rx.borrow()).expect("progress update should be emitted");
+    assert_eq!(progress.stage, SyncProgressStage::IndexingUtxos);
+    assert_eq!(progress.start_block, 100);
+    assert_eq!(progress.current_block, 150);
+    assert_eq!(progress.target_block, 200);
+}
+
+#[tokio::test]
+async fn startup_sync_target_waits_for_safe_head_when_open_ended() {
+    let (safe_head_tx, safe_head_rx) = watch::channel(0);
+    let cancel = CancellationToken::new();
+    let waiter = wait_for_startup_sync_target(safe_head_rx, None, 0, &cancel);
+
+    safe_head_tx.send(123).expect("send safe head");
+
+    assert_eq!(waiter.await, Some(123));
+}
+
+#[tokio::test]
+async fn startup_sync_target_uses_existing_fixed_target_without_waiting() {
+    let (_safe_head_tx, safe_head_rx) = watch::channel(0);
+    let cancel = CancellationToken::new();
+
+    assert_eq!(
+        wait_for_startup_sync_target(safe_head_rx, Some(900), 900, &cancel).await,
+        Some(900)
+    );
 }
 
 #[test]

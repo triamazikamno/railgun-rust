@@ -51,6 +51,7 @@ pub mod checksum_address {
 }
 
 pub mod hex_string {
+    use alloy::hex;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
@@ -70,6 +71,7 @@ pub mod hex_string {
 }
 
 pub mod hex_array32 {
+    use alloy::hex;
     use serde::{Deserializer, de};
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>

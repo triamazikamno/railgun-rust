@@ -476,7 +476,7 @@ pub(super) fn spawn_backfill_loop(
     mut safe_head_rx: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
-    tokio::spawn(async move {
+    let task = async move {
         let mut cursors: HashMap<String, WalletBackfill> = HashMap::new();
         loop {
             if cursors.is_empty() {
@@ -484,12 +484,28 @@ pub(super) fn spawn_backfill_loop(
                     _ = cancel.cancelled() => break,
                     Some(request) = backfill_rx.recv() => {
                         match request {
-                            BackfillRequest::Add { cache_key, from_block, to_block, follow_safe_head, sender } => {
-                                cursors.insert(cache_key, WalletBackfill { from_block, target_block: to_block, follow_safe_head, sender });
+                            BackfillRequest::Add {
+                                cache_key,
+                                from_block,
+                                to_block,
+                                follow_safe_head,
+                                progress_start_block,
+                                progress_tx,
+                                sender,
+                            } => {
+                                cursors.insert(cache_key, WalletBackfill {
+                                    from_block,
+                                    target_block: to_block,
+                                    follow_safe_head,
+                                    progress_start_block,
+                                    progress_tx,
+                                    sender,
+                                });
                             }
                             BackfillRequest::Reset { cache_key, from_block } => {
                                 if let Some(cursor) = cursors.get_mut(&cache_key) {
                                     cursor.from_block = from_block;
+                                    cursor.progress_start_block = from_block;
                                 }
                             }
                             BackfillRequest::Remove { cache_key } => {
@@ -508,11 +524,14 @@ pub(super) fn spawn_backfill_loop(
             let safe_head = *safe_head_rx.borrow();
             for cursor in cursors.values_mut() {
                 cursor.refresh_target(safe_head);
+                cursor.send_progress(cursor.from_block);
             }
 
             let done_keys: Vec<_> = cursors
                 .iter()
-                .filter(|(_, cursor)| cursor.target_block > 0 && cursor.from_block > cursor.target_block)
+                .filter(|(_, cursor)| {
+                    cursor.target_block > 0 && cursor.from_block > cursor.target_block
+                })
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in done_keys {
@@ -559,13 +578,15 @@ pub(super) fn spawn_backfill_loop(
             };
             let to_block = min(from_block + service.chain.block_range - 1, target_block);
             let fetch_logs_started = Instant::now();
-            match service.chain.fetch_logs_for_range(
-                &rpc.provider,
-                archive_provider.as_ref(),
-                from_block,
-                to_block,
-            )
-            .await
+            match service
+                .chain
+                .fetch_logs_for_range(
+                    &rpc.provider,
+                    archive_provider.as_ref(),
+                    from_block,
+                    to_block,
+                )
+                .await
             {
                 Ok(mut logs) => {
                     debug!(
@@ -601,16 +622,14 @@ pub(super) fn spawn_backfill_loop(
                         "fetched backfill log block timestamps"
                     );
                     let block_hash_started = Instant::now();
-                    let to_block_hash = service.chain.fetch_block_hash(
-                        &rpc.provider,
-                        archive_provider.as_ref(),
-                        to_block,
-                    )
-                    .await
-                    .unwrap_or_else(|err| {
-                        warn!(?err, to_block, "failed to fetch backfill block hash");
-                        None
-                    });
+                    let to_block_hash = service
+                        .chain
+                        .fetch_block_hash(&rpc.provider, archive_provider.as_ref(), to_block)
+                        .await
+                        .unwrap_or_else(|err| {
+                            warn!(?err, to_block, "failed to fetch backfill block hash");
+                            None
+                        });
                     debug!(
                         to_block,
                         elapsed_ms = block_hash_started.elapsed().as_millis(),
@@ -639,6 +658,7 @@ pub(super) fn spawn_backfill_loop(
                                     "failed to send backfill logs"
                                 );
                             }
+                            cursor.send_progress(to_block);
                             cursor.from_block = to_block.saturating_add(1);
                             cursor.refresh_target(latest_safe_head);
                             if cursor.from_block > cursor.target_block {
@@ -674,5 +694,6 @@ pub(super) fn spawn_backfill_loop(
                 }
             }
         }
-    }.instrument(tracing::info_span!("sync_backfill")));
+    };
+    tokio::spawn(task.instrument(tracing::info_span!("sync_backfill")));
 }

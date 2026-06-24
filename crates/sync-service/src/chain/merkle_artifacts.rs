@@ -1276,7 +1276,7 @@ mod tests {
         IndexedArtifactManifest::new(
             1_700_000_000_000,
             1,
-            PublisherIdentity::ed25519("11".repeat(32)),
+            PublisherIdentity::ed25519(FixedBytes::from([0x11; 32])),
             vec![IndexedArtifactChainEntry {
                 scope: scope.clone(),
                 latest_indexed: vec![LatestIndexedHeight {

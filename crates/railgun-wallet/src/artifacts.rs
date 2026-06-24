@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use alloy::hex;
 use alloy::primitives::FixedBytes;
 use brotli::Decompressor;
 use reqwest::blocking::Client;

@@ -77,8 +77,6 @@ pub enum PreTransactionPoiError {
         expected: FixedBytes<32>,
         actual: FixedBytes<32>,
     },
-    #[error("invalid hex field {field}: {value}")]
-    InvalidHex { field: &'static str, value: String },
     #[error("POI RPC failed: {0}")]
     PoiRpc(#[from] PoiRpcError),
     #[error("POI merkle proof source failed: {0}")]

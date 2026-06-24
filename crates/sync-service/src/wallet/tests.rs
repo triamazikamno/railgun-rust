@@ -316,6 +316,16 @@ async fn spawn_poi_rpc_sequence(results: Vec<serde_json::Value>) -> MockPoiRpc {
     MockPoiRpc { url, requests }
 }
 
+fn poi_leaf_response(leaves: &[U256]) -> serde_json::Value {
+    serde_json::to_value(
+        leaves
+            .iter()
+            .map(|leaf| format!("0x{leaf:064x}"))
+            .collect::<Vec<_>>(),
+    )
+    .expect("leaves JSON")
+}
+
 async fn spawn_http_response(body: Vec<u8>) -> (Url, std_mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1505,14 +1515,14 @@ async fn indexed_artifacts_startup_warms_cache_even_when_status_refresh_not_need
     let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
     let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
     let entry = ManifestEntry {
-        list_key: hex::encode_prefixed(list_key),
+        list_key,
         chain_id: 1,
         base: base_descriptor.clone(),
         deltas: Vec::new(),
         retained_deltas: Vec::new(),
         blocked_shields: blocked_descriptor.clone(),
         current_tip_index: 0,
-        current_tip_merkleroot: hex::encode_prefixed(expected_root),
+        current_tip_merkleroot: expected_root,
     };
 
     let root_dir = temp_db_root();
@@ -1522,7 +1532,7 @@ async fn indexed_artifacts_startup_warms_cache_even_when_status_refresh_not_need
     let signing_key = poi::artifacts::manifest::load_publisher_signing_key(&key_path)
         .expect("load publisher key");
     let trusted_publisher_pubkey = FixedBytes::from(signing_key.verifying_key().to_bytes());
-    let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, String::new(), vec![entry]);
+    let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, FixedBytes::ZERO, vec![entry]);
     manifest.sign_manifest(&signing_key).expect("sign manifest");
     let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
     let (manifest_url, requests) = spawn_http_response(manifest_bytes).await;
@@ -1610,14 +1620,14 @@ async fn local_poi_cache_rejected_live_tail_keeps_artifact_checkpoint() {
     let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
     let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
     let entry = ManifestEntry {
-        list_key: hex::encode_prefixed(list_key),
+        list_key,
         chain_id: 1,
         base: base_descriptor.clone(),
         deltas: Vec::new(),
         retained_deltas: Vec::new(),
         blocked_shields: blocked_descriptor.clone(),
         current_tip_index: 0,
-        current_tip_merkleroot: hex::encode_prefixed(expected_root),
+        current_tip_merkleroot: expected_root,
     };
 
     let root_dir = temp_db_root();
@@ -1627,7 +1637,7 @@ async fn local_poi_cache_rejected_live_tail_keeps_artifact_checkpoint() {
     let signing_key = poi::artifacts::manifest::load_publisher_signing_key(&key_path)
         .expect("load publisher key");
     let trusted_publisher_pubkey = FixedBytes::from(signing_key.verifying_key().to_bytes());
-    let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, String::new(), vec![entry]);
+    let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, FixedBytes::ZERO, vec![entry]);
     manifest.sign_manifest(&signing_key).expect("sign manifest");
     let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
     let (manifest_url, manifest_requests) = spawn_http_response(manifest_bytes).await;
@@ -1775,7 +1785,7 @@ async fn startup_installs_persisted_artifact_cache_before_warmup() {
 fn descriptor_record(descriptor: &ArtifactDescriptor) -> PoiArtifactDescriptorRecord {
     PoiArtifactDescriptorRecord {
         cid: descriptor.cid.clone(),
-        sha256: descriptor.sha256.clone(),
+        sha256: hex::encode_prefixed(descriptor.sha256),
         byte_size: descriptor.byte_size,
     }
 }
@@ -1874,7 +1884,7 @@ async fn poi_proxy_merkle_proof_source_calls_remote_merkle_proofs() {
         .expect("remote proof request");
     assert_eq!(request["method"], "ppoi_merkle_proofs");
     assert_eq!(proofs.len(), 1);
-    assert_eq!(proofs[0].leaf, hex::encode_prefixed(blinded_commitment));
+    assert_eq!(proofs[0].leaf, U256::from_be_bytes(blinded_commitment.0));
 }
 
 #[tokio::test]
@@ -1911,7 +1921,7 @@ async fn local_poi_merkle_proof_source_reads_cache_without_remote_merkle_proofs(
         .expect("local proof");
 
     assert_eq!(proofs.len(), 1);
-    assert_eq!(proofs[0].leaf, hex::encode_prefixed(blinded_commitment));
+    assert_eq!(proofs[0].leaf, U256::from_be_bytes(blinded_commitment.0));
 }
 
 #[tokio::test]
@@ -2027,11 +2037,8 @@ async fn live_poi_tail_applies_public_leaves_and_validates_root() {
         .get(&0)
         .expect("expected root");
     let leaves = vec![U256::from_be_bytes(blinded_commitment.0)];
-    let mock = spawn_poi_rpc_sequence(vec![
-        serde_json::to_value(leaves).expect("leaves JSON"),
-        serde_json::json!(true),
-    ])
-    .await;
+    let mock =
+        spawn_poi_rpc_sequence(vec![poi_leaf_response(&leaves), serde_json::json!(true)]).await;
     let client = PoiRpcClient::new(mock.url.clone());
     let mut cache = PoiCache::new(identity);
     cache
@@ -2065,7 +2072,7 @@ async fn live_poi_tail_applies_public_leaves_and_validates_root() {
     let proof = cache
         .poi_merkle_proofs(&[blinded_commitment])
         .expect("proof after live root validation");
-    assert_eq!(proof[0].leaf, hex::encode_prefixed(blinded_commitment));
+    assert_eq!(proof[0].leaf, U256::from_be_bytes(blinded_commitment.0));
 }
 
 #[tokio::test]
@@ -2101,11 +2108,8 @@ async fn live_poi_tail_stops_at_merkle_zero_padding() {
         MERKLE_ZERO_VALUE,
         U256::from_be_bytes([0x55; 32]),
     ];
-    let mock = spawn_poi_rpc_sequence(vec![
-        serde_json::to_value(leaves).expect("leaves JSON"),
-        serde_json::json!(true),
-    ])
-    .await;
+    let mock =
+        spawn_poi_rpc_sequence(vec![poi_leaf_response(&leaves), serde_json::json!(true)]).await;
     let client = PoiRpcClient::new(mock.url.clone());
     let mut cache = PoiCache::new(identity);
     cache

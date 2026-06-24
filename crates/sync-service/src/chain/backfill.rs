@@ -4,6 +4,8 @@ pub(super) struct WalletBackfill {
     pub(super) from_block: u64,
     pub(super) target_block: u64,
     pub(super) follow_safe_head: bool,
+    pub(super) progress_start_block: u64,
+    pub(super) progress_tx: Option<SyncProgressSender>,
     pub(super) sender: mpsc::Sender<BackfillEvent>,
 }
 
@@ -17,6 +19,21 @@ impl WalletBackfill {
         } else if self.target_block == 0 {
             self.target_block = safe_head;
         }
+    }
+
+    pub(super) fn send_progress(&self, current_block: u64) {
+        if self.target_block == 0 {
+            return;
+        }
+        send_sync_progress(
+            self.progress_tx.as_ref(),
+            SyncProgressUpdate::new(
+                SyncProgressStage::IndexingUtxos,
+                self.progress_start_block,
+                current_block,
+                self.target_block,
+            ),
+        );
     }
 }
 
@@ -125,6 +142,12 @@ impl ChainService {
                     from_block,
                     to_block: sync_target,
                     follow_safe_head: registration.sync_to_block.is_none(),
+                    progress_start_block: from_block,
+                    progress_tx: registration
+                        .cfg
+                        .progress_tx
+                        .clone()
+                        .or_else(|| self.chain.progress_tx.clone()),
                     sender: registration.backfill_sender.clone(),
                 })
                 .await

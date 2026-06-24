@@ -497,10 +497,146 @@ struct GetFilteredBlockedShieldsParams<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoiMerkleProof {
-    pub leaf: String,
-    pub elements: Vec<String>,
-    pub indices: String,
-    pub root: String,
+    #[serde(with = "u256_hex_full")]
+    pub leaf: U256,
+    #[serde(with = "u256_hex_full_vec")]
+    pub elements: Vec<U256>,
+    #[serde(with = "u256_hex_full")]
+    pub indices: U256,
+    #[serde(with = "u256_hex_full")]
+    pub root: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct PoiMerkletreeLeavesResponse {
+    #[serde(with = "u256_hex_32_vec")]
+    leaves: Vec<U256>,
+}
+
+mod fixed_bytes32_hex {
+    use super::{FixedBytes, hex};
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S>(value: &FixedBytes<32>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode_prefixed(value.as_slice()))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<FixedBytes<32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        decode(&value).map_err(de::Error::custom)
+    }
+
+    pub(super) fn decode(value: &str) -> Result<FixedBytes<32>, String> {
+        let value_without_prefix = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        let bytes = hex::decode(value_without_prefix).map_err(|err| err.to_string())?;
+        if bytes.len() != 32 {
+            return Err(format!("hex string has {} bytes, expected 32", bytes.len()));
+        }
+        Ok(FixedBytes::from_slice(&bytes))
+    }
+}
+
+mod u256_hex_full {
+    use super::U256;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S>(value: &U256, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("0x{value:064x}"))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_u256_hex(&value).map_err(de::Error::custom)
+    }
+
+    pub(super) fn parse_u256_hex(value: &str) -> Result<U256, String> {
+        let value_without_prefix = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        if value_without_prefix.len() > 64 {
+            return Err(format!(
+                "hex string has {} nibbles, expected at most 64",
+                value_without_prefix.len()
+            ));
+        }
+        if value_without_prefix.is_empty() {
+            return Ok(U256::ZERO);
+        }
+        U256::from_str_radix(value_without_prefix, 16).map_err(|err| err.to_string())
+    }
+}
+
+mod u256_hex_full_vec {
+    use super::{U256, u256_hex_full};
+    use serde::{Deserialize, Deserializer, Serializer, de, ser::SerializeSeq};
+
+    pub(super) fn serialize<S>(values: &[U256], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            seq.serialize_element(&format!("0x{value:064x}"))?;
+        }
+        seq.end()
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<U256>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| u256_hex_full::parse_u256_hex(&value).map_err(de::Error::custom))
+            .collect()
+    }
+}
+
+mod u256_hex_32_vec {
+    use super::{U256, fixed_bytes32_hex};
+    use serde::{Deserialize, Deserializer, Serializer, de, ser::SerializeSeq};
+
+    pub(super) fn serialize<S>(values: &[U256], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            seq.serialize_element(&format!("0x{value:064x}"))?;
+        }
+        seq.end()
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<U256>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| {
+                fixed_bytes32_hex::decode(&value)
+                    .map(|bytes| U256::from_be_bytes(bytes.0))
+                    .map_err(de::Error::custom)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,7 +651,8 @@ pub enum PoiEventType {
 #[serde(rename_all = "camelCase")]
 pub struct SignedPoiEvent {
     pub index: u64,
-    pub blinded_commitment: String,
+    #[serde(with = "fixed_bytes32_hex")]
+    pub blinded_commitment: FixedBytes<32>,
     pub signature: String,
     #[serde(rename = "type")]
     pub event_type: PoiEventType,
@@ -1099,18 +1236,20 @@ impl PoiRpcClient {
         start_index: u64,
         end_index: u64,
     ) -> Result<Vec<U256>, PoiRpcError> {
-        self.send_request(
-            POI_MERKLETREE_LEAVES_METHOD,
-            Self::poi_merkletree_leaves_params(
-                txid_version,
-                chain_type,
-                chain_id,
-                list_key,
-                start_index,
-                end_index,
-            ),
-        )
-        .await
+        let response: PoiMerkletreeLeavesResponse = self
+            .send_request(
+                POI_MERKLETREE_LEAVES_METHOD,
+                Self::poi_merkletree_leaves_params(
+                    txid_version,
+                    chain_type,
+                    chain_id,
+                    list_key,
+                    start_index,
+                    end_index,
+                ),
+            )
+            .await?;
+        Ok(response.leaves)
     }
 
     pub async fn blocked_shields(
@@ -1203,8 +1342,8 @@ fn encode_u256_bare(value: U256) -> String {
 mod tests {
     use super::{
         BlindedCommitmentData, DEFAULT_ACTIVE_POI_LIST_KEY_HEX, DEFAULT_WALLET_POI_RPC_URL,
-        PoiEventType, PoiMerkleProof, PoiRpcClient, PoiStatus, PoiSyncedListEvent,
-        SignedBlockedShield, SignedPoiEvent, SingleCommitmentProofContext,
+        PoiEventType, PoiMerkleProof, PoiMerkletreeLeavesResponse, PoiRpcClient, PoiStatus,
+        PoiSyncedListEvent, SignedBlockedShield, SignedPoiEvent, SingleCommitmentProofContext,
         ValidatedRailgunTxidStatus, decode_json_rpc_ack_response, decode_json_rpc_response,
         default_active_poi_list_key, encode_u256_bare, railgun_txid_leaf_hash,
     };
@@ -1504,10 +1643,43 @@ mod tests {
         .expect("decode merkle proofs");
 
         assert_eq!(proofs.len(), 1);
-        assert_eq!(proofs[0].leaf, "0x11");
-        assert_eq!(proofs[0].elements, vec!["0x22".to_string()]);
-        assert_eq!(proofs[0].indices, "0x00");
-        assert_eq!(proofs[0].root, "0x33");
+        assert_eq!(proofs[0].leaf, U256::from(0x11));
+        assert_eq!(proofs[0].elements, vec![U256::from(0x22)]);
+        assert_eq!(proofs[0].indices, U256::ZERO);
+        assert_eq!(proofs[0].root, U256::from(0x33));
+
+        let encoded = to_value(&proofs[0]).expect("encode merkle proof");
+        assert_eq!(
+            encoded["leaf"],
+            "0x0000000000000000000000000000000000000000000000000000000000000011"
+        );
+    }
+
+    #[test]
+    fn poi_merkletree_leaves_response_decodes_bare_and_prefixed_hex() {
+        let prefixed: PoiMerkletreeLeavesResponse = decode_json_rpc_response(
+            r#"{"result":["0x1111111111111111111111111111111111111111111111111111111111111111","0x2222222222222222222222222222222222222222222222222222222222222222"]}"#,
+        )
+        .expect("decode prefixed leaves");
+        assert_eq!(
+            prefixed.leaves,
+            vec![
+                U256::from_be_bytes([0x11; 32]),
+                U256::from_be_bytes([0x22; 32])
+            ]
+        );
+
+        let bare: PoiMerkletreeLeavesResponse = decode_json_rpc_response(
+            r#"{"result":["3333333333333333333333333333333333333333333333333333333333333333"]}"#,
+        )
+        .expect("decode bare leaf");
+        assert_eq!(bare.leaves, vec![U256::from_be_bytes([0x33; 32])]);
+
+        let encoded = to_value(prefixed).expect("encode leaves");
+        assert_eq!(
+            encoded[0],
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
     }
 
     #[test]
@@ -1582,7 +1754,7 @@ mod tests {
     #[test]
     fn bulk_poi_responses_decode() {
         let events: Vec<PoiSyncedListEvent> = decode_json_rpc_response(
-            r#"{"result":[{"signedPOIEvent":{"index":7,"blindedCommitment":"0x11","signature":"sig","type":"Shield"},"validatedMerkleroot":"0x22"}]}"#,
+            r#"{"result":[{"signedPOIEvent":{"index":7,"blindedCommitment":"0x1111111111111111111111111111111111111111111111111111111111111111","signature":"sig","type":"Shield"},"validatedMerkleroot":"0x22"}]}"#,
         )
         .expect("decode poi events");
         let blocked_shields: Vec<SignedBlockedShield> = decode_json_rpc_response(
@@ -1592,19 +1764,34 @@ mod tests {
 
         assert_eq!(events[0].signed_poi_event.index, 7);
         assert_eq!(events[0].signed_poi_event.event_type, PoiEventType::Shield);
+        assert_eq!(
+            events[0].signed_poi_event.blinded_commitment,
+            FixedBytes::from([0x11; 32])
+        );
+        let bare_events: Vec<PoiSyncedListEvent> = decode_json_rpc_response(
+            r#"{"result":[{"signedPOIEvent":{"index":8,"blindedCommitment":"2222222222222222222222222222222222222222222222222222222222222222","signature":"sig","type":"Transact"},"validatedMerkleroot":"0x33"}]}"#,
+        )
+        .expect("decode bare poi event commitment");
+        assert_eq!(
+            bare_events[0].signed_poi_event.blinded_commitment,
+            FixedBytes::from([0x22; 32])
+        );
         assert_eq!(events[0].validated_merkleroot, "0x22");
         assert_eq!(blocked_shields[0].blinded_commitment, "0x44");
         assert_eq!(blocked_shields[0].block_reason.as_deref(), Some("blocked"));
 
         let signed = SignedPoiEvent {
             index: 8,
-            blinded_commitment: "0x55".to_string(),
+            blinded_commitment: FixedBytes::from([0x55; 32]),
             signature: "sig".to_string(),
             event_type: PoiEventType::Transact,
         };
         let json = to_value(signed).expect("serialize signed poi event");
         assert_eq!(json["type"], "Transact");
-        assert_eq!(json["blindedCommitment"], "0x55");
+        assert_eq!(
+            json["blindedCommitment"],
+            "0x5555555555555555555555555555555555555555555555555555555555555555"
+        );
     }
 
     #[test]
@@ -1632,7 +1819,7 @@ mod tests {
             let event: PoiSyncedListEvent =
                 serde_json::from_str(fixture).expect("deserialize POI event fixture");
             assert_eq!(event.signed_poi_event.event_type, event_type);
-            assert!(!event.signed_poi_event.blinded_commitment.is_empty());
+            assert_ne!(event.signed_poi_event.blinded_commitment, FixedBytes::ZERO);
             assert!(!event.signed_poi_event.signature.is_empty());
             assert!(!event.validated_merkleroot.is_empty());
         }

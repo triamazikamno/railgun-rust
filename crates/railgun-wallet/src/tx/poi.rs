@@ -139,7 +139,7 @@ impl PreTransactionPoiChunkInputs {
         let mut poi_in_merkle_proof_path_elements = Vec::with_capacity(merkle_proofs.len());
 
         for (index, proof) in merkle_proofs.iter().enumerate() {
-            let leaf = parse_fixed_hex(&proof.leaf, "leaf")?;
+            let leaf = FixedBytes::from(proof.leaf.to_be_bytes::<32>());
             let expected = self.blinded_commitments_in[index];
             if leaf != expected {
                 return Err(PreTransactionPoiError::MerkleProofLeafMismatch {
@@ -155,15 +155,9 @@ impl PreTransactionPoiChunkInputs {
                     got: proof.elements.len(),
                 });
             }
-            poi_merkleroots.push(parse_u256_hex(&proof.root, "root")?);
-            poi_in_merkle_proof_indices.push(parse_u256_hex(&proof.indices, "indices")?);
-            poi_in_merkle_proof_path_elements.push(
-                proof
-                    .elements
-                    .iter()
-                    .map(|element| parse_u256_hex(element, "elements"))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            poi_merkleroots.push(proof.root);
+            poi_in_merkle_proof_indices.push(proof.indices);
+            poi_in_merkle_proof_path_elements.push(proof.elements.clone());
         }
 
         Ok(PoiProofInputs {
@@ -779,28 +773,4 @@ fn validate_public_signal(
         });
     }
     Ok(())
-}
-
-fn parse_fixed_hex(
-    value: &str,
-    field: &'static str,
-) -> Result<FixedBytes<32>, PreTransactionPoiError> {
-    parse_u256_hex(value, field).map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
-}
-
-fn parse_u256_hex(value: &str, field: &'static str) -> Result<U256, PreTransactionPoiError> {
-    let value_without_prefix = value.strip_prefix("0x").unwrap_or(value);
-    if value_without_prefix.len() > 64 {
-        return Err(PreTransactionPoiError::InvalidHex {
-            field,
-            value: value.to_string(),
-        });
-    }
-    if value_without_prefix.is_empty() {
-        return Ok(U256::ZERO);
-    }
-    U256::from_str_radix(value_without_prefix, 16).map_err(|_| PreTransactionPoiError::InvalidHex {
-        field,
-        value: value.to_string(),
-    })
 }

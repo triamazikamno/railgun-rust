@@ -633,6 +633,8 @@ pub enum BackfillRequest {
         from_block: u64,
         to_block: u64,
         follow_safe_head: bool,
+        progress_start_block: u64,
+        progress_tx: Option<SyncProgressSender>,
         sender: mpsc::Sender<BackfillEvent>,
     },
     Reset {

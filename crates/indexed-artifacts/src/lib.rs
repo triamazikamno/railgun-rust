@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use alloy_primitives::{Address, FixedBytes};
+use alloy_primitives::{Address, FixedBytes, hex};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,7 +26,7 @@ pub struct IndexedArtifactManifest {
     pub sequence: u64,
     pub publisher: PublisherIdentity,
     pub chains: Vec<IndexedArtifactChainEntry>,
-    pub publisher_signature: Option<String>,
+    pub publisher_signature: Option<FixedBytes<64>>,
 }
 
 impl IndexedArtifactManifest {
@@ -67,22 +67,16 @@ impl IndexedArtifactManifest {
 
     pub fn sign_manifest(&mut self, signing_key: &SigningKey) -> Result<(), IndexedArtifactError> {
         self.publisher =
-            PublisherIdentity::ed25519(hex::encode(signing_key.verifying_key().to_bytes()));
+            PublisherIdentity::ed25519(FixedBytes::from(signing_key.verifying_key().to_bytes()));
         let body_bytes = self.deterministic_body_bytes()?;
-        self.publisher_signature = Some(hex::encode(signing_key.sign(&body_bytes).to_bytes()));
+        self.publisher_signature = Some(FixedBytes::from(signing_key.sign(&body_bytes).to_bytes()));
         Ok(())
     }
 
     pub fn verify_signature(&self) -> Result<(), IndexedArtifactError> {
         match self.publisher.key_algorithm {
             PublisherKeyAlgorithm::Ed25519 => {
-                let pubkey_bytes: [u8; 32] = self
-                    .publisher
-                    .public_key
-                    .parse::<FixedBytes<32>>()
-                    .map_err(|err| IndexedArtifactError::Hex(err.to_string()))?
-                    .into();
-                self.verify_signature_with_key(&pubkey_bytes)
+                self.verify_signature_with_key(&self.publisher.public_key.0)
             }
         }
     }
@@ -91,15 +85,10 @@ impl IndexedArtifactManifest {
         &self,
         trusted_publisher_pubkey: &[u8; 32],
     ) -> Result<(), IndexedArtifactError> {
-        let pubkey = self
-            .publisher
-            .public_key
-            .parse::<FixedBytes<32>>()
-            .map_err(|err| IndexedArtifactError::Hex(err.to_string()))?;
-        if pubkey.as_slice() != trusted_publisher_pubkey.as_slice() {
+        if self.publisher.public_key.as_slice() != trusted_publisher_pubkey.as_slice() {
             return Err(IndexedArtifactError::PublisherKeyMismatch {
-                expected: prefixed_hex(trusted_publisher_pubkey),
-                actual: prefixed_hex(pubkey.as_slice()),
+                expected: hex::encode_prefixed(trusted_publisher_pubkey),
+                actual: hex::encode_prefixed(self.publisher.public_key.as_slice()),
             });
         }
 
@@ -110,16 +99,13 @@ impl IndexedArtifactManifest {
         &self,
         pubkey_bytes: &[u8; 32],
     ) -> Result<(), IndexedArtifactError> {
-        let signature_bytes: [u8; 64] = self
+        let signature_bytes = self
             .publisher_signature
-            .as_deref()
-            .ok_or(IndexedArtifactError::MissingPublisherSignature)?
-            .parse::<FixedBytes<64>>()
-            .map_err(|err| IndexedArtifactError::Hex(err.to_string()))?
-            .into();
+            .as_ref()
+            .ok_or(IndexedArtifactError::MissingPublisherSignature)?;
         let verifying_key =
             VerifyingKey::from_bytes(pubkey_bytes).map_err(IndexedArtifactError::PublicKey)?;
-        let signature = Signature::from_bytes(&signature_bytes);
+        let signature = Signature::from_bytes(&signature_bytes.0);
         verifying_key
             .verify(&self.deterministic_body_bytes()?, &signature)
             .map_err(IndexedArtifactError::Signature)
@@ -138,15 +124,15 @@ struct IndexedArtifactManifestBody<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublisherIdentity {
     pub key_algorithm: PublisherKeyAlgorithm,
-    pub public_key: String,
+    pub public_key: FixedBytes<32>,
 }
 
 impl PublisherIdentity {
     #[must_use]
-    pub fn ed25519(public_key: impl Into<String>) -> Self {
+    pub fn ed25519(public_key: FixedBytes<32>) -> Self {
         Self {
             key_algorithm: PublisherKeyAlgorithm::Ed25519,
-            public_key: public_key.into(),
+            public_key,
         }
     }
 }
@@ -378,7 +364,7 @@ impl ChunkEnvelope {
         write_string(
             &mut bytes,
             "railgun_contract",
-            &prefixed_hex(self.header.scope.railgun_contract.as_slice()),
+            &hex::encode_prefixed(self.header.scope.railgun_contract.as_slice()),
         )?;
         bytes.push(range_kind_id(self.header.range.kind));
         write_u64(&mut bytes, self.header.range.start);
@@ -1102,17 +1088,12 @@ const fn range_kind_order(value: IndexedArtifactRangeKind) -> u8 {
 }
 
 #[must_use]
-pub fn prefixed_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
-}
-
-#[must_use]
 pub fn format_scope(scope: &ChainScope) -> String {
     format!(
         "{:?}:{}:{}",
         scope.chain_type,
         scope.chain_id,
-        prefixed_hex(scope.railgun_contract.as_slice())
+        hex::encode_prefixed(scope.railgun_contract.as_slice())
     )
 }
 
@@ -1126,7 +1107,7 @@ mod tests {
         let mut manifest = IndexedArtifactManifest::new(
             42,
             7,
-            PublisherIdentity::ed25519(""),
+            PublisherIdentity::ed25519(FixedBytes::ZERO),
             vec![IndexedArtifactChainEntry {
                 scope: scope(),
                 latest_indexed: vec![LatestIndexedHeight {
