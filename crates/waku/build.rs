@@ -1,23 +1,18 @@
 fn main() {
     let proto_dir = "proto";
+    let protos = [
+        "proto/message.proto",
+        "proto/light_push.proto",
+        "proto/peer_exchange.proto",
+        "proto/metadata.proto",
+        "proto/filter.proto",
+        "proto/store.proto",
+    ];
 
-    prost_build::compile_protos(
-        &[
-            format!("{proto_dir}/message.proto"),
-            format!("{proto_dir}/light_push.proto"),
-            format!("{proto_dir}/peer_exchange.proto"),
-            format!("{proto_dir}/metadata.proto"),
-            format!("{proto_dir}/filter.proto"),
-            format!("{proto_dir}/store.proto"),
-        ],
-        &[proto_dir],
-    )
-    .expect("failed to compile protos");
+    let descriptors = protox::compile(protos, [proto_dir]).expect("failed to compile protos");
+    prost_build::compile_fds(descriptors).expect("failed to generate protobuf bindings");
 
-    println!("cargo:rerun-if-changed={proto_dir}/message.proto");
-    println!("cargo:rerun-if-changed={proto_dir}/light_push.proto");
-    println!("cargo:rerun-if-changed={proto_dir}/peer_exchange.proto");
-    println!("cargo:rerun-if-changed={proto_dir}/metadata.proto");
-    println!("cargo:rerun-if-changed={proto_dir}/filter.proto");
-    println!("cargo:rerun-if-changed={proto_dir}/store.proto");
+    for proto in protos {
+        println!("cargo:rerun-if-changed={proto}");
+    }
 }
