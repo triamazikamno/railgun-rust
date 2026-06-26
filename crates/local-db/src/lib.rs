@@ -5,7 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, railgun_txid_leaf_hash};
-use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table, TableDefinition,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1003,6 +1005,18 @@ impl DbStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub fn clear_poi_artifact_cache(&self) -> Result<u64, DbError> {
+        let txn = self.db.begin_write()?;
+        let removed = {
+            let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+            let removed = table.len()?;
+            table.retain(|_, _| false)?;
+            removed
+        };
+        txn.commit()?;
+        Ok(removed)
     }
 
     pub fn get_pending_fee_note_assurance(

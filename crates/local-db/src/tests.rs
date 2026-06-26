@@ -1,7 +1,7 @@
 use super::{
     CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, OutputPoiRecoveryRecord,
     OutputPoiRecoveryStatus, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
-    PendingOutputPoiRole, WalletMeta,
+    PendingOutputPoiRole, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, WalletMeta,
 };
 use alloy::primitives::{Bytes, FixedBytes, U256};
 use alloy::uint;
@@ -84,6 +84,31 @@ fn sample_pending_output_record(
         observation: None,
         submitted_poi_list_keys: Vec::new(),
         terminal_error: None,
+    }
+}
+
+fn sample_poi_artifact_cache_record(
+    chain_id: u64,
+    list_key: FixedBytes<32>,
+) -> PoiArtifactCacheRecord {
+    let descriptor = PoiArtifactDescriptorRecord {
+        cid: "bafybeihash".to_string(),
+        sha256: "00".repeat(32),
+        byte_size: 16,
+    };
+    PoiArtifactCacheRecord {
+        chain_type: 0,
+        chain_id,
+        txid_version: "V3_PoseidonMerkle".to_string(),
+        list_key,
+        last_accepted_manifest_sequence: 7,
+        base_descriptor: descriptor.clone(),
+        applied_delta_descriptors: vec![descriptor.clone()],
+        blocked_shields_descriptor: descriptor,
+        current_tip_index: 99,
+        current_tip_root: FixedBytes::from([0x77; 32]),
+        cache_payload: vec![1, 2, 3, 4],
+        updated_at: 0,
     }
 }
 
@@ -365,6 +390,75 @@ fn app_settings_records_are_transactional_plaintext_records() {
             .get_app_settings_record("wallet-settings")
             .expect("load deleted settings")
             .is_none()
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn clear_poi_artifact_cache_removes_only_poi_artifact_records() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+
+    let record_a = sample_poi_artifact_cache_record(1, FixedBytes::from([0x11; 32]));
+    let record_b = sample_poi_artifact_cache_record(137, FixedBytes::from([0x22; 32]));
+    store
+        .put_poi_artifact_cache(&record_a)
+        .expect("store first POI artifact cache");
+    store
+        .put_poi_artifact_cache(&record_b)
+        .expect("store second POI artifact cache");
+    store
+        .put_app_settings_record("wallet-settings", b"settings-v1")
+        .expect("store settings");
+    store
+        .put_desktop_wallet_vault_record("vault|meta", b"encrypted metadata")
+        .expect("store vault metadata");
+
+    let removed = store
+        .clear_poi_artifact_cache()
+        .expect("clear POI artifact cache");
+
+    assert_eq!(removed, 2);
+    assert!(
+        store
+            .get_poi_artifact_cache(
+                record_a.chain_type,
+                record_a.chain_id,
+                &record_a.txid_version,
+                &record_a.list_key,
+            )
+            .expect("load first cleared POI artifact cache")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_poi_artifact_cache(
+                record_b.chain_type,
+                record_b.chain_id,
+                &record_b.txid_version,
+                &record_b.list_key,
+            )
+            .expect("load second cleared POI artifact cache")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_app_settings_record("wallet-settings")
+            .expect("load settings after POI cache clear")
+            .expect("settings still present"),
+        b"settings-v1"
+    );
+    assert_eq!(
+        store
+            .get_desktop_wallet_vault_record("vault|meta")
+            .expect("load vault metadata after POI cache clear")
+            .expect("vault metadata still present"),
+        b"encrypted metadata"
     );
 
     drop(store);

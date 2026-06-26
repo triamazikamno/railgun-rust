@@ -126,6 +126,45 @@ impl PoiCacheService {
             .map(|state| Arc::clone(&state.local_caches))
     }
 
+    pub async fn reset_poi_artifact_cache(&self) -> Result<u64, local_db::DbError> {
+        let removed = self.db.clear_poi_artifact_cache()?;
+        let chains: Vec<_> = self
+            .chains
+            .read()
+            .await
+            .iter()
+            .map(|(chain_id, state)| (*chain_id, Arc::clone(&state.local_caches)))
+            .collect();
+        let chain_count = chains.len();
+
+        for (chain_id, local_caches) in &chains {
+            let mut caches = local_caches.write().await;
+            let in_memory_caches = caches.len();
+            caches.clear();
+            info!(
+                chain_id,
+                in_memory_caches, "cleared in-memory artifact POI cache"
+            );
+        }
+
+        for (chain_id, local_caches) in chains {
+            spawn_chain_poi_cache_resync(
+                Arc::clone(&self.db),
+                self.http_client.clone(),
+                self.poi_rpc_url.clone(),
+                self.artifact_config.clone(),
+                chain_id,
+                local_caches,
+            );
+        }
+
+        info!(
+            persisted_records = removed,
+            chain_count, "reset local artifact POI cache"
+        );
+        Ok(removed)
+    }
+
     pub fn shutdown(&self) {
         self.cancel.cancel();
     }
@@ -148,6 +187,33 @@ fn spawn_chain_poi_cache_loop(task: ChainPoiCacheLoop) {
             run_chain_poi_cache_loop(task).await;
         }
         .instrument(tracing::info_span!("poi_artifact_cache", chain_id)),
+    );
+}
+
+fn spawn_chain_poi_cache_resync(
+    db: Arc<DbStore>,
+    http_client: Option<reqwest::Client>,
+    poi_rpc_url: Url,
+    artifact_config: PoiArtifactSourceConfig,
+    chain_id: u64,
+    local_caches: LocalPoiCaches,
+) {
+    tokio::spawn(
+        async move {
+            let active_list_keys = default_active_poi_list_keys();
+            sync_chain_poi_artifact_caches(
+                db.as_ref(),
+                http_client.as_ref(),
+                &poi_rpc_url,
+                &artifact_config,
+                chain_id,
+                &local_caches,
+                &active_list_keys,
+                BTreeMap::new(),
+            )
+            .await;
+        }
+        .instrument(tracing::info_span!("poi_artifact_cache_resync", chain_id)),
     );
 }
 
