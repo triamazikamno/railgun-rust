@@ -14,9 +14,9 @@ pub use poi_cache::PoiCacheService;
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
     IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LocalPoiCaches,
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, SyncProgressSender,
-    SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletCacheStore, WalletConfig,
-    WalletLocalPoiCaches,
+    PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
+    PoiArtifactSourceConfig, PoiReadSource, SyncProgressSender, SyncProgressStage,
+    SyncProgressUnit, SyncProgressUpdate, WalletCacheStore, WalletConfig, WalletLocalPoiCaches,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

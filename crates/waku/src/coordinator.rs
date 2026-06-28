@@ -262,20 +262,10 @@ struct Subscription {
 
 #[derive(Debug)]
 enum FilterOp {
-    Subscribe {
-        sub_id: SubId,
-    },
-    Unsubscribe {
-        sub_id: SubId,
-        batch_id: u64,
-    },
-    UnsubscribeAll {
-        pubsub_topic: String,
-        batch_id: u64,
-    },
-    SubscribeOnPeer {
-        sub_id: SubId,
-    },
+    Subscribe { sub_id: SubId },
+    Unsubscribe { sub_id: SubId, batch_id: u64 },
+    UnsubscribeAll { pubsub_topic: String, batch_id: u64 },
+    SubscribeOnPeer { sub_id: SubId },
 }
 
 #[derive(Debug)]

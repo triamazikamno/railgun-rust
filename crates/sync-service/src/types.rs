@@ -157,6 +157,87 @@ impl SyncProgressUpdate {
 }
 
 pub type SyncProgressSender = watch::Sender<Option<SyncProgressUpdate>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoiArtifactCachePhase {
+    Idle,
+    LoadingPersisted,
+    Resetting,
+    FetchingManifest,
+    DownloadingBase,
+    ApplyingDeltas,
+    SyncingBlockedShields,
+    LiveTailing,
+    ValidatingRoots,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoiArtifactCacheProgress {
+    pub chain_id: u64,
+    pub phase: PoiArtifactCachePhase,
+    pub completed_lists: usize,
+    pub total_lists: usize,
+    pub current_list_key: Option<FixedBytes<32>>,
+    pub current_event_index: Option<u64>,
+    pub target_event_index: Option<u64>,
+    pub ready_for_wallet_checks: bool,
+    pub last_error: Option<String>,
+}
+
+impl PoiArtifactCacheProgress {
+    #[must_use]
+    pub fn percent(&self) -> u8 {
+        if self.is_ready() {
+            return 100;
+        }
+        if self.total_lists == 0 {
+            return 0;
+        }
+
+        let completed_lists = self.completed_lists.min(self.total_lists);
+        let mut basis_points = completed_lists.saturating_mul(10_000) / self.total_lists;
+        if completed_lists < self.total_lists
+            && let (Some(current), Some(target)) =
+                (self.current_event_index, self.target_event_index)
+            && target > 0
+        {
+            let current = current.min(target);
+            basis_points = basis_points.saturating_add(
+                current.saturating_mul(10_000) as usize
+                    / (target as usize).saturating_mul(self.total_lists),
+            );
+        }
+        (basis_points.min(10_000) / 100) as u8
+    }
+
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(
+            self.phase,
+            PoiArtifactCachePhase::LoadingPersisted
+                | PoiArtifactCachePhase::Resetting
+                | PoiArtifactCachePhase::FetchingManifest
+                | PoiArtifactCachePhase::DownloadingBase
+                | PoiArtifactCachePhase::ApplyingDeltas
+                | PoiArtifactCachePhase::SyncingBlockedShields
+                | PoiArtifactCachePhase::LiveTailing
+                | PoiArtifactCachePhase::ValidatingRoots
+        )
+    }
+
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self.phase, PoiArtifactCachePhase::Ready) && self.ready_for_wallet_checks
+    }
+
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self.phase, PoiArtifactCachePhase::Error)
+    }
+}
+
 pub type LocalPoiCaches = Arc<RwLock<BTreeMap<FixedBytes<32>, PoiCache>>>;
 pub type WalletLocalPoiCaches = LocalPoiCaches;
 
@@ -513,7 +594,10 @@ pub struct WalletConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChainConfigDefaults, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate};
+    use super::{
+        ChainConfigDefaults, PoiArtifactCachePhase, PoiArtifactCacheProgress, SyncProgressStage,
+        SyncProgressUnit, SyncProgressUpdate,
+    };
 
     #[test]
     fn default_indexed_wallet_ranges_are_chain_specific() {
@@ -596,6 +680,52 @@ mod tests {
 
         assert_eq!(early.percent(), 0);
         assert_eq!(late.percent(), 100);
+    }
+
+    #[test]
+    fn poi_artifact_cache_progress_percent_handles_zero_totals() {
+        let progress = PoiArtifactCacheProgress {
+            chain_id: 1,
+            phase: PoiArtifactCachePhase::LoadingPersisted,
+            completed_lists: 0,
+            total_lists: 0,
+            current_list_key: None,
+            current_event_index: None,
+            target_event_index: None,
+            ready_for_wallet_checks: false,
+            last_error: None,
+        };
+
+        assert_eq!(progress.percent(), 0);
+        assert!(progress.is_active());
+        assert!(!progress.is_ready());
+        assert!(!progress.is_error());
+    }
+
+    #[test]
+    fn poi_artifact_cache_progress_reports_ready_and_error_state() {
+        let ready = PoiArtifactCacheProgress {
+            chain_id: 1,
+            phase: PoiArtifactCachePhase::Ready,
+            completed_lists: 1,
+            total_lists: 1,
+            current_list_key: None,
+            current_event_index: None,
+            target_event_index: None,
+            ready_for_wallet_checks: true,
+            last_error: None,
+        };
+        let error = PoiArtifactCacheProgress {
+            phase: PoiArtifactCachePhase::Error,
+            ready_for_wallet_checks: false,
+            last_error: Some("failed".to_string()),
+            ..ready.clone()
+        };
+
+        assert_eq!(ready.percent(), 100);
+        assert!(ready.is_ready());
+        assert!(error.is_error());
+        assert!(!error.is_active());
     }
 }
 

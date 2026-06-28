@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -17,19 +18,56 @@ use tracing::debug;
 use url::Url;
 
 use crate::trustless_artifacts::{self, TrustlessArtifactError, TrustlessArtifactFetcher};
-use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
+use crate::types::{PoiArtifactCachePhase, PoiArtifactManifestSource, PoiArtifactSourceConfig};
 
 const BLOCKED_SHIELDS_LIST_KEY_FIELD: &str = "blocked_shields.list_key";
 const ENTRY_LIST_KEY_FIELD: &str = "entry.list_key";
 
+#[derive(Clone, Copy)]
+pub(crate) struct PoiArtifactProgressEvent {
+    pub(crate) phase: PoiArtifactCachePhase,
+    pub(crate) current_event_index: Option<u64>,
+    pub(crate) target_event_index: Option<u64>,
+}
+
+type PoiArtifactProgressObserver = Arc<dyn Fn(PoiArtifactProgressEvent) + Send + Sync>;
+
 pub(crate) struct PoiArtifactIngestor {
     config: PoiArtifactSourceConfig,
     client: reqwest::Client,
+    progress_observer: Option<PoiArtifactProgressObserver>,
 }
 
 impl PoiArtifactIngestor {
     pub(crate) const fn new(config: PoiArtifactSourceConfig, client: reqwest::Client) -> Self {
-        Self { config, client }
+        Self {
+            config,
+            client,
+            progress_observer: None,
+        }
+    }
+
+    pub(crate) fn with_progress_observer(
+        mut self,
+        observer: impl Fn(PoiArtifactProgressEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress_observer = Some(Arc::new(observer));
+        self
+    }
+
+    fn report_progress(
+        &self,
+        phase: PoiArtifactCachePhase,
+        current_event_index: Option<u64>,
+        target_event_index: Option<u64>,
+    ) {
+        if let Some(observer) = self.progress_observer.as_ref() {
+            observer(PoiArtifactProgressEvent {
+                phase,
+                current_event_index,
+                target_event_index,
+            });
+        }
     }
 
     pub(crate) async fn fetch_manifest(
@@ -205,23 +243,44 @@ impl PoiArtifactIngestor {
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let started = Instant::now();
         let mut cache = PoiCache::new(identity.clone());
+        let target_index = Some(entry.current_tip_index);
 
         let base_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::DownloadingBase,
+            Some(0),
+            target_index,
+        );
         let base_bytes = self.fetch_artifact(&entry.base).await?;
         let base = SnapshotReader::read(&base_bytes)?;
         let mut next_start = validate_snapshot(&base, &identity, &entry, SnapshotKind::Base, 0)?;
         cache.apply_verified_artifact_events(&base.events)?;
+        self.report_progress(
+            PoiArtifactCachePhase::ApplyingDeltas,
+            Some(next_start.saturating_sub(1)),
+            target_index,
+        );
         let base_elapsed_ms = base_started.elapsed().as_millis();
 
         let deltas_started = Instant::now();
         let mut delta_events = 0_usize;
         for delta_descriptor in &entry.deltas {
+            self.report_progress(
+                PoiArtifactCachePhase::ApplyingDeltas,
+                Some(next_start.saturating_sub(1)),
+                target_index,
+            );
             let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
             let delta = SnapshotReader::read(&delta_bytes)?;
             next_start =
                 validate_snapshot(&delta, &identity, &entry, SnapshotKind::Delta, next_start)?;
             delta_events = delta_events.saturating_add(delta.events.len());
             cache.apply_verified_artifact_events(&delta.events)?;
+            self.report_progress(
+                PoiArtifactCachePhase::ApplyingDeltas,
+                Some(next_start.saturating_sub(1)),
+                target_index,
+            );
         }
         let deltas_elapsed_ms = deltas_started.elapsed().as_millis();
 
@@ -236,6 +295,11 @@ impl PoiArtifactIngestor {
         }
 
         let blocked_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::SyncingBlockedShields,
+            Some(final_index),
+            target_index,
+        );
         let blocked_bytes = self.fetch_artifact(&entry.blocked_shields).await?;
         let blocked = BlockedShieldsArtifact::read(&blocked_bytes)?;
         let blocked_records = validate_blocked_shields_artifact(&blocked, &identity)?;
@@ -246,6 +310,11 @@ impl PoiArtifactIngestor {
         let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
 
         let root_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::ValidatingRoots,
+            Some(final_index),
+            target_index,
+        );
         verify_manifest_root(&mut cache, &entry)?;
         if !cache.validate_roots(proxy_client).await? {
             return Err(PoiArtifactError::RootRejected);
@@ -375,6 +444,7 @@ impl PoiArtifactIngestor {
         now: SystemTime,
         proxy_client: Option<&PoiRpcClient>,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
+        self.report_progress(PoiArtifactCachePhase::FetchingManifest, None, None);
         let manifest = self.fetch_manifest(last_accepted_sequence, now).await?;
         let entry = manifest_entry_for_identity(&manifest, &identity)?.clone();
 
@@ -455,16 +525,27 @@ impl PoiArtifactIngestor {
             .current_tip_index
             .checked_add(1)
             .ok_or(PoiArtifactError::RangeOverflow)?;
+        let target_index = Some(entry.current_tip_index);
 
         let deltas_started = Instant::now();
         let mut delta_events = 0_usize;
         for delta_descriptor in entry.deltas.iter().skip(applied_delta_count) {
+            self.report_progress(
+                PoiArtifactCachePhase::ApplyingDeltas,
+                Some(next_start.saturating_sub(1)),
+                target_index,
+            );
             let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
             let delta = SnapshotReader::read(&delta_bytes)?;
             next_start =
                 validate_snapshot(&delta, identity, entry, SnapshotKind::Delta, next_start)?;
             delta_events = delta_events.saturating_add(delta.events.len());
             cache.apply_verified_artifact_events(&delta.events)?;
+            self.report_progress(
+                PoiArtifactCachePhase::ApplyingDeltas,
+                Some(next_start.saturating_sub(1)),
+                target_index,
+            );
         }
         let deltas_elapsed_ms = deltas_started.elapsed().as_millis();
 
@@ -479,6 +560,11 @@ impl PoiArtifactIngestor {
         }
 
         let blocked_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::SyncingBlockedShields,
+            Some(final_index),
+            target_index,
+        );
         let mut blocked_records_count = 0_usize;
         let blocked_refreshed = !descriptor_matches_record(
             &entry.blocked_shields,
@@ -497,6 +583,11 @@ impl PoiArtifactIngestor {
         let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
 
         let root_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::ValidatingRoots,
+            Some(final_index),
+            target_index,
+        );
         verify_manifest_root(&mut cache, entry)?;
         if !cache.validate_roots(proxy_client).await? {
             return Err(PoiArtifactError::RootRejected);
@@ -566,6 +657,11 @@ impl PoiArtifactIngestor {
         let artifact_elapsed_ms = artifact_started.elapsed().as_millis();
 
         let root_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::ValidatingRoots,
+            Some(artifact_tip_index),
+            Some(artifact_tip_index),
+        );
         verify_manifest_root(&mut cache, entry)?;
         if !cache
             .validate_roots(proxy_client)
@@ -577,6 +673,11 @@ impl PoiArtifactIngestor {
         let root_validation_elapsed_ms = root_started.elapsed().as_millis();
 
         let blocked_started = Instant::now();
+        self.report_progress(
+            PoiArtifactCachePhase::SyncingBlockedShields,
+            Some(artifact_tip_index),
+            Some(artifact_tip_index),
+        );
         let mut blocked_records_count = 0_usize;
         let blocked_refreshed = !descriptor_matches_record(
             &entry.blocked_shields,
@@ -630,7 +731,13 @@ impl PoiArtifactIngestor {
         let mut expected_apply_index = local_tip_index
             .checked_add(1)
             .ok_or(PoiArtifactError::RangeOverflow)?;
+        let target_index = Some(entry.current_tip_index);
 
+        self.report_progress(
+            PoiArtifactCachePhase::DownloadingBase,
+            Some(local_tip_index),
+            target_index,
+        );
         let base_bytes = self.fetch_artifact(&entry.base).await?;
         let base = SnapshotReader::read(&base_bytes)?;
         expected_artifact_start = validate_snapshot(
@@ -646,8 +753,18 @@ impl PoiArtifactIngestor {
         outcome.skipped_events = outcome
             .skipped_events
             .saturating_add(base.events.len().saturating_sub(applied));
+        self.report_progress(
+            PoiArtifactCachePhase::ApplyingDeltas,
+            Some(expected_apply_index.saturating_sub(1)),
+            target_index,
+        );
 
         for delta_descriptor in &entry.deltas {
+            self.report_progress(
+                PoiArtifactCachePhase::ApplyingDeltas,
+                Some(expected_apply_index.saturating_sub(1)),
+                target_index,
+            );
             let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
             let delta = SnapshotReader::read(&delta_bytes)?;
             expected_artifact_start = validate_snapshot(
@@ -664,6 +781,11 @@ impl PoiArtifactIngestor {
             outcome.skipped_events = outcome
                 .skipped_events
                 .saturating_add(delta.events.len().saturating_sub(applied));
+            self.report_progress(
+                PoiArtifactCachePhase::ApplyingDeltas,
+                Some(expected_apply_index.saturating_sub(1)),
+                target_index,
+            );
         }
 
         let final_index = expected_apply_index
