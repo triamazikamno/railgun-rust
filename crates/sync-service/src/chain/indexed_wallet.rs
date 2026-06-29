@@ -1065,21 +1065,53 @@ pub(super) async fn send_wallet_startup_events(
     cache_key: &str,
     events: Vec<BackfillEvent>,
     done_block: Option<u64>,
+    reset_generation: u64,
     sender: &mpsc::Sender<BackfillEvent>,
 ) -> bool {
     for event in events {
+        let event = backfill_event_at_generation(event, reset_generation);
         if let Err(err) = sender.send(event).await {
             debug!(?err, cache_key, "failed to send wallet startup sync event");
             return false;
         }
     }
     if let Some(last_block) = done_block
-        && let Err(err) = sender.send(BackfillEvent::Done { last_block }).await
+        && let Err(err) = sender
+            .send(BackfillEvent::DoneAtGeneration {
+                last_block,
+                reset_generation,
+            })
+            .await
     {
         debug!(?err, cache_key, "failed to send wallet startup sync done");
         return false;
     }
     true
+}
+
+fn backfill_event_at_generation(event: BackfillEvent, reset_generation: u64) -> BackfillEvent {
+    match event {
+        BackfillEvent::Logs(batch) => BackfillEvent::LogsAtGeneration {
+            batch,
+            reset_generation,
+        },
+        BackfillEvent::IndexedDelta {
+            from_block,
+            to_block,
+            delta,
+            ..
+        } => BackfillEvent::IndexedDelta {
+            from_block,
+            to_block,
+            delta,
+            reset_generation: Some(reset_generation),
+        },
+        BackfillEvent::Done { last_block } => BackfillEvent::DoneAtGeneration {
+            last_block,
+            reset_generation,
+        },
+        event => event,
+    }
 }
 
 #[cfg(test)]

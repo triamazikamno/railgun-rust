@@ -5,28 +5,34 @@ use alloy::sol_types::SolEvent;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::service::{wait_for_startup_sync_target, wait_for_wallet_ready};
+use super::service::{
+    await_live_log_task_shutdown, wait_for_startup_sync_target, wait_for_wallet_ready,
+};
 use super::{
     CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletArtifactProbe,
     IndexedWalletPageKind, Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, Transact,
-    WalletBackfill, artifact_failure_can_fallback_to_squid,
-    combined_log_event_signatures_for_range, complete_stream_checkpoint, pending_tip_from_block,
-    pending_tip_provider_covers_target, send_wallet_startup_events, should_hedge_wallet_startup,
-    squid_tail_target_after_artifact, wallet_backfill_from_block, wallet_reorg_backfill_from_block,
+    WalletBackfill, WalletTailFallbackState, artifact_failure_can_fallback_to_squid,
+    combined_log_event_signatures_for_range, complete_stream_checkpoint,
+    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
+    send_wallet_startup_events, should_hedge_wallet_startup, squid_tail_target_after_artifact,
+    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_reorg_backfill_from_block,
     wallet_startup_hedge_block_count, wallet_sync_target,
+    wallet_tail_fallback_lag_threshold_blocks,
 };
-use crate::types::{BackfillEvent, LogBatch, SyncProgressStage};
+use crate::types::{BackfillEvent, BackfillRequest, LogBatch, SyncProgressStage};
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
-    WalletBackfill {
-        from_block: 100,
+    WalletBackfill::new(
+        100,
         target_block,
         follow_safe_head,
-        progress_start_block: 100,
-        progress_tx: None,
+        100,
+        0,
+        None,
         sender,
-    }
+        std::time::Instant::now(),
+    )
 }
 
 #[test]
@@ -82,14 +88,16 @@ fn zero_wallet_backfill_target_initializes_from_safe_head() {
 fn wallet_backfill_progress_tracks_cursor_range() {
     let (sender, _receiver) = mpsc::channel(1);
     let (progress_tx, progress_rx) = watch::channel(None);
-    let mut cursor = WalletBackfill {
-        from_block: 100,
-        target_block: 0,
-        follow_safe_head: false,
-        progress_start_block: 100,
-        progress_tx: Some(progress_tx),
+    let mut cursor = WalletBackfill::new(
+        100,
+        0,
+        false,
+        100,
+        0,
+        Some(progress_tx),
         sender,
-    };
+        std::time::Instant::now(),
+    );
 
     cursor.send_progress(100);
     assert!(progress_rx.borrow().is_none());
@@ -102,6 +110,150 @@ fn wallet_backfill_progress_tracks_cursor_range() {
     assert_eq!(progress.start_block, 100);
     assert_eq!(progress.current_block, 150);
     assert_eq!(progress.target_block, 200);
+}
+
+#[test]
+fn active_backfill_drains_reset_replacement_request() {
+    let (request_tx, mut request_rx) = mpsc::channel(4);
+    let (old_sender, _old_receiver) = mpsc::channel(1);
+    let (new_sender, _new_receiver) = mpsc::channel(1);
+    let mut cursors = HashMap::new();
+    cursors.insert(
+        "test".to_string(),
+        WalletBackfill::new(
+            100,
+            1_000,
+            true,
+            100,
+            0,
+            None,
+            old_sender,
+            std::time::Instant::now(),
+        ),
+    );
+
+    request_tx
+        .try_send(BackfillRequest::Add {
+            cache_key: "test".to_string(),
+            from_block: 80,
+            to_block: 150,
+            follow_safe_head: true,
+            progress_start_block: 80,
+            reset_generation: 1,
+            progress_tx: None,
+            sender: new_sender,
+        })
+        .expect("queue reset replacement backfill");
+
+    drain_pending_backfill_requests(&mut request_rx, &mut cursors);
+
+    let cursor = cursors.get("test").expect("cursor retained");
+    assert_eq!(cursor.from_block, 80);
+    assert_eq!(cursor.target_block, 150);
+    assert!(cursor.follow_safe_head);
+    assert_eq!(cursor.progress_start_block, 80);
+    assert_eq!(cursor.reset_generation, 1);
+}
+
+#[test]
+fn wallet_tail_fallback_thresholds_are_chain_specific() {
+    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(1), 10);
+    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(56), 15);
+    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(137), 22);
+    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(42161), 45);
+}
+
+#[test]
+fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
+    let now = std::time::Instant::now();
+    let (sender, _receiver) = mpsc::channel(1);
+    let mut cursor = WalletBackfill::new(
+        100,
+        160,
+        true,
+        100,
+        0,
+        None,
+        sender,
+        now - std::time::Duration::from_secs(20),
+    );
+
+    assert_eq!(
+        wallet_backfill_lag_blocks(cursor.from_block, cursor.target_block),
+        61
+    );
+    assert!(cursor.should_try_indexed_tail_fallback(
+        42161,
+        now,
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+
+    cursor.mark_indexed_tail_attempt(now);
+    assert!(!cursor.should_try_indexed_tail_fallback(
+        42161,
+        now + std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+    assert!(cursor.should_try_indexed_tail_fallback(
+        42161,
+        now + std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+
+    cursor.mark_progress(150, now + std::time::Duration::from_secs(60));
+    assert!(!cursor.should_try_indexed_tail_fallback(
+        42161,
+        now + std::time::Duration::from_secs(70),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+}
+
+#[test]
+fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
+    let now = std::time::Instant::now();
+    let mut state = WalletTailFallbackState::new(100, now - std::time::Duration::from_secs(20));
+
+    assert!(state.should_try_indexed_tail_fallback(
+        42161,
+        101,
+        160,
+        now,
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+
+    state.mark_indexed_tail_attempt(now);
+    assert!(!state.should_try_indexed_tail_fallback(
+        42161,
+        101,
+        160,
+        now + std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+
+    state.update_last_scanned(130, now + std::time::Duration::from_secs(30));
+    assert!(!state.should_try_indexed_tail_fallback(
+        42161,
+        131,
+        190,
+        now + std::time::Duration::from_secs(40),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
+
+    assert!(state.should_try_indexed_tail_fallback(
+        42161,
+        131,
+        190,
+        now + std::time::Duration::from_secs(90),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ));
 }
 
 #[tokio::test]
@@ -340,6 +492,31 @@ async fn txid_background_wait_exits_when_wallet_cancelled() {
 }
 
 #[tokio::test]
+async fn chain_shutdown_waits_for_live_log_worker() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = release_rx.await;
+    });
+    let live_log_task = Arc::new(tokio::sync::Mutex::new(Some(task)));
+    let waiter_task = tokio::spawn({
+        let live_log_task = Arc::clone(&live_log_task);
+        async move {
+            await_live_log_task_shutdown(live_log_task.as_ref(), 1).await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(!waiter_task.is_finished());
+
+    release_tx.send(()).expect("release live log worker");
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter_task)
+        .await
+        .expect("shutdown wait completed")
+        .expect("shutdown task completed");
+    assert!(live_log_task.lock().await.is_none());
+}
+
+#[tokio::test]
 async fn wallet_startup_events_send_done_before_follow_safe_head_backfill_runs() {
     let (sender, mut receiver) = mpsc::channel(4);
     let batch = Arc::new(LogBatch {
@@ -350,18 +527,33 @@ async fn wallet_startup_events_send_done_before_follow_safe_head_backfill_runs()
         to_block_hash: None,
     });
 
-    let sent =
-        send_wallet_startup_events("test", vec![BackfillEvent::Logs(batch)], Some(105), &sender)
-            .await;
+    let sent = send_wallet_startup_events(
+        "test",
+        vec![BackfillEvent::Logs(batch)],
+        Some(105),
+        7,
+        &sender,
+    )
+    .await;
 
     assert!(sent);
-    let Some(BackfillEvent::Logs(batch)) = receiver.recv().await else {
+    let Some(BackfillEvent::LogsAtGeneration {
+        batch,
+        reset_generation,
+    }) = receiver.recv().await
+    else {
         panic!("startup logs should be sent first");
     };
     assert_eq!(batch.to_block, 105);
-    let Some(BackfillEvent::Done { last_block }) = receiver.recv().await else {
+    assert_eq!(reset_generation, 7);
+    let Some(BackfillEvent::DoneAtGeneration {
+        last_block,
+        reset_generation,
+    }) = receiver.recv().await
+    else {
         panic!("startup done should be sent after logs");
     };
     assert_eq!(last_block, 105);
+    assert_eq!(reset_generation, 7);
     assert!(receiver.try_recv().is_err());
 }

@@ -18,6 +18,7 @@ pub(crate) fn spawn_wallet_worker(
     let utxos = Arc::new(RwLock::new(initial_utxos));
     let pending_overlay = Arc::new(RwLock::new(WalletPendingOverlay::default()));
     let last_scanned_state = Arc::new(AtomicU64::new(initial_last_scanned));
+    let reset_generation_state = Arc::new(AtomicU64::new(0));
     let WalletWorkerServices {
         db,
         rpcs,
@@ -32,18 +33,22 @@ pub(crate) fn spawn_wallet_worker(
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel(1);
     let (poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
+    let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let handle = WalletHandle {
         cache_key: cfg.cache_key.clone(),
         utxos: utxos.clone(),
         pending_overlay,
         last_scanned: last_scanned_state,
+        reset_generation: reset_generation_state,
         ready_rx,
         rev_rx,
         poi_refreshing_rx,
+        indexed_catch_up_rx,
         poi_read_source: cfg.poi_read_source.clone(),
         local_poi_caches: cfg.local_poi_caches.clone(),
         poi_refresh_tx,
         rev_tx,
+        indexed_catch_up_tx,
     };
 
     let chain_id = cfg.chain.chain_id;
@@ -102,6 +107,270 @@ pub(crate) fn spawn_wallet_worker(
         }
 
         let mut readiness_started = worker_started;
+        let mut reset_generation = 0_u64;
+        macro_rules! apply_backfill_done {
+            ($last_block:expr) => {{
+                let last_block = $last_block;
+                let should_persist = last_scanned < last_block
+                    || persist_state.needs_full_persist
+                    || persist_state.pending_cache_reset.is_some();
+                if last_scanned < last_block {
+                    last_scanned = last_block;
+                    worker_handle.set_last_scanned(last_scanned);
+                }
+                let snapshot = utxos.read().await;
+                if should_persist
+                    && let Err(err) = persist_state.persist_progress(
+                        cache_store.as_ref(),
+                        WalletProgressPersist {
+                            cache_key: &cfg.cache_key,
+                            snapshot: &snapshot,
+                            last_scanned,
+                            last_scanned_block_hash: None,
+                            changed: false,
+                        },
+                    )
+                {
+                    warn!(?err, cache_key = %cfg.cache_key, "failed to update wallet cache metadata");
+                }
+                if should_persist {
+                    live_metadata_flush.mark_persisted(last_scanned, Instant::now());
+                }
+                drop(snapshot);
+                let mut pre_ready_poi_status_changed = false;
+                let mut pre_ready_poi_status_refresh_elapsed_ms = 0_u128;
+                let mut pre_ready_local_cache_available = false;
+                if let Some(client) = poi_status_client.as_ref() {
+                    let refresh_needed = {
+                        let locked = utxos.read().await;
+                        wallet_poi_status_refresh_needed_for_selection(
+                            &locked,
+                            &active_poi_list_keys,
+                            WalletPoiRefreshSelection::RequiredOrRecoverable,
+                        )
+                    };
+                    if refresh_needed {
+                        pre_ready_local_cache_available = local_poi_caches_available_for_lists(
+                            &cfg,
+                            &active_poi_list_keys,
+                        ).await;
+                        if pre_ready_local_cache_available {
+                            let status_refresh_started = Instant::now();
+                            pre_ready_poi_status_changed = refresh_wallet_poi_statuses_and_persist_with_config(
+                                client,
+                                db.as_ref(),
+                                http_client.as_ref(),
+                                WalletPoiStatusRefreshPersist {
+                                    cache_store: cache_store.as_ref(),
+                                    cfg: &cfg,
+                                    active_list_keys: &active_poi_list_keys,
+                                    utxos: &utxos,
+                                    last_scanned,
+                                    persist_state: &mut persist_state,
+                                },
+                                WalletPoiRefreshSelection::RequiredOrRecoverable,
+                            )
+                            .await;
+                            pre_ready_poi_status_refresh_elapsed_ms =
+                                status_refresh_started.elapsed().as_millis();
+                            worker_handle.notify_if_changed(pre_ready_poi_status_changed);
+                            debug!(
+                                cache_key = %cfg.cache_key,
+                                changed = pre_ready_poi_status_changed,
+                                status_refresh_elapsed_ms = pre_ready_poi_status_refresh_elapsed_ms,
+                                "pre-ready wallet POI status refresh visible"
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                let snapshot = utxos.read().await;
+                let (unspent, spent) = wallet_utxo_counts(&snapshot);
+                backfill_complete_block = Some(last_block);
+                if let Err(err) = ready_tx.send(true) {
+                    debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
+                }
+                worker_handle.notify_if_changed(pre_ready_poi_status_changed);
+                info!(
+                    cache_key = %cfg.cache_key,
+                    last_scanned,
+                    total = snapshot.len(),
+                    unspent,
+                    spent,
+                    pre_ready_poi_status_changed,
+                    pre_ready_local_cache_available,
+                    pre_ready_poi_status_refresh_elapsed_ms,
+                    ready_elapsed_ms = readiness_started.elapsed().as_millis(),
+                    worker_elapsed_ms = worker_started.elapsed().as_millis(),
+                    "wallet backfill complete"
+                );
+                drop(snapshot);
+                tokio::task::yield_now().await;
+
+                if let Some(client) = poi_status_client.as_ref() {
+                    let post_ready_poi_started = Instant::now();
+                    let pending_observations_started = Instant::now();
+                    process_pending_output_poi_observations(
+                        db.as_ref(),
+                        cfg.chain.chain_id,
+                        &[],
+                        Some(client as &dyn PendingOutputPoiSubmitter),
+                    ).await;
+                    let pending_observations_elapsed_ms =
+                        pending_observations_started.elapsed().as_millis();
+
+                    let refresh_needed = {
+                        let locked = utxos.read().await;
+                        wallet_poi_status_refresh_needed_for_selection(
+                            &locked,
+                            &active_poi_list_keys,
+                            WalletPoiRefreshSelection::RequiredOrRecoverable,
+                        )
+                    };
+                    if refresh_needed {
+                        set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
+                        let warmup_wait_started = Instant::now();
+                        let local_cache_available = local_poi_caches_ready_for_refresh(
+                            &mut startup_artifact_warmup,
+                            &cfg,
+                            &active_poi_list_keys,
+                            "post_ready_poi_refresh",
+                        ).await;
+                        let warmup_wait_elapsed_ms =
+                            warmup_wait_started.elapsed().as_millis();
+                        if !local_cache_available {
+                            log_local_poi_cache_unavailable(&cfg, "post_ready_poi_refresh");
+                            set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                            continue;
+                        }
+                        let status_refresh_started = Instant::now();
+                        let changed = refresh_wallet_poi_statuses_and_persist_with_config(
+                            client,
+                            db.as_ref(),
+                            http_client.as_ref(),
+                            WalletPoiStatusRefreshPersist {
+                                cache_store: cache_store.as_ref(),
+                                cfg: &cfg,
+                                active_list_keys: &active_poi_list_keys,
+                                utxos: &utxos,
+                                last_scanned,
+                                persist_state: &mut persist_state,
+                            },
+                            WalletPoiRefreshSelection::RequiredOrRecoverable,
+                        )
+                        .await;
+                        let status_refresh_elapsed_ms =
+                            status_refresh_started.elapsed().as_millis();
+                        worker_handle.notify_if_changed(changed);
+                        debug!(
+                            cache_key = %cfg.cache_key,
+                            changed,
+                            status_refresh_elapsed_ms,
+                            elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
+                            "post-ready wallet POI status refresh visible"
+                        );
+                        tokio::task::yield_now().await;
+                        let pending_verification = verify_submitted_pending_output_pois_with_config(
+                            client,
+                            &cfg,
+                            db.as_ref(),
+                            &active_poi_list_keys,
+                        )
+                        .await;
+                        set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                        let output_recovery_started = Instant::now();
+                        let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
+                            db: db.as_ref(),
+                            cfg: &cfg,
+                            rpcs: rpcs.as_ref(),
+                            http_client: http_client.as_ref(),
+                            indexed_artifact_source: indexed_artifact_source.as_ref(),
+                            forest: &forest,
+                            utxos: &utxos,
+                            client,
+                            active_list_keys: &active_poi_list_keys,
+                            force_retry: false,
+                        }).await;
+                        let output_recovery_elapsed_ms =
+                            output_recovery_started.elapsed().as_millis();
+                        worker_handle.notify_if_changed(recovered > 0);
+                        info!(
+                            cache_key = %cfg.cache_key,
+                            changed,
+                            recovered,
+                            pending_observations_elapsed_ms,
+                            local_cache_available,
+                            warmup_wait_elapsed_ms,
+                            status_refresh_elapsed_ms,
+                            output_recovery_elapsed_ms,
+                            pending_completed = pending_verification.completed,
+                            pending_still_missing = pending_verification.pending,
+                            pending_errors = pending_verification.errors,
+                            elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
+                            "post-ready wallet POI maintenance complete"
+                        );
+                    } else {
+                        debug!(
+                            cache_key = %cfg.cache_key,
+                            pending_observations_elapsed_ms,
+                            elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
+                            "post-ready wallet POI status refresh not needed"
+                        );
+                    }
+                }
+            }};
+        }
+        macro_rules! apply_backfill_logs {
+            ($batch:expr) => {{
+                let batch = $batch;
+                if batch.to_block <= last_scanned {
+                    continue;
+                }
+                debug!(
+                    cache_key = %cfg.cache_key,
+                    from_block = batch.from_block,
+                    to_block = batch.to_block,
+                    last_scanned,
+                    logs = batch.logs.len(),
+                    "applying wallet backfill logs"
+                );
+                match apply_wallet_logs(db.as_ref(), None, &cfg, &utxos, &batch, last_scanned).await {
+                    Ok((updated_last_scanned, changed)) => {
+                        last_scanned = updated_last_scanned;
+                        worker_handle.set_last_scanned(last_scanned);
+                        let snapshot = utxos.read().await;
+                        let (unspent, spent) = wallet_utxo_counts(&snapshot);
+                        let persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
+                            cache_store: cache_store.as_ref(),
+                            cfg: &cfg,
+                            snapshot: &snapshot,
+                            last_scanned,
+                            last_scanned_block_hash: batch.to_block_hash,
+                            changed,
+                            persist_state: &mut persist_state,
+                            live_metadata_flush: Some(&mut live_metadata_flush),
+                            error_message: "failed to persist wallet cache",
+                        });
+                        debug!(
+                            cache_key = %cfg.cache_key,
+                            last_scanned,
+                            total = snapshot.len(),
+                            unspent,
+                            spent,
+                            changed,
+                            poi_status_deferred = poi_status_client.is_some(),
+                            persisted_full_snapshot = persist_outcome.persisted_full_snapshot,
+                            needs_full_persist = persist_state.needs_full_persist,
+                            "wallet backfill batch complete"
+                        );
+                        worker_handle.notify_if_changed(changed);
+                    }
+                    Err(err) => {
+                        warn!(?err, cache_key = %cfg.cache_key, "failed to apply backfill logs");
+                    }
+                }
+            }};
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -300,8 +569,31 @@ pub(crate) fn spawn_wallet_worker(
                 }
                 Some(event) = backfill_rx.recv() => {
                     match event {
-                        BackfillEvent::IndexedDelta { from_block, to_block, delta } => {
+                        BackfillEvent::IndexedDelta { from_block, to_block, delta, reset_generation: event_reset_generation } => {
+                            if event_reset_generation.is_some_and(|generation| generation != reset_generation) {
+                                debug!(
+                                    cache_key = %cfg.cache_key,
+                                    from_block,
+                                    to_block,
+                                    event_reset_generation,
+                                    reset_generation,
+                                    "ignoring stale indexed wallet delta"
+                                );
+                                continue;
+                            }
                             if to_block <= last_scanned {
+                                continue;
+                            }
+                            let expected_from_block = last_scanned.saturating_add(1);
+                            if from_block != expected_from_block {
+                                warn!(
+                                    cache_key = %cfg.cache_key,
+                                    from_block,
+                                    expected_from_block,
+                                    to_block,
+                                    last_scanned,
+                                    "ignoring non-contiguous indexed wallet delta"
+                                );
                                 continue;
                             }
                             let delta = *delta;
@@ -366,263 +658,74 @@ pub(crate) fn spawn_wallet_worker(
                             worker_handle.notify_if_changed(changed);
                         }
                         BackfillEvent::Logs(batch) => {
-                            if batch.to_block <= last_scanned {
+                            apply_backfill_logs!(batch);
+                        }
+                        BackfillEvent::LogsAtGeneration { batch, reset_generation: event_reset_generation } => {
+                            if event_reset_generation != reset_generation {
+                                debug!(
+                                    cache_key = %cfg.cache_key,
+                                    from_block = batch.from_block,
+                                    to_block = batch.to_block,
+                                    event_reset_generation,
+                                    reset_generation,
+                                    "ignoring stale wallet backfill logs"
+                                );
                                 continue;
                             }
+                            apply_backfill_logs!(batch);
+                        }
+                        BackfillEvent::Checkpoint { last_block } => {
+                            if last_block <= last_scanned {
+                                continue;
+                            }
+                            last_scanned = last_block;
+                            worker_handle.set_last_scanned(last_scanned);
+                            live_metadata_flush.mark_persisted(last_scanned, Instant::now());
                             debug!(
                                 cache_key = %cfg.cache_key,
-                                from_block = batch.from_block,
-                                to_block = batch.to_block,
                                 last_scanned,
-                                logs = batch.logs.len(),
-                                "applying wallet backfill logs"
+                                "wallet indexed backfill checkpoint applied"
                             );
-                            match apply_wallet_logs(db.as_ref(), None, &cfg, &utxos, &batch, last_scanned).await {
-                                Ok((updated_last_scanned, changed)) => {
-                                    last_scanned = updated_last_scanned;
-                                    worker_handle.set_last_scanned(last_scanned);
-                                    let snapshot = utxos.read().await;
-                                    let (unspent, spent) = wallet_utxo_counts(&snapshot);
-                                    let persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
-                                        cache_store: cache_store.as_ref(),
-                                        cfg: &cfg,
-                                        snapshot: &snapshot,
-                                        last_scanned,
-                                        last_scanned_block_hash: batch.to_block_hash,
-                                        changed,
-                                        persist_state: &mut persist_state,
-                                        live_metadata_flush: Some(&mut live_metadata_flush),
-                                        error_message: "failed to persist wallet cache",
-                                    });
-                                    debug!(
-                                        cache_key = %cfg.cache_key,
-                                        last_scanned,
-                                        total = snapshot.len(),
-                                        unspent,
-                                        spent,
-                                        changed,
-                                        poi_status_deferred = poi_status_client.is_some(),
-                                        persisted_full_snapshot = persist_outcome.persisted_full_snapshot,
-                                        needs_full_persist = persist_state.needs_full_persist,
-                                        "wallet backfill batch complete"
-                                    );
-                                    worker_handle.notify_if_changed(changed);
-                                }
-                                Err(err) => {
-                                    warn!(?err, cache_key = %cfg.cache_key, "failed to apply backfill logs");
-                                }
-                            }
                         }
                         BackfillEvent::Done { last_block } => {
-                            let should_persist = last_scanned < last_block
-                                || persist_state.needs_full_persist
-                                || persist_state.pending_cache_reset.is_some();
-                            if last_scanned < last_block {
-                                last_scanned = last_block;
-                                worker_handle.set_last_scanned(last_scanned);
-                            }
-                            let snapshot = utxos.read().await;
-                            if should_persist
-                                && let Err(err) = persist_state.persist_progress(
-                                    cache_store.as_ref(),
-                                    WalletProgressPersist {
-                                        cache_key: &cfg.cache_key,
-                                        snapshot: &snapshot,
-                                        last_scanned,
-                                        last_scanned_block_hash: None,
-                                        changed: false,
-                                    },
-                                )
-                            {
-                                warn!(?err, cache_key = %cfg.cache_key, "failed to update wallet cache metadata");
-                            }
-                            if should_persist {
-                                live_metadata_flush.mark_persisted(last_scanned, Instant::now());
-                            }
-                            drop(snapshot);
-                            let mut pre_ready_poi_status_changed = false;
-                            let mut pre_ready_poi_status_refresh_elapsed_ms = 0_u128;
-                            let mut pre_ready_local_cache_available = false;
-                            if let Some(client) = poi_status_client.as_ref() {
-                                let refresh_needed = {
-                                    let locked = utxos.read().await;
-                                    wallet_poi_status_refresh_needed_for_selection(
-                                        &locked,
-                                        &active_poi_list_keys,
-                                        WalletPoiRefreshSelection::RequiredOrRecoverable,
-                                    )
-                                };
-                                if refresh_needed {
-                                    pre_ready_local_cache_available = local_poi_caches_available_for_lists(
-                                        &cfg,
-                                        &active_poi_list_keys,
-                                    ).await;
-                                    if pre_ready_local_cache_available {
-                                        let status_refresh_started = Instant::now();
-                                        pre_ready_poi_status_changed = refresh_wallet_poi_statuses_and_persist_with_config(
-                                            client,
-                                            db.as_ref(),
-                                            http_client.as_ref(),
-                                            WalletPoiStatusRefreshPersist {
-                                                cache_store: cache_store.as_ref(),
-                                                cfg: &cfg,
-                                                active_list_keys: &active_poi_list_keys,
-                                                utxos: &utxos,
-                                                last_scanned,
-                                                persist_state: &mut persist_state,
-                                            },
-                                            WalletPoiRefreshSelection::RequiredOrRecoverable,
-                                        )
-                                        .await;
-                                        pre_ready_poi_status_refresh_elapsed_ms =
-                                            status_refresh_started.elapsed().as_millis();
-                                        worker_handle.notify_if_changed(pre_ready_poi_status_changed);
-                                        debug!(
-                                            cache_key = %cfg.cache_key,
-                                            changed = pre_ready_poi_status_changed,
-                                            status_refresh_elapsed_ms = pre_ready_poi_status_refresh_elapsed_ms,
-                                            "pre-ready wallet POI status refresh visible"
-                                        );
-                                        tokio::task::yield_now().await;
-                                    }
-                                }
-                            }
-                            let snapshot = utxos.read().await;
-                            let (unspent, spent) = wallet_utxo_counts(&snapshot);
-                            backfill_complete_block = Some(last_block);
-                            if let Err(err) = ready_tx.send(true) {
-                                debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
-                            }
-                            worker_handle.notify_if_changed(pre_ready_poi_status_changed);
-                            info!(
-                                cache_key = %cfg.cache_key,
-                                last_scanned,
-                                total = snapshot.len(),
-                                unspent,
-                                spent,
-                                pre_ready_poi_status_changed,
-                                pre_ready_local_cache_available,
-                                pre_ready_poi_status_refresh_elapsed_ms,
-                                ready_elapsed_ms = readiness_started.elapsed().as_millis(),
-                                worker_elapsed_ms = worker_started.elapsed().as_millis(),
-                                "wallet backfill complete"
-                            );
-                            drop(snapshot);
-                            tokio::task::yield_now().await;
-
-                            if let Some(client) = poi_status_client.as_ref() {
-                                let post_ready_poi_started = Instant::now();
-                                let pending_observations_started = Instant::now();
-                                process_pending_output_poi_observations(
-                                    db.as_ref(),
-                                    cfg.chain.chain_id,
-                                    &[],
-                                    Some(client as &dyn PendingOutputPoiSubmitter),
-                                ).await;
-                                let pending_observations_elapsed_ms =
-                                    pending_observations_started.elapsed().as_millis();
-
-                                let refresh_needed = {
-                                    let locked = utxos.read().await;
-                                    wallet_poi_status_refresh_needed_for_selection(
-                                        &locked,
-                                        &active_poi_list_keys,
-                                        WalletPoiRefreshSelection::RequiredOrRecoverable,
-                                    )
-                                };
-                                if refresh_needed {
-                                    set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
-                                    let warmup_wait_started = Instant::now();
-                                    let local_cache_available = local_poi_caches_ready_for_refresh(
-                                        &mut startup_artifact_warmup,
-                                        &cfg,
-                                        &active_poi_list_keys,
-                                        "post_ready_poi_refresh",
-                                    ).await;
-                                    let warmup_wait_elapsed_ms =
-                                        warmup_wait_started.elapsed().as_millis();
-                                    if !local_cache_available {
-                                        log_local_poi_cache_unavailable(&cfg, "post_ready_poi_refresh");
-                                        set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
-                                        continue;
-                                    }
-                                    let status_refresh_started = Instant::now();
-                                    let changed = refresh_wallet_poi_statuses_and_persist_with_config(
-                                        client,
-                                        db.as_ref(),
-                                        http_client.as_ref(),
-                                        WalletPoiStatusRefreshPersist {
-                                            cache_store: cache_store.as_ref(),
-                                            cfg: &cfg,
-                                            active_list_keys: &active_poi_list_keys,
-                                            utxos: &utxos,
-                                            last_scanned,
-                                            persist_state: &mut persist_state,
-                                        },
-                                        WalletPoiRefreshSelection::RequiredOrRecoverable,
-                                    )
-                                    .await;
-                                    let status_refresh_elapsed_ms =
-                                        status_refresh_started.elapsed().as_millis();
-                                    worker_handle.notify_if_changed(changed);
-                                    debug!(
-                                        cache_key = %cfg.cache_key,
-                                        changed,
-                                        status_refresh_elapsed_ms,
-                                        elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
-                                        "post-ready wallet POI status refresh visible"
-                                    );
-                                    tokio::task::yield_now().await;
-                                    let pending_verification = verify_submitted_pending_output_pois_with_config(
-                                        client,
-                                        &cfg,
-                                        db.as_ref(),
-                                        &active_poi_list_keys,
-                                    )
-                                    .await;
-                                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
-                                    let output_recovery_started = Instant::now();
-                                    let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
-                                        db: db.as_ref(),
-                                        cfg: &cfg,
-                                        rpcs: rpcs.as_ref(),
-                                        http_client: http_client.as_ref(),
-                                        indexed_artifact_source: indexed_artifact_source.as_ref(),
-                                        forest: &forest,
-                                        utxos: &utxos,
-                                        client,
-                                        active_list_keys: &active_poi_list_keys,
-                                        force_retry: false,
-                                    }).await;
-                                    let output_recovery_elapsed_ms =
-                                        output_recovery_started.elapsed().as_millis();
-                                    worker_handle.notify_if_changed(recovered > 0);
-                                    info!(
-                                        cache_key = %cfg.cache_key,
-                                        changed,
-                                        recovered,
-                                        pending_observations_elapsed_ms,
-                                        local_cache_available,
-                                        warmup_wait_elapsed_ms,
-                                        status_refresh_elapsed_ms,
-                                        output_recovery_elapsed_ms,
-                                        pending_completed = pending_verification.completed,
-                                        pending_still_missing = pending_verification.pending,
-                                        pending_errors = pending_verification.errors,
-                                        elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
-                                        "post-ready wallet POI maintenance complete"
-                                    );
-                                } else {
-                                    debug!(
-                                        cache_key = %cfg.cache_key,
-                                        pending_observations_elapsed_ms,
-                                        elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
-                                        "post-ready wallet POI status refresh not needed"
-                                    );
-                                }
-                            }
+                            apply_backfill_done!(last_block);
                         }
-                        BackfillEvent::Reset { from_block } => {
+                        BackfillEvent::DoneAtGeneration { last_block, reset_generation: event_reset_generation } => {
+                            if event_reset_generation != reset_generation {
+                                debug!(
+                                    cache_key = %cfg.cache_key,
+                                    last_block,
+                                    event_reset_generation,
+                                    reset_generation,
+                                    "ignoring stale indexed wallet backfill done"
+                                );
+                                continue;
+                            }
+                            if last_block > last_scanned {
+                                warn!(
+                                    cache_key = %cfg.cache_key,
+                                    last_block,
+                                    last_scanned,
+                                    reset_generation,
+                                    "ignoring non-contiguous wallet backfill done"
+                                );
+                                continue;
+                            }
+                            apply_backfill_done!(last_block);
+                        }
+                        BackfillEvent::Reset { from_block, reset_generation: event_reset_generation } => {
+                            if event_reset_generation <= reset_generation {
+                                debug!(
+                                    cache_key = %cfg.cache_key,
+                                    from_block,
+                                    event_reset_generation,
+                                    reset_generation,
+                                    "ignoring stale wallet reset"
+                                );
+                                continue;
+                            }
+                            reset_generation = event_reset_generation;
+                            worker_handle.set_reset_generation(reset_generation);
                             readiness_started = Instant::now();
                             last_scanned = from_block.saturating_sub(1);
                             worker_handle.set_last_scanned(last_scanned);
@@ -663,6 +766,7 @@ pub(crate) fn spawn_wallet_worker(
                                 unspent,
                                 spent,
                                 changed,
+                                reset_generation,
                                 "wallet cache rewound"
                             );
                         }
@@ -697,6 +801,7 @@ pub(crate) fn spawn_wallet_worker(
                                         to_block: batch.to_block,
                                         follow_safe_head: true,
                                         progress_start_block: expected_from_block,
+                                        reset_generation,
                                         progress_tx: cfg.progress_tx.clone(),
                                         sender: backfill_sender.clone(),
                                     })
@@ -874,13 +979,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, FixedBytes, U256};
     use broadcaster_core::crypto::railgun::ViewingKeyData;
+    use broadcaster_core::notes::Note;
     use broadcaster_core::query_rpc_pool::QueryRpcPool;
     use local_db::{DbConfig, DbStore};
     use merkletree::tree::MerkleForest;
     use tokio::sync::{RwLock, broadcast, mpsc};
     use url::Url;
+
+    use railgun_wallet::scan::{SpentNullifier, WalletLogDelta};
+    use railgun_wallet::{Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 
     use crate::types::{BackfillRequest, ChainKey, LogBatch, PoiReadSource, WalletConfig};
 
@@ -947,6 +1056,425 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_worker_checkpoint_advances_cursor_without_ready() {
+        let root_dir = temp_db_root("wallet-worker-indexed-checkpoint");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+
+        backfill_tx
+            .send(BackfillEvent::Checkpoint { last_block: 150 })
+            .await
+            .expect("send checkpoint");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() != 150 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("checkpoint applied");
+
+        assert!(!*handle.ready_rx.borrow());
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_applies_indexed_tail_delta_after_prior_wallet_delta() {
+        let root_dir = temp_db_root("wallet-worker-indexed-tail-order");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+        let wallet_utxo = test_wallet_utxo(105, 7);
+        let nullifier = wallet_utxo.utxo.nullifier(U256::ZERO);
+
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 101,
+                to_block: 110,
+                delta: Box::new(WalletLogDelta {
+                    utxos: vec![wallet_utxo.utxo.clone()],
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(0),
+            })
+            .await
+            .expect("send indexed output delta");
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 111,
+                to_block: 120,
+                delta: Box::new(WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: vec![SpentNullifier {
+                        tree: wallet_utxo.utxo.tree,
+                        nullifier,
+                        source: source(120, 0x78),
+                    }],
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(0),
+            })
+            .await
+            .expect("send indexed spend delta");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() != 120 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("indexed deltas applied");
+
+        let snapshot = handle.utxos.read().await;
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].spent.is_some());
+
+        cancel.cancel();
+        drop(snapshot);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_marks_ready_after_queued_indexed_startup_delta() {
+        let root_dir = temp_db_root("wallet-worker-indexed-startup-ready");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 101,
+                to_block: 200,
+                delta: Box::new(WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(0),
+            })
+            .await
+            .expect("send startup indexed delta");
+        backfill_tx
+            .send(BackfillEvent::DoneAtGeneration {
+                last_block: 200,
+                reset_generation: 0,
+            })
+            .await
+            .expect("send startup done");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() != 200 || !*handle.ready_rx.borrow() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("indexed startup done marked ready");
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_ignores_done_after_non_contiguous_indexed_delta() {
+        let root_dir = temp_db_root("wallet-worker-indexed-tail-non-contiguous-done");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            150,
+        );
+
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 101,
+                to_block: 200,
+                delta: Box::new(WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(0),
+            })
+            .await
+            .expect("send non-contiguous indexed delta");
+        backfill_tx
+            .send(BackfillEvent::DoneAtGeneration {
+                last_block: 200,
+                reset_generation: 0,
+            })
+            .await
+            .expect("send non-contiguous done");
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 151,
+                to_block: 151,
+                delta: Box::new(WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(0),
+            })
+            .await
+            .expect("send contiguous marker delta");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() == 150 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("marker delta processed");
+        assert_eq!(handle.last_scanned(), 151);
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_ignores_stale_indexed_tail_events_after_reset() {
+        let root_dir = temp_db_root("wallet-worker-indexed-tail-reset");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+            },
+            wallet_config(),
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+
+        backfill_tx
+            .send(BackfillEvent::Reset {
+                from_block: 80,
+                reset_generation: 1,
+            })
+            .await
+            .expect("send reset");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.reset_generation() != 1 || handle.last_scanned() != 79 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reset applied");
+
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 101,
+                to_block: 150,
+                delta: Box::new(WalletLogDelta {
+                    utxos: vec![test_wallet_utxo(120, 1).utxo],
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(0),
+            })
+            .await
+            .expect("send stale indexed delta");
+        backfill_tx
+            .send(BackfillEvent::DoneAtGeneration {
+                last_block: 150,
+                reset_generation: 0,
+            })
+            .await
+            .expect("send stale done");
+        backfill_tx
+            .send(BackfillEvent::LogsAtGeneration {
+                batch: Arc::new(LogBatch {
+                    from_block: 101,
+                    to_block: 150,
+                    logs: Vec::new(),
+                    block_timestamps: HashMap::new(),
+                    to_block_hash: None,
+                }),
+                reset_generation: 0,
+            })
+            .await
+            .expect("send stale backfill logs");
+        tokio::task::yield_now().await;
+        assert_eq!(handle.last_scanned(), 79);
+
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 101,
+                to_block: 150,
+                delta: Box::new(WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(1),
+            })
+            .await
+            .expect("send same-generation non-contiguous indexed delta");
+        backfill_tx
+            .send(BackfillEvent::DoneAtGeneration {
+                last_block: 150,
+                reset_generation: 1,
+            })
+            .await
+            .expect("send same-generation non-contiguous done");
+        backfill_tx
+            .send(BackfillEvent::IndexedDelta {
+                from_block: 80,
+                to_block: 90,
+                delta: Box::new(WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                }),
+                reset_generation: Some(1),
+            })
+            .await
+            .expect("send current indexed delta");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.last_scanned() != 90 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("current delta applied");
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
     async fn wallet_worker_requests_backfill_after_live_receiver_lag() {
         let root_dir = temp_db_root("wallet-worker-live-lag-gap");
         let db = Arc::new(
@@ -1006,6 +1534,7 @@ mod tests {
             from_block,
             to_block,
             follow_safe_head,
+            reset_generation,
             ..
         } = request
         else {
@@ -1015,6 +1544,7 @@ mod tests {
         assert_eq!(from_block, 101);
         assert!(to_block > from_block);
         assert!(follow_safe_head);
+        assert_eq!(reset_generation, 0);
         assert_eq!(handle.last_scanned(), 100);
 
         backfill_tx
@@ -1072,6 +1602,29 @@ mod tests {
             manage_local_poi_cache: false,
             use_indexed_wallet_catch_up: true,
         }
+    }
+
+    fn source(block_number: u64, byte: u8) -> UtxoSource {
+        UtxoSource {
+            tx_hash: FixedBytes::from([byte; 32]),
+            block_number,
+            block_timestamp: 1_700_000_000 + block_number,
+        }
+    }
+
+    fn test_wallet_utxo(block_number: u64, position: u64) -> WalletUtxo {
+        WalletUtxo::new(Utxo::new(
+            Note {
+                token_hash: U256::from(1),
+                value: U256::from(10),
+                random: [0u8; 16],
+                npk: U256::from(2),
+            },
+            2,
+            position,
+            source(block_number, block_number as u8),
+            UtxoCommitmentKind::Transact,
+        ))
     }
 
     fn temp_db_root(name: &str) -> std::path::PathBuf {

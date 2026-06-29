@@ -159,6 +159,29 @@ impl SyncProgressUpdate {
 pub type SyncProgressSender = watch::Sender<Option<SyncProgressUpdate>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletIndexedCatchUpSource {
+    Squid,
+    IndexedArtifacts,
+}
+
+impl WalletIndexedCatchUpSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Squid => "squid",
+            Self::IndexedArtifacts => "indexed_artifacts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletIndexedCatchUpStatus {
+    pub source: WalletIndexedCatchUpSource,
+    pub from_block: u64,
+    pub target_block: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoiArtifactCachePhase {
     Idle,
     LoadingPersisted,
@@ -174,6 +197,14 @@ pub enum PoiArtifactCachePhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoiArtifactCacheListProgress {
+    pub list_key: FixedBytes<32>,
+    pub current_event_index: Option<u64>,
+    pub target_event_index: Option<u64>,
+    pub ready_for_wallet_checks: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoiArtifactCacheProgress {
     pub chain_id: u64,
     pub phase: PoiArtifactCachePhase,
@@ -182,6 +213,7 @@ pub struct PoiArtifactCacheProgress {
     pub current_list_key: Option<FixedBytes<32>>,
     pub current_event_index: Option<u64>,
     pub target_event_index: Option<u64>,
+    pub list_progress: Vec<PoiArtifactCacheListProgress>,
     pub ready_for_wallet_checks: bool,
     pub last_error: Option<String>,
 }
@@ -692,6 +724,7 @@ mod tests {
             current_list_key: None,
             current_event_index: None,
             target_event_index: None,
+            list_progress: Vec::new(),
             ready_for_wallet_checks: false,
             last_error: None,
         };
@@ -712,6 +745,7 @@ mod tests {
             current_list_key: None,
             current_event_index: None,
             target_event_index: None,
+            list_progress: Vec::new(),
             ready_for_wallet_checks: true,
             last_error: None,
         };
@@ -743,16 +777,29 @@ pub type SharedLogBatch = Arc<LogBatch>;
 #[derive(Debug, Clone)]
 pub enum BackfillEvent {
     Logs(SharedLogBatch),
+    LogsAtGeneration {
+        batch: SharedLogBatch,
+        reset_generation: u64,
+    },
     IndexedDelta {
         from_block: u64,
         to_block: u64,
         delta: Box<WalletLogDelta>,
+        reset_generation: Option<u64>,
+    },
+    Checkpoint {
+        last_block: u64,
     },
     Done {
         last_block: u64,
     },
+    DoneAtGeneration {
+        last_block: u64,
+        reset_generation: u64,
+    },
     Reset {
         from_block: u64,
+        reset_generation: u64,
     },
 }
 
@@ -764,12 +811,14 @@ pub enum BackfillRequest {
         to_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
+        reset_generation: u64,
         progress_tx: Option<SyncProgressSender>,
         sender: mpsc::Sender<BackfillEvent>,
     },
     Reset {
         cache_key: String,
         from_block: u64,
+        reset_generation: u64,
     },
     Remove {
         cache_key: String,

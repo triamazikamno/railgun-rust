@@ -118,6 +118,7 @@ pub(super) async fn apply_wallet_delta_with_outcome(
     outcome
 }
 
+#[cfg(test)]
 pub(crate) fn apply_wallet_delta_to_vec(
     cfg: &WalletConfig,
     wallet_utxos: &mut Vec<WalletUtxo>,

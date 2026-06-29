@@ -57,7 +57,7 @@ use crate::txid_cache::{
 };
 use crate::types::{
     BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch, WalletCacheStore,
-    WalletConfig, WalletLocalPoiCaches,
+    WalletConfig, WalletIndexedCatchUpStatus, WalletLocalPoiCaches,
 };
 
 mod delta;
@@ -79,7 +79,9 @@ use persist::*;
 use poi_refresh::*;
 use poi_sources::*;
 
-pub(crate) use delta::{apply_wallet_delta_to_vec, pending_overlay_from_delta};
+#[cfg(test)]
+pub(crate) use delta::apply_wallet_delta_to_vec;
+pub(crate) use delta::pending_overlay_from_delta;
 pub use handle::{WalletHandle, WalletPendingOverlay, WalletPendingSpent};
 pub(crate) use pending_output_poi::process_pending_output_poi_observations;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};

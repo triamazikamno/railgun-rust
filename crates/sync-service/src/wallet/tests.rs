@@ -136,18 +136,22 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
+    let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     WalletHandle {
         cache_key: "cache-key".to_string(),
         utxos: Arc::new(RwLock::new(utxos)),
         pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
         last_scanned: Arc::new(AtomicU64::new(0)),
+        reset_generation: Arc::new(AtomicU64::new(0)),
         ready_rx,
         rev_rx,
         poi_refreshing_rx,
+        indexed_catch_up_rx,
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         poi_refresh_tx,
         rev_tx,
+        indexed_catch_up_tx,
     }
 }
 
@@ -3381,18 +3385,22 @@ fn notify_changed_increments_revision() {
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
+    let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let handle = WalletHandle {
         cache_key: "cache-key".to_string(),
         utxos: Arc::new(RwLock::new(Vec::new())),
         pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
         last_scanned: Arc::new(AtomicU64::new(0)),
+        reset_generation: Arc::new(AtomicU64::new(0)),
         ready_rx,
         rev_rx,
         poi_refreshing_rx,
+        indexed_catch_up_rx,
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         poi_refresh_tx,
         rev_tx,
+        indexed_catch_up_tx,
     };
 
     handle.notify_changed();
@@ -3409,18 +3417,22 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel::<WalletPoiRefreshRequest>(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
+    let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let handle = WalletHandle {
         cache_key: "cache-key".to_string(),
         utxos: Arc::new(RwLock::new(Vec::new())),
         pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
         last_scanned: Arc::new(AtomicU64::new(0)),
+        reset_generation: Arc::new(AtomicU64::new(0)),
         ready_rx,
         rev_rx,
         poi_refreshing_rx,
+        indexed_catch_up_rx,
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         poi_refresh_tx,
         rev_tx,
+        indexed_catch_up_tx,
     };
 
     assert!(handle.refresh_poi_statuses().await);

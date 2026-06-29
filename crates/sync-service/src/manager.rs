@@ -48,8 +48,14 @@ impl SyncManager {
     }
 
     pub async fn remove_chain(&self, key: &ChainKey) {
-        if let Some((_key, service)) = self.chains.write().await.remove_entry(key) {
-            service.shutdown();
+        let service = self
+            .chains
+            .write()
+            .await
+            .remove_entry(key)
+            .map(|(_, service)| service);
+        if let Some(service) = service {
+            service.shutdown().await;
         }
     }
 
@@ -62,7 +68,7 @@ impl SyncManager {
             .map(|(_, service)| service)
             .collect::<Vec<_>>();
         for service in services {
-            service.shutdown();
+            service.shutdown().await;
         }
     }
 

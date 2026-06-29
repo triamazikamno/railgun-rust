@@ -56,12 +56,13 @@ impl ChainService {
             archive_provider: archive_provider.clone(),
             wallets: RwLock::new(HashMap::new()),
             cancel: cancel.clone(),
+            live_log_task: Mutex::new(None),
             anchor_last: AtomicU64::new(last_anchor),
             txid_public_cache_started: AtomicBool::new(false),
         });
 
         spawn_head_poller(service.clone(), rpcs.clone());
-        spawn_live_log_loop(
+        let live_log_task = spawn_live_log_loop(
             service.clone(),
             rpcs.clone(),
             archive_provider.clone(),
@@ -70,6 +71,7 @@ impl ChainService {
             snapshot_path,
             cancel.clone(),
         );
+        *service.live_log_task.lock().await = Some(live_log_task);
         spawn_pending_tip_loop(
             service.clone(),
             rpcs.clone(),
@@ -78,6 +80,7 @@ impl ChainService {
             safe_head_rx.clone(),
             cancel.clone(),
         );
+        spawn_wallet_lag_fallback_loop(service.clone(), safe_head_rx.clone(), cancel.clone());
         spawn_backfill_loop(
             service.clone(),
             backfill_rx,
@@ -134,10 +137,11 @@ impl ChainService {
         cache_key: &str,
         from_block: Option<u64>,
     ) -> Result<(), ChainError> {
-        let (backfill_sender, start_block, sync_to_block, progress_tx) = {
+        let (handle, backfill_sender, start_block, sync_to_block, progress_tx) = {
             let wallets = self.wallets.read().await;
             let registration = wallets.get(cache_key).ok_or(ChainError::WalletNotFound)?;
             (
+                registration.handle.clone(),
                 registration.backfill_sender.clone(),
                 registration.start_block,
                 registration.sync_to_block,
@@ -152,9 +156,11 @@ impl ChainService {
         let reset_from = from_block.unwrap_or(start_block);
         let safe_head = *self.safe_head_tx.borrow();
         let sync_target = wallet_sync_target(safe_head, sync_to_block);
+        let reset_generation = handle.advance_reset_generation();
         backfill_sender
             .send(BackfillEvent::Reset {
                 from_block: reset_from,
+                reset_generation,
             })
             .await?;
 
@@ -165,6 +171,7 @@ impl ChainService {
                 to_block: sync_target,
                 follow_safe_head: sync_to_block.is_none(),
                 progress_start_block: reset_from,
+                reset_generation,
                 progress_tx,
                 sender: backfill_sender,
             })
@@ -172,6 +179,68 @@ impl ChainService {
 
         info!(cache_key = %cache_key, from_block = reset_from, "wallet reset requested");
         Ok(())
+    }
+
+    pub(super) async fn try_indexed_wallet_tail_catch_up(
+        &self,
+        cache_key: &str,
+        from_block: u64,
+        target_block: u64,
+        sender: &mpsc::Sender<BackfillEvent>,
+    ) -> Option<(u64, u64)> {
+        if from_block > target_block {
+            return None;
+        }
+        let (cfg, start_block, handle, cancel) = {
+            let wallets = self.wallets.read().await;
+            let registration = wallets.get(cache_key)?;
+            if !registration.cfg.use_indexed_wallet_catch_up {
+                debug!(cache_key = %cache_key, "indexed wallet tail fallback disabled");
+                return None;
+            }
+            (
+                registration.cfg.clone(),
+                registration.start_block,
+                registration.handle.clone(),
+                registration.cancel.clone(),
+            )
+        };
+        let reset_generation = handle.reset_generation();
+        let last_scanned = from_block.saturating_sub(1);
+        let started = Instant::now();
+        let checkpoint = self
+            .indexed_wallet_catch_up(
+                &cfg,
+                start_block,
+                last_scanned,
+                target_block,
+                &handle,
+                &cancel,
+                IndexedWalletCatchUpSourceOrder::SquidFirst,
+                true,
+                (sender, reset_generation),
+            )
+            .await;
+        if checkpoint < from_block {
+            debug!(
+                cache_key = %cache_key,
+                from_block,
+                target_block,
+                checkpoint,
+                elapsed_ms = started.elapsed().as_millis(),
+                "indexed wallet tail fallback did not advance"
+            );
+            return None;
+        }
+        info!(
+            cache_key = %cache_key,
+            from_block,
+            target_block,
+            checkpoint,
+            elapsed_ms = started.elapsed().as_millis(),
+            "indexed wallet tail fallback complete"
+        );
+        Some((checkpoint, reset_generation))
     }
 
     pub async fn register_wallet(self: &Arc<Self>, cfg: WalletConfig) -> WalletHandle {
@@ -259,6 +328,7 @@ impl ChainService {
         let catch_up_handle = handle.clone();
         let catch_up_cancel = cancel;
         tokio::spawn(async move {
+            let startup_reset_generation = catch_up_handle.reset_generation();
             let Some(sync_target) = wait_for_startup_sync_target(
                 service.safe_head_tx.subscribe(),
                 catch_up_cfg.sync_to_block,
@@ -276,6 +346,7 @@ impl ChainService {
                     start_block,
                     last_scanned,
                     sync_target,
+                    startup_reset_generation,
                     backfill_sender.clone(),
                     &catch_up_cancel,
                 )
@@ -294,12 +365,24 @@ impl ChainService {
                         sync_target,
                         &catch_up_handle,
                         &catch_up_cancel,
+                        IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
+                        false,
+                        (&backfill_sender, startup_reset_generation),
                     )
                     .await;
             } else {
                 debug!(cache_key = %catch_up_cfg.cache_key, "indexed wallet catch-up disabled");
             }
             if catch_up_cancel.is_cancelled() {
+                return;
+            }
+            if catch_up_handle.reset_generation() != startup_reset_generation {
+                debug!(
+                    cache_key = %catch_up_cfg.cache_key,
+                    startup_reset_generation,
+                    current_reset_generation = catch_up_handle.reset_generation(),
+                    "wallet startup sync superseded by reset"
+                );
                 return;
             }
             service
@@ -309,6 +392,7 @@ impl ChainService {
                     checkpoint,
                     sync_target,
                     catch_up_cfg.sync_to_block.is_none(),
+                    startup_reset_generation,
                     backfill_sender,
                 )
                 .await;
@@ -324,6 +408,7 @@ impl ChainService {
         last_scanned: u64,
         sync_target: u64,
         follow_safe_head: bool,
+        reset_generation: u64,
         backfill_sender: mpsc::Sender<BackfillEvent>,
     ) {
         let from_block = wallet_backfill_from_block(last_scanned, start_block);
@@ -346,6 +431,7 @@ impl ChainService {
                     to_block: sync_target,
                     follow_safe_head,
                     progress_start_block: from_block,
+                    reset_generation,
                     progress_tx,
                     sender: backfill_sender.clone(),
                 })
@@ -357,14 +443,16 @@ impl ChainService {
                     "backfill loop unavailable, sending done as fallback"
                 );
                 let _ = backfill_sender
-                    .send(BackfillEvent::Done {
+                    .send(BackfillEvent::DoneAtGeneration {
                         last_block: sync_target,
+                        reset_generation,
                     })
                     .await;
             }
         } else if let Err(err) = backfill_sender
-            .send(BackfillEvent::Done {
+            .send(BackfillEvent::DoneAtGeneration {
                 last_block: sync_target,
+                reset_generation,
             })
             .await
         {
@@ -378,6 +466,7 @@ impl ChainService {
         start_block: u64,
         last_scanned: u64,
         sync_target: u64,
+        reset_generation: u64,
         backfill_sender: mpsc::Sender<BackfillEvent>,
         cancel: &CancellationToken,
     ) -> bool {
@@ -460,6 +549,7 @@ impl ChainService {
                         &cfg.cache_key,
                         candidate.events,
                         Some(sync_target),
+                        reset_generation,
                         &backfill_sender,
                     )
                     .await;
@@ -470,6 +560,7 @@ impl ChainService {
                             sync_target,
                             sync_target,
                             true,
+                            reset_generation,
                             backfill_sender.clone(),
                         )
                         .await;
@@ -637,6 +728,7 @@ impl ChainService {
                 from_block,
                 to_block: checkpoint,
                 delta: Box::new(delta),
+                reset_generation: None,
             });
             debug!(
                 cache_key = %cfg.cache_key,
@@ -842,6 +934,57 @@ impl ChainService {
         Some((client, height, target))
     }
 
+    async fn prepare_indexed_wallet_artifact_session(
+        &self,
+        cfg: &WalletConfig,
+        from_block: u64,
+        safe_head: u64,
+        progress_tx: Option<&SyncProgressSender>,
+    ) -> Option<IndexedWalletArtifactSession> {
+        if self.chain.indexed_artifact_source.is_none() {
+            return None;
+        }
+        let artifact_session_started = Instant::now();
+        match IndexedWalletArtifactSession::prepare(&self.chain, from_block, safe_head, progress_tx)
+            .await
+        {
+            Ok(Some(session)) => {
+                debug!(
+                    cache_key = %cfg.cache_key,
+                    from_block,
+                    safe_head,
+                    latest_indexed_block = session.latest_indexed_block(),
+                    catalog_count = session.catalog_count(),
+                    chunk_count = session.chunk_count(),
+                    elapsed_ms = artifact_session_started.elapsed().as_millis(),
+                    "indexed wallet artifact session prepared"
+                );
+                Some(session)
+            }
+            Ok(None) => {
+                debug!(
+                    cache_key = %cfg.cache_key,
+                    from_block,
+                    safe_head,
+                    elapsed_ms = artifact_session_started.elapsed().as_millis(),
+                    "indexed wallet artifact session unavailable"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %cfg.cache_key,
+                    from_block,
+                    safe_head,
+                    elapsed_ms = artifact_session_started.elapsed().as_millis(),
+                    "indexed wallet artifact session failed; falling back to configured indexed sources"
+                );
+                None
+            }
+        }
+    }
+
     pub async fn unregister_wallet(&self, cache_key: &str) {
         if let Some((_key, registration)) = self.wallets.write().await.remove_entry(cache_key) {
             registration.cancel.cancel();
@@ -858,8 +1001,9 @@ impl ChainService {
         }
     }
 
-    pub fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         self.cancel.cancel();
+        await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;
     }
 
     async fn indexed_wallet_catch_up(
@@ -870,6 +1014,9 @@ impl ChainService {
         safe_head: u64,
         handle: &WalletHandle,
         cancel: &CancellationToken,
+        source_order: IndexedWalletCatchUpSourceOrder,
+        expose_status: bool,
+        queued_sender: (&mpsc::Sender<BackfillEvent>, u64),
     ) -> u64 {
         if safe_head == 0 {
             debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
@@ -880,74 +1027,106 @@ impl ChainService {
             .progress_tx
             .clone()
             .or_else(|| self.chain.progress_tx.clone());
-        let mut artifact_session = None;
-        if self.chain.indexed_artifact_source.is_some() {
-            let artifact_session_started = Instant::now();
-            match IndexedWalletArtifactSession::prepare(
-                &self.chain,
-                from_block,
-                safe_head,
-                progress_tx.as_ref(),
-            )
-            .await
-            {
-                Ok(Some(session)) => {
-                    debug!(
-                        cache_key = %cfg.cache_key,
-                        from_block,
-                        safe_head,
-                        latest_indexed_block = session.latest_indexed_block(),
-                        catalog_count = session.catalog_count(),
-                        chunk_count = session.chunk_count(),
-                        elapsed_ms = artifact_session_started.elapsed().as_millis(),
-                        "indexed wallet artifact session prepared"
-                    );
-                    artifact_session = Some(session);
-                }
-                Ok(None) => {
-                    debug!(
-                        cache_key = %cfg.cache_key,
-                        from_block,
-                        safe_head,
-                        elapsed_ms = artifact_session_started.elapsed().as_millis(),
-                        "indexed wallet artifact session unavailable"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        cache_key = %cfg.cache_key,
-                        from_block,
-                        safe_head,
-                        elapsed_ms = artifact_session_started.elapsed().as_millis(),
-                        "indexed wallet artifact session failed; falling back to configured indexed sources"
-                    );
-                }
-            }
-        }
+        let status_guard = if expose_status {
+            WalletIndexedCatchUpStatusGuard::enabled(handle)
+        } else {
+            WalletIndexedCatchUpStatusGuard::disabled(handle)
+        };
+        let mut artifact_session =
+            if source_order == IndexedWalletCatchUpSourceOrder::ArtifactsFirst {
+                self.prepare_indexed_wallet_artifact_session(
+                    cfg,
+                    from_block,
+                    safe_head,
+                    progress_tx.as_ref(),
+                )
+                .await
+            } else {
+                None
+            };
         let catch_up_started = Instant::now();
         let mut squid_client = None;
-        let mut using_artifact = artifact_session.is_some();
-        let (mut indexed_source, mut indexed_height, mut target) = if let Some(session) =
-            artifact_session.as_ref()
-        {
-            (
-                "artifact",
-                session.latest_indexed_block(),
-                session.probe().catch_up_target(safe_head),
-            )
-        } else {
-            let Some((client, height)) = self.probe_squid_indexed_wallet_source(cfg).await else {
-                return last_scanned;
+        let (mut indexed_source, mut indexed_height, mut target, mut using_artifact) =
+            if source_order == IndexedWalletCatchUpSourceOrder::SquidFirst {
+                if let Some((client, height)) = self.probe_squid_indexed_wallet_source(cfg).await {
+                    let target = height.min(safe_head);
+                    if from_block <= target {
+                        squid_client = Some(client);
+                        (WalletIndexedCatchUpSource::Squid, height, target, false)
+                    } else {
+                        status_guard.set(
+                            WalletIndexedCatchUpSource::IndexedArtifacts,
+                            from_block,
+                            safe_head,
+                        );
+                        artifact_session = self
+                            .prepare_indexed_wallet_artifact_session(
+                                cfg,
+                                from_block,
+                                safe_head,
+                                progress_tx.as_ref(),
+                            )
+                            .await;
+                        let Some(session) = artifact_session.as_ref() else {
+                            return last_scanned;
+                        };
+                        (
+                            WalletIndexedCatchUpSource::IndexedArtifacts,
+                            session.latest_indexed_block(),
+                            session.probe().catch_up_target(safe_head),
+                            true,
+                        )
+                    }
+                } else {
+                    status_guard.set(
+                        WalletIndexedCatchUpSource::IndexedArtifacts,
+                        from_block,
+                        safe_head,
+                    );
+                    artifact_session = self
+                        .prepare_indexed_wallet_artifact_session(
+                            cfg,
+                            from_block,
+                            safe_head,
+                            progress_tx.as_ref(),
+                        )
+                        .await;
+                    let Some(session) = artifact_session.as_ref() else {
+                        return last_scanned;
+                    };
+                    (
+                        WalletIndexedCatchUpSource::IndexedArtifacts,
+                        session.latest_indexed_block(),
+                        session.probe().catch_up_target(safe_head),
+                        true,
+                    )
+                }
+            } else if let Some(session) = artifact_session.as_ref() {
+                (
+                    WalletIndexedCatchUpSource::IndexedArtifacts,
+                    session.latest_indexed_block(),
+                    session.probe().catch_up_target(safe_head),
+                    true,
+                )
+            } else {
+                let Some((client, height)) = self.probe_squid_indexed_wallet_source(cfg).await
+                else {
+                    return last_scanned;
+                };
+                squid_client = Some(client);
+                (
+                    WalletIndexedCatchUpSource::Squid,
+                    height,
+                    height.min(safe_head),
+                    false,
+                )
             };
-            squid_client = Some(client);
-            ("squid", height, height.min(safe_head))
-        };
         let mut from_block = from_block;
         let progress_start = from_block;
+        status_guard.set(indexed_source, from_block, target);
         info!(
             cache_key = %cfg.cache_key,
-            indexed_source,
+            indexed_source = indexed_source.as_str(),
             indexed_height,
             safe_head,
             from_block,
@@ -967,12 +1146,13 @@ impl ChainService {
                 squid_client = Some(client);
                 artifact_session = None;
                 using_artifact = false;
-                indexed_source = "squid";
+                indexed_source = WalletIndexedCatchUpSource::Squid;
                 indexed_height = height;
                 target = squid_target;
+                status_guard.set(indexed_source, from_block, target);
                 info!(
                     cache_key = %cfg.cache_key,
-                    indexed_source,
+                    indexed_source = indexed_source.as_str(),
                     indexed_height,
                     safe_head,
                     from_block,
@@ -1000,7 +1180,6 @@ impl ChainService {
             ),
         );
 
-        let cache_store = wallet_cache_store(&self.db, cfg);
         let mut checkpoint = last_scanned;
         loop {
             if from_block > target {
@@ -1017,12 +1196,13 @@ impl ChainService {
                 squid_client = Some(client);
                 artifact_session = None;
                 using_artifact = false;
-                indexed_source = "squid";
+                indexed_source = WalletIndexedCatchUpSource::Squid;
                 indexed_height = height;
                 target = squid_target;
+                status_guard.set(indexed_source, from_block, target);
                 info!(
                     cache_key = %cfg.cache_key,
-                    indexed_source,
+                    indexed_source = indexed_source.as_str(),
                     indexed_height,
                     safe_head,
                     from_block,
@@ -1100,12 +1280,13 @@ impl ChainService {
                         squid_client = Some(client);
                         artifact_session = None;
                         using_artifact = false;
-                        indexed_source = "squid";
+                        indexed_source = WalletIndexedCatchUpSource::Squid;
                         indexed_height = height;
                         target = height.min(safe_head);
+                        status_guard.set(indexed_source, from_block, target);
                         info!(
                             cache_key = %cfg.cache_key,
-                            indexed_source,
+                            indexed_source = indexed_source.as_str(),
                             indexed_height,
                             safe_head,
                             from_block,
@@ -1116,7 +1297,70 @@ impl ChainService {
                         if from_block > target {
                             debug!(
                                 cache_key = %cfg.cache_key,
-                                indexed_source,
+                                indexed_source = indexed_source.as_str(),
+                                indexed_height,
+                                target,
+                                elapsed_ms = catch_up_started.elapsed().as_millis(),
+                                "indexed wallet fallback skipped; cache already at target"
+                            );
+                            return checkpoint;
+                        }
+                        send_sync_progress(
+                            progress_tx.as_ref(),
+                            SyncProgressUpdate::new(
+                                SyncProgressStage::IndexingUtxos,
+                                progress_start,
+                                from_block,
+                                target,
+                            ),
+                        );
+                        continue;
+                    }
+                    if !using_artifact
+                        && source_order == IndexedWalletCatchUpSourceOrder::SquidFirst
+                        && checkpoint == last_scanned
+                    {
+                        warn!(
+                            ?err,
+                            cache_key = %cfg.cache_key,
+                            fallback_from = checkpoint,
+                            "indexed wallet Squid page failed before checkpoint; falling back to artifacts"
+                        );
+                        status_guard.set(
+                            WalletIndexedCatchUpSource::IndexedArtifacts,
+                            from_block,
+                            safe_head,
+                        );
+                        artifact_session = self
+                            .prepare_indexed_wallet_artifact_session(
+                                cfg,
+                                from_block,
+                                safe_head,
+                                progress_tx.as_ref(),
+                            )
+                            .await;
+                        let Some(session) = artifact_session.as_ref() else {
+                            return checkpoint;
+                        };
+                        using_artifact = true;
+                        indexed_source = WalletIndexedCatchUpSource::IndexedArtifacts;
+                        indexed_height = session.latest_indexed_block();
+                        target = session.probe().catch_up_target(safe_head);
+                        status_guard.set(indexed_source, from_block, target);
+                        info!(
+                            cache_key = %cfg.cache_key,
+                            indexed_source = indexed_source.as_str(),
+                            indexed_height,
+                            safe_head,
+                            from_block,
+                            target,
+                            indexed_block_range = self.chain.indexed_wallet_block_range,
+                            "indexed wallet fallback target"
+                        );
+                        if from_block > target {
+                            debug!(
+                                cache_key = %cfg.cache_key,
+                                indexed_source = indexed_source.as_str(),
                                 indexed_height,
                                 target,
                                 elapsed_ms = catch_up_started.elapsed().as_millis(),
@@ -1138,7 +1382,7 @@ impl ChainService {
                     warn!(
                         ?err,
                         cache_key = %cfg.cache_key,
-                        indexed_source,
+                        indexed_source = indexed_source.as_str(),
                         fallback_from = checkpoint,
                         "indexed wallet catch-up page failed; using RPC backfill"
                     );
@@ -1162,81 +1406,52 @@ impl ChainService {
             let delta_nullifiers = delta.nullifiers.len();
             let commitment_observations = delta.commitment_observations.len();
             let parse_elapsed_ms = parse_started.elapsed().as_millis();
-            let poi_observation_started = Instant::now();
-            process_pending_output_poi_observations(
-                self.db.as_ref(),
-                self.chain.chain_id,
-                &delta.commitment_observations,
-                None,
-            )
-            .await;
-            let poi_observation_elapsed_ms = poi_observation_started.elapsed().as_millis();
-            let lock_wait_started = Instant::now();
-            let mut wallet_utxos = handle.utxos.write().await;
-            let lock_wait_elapsed_ms = lock_wait_started.elapsed().as_millis();
-            let apply_started = Instant::now();
-            let changed = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
-            let apply_elapsed_ms = apply_started.elapsed().as_millis();
-            let (indexed_total, indexed_unspent, indexed_spent, persist_elapsed_ms) = {
-                let indexed_spent = wallet_utxos.iter().filter(|utxo| utxo.is_spent()).count();
-                let indexed_unspent = wallet_utxos.len().saturating_sub(indexed_spent);
-                let persist_started = Instant::now();
-                if let Err(err) = cache_store.store_wallet_utxos(
-                    &cfg.cache_key,
-                    &wallet_utxos,
-                    Some(page.checkpoint_block),
-                    None,
-                ) {
-                    warn!(
-                        ?err,
-                        cache_key = %cfg.cache_key,
-                        fallback_from = checkpoint,
-                        "failed to persist indexed wallet checkpoint; using RPC backfill"
-                    );
-                    return checkpoint;
-                }
-                let persist_elapsed_ms = persist_started.elapsed().as_millis();
-                (
-                    wallet_utxos.len(),
-                    indexed_unspent,
-                    indexed_spent,
-                    persist_elapsed_ms,
-                )
-            };
-            drop(wallet_utxos);
-            if changed {
-                handle.notify_changed();
+            let page_checkpoint = page.checkpoint_block;
+            let (sender, reset_generation) = queued_sender;
+            if let Err(err) = sender
+                .send(BackfillEvent::IndexedDelta {
+                    from_block,
+                    to_block: page_checkpoint,
+                    delta: Box::new(delta),
+                    reset_generation: Some(reset_generation),
+                })
+                .await
+            {
+                warn!(
+                    ?err,
+                    cache_key = %cfg.cache_key,
+                    from_block,
+                    to_block = page_checkpoint,
+                    "failed to queue indexed wallet delta; using RPC backfill"
+                );
+                return checkpoint;
             }
-            checkpoint = page.checkpoint_block;
+            checkpoint = page_checkpoint;
             debug!(
                 cache_key = %cfg.cache_key,
-                indexed_source,
+                indexed_source = indexed_source.as_str(),
                 page_kind = page_kind.as_str(),
                 from_block,
                 to_block,
                 checkpoint,
+                reset_generation,
                 transact_rows = page.transact_rows,
                 shield_rows = page.shield_rows,
                 legacy_encrypted_rows = page.legacy_encrypted_rows,
                 legacy_generated_rows = page.legacy_generated_rows,
                 nullifier_rows = page.nullifier_rows,
-                total = indexed_total,
-                unspent = indexed_unspent,
-                spent = indexed_spent,
                 delta_utxos,
                 delta_nullifiers,
                 commitment_observations,
-                poi_status_deferred = true,
                 fetch_elapsed_ms,
                 parse_elapsed_ms,
-                poi_observation_elapsed_ms,
-                lock_wait_elapsed_ms,
-                apply_elapsed_ms,
-                persist_elapsed_ms,
                 elapsed_ms = page_started.elapsed().as_millis(),
-                "indexed wallet catch-up page complete"
+                "indexed wallet catch-up page queued"
             );
             from_block = checkpoint.saturating_add(1);
+            if from_block <= target {
+                status_guard.set(indexed_source, from_block, target);
+            }
             send_sync_progress(
                 progress_tx.as_ref(),
                 SyncProgressUpdate::new(
@@ -1264,6 +1479,19 @@ impl ChainService {
             ),
         );
         checkpoint
+    }
+}
+
+pub(super) async fn await_live_log_task_shutdown(
+    live_log_task: &Mutex<Option<JoinHandle<()>>>,
+    chain_id: u64,
+) {
+    let live_log_task = live_log_task.lock().await.take();
+    if let Some(task) = live_log_task
+        && let Err(err) = task.await
+        && !err.is_cancelled()
+    {
+        warn!(?err, chain_id, "live log worker failed during shutdown");
     }
 }
 

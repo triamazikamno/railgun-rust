@@ -5,11 +5,87 @@ pub(super) struct WalletBackfill {
     pub(super) target_block: u64,
     pub(super) follow_safe_head: bool,
     pub(super) progress_start_block: u64,
+    pub(super) reset_generation: u64,
     pub(super) progress_tx: Option<SyncProgressSender>,
     pub(super) sender: mpsc::Sender<BackfillEvent>,
+    pub(super) last_advanced_at: Instant,
+    pub(super) last_indexed_tail_attempt_at: Option<Instant>,
+}
+
+pub(super) struct WalletTailFallbackState {
+    last_scanned: u64,
+    last_advanced_at: Instant,
+    last_indexed_tail_attempt_at: Option<Instant>,
+}
+
+impl WalletTailFallbackState {
+    pub(super) const fn new(last_scanned: u64, now: Instant) -> Self {
+        Self {
+            last_scanned,
+            last_advanced_at: now,
+            last_indexed_tail_attempt_at: None,
+        }
+    }
+
+    pub(super) fn update_last_scanned(&mut self, last_scanned: u64, now: Instant) {
+        if last_scanned != self.last_scanned {
+            self.last_scanned = last_scanned;
+            self.last_advanced_at = now;
+        }
+    }
+
+    pub(super) fn mark_indexed_tail_attempt(&mut self, now: Instant) {
+        self.last_indexed_tail_attempt_at = Some(now);
+    }
+
+    pub(super) fn should_try_indexed_tail_fallback(
+        &self,
+        chain_id: u64,
+        from_block: u64,
+        target_block: u64,
+        now: Instant,
+        min_stall: Duration,
+        cooldown: Duration,
+    ) -> bool {
+        if from_block > target_block {
+            return false;
+        }
+        let lag_blocks = wallet_backfill_lag_blocks(from_block, target_block);
+        if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(chain_id) {
+            return false;
+        }
+        if now.duration_since(self.last_advanced_at) < min_stall {
+            return false;
+        }
+        self.last_indexed_tail_attempt_at
+            .is_none_or(|attempted_at| now.duration_since(attempted_at) >= cooldown)
+    }
 }
 
 impl WalletBackfill {
+    pub(super) fn new(
+        from_block: u64,
+        target_block: u64,
+        follow_safe_head: bool,
+        progress_start_block: u64,
+        reset_generation: u64,
+        progress_tx: Option<SyncProgressSender>,
+        sender: mpsc::Sender<BackfillEvent>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            from_block,
+            target_block,
+            follow_safe_head,
+            progress_start_block,
+            reset_generation,
+            progress_tx,
+            sender,
+            last_advanced_at: now,
+            last_indexed_tail_attempt_at: None,
+        }
+    }
+
     pub(super) fn refresh_target(&mut self, safe_head: u64) {
         if safe_head == 0 {
             return;
@@ -35,6 +111,65 @@ impl WalletBackfill {
             ),
         );
     }
+
+    pub(super) fn mark_progress(&mut self, from_block: u64, now: Instant) {
+        self.from_block = from_block;
+        self.last_advanced_at = now;
+    }
+
+    pub(super) fn mark_indexed_tail_attempt(&mut self, now: Instant) {
+        self.last_indexed_tail_attempt_at = Some(now);
+    }
+
+    pub(super) fn should_try_indexed_tail_fallback(
+        &self,
+        chain_id: u64,
+        now: Instant,
+        min_stall: Duration,
+        cooldown: Duration,
+    ) -> bool {
+        if self.target_block == 0 || self.from_block > self.target_block {
+            return false;
+        }
+        let lag_blocks = wallet_backfill_lag_blocks(self.from_block, self.target_block);
+        if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(chain_id) {
+            return false;
+        }
+        if now.duration_since(self.last_advanced_at) < min_stall {
+            return false;
+        }
+        self.last_indexed_tail_attempt_at
+            .is_none_or(|attempted_at| now.duration_since(attempted_at) >= cooldown)
+    }
+}
+
+pub(super) const fn wallet_backfill_lag_blocks(from_block: u64, target_block: u64) -> u64 {
+    if from_block > target_block {
+        0
+    } else {
+        target_block.saturating_sub(from_block).saturating_add(1)
+    }
+}
+
+pub(super) const fn wallet_tail_fallback_block_time_secs(chain_id: u64) -> u64 {
+    match chain_id {
+        1 => 12,
+        56 => 3,
+        137 => 2,
+        42161 => 1,
+        _ => 12,
+    }
+}
+
+pub(super) const fn wallet_tail_fallback_stale_timeout_secs(chain_id: u64) -> u64 {
+    let timeout = wallet_tail_fallback_block_time_secs(chain_id) * 10;
+    if timeout < 45 { 45 } else { timeout }
+}
+
+pub(super) const fn wallet_tail_fallback_lag_threshold_blocks(chain_id: u64) -> u64 {
+    let block_time = wallet_tail_fallback_block_time_secs(chain_id);
+    let threshold = wallet_tail_fallback_stale_timeout_secs(chain_id) / block_time;
+    if threshold < 2 { 2 } else { threshold }
 }
 
 impl ChainService {
@@ -124,9 +259,13 @@ impl ChainService {
             let from_block =
                 wallet_reorg_backfill_from_block(reset_from_block, registration.start_block);
             let sync_target = wallet_sync_target(safe_head, registration.sync_to_block);
+            let reset_generation = registration.handle.advance_reset_generation();
             if let Err(err) = registration
                 .backfill_sender
-                .send(BackfillEvent::Reset { from_block })
+                .send(BackfillEvent::Reset {
+                    from_block,
+                    reset_generation,
+                })
                 .await
             {
                 debug!(
@@ -143,6 +282,7 @@ impl ChainService {
                     to_block: sync_target,
                     follow_safe_head: registration.sync_to_block.is_none(),
                     progress_start_block: from_block,
+                    reset_generation,
                     progress_tx: registration
                         .cfg
                         .progress_tx

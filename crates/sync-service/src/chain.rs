@@ -1,12 +1,12 @@
 use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, SyncProgressSender,
-    SyncProgressStage, SyncProgressUpdate, WalletConfig,
+    SyncProgressStage, SyncProgressUpdate, WalletConfig, WalletIndexedCatchUpSource,
+    WalletIndexedCatchUpStatus,
 };
 use crate::wallet::{
-    WalletHandle, WalletPendingOverlay, WalletWorkerServices, apply_wallet_delta_to_vec,
-    pending_overlay_from_delta, process_pending_output_poi_observations, spawn_wallet_worker,
-    wallet_cache_store,
+    WalletHandle, WalletPendingOverlay, WalletWorkerServices, pending_overlay_from_delta,
+    spawn_wallet_worker, wallet_cache_store,
 };
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, FixedBytes};
@@ -43,7 +43,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 

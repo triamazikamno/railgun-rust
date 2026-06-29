@@ -1,5 +1,8 @@
 use super::*;
 
+const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
+const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
+
 pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
     let cancel = service.cancel.clone();
     let chain_id = service.chain.chain_id;
@@ -254,6 +257,141 @@ pub(super) async fn clear_pending_tip_overlays(registrations: Vec<PendingTipWall
     }
 }
 
+struct WalletLagFallbackCandidate {
+    cache_key: String,
+    from_block: u64,
+    target_block: u64,
+    lag_blocks: u64,
+    sender: mpsc::Sender<BackfillEvent>,
+}
+
+pub(super) fn spawn_wallet_lag_fallback_loop(
+    service: Arc<ChainService>,
+    mut safe_head_rx: watch::Receiver<u64>,
+    cancel: CancellationToken,
+) {
+    let chain_id = service.chain.chain_id;
+    tokio::spawn(
+        async move {
+            let mut states: HashMap<String, WalletTailFallbackState> = HashMap::new();
+            loop {
+                let safe_head = *safe_head_rx.borrow();
+                if safe_head > 0 {
+                    let now = Instant::now();
+                    let candidates =
+                        wallet_lag_fallback_candidates(&service, &mut states, safe_head, now).await;
+
+                    for candidate in candidates {
+                        info!(
+                            cache_key = %candidate.cache_key,
+                            from_block = candidate.from_block,
+                            target_block = candidate.target_block,
+                            lag_blocks = candidate.lag_blocks,
+                            stalled_secs = INDEXED_TAIL_FALLBACK_MIN_STALL.as_secs(),
+                            "indexed wallet ready-tail fallback triggered"
+                        );
+                        let Some((checkpoint, reset_generation)) = service
+                            .try_indexed_wallet_tail_catch_up(
+                                &candidate.cache_key,
+                                candidate.from_block,
+                                candidate.target_block,
+                                &candidate.sender,
+                            )
+                            .await
+                        else {
+                            debug!(
+                                cache_key = %candidate.cache_key,
+                                from_block = candidate.from_block,
+                                target_block = candidate.target_block,
+                                "indexed wallet ready-tail fallback unavailable"
+                            );
+                            continue;
+                        };
+                        if checkpoint < candidate.from_block {
+                            continue;
+                        }
+                        if let Err(err) = candidate
+                            .sender
+                            .send(BackfillEvent::DoneAtGeneration {
+                                last_block: checkpoint,
+                                reset_generation,
+                            })
+                            .await
+                        {
+                            debug!(
+                                ?err,
+                                cache_key = %candidate.cache_key,
+                                "failed to send ready-tail indexed wallet done"
+                            );
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    changed = safe_head_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(service.chain.poll_interval) => {}
+                }
+            }
+        }
+        .instrument(tracing::info_span!("wallet_lag_fallback", chain_id)),
+    );
+}
+
+async fn wallet_lag_fallback_candidates(
+    service: &Arc<ChainService>,
+    states: &mut HashMap<String, WalletTailFallbackState>,
+    safe_head: u64,
+    now: Instant,
+) -> Vec<WalletLagFallbackCandidate> {
+    let wallets = service.wallets.read().await;
+    states.retain(|cache_key, _| wallets.contains_key(cache_key));
+
+    wallets
+        .iter()
+        .filter_map(|(cache_key, registration)| {
+            if !registration.cfg.use_indexed_wallet_catch_up
+                || !*registration.handle.ready_rx.borrow()
+                || registration.handle.indexed_catch_up_rx.borrow().is_some()
+            {
+                return None;
+            }
+
+            let last_scanned = registration.handle.last_scanned();
+            let target_block = wallet_sync_target(safe_head, registration.sync_to_block);
+            let from_block = wallet_backfill_from_block(last_scanned, registration.start_block);
+            let state = states
+                .entry(cache_key.clone())
+                .or_insert_with(|| WalletTailFallbackState::new(last_scanned, now));
+            state.update_last_scanned(last_scanned, now);
+
+            if !state.should_try_indexed_tail_fallback(
+                service.chain.chain_id,
+                from_block,
+                target_block,
+                now,
+                INDEXED_TAIL_FALLBACK_MIN_STALL,
+                INDEXED_TAIL_FALLBACK_COOLDOWN,
+            ) {
+                return None;
+            }
+            let lag_blocks = wallet_backfill_lag_blocks(from_block, target_block);
+            state.mark_indexed_tail_attempt(now);
+            Some(WalletLagFallbackCandidate {
+                cache_key: cache_key.clone(),
+                from_block,
+                target_block,
+                lag_blocks,
+                sender: registration.backfill_sender.clone(),
+            })
+        })
+        .collect()
+}
+
 pub(super) fn pending_tip_from_block(
     safe_head: u64,
     wallet_last_scanned: u64,
@@ -323,7 +461,7 @@ pub(super) fn spawn_live_log_loop(
     mut safe_head_rx: watch::Receiver<u64>,
     snapshot_path: PathBuf,
     cancel: CancellationToken,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(
         async move {
             loop {
@@ -335,31 +473,44 @@ pub(super) fn spawn_live_log_loop(
 
                 let safe_head = *safe_head_rx.borrow();
                 if safe_head == 0 && service.chain.deployment_block > 0 {
-                    tokio::time::sleep(service.chain.poll_interval).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(service.chain.poll_interval) => {}
+                    }
                     continue;
                 }
                 let last_processed = *forest_last_rx.borrow();
                 if last_processed >= safe_head {
-                    tokio::time::sleep(service.chain.poll_interval).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(service.chain.poll_interval) => {}
+                    }
                     continue;
                 }
                 let Some(rpc) = rpcs.random_provider() else {
                     warn!("no healthy rpc providers available");
-                    tokio::time::sleep(service.chain.poll_interval).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(service.chain.poll_interval) => {}
+                    }
                     continue;
                 };
-                if let Err(err) = service
-                    .check_forest_reorg(
+                let reorg_check = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = service.check_forest_reorg(
                         &rpc.provider,
                         archive_provider.as_ref(),
                         rpc.url.as_str(),
                         &snapshot_path,
                         safe_head,
                         last_processed,
-                    )
-                    .await
-                {
+                    ) => result,
+                };
+                if let Err(err) = reorg_check {
                     debug!(?err, rpc = rpc.url.as_str(), "reorg check failed");
+                }
+                if cancel.is_cancelled() {
+                    break;
                 }
                 let last_processed = *forest_last_rx.borrow();
                 if last_processed >= safe_head {
@@ -368,28 +519,27 @@ pub(super) fn spawn_live_log_loop(
 
                 let from_block = last_processed.saturating_add(1);
                 let to_block = min(from_block + service.chain.block_range - 1, safe_head);
-                match service
-                    .chain
-                    .fetch_logs_for_range(
+                let logs_result = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = service.chain.fetch_logs_for_range(
                         &rpc.provider,
                         archive_provider.as_ref(),
                         from_block,
                         to_block,
-                    )
-                    .await
-                {
+                    ) => result,
+                };
+                match logs_result {
                     Ok(mut logs) => {
                         sort_logs(&mut logs);
                         let block_timestamps = if service.live_log_tx.receiver_count() > 0 {
-                            match service
-                                .chain
-                                .fetch_log_block_timestamps(
+                            match tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                result = service.chain.fetch_log_block_timestamps(
                                     &rpc.provider,
                                     archive_provider.as_ref(),
                                     &logs,
-                                )
-                                .await
-                            {
+                                ) => result,
+                            } {
                                 Ok(block_timestamps) => block_timestamps,
                                 Err(err) => {
                                     warn!(?err, "failed to fetch log block timestamps");
@@ -402,18 +552,23 @@ pub(super) fn spawn_live_log_loop(
                         } else {
                             HashMap::new()
                         };
-                        let to_block_hash = service
-                            .chain
-                            .fetch_confirmed_block_hash(
+                        let to_block_hash = match tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            result = service.chain.fetch_confirmed_block_hash(
                                 &rpc.provider,
                                 archive_provider.as_ref(),
                                 to_block,
-                            )
-                            .await
-                            .unwrap_or_else(|err| {
+                            ) => result,
+                        } {
+                            Ok(hash) => hash,
+                            Err(err) => {
                                 warn!(?err, to_block, "failed to fetch confirmed block hash");
                                 None
-                            });
+                            }
+                        };
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         let batch = Arc::new(LogBatch {
                             from_block,
                             to_block,
@@ -423,9 +578,15 @@ pub(super) fn spawn_live_log_loop(
                         });
 
                         let batch_hash = batch.to_block_hash;
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         if let Err(err) = service.apply_forest_updates(&batch).await {
                             warn!(?err, "failed to apply forest updates");
                         } else {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
                             let log_count = batch.logs.len();
                             if service.live_log_tx.send(batch).is_err() {
                                 debug!(
@@ -435,6 +596,9 @@ pub(super) fn spawn_live_log_loop(
                             }
                             if let Err(err) = service.forest_last_tx.send(to_block) {
                                 debug!(?err, to_block, "failed to send forest progress update");
+                            }
+                            if cancel.is_cancelled() {
+                                break;
                             }
                             if let Err(err) = service
                                 .persist_forest_snapshot(&snapshot_path, to_block, batch_hash)
@@ -465,7 +629,7 @@ pub(super) fn spawn_live_log_loop(
             }
         }
         .instrument(tracing::info_span!("sync_live")),
-    );
+    )
 }
 
 pub(super) fn spawn_backfill_loop(
@@ -479,39 +643,13 @@ pub(super) fn spawn_backfill_loop(
     let task = async move {
         let mut cursors: HashMap<String, WalletBackfill> = HashMap::new();
         loop {
+            drain_pending_backfill_requests(&mut backfill_rx, &mut cursors);
+
             if cursors.is_empty() {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     Some(request) = backfill_rx.recv() => {
-                        match request {
-                            BackfillRequest::Add {
-                                cache_key,
-                                from_block,
-                                to_block,
-                                follow_safe_head,
-                                progress_start_block,
-                                progress_tx,
-                                sender,
-                            } => {
-                                cursors.insert(cache_key, WalletBackfill {
-                                    from_block,
-                                    target_block: to_block,
-                                    follow_safe_head,
-                                    progress_start_block,
-                                    progress_tx,
-                                    sender,
-                                });
-                            }
-                            BackfillRequest::Reset { cache_key, from_block } => {
-                                if let Some(cursor) = cursors.get_mut(&cache_key) {
-                                    cursor.from_block = from_block;
-                                    cursor.progress_start_block = from_block;
-                                }
-                            }
-                            BackfillRequest::Remove { cache_key } => {
-                                cursors.remove(&cache_key);
-                            }
-                        }
+                        apply_backfill_request(&mut cursors, request, Instant::now());
                     }
                     _ = safe_head_rx.changed() => {},
                 }
@@ -538,8 +676,81 @@ pub(super) fn spawn_backfill_loop(
                 if let Some(cursor) = cursors.remove(&key)
                     && let Err(err) = cursor
                         .sender
-                        .send(BackfillEvent::Done {
+                        .send(BackfillEvent::DoneAtGeneration {
                             last_block: cursor.target_block,
+                            reset_generation: cursor.reset_generation,
+                        })
+                        .await
+                {
+                    debug!(?err, cache_key = %key, "failed to send backfill done");
+                }
+            }
+
+            let now = Instant::now();
+            let indexed_tail_attempts: Vec<_> = cursors
+                .iter_mut()
+                .filter_map(|(key, cursor)| {
+                    if cursor.should_try_indexed_tail_fallback(
+                        service.chain.chain_id,
+                        now,
+                        INDEXED_TAIL_FALLBACK_MIN_STALL,
+                        INDEXED_TAIL_FALLBACK_COOLDOWN,
+                    ) {
+                        let lag_blocks =
+                            wallet_backfill_lag_blocks(cursor.from_block, cursor.target_block);
+                        cursor.mark_indexed_tail_attempt(now);
+                        Some((
+                            key.clone(),
+                            cursor.from_block,
+                            cursor.target_block,
+                            lag_blocks,
+                            cursor.sender.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (key, from_block, target_block, lag_blocks, sender) in indexed_tail_attempts {
+                info!(
+                    cache_key = %key,
+                    from_block,
+                    target_block,
+                    lag_blocks,
+                    stalled_secs = INDEXED_TAIL_FALLBACK_MIN_STALL.as_secs(),
+                    "indexed wallet tail fallback triggered"
+                );
+                let Some((checkpoint, reset_generation)) = service
+                    .try_indexed_wallet_tail_catch_up(&key, from_block, target_block, &sender)
+                    .await
+                else {
+                    debug!(
+                        cache_key = %key,
+                        from_block,
+                        target_block,
+                        "indexed wallet tail fallback unavailable"
+                    );
+                    continue;
+                };
+                let latest_safe_head = *safe_head_rx.borrow();
+                let mut completed_last_block = None;
+                if let Some(cursor) = cursors.get_mut(&key)
+                    && checkpoint >= cursor.from_block
+                {
+                    cursor.send_progress(checkpoint);
+                    cursor.mark_progress(checkpoint.saturating_add(1), Instant::now());
+                    cursor.refresh_target(latest_safe_head);
+                    if cursor.from_block > cursor.target_block {
+                        completed_last_block = Some(cursor.target_block);
+                    }
+                }
+                if let Some(last_block) = completed_last_block
+                    && let Some(cursor) = cursors.remove(&key)
+                    && let Err(err) = cursor
+                        .sender
+                        .send(BackfillEvent::DoneAtGeneration {
+                            last_block,
+                            reset_generation,
                         })
                         .await
                 {
@@ -649,8 +860,13 @@ pub(super) fn spawn_backfill_loop(
                         if let Some(cursor) = cursors.get_mut(&key)
                             && cursor.from_block <= to_block
                         {
-                            if let Err(err) =
-                                cursor.sender.send(BackfillEvent::Logs(batch.clone())).await
+                            if let Err(err) = cursor
+                                .sender
+                                .send(BackfillEvent::LogsAtGeneration {
+                                    batch: batch.clone(),
+                                    reset_generation: cursor.reset_generation,
+                                })
+                                .await
                             {
                                 debug!(
                                     ?err,
@@ -659,13 +875,14 @@ pub(super) fn spawn_backfill_loop(
                                 );
                             }
                             cursor.send_progress(to_block);
-                            cursor.from_block = to_block.saturating_add(1);
+                            cursor.mark_progress(to_block.saturating_add(1), Instant::now());
                             cursor.refresh_target(latest_safe_head);
                             if cursor.from_block > cursor.target_block {
                                 if let Err(err) = cursor
                                     .sender
-                                    .send(BackfillEvent::Done {
+                                    .send(BackfillEvent::DoneAtGeneration {
                                         last_block: cursor.target_block,
+                                        reset_generation: cursor.reset_generation,
                                     })
                                     .await
                                 {
@@ -696,4 +913,61 @@ pub(super) fn spawn_backfill_loop(
         }
     };
     tokio::spawn(task.instrument(tracing::info_span!("sync_backfill")));
+}
+
+pub(super) fn drain_pending_backfill_requests(
+    backfill_rx: &mut mpsc::Receiver<BackfillRequest>,
+    cursors: &mut HashMap<String, WalletBackfill>,
+) {
+    while let Ok(request) = backfill_rx.try_recv() {
+        apply_backfill_request(cursors, request, Instant::now());
+    }
+}
+
+fn apply_backfill_request(
+    cursors: &mut HashMap<String, WalletBackfill>,
+    request: BackfillRequest,
+    now: Instant,
+) {
+    match request {
+        BackfillRequest::Add {
+            cache_key,
+            from_block,
+            to_block,
+            follow_safe_head,
+            progress_start_block,
+            reset_generation,
+            progress_tx,
+            sender,
+        } => {
+            cursors.insert(
+                cache_key,
+                WalletBackfill::new(
+                    from_block,
+                    to_block,
+                    follow_safe_head,
+                    progress_start_block,
+                    reset_generation,
+                    progress_tx,
+                    sender,
+                    now,
+                ),
+            );
+        }
+        BackfillRequest::Reset {
+            cache_key,
+            from_block,
+            reset_generation,
+        } => {
+            if let Some(cursor) = cursors.get_mut(&cache_key) {
+                cursor.mark_progress(from_block, now);
+                cursor.progress_start_block = from_block;
+                cursor.reset_generation = reset_generation;
+                cursor.last_indexed_tail_attempt_at = None;
+            }
+        }
+        BackfillRequest::Remove { cache_key } => {
+            cursors.remove(&cache_key);
+        }
+    }
 }

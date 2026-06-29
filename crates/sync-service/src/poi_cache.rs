@@ -17,7 +17,8 @@ use crate::poi_artifacts::{
     PersistedPoiArtifactCache, PoiArtifactIngestor, PoiArtifactProgressEvent, load_persisted_cache,
 };
 use crate::types::{
-    LocalPoiCaches, PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactSourceConfig,
+    LocalPoiCaches, PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+    PoiArtifactSourceConfig,
 };
 use crate::wallet::{
     live_tail_candidate_cache, sync_live_poi_event_tail, wallet_poi_status_client,
@@ -120,6 +121,7 @@ impl PoiCacheService {
                 None,
                 None,
                 None,
+                poi_cache_list_progress_for_keys(&active_list_keys),
                 false,
                 None,
             ),
@@ -161,6 +163,22 @@ impl PoiCacheService {
             .map(|state| Arc::clone(&state.local_caches))
     }
 
+    pub async fn retry_poi_artifact_cache_refresh(&self, chain_id: u64) -> bool {
+        let Some(local_caches) = self.local_caches(chain_id).await else {
+            return false;
+        };
+        spawn_chain_poi_cache_resync(
+            Arc::clone(&self.db),
+            self.http_client.clone(),
+            self.poi_rpc_url.clone(),
+            self.artifact_config.clone(),
+            chain_id,
+            local_caches,
+            self.progress_tx.clone(),
+        );
+        true
+    }
+
     pub async fn reset_poi_artifact_cache(&self) -> Result<u64, local_db::DbError> {
         let removed = self.db.clear_poi_artifact_cache()?;
         let chains: Vec<_> = self
@@ -184,6 +202,7 @@ impl PoiCacheService {
                     None,
                     None,
                     None,
+                    poi_cache_list_progress_for_keys(&active_list_keys),
                     false,
                     None,
                 ),
@@ -234,6 +253,7 @@ fn new_poi_artifact_cache_progress(
     current_list_key: Option<FixedBytes<32>>,
     current_event_index: Option<u64>,
     target_event_index: Option<u64>,
+    list_progress: Vec<PoiArtifactCacheListProgress>,
     ready_for_wallet_checks: bool,
     last_error: Option<String>,
 ) -> PoiArtifactCacheProgress {
@@ -245,6 +265,7 @@ fn new_poi_artifact_cache_progress(
         current_list_key,
         current_event_index,
         target_event_index,
+        list_progress,
         ready_for_wallet_checks,
         last_error,
     }
@@ -259,15 +280,77 @@ fn send_poi_artifact_cache_progress(
     });
 }
 
+fn poi_cache_list_progress_for_keys(
+    active_list_keys: &[FixedBytes<32>],
+) -> Vec<PoiArtifactCacheListProgress> {
+    active_list_keys
+        .iter()
+        .map(|list_key| PoiArtifactCacheListProgress {
+            list_key: *list_key,
+            current_event_index: None,
+            target_event_index: None,
+            ready_for_wallet_checks: false,
+        })
+        .collect()
+}
+
+fn single_list_event_index(
+    list_progress: &[PoiArtifactCacheListProgress],
+) -> (Option<u64>, Option<u64>) {
+    if let [progress] = list_progress {
+        (progress.current_event_index, progress.target_event_index)
+    } else {
+        (None, None)
+    }
+}
+
+fn list_progress_with_active_event(
+    active_list_keys: &[FixedBytes<32>],
+    baseline: &[PoiArtifactCacheListProgress],
+    active_list_key: FixedBytes<32>,
+    current_event_index: Option<u64>,
+    target_event_index: Option<u64>,
+) -> Vec<PoiArtifactCacheListProgress> {
+    active_list_keys
+        .iter()
+        .map(|list_key| {
+            let mut progress = baseline
+                .iter()
+                .find(|progress| progress.list_key == *list_key)
+                .cloned()
+                .unwrap_or(PoiArtifactCacheListProgress {
+                    list_key: *list_key,
+                    current_event_index: None,
+                    target_event_index: None,
+                    ready_for_wallet_checks: false,
+                });
+            if *list_key == active_list_key {
+                progress.current_event_index = current_event_index;
+                progress.target_event_index = target_event_index;
+            }
+            progress
+        })
+        .collect()
+}
+
 fn emit_poi_artifact_ingestor_progress(
     progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
     chain_id: u64,
     total_lists: usize,
     list_index: usize,
     list_key: FixedBytes<32>,
+    active_list_keys: &[FixedBytes<32>],
+    baseline_list_progress: &[PoiArtifactCacheListProgress],
     ready_for_wallet_checks: bool,
     event: PoiArtifactProgressEvent,
 ) {
+    let list_progress = list_progress_with_active_event(
+        active_list_keys,
+        baseline_list_progress,
+        list_key,
+        event.current_event_index,
+        event.target_event_index,
+    );
     send_poi_artifact_cache_progress(
         progress_tx,
         new_poi_artifact_cache_progress(
@@ -278,6 +361,7 @@ fn emit_poi_artifact_ingestor_progress(
             Some(list_key),
             event.current_event_index,
             event.target_event_index,
+            list_progress,
             ready_for_wallet_checks,
             None,
         ),
@@ -293,6 +377,9 @@ async fn emit_chain_poi_cache_ready_progress(
     let ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
+    let list_progress =
+        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+    let (current_event_index, target_event_index) = single_list_event_index(&list_progress);
     send_poi_artifact_cache_progress(
         progress_tx,
         new_poi_artifact_cache_progress(
@@ -301,8 +388,9 @@ async fn emit_chain_poi_cache_ready_progress(
             completed,
             active_list_keys.len(),
             None,
-            None,
-            None,
+            current_event_index,
+            target_event_index,
+            list_progress,
             ready,
             None,
         ),
@@ -427,6 +515,7 @@ async fn sync_chain_poi_artifact_caches(
                 None,
                 None,
                 None,
+                Vec::new(),
                 true,
                 None,
             ),
@@ -442,10 +531,14 @@ async fn sync_chain_poi_artifact_caches(
     for (list_index, list_key) in active_list_keys.iter().enumerate() {
         let identity =
             PoiCacheIdentity::new(EVM_CHAIN_TYPE, chain_id, DEFAULT_TXID_VERSION, *list_key);
+        let baseline_list_progress =
+            chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+        let active_list_keys_for_progress = active_list_keys.to_vec();
         let ingestor = PoiArtifactIngestor::new(artifact_config.clone(), client.clone())
             .with_progress_observer({
                 let progress_tx = progress_tx.clone();
                 let list_key = *list_key;
+                let baseline_list_progress = baseline_list_progress.clone();
                 move |event| {
                     emit_poi_artifact_ingestor_progress(
                         &progress_tx,
@@ -453,6 +546,8 @@ async fn sync_chain_poi_artifact_caches(
                         total_lists,
                         list_index,
                         list_key,
+                        &active_list_keys_for_progress,
+                        &baseline_list_progress,
                         initially_ready,
                         event,
                     );
@@ -478,6 +573,16 @@ async fn sync_chain_poi_artifact_caches(
                 let live_tail_started = Instant::now();
                 let live_tail = if let Some(client) = live_tail_client.as_ref() {
                     let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
+                    let baseline_list_progress =
+                        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys)
+                            .await;
+                    let list_progress = list_progress_with_active_event(
+                        active_list_keys,
+                        &baseline_list_progress,
+                        *list_key,
+                        Some(local_tip_index),
+                        None,
+                    );
                     send_poi_artifact_cache_progress(
                         progress_tx,
                         new_poi_artifact_cache_progress(
@@ -488,6 +593,7 @@ async fn sync_chain_poi_artifact_caches(
                             Some(*list_key),
                             Some(local_tip_index),
                             None,
+                            list_progress,
                             initially_ready,
                             None,
                         ),
@@ -495,6 +601,13 @@ async fn sync_chain_poi_artifact_caches(
                     match live_tail_candidate_cache(client, &cache).await {
                         Ok((tailed_cache, outcome)) => {
                             cache = tailed_cache;
+                            let list_progress = list_progress_with_active_event(
+                                active_list_keys,
+                                &baseline_list_progress,
+                                *list_key,
+                                Some(outcome.next_event_index.saturating_sub(1)),
+                                Some(outcome.next_event_index.saturating_sub(1)),
+                            );
                             send_poi_artifact_cache_progress(
                                 progress_tx,
                                 new_poi_artifact_cache_progress(
@@ -505,6 +618,7 @@ async fn sync_chain_poi_artifact_caches(
                                     Some(*list_key),
                                     Some(outcome.next_event_index.saturating_sub(1)),
                                     Some(outcome.next_event_index.saturating_sub(1)),
+                                    list_progress,
                                     initially_ready,
                                     None,
                                 ),
@@ -602,6 +716,10 @@ async fn sync_chain_poi_artifact_caches(
                         .await;
                 let completed =
                     installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
+                let list_progress =
+                    chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+                let (current_event_index, target_event_index) =
+                    single_list_event_index(&list_progress);
                 send_poi_artifact_cache_progress(
                     progress_tx,
                     new_poi_artifact_cache_progress(
@@ -610,8 +728,9 @@ async fn sync_chain_poi_artifact_caches(
                         completed,
                         total_lists,
                         Some(*list_key),
-                        None,
-                        None,
+                        current_event_index,
+                        target_event_index,
+                        list_progress,
                         ready,
                         last_error.clone(),
                     ),
@@ -622,6 +741,9 @@ async fn sync_chain_poi_artifact_caches(
     let ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
+    let list_progress =
+        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+    let (current_event_index, target_event_index) = single_list_event_index(&list_progress);
     let phase = if last_error.is_some() {
         PoiArtifactCachePhase::Error
     } else {
@@ -635,8 +757,9 @@ async fn sync_chain_poi_artifact_caches(
             completed,
             total_lists,
             None,
-            None,
-            None,
+            current_event_index,
+            target_event_index,
+            list_progress,
             ready,
             last_error,
         ),
@@ -740,6 +863,35 @@ async fn installed_chain_poi_cache_count(
         .count()
 }
 
+async fn chain_poi_cache_list_progress(
+    chain_id: u64,
+    local_caches: &LocalPoiCaches,
+    active_list_keys: &[FixedBytes<32>],
+) -> Vec<PoiArtifactCacheListProgress> {
+    let caches = local_caches.read().await;
+    active_list_keys
+        .iter()
+        .map(|list_key| {
+            let event_index = caches.get(list_key).and_then(|cache| {
+                if cache.identity().chain_type == EVM_CHAIN_TYPE
+                    && cache.identity().chain_id == chain_id
+                    && cache.identity().txid_version == DEFAULT_TXID_VERSION
+                {
+                    cache.progress().next_event_index.checked_sub(1)
+                } else {
+                    None
+                }
+            });
+            PoiArtifactCacheListProgress {
+                list_key: *list_key,
+                current_event_index: event_index,
+                target_event_index: event_index,
+                ready_for_wallet_checks: event_index.is_some(),
+            }
+        })
+        .collect()
+}
+
 async fn sync_chain_poi_live_tails(
     client: &PoiRpcClient,
     chain_id: u64,
@@ -759,6 +911,15 @@ async fn sync_chain_poi_live_tails(
         if original_next_event_index == 0 {
             continue;
         }
+        let baseline_list_progress =
+            chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+        let list_progress = list_progress_with_active_event(
+            active_list_keys,
+            &baseline_list_progress,
+            *list_key,
+            Some(original_next_event_index.saturating_sub(1)),
+            None,
+        );
         send_poi_artifact_cache_progress(
             progress_tx,
             new_poi_artifact_cache_progress(
@@ -769,6 +930,7 @@ async fn sync_chain_poi_live_tails(
                 Some(*list_key),
                 Some(original_next_event_index.saturating_sub(1)),
                 None,
+                list_progress,
                 initially_ready,
                 None,
             ),
@@ -829,6 +991,9 @@ async fn sync_chain_poi_live_tails(
     let ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
+    let list_progress =
+        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+    let (current_event_index, target_event_index) = single_list_event_index(&list_progress);
     let phase = if last_error.is_some() {
         PoiArtifactCachePhase::Error
     } else {
@@ -842,8 +1007,9 @@ async fn sync_chain_poi_live_tails(
             completed,
             total_lists,
             None,
-            None,
-            None,
+            current_event_index,
+            target_event_index,
+            list_progress,
             ready,
             last_error,
         ),
@@ -870,7 +1036,8 @@ async fn install_tailed_poi_cache_if_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        EVM_CHAIN_TYPE, PoiCacheService, install_cache_if_not_behind, live_tail_candidate_cache,
+        EVM_CHAIN_TYPE, PoiCacheService, chain_poi_cache_list_progress,
+        install_cache_if_not_behind, live_tail_candidate_cache, single_list_event_index,
     };
     use crate::types::{
         PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
@@ -935,6 +1102,46 @@ mod tests {
             .expect("apply cache events");
         cache.accept_current_roots();
         cache
+    }
+
+    #[tokio::test]
+    async fn chain_poi_cache_list_progress_reports_each_active_list() {
+        let first_key = default_active_poi_list_key();
+        let second_key = FixedBytes::from([7_u8; 32]);
+        let first_identity =
+            PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, first_key);
+        let second_identity =
+            PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, second_key);
+        let first_cache = cache_with_events(
+            first_identity,
+            &[snapshot_event(0, FixedBytes::from([1_u8; 32]))],
+        );
+        let second_cache = cache_with_events(
+            second_identity,
+            &[
+                snapshot_event(0, FixedBytes::from([2_u8; 32])),
+                snapshot_event(1, FixedBytes::from([3_u8; 32])),
+            ],
+        );
+        let local_caches = Arc::new(tokio::sync::RwLock::new(BTreeMap::from([
+            (first_key, first_cache),
+            (second_key, second_cache),
+        ])));
+        let active_list_keys = vec![first_key, second_key];
+
+        let list_progress =
+            chain_poi_cache_list_progress(1, &local_caches, &active_list_keys).await;
+
+        assert_eq!(list_progress.len(), 2);
+        assert_eq!(list_progress[0].list_key, first_key);
+        assert_eq!(list_progress[0].current_event_index, Some(0));
+        assert_eq!(list_progress[0].target_event_index, Some(0));
+        assert!(list_progress[0].ready_for_wallet_checks);
+        assert_eq!(list_progress[1].list_key, second_key);
+        assert_eq!(list_progress[1].current_event_index, Some(1));
+        assert_eq!(list_progress[1].target_event_index, Some(1));
+        assert!(list_progress[1].ready_for_wallet_checks);
+        assert_eq!(single_list_event_index(&list_progress), (None, None));
     }
 
     fn persist_cache(db: &DbStore, cache: &PoiCache) {
@@ -1091,6 +1298,11 @@ mod tests {
         assert_eq!(progress.phase, PoiArtifactCachePhase::Ready);
         assert_eq!(progress.completed_lists, 1);
         assert_eq!(progress.total_lists, 1);
+        assert_eq!(progress.current_event_index, Some(0));
+        assert_eq!(progress.target_event_index, Some(0));
+        assert_eq!(progress.list_progress.len(), 1);
+        assert_eq!(progress.list_progress[0].list_key, list_key);
+        assert_eq!(progress.list_progress[0].current_event_index, Some(0));
         assert!(progress.ready_for_wallet_checks);
         service.shutdown();
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -1125,6 +1337,11 @@ mod tests {
         assert_eq!(progress.phase, PoiArtifactCachePhase::Error);
         assert!(progress.ready_for_wallet_checks);
         assert_eq!(progress.completed_lists, 1);
+        assert_eq!(progress.current_event_index, Some(0));
+        assert_eq!(progress.target_event_index, Some(0));
+        assert_eq!(progress.list_progress.len(), 1);
+        assert_eq!(progress.list_progress[0].list_key, list_key);
+        assert_eq!(progress.list_progress[0].current_event_index, Some(0));
         assert!(progress.last_error.is_some());
         start.await.expect("start chain task");
         service.shutdown();

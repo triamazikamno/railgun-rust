@@ -84,6 +84,57 @@ impl WalletStartupSyncStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexedWalletCatchUpSourceOrder {
+    ArtifactsFirst,
+    SquidFirst,
+}
+
+pub(super) struct WalletIndexedCatchUpStatusGuard<'a> {
+    handle: &'a WalletHandle,
+    enabled: bool,
+}
+
+impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
+    pub(super) const fn disabled(handle: &'a WalletHandle) -> Self {
+        Self {
+            handle,
+            enabled: false,
+        }
+    }
+
+    pub(super) const fn enabled(handle: &'a WalletHandle) -> Self {
+        Self {
+            handle,
+            enabled: true,
+        }
+    }
+
+    pub(super) fn set(
+        &self,
+        source: WalletIndexedCatchUpSource,
+        from_block: u64,
+        target_block: u64,
+    ) {
+        if self.enabled {
+            self.handle
+                .set_indexed_catch_up(WalletIndexedCatchUpStatus {
+                    source,
+                    from_block,
+                    target_block,
+                });
+        }
+    }
+}
+
+impl Drop for WalletIndexedCatchUpStatusGuard<'_> {
+    fn drop(&mut self) {
+        if self.enabled {
+            self.handle.clear_indexed_catch_up();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum WalletStartupSyncError {
     Cancelled,
@@ -229,6 +280,7 @@ pub struct ChainService {
     pub(super) archive_provider: Option<DynProvider>,
     pub(super) wallets: RwLock<HashMap<String, WalletRegistration>>,
     pub(super) cancel: CancellationToken,
+    pub(super) live_log_task: Mutex<Option<JoinHandle<()>>>,
     pub(super) anchor_last: AtomicU64,
     pub(super) txid_public_cache_started: AtomicBool,
 }

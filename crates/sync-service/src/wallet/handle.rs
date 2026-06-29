@@ -83,13 +83,16 @@ pub struct WalletHandle {
     pub utxos: Arc<RwLock<Vec<WalletUtxo>>>,
     pub pending_overlay: Arc<RwLock<WalletPendingOverlay>>,
     pub(super) last_scanned: Arc<AtomicU64>,
+    pub(super) reset_generation: Arc<AtomicU64>,
     pub ready_rx: watch::Receiver<bool>,
     pub rev_rx: watch::Receiver<u64>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
+    pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
     pub(super) poi_read_source: PoiReadSource,
     pub(super) local_poi_caches: Option<WalletLocalPoiCaches>,
     pub(super) poi_refresh_tx: mpsc::Sender<WalletPoiRefreshRequest>,
     pub(super) rev_tx: watch::Sender<u64>,
+    pub(super) indexed_catch_up_tx: watch::Sender<Option<WalletIndexedCatchUpStatus>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,6 +146,33 @@ impl WalletHandle {
 
     pub(super) fn set_last_scanned(&self, block: u64) {
         self.last_scanned.store(block, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub(crate) fn reset_generation(&self) -> u64 {
+        self.reset_generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn advance_reset_generation(&self) -> u64 {
+        self.reset_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    pub(super) fn set_reset_generation(&self, generation: u64) {
+        self.reset_generation.store(generation, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_indexed_catch_up(&self, status: WalletIndexedCatchUpStatus) {
+        if let Err(err) = self.indexed_catch_up_tx.send(Some(status)) {
+            debug!(?err, cache_key = %self.cache_key, "failed to send indexed wallet catch-up status");
+        }
+    }
+
+    pub(crate) fn clear_indexed_catch_up(&self) {
+        if let Err(err) = self.indexed_catch_up_tx.send(None) {
+            debug!(?err, cache_key = %self.cache_key, "failed to clear indexed wallet catch-up status");
+        }
     }
 
     pub async fn pending_overlay(&self) -> WalletPendingOverlay {
