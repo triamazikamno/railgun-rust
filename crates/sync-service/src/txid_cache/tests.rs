@@ -2110,6 +2110,7 @@ fn public_txid_artifact_chunk(
                 leaf_count: None,
                 start_block: None,
                 end_block: None,
+                ..DatasetDescriptorMetadata::default()
             },
         },
         bytes,
@@ -2149,6 +2150,7 @@ fn public_txid_artifact_chunk_from_payload(
                 leaf_count: None,
                 start_block: None,
                 end_block: None,
+                ..DatasetDescriptorMetadata::default()
             },
         },
         bytes,
@@ -2267,7 +2269,10 @@ fn public_txid_artifact_source(
         byte_size: catalog_bytes.len() as u64,
         encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
         compression: CompressionAlgorithm::None,
-        metadata: DatasetDescriptorMetadata::default(),
+        metadata: DatasetDescriptorMetadata {
+            catalog_generation: Some(1),
+            ..DatasetDescriptorMetadata::default()
+        },
     };
     signed_artifact_source(
         scope,

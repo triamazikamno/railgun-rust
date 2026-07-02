@@ -215,6 +215,12 @@ impl IndexedArtifactDescriptor {
     ) -> bool {
         self.matches(dataset_kind, scope, range_kind) && self.range.intersects(start, end)
     }
+
+    #[must_use]
+    pub fn with_inherited_catalog_generation(mut self, catalog: &Self) -> Self {
+        self.metadata.catalog_generation = catalog.metadata.catalog_generation;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

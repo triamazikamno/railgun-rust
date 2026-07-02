@@ -272,6 +272,7 @@ impl IndexedArtifactManifestClient {
         &self,
         descriptor: &IndexedArtifactDescriptor,
     ) -> Result<IndexedArtifactCatalog, IndexedArtifactManifestError> {
+        validate_catalog_descriptor_for_expansion(descriptor)?;
         let started = Instant::now();
         let bytes = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
             .fetch_artifact_cid(&descriptor.cid, descriptor.byte_size)
@@ -650,6 +651,7 @@ pub fn verify_catalog_bytes(
     descriptor: &IndexedArtifactDescriptor,
     bytes: &[u8],
 ) -> Result<IndexedArtifactCatalog, IndexedArtifactManifestError> {
+    validate_catalog_descriptor_for_expansion(descriptor)?;
     let actual_size =
         u64::try_from(bytes.len()).map_err(|_| IndexedArtifactManifestError::ByteSizeOverflow)?;
     if actual_size != descriptor.byte_size {
@@ -668,7 +670,7 @@ pub fn verify_catalog_bytes(
         });
     }
 
-    let catalog: IndexedArtifactCatalog = serde_json::from_slice(bytes)?;
+    let mut catalog: IndexedArtifactCatalog = serde_json::from_slice(bytes)?;
     if catalog.format_version != INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION {
         return Err(IndexedArtifactManifestError::UnsupportedCatalogVersion {
             version: catalog.format_version,
@@ -689,6 +691,12 @@ pub fn verify_catalog_bytes(
     for chunk in &catalog.chunks {
         validate_chunk_descriptor_scope(descriptor, chunk)?;
     }
+    validate_catalog_descriptor_aggregate(descriptor, &catalog.chunks)?;
+    catalog.chunks = catalog
+        .chunks
+        .into_iter()
+        .map(|chunk| chunk.with_inherited_catalog_generation(descriptor))
+        .collect();
     Ok(catalog)
 }
 
@@ -749,6 +757,83 @@ fn validate_chunk_descriptor_scope(
             chunk_start: chunk.range.start,
             chunk_end: chunk.range.end,
         });
+    }
+    Ok(())
+}
+
+fn validate_catalog_descriptor_for_expansion(
+    descriptor: &IndexedArtifactDescriptor,
+) -> Result<(), IndexedArtifactManifestError> {
+    if descriptor.metadata.catalog_generation.is_none() {
+        return Err(IndexedArtifactManifestError::CatalogMissingGeneration {
+            cid: descriptor.cid.clone(),
+        });
+    }
+    if descriptor.range.start > descriptor.range.end {
+        return Err(
+            IndexedArtifactManifestError::CatalogDescriptorInvalidRange {
+                cid: descriptor.cid.clone(),
+                start: descriptor.range.start,
+                end: descriptor.range.end,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_catalog_descriptor_aggregate(
+    descriptor: &IndexedArtifactDescriptor,
+    chunks: &[IndexedArtifactDescriptor],
+) -> Result<(), IndexedArtifactManifestError> {
+    if chunks.is_empty() {
+        if descriptor.row_count != 0 {
+            return Err(IndexedArtifactManifestError::EmptyCatalogRowCountMismatch {
+                cid: descriptor.cid.clone(),
+                row_count: descriptor.row_count,
+            });
+        }
+        return Ok(());
+    }
+
+    let mut aggregate_start = u64::MAX;
+    let mut aggregate_end = 0_u64;
+    let mut aggregate_row_count = 0_u64;
+    for chunk in chunks {
+        if chunk.range.start > chunk.range.end {
+            return Err(IndexedArtifactManifestError::CatalogChunkInvalidRange {
+                cid: chunk.cid.clone(),
+                start: chunk.range.start,
+                end: chunk.range.end,
+            });
+        }
+        aggregate_start = aggregate_start.min(chunk.range.start);
+        aggregate_end = aggregate_end.max(chunk.range.end);
+        aggregate_row_count = aggregate_row_count
+            .checked_add(chunk.row_count)
+            .ok_or_else(
+                || IndexedArtifactManifestError::CatalogAggregateRowCountOverflow {
+                    cid: descriptor.cid.clone(),
+                },
+            )?;
+    }
+
+    if descriptor.range.start != aggregate_start || descriptor.range.end != aggregate_end {
+        return Err(
+            IndexedArtifactManifestError::CatalogAggregateRangeMismatch {
+                expected_start: descriptor.range.start,
+                expected_end: descriptor.range.end,
+                actual_start: aggregate_start,
+                actual_end: aggregate_end,
+            },
+        );
+    }
+    if descriptor.row_count != aggregate_row_count {
+        return Err(
+            IndexedArtifactManifestError::CatalogAggregateRowCountMismatch {
+                expected: descriptor.row_count,
+                actual: aggregate_row_count,
+            },
+        );
     }
     Ok(())
 }
@@ -878,6 +963,29 @@ pub enum IndexedArtifactManifestError {
         chunk_start: u64,
         chunk_end: u64,
     },
+    #[error("indexed artifact catalog {cid} missing catalog generation metadata")]
+    CatalogMissingGeneration { cid: String },
+    #[error("indexed artifact catalog {cid} range start {start} exceeds end {end}")]
+    CatalogDescriptorInvalidRange { cid: String, start: u64, end: u64 },
+    #[error("indexed artifact catalog chunk {cid} range start {start} exceeds end {end}")]
+    CatalogChunkInvalidRange { cid: String, start: u64, end: u64 },
+    #[error(
+        "indexed artifact catalog aggregate range mismatch: expected {expected_start}-{expected_end}, got {actual_start}-{actual_end}"
+    )]
+    CatalogAggregateRangeMismatch {
+        expected_start: u64,
+        expected_end: u64,
+        actual_start: u64,
+        actual_end: u64,
+    },
+    #[error(
+        "indexed artifact catalog aggregate row count mismatch: expected {expected}, got {actual}"
+    )]
+    CatalogAggregateRowCountMismatch { expected: u64, actual: u64 },
+    #[error("indexed artifact catalog aggregate row count overflowed for catalog {cid}")]
+    CatalogAggregateRowCountOverflow { cid: String },
+    #[error("empty indexed artifact catalog {cid} has non-zero row count {row_count}")]
+    EmptyCatalogRowCountMismatch { cid: String, row_count: u64 },
     #[error("indexed artifact byte size overflows u64")]
     ByteSizeOverflow,
     #[error("indexed artifact {cid} byte size mismatch: expected {expected}, got {actual}")]
@@ -1161,6 +1269,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use libp2p_identity::Keypair;
     use multihash_codetable::{Code, MultihashDigest};
+    use railgun_indexed_artifacts::{IndexedArtifactStreamPlan, IndexedArtifactStreamPlanRequest};
     use url::Url;
 
     const LIBP2P_KEY_CODEC: u64 = 0x72;
@@ -1401,7 +1510,7 @@ mod tests {
             chunks: vec![chunk_descriptor(scope.clone(), 0, 50)],
         };
         let bytes = serde_json::to_vec(&catalog).expect("catalog json");
-        let descriptor = catalog_descriptor(scope, 0, 100, &bytes);
+        let descriptor = catalog_descriptor(scope, 0, 50, &bytes);
 
         let verified = verify_catalog_bytes(&descriptor, &bytes).expect("catalog verifies");
 
@@ -1423,6 +1532,266 @@ mod tests {
             verify_catalog_bytes(&wrong_chunk_descriptor, &wrong_chunk_bytes),
             Err(IndexedArtifactManifestError::CatalogChunkRangeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn catalog_verification_rejects_missing_generation() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: vec![chunk_descriptor(scope.clone(), 0, 50)],
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let mut descriptor = catalog_descriptor(scope, 0, 50, &bytes);
+        descriptor.metadata.catalog_generation = None;
+
+        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("generation required");
+
+        assert!(matches!(
+            err,
+            IndexedArtifactManifestError::CatalogMissingGeneration { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_verification_rejects_missing_generation_on_empty_matching_catalog() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let mut descriptor = catalog_descriptor_with_metadata(
+            scope,
+            0,
+            50,
+            0,
+            &bytes,
+            DatasetDescriptorMetadata::default(),
+        );
+        descriptor.metadata.catalog_generation = None;
+
+        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("generation required");
+
+        assert!(matches!(
+            err,
+            IndexedArtifactManifestError::CatalogMissingGeneration { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_verification_rejects_aggregate_range_mismatch() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: vec![chunk_descriptor(scope.clone(), 0, 50)],
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let descriptor = catalog_descriptor(scope, 0, 100, &bytes);
+
+        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("aggregate range rejected");
+
+        assert!(matches!(
+            err,
+            IndexedArtifactManifestError::CatalogAggregateRangeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_verification_rejects_aggregate_row_count_mismatch() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: vec![chunk_descriptor(scope.clone(), 0, 50)],
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let descriptor =
+            catalog_descriptor_with_metadata(scope, 0, 50, 6, &bytes, catalog_metadata(1));
+
+        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("row count rejected");
+
+        assert!(matches!(
+            err,
+            IndexedArtifactManifestError::CatalogAggregateRowCountMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_verification_rejects_empty_catalog_with_nonzero_row_count() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let descriptor =
+            catalog_descriptor_with_metadata(scope, 0, 50, 1, &bytes, catalog_metadata(1));
+
+        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("empty row count rejected");
+
+        assert!(matches!(
+            err,
+            IndexedArtifactManifestError::EmptyCatalogRowCountMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_verification_inherits_generation_and_preserves_chunk_stream_metadata() {
+        let scope = scope();
+        let catalog_metadata = DatasetDescriptorMetadata {
+            catalog_generation: Some(42),
+            stream_partition: Some("catalog-partition".to_string()),
+            stream_complete: true,
+            chunk_sealed: true,
+            ..DatasetDescriptorMetadata::default()
+        };
+        let mut list_a = chunk_descriptor_for_dataset(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            scope.clone(),
+            0,
+            9,
+        );
+        list_a.cid = "bafytxid-list-a".to_string();
+        list_a.metadata.stream_partition = Some("list-a".to_string());
+        list_a.metadata.stream_complete = false;
+        list_a.metadata.chunk_sealed = false;
+        let mut list_b = chunk_descriptor_for_dataset(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            scope.clone(),
+            0,
+            9,
+        );
+        list_b.cid = "bafytxid-list-b".to_string();
+        list_b.metadata.stream_partition = Some("list-b".to_string());
+        list_b.metadata.stream_complete = false;
+        list_b.metadata.chunk_sealed = false;
+        let catalog_row_count = list_a.row_count + list_b.row_count;
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::PublicTxid,
+            scope: scope.clone(),
+            chunks: vec![list_a, list_b],
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let descriptor = catalog_descriptor_for_dataset_with_metadata(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            scope.clone(),
+            0,
+            9,
+            catalog_row_count,
+            &bytes,
+            catalog_metadata,
+        );
+
+        let verified = verify_catalog_bytes(&descriptor, &bytes).expect("catalog verifies");
+
+        let list_a_metadata = &verified.chunks[0].metadata;
+        assert_eq!(list_a_metadata.catalog_generation, Some(42));
+        assert_eq!(list_a_metadata.stream_partition.as_deref(), Some("list-a"));
+        assert!(!list_a_metadata.stream_complete);
+        assert!(!list_a_metadata.chunk_sealed);
+        let list_b_metadata = &verified.chunks[1].metadata;
+        assert_eq!(list_b_metadata.catalog_generation, Some(42));
+        assert_eq!(list_b_metadata.stream_partition.as_deref(), Some("list-b"));
+        assert!(!list_b_metadata.stream_complete);
+        assert!(!list_b_metadata.chunk_sealed);
+
+        let plan = IndexedArtifactStreamPlan::plan(
+            &verified.chunks,
+            &IndexedArtifactStreamPlanRequest::new(
+                IndexedDatasetKind::PublicTxid,
+                scope,
+                IndexedArtifactRangeKind::TxidIndex,
+                0,
+                9,
+            ),
+        )
+        .expect("verified catalog partitions remain independently plannable");
+
+        assert_eq!(plan.required_current.len(), 2);
+        assert_eq!(
+            plan.required_current
+                .iter()
+                .map(|chunk| chunk.metadata.stream_partition.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("list-a"), Some("list-b")]
+        );
+    }
+
+    #[test]
+    fn catalog_verification_replaces_chunk_generation_with_authenticated_catalog_generation() {
+        let scope = scope();
+        let mut chunk = chunk_descriptor(scope.clone(), 0, 50);
+        chunk.metadata.catalog_generation = Some(7);
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: vec![chunk],
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let descriptor =
+            catalog_descriptor_with_metadata(scope, 0, 50, 5, &bytes, catalog_metadata(42));
+
+        let verified = verify_catalog_bytes(&descriptor, &bytes).expect("catalog verifies");
+
+        let metadata = &verified.chunks[0].metadata;
+        assert_eq!(metadata.catalog_generation, Some(42));
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_rejects_missing_generation_before_gateway_request() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let cid = raw_cid(&bytes);
+        let mut descriptor = catalog_descriptor_with_metadata(
+            scope,
+            0,
+            50,
+            0,
+            &bytes,
+            DatasetDescriptorMetadata::default(),
+        );
+        descriptor.cid = cid.to_string();
+        descriptor.metadata.catalog_generation = None;
+        let server = ChunkServer::spawn(HashMap::from([(
+            descriptor.cid.clone(),
+            ChunkResponse::new(&bytes, Duration::ZERO),
+        )]));
+        let mut source_config = config([7_u8; 32], None);
+        source_config.gateway_urls = vec![server.url.clone()];
+        let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
+
+        let err = client
+            .fetch_catalog(&descriptor)
+            .await
+            .expect_err("missing generation rejected before fetch");
+
+        assert!(matches!(
+            err,
+            IndexedArtifactManifestError::CatalogMissingGeneration { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.max_active(), 0, "gateway should not be touched");
     }
 
     #[test]
@@ -1793,21 +2162,62 @@ mod tests {
         end: u64,
         bytes: &[u8],
     ) -> IndexedArtifactDescriptor {
+        catalog_descriptor_with_metadata(scope, start, end, 5, bytes, catalog_metadata(1))
+    }
+
+    fn catalog_descriptor_with_metadata(
+        scope: ChainScope,
+        start: u64,
+        end: u64,
+        row_count: u64,
+        bytes: &[u8],
+        metadata: DatasetDescriptorMetadata,
+    ) -> IndexedArtifactDescriptor {
+        catalog_descriptor_for_dataset_with_metadata(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            scope,
+            start,
+            end,
+            row_count,
+            bytes,
+            metadata,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catalog_descriptor_for_dataset_with_metadata(
+        dataset_kind: IndexedDatasetKind,
+        range_kind: IndexedArtifactRangeKind,
+        scope: ChainScope,
+        start: u64,
+        end: u64,
+        row_count: u64,
+        bytes: &[u8],
+        metadata: DatasetDescriptorMetadata,
+    ) -> IndexedArtifactDescriptor {
         IndexedArtifactDescriptor {
-            dataset_kind: IndexedDatasetKind::WalletScan,
+            dataset_kind,
             scope,
             range: IndexedArtifactRange {
-                kind: IndexedArtifactRangeKind::Block,
+                kind: range_kind,
                 start,
                 end,
             },
-            row_count: 5,
+            row_count,
             cid: "bafycatalog".to_string(),
             sha256: FixedBytes::from_slice(&Sha256::digest(bytes)),
             byte_size: u64::try_from(bytes.len()).expect("catalog size"),
             encoding_version: INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
             compression: CompressionAlgorithm::Zstd,
-            metadata: DatasetDescriptorMetadata::default(),
+            metadata,
+        }
+    }
+
+    fn catalog_metadata(generation: u64) -> DatasetDescriptorMetadata {
+        DatasetDescriptorMetadata {
+            catalog_generation: Some(generation),
+            ..DatasetDescriptorMetadata::default()
         }
     }
 

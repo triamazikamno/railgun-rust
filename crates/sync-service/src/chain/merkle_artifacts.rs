@@ -1400,6 +1400,7 @@ mod tests {
                 start_block: None,
                 end_block: None,
                 last_indexed_block: Some(last_indexed_block),
+                ..DatasetDescriptorMetadata::default()
             },
         )
     }
