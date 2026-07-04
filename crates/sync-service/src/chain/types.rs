@@ -92,22 +92,20 @@ pub(super) enum IndexedWalletCatchUpSourceOrder {
 
 pub(super) struct WalletIndexedCatchUpStatusGuard<'a> {
     handle: &'a WalletHandle,
-    enabled: bool,
+    expose_status: bool,
+    claimed: bool,
 }
 
 impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
-    pub(super) const fn disabled(handle: &'a WalletHandle) -> Self {
-        Self {
-            handle,
-            enabled: false,
+    pub(super) fn claim(handle: &'a WalletHandle, expose_status: bool) -> Option<Self> {
+        if !handle.try_claim_indexed_catch_up() {
+            return None;
         }
-    }
-
-    pub(super) const fn enabled(handle: &'a WalletHandle) -> Self {
-        Self {
+        Some(Self {
             handle,
-            enabled: true,
-        }
+            expose_status,
+            claimed: true,
+        })
     }
 
     pub(super) fn set(
@@ -116,7 +114,7 @@ impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
         from_block: u64,
         target_block: u64,
     ) {
-        if self.enabled {
+        if self.expose_status {
             self.handle
                 .set_indexed_catch_up(WalletIndexedCatchUpStatus {
                     source,
@@ -129,7 +127,7 @@ impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
 
 impl Drop for WalletIndexedCatchUpStatusGuard<'_> {
     fn drop(&mut self) {
-        if self.enabled {
+        if self.claimed {
             self.handle.clear_indexed_catch_up();
         }
     }
@@ -167,7 +165,7 @@ impl From<SyncError> for WalletStartupSyncError {
 #[derive(Debug)]
 pub(super) struct WalletStartupSyncCandidate {
     pub(super) strategy: WalletStartupSyncStrategy,
-    pub(super) events: Vec<BackfillEvent>,
+    pub(super) applies: Vec<WalletScanApply>,
     pub(super) elapsed_ms: u128,
 }
 
@@ -212,6 +210,8 @@ pub enum ChainError {
     WalletNotFound,
     #[error("wallet reset failed")]
     WalletResetFailed(#[from] mpsc::error::SendError<BackfillEvent>),
+    #[error("wallet reset rejected: {0:?}")]
+    WalletResetRejected(WalletBackfillResetResult),
     #[error("backfill request failed")]
     BackfillRequestFailed(#[from] mpsc::error::SendError<BackfillRequest>),
 }
@@ -246,6 +246,8 @@ pub(super) struct PendingTipWalletRegistration {
     pub(super) cache_key: String,
     pub(super) cfg: WalletConfig,
     pub(super) handle: WalletHandle,
+    pub(super) reset_generation: u64,
+    pub(super) last_scanned: u64,
     pub(super) from_block: u64,
     pub(super) target_block: u64,
 }
@@ -283,4 +285,7 @@ pub struct ChainService {
     pub(super) live_log_task: Mutex<Option<JoinHandle<()>>>,
     pub(super) anchor_last: AtomicU64,
     pub(super) txid_public_cache_started: AtomicBool,
+    pub(super) wallet_actor_next: AtomicU64,
+    pub(super) wallet_reset_intent_next: AtomicU64,
+    pub(super) public_data_epoch: Arc<AtomicU64>,
 }

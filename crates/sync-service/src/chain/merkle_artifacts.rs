@@ -323,7 +323,8 @@ impl MerkleArtifactSession {
             let catalog = client
                 .fetch_catalog(catalog_descriptor)
                 .await
-                .map_err(merkle_artifact_error)?;
+                .map_err(merkle_artifact_error)?
+                .into_catalog();
             for chunk in catalog.chunks.into_iter().filter(|chunk| {
                 chunk.matches(
                     IndexedDatasetKind::MerkleCheckpoint,
@@ -383,7 +384,8 @@ impl MerkleArtifactSession {
             let catalog = client
                 .fetch_catalog(catalog_descriptor)
                 .await
-                .map_err(merkle_artifact_error)?;
+                .map_err(merkle_artifact_error)?
+                .into_catalog();
             for chunk in catalog.chunks.into_iter().filter(|chunk| {
                 chunk.matches(
                     IndexedDatasetKind::Commitments,

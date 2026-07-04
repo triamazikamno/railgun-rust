@@ -49,6 +49,7 @@ pub(crate) struct WalletWorkerServices {
     pub forest: Arc<RwLock<MerkleForest>>,
     pub backfill_tx: mpsc::Sender<crate::types::BackfillRequest>,
     pub backfill_sender: mpsc::Sender<BackfillEvent>,
+    pub public_data_epoch: Arc<AtomicU64>,
 }
 
 pub(super) fn now_epoch_secs() -> u64 {
@@ -59,8 +60,14 @@ pub(super) fn now_epoch_secs() -> u64 {
 
 impl WalletHandle {
     pub async fn wait_until_ready(&mut self) {
-        while !*self.ready_rx.borrow() {
-            if self.ready_rx.changed().await.is_err() {
+        loop {
+            match &*self.readiness_rx.borrow() {
+                WalletReadiness::Ready | WalletReadiness::Failed(_) | WalletReadiness::Shutdown => {
+                    break;
+                }
+                WalletReadiness::Syncing => {}
+            }
+            if self.readiness_rx.changed().await.is_err() {
                 break;
             }
         }
@@ -89,33 +96,49 @@ pub(super) struct WalletPersistState {
 impl WalletPersistState {
     pub(super) fn persist_progress(
         &mut self,
+        db: &DbStore,
         cache_store: &dyn WalletCacheStore,
+        authority: &WalletPrivateMutationAuthority<'_>,
         request: WalletProgressPersist<'_>,
     ) -> Result<bool, WalletCacheError> {
-        if let Some(reset_last_scanned) = self.pending_cache_reset {
-            let reset_started = Instant::now();
-            cache_store.reset_wallet_cache(request.cache_key, reset_last_scanned)?;
-            self.pending_cache_reset = None;
-            self.needs_full_persist = true;
-            debug!(
-                cache_key = %request.cache_key,
-                reset_last_scanned,
-                elapsed_ms = reset_started.elapsed().as_millis(),
-                "reset wallet cache before persisting progress"
-            );
-        }
+        self.persist_progress_with_private_effects(
+            db,
+            cache_store,
+            authority,
+            request,
+            WalletProgressPrivateEffects::default(),
+        )
+    }
 
-        let full_persist = request.changed || self.needs_full_persist;
+    pub(super) fn persist_progress_with_private_effects(
+        &mut self,
+        db: &DbStore,
+        cache_store: &dyn WalletCacheStore,
+        authority: &WalletPrivateMutationAuthority<'_>,
+        request: WalletProgressPersist<'_>,
+        effects: WalletProgressPrivateEffects<'_>,
+    ) -> Result<bool, WalletCacheError> {
+        let full_persist =
+            request.changed || self.needs_full_persist || self.pending_cache_reset.is_some();
         if full_persist {
             let persist_started = Instant::now();
-            return match cache_store.store_wallet_utxos(
-                request.cache_key,
-                request.snapshot,
-                Some(request.last_scanned),
-                request.last_scanned_block_hash,
+            return match cache_store.commit_wallet_private_state(
+                db,
+                WalletPrivateCommit::new(
+                    authority,
+                    effects.pending_output_context_chain_id,
+                    request.snapshot,
+                    true,
+                    request.last_scanned,
+                    request.last_scanned_block_hash,
+                    effects.pending_output_context_updates,
+                    effects.pending_output_context_deletes,
+                    effects.output_poi_recovery_updates,
+                ),
             ) {
                 Ok(()) => {
                     self.needs_full_persist = false;
+                    self.pending_cache_reset = None;
                     debug!(
                         cache_key = %request.cache_key,
                         rows = request.snapshot.len(),
@@ -143,10 +166,19 @@ impl WalletPersistState {
         }
 
         let meta_started = Instant::now();
-        cache_store.update_wallet_meta(
-            request.cache_key,
-            request.last_scanned,
-            request.last_scanned_block_hash,
+        cache_store.commit_wallet_private_state(
+            db,
+            WalletPrivateCommit::new(
+                authority,
+                effects.pending_output_context_chain_id,
+                request.snapshot,
+                false,
+                request.last_scanned,
+                request.last_scanned_block_hash,
+                effects.pending_output_context_updates,
+                effects.pending_output_context_deletes,
+                effects.output_poi_recovery_updates,
+            ),
         )?;
         debug!(
             cache_key = %request.cache_key,
@@ -171,6 +203,7 @@ impl WalletLiveMetadataFlush {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn should_flush(&self, last_scanned: u64, now: Instant) -> bool {
         last_scanned.saturating_sub(self.last_persisted_block) >= WALLET_METADATA_LIVE_FLUSH_BLOCKS
             || now.duration_since(self.last_persisted_at) >= WALLET_METADATA_LIVE_FLUSH_INTERVAL
@@ -191,162 +224,19 @@ pub(super) struct WalletProgressPersist<'a> {
 }
 
 #[derive(Default)]
-pub(super) struct WalletProgressPersistOutcome {
-    pub(super) persisted_full_snapshot: bool,
-    pub(super) persisted_progress: bool,
-}
-
-pub(super) struct WalletSnapshotPersist<'a> {
-    pub(super) cache_store: &'a dyn WalletCacheStore,
-    pub(super) cfg: &'a WalletConfig,
-    pub(super) snapshot: &'a [WalletUtxo],
-    pub(super) last_scanned: u64,
-    pub(super) last_scanned_block_hash: Option<[u8; 32]>,
-    pub(super) changed: bool,
-    pub(super) persist_state: &'a mut WalletPersistState,
-    pub(super) live_metadata_flush: Option<&'a mut WalletLiveMetadataFlush>,
-    pub(super) error_message: &'static str,
-}
-
-pub(super) struct WalletPoiStatusRefreshPersist<'a> {
-    pub(super) cache_store: &'a dyn WalletCacheStore,
-    pub(super) cfg: &'a WalletConfig,
-    pub(super) active_list_keys: &'a [FixedBytes<32>],
-    pub(super) utxos: &'a Arc<RwLock<Vec<WalletUtxo>>>,
-    pub(super) last_scanned: u64,
-    pub(super) persist_state: &'a mut WalletPersistState,
-}
-
-pub(super) fn persist_wallet_snapshot(
-    request: WalletSnapshotPersist<'_>,
-) -> WalletProgressPersistOutcome {
-    let WalletSnapshotPersist {
-        cache_store,
-        cfg,
-        snapshot,
-        last_scanned,
-        last_scanned_block_hash,
-        changed,
-        persist_state,
-        live_metadata_flush,
-        error_message,
-    } = request;
-
-    match persist_state.persist_progress(
-        cache_store,
-        WalletProgressPersist {
-            cache_key: &cfg.cache_key,
-            snapshot,
-            last_scanned,
-            last_scanned_block_hash,
-            changed,
-        },
-    ) {
-        Ok(persisted_full_snapshot) => {
-            if let Some(live_metadata_flush) = live_metadata_flush {
-                live_metadata_flush.mark_persisted(last_scanned, Instant::now());
-            }
-            WalletProgressPersistOutcome {
-                persisted_full_snapshot,
-                persisted_progress: true,
-            }
-        }
-        Err(err) => {
-            warn!(?err, cache_key = %cfg.cache_key, "{error_message}");
-            WalletProgressPersistOutcome::default()
-        }
-    }
-}
-
-pub(super) async fn refresh_wallet_poi_statuses_and_persist(
-    client: &dyn PoiStatusReader,
-    persist: WalletPoiStatusRefreshPersist<'_>,
-    selection: WalletPoiRefreshSelection,
-) -> bool {
-    let started = Instant::now();
-    let selection_label = selection.as_str();
-    let lock_wait_started = Instant::now();
-    let mut locked = persist.utxos.write().await;
-    let lock_wait_elapsed_ms = lock_wait_started.elapsed().as_millis();
-    let changed = refresh_wallet_poi_statuses_selected(
-        client,
-        persist.cfg.chain.chain_id,
-        persist.active_list_keys,
-        &mut locked,
-        selection,
-    )
-    .await;
-    if !changed {
-        debug!(
-            cache_key = %persist.cfg.cache_key,
-            selection = selection_label,
-            changed,
-            lock_wait_elapsed_ms,
-            elapsed_ms = started.elapsed().as_millis(),
-            "wallet POI status refresh persistence skipped"
-        );
-        return false;
-    }
-
-    let persist_started = Instant::now();
-    if let Err(err) = persist.persist_state.persist_progress(
-        persist.cache_store,
-        WalletProgressPersist {
-            cache_key: &persist.cfg.cache_key,
-            snapshot: &locked,
-            last_scanned: persist.last_scanned,
-            last_scanned_block_hash: None,
-            changed: true,
-        },
-    ) {
-        warn!(?err, cache_key = %persist.cfg.cache_key, "failed to persist wallet POI status refresh");
-    }
-    debug!(
-        cache_key = %persist.cfg.cache_key,
-        selection = selection_label,
-        changed,
-        rows = locked.len(),
-        lock_wait_elapsed_ms,
-        persist_elapsed_ms = persist_started.elapsed().as_millis(),
-        elapsed_ms = started.elapsed().as_millis(),
-        "wallet POI status refresh persisted"
-    );
-    true
-}
-
-pub(super) async fn refresh_wallet_poi_statuses_and_persist_with_config(
-    remote_client: &PoiRpcClient,
-    _db: &DbStore,
-    _http_client: Option<&reqwest::Client>,
-    persist: WalletPoiStatusRefreshPersist<'_>,
-    selection: WalletPoiRefreshSelection,
-) -> bool {
-    match &persist.cfg.poi_read_source {
-        PoiReadSource::IndexedArtifacts(_) => {
-            let local_caches = persist
-                .cfg
-                .local_poi_caches
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| {
-                    warn!(
-                        cache_key = %persist.cfg.cache_key,
-                        chain_id = persist.cfg.chain.chain_id,
-                        "artifact POI read source missing local cache handle"
-                    );
-                    Arc::new(RwLock::new(BTreeMap::new()))
-                });
-            let reader = LocalPoiStatusReader::new(local_caches);
-            refresh_wallet_poi_statuses_and_persist(&reader, persist, selection).await
-        }
-        PoiReadSource::PoiProxy => {
-            refresh_wallet_poi_statuses_and_persist(remote_client, persist, selection).await
-        }
-    }
+pub(super) struct WalletProgressPrivateEffects<'a> {
+    pub(super) pending_output_context_chain_id: u64,
+    pub(super) pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
+    pub(super) pending_output_context_deletes: &'a [FixedBytes<32>],
+    pub(super) output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
 }
 
 pub(super) struct OutputPoiRecoveryRun<'a> {
+    pub(super) worker_handle: &'a WalletHandle,
+    pub(super) reset_generation: u64,
+    pub(super) cancel: &'a CancellationToken,
     pub(super) db: &'a DbStore,
+    pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
     pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
@@ -364,9 +254,30 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
     if run.cfg.spending_public_key.is_none() || run.cfg.poi_recovery_prover.is_none() {
         return 0;
     }
+    let authority = WalletPrivateMutationAuthority {
+        handle: run.worker_handle,
+        reset_generation: run.reset_generation,
+        cancel: run.cancel,
+    };
+    let guard = match authority.acquire().await {
+        Ok(guard) => guard,
+        Err(reason) => {
+            debug!(?reason, cache_key = %run.cfg.cache_key, "output POI recovery skipped");
+            return 0;
+        }
+    };
     let snapshot = run.utxos.read().await.clone();
-    mark_valid_output_poi_recoveries(run.db, run.cfg, &snapshot, run.active_list_keys);
+    mark_valid_output_poi_recoveries(
+        &authority,
+        run.db,
+        run.cache_store,
+        run.cfg,
+        &snapshot,
+        run.active_list_keys,
+    )
+    .await;
     if output_poi_recovery_candidates(&snapshot, run.active_list_keys).is_empty() {
+        drop(guard);
         return 0;
     }
     let forest = run.forest.read().await.clone();
@@ -395,8 +306,10 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
     } else {
         proof_source = run.client;
     }
-    recover_missing_output_pois(OutputPoiRecoveryRequest {
+    let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
+        authority: &authority,
         db: run.db,
+        cache_store: run.cache_store,
         cfg: run.cfg,
         rpcs: run.rpcs,
         http_client: run.http_client,
@@ -410,5 +323,7 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
         wallet_utxos: &snapshot,
         force_retry: run.force_retry,
     })
-    .await
+    .await;
+    drop(guard);
+    recovered
 }

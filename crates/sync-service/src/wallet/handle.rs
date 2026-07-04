@@ -2,7 +2,9 @@ pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
 pub const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_secs(60);
 pub(super) const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const WALLET_POI_LIVE_TAIL_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
 pub(super) const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
 pub(super) const WALLET_METADATA_LIVE_FLUSH_BLOCKS: u64 = 25;
 pub(super) const LOCAL_PENDING_SPENT_TTL: Duration = Duration::from_secs(10 * 60);
 pub(super) const OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -15,6 +17,7 @@ pub(super) const OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES: u64 = 128;
 pub(super) const OUTPUT_POI_RECOVERY_VERIFY_PROOF: bool = true;
 pub(super) const OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER: Duration = Duration::from_secs(5);
 pub(super) const EVM_CHAIN_TYPE: u8 = 0;
+pub(super) const RETIRED_WALLET_ACTOR_ID: u64 = 0;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum WalletPoiRefreshSelection {
@@ -80,19 +83,67 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
     pub cache_key: String,
-    pub utxos: Arc<RwLock<Vec<WalletUtxo>>>,
-    pub pending_overlay: Arc<RwLock<WalletPendingOverlay>>,
+    pub(super) actor_id: u64,
+    pub(super) active_actor_id: Arc<AtomicU64>,
+    pub(super) authority_lock: Arc<Mutex<()>>,
+    pub(super) utxos: Arc<RwLock<Vec<WalletUtxo>>>,
+    pub(super) pending_overlay: Arc<RwLock<WalletPendingOverlay>>,
     pub(super) last_scanned: Arc<AtomicU64>,
     pub(super) reset_generation: Arc<AtomicU64>,
     pub ready_rx: watch::Receiver<bool>,
+    pub readiness_rx: watch::Receiver<WalletReadiness>,
     pub rev_rx: watch::Receiver<u64>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
     pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
+    pub(super) indexed_catch_up_active: Arc<AtomicBool>,
     pub(super) poi_read_source: PoiReadSource,
     pub(super) local_poi_caches: Option<WalletLocalPoiCaches>,
+    pub(super) pending_overlay_tx: mpsc::Sender<WalletPendingOverlayRequest>,
     pub(super) poi_refresh_tx: mpsc::Sender<WalletPoiRefreshRequest>,
     pub(super) rev_tx: watch::Sender<u64>,
     pub(super) indexed_catch_up_tx: watch::Sender<Option<WalletIndexedCatchUpStatus>>,
+}
+
+#[derive(Debug)]
+pub(super) struct WalletPendingOverlayRequest {
+    pub(super) overlay: WalletPendingOverlay,
+    pub(super) reset_generation: u64,
+    pub(super) last_scanned: u64,
+}
+
+pub(crate) struct WalletPrivateMutationAuthority<'a> {
+    pub(super) handle: &'a WalletHandle,
+    pub(super) reset_generation: u64,
+    pub(super) cancel: &'a CancellationToken,
+}
+
+impl WalletPrivateMutationAuthority<'_> {
+    pub(crate) fn wallet_id(&self) -> &str {
+        &self.handle.cache_key
+    }
+
+    pub(super) async fn acquire(&self) -> Result<OwnedMutexGuard<()>, WalletBackfillRejectReason> {
+        if self.cancel.is_cancelled() {
+            return Err(WalletBackfillRejectReason::Shutdown);
+        }
+        let guard = self.handle.actor_authority(self.reset_generation).await?;
+        self.revalidate()?;
+        Ok(guard)
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), WalletBackfillRejectReason> {
+        if self.cancel.is_cancelled() || !self.handle.is_current_actor() {
+            return Err(WalletBackfillRejectReason::Shutdown);
+        }
+        let current_reset_generation = self.handle.reset_generation();
+        if current_reset_generation != self.reset_generation {
+            return Err(WalletBackfillRejectReason::StaleGeneration {
+                expected: current_reset_generation,
+                actual: self.reset_generation,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,6 +178,7 @@ impl WalletPendingSpent {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn submitted(utxo: &Utxo, tx_hash: Option<FixedBytes<32>>, now: u64) -> Self {
         Self {
             tree: utxo.tree,
@@ -139,6 +191,42 @@ impl WalletPendingSpent {
 }
 
 impl WalletHandle {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn actor_id(&self) -> u64 {
+        self.actor_id
+    }
+
+    #[must_use]
+    pub(super) fn is_current_actor(&self) -> bool {
+        self.actor_id != RETIRED_WALLET_ACTOR_ID
+            && self.active_actor_id.load(Ordering::Acquire) == self.actor_id
+    }
+
+    pub(super) async fn actor_authority(
+        &self,
+        expected_reset_generation: u64,
+    ) -> Result<OwnedMutexGuard<()>, WalletBackfillRejectReason> {
+        let guard = Arc::clone(&self.authority_lock).lock_owned().await;
+        if !self.is_current_actor() {
+            return Err(WalletBackfillRejectReason::Shutdown);
+        }
+        let current_reset_generation = self.reset_generation();
+        if current_reset_generation != expected_reset_generation {
+            return Err(WalletBackfillRejectReason::StaleGeneration {
+                expected: current_reset_generation,
+                actual: expected_reset_generation,
+            });
+        }
+        Ok(guard)
+    }
+
+    pub(crate) async fn retire_actor(&self) {
+        let _guard = self.authority_lock.lock().await;
+        self.active_actor_id
+            .store(RETIRED_WALLET_ACTOR_ID, Ordering::Release);
+    }
+
     #[must_use]
     pub fn last_scanned(&self) -> u64 {
         self.last_scanned.load(Ordering::Relaxed)
@@ -149,14 +237,26 @@ impl WalletHandle {
     }
 
     #[must_use]
+    pub fn readiness(&self) -> WalletReadiness {
+        self.readiness_rx.borrow().clone()
+    }
+
+    #[must_use]
     pub(crate) fn reset_generation(&self) -> u64 {
         self.reset_generation.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn advance_reset_generation(&self) -> u64 {
-        self.reset_generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1)
+    #[cfg(test)]
+    pub(crate) async fn advance_reset_generation(&self) -> Option<u64> {
+        let _guard = self.authority_lock.lock().await;
+        if !self.is_current_actor() {
+            return None;
+        }
+        Some(
+            self.reset_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1),
+        )
     }
 
     pub(super) fn set_reset_generation(&self, generation: u64) {
@@ -169,7 +269,14 @@ impl WalletHandle {
         }
     }
 
+    pub(crate) fn try_claim_indexed_catch_up(&self) -> bool {
+        self.indexed_catch_up_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub(crate) fn clear_indexed_catch_up(&self) {
+        self.indexed_catch_up_active.store(false, Ordering::Release);
         if let Err(err) = self.indexed_catch_up_tx.send(None) {
             debug!(?err, cache_key = %self.cache_key, "failed to clear indexed wallet catch-up status");
         }
@@ -179,7 +286,28 @@ impl WalletHandle {
         self.pending_overlay.read().await.clone()
     }
 
-    pub async fn clear_local_pending_spent(&self) -> bool {
+    pub(crate) async fn request_pending_overlay_update(
+        &self,
+        overlay: WalletPendingOverlay,
+        reset_generation: u64,
+        last_scanned: u64,
+    ) -> bool {
+        self.pending_overlay_tx
+            .send(WalletPendingOverlayRequest {
+                overlay,
+                reset_generation,
+                last_scanned,
+            })
+            .await
+            .is_ok()
+    }
+
+    pub async fn utxos_snapshot(&self) -> Vec<WalletUtxo> {
+        self.utxos.read().await.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_local_pending_spent(&self) -> bool {
         let changed = {
             let mut overlay = self.pending_overlay.write().await;
             let changed = !overlay.local_pending_spent.is_empty();
@@ -190,7 +318,12 @@ impl WalletHandle {
         changed
     }
 
-    pub async fn mark_pending_spent_utxos(&self, utxos: &[Utxo], tx_hash: Option<FixedBytes<32>>) {
+    #[cfg(test)]
+    pub(crate) async fn mark_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: Option<FixedBytes<32>>,
+    ) {
         if utxos.is_empty() {
             return;
         }
@@ -237,7 +370,7 @@ impl WalletHandle {
         self.notify_if_changed(changed);
     }
 
-    pub(crate) async fn set_chain_pending_overlay(&self, next: WalletPendingOverlay) {
+    pub(super) async fn set_chain_pending_overlay(&self, next: WalletPendingOverlay) {
         let now = now_epoch_secs();
         let confirmed_spent: HashSet<_> = {
             let utxos = self.utxos.read().await;

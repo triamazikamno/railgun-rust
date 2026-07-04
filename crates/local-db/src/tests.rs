@@ -249,7 +249,11 @@ fn pending_output_poi_context_roundtrip_and_listing() {
         .expect("store pending output POI context");
 
     let loaded = store
-        .get_pending_output_poi_context(record.chain_id, &record.output_commitment)
+        .get_pending_output_poi_context(
+            record.chain_id,
+            &record.wallet_id,
+            &record.output_commitment,
+        )
         .expect("load pending output POI context")
         .expect("record present");
     assert_eq!(loaded.wallet_id, record.wallet_id);
@@ -262,22 +266,36 @@ fn pending_output_poi_context_roundtrip_and_listing() {
     assert!(loaded.terminal_error.is_none());
 
     let records = store
-        .list_pending_output_poi_contexts(record.chain_id)
+        .list_pending_output_poi_contexts(record.chain_id, &record.wallet_id)
         .expect("list pending output POI contexts");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].output_commitment, record.output_commitment);
     assert!(
         store
-            .list_pending_output_poi_contexts(2)
+            .list_pending_output_poi_contexts(2, &record.wallet_id)
             .expect("list other chain pending output POI contexts")
             .is_empty()
     );
+    assert!(
+        store
+            .list_pending_output_poi_contexts(record.chain_id, "other-wallet")
+            .expect("list other wallet pending output POI contexts")
+            .is_empty()
+    );
     store
-        .delete_pending_output_poi_context(record.chain_id, &record.output_commitment)
+        .delete_pending_output_poi_context(
+            record.chain_id,
+            &record.wallet_id,
+            &record.output_commitment,
+        )
         .expect("delete pending output POI context");
     assert!(
         store
-            .get_pending_output_poi_context(record.chain_id, &record.output_commitment)
+            .get_pending_output_poi_context(
+                record.chain_id,
+                &record.wallet_id,
+                &record.output_commitment,
+            )
             .expect("load deleted pending output POI context")
             .is_none()
     );

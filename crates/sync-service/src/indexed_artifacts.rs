@@ -15,8 +15,9 @@ pub use railgun_indexed_artifacts::{
     IndexedArtifactCatalog, IndexedArtifactChainEntry, IndexedArtifactChunkEnvelope,
     IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection, IndexedArtifactDescriptor,
     IndexedArtifactError, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
-    IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm,
-    format_scope,
+    IndexedArtifactStreamCatalog, IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactStreamPlanError, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
+    LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm, format_scope,
 };
 
 use crate::trustless_artifacts::{TrustlessArtifactError, TrustlessArtifactFetcher};
@@ -26,6 +27,24 @@ use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
 pub struct VerifiedIndexedArtifactChunk {
     pub descriptor: IndexedArtifactDescriptor,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedIndexedArtifactCatalog {
+    pub descriptor: IndexedArtifactDescriptor,
+    pub catalog: IndexedArtifactCatalog,
+}
+
+impl VerifiedIndexedArtifactCatalog {
+    #[must_use]
+    pub fn into_stream_catalog(self) -> IndexedArtifactStreamCatalog {
+        IndexedArtifactStreamCatalog::new(self.descriptor, self.catalog.chunks)
+    }
+
+    #[must_use]
+    pub fn into_catalog(self) -> IndexedArtifactCatalog {
+        self.catalog
+    }
 }
 
 struct FetchedIndexedArtifactChunk {
@@ -271,7 +290,7 @@ impl IndexedArtifactManifestClient {
     pub async fn fetch_catalog(
         &self,
         descriptor: &IndexedArtifactDescriptor,
-    ) -> Result<IndexedArtifactCatalog, IndexedArtifactManifestError> {
+    ) -> Result<VerifiedIndexedArtifactCatalog, IndexedArtifactManifestError> {
         validate_catalog_descriptor_for_expansion(descriptor)?;
         let started = Instant::now();
         let bytes = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
@@ -319,7 +338,10 @@ impl IndexedArtifactManifestClient {
             elapsed_ms = started.elapsed().as_millis(),
             "fetched verified indexed artifact catalog"
         );
-        Ok(catalog)
+        Ok(VerifiedIndexedArtifactCatalog {
+            descriptor: descriptor.clone(),
+            catalog,
+        })
     }
 
     pub async fn fetch_chunks_bounded(
@@ -817,7 +839,11 @@ fn validate_catalog_descriptor_aggregate(
             )?;
     }
 
-    if descriptor.range.start != aggregate_start || descriptor.range.end != aggregate_end {
+    let allows_sparse_chunks = descriptor.dataset_kind == IndexedDatasetKind::WalletScan
+        && descriptor.range.kind == IndexedArtifactRangeKind::Block;
+    if !allows_sparse_chunks
+        && (descriptor.range.start != aggregate_start || descriptor.range.end != aggregate_end)
+    {
         return Err(
             IndexedArtifactManifestError::CatalogAggregateRangeMismatch {
                 expected_start: descriptor.range.start,
@@ -1028,6 +1054,19 @@ pub enum IndexedArtifactManifestError {
     ChunkUncompressedLengthMismatch { expected: u64, actual: u64 },
     #[error("indexed artifact chunk section {section_id} range overflows u64")]
     ChunkSectionRangeOverflow { section_id: u16 },
+    #[error("indexed artifact chunk section {section_id} appears more than once")]
+    ChunkDuplicateSection { section_id: u16 },
+    #[error(
+        "indexed artifact chunk section {second_section_id} byte range [{second_start}, {second_end}) overlaps section {first_section_id} byte range [{first_start}, {first_end})"
+    )]
+    ChunkOverlappingSections {
+        first_section_id: u16,
+        first_start: u64,
+        first_end: u64,
+        second_section_id: u16,
+        second_start: u64,
+        second_end: u64,
+    },
     #[error(
         "indexed artifact chunk section {section_id} is out of bounds: offset {offset}, length {byte_length}, payload length {payload_len}"
     )]
@@ -1228,6 +1267,24 @@ impl From<IndexedArtifactChunkError> for IndexedArtifactManifestError {
             IndexedArtifactChunkError::TooManySections { count } => Self::ChunkFormat {
                 message: format!("chunk has {count} sections, exceeding u16"),
             },
+            IndexedArtifactChunkError::DuplicateSection { section_id } => {
+                Self::ChunkDuplicateSection { section_id }
+            }
+            IndexedArtifactChunkError::OverlappingSections {
+                first_section_id,
+                first_start,
+                first_end,
+                second_section_id,
+                second_start,
+                second_end,
+            } => Self::ChunkOverlappingSections {
+                first_section_id,
+                first_start,
+                first_end,
+                second_section_id,
+                second_start,
+                second_end,
+            },
             IndexedArtifactChunkError::UncompressedLengthMismatch { expected, actual } => {
                 Self::ChunkUncompressedLengthMismatch { expected, actual }
             }
@@ -1269,7 +1326,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use libp2p_identity::Keypair;
     use multihash_codetable::{Code, MultihashDigest};
-    use railgun_indexed_artifacts::{IndexedArtifactStreamPlan, IndexedArtifactStreamPlanRequest};
+    use railgun_indexed_artifacts::{
+        IndexedArtifactStreamCatalog, IndexedArtifactStreamPlan, IndexedArtifactStreamPlanRequest,
+    };
     use url::Url;
 
     const LIBP2P_KEY_CODEC: u64 = 0x72;
@@ -1586,14 +1645,30 @@ mod tests {
     #[test]
     fn catalog_verification_rejects_aggregate_range_mismatch() {
         let scope = scope();
+        let chunk = chunk_descriptor_for_dataset(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            scope.clone(),
+            0,
+            50,
+        );
         let catalog = IndexedArtifactCatalog {
             format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
-            dataset_kind: IndexedDatasetKind::WalletScan,
+            dataset_kind: IndexedDatasetKind::PublicTxid,
             scope: scope.clone(),
-            chunks: vec![chunk_descriptor(scope.clone(), 0, 50)],
+            chunks: vec![chunk.clone()],
         };
         let bytes = serde_json::to_vec(&catalog).expect("catalog json");
-        let descriptor = catalog_descriptor(scope, 0, 100, &bytes);
+        let descriptor = catalog_descriptor_for_dataset_with_metadata(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            scope,
+            0,
+            100,
+            chunk.row_count,
+            &bytes,
+            catalog_metadata(1),
+        );
 
         let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("aggregate range rejected");
 
@@ -1601,6 +1676,52 @@ mod tests {
             err,
             IndexedArtifactManifestError::CatalogAggregateRangeMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn catalog_verification_accepts_sparse_wallet_scan_catalog_coverage() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: vec![chunk_descriptor(scope.clone(), 150, 180)],
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let descriptor = catalog_descriptor_with_metadata(
+            scope.clone(),
+            100,
+            200,
+            5,
+            &bytes,
+            catalog_metadata(1),
+        );
+
+        let verified = verify_catalog_bytes(&descriptor, &bytes).expect("sparse catalog verifies");
+        let plan = IndexedArtifactStreamPlan::plan(
+            &[IndexedArtifactStreamCatalog::new(
+                descriptor.clone(),
+                verified.chunks,
+            )],
+            &IndexedArtifactStreamPlanRequest::new(
+                IndexedDatasetKind::WalletScan,
+                scope,
+                IndexedArtifactRangeKind::Block,
+                100,
+                200,
+                IndexedArtifactStreamPartitionPolicy::Ignore,
+            ),
+        )
+        .expect("sparse catalog remains plannable");
+
+        assert_eq!(plan.required_current_chunks.len(), 1);
+        assert_eq!(plan.required_current_chunks[0].range.start, 150);
+        assert_eq!(plan.required_current_chunks[0].range.end, 180);
+        assert!(
+            plan.required_current_coverage
+                .iter()
+                .any(|coverage| { coverage.range.start == 100 && coverage.range.end == 200 })
+        );
     }
 
     #[test]
@@ -1710,24 +1831,28 @@ mod tests {
         assert!(!list_b_metadata.chunk_sealed);
 
         let plan = IndexedArtifactStreamPlan::plan(
-            &verified.chunks,
+            &[IndexedArtifactStreamCatalog::new(
+                descriptor,
+                verified.chunks,
+            )],
             &IndexedArtifactStreamPlanRequest::new(
                 IndexedDatasetKind::PublicTxid,
                 scope,
                 IndexedArtifactRangeKind::TxidIndex,
                 0,
                 9,
+                IndexedArtifactStreamPartitionPolicy::Exact("list-a".to_string()),
             ),
         )
         .expect("verified catalog partitions remain independently plannable");
 
-        assert_eq!(plan.required_current.len(), 2);
+        assert_eq!(plan.required_current_chunks.len(), 1);
         assert_eq!(
-            plan.required_current
+            plan.required_current_chunks
                 .iter()
                 .map(|chunk| chunk.metadata.stream_partition.as_deref())
                 .collect::<Vec<_>>(),
-            vec![Some("list-a"), Some("list-b")]
+            vec![Some("list-a")]
         );
     }
 

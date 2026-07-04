@@ -1,16 +1,23 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, FixedBytes, U256, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
-use local_db::{DbStore, WalletMeta};
+use local_db::{DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, WalletMeta};
 use poi::cache::PoiCache;
-use railgun_wallet::scan::{WalletLogDelta, WalletScanKeys};
-use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError};
+#[cfg(test)]
+use railgun_wallet::scan::WalletLogDelta;
+use railgun_wallet::scan::{
+    IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
+    IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
+    WalletScanKeys,
+};
+use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError, serialize_wallet_utxo};
 use railgun_wallet::{ProverService, WalletUtxo};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use url::Url;
 
 use crate::indexed_artifacts::{ChainScope, ChainType};
@@ -503,63 +510,128 @@ fn default_rpc_urls(urls: &[&str]) -> Vec<Url> {
         .collect()
 }
 
-pub trait WalletCacheStore: Send + Sync {
-    fn store_wallet_utxos(
-        &self,
-        wallet_id: &str,
-        utxos: &[WalletUtxo],
-        last_scanned_block: Option<u64>,
+pub struct WalletPrivateCommit<'a> {
+    wallet_id: &'a str,
+    utxos: &'a [WalletUtxo],
+    replace_wallet_utxos: bool,
+    last_scanned_block: u64,
+    last_scanned_block_hash: Option<[u8; 32]>,
+    pending_output_context_chain_id: u64,
+    pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
+    pending_output_context_deletes: &'a [FixedBytes<32>],
+    output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+}
+
+impl<'a> WalletPrivateCommit<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        authority: &'a crate::wallet::WalletPrivateMutationAuthority<'_>,
+        chain_id: u64,
+        utxos: &'a [WalletUtxo],
+        replace_wallet_utxos: bool,
+        last_scanned_block: u64,
         last_scanned_block_hash: Option<[u8; 32]>,
+        pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
+        pending_output_context_deletes: &'a [FixedBytes<32>],
+        output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+    ) -> Self {
+        Self {
+            wallet_id: authority.wallet_id(),
+            utxos,
+            replace_wallet_utxos,
+            last_scanned_block,
+            last_scanned_block_hash,
+            pending_output_context_chain_id: chain_id,
+            pending_output_context_updates,
+            pending_output_context_deletes,
+            output_poi_recovery_updates,
+        }
+    }
+
+    #[must_use]
+    pub const fn wallet_id(&self) -> &str {
+        self.wallet_id
+    }
+
+    #[must_use]
+    pub const fn utxos(&self) -> &[WalletUtxo] {
+        self.utxos
+    }
+
+    #[must_use]
+    pub const fn replace_wallet_utxos(&self) -> bool {
+        self.replace_wallet_utxos
+    }
+
+    #[must_use]
+    pub const fn last_scanned_block(&self) -> u64 {
+        self.last_scanned_block
+    }
+
+    #[must_use]
+    pub const fn last_scanned_block_hash(&self) -> Option<[u8; 32]> {
+        self.last_scanned_block_hash
+    }
+
+    #[must_use]
+    pub const fn pending_output_context_chain_id(&self) -> u64 {
+        self.pending_output_context_chain_id
+    }
+
+    #[must_use]
+    pub const fn pending_output_context_updates(&self) -> &[PendingOutputPoiContextRecord] {
+        self.pending_output_context_updates
+    }
+
+    #[must_use]
+    pub const fn pending_output_context_deletes(&self) -> &[FixedBytes<32>] {
+        self.pending_output_context_deletes
+    }
+
+    #[must_use]
+    pub const fn output_poi_recovery_updates(&self) -> &[OutputPoiRecoveryRecord] {
+        self.output_poi_recovery_updates
+    }
+}
+
+pub trait WalletCacheStore: Send + Sync {
+    fn commit_wallet_private_state(
+        &self,
+        db: &DbStore,
+        commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError>;
 
     fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
 
     fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError>;
-
-    fn update_wallet_meta(
-        &self,
-        wallet_id: &str,
-        last_scanned_block: u64,
-        last_scanned_block_hash: Option<[u8; 32]>,
-    ) -> Result<(), WalletCacheError>;
-
-    fn reset_wallet_cache(
-        &self,
-        wallet_id: &str,
-        last_scanned_block: u64,
-    ) -> Result<(), WalletCacheError>;
-
-    fn replace_wallet_cache(
-        &self,
-        wallet_id: &str,
-        utxos: &[WalletUtxo],
-        last_scanned_block: u64,
-        last_scanned_block_hash: Option<[u8; 32]>,
-    ) -> Result<(), WalletCacheError> {
-        self.store_wallet_utxos(
-            wallet_id,
-            utxos,
-            Some(last_scanned_block),
-            last_scanned_block_hash,
-        )
-    }
 }
 
 impl WalletCacheStore for DbStore {
-    fn store_wallet_utxos(
+    fn commit_wallet_private_state(
         &self,
-        wallet_id: &str,
-        utxos: &[WalletUtxo],
-        last_scanned_block: Option<u64>,
-        last_scanned_block_hash: Option<[u8; 32]>,
+        _db: &DbStore,
+        commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
-        WalletCacheDbExt::store_wallet_utxos(
-            self,
-            wallet_id,
-            utxos,
-            last_scanned_block,
-            last_scanned_block_hash,
-        )
+        let utxo_entries = if commit.replace_wallet_utxos() {
+            Some(wallet_utxo_entries(commit.utxos())?)
+        } else {
+            None
+        };
+        let meta = WalletMeta {
+            last_scanned_block: commit.last_scanned_block(),
+            updated_at: wallet_cache_now_epoch_secs()?,
+            last_scanned_block_hash: commit.last_scanned_block_hash(),
+        };
+        self.batch_commit_wallet_private_state(
+            commit.wallet_id(),
+            utxo_entries.as_deref(),
+            Some(&meta),
+            commit.pending_output_context_updates(),
+            commit.pending_output_context_chain_id(),
+            commit.pending_output_context_deletes(),
+            commit.output_poi_recovery_updates(),
+        )?;
+        Ok(())
     }
 
     fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
@@ -569,40 +641,25 @@ impl WalletCacheStore for DbStore {
     fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
         Ok(DbStore::get_wallet_meta(self, wallet_id)?)
     }
+}
 
-    fn update_wallet_meta(
-        &self,
-        wallet_id: &str,
-        last_scanned_block: u64,
-        last_scanned_block_hash: Option<[u8; 32]>,
-    ) -> Result<(), WalletCacheError> {
-        self.put_wallet_meta(
-            wallet_id,
-            &WalletMeta {
-                last_scanned_block,
-                updated_at: 0,
-                last_scanned_block_hash,
-            },
-        )?;
-        Ok(())
-    }
+fn wallet_utxo_entries(utxos: &[WalletUtxo]) -> Result<Vec<(String, Vec<u8>)>, WalletCacheError> {
+    utxos
+        .iter()
+        .map(|utxo| {
+            Ok((
+                format!("{}:{}", utxo.utxo.tree, utxo.utxo.position),
+                serialize_wallet_utxo(utxo)?,
+            ))
+        })
+        .collect()
+}
 
-    fn reset_wallet_cache(
-        &self,
-        wallet_id: &str,
-        last_scanned_block: u64,
-    ) -> Result<(), WalletCacheError> {
-        self.batch_store_wallet_utxos(
-            wallet_id,
-            &[],
-            Some(&WalletMeta {
-                last_scanned_block,
-                updated_at: 0,
-                last_scanned_block_hash: None,
-            }),
-        )?;
-        Ok(())
-    }
+fn wallet_cache_now_epoch_secs() -> Result<u64, std::io::Error> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(std::io::Error::other)
 }
 
 #[derive(Clone)]
@@ -774,32 +831,322 @@ pub struct LogBatch {
 
 pub type SharedLogBatch = Arc<LogBatch>;
 
-#[derive(Debug, Clone)]
-pub enum BackfillEvent {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicDataPlaneEpoch {
+    pub value: u64,
+}
+
+impl PublicDataPlaneEpoch {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self { value }
+    }
+}
+
+#[derive(Clone)]
+pub struct WalletIndexedScanRows {
+    pub transact_commitments: Vec<IndexedTransactCommitmentInput>,
+    pub shield_commitments: Vec<IndexedShieldCommitmentInput>,
+    pub legacy_encrypted_commitments: Vec<IndexedLegacyEncryptedCommitmentInput>,
+    pub legacy_generated_commitments: Vec<IndexedLegacyGeneratedCommitmentInput>,
+    pub nullifiers: Vec<IndexedNullifierInput>,
+    pub source: WalletIndexedCatchUpSource,
+}
+
+impl fmt::Debug for WalletIndexedScanRows {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletIndexedScanRows")
+            .field("transact_commitments", &self.transact_commitments.len())
+            .field("shield_commitments", &self.shield_commitments.len())
+            .field(
+                "legacy_encrypted_commitments",
+                &self.legacy_encrypted_commitments.len(),
+            )
+            .field(
+                "legacy_generated_commitments",
+                &self.legacy_generated_commitments.len(),
+            )
+            .field("nullifiers", &self.nullifiers.len())
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum WalletScanPayload {
     Logs(SharedLogBatch),
-    LogsAtGeneration {
-        batch: SharedLogBatch,
-        reset_generation: u64,
+    IndexedRows {
+        from_block: u64,
+        to_block: u64,
+        rows: Box<WalletIndexedScanRows>,
+        source: WalletIndexedCatchUpSource,
     },
-    IndexedDelta {
+    #[cfg(test)]
+    IndexedDeltaForTest {
         from_block: u64,
         to_block: u64,
         delta: Box<WalletLogDelta>,
-        reset_generation: Option<u64>,
+        source: WalletIndexedCatchUpSource,
     },
-    Checkpoint {
-        last_block: u64,
+}
+
+#[derive(Debug)]
+pub struct WalletScanApply {
+    pub from_block: u64,
+    pub to_block: u64,
+    pub payload: WalletScanPayload,
+    pub data_epoch: PublicDataPlaneEpoch,
+}
+
+impl WalletScanApply {
+    #[must_use]
+    pub const fn new(
+        from_block: u64,
+        to_block: u64,
+        payload: WalletScanPayload,
+        data_epoch: PublicDataPlaneEpoch,
+    ) -> Self {
+        Self {
+            from_block,
+            to_block,
+            payload,
+            data_epoch,
+        }
+    }
+
+    #[must_use]
+    pub fn logs(
+        from_block: u64,
+        to_block: u64,
+        batch: SharedLogBatch,
+        data_epoch: PublicDataPlaneEpoch,
+    ) -> Self {
+        Self::new(
+            from_block,
+            to_block,
+            WalletScanPayload::Logs(batch),
+            data_epoch,
+        )
+    }
+
+    #[must_use]
+    pub fn indexed_rows(
+        from_block: u64,
+        to_block: u64,
+        rows: WalletIndexedScanRows,
+        data_epoch: PublicDataPlaneEpoch,
+        source: WalletIndexedCatchUpSource,
+    ) -> Self {
+        Self::new(
+            from_block,
+            to_block,
+            WalletScanPayload::IndexedRows {
+                from_block,
+                to_block,
+                rows: Box::new(rows),
+                source,
+            },
+            data_epoch,
+        )
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn indexed_delta_for_test(
+        from_block: u64,
+        to_block: u64,
+        delta: WalletLogDelta,
+        data_epoch: PublicDataPlaneEpoch,
+        source: WalletIndexedCatchUpSource,
+    ) -> Self {
+        Self::new(
+            from_block,
+            to_block,
+            WalletScanPayload::IndexedDeltaForTest {
+                from_block,
+                to_block,
+                delta: Box::new(delta),
+                source,
+            },
+            data_epoch,
+        )
+    }
+}
+
+impl WalletScanPayload {
+    #[must_use]
+    pub fn covers(&self, from_block: u64, to_block: u64) -> bool {
+        match self {
+            Self::Logs(batch) => batch.from_block <= from_block && batch.to_block >= to_block,
+            Self::IndexedRows {
+                from_block: payload_from,
+                to_block: payload_to,
+                ..
+            } => *payload_from == from_block && *payload_to == to_block,
+            #[cfg(test)]
+            Self::IndexedDeltaForTest {
+                from_block: payload_from,
+                to_block: payload_to,
+                ..
+            } => *payload_from == from_block && *payload_to == to_block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletBackfillRejectReason {
+    StaleGeneration {
+        expected: u64,
+        actual: u64,
     },
-    Done {
-        last_block: u64,
+    NonContiguous {
+        expected_from: u64,
+        actual_from: u64,
     },
-    DoneAtGeneration {
-        last_block: u64,
+    ApplyFailed,
+    PersistenceFailed,
+    TargetNotReached {
+        target_block: u64,
+    },
+    TargetExceeded {
+        target_block: u64,
+        requested_to: u64,
+    },
+    Shutdown,
+    StaleDataPlaneEpoch {
+        expected: u64,
+        actual: u64,
+    },
+    StaleResetIntent {
+        accepted: u64,
+        actual: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletBackfillApplyResult {
+    Committed {
+        committed_to: u64,
+    },
+    AlreadyCovered {
+        committed_to: u64,
+    },
+    Rejected {
+        committed_to: u64,
+        reason: WalletBackfillRejectReason,
+    },
+}
+
+impl WalletBackfillApplyResult {
+    #[must_use]
+    pub const fn committed_to(&self) -> u64 {
+        match self {
+            Self::Committed { committed_to }
+            | Self::AlreadyCovered { committed_to }
+            | Self::Rejected { committed_to, .. } => *committed_to,
+        }
+    }
+
+    #[must_use]
+    pub const fn accepted_committed_to(&self) -> Option<u64> {
+        match self {
+            Self::Committed { committed_to } | Self::AlreadyCovered { committed_to } => {
+                Some(*committed_to)
+            }
+            Self::Rejected { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletBackfillFinishResult {
+    Ready {
+        committed_to: u64,
+    },
+    Rejected {
+        committed_to: u64,
+        reason: WalletBackfillRejectReason,
+    },
+}
+
+impl WalletBackfillFinishResult {
+    #[must_use]
+    pub const fn committed_to(&self) -> u64 {
+        match self {
+            Self::Ready { committed_to } | Self::Rejected { committed_to, .. } => *committed_to,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletBackfillResetResult {
+    Accepted {
         reset_generation: u64,
+        committed_to: u64,
+        committed: bool,
+    },
+    Rejected {
+        committed_to: u64,
+        reason: WalletBackfillRejectReason,
+    },
+}
+
+impl WalletBackfillResetResult {
+    #[must_use]
+    pub const fn reset_generation(&self) -> Option<u64> {
+        match self {
+            Self::Accepted {
+                reset_generation, ..
+            } => Some(*reset_generation),
+            Self::Rejected { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletReadinessError {
+    BackfillUnavailable,
+    TargetNotReached { target_block: u64 },
+    PersistenceFailed,
+    ApplyFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletReadiness {
+    Syncing,
+    Ready,
+    Failed(WalletReadinessError),
+    Shutdown,
+}
+
+impl WalletReadiness {
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Ready | Self::Failed(_) | Self::Shutdown)
+    }
+}
+
+#[derive(Debug)]
+pub enum BackfillEvent {
+    Apply {
+        apply: WalletScanApply,
+        reset_generation: u64,
+        response: oneshot::Sender<WalletBackfillApplyResult>,
+    },
+    Target {
+        target_block: u64,
+        reset_generation: u64,
+        response: oneshot::Sender<WalletBackfillFinishResult>,
     },
     Reset {
+        intent_id: u64,
         from_block: u64,
-        reset_generation: u64,
+        response: oneshot::Sender<WalletBackfillResetResult>,
     },
 }
 

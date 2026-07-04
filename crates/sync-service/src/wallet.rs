@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -25,7 +25,7 @@ use railgun_wallet::tx::{
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::{RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
@@ -41,7 +41,7 @@ use poi::poi::{
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
 };
 use railgun_wallet::scan::{
-    CommitmentObservation, WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
+    CommitmentObservation, WalletLogDelta, parse_indexed_wallet_delta, parse_wallet_delta_from_logs,
 };
 use railgun_wallet::wallet_cache::WalletCacheError;
 use railgun_wallet::{
@@ -56,8 +56,11 @@ use crate::txid_cache::{
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
 use crate::types::{
-    BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch, WalletCacheStore,
-    WalletConfig, WalletIndexedCatchUpStatus, WalletLocalPoiCaches,
+    BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, PublicDataPlaneEpoch,
+    SharedLogBatch, WalletBackfillApplyResult, WalletBackfillFinishResult,
+    WalletBackfillRejectReason, WalletBackfillResetResult, WalletCacheStore, WalletConfig,
+    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness,
+    WalletReadinessError, WalletScanApply, WalletScanPayload,
 };
 
 mod delta;
@@ -71,6 +74,7 @@ mod poi_sources;
 mod worker;
 
 use delta::*;
+pub(crate) use handle::WalletPrivateMutationAuthority;
 use handle::*;
 use local_poi_cache::*;
 use output_poi_recovery::*;
@@ -83,12 +87,15 @@ use poi_sources::*;
 pub(crate) use delta::apply_wallet_delta_to_vec;
 pub(crate) use delta::pending_overlay_from_delta;
 pub use handle::{WalletHandle, WalletPendingOverlay, WalletPendingSpent};
+#[cfg(test)]
 pub(crate) use pending_output_poi::process_pending_output_poi_observations;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
 #[cfg(test)]
 pub(crate) use poi_refresh::LivePoiTailError;
 pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
+#[cfg(test)]
+use worker::wallet_poi_status_reader_source;
 pub(crate) use worker::{spawn_wallet_worker, wallet_cache_store};
 
 #[cfg(test)]

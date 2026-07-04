@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::chain::service::{send_wallet_scan_apply, send_wallet_target};
+
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
 const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -94,11 +96,9 @@ pub(super) async fn refresh_pending_tip_overlays(
             .iter()
             .map(|(cache_key, registration)| {
                 let handle = registration.handle.clone();
-                let from_block = pending_tip_from_block(
-                    safe_head,
-                    handle.last_scanned(),
-                    service.chain.block_range,
-                );
+                let last_scanned = handle.last_scanned();
+                let from_block =
+                    pending_tip_from_block(safe_head, last_scanned, service.chain.block_range);
                 let target_block = registration
                     .sync_to_block
                     .map_or(head, |limit| limit.min(head));
@@ -106,6 +106,8 @@ pub(super) async fn refresh_pending_tip_overlays(
                     cache_key: cache_key.clone(),
                     cfg: registration.cfg.clone(),
                     handle,
+                    reset_generation: registration.handle.reset_generation(),
+                    last_scanned,
                     from_block,
                     target_block,
                 }
@@ -205,10 +207,17 @@ pub(super) async fn refresh_pending_tip_overlays(
 
     for registration in registrations {
         if registration.target_block < registration.from_block {
-            registration
+            if !registration
                 .handle
-                .set_chain_pending_overlay(WalletPendingOverlay::default())
-                .await;
+                .request_pending_overlay_update(
+                    WalletPendingOverlay::default(),
+                    registration.reset_generation,
+                    registration.last_scanned,
+                )
+                .await
+            {
+                debug!(cache_key = %registration.cache_key, "failed to send pending overlay clear request");
+            }
             continue;
         }
 
@@ -241,19 +250,35 @@ pub(super) async fn refresh_pending_tip_overlays(
             }
         };
 
-        let confirmed = registration.handle.utxos.read().await;
+        let confirmed = registration.handle.utxos_snapshot().await;
         let overlay = pending_overlay_from_delta(&registration.cfg, &confirmed, delta);
-        drop(confirmed);
-        registration.handle.set_chain_pending_overlay(overlay).await;
+        if !registration
+            .handle
+            .request_pending_overlay_update(
+                overlay,
+                registration.reset_generation,
+                registration.last_scanned,
+            )
+            .await
+        {
+            debug!(cache_key = %registration.cache_key, "failed to send pending overlay update request");
+        }
     }
 }
 
 pub(super) async fn clear_pending_tip_overlays(registrations: Vec<PendingTipWalletRegistration>) {
     for registration in registrations {
-        registration
+        if !registration
             .handle
-            .set_chain_pending_overlay(WalletPendingOverlay::default())
-            .await;
+            .request_pending_overlay_update(
+                WalletPendingOverlay::default(),
+                registration.reset_generation,
+                registration.last_scanned,
+            )
+            .await
+        {
+            debug!(cache_key = %registration.cache_key, "failed to send pending overlay clear request");
+        }
     }
 }
 
@@ -262,7 +287,21 @@ struct WalletLagFallbackCandidate {
     from_block: u64,
     target_block: u64,
     lag_blocks: u64,
+    follow_safe_head: bool,
+    progress_tx: Option<SyncProgressSender>,
     sender: mpsc::Sender<BackfillEvent>,
+}
+
+pub(super) fn wallet_finish_result_removes_cursor(result: &WalletBackfillFinishResult) -> bool {
+    matches!(
+        result,
+        WalletBackfillFinishResult::Ready { .. }
+            | WalletBackfillFinishResult::Rejected {
+                reason: WalletBackfillRejectReason::StaleGeneration { .. }
+                    | WalletBackfillRejectReason::Shutdown,
+                ..
+            }
+    )
 }
 
 pub(super) fn spawn_wallet_lag_fallback_loop(
@@ -310,18 +349,42 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                         if checkpoint < candidate.from_block {
                             continue;
                         }
-                        if let Err(err) = candidate
-                            .sender
-                            .send(BackfillEvent::DoneAtGeneration {
-                                last_block: checkpoint,
+                        if checkpoint >= candidate.target_block {
+                            let result = send_wallet_target(
+                                &candidate.cache_key,
+                                &candidate.sender,
+                                candidate.target_block,
                                 reset_generation,
+                            )
+                            .await;
+                            debug!(?result, cache_key = %candidate.cache_key, "ready-tail indexed wallet finish result");
+                        } else if let Err(err) = service
+                            .backfill_tx
+                            .send(BackfillRequest::Add {
+                                cache_key: candidate.cache_key.clone(),
+                                from_block: checkpoint.saturating_add(1),
+                                to_block: candidate.target_block,
+                                follow_safe_head: candidate.follow_safe_head,
+                                progress_start_block: candidate.from_block,
+                                reset_generation,
+                                progress_tx: candidate.progress_tx.clone(),
+                                sender: candidate.sender.clone(),
                             })
                             .await
                         {
-                            debug!(
+                            warn!(
                                 ?err,
                                 cache_key = %candidate.cache_key,
-                                "failed to send ready-tail indexed wallet done"
+                                checkpoint,
+                                target_block = candidate.target_block,
+                                "failed to enqueue ready-tail remainder backfill"
+                            );
+                        } else {
+                            debug!(
+                                cache_key = %candidate.cache_key,
+                                checkpoint,
+                                target_block = candidate.target_block,
+                                "ready-tail indexed fallback enqueued remainder backfill"
                             );
                         }
                     }
@@ -355,7 +418,7 @@ async fn wallet_lag_fallback_candidates(
         .iter()
         .filter_map(|(cache_key, registration)| {
             if !registration.cfg.use_indexed_wallet_catch_up
-                || !*registration.handle.ready_rx.borrow()
+                || !registration.handle.readiness().is_ready()
                 || registration.handle.indexed_catch_up_rx.borrow().is_some()
             {
                 return None;
@@ -386,6 +449,12 @@ async fn wallet_lag_fallback_candidates(
                 from_block,
                 target_block,
                 lag_blocks,
+                follow_safe_head: registration.sync_to_block.is_none(),
+                progress_tx: registration
+                    .cfg
+                    .progress_tx
+                    .clone()
+                    .or_else(|| service.chain.progress_tx.clone()),
                 sender: registration.backfill_sender.clone(),
             })
         })
@@ -673,16 +742,26 @@ pub(super) fn spawn_backfill_loop(
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in done_keys {
-                if let Some(cursor) = cursors.remove(&key)
-                    && let Err(err) = cursor
-                        .sender
-                        .send(BackfillEvent::DoneAtGeneration {
-                            last_block: cursor.target_block,
-                            reset_generation: cursor.reset_generation,
-                        })
-                        .await
-                {
-                    debug!(?err, cache_key = %key, "failed to send backfill done");
+                let Some((sender, target_block, reset_generation)) =
+                    cursors.get(&key).map(|cursor| {
+                        (
+                            cursor.sender.clone(),
+                            cursor.target_block,
+                            cursor.reset_generation,
+                        )
+                    })
+                else {
+                    continue;
+                };
+                let result =
+                    send_wallet_target(&key, &sender, target_block, reset_generation).await;
+                let remove_cursor = wallet_finish_result_removes_cursor(&result);
+                let committed_to = result.committed_to();
+                debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
+                if remove_cursor {
+                    cursors.remove(&key);
+                } else if let Some(cursor) = cursors.get_mut(&key) {
+                    cursor.retry_after_rejected_finish(committed_to, Instant::now());
                 }
             }
 
@@ -745,16 +824,18 @@ pub(super) fn spawn_backfill_loop(
                     }
                 }
                 if let Some(last_block) = completed_last_block
-                    && let Some(cursor) = cursors.remove(&key)
-                    && let Err(err) = cursor
-                        .sender
-                        .send(BackfillEvent::DoneAtGeneration {
-                            last_block,
-                            reset_generation,
-                        })
-                        .await
+                    && let Some(sender) = cursors.get(&key).map(|cursor| cursor.sender.clone())
                 {
-                    debug!(?err, cache_key = %key, "failed to send backfill done");
+                    let result =
+                        send_wallet_target(&key, &sender, last_block, reset_generation).await;
+                    let remove_cursor = wallet_finish_result_removes_cursor(&result);
+                    let committed_to = result.committed_to();
+                    debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
+                    if remove_cursor {
+                        cursors.remove(&key);
+                    } else if let Some(cursor) = cursors.get_mut(&key) {
+                        cursor.retry_after_rejected_finish(committed_to, Instant::now());
+                    }
                 }
             }
 
@@ -857,43 +938,96 @@ pub(super) fn spawn_backfill_loop(
                     let keys: Vec<String> = cursors.keys().cloned().collect();
                     let latest_safe_head = *safe_head_rx.borrow();
                     for key in keys {
-                        if let Some(cursor) = cursors.get_mut(&key)
-                            && cursor.from_block <= to_block
-                        {
-                            if let Err(err) = cursor
-                                .sender
-                                .send(BackfillEvent::LogsAtGeneration {
-                                    batch: batch.clone(),
-                                    reset_generation: cursor.reset_generation,
-                                })
-                                .await
-                            {
-                                debug!(
-                                    ?err,
-                                    cache_key = %key,
-                                    "failed to send backfill logs"
-                                );
-                            }
-                            cursor.send_progress(to_block);
-                            cursor.mark_progress(to_block.saturating_add(1), Instant::now());
-                            cursor.refresh_target(latest_safe_head);
-                            if cursor.from_block > cursor.target_block {
-                                if let Err(err) = cursor
-                                    .sender
-                                    .send(BackfillEvent::DoneAtGeneration {
-                                        last_block: cursor.target_block,
-                                        reset_generation: cursor.reset_generation,
-                                    })
-                                    .await
+                        let Some((sender, reset_generation, apply_from_block, apply_to_block)) =
+                            cursors.get(&key).and_then(|cursor| {
+                                if cursor.target_block == 0
+                                    || cursor.from_block > cursor.target_block
                                 {
-                                    debug!(
-                                        ?err,
-                                        cache_key = %key,
-                                        "failed to send backfill done"
-                                    );
+                                    return None;
                                 }
-                                cursors.remove(&key);
+                                let apply_to_block = min(to_block, cursor.target_block);
+                                (cursor.from_block <= apply_to_block).then(|| {
+                                    (
+                                        cursor.sender.clone(),
+                                        cursor.reset_generation,
+                                        cursor.from_block,
+                                        apply_to_block,
+                                    )
+                                })
+                            })
+                        else {
+                            continue;
+                        };
+                        let apply_result = send_wallet_scan_apply(
+                            &key,
+                            &sender,
+                            WalletScanApply::logs(
+                                apply_from_block,
+                                apply_to_block,
+                                batch.clone(),
+                                service.current_public_data_epoch(),
+                            ),
+                            reset_generation,
+                        )
+                        .await;
+                        let mut remove_cursor = false;
+                        let mut finish_request = None;
+                        if let Some(cursor) = cursors.get_mut(&key) {
+                            if let Some(committed_to) = apply_result.accepted_committed_to() {
+                                cursor.send_progress(committed_to);
+                                cursor
+                                    .mark_progress(committed_to.saturating_add(1), Instant::now());
+                                cursor.refresh_target(latest_safe_head);
+                                if cursor.from_block > cursor.target_block {
+                                    finish_request = Some((
+                                        cursor.sender.clone(),
+                                        cursor.target_block,
+                                        cursor.reset_generation,
+                                    ));
+                                }
+                            } else {
+                                warn!(?apply_result, cache_key = %key, "wallet backfill logs rejected");
+                                match apply_result {
+                                    WalletBackfillApplyResult::Rejected {
+                                        committed_to,
+                                        reason: WalletBackfillRejectReason::NonContiguous { .. },
+                                    }
+                                    | WalletBackfillApplyResult::Rejected {
+                                        committed_to,
+                                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                                    } => {
+                                        cursor.retry_after_rejected_apply(
+                                            committed_to,
+                                            Instant::now(),
+                                        );
+                                    }
+                                    WalletBackfillApplyResult::Rejected {
+                                        reason:
+                                            WalletBackfillRejectReason::StaleGeneration { .. }
+                                            | WalletBackfillRejectReason::Shutdown,
+                                        ..
+                                    } => {
+                                        remove_cursor = true;
+                                    }
+                                    WalletBackfillApplyResult::Rejected { .. } => {}
+                                    WalletBackfillApplyResult::Committed { .. }
+                                    | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
+                                }
                             }
+                        }
+                        if let Some((sender, target_block, reset_generation)) = finish_request {
+                            let result =
+                                send_wallet_target(&key, &sender, target_block, reset_generation)
+                                    .await;
+                            remove_cursor = wallet_finish_result_removes_cursor(&result);
+                            let committed_to = result.committed_to();
+                            debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
+                            if !remove_cursor && let Some(cursor) = cursors.get_mut(&key) {
+                                cursor.retry_after_rejected_finish(committed_to, Instant::now());
+                            }
+                        }
+                        if remove_cursor {
+                            cursors.remove(&key);
                         }
                     }
                 }

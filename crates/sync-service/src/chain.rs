@@ -1,8 +1,10 @@
 use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
-    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, SyncProgressSender,
-    SyncProgressStage, SyncProgressUpdate, WalletConfig, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus,
+    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, PublicDataPlaneEpoch, SharedLogBatch,
+    SyncProgressSender, SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult,
+    WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
+    WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletIndexedScanRows,
+    WalletReadiness, WalletScanApply,
 };
 use crate::wallet::{
     WalletHandle, WalletPendingOverlay, WalletWorkerServices, pending_overlay_from_delta,
@@ -31,10 +33,12 @@ use merkletree::slow::types::{
 };
 use merkletree::tree::MerkleForest;
 use railgun_wallet::UtxoSource;
+#[cfg(test)]
+use railgun_wallet::scan::parse_indexed_wallet_delta;
 use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    WalletLogDelta, WalletScanError, parse_indexed_wallet_delta, parse_wallet_delta_from_logs,
+    WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
 };
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -43,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};

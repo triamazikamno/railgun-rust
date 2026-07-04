@@ -36,6 +36,7 @@ use url::Url;
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 const RAW_CODEC: u64 = 0x55;
+const TEST_TXID_VERSION: &str = "V2_PoseidonMerkle";
 
 #[test]
 fn txid_root_index_uses_latest_index_in_same_tree() {
@@ -138,12 +139,13 @@ async fn txid_public_cache_syncs_broad_page_and_builds_proof() {
         })
         .await
         .expect("update latest validated");
-    let latest = cache
-        .cached_latest_validated()
-        .expect("read updated latest validated")
-        .expect("updated latest present");
-    assert_eq!(latest.txid_index, 12);
-    assert_eq!(latest.merkleroot, Some(FixedBytes::from([0x33; 32])));
+    assert!(
+        cache
+            .cached_latest_validated()
+            .expect("read unsupported latest validated")
+            .is_none(),
+        "unsupported test-seeded latest marker must not be returned"
+    );
     let request = requests
         .recv_timeout(Duration::from_secs(5))
         .expect("request received");
@@ -450,7 +452,7 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
         .await
         .expect("prefetch stale graph-tip row");
     let (empty_endpoint, _empty_requests) = spawn_graphql_response(public_txid_response(vec![]));
-    cache
+    let error = cache
         .sync(
             &empty_endpoint,
             None,
@@ -460,13 +462,27 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
             },
         )
         .await
-        .expect("empty validated refresh records latest metadata only");
+        .expect_err("empty validated refresh must not record unsupported latest metadata");
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        }
+    ));
     let manifest = cache
         .load_manifest()
         .expect("load manifest")
         .expect("manifest present");
-    assert_eq!(manifest.latest_validated_txid_index, Some(0));
+    assert_eq!(manifest.latest_validated_txid_index, None);
     assert_eq!(manifest.validated_cached_txid_index, None);
+    assert!(
+        cache
+            .cached_latest_validated()
+            .expect("read latest validated")
+            .is_none(),
+        "unsupported latest marker must not be returned"
+    );
     let err = txid_public_proof_for_recovered_output_at_index(
         &db,
         key,
@@ -533,6 +549,7 @@ async fn txid_public_latest_validated_waits_for_graph_tip_sync_manifest_write() 
     let graph_row = indexed_transaction(0x33, 0x07, 0x08, 0x09);
     let (endpoint, requests, release_response) =
         spawn_delayed_graphql_response(public_txid_response(vec![graph_row]));
+    let sync_turn = super::TXID_CACHE_SYNC_LOCK.lock().await;
     let sync_db = Arc::clone(&db);
     let sync_endpoint = endpoint.clone();
     let sync_handle = tokio::spawn(async move {
@@ -540,7 +557,9 @@ async fn txid_public_latest_validated_waits_for_graph_tip_sync_manifest_write() 
             .sync_to_graph_tip(&sync_endpoint, None)
             .await
     });
-    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(30)))
+    tokio::task::yield_now().await;
+    drop(sync_turn);
+    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(120)))
         .await
         .expect("join request receiver")
         .expect("graph-tip request received");
@@ -619,6 +638,7 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
     let second = indexed_transaction(0x52, 0x04, 0x05, 0x06);
     let (endpoint, requests, release_response) =
         spawn_delayed_graphql_response(public_txid_response(vec![second.clone()]));
+    let sync_turn = super::TXID_CACHE_SYNC_LOCK.lock().await;
     let sync_db = Arc::clone(&db);
     let sync_endpoint = endpoint.clone();
     let sync_handle = tokio::spawn(async move {
@@ -626,7 +646,9 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
             .sync_to_graph_tip(&sync_endpoint, None)
             .await
     });
-    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(30)))
+    tokio::task::yield_now().await;
+    drop(sync_turn);
+    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(120)))
         .await
         .expect("join request receiver")
         .expect("graph-tip request received");
@@ -731,6 +753,47 @@ async fn txid_public_cache_rejects_oversized_graph_offset_without_writing_page()
         .expect("manifest present");
     assert_eq!(manifest.next_txid_index, next_txid_index);
     assert!(manifest.pages.is_empty());
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let manifest = super::TxidPublicCacheManifest {
+        format_version: super::TXID_CACHE_FORMAT_VERSION,
+        chain_type: key.chain_type,
+        chain_id: key.chain_id,
+        txid_version: key.txid_version.to_string(),
+        page_size: super::TXID_CACHE_PAGE_SIZE.get(),
+        next_txid_index: 1,
+        latest_validated_txid_index: Some(0),
+        latest_validated_merkleroot: None,
+        validated_cached_txid_index: Some(0),
+        pages: Vec::new(),
+    };
+    manifest
+        .write_to(&db, key)
+        .expect("seed unsupported marker");
+
+    let latest = TxidPublicCache::new(&db, key)
+        .cached_latest_validated()
+        .expect("read cached latest marker");
+
+    assert!(
+        latest.is_none(),
+        "rootless latest marker must require readable rows, not only high-water metadata"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -959,6 +1022,128 @@ async fn txid_public_artifact_only_failure_before_progress_returns_error() {
 }
 
 #[tokio::test]
+async fn txid_public_artifact_only_rejects_missing_stream_partition() {
+    txid_public_artifact_only_rejects_unsupported_stream_partition(None).await;
+}
+
+#[tokio::test]
+async fn txid_public_artifact_only_rejects_different_stream_partition() {
+    txid_public_artifact_only_rejects_unsupported_stream_partition(Some("other-txid-version"))
+        .await;
+}
+
+async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
+    stream_partition: Option<&str>,
+) {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let artifact_row = indexed_transaction(0x45, 0x04, 0x05, 0x06);
+    let artifact_root = root_for_single_leaf(artifact_row.txid_leaf_hash());
+    let mut chunk =
+        public_txid_artifact_chunk(0, std::slice::from_ref(&artifact_row), Some(artifact_root));
+    chunk.descriptor.metadata.stream_partition = stream_partition.map(str::to_string);
+    let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    let error = cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(artifact_root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect_err("unsupported partition must not satisfy artifact-only latest sync");
+
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        }
+    ));
+    assert!(
+        cache.load_manifest().expect("load manifest").is_none(),
+        "unsupported partition must not write public TXID progress or latest metadata"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_artifact_only_empty_source_does_not_write_latest_marker() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let (artifact_source, _artifact_server) = public_txid_empty_artifact_source();
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    let error = cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect_err("artifact-only empty source must not claim latest support");
+
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        }
+    ));
+    assert!(
+        cache.load_manifest().expect("load manifest").is_none(),
+        "empty artifact-only sync must not write unsupported latest metadata"
+    );
+    assert!(
+        cache
+            .cached_latest_validated()
+            .expect("read latest marker")
+            .is_none(),
+        "empty artifact-only sync must not return unsupported latest metadata"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_full_range_artifact_root_mismatch_falls_back_to_graphql() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -1163,6 +1348,67 @@ async fn txid_public_cache_prefers_configured_artifact_source_before_graphql() {
 }
 
 #[tokio::test]
+async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: "V2_PoseidonMerkle",
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let old_first = indexed_transaction(0x61, 0x02, 0x01, 0x03);
+    let old_root = txid_root_for_transactions(std::slice::from_ref(&old_first));
+    let old_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&old_first), Some(old_root));
+    let new_first = indexed_transaction(0x62, 0x04, 0x05, 0x06);
+    let second = indexed_transaction(0x63, 0x07, 0x08, 0x09);
+    let new_root = txid_root_for_transactions(&[new_first.clone(), second.clone()]);
+    let replacement = public_txid_artifact_chunk(0, &[new_first.clone(), second], Some(new_root));
+    let (artifact_source, _artifact_server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![old_tail]),
+        (2, vec![replacement]),
+    ]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(new_root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect("planner should select only replacement current TXID chunk");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.next_txid_index, 2);
+    assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    let first_row = super::row_for_txid_index(&manifest, &db, 0)
+        .expect("read first row")
+        .expect("first row present");
+    assert_eq!(
+        first_row.transaction.transaction_hash,
+        new_first.transaction_hash
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_cache_skips_unavailable_artifact_when_local_cache_is_sufficient() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -1217,6 +1463,75 @@ async fn txid_public_cache_skips_unavailable_artifact_when_local_cache_is_suffic
         txid_public_proof_for_recovered_output(&db, key, row.txid_leaf_hash(), 0, 0, Some(root))
             .expect("local proof should still be available");
     assert_eq!(proof.target_txid_index, 0);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_cache_accepts_rootless_same_index_latest_from_local_rows() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let row = indexed_transaction(0x31, 0x02, 0x01, 0x03);
+    let root = root_for_single_leaf(row.txid_leaf_hash());
+    let artifact_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
+    let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect("seed rooted latest marker and local row");
+
+    let unavailable_source = unavailable_artifact_source();
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+            Some(&unavailable_source),
+        )
+        .await
+        .expect("rootless same-index latest should be certified from readable local rows");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.latest_validated_txid_index, Some(0));
+    assert_eq!(manifest.latest_validated_merkleroot, None);
+    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    let cached_latest = cache
+        .cached_latest_validated()
+        .expect("read certified latest")
+        .expect("latest marker present");
+    assert_eq!(cached_latest.txid_index, 0);
+    assert_eq!(cached_latest.merkleroot, None);
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -2110,6 +2425,7 @@ fn public_txid_artifact_chunk(
                 leaf_count: None,
                 start_block: None,
                 end_block: None,
+                stream_partition: Some(TEST_TXID_VERSION.to_string()),
                 ..DatasetDescriptorMetadata::default()
             },
         },
@@ -2231,55 +2547,76 @@ fn artifact_scope() -> ChainScope {
 fn public_txid_artifact_source(
     chunks: Vec<VerifiedIndexedArtifactChunk>,
 ) -> (IndexedArtifactSourceConfig, PathServer) {
+    public_txid_artifact_source_with_catalogs(vec![(1, chunks)])
+}
+
+fn public_txid_artifact_source_with_catalogs(
+    catalogs: Vec<(u64, Vec<VerifiedIndexedArtifactChunk>)>,
+) -> (IndexedArtifactSourceConfig, PathServer) {
     let scope = artifact_scope();
-    let chunks = chunks
-        .into_iter()
-        .map(with_real_chunk_cid)
-        .collect::<Vec<_>>();
-    let catalog = IndexedArtifactCatalog {
-        format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
-        dataset_kind: IndexedDatasetKind::PublicTxid,
-        scope: scope.clone(),
-        chunks: chunks
-            .iter()
-            .map(|chunk| chunk.descriptor.clone())
-            .collect(),
-    };
-    let catalog_bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
-    let catalog_cid = raw_cid(&catalog_bytes);
-    let catalog_descriptor = IndexedArtifactDescriptor {
-        dataset_kind: IndexedDatasetKind::PublicTxid,
-        scope: scope.clone(),
-        range: IndexedArtifactRange {
-            kind: IndexedArtifactRangeKind::TxidIndex,
-            start: chunks
+    let mut catalog_descriptors = Vec::new();
+    let mut catalog_blocks = Vec::new();
+    let mut all_chunks = Vec::new();
+    for (generation, chunks) in catalogs {
+        let chunks = chunks
+            .into_iter()
+            .map(with_real_chunk_cid)
+            .collect::<Vec<_>>();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::PublicTxid,
+            scope: scope.clone(),
+            chunks: chunks
                 .iter()
-                .map(|chunk| chunk.descriptor.range.start)
-                .min()
-                .unwrap_or(0),
-            end: chunks
-                .iter()
-                .map(|chunk| chunk.descriptor.range.end)
-                .max()
-                .unwrap_or(0),
-        },
-        row_count: chunks.iter().map(|chunk| chunk.descriptor.row_count).sum(),
-        cid: catalog_cid.to_string(),
-        sha256: prefixed_sha256(&catalog_bytes),
-        byte_size: catalog_bytes.len() as u64,
-        encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
-        compression: CompressionAlgorithm::None,
-        metadata: DatasetDescriptorMetadata {
-            catalog_generation: Some(1),
-            ..DatasetDescriptorMetadata::default()
-        },
-    };
-    signed_artifact_source(
-        scope,
-        vec![catalog_descriptor],
-        vec![(catalog_cid, catalog_bytes)],
-        chunks,
-    )
+                .map(|chunk| chunk.descriptor.clone())
+                .collect(),
+        };
+        let catalog_bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
+        let catalog_cid = raw_cid(&catalog_bytes);
+        let catalog_stream_partition = shared_stream_partition(&chunks);
+        let catalog_descriptor = IndexedArtifactDescriptor {
+            dataset_kind: IndexedDatasetKind::PublicTxid,
+            scope: scope.clone(),
+            range: IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::TxidIndex,
+                start: chunks
+                    .iter()
+                    .map(|chunk| chunk.descriptor.range.start)
+                    .min()
+                    .unwrap_or(0),
+                end: chunks
+                    .iter()
+                    .map(|chunk| chunk.descriptor.range.end)
+                    .max()
+                    .unwrap_or(0),
+            },
+            row_count: chunks.iter().map(|chunk| chunk.descriptor.row_count).sum(),
+            cid: catalog_cid.to_string(),
+            sha256: prefixed_sha256(&catalog_bytes),
+            byte_size: catalog_bytes.len() as u64,
+            encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            compression: CompressionAlgorithm::None,
+            metadata: DatasetDescriptorMetadata {
+                catalog_generation: Some(generation),
+                stream_partition: catalog_stream_partition,
+                ..DatasetDescriptorMetadata::default()
+            },
+        };
+        catalog_descriptors.push(catalog_descriptor);
+        catalog_blocks.push((catalog_cid, catalog_bytes));
+        all_chunks.extend(chunks);
+    }
+    signed_artifact_source(scope, catalog_descriptors, catalog_blocks, all_chunks)
+}
+
+fn shared_stream_partition(chunks: &[VerifiedIndexedArtifactChunk]) -> Option<String> {
+    let mut partitions = chunks
+        .iter()
+        .map(|chunk| chunk.descriptor.metadata.stream_partition.as_deref());
+    let first = partitions.next()??;
+    partitions
+        .all(|partition| partition == Some(first))
+        .then(|| first.to_string())
 }
 
 fn public_txid_empty_artifact_source() -> (IndexedArtifactSourceConfig, PathServer) {

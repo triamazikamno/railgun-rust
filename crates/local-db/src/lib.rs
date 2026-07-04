@@ -218,6 +218,15 @@ pub enum DbError {
     Decode(#[from] rmp_serde::decode::Error),
     #[error("unsupported schema version {version}")]
     UnsupportedSchemaVersion { version: u32 },
+    #[error(
+        "invalid wallet-private commit namespace: expected chain {expected_chain_id} wallet {expected_wallet_id}, got chain {actual_chain_id} wallet {actual_wallet_id}"
+    )]
+    InvalidWalletPrivateCommitNamespace {
+        expected_chain_id: u64,
+        expected_wallet_id: String,
+        actual_chain_id: u64,
+        actual_wallet_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,17 +422,17 @@ pub struct PendingOutputPoiContextRecord {
 impl PendingOutputPoiContextRecord {
     #[must_use]
     pub fn key(&self) -> String {
-        Self::key_for(self.chain_id, &self.output_commitment)
+        Self::key_for(self.chain_id, &self.wallet_id, &self.output_commitment)
     }
 
     #[must_use]
-    pub fn key_for(chain_id: u64, output_commitment: &FixedBytes<32>) -> String {
-        format!("{chain_id}|{}", hex::encode(output_commitment))
+    pub fn key_for(chain_id: u64, wallet_id: &str, output_commitment: &FixedBytes<32>) -> String {
+        format!("{chain_id}|{wallet_id}|{}", hex::encode(output_commitment))
     }
 
     #[must_use]
-    pub fn prefix_for_chain(chain_id: u64) -> String {
-        format!("{chain_id}|")
+    pub fn prefix_for_wallet(chain_id: u64, wallet_id: &str) -> String {
+        format!("{chain_id}|{wallet_id}|")
     }
 
     #[must_use]
@@ -939,6 +948,90 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn batch_commit_wallet_private_state(
+        &self,
+        wallet_id: &str,
+        utxos: Option<&[(String, Vec<u8>)]>,
+        meta: Option<&WalletMeta>,
+        pending_output_context_updates: &[PendingOutputPoiContextRecord],
+        pending_output_context_delete_chain_id: u64,
+        pending_output_context_deletes: &[FixedBytes<32>],
+        output_poi_recovery_updates: &[OutputPoiRecoveryRecord],
+    ) -> Result<(), DbError> {
+        for record in pending_output_context_updates {
+            if record.chain_id != pending_output_context_delete_chain_id
+                || record.wallet_id != wallet_id
+            {
+                return Err(DbError::InvalidWalletPrivateCommitNamespace {
+                    expected_chain_id: pending_output_context_delete_chain_id,
+                    expected_wallet_id: wallet_id.to_string(),
+                    actual_chain_id: record.chain_id,
+                    actual_wallet_id: record.wallet_id.clone(),
+                });
+            }
+        }
+        for record in output_poi_recovery_updates {
+            if record.chain_id != pending_output_context_delete_chain_id
+                || record.wallet_id != wallet_id
+            {
+                return Err(DbError::InvalidWalletPrivateCommitNamespace {
+                    expected_chain_id: pending_output_context_delete_chain_id,
+                    expected_wallet_id: wallet_id.to_string(),
+                    actual_chain_id: record.chain_id,
+                    actual_wallet_id: record.wallet_id.clone(),
+                });
+            }
+        }
+        let prefix = wallet_utxo_prefix(wallet_id);
+        let txn = self.db.begin_write()?;
+        {
+            if let Some(utxos) = utxos {
+                let mut utxo_table = txn.open_table(WALLET_UTXO_TABLE)?;
+                remove_table_prefix(&mut utxo_table, &prefix)?;
+                for (utxo_id, payload) in utxos {
+                    let key = wallet_utxo_key(wallet_id, utxo_id);
+                    utxo_table.insert(key.as_str(), payload.as_slice())?;
+                }
+            }
+
+            if let Some(meta) = meta {
+                let data = encode(meta)?;
+                let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
+                meta_table.insert(wallet_id, data.as_slice())?;
+            }
+
+            if !pending_output_context_updates.is_empty()
+                || !pending_output_context_deletes.is_empty()
+            {
+                let mut pending_table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+                for record in pending_output_context_updates {
+                    let key = record.key();
+                    let data = encode(record)?;
+                    pending_table.insert(key.as_str(), data.as_slice())?;
+                }
+                for output_commitment in pending_output_context_deletes {
+                    let key = PendingOutputPoiContextRecord::key_for(
+                        pending_output_context_delete_chain_id,
+                        wallet_id,
+                        output_commitment,
+                    );
+                    pending_table.remove(key.as_str())?;
+                }
+            }
+
+            if !output_poi_recovery_updates.is_empty() {
+                let mut recovery_table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+                for record in output_poi_recovery_updates {
+                    let key = record.key();
+                    let data = encode(record)?;
+                    recovery_table.insert(key.as_str(), data.as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn list_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxoRecord>, DbError> {
         let prefix = wallet_utxo_prefix(wallet_id);
         let range_end = prefix_range_end(&prefix);
@@ -1121,9 +1214,10 @@ impl DbStore {
     pub fn get_pending_output_poi_context(
         &self,
         chain_id: u64,
+        wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<Option<PendingOutputPoiContextRecord>, DbError> {
-        let key = PendingOutputPoiContextRecord::key_for(chain_id, output_commitment);
+        let key = PendingOutputPoiContextRecord::key_for(chain_id, wallet_id, output_commitment);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         match table.get(key.as_str())? {
@@ -1150,9 +1244,10 @@ impl DbStore {
     pub fn delete_pending_output_poi_context(
         &self,
         chain_id: u64,
+        wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<(), DbError> {
-        let key = PendingOutputPoiContextRecord::key_for(chain_id, output_commitment);
+        let key = PendingOutputPoiContextRecord::key_for(chain_id, wallet_id, output_commitment);
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
@@ -1165,9 +1260,15 @@ impl DbStore {
     pub fn list_pending_output_poi_contexts(
         &self,
         chain_id: u64,
+        wallet_id: &str,
     ) -> Result<Vec<PendingOutputPoiContextRecord>, DbError> {
-        let prefix = PendingOutputPoiContextRecord::prefix_for_chain(chain_id);
-        self.list_decoded_by_prefix(PENDING_OUTPUT_POI_CONTEXT_TABLE, &prefix)
+        let prefix = PendingOutputPoiContextRecord::prefix_for_wallet(chain_id, wallet_id);
+        let records: Vec<PendingOutputPoiContextRecord> =
+            self.list_decoded_by_prefix(PENDING_OUTPUT_POI_CONTEXT_TABLE, &prefix)?;
+        Ok(records
+            .into_iter()
+            .filter(|record| record.chain_id == chain_id && record.wallet_id == wallet_id)
+            .collect())
     }
 
     pub fn get_output_poi_recovery(

@@ -27,7 +27,7 @@ impl TxidPublicCache<'_> {
             let local_status = manifest.local_latest_status(self.db, latest)?;
             if local_status == TxidPublicLocalLatestStatus::Satisfied {
                 if progress_reconciled || !manifest.latest_validated_matches(latest) {
-                    manifest.set_latest_validated(latest);
+                    manifest.commit_latest_validated_if_supported(self.db, latest)?;
                     manifest.write_to(self.db, self.key)?;
                 }
                 debug!(
@@ -108,11 +108,8 @@ impl TxidPublicCache<'_> {
         } else {
             manifest.reconcile_validated_progress_for_latest(latest);
         }
-        if !force_validated_refresh {
-            manifest.set_latest_validated(latest);
-        }
         if !force_validated_refresh
-            && manifest.local_latest_status(self.db, latest)?
+            && manifest.commit_latest_validated_if_supported(self.db, latest)?
                 == TxidPublicLocalLatestStatus::Satisfied
         {
             manifest.write_to(self.db, self.key)?;
@@ -233,14 +230,13 @@ impl TxidPublicCache<'_> {
             }
         }
 
-        if force_validated_refresh {
-            match manifest.local_latest_status(self.db, latest)? {
-                TxidPublicLocalLatestStatus::Satisfied => manifest.set_latest_validated(latest),
-                TxidPublicLocalLatestStatus::NeedsRows
-                | TxidPublicLocalLatestStatus::NeedsValidatedRefresh => {
-                    return Err(TxidPublicCacheError::RootMismatch);
-                }
-            }
+        let latest_status = manifest.commit_latest_validated_if_supported(self.db, latest)?;
+        if latest_status != TxidPublicLocalLatestStatus::Satisfied {
+            return Err(manifest.unsupported_latest_error(
+                latest,
+                latest_status,
+                force_validated_refresh,
+            ));
         }
 
         manifest.write_to(self.db, self.key)?;
@@ -453,12 +449,18 @@ impl TxidPublicCache<'_> {
             return Ok(None);
         };
         manifest.validate_for(self.key)?;
-        Ok(manifest
-            .latest_validated_txid_index
-            .map(|txid_index| TxidPublicLatestValidated {
-                txid_index,
-                merkleroot: manifest.latest_validated_merkleroot,
-            }))
+        let Some(txid_index) = manifest.latest_validated_txid_index else {
+            return Ok(None);
+        };
+        let latest = TxidPublicLatestValidated {
+            txid_index,
+            merkleroot: manifest.latest_validated_merkleroot,
+        };
+        match manifest.local_latest_status(self.db, latest)? {
+            TxidPublicLocalLatestStatus::Satisfied => Ok(Some(latest)),
+            TxidPublicLocalLatestStatus::NeedsRows
+            | TxidPublicLocalLatestStatus::NeedsValidatedRefresh => Ok(None),
+        }
     }
 
     #[cfg(test)]
@@ -486,6 +488,7 @@ impl TxidPublicCache<'_> {
             config,
             http_client,
             &scope,
+            self.key.txid_version,
             from_index,
             to_index,
         )
@@ -518,9 +521,52 @@ enum TxidPublicLocalLatestStatus {
 }
 
 impl TxidPublicCacheManifest {
+    fn commit_latest_validated_if_supported(
+        &mut self,
+        db: &DbStore,
+        latest: TxidPublicLatestValidated,
+    ) -> Result<TxidPublicLocalLatestStatus, TxidPublicCacheError> {
+        let status = self.local_latest_status(db, latest)?;
+        if status == TxidPublicLocalLatestStatus::Satisfied {
+            self.set_latest_validated(latest);
+            if self
+                .validated_cached_txid_index
+                .is_none_or(|index| index < latest.txid_index)
+            {
+                self.validated_cached_txid_index = Some(latest.txid_index);
+            }
+        }
+        Ok(status)
+    }
+
     fn set_latest_validated(&mut self, latest: TxidPublicLatestValidated) {
         self.latest_validated_txid_index = Some(latest.txid_index);
         self.latest_validated_merkleroot = latest.merkleroot;
+    }
+
+    fn unsupported_latest_error(
+        &self,
+        latest: TxidPublicLatestValidated,
+        status: TxidPublicLocalLatestStatus,
+        force_validated_refresh: bool,
+    ) -> TxidPublicCacheError {
+        match status {
+            TxidPublicLocalLatestStatus::Satisfied => TxidPublicCacheError::MetadataMismatch(
+                "supported latest marker unexpectedly rejected".to_string(),
+            ),
+            TxidPublicLocalLatestStatus::NeedsRows if !force_validated_refresh => {
+                TxidPublicCacheError::CacheNotReady {
+                    next_index: self
+                        .validated_cached_txid_index
+                        .map_or(0, |index| index.saturating_add(1)),
+                    required_index: latest.txid_index,
+                }
+            }
+            TxidPublicLocalLatestStatus::NeedsRows
+            | TxidPublicLocalLatestStatus::NeedsValidatedRefresh => {
+                TxidPublicCacheError::RootMismatch
+            }
+        }
     }
 
     fn latest_validated_matches(&self, latest: TxidPublicLatestValidated) -> bool {
@@ -545,6 +591,7 @@ impl TxidPublicCacheManifest {
             }
         } else if self.latest_validated_txid_index == Some(latest.txid_index)
             && self.latest_validated_merkleroot != latest.merkleroot
+            && latest.merkleroot.is_some()
         {
             self.validated_cached_txid_index = None;
         }
@@ -556,11 +603,25 @@ impl TxidPublicCacheManifest {
         db: &DbStore,
         latest: TxidPublicLatestValidated,
     ) -> Result<TxidPublicLocalLatestStatus, TxidPublicCacheError> {
-        if self
+        let high_water_covers_latest = self
             .validated_cached_txid_index
-            .is_none_or(|index| index < latest.txid_index)
-        {
+            .is_some_and(|index| index >= latest.txid_index);
+        if !high_water_covers_latest {
             return Ok(TxidPublicLocalLatestStatus::NeedsRows);
+        }
+        match self.validate_contiguous_rows_through(db, latest.txid_index) {
+            Ok(()) => {}
+            Err(TxidPublicCacheError::MissingLeaf { .. }) => {
+                return Ok(TxidPublicLocalLatestStatus::NeedsValidatedRefresh);
+            }
+            Err(TxidPublicCacheError::MetadataMismatch(_))
+            | Err(TxidPublicCacheError::Decode(_)) => {
+                return Ok(TxidPublicLocalLatestStatus::NeedsValidatedRefresh);
+            }
+            Err(TxidPublicCacheError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+                return Ok(TxidPublicLocalLatestStatus::NeedsValidatedRefresh);
+            }
+            Err(err) => return Err(err),
         }
         let Some(expected_root) = latest.merkleroot else {
             return Ok(TxidPublicLocalLatestStatus::Satisfied);
@@ -580,6 +641,53 @@ impl TxidPublicCacheManifest {
         } else {
             Ok(TxidPublicLocalLatestStatus::NeedsValidatedRefresh)
         }
+    }
+
+    fn validate_contiguous_rows_through(
+        &self,
+        db: &DbStore,
+        txid_index: u64,
+    ) -> Result<(), TxidPublicCacheError> {
+        let mut expected_index = 0_u64;
+        for page_ref in &self.pages {
+            if expected_index > txid_index {
+                return Ok(());
+            }
+            let page_ref_end = page_ref.start_index.saturating_add(page_ref.row_count);
+            if page_ref_end <= expected_index {
+                continue;
+            }
+            if page_ref.start_index > expected_index {
+                return Err(TxidPublicCacheError::MissingLeaf {
+                    index: expected_index,
+                });
+            }
+            let page = page_ref.read(db)?;
+            if page.rows.len() as u64 != page_ref.row_count {
+                return Err(TxidPublicCacheError::MetadataMismatch(
+                    "page row count mismatch".to_string(),
+                ));
+            }
+            for row in page.rows {
+                if row.txid_index < expected_index {
+                    continue;
+                }
+                if row.txid_index != expected_index {
+                    return Err(TxidPublicCacheError::MissingLeaf {
+                        index: expected_index,
+                    });
+                }
+                if row.txid_index == txid_index {
+                    return Ok(());
+                }
+                expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                    TxidPublicCacheError::MetadataMismatch("txid index overflow".to_string())
+                })?;
+            }
+        }
+        Err(TxidPublicCacheError::MissingLeaf {
+            index: expected_index,
+        })
     }
 
     fn artifact_fetch_start_index(

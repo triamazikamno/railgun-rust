@@ -1056,9 +1056,12 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use url::Url;
+
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct MockPoiRpc {
         url: Url,
@@ -1069,8 +1072,9 @@ mod tests {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
+        let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "railgun-poi-cache-service-test-{}-{nanos}",
+            "railgun-poi-cache-service-test-{}-{nanos}-{counter}",
             std::process::id()
         ))
     }

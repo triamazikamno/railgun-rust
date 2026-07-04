@@ -1,3 +1,4 @@
+use super::service::send_wallet_reset;
 use super::*;
 
 pub(super) struct WalletBackfill {
@@ -115,6 +116,24 @@ impl WalletBackfill {
     pub(super) fn mark_progress(&mut self, from_block: u64, now: Instant) {
         self.from_block = from_block;
         self.last_advanced_at = now;
+    }
+
+    pub(super) fn retry_after_rejected_apply(&mut self, committed_to: u64, now: Instant) {
+        let retry_from = self.from_block.min(committed_to.saturating_add(1));
+        self.mark_progress(retry_from, now);
+    }
+
+    pub(super) fn retry_after_rejected_finish(&mut self, committed_to: u64, now: Instant) {
+        let replay_from = self
+            .progress_start_block
+            .min(committed_to.saturating_add(1));
+        self.from_block = if self.target_block == 0 {
+            replay_from
+        } else {
+            replay_from.min(self.target_block)
+        };
+        self.last_advanced_at = now;
+        self.last_indexed_tail_attempt_at = None;
     }
 
     pub(super) fn mark_indexed_tail_attempt(&mut self, now: Instant) {
@@ -245,6 +264,7 @@ impl ChainService {
         if let Err(err) = self.forest_last_tx.send(reset_block) {
             debug!(?err, reset_block, "failed to send forest reset update");
         }
+        self.public_data_epoch.fetch_add(1, Ordering::AcqRel);
         info!(
             from = last_processed,
             to = reset_block,
@@ -259,21 +279,26 @@ impl ChainService {
             let from_block =
                 wallet_reorg_backfill_from_block(reset_from_block, registration.start_block);
             let sync_target = wallet_sync_target(safe_head, registration.sync_to_block);
-            let reset_generation = registration.handle.advance_reset_generation();
-            if let Err(err) = registration
-                .backfill_sender
-                .send(BackfillEvent::Reset {
-                    from_block,
-                    reset_generation,
-                })
-                .await
-            {
-                debug!(
-                    ?err,
-                    cache_key = %cache_key,
-                    "failed to send wallet rewind"
-                );
-            }
+            let reset_result = send_wallet_reset(
+                cache_key,
+                &registration.backfill_sender,
+                self.next_wallet_reset_intent(),
+                from_block,
+                registration.handle.last_scanned(),
+            )
+            .await;
+            let Some(reset_generation) = reset_result.reset_generation() else {
+                debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
+                continue;
+            };
+            let target_result = super::service::send_wallet_target(
+                cache_key,
+                &registration.backfill_sender,
+                sync_target,
+                reset_generation,
+            )
+            .await;
+            debug!(?target_result, cache_key = %cache_key, "wallet reorg target update result");
             if self
                 .backfill_tx
                 .send(BackfillRequest::Add {

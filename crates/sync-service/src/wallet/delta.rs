@@ -1,123 +1,5 @@
 use super::*;
 
-pub(super) async fn apply_wallet_logs(
-    db: &DbStore,
-    poi_submitter: Option<&dyn PendingOutputPoiSubmitter>,
-    cfg: &WalletConfig,
-    wallet_utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
-    batch: &SharedLogBatch,
-    last_scanned: u64,
-) -> Result<(u64, bool), WalletScanError> {
-    let started = Instant::now();
-    let filter_started = Instant::now();
-    let filtered_logs: Vec<_> = batch
-        .logs
-        .iter()
-        .filter(|log| log.block_number.unwrap_or_default() > last_scanned)
-        .cloned()
-        .collect();
-    let filter_elapsed_ms = filter_started.elapsed().as_millis();
-
-    let parse_started = Instant::now();
-    let WalletLogDelta {
-        utxos: new_utxos,
-        nullifiers,
-        commitment_observations,
-    } = if filtered_logs.is_empty() {
-        WalletLogDelta {
-            utxos: Vec::new(),
-            nullifiers: Vec::new(),
-            commitment_observations: Vec::new(),
-        }
-    } else {
-        parse_wallet_delta_from_logs(&filtered_logs, &batch.block_timestamps, &cfg.scan_keys)?
-    };
-    let parse_elapsed_ms = parse_started.elapsed().as_millis();
-    let delta_utxos = new_utxos.len();
-    let delta_nullifiers = nullifiers.len();
-    let commitment_observation_count = commitment_observations.len();
-
-    let poi_submitter = if commitment_observation_count > 0 {
-        poi_submitter
-    } else {
-        None
-    };
-    let poi_observation_started = Instant::now();
-    process_pending_output_poi_observations(
-        db,
-        cfg.chain.chain_id,
-        &commitment_observations,
-        poi_submitter,
-    )
-    .await;
-    let poi_observation_elapsed_ms = poi_observation_started.elapsed().as_millis();
-
-    let apply_started = Instant::now();
-    let outcome = apply_wallet_delta_with_outcome(
-        cfg,
-        wallet_utxos,
-        WalletLogDelta {
-            utxos: new_utxos,
-            nullifiers,
-            commitment_observations,
-        },
-    )
-    .await;
-    let apply_elapsed_ms = apply_started.elapsed().as_millis();
-    discard_pending_output_poi_contexts_for_spent_outputs(
-        db,
-        cfg.chain.chain_id,
-        &outcome.spent_output_commitments,
-    );
-    let changed = outcome.changed;
-
-    debug!(
-        cache_key = %cfg.cache_key,
-        chain_id = cfg.chain.chain_id,
-        from_block = batch.from_block,
-        to_block = batch.to_block,
-        logs = batch.logs.len(),
-        filtered_logs = filtered_logs.len(),
-        delta_utxos,
-        delta_nullifiers,
-        commitment_observations = commitment_observation_count,
-        poi_submission_enabled = poi_submitter.is_some(),
-        changed,
-        filter_elapsed_ms,
-        parse_elapsed_ms,
-        poi_observation_elapsed_ms,
-        apply_elapsed_ms,
-        elapsed_ms = started.elapsed().as_millis(),
-        "applied wallet log delta"
-    );
-
-    Ok((batch.to_block, changed))
-}
-
-pub(super) async fn apply_wallet_delta_with_outcome(
-    cfg: &WalletConfig,
-    wallet_utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
-    delta: WalletLogDelta,
-) -> WalletDeltaApplyOutcome {
-    let started = Instant::now();
-    let lock_wait_started = Instant::now();
-    let mut locked = wallet_utxos.write().await;
-    let lock_wait_elapsed_ms = lock_wait_started.elapsed().as_millis();
-    let rows_before = locked.len();
-    let outcome = apply_wallet_delta_to_vec_with_outcome(cfg, &mut locked, delta);
-    debug!(
-        cache_key = %cfg.cache_key,
-        rows_before,
-        rows_after = locked.len(),
-        changed = outcome.changed,
-        spent_outputs = outcome.spent_output_commitments.len(),
-        lock_wait_elapsed_ms,
-        elapsed_ms = started.elapsed().as_millis(),
-        "applied wallet delta to cache"
-    );
-    outcome
-}
-
 #[cfg(test)]
 pub(crate) fn apply_wallet_delta_to_vec(
     cfg: &WalletConfig,
@@ -231,9 +113,20 @@ pub(super) fn apply_wallet_delta_to_vec_with_outcome(
     }
 }
 
-pub(crate) fn rewind_wallet_utxos(wallet_utxos: &mut Vec<WalletUtxo>, from_block: u64) -> bool {
+pub(crate) fn rewind_wallet_utxos(
+    wallet_utxos: &mut Vec<WalletUtxo>,
+    from_block: u64,
+) -> WalletRewindOutcome {
     let before_len = wallet_utxos.len();
-    wallet_utxos.retain(|wallet_utxo| wallet_utxo.utxo.source.block_number < from_block);
+    let mut removed_output_commitments = Vec::new();
+    wallet_utxos.retain(|wallet_utxo| {
+        if wallet_utxo.utxo.source.block_number < from_block {
+            true
+        } else {
+            removed_output_commitments.push(wallet_utxo.utxo.poi.commitment);
+            false
+        }
+    });
     let mut changed = wallet_utxos.len() != before_len;
 
     for wallet_utxo in wallet_utxos {
@@ -247,7 +140,16 @@ pub(crate) fn rewind_wallet_utxos(wallet_utxos: &mut Vec<WalletUtxo>, from_block
         }
     }
 
-    changed
+    WalletRewindOutcome {
+        changed,
+        removed_output_commitments,
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WalletRewindOutcome {
+    pub(crate) changed: bool,
+    pub(crate) removed_output_commitments: Vec<FixedBytes<32>>,
 }
 
 #[derive(Debug, Default)]
@@ -256,21 +158,19 @@ pub(super) struct WalletDeltaApplyOutcome {
     pub(super) spent_output_commitments: Vec<FixedBytes<32>>,
 }
 
+#[cfg(test)]
 pub(super) fn discard_pending_output_poi_contexts_for_spent_outputs(
     db: &DbStore,
     chain_id: u64,
+    wallet_id: &str,
     spent_output_commitments: &[FixedBytes<32>],
-) {
+) -> Result<usize, local_db::DbError> {
+    let mut discarded = 0;
     for output_commitment in spent_output_commitments {
-        if let Err(err) = db.delete_pending_output_poi_context(chain_id, output_commitment) {
-            warn!(
-                ?err,
-                chain_id,
-                commitment = %hex::encode(output_commitment),
-                "failed to delete pending output POI context for spent output"
-            );
-        }
+        db.delete_pending_output_poi_context(chain_id, wallet_id, output_commitment)?;
+        discarded += 1;
     }
+    Ok(discarded)
 }
 
 pub(super) fn spent_source_for_utxo(

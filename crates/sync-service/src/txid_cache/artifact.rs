@@ -2,8 +2,9 @@ use super::*;
 
 use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactManifestClient, IndexedArtifactRangeKind,
-    IndexedDatasetKind, VerifiedIndexedArtifactChunk, VerifiedIndexedArtifactChunkStager,
-    decode_indexed_artifact_chunk,
+    IndexedArtifactStreamCatalog, IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
+    VerifiedIndexedArtifactChunkStager, decode_indexed_artifact_chunk,
 };
 
 use broadcaster_core::transact::{
@@ -18,6 +19,7 @@ pub(crate) async fn fetch_txid_public_artifact_chunks(
     config: &IndexedArtifactSourceConfig,
     http_client: Option<&reqwest::Client>,
     scope: &ChainScope,
+    txid_version: &str,
     from_index: u64,
     to_index: Option<u64>,
 ) -> Result<Vec<VerifiedIndexedArtifactChunk>, TxidPublicCacheError> {
@@ -33,7 +35,7 @@ pub(crate) async fn fetch_txid_public_artifact_chunks(
     };
     let range_end = to_index.unwrap_or(u64::MAX);
 
-    let mut descriptors = Vec::new();
+    let mut catalogs = Vec::new();
     for catalog_descriptor in chain_entry.catalogs.iter().filter(|catalog| {
         catalog.matches_range(
             IndexedDatasetKind::PublicTxid,
@@ -43,20 +45,29 @@ pub(crate) async fn fetch_txid_public_artifact_chunks(
             range_end,
         )
     }) {
-        let catalog = client.fetch_catalog(catalog_descriptor).await?;
-        descriptors.extend(catalog.chunks.into_iter().filter(|chunk| {
-            chunk.matches_range(
-                IndexedDatasetKind::PublicTxid,
-                scope,
-                IndexedArtifactRangeKind::TxidIndex,
-                from_index,
-                range_end,
-            )
-        }));
+        let catalog = client
+            .fetch_catalog(catalog_descriptor)
+            .await?
+            .into_stream_catalog();
+        catalogs.push(IndexedArtifactStreamCatalog::new(
+            catalog.descriptor,
+            catalog.chunks,
+        ));
     }
-    descriptors.sort_by_key(|chunk| (chunk.range.start, chunk.range.end));
+    let plan = IndexedArtifactStreamPlan::plan(
+        &catalogs,
+        &IndexedArtifactStreamPlanRequest::new(
+            IndexedDatasetKind::PublicTxid,
+            scope.clone(),
+            IndexedArtifactRangeKind::TxidIndex,
+            from_index,
+            range_end,
+            IndexedArtifactStreamPartitionPolicy::Exact(txid_version.to_string()),
+        ),
+    )
+    .map_err(|err| TxidPublicCacheError::MetadataMismatch(err.to_string()))?;
     client
-        .fetch_chunks_bounded(&descriptors)
+        .fetch_chunks_bounded(&plan.required_current_chunks)
         .await
         .map_err(Into::into)
 }

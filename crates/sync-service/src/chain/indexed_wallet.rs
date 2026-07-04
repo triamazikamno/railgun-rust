@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::chain::service::{send_wallet_scan_apply, send_wallet_target};
+
 use std::time::SystemTime;
 
 use alloy::primitives::{FixedBytes as AlloyFixedBytes, U256};
@@ -12,8 +14,10 @@ use broadcaster_core::contracts::railgun::{
 use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
     IndexedArtifactManifest, IndexedArtifactManifestClient, IndexedArtifactManifestError,
-    IndexedArtifactRange, IndexedArtifactRangeKind, IndexedDatasetKind,
-    VerifiedIndexedArtifactChunk, decode_indexed_artifact_chunk,
+    IndexedArtifactRange, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
+    IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
+    decode_indexed_artifact_chunk,
 };
 
 const WALLET_TRANSACT_SECTION_ID: u16 = 1;
@@ -51,6 +55,11 @@ impl IndexedWalletArtifactProbe {
             return None;
         }
 
+        let target_block = to_block.min(latest_indexed_block);
+        if target_block < from_block {
+            return None;
+        }
+
         let catalog_count = chain
             .catalogs
             .iter()
@@ -60,10 +69,14 @@ impl IndexedWalletArtifactProbe {
                     scope,
                     IndexedArtifactRangeKind::Block,
                     from_block,
-                    to_block,
+                    target_block,
                 )
             })
             .count();
+        if catalog_count == 0 {
+            return None;
+        }
+
         Some(Self {
             latest_indexed_block,
             catalog_count,
@@ -90,6 +103,20 @@ pub(super) struct IndexedWalletPage {
 }
 
 impl IndexedWalletPage {
+    pub(super) fn into_scan_rows(
+        self,
+        source: WalletIndexedCatchUpSource,
+    ) -> WalletIndexedScanRows {
+        WalletIndexedScanRows {
+            transact_commitments: self.transact_commitments,
+            shield_commitments: self.shield_commitments,
+            legacy_encrypted_commitments: self.legacy_encrypted_commitments,
+            legacy_generated_commitments: self.legacy_generated_commitments,
+            nullifiers: self.nullifiers,
+            source,
+        }
+    }
+
     async fn fetch_modern(
         client: &QuickSyncClient,
         from_block: u64,
@@ -310,54 +337,6 @@ impl IndexedWalletPage {
         self.nullifier_rows = self.nullifiers.len();
     }
 
-    fn validate_sources_in_range(&self, from_block: u64, to_block: u64) -> Result<(), SyncError> {
-        Self::validate_source_iter(
-            self.transact_commitments.iter().map(|row| &row.source),
-            from_block,
-            to_block,
-        )?;
-        Self::validate_source_iter(
-            self.shield_commitments.iter().map(|row| &row.source),
-            from_block,
-            to_block,
-        )?;
-        Self::validate_source_iter(
-            self.legacy_encrypted_commitments
-                .iter()
-                .map(|row| &row.source),
-            from_block,
-            to_block,
-        )?;
-        Self::validate_source_iter(
-            self.legacy_generated_commitments
-                .iter()
-                .map(|row| &row.source),
-            from_block,
-            to_block,
-        )?;
-        Self::validate_source_iter(
-            self.nullifiers.iter().map(|row| &row.source),
-            from_block,
-            to_block,
-        )
-    }
-
-    fn validate_source_iter<'a>(
-        sources: impl IntoIterator<Item = &'a UtxoSource>,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<(), SyncError> {
-        for source in sources {
-            if !Self::source_in_range(source, from_block, to_block) {
-                return Err(wallet_artifact_format(format!(
-                    "wallet_scan row source block {} is outside chunk block range {from_block}-{to_block}",
-                    source.block_number
-                )));
-            }
-        }
-        Ok(())
-    }
-
     const fn source_in_range(source: &UtxoSource, from_block: u64, to_block: u64) -> bool {
         source.block_number >= from_block && source.block_number <= to_block
     }
@@ -366,7 +345,23 @@ impl IndexedWalletPage {
 pub(super) struct IndexedWalletArtifactSession {
     probe: IndexedWalletArtifactProbe,
     chunk_descriptors: Vec<IndexedArtifactDescriptor>,
-    chunk_pages: Vec<IndexedWalletArtifactChunkPage>,
+    chunks: Vec<IndexedWalletArtifactChunk>,
+    coverage: WalletScanArtifactCoverage,
+}
+
+pub(super) enum IndexedWalletArtifactPageOutcome {
+    Page(IndexedWalletPage),
+    Exhausted { checkpoint_block: u64 },
+}
+
+#[cfg(test)]
+impl IndexedWalletArtifactPageOutcome {
+    fn expect(self, message: &str) -> IndexedWalletPage {
+        match self {
+            Self::Page(page) => page,
+            Self::Exhausted { .. } => panic!("{message}"),
+        }
+    }
 }
 
 impl IndexedWalletArtifactSession {
@@ -407,8 +402,9 @@ impl IndexedWalletArtifactSession {
             return Ok(None);
         };
         let descriptor_started = Instant::now();
-        let chunk_descriptors =
+        let descriptors =
             Self::fetch_descriptors(&client, chain_entry, &scope, from_block, target_block).await?;
+        let chunk_descriptors = descriptors.chunk_descriptors;
         let descriptor_elapsed_ms = descriptor_started.elapsed().as_millis();
         debug!(
             from_block,
@@ -424,8 +420,7 @@ impl IndexedWalletArtifactSession {
         );
         let indexed_chunk_descriptors: Vec<_> =
             chunk_descriptors.iter().cloned().enumerate().collect();
-        let chunks =
-            Self::fetch_chunk_pages(&client, &indexed_chunk_descriptors, progress_tx).await?;
+        let chunks = Self::fetch_chunks(&client, &indexed_chunk_descriptors, progress_tx).await?;
         debug!(
             from_block,
             to_block,
@@ -434,14 +429,14 @@ impl IndexedWalletArtifactSession {
             catalog_count = probe.catalog_count,
             chunk_count = chunk_descriptors.len(),
             chunk_fetch_verify_elapsed_ms = chunks.fetch_verify_elapsed_ms,
-            chunk_decode_elapsed_ms = chunks.decode_elapsed_ms,
             elapsed_ms = started.elapsed().as_millis(),
             "indexed wallet artifact chunks prepared"
         );
         Ok(Some(Self {
             probe,
             chunk_descriptors,
-            chunk_pages: chunks.pages,
+            chunks: chunks.chunks,
+            coverage: descriptors.coverage,
         }))
     }
 
@@ -465,12 +460,30 @@ impl IndexedWalletArtifactSession {
         &self,
         from_block: u64,
         to_block: u64,
-    ) -> Result<Option<IndexedWalletPage>, SyncError> {
+    ) -> Result<IndexedWalletArtifactPageOutcome, SyncError> {
         let target_block = to_block.min(self.probe.latest_indexed_block);
         if target_block < from_block {
-            return Ok(None);
+            return Ok(IndexedWalletArtifactPageOutcome::Exhausted {
+                checkpoint_block: self.probe.latest_indexed_block,
+            });
         }
         let started = Instant::now();
+        let mut page_checkpoint = match self
+            .coverage
+            .checkpoint_for_range(from_block, target_block)?
+        {
+            WalletScanCoverageStatus::Available { checkpoint_block } => checkpoint_block,
+            WalletScanCoverageStatus::Exhausted { checkpoint_block } => {
+                debug!(
+                    from_block,
+                    to_block,
+                    target_block,
+                    checkpoint_block,
+                    "indexed wallet artifact coverage exhausted before requested range"
+                );
+                return Ok(IndexedWalletArtifactPageOutcome::Exhausted { checkpoint_block });
+            }
+        };
         let needed_indices: Vec<_> = self
             .chunk_descriptors
             .iter()
@@ -481,7 +494,7 @@ impl IndexedWalletArtifactSession {
         let cached_chunks = needed_indices
             .iter()
             .filter(|needed_index| {
-                self.chunk_pages
+                self.chunks
                     .iter()
                     .any(|chunk| chunk.descriptor_index == **needed_index)
             })
@@ -491,29 +504,63 @@ impl IndexedWalletArtifactSession {
                 "prepared wallet_scan artifact chunk missing",
             ));
         }
-        let mut page = IndexedWalletPage::empty(target_block);
-        for chunk in self
-            .chunk_pages
+
+        let needed_chunks: Vec<_> = self
+            .chunks
             .iter()
             .filter(|chunk| needed_indices.contains(&chunk.descriptor_index))
-        {
-            page.extend_filtered_from(&chunk.page, from_block, target_block);
+            .collect();
+        for chunk in &needed_chunks {
+            if !chunk.range.intersects(from_block, page_checkpoint) {
+                continue;
+            }
+            let chunk_bounds = WalletScanChunkBounds::from_descriptor(&chunk.chunk.descriptor)?;
+            if chunk_bounds.checkpoint_block() < chunk.range.end {
+                page_checkpoint = page_checkpoint.min(chunk_bounds.checkpoint_block());
+            }
+        }
+        if page_checkpoint < from_block {
+            debug!(
+                from_block,
+                to_block,
+                target_block,
+                page_checkpoint,
+                "indexed wallet artifact source has no proven data after checkpoint"
+            );
+            return Ok(IndexedWalletArtifactPageOutcome::Exhausted {
+                checkpoint_block: page_checkpoint,
+            });
+        }
+
+        let decode_started = Instant::now();
+        let mut page = IndexedWalletPage::empty(page_checkpoint);
+        for chunk in needed_chunks {
+            if !chunk.range.intersects(from_block, page_checkpoint) {
+                continue;
+            }
+            let chunk_page = IndexedWalletPage::from_chunk_for_block_range(
+                &chunk.chunk,
+                from_block,
+                page_checkpoint,
+            )?;
+            page.extend_filtered_from(&chunk_page, from_block, page_checkpoint);
         }
         page.refresh_row_counts();
         debug!(
             from_block,
             to_block,
             target_block,
+            page_checkpoint,
             needed_chunks = needed_indices.len(),
             cached_chunks,
             fetched_chunks = 0,
-            session_cached_chunks = self.chunk_pages.len(),
+            session_cached_chunks = self.chunks.len(),
             chunk_fetch_verify_elapsed_ms = 0,
-            chunk_decode_elapsed_ms = 0,
+            chunk_decode_elapsed_ms = decode_started.elapsed().as_millis(),
             elapsed_ms = started.elapsed().as_millis(),
             "indexed wallet artifact page chunks ready"
         );
-        Ok(Some(page))
+        Ok(IndexedWalletArtifactPageOutcome::Page(page))
     }
 
     async fn fetch_descriptors(
@@ -522,8 +569,8 @@ impl IndexedWalletArtifactSession {
         scope: &ChainScope,
         from_block: u64,
         target_block: u64,
-    ) -> Result<Vec<IndexedArtifactDescriptor>, SyncError> {
-        let mut descriptors = Vec::new();
+    ) -> Result<IndexedWalletArtifactDescriptorFetchResult, SyncError> {
+        let mut candidate_catalogs = Vec::new();
         for catalog_descriptor in chain_entry.catalogs.iter().filter(|catalog| {
             catalog.matches_range(
                 IndexedDatasetKind::WalletScan,
@@ -537,21 +584,39 @@ impl IndexedWalletArtifactSession {
                 .fetch_catalog(catalog_descriptor)
                 .await
                 .map_err(wallet_artifact_error)?;
-            descriptors.extend(catalog.chunks.into_iter().filter(|chunk| {
-                chunk.matches_range(
-                    IndexedDatasetKind::WalletScan,
-                    scope,
-                    IndexedArtifactRangeKind::Block,
-                    from_block,
-                    target_block,
-                )
-            }));
+            candidate_catalogs.push(catalog.into_stream_catalog());
         }
-        descriptors.sort_by_key(|chunk| (chunk.range.start, chunk.range.end));
-        Ok(descriptors)
+        let plan =
+            Self::select_current_stream_plan(&candidate_catalogs, scope, from_block, target_block)?;
+        let coverage =
+            WalletScanArtifactCoverage::from_descriptors(&plan.required_current_coverage)?;
+        Ok(IndexedWalletArtifactDescriptorFetchResult {
+            chunk_descriptors: plan.required_current_chunks,
+            coverage,
+        })
     }
 
-    async fn fetch_chunk_pages(
+    fn select_current_stream_plan(
+        catalogs: &[IndexedArtifactStreamCatalog],
+        scope: &ChainScope,
+        from_block: u64,
+        target_block: u64,
+    ) -> Result<IndexedArtifactStreamPlan, SyncError> {
+        IndexedArtifactStreamPlan::plan(
+            catalogs,
+            &IndexedArtifactStreamPlanRequest::new(
+                IndexedDatasetKind::WalletScan,
+                scope.clone(),
+                IndexedArtifactRangeKind::Block,
+                from_block,
+                target_block,
+                IndexedArtifactStreamPartitionPolicy::Ignore,
+            ),
+        )
+        .map_err(|err| wallet_artifact_format(err.to_string()))
+    }
+
+    async fn fetch_chunks(
         client: &IndexedArtifactManifestClient,
         chunk_descriptors: &[(usize, IndexedArtifactDescriptor)],
         progress_tx: Option<&SyncProgressSender>,
@@ -569,42 +634,226 @@ impl IndexedWalletArtifactSession {
             .await
             .map_err(wallet_artifact_error)?;
         let fetch_verify_elapsed_ms = fetch_started.elapsed().as_millis();
-        let decode_started = Instant::now();
-        let mut chunk_pages = Vec::with_capacity(chunks.len());
+        let mut indexed_chunks = Vec::with_capacity(chunks.len());
         for ((descriptor_index, _), chunk) in chunk_descriptors.iter().zip(chunks) {
             let range = chunk.descriptor.range.clone();
-            let page = IndexedWalletPage::try_from(&chunk)?;
-            chunk_pages.push(IndexedWalletArtifactChunkPage {
+            indexed_chunks.push(IndexedWalletArtifactChunk {
                 descriptor_index: *descriptor_index,
                 range,
-                page,
+                chunk,
             });
         }
-        chunk_pages.sort_by_key(|chunk| (chunk.range.start, chunk.range.end));
+        indexed_chunks.sort_by_key(|chunk| (chunk.range.start, chunk.range.end));
         Ok(IndexedWalletArtifactChunkFetchResult {
-            pages: chunk_pages,
+            chunks: indexed_chunks,
             fetch_verify_elapsed_ms,
-            decode_elapsed_ms: decode_started.elapsed().as_millis(),
         })
     }
 }
 
-struct IndexedWalletArtifactChunkPage {
+struct IndexedWalletArtifactChunk {
     descriptor_index: usize,
     range: IndexedArtifactRange,
-    page: IndexedWalletPage,
+    chunk: VerifiedIndexedArtifactChunk,
 }
 
 struct IndexedWalletArtifactChunkFetchResult {
-    pages: Vec<IndexedWalletArtifactChunkPage>,
+    chunks: Vec<IndexedWalletArtifactChunk>,
     fetch_verify_elapsed_ms: u128,
-    decode_elapsed_ms: u128,
 }
 
-impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
-    type Error = SyncError;
+struct IndexedWalletArtifactDescriptorFetchResult {
+    chunk_descriptors: Vec<IndexedArtifactDescriptor>,
+    coverage: WalletScanArtifactCoverage,
+}
 
-    fn try_from(chunk: &VerifiedIndexedArtifactChunk) -> Result<Self, Self::Error> {
+#[derive(Default)]
+struct WalletScanArtifactCoverage {
+    ranges: Vec<WalletScanCoverageRange>,
+}
+
+impl WalletScanArtifactCoverage {
+    fn from_descriptors(descriptors: &[IndexedArtifactDescriptor]) -> Result<Self, SyncError> {
+        let mut coverage = Self::default();
+        for descriptor in descriptors {
+            coverage.add_descriptor(descriptor)?;
+        }
+        Ok(coverage)
+    }
+
+    fn add_descriptor(&mut self, descriptor: &IndexedArtifactDescriptor) -> Result<(), SyncError> {
+        self.ranges
+            .push(WalletScanCoverageRange::from_descriptor(descriptor)?);
+        self.ranges.sort_by_key(|range| (range.start, range.end));
+        Ok(())
+    }
+
+    fn checkpoint_for_range(
+        &self,
+        from_block: u64,
+        target_block: u64,
+    ) -> Result<WalletScanCoverageStatus, SyncError> {
+        let mut next_start = from_block;
+        let mut checkpoint = None;
+        for range in &self.ranges {
+            if range.end < next_start {
+                continue;
+            }
+            if range.start > next_start {
+                break;
+            }
+            let range_end = range.end.min(target_block);
+            if range.checkpoint_block < next_start {
+                return Ok(WalletScanCoverageStatus::Exhausted {
+                    checkpoint_block: checkpoint.map_or(range.checkpoint_block, |current: u64| {
+                        current.max(range.checkpoint_block)
+                    }),
+                });
+            }
+            let range_checkpoint = range.checkpoint_block.min(range_end);
+            checkpoint = Some(checkpoint.map_or(range_checkpoint, |current: u64| {
+                current.max(range_checkpoint)
+            }));
+            if range_checkpoint < range_end {
+                return Ok(WalletScanCoverageStatus::Available {
+                    checkpoint_block: range_checkpoint,
+                });
+            }
+            if range_end >= target_block {
+                return Ok(WalletScanCoverageStatus::Available {
+                    checkpoint_block: target_block,
+                });
+            }
+            next_start = range_end.saturating_add(1);
+        }
+
+        checkpoint.map_or_else(
+            || {
+                Err(wallet_artifact_format(format!(
+                    "wallet_scan artifact coverage does not include requested block {from_block}"
+                )))
+            },
+            |checkpoint_block| Ok(WalletScanCoverageStatus::Available { checkpoint_block }),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WalletScanCoverageStatus {
+    Available { checkpoint_block: u64 },
+    Exhausted { checkpoint_block: u64 },
+}
+
+#[derive(Clone, Copy)]
+struct WalletScanCoverageRange {
+    start: u64,
+    end: u64,
+    checkpoint_block: u64,
+}
+
+impl WalletScanCoverageRange {
+    fn from_descriptor(descriptor: &IndexedArtifactDescriptor) -> Result<Self, SyncError> {
+        let checkpoint_block = wallet_scan_descriptor_checkpoint_block(descriptor, "coverage")?;
+        Ok(Self {
+            start: descriptor.range.start,
+            end: descriptor.range.end,
+            checkpoint_block,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WalletScanChunkBounds {
+    range_start: u64,
+    range_end: u64,
+    checkpoint_block: u64,
+}
+
+impl WalletScanChunkBounds {
+    fn from_descriptor(descriptor: &IndexedArtifactDescriptor) -> Result<Self, SyncError> {
+        let checkpoint_block = wallet_scan_descriptor_checkpoint_block(descriptor, "chunk")?;
+        Ok(Self {
+            range_start: descriptor.range.start,
+            range_end: descriptor.range.end,
+            checkpoint_block,
+        })
+    }
+
+    const fn checkpoint_block(self) -> u64 {
+        self.checkpoint_block
+    }
+
+    fn validate_source(self, source: &UtxoSource) -> Result<(), SyncError> {
+        if !IndexedWalletPage::source_in_range(source, self.range_start, self.range_end) {
+            return Err(wallet_artifact_format(format!(
+                "wallet_scan row source block {} is outside chunk block range {}-{}",
+                source.block_number, self.range_start, self.range_end
+            )));
+        }
+        if source.block_number > self.checkpoint_block {
+            return Err(wallet_artifact_format(format!(
+                "wallet_scan row source block {} exceeds checkpoint block {}",
+                source.block_number, self.checkpoint_block
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn wallet_scan_descriptor_checkpoint_block(
+    descriptor: &IndexedArtifactDescriptor,
+    descriptor_kind: &str,
+) -> Result<u64, SyncError> {
+    let checkpoint_block = descriptor
+        .metadata
+        .checkpoint_block
+        .unwrap_or(descriptor.range.end);
+    if checkpoint_block > descriptor.range.end {
+        return Err(wallet_artifact_format(format!(
+            "wallet_scan {descriptor_kind} checkpoint block {checkpoint_block} exceeds range end {}",
+            descriptor.range.end
+        )));
+    }
+    if checkpoint_block < descriptor.range.start {
+        return Err(wallet_artifact_format(format!(
+            "wallet_scan {descriptor_kind} checkpoint block {checkpoint_block} is before range start {}",
+            descriptor.range.start
+        )));
+    }
+    Ok(checkpoint_block)
+}
+
+#[derive(Clone, Copy)]
+struct WalletScanRowBounds {
+    from_block: u64,
+    to_block: u64,
+}
+
+impl WalletScanRowBounds {
+    const fn contains(self, source: &UtxoSource) -> bool {
+        source.block_number >= self.from_block && source.block_number <= self.to_block
+    }
+}
+
+impl IndexedWalletPage {
+    fn from_chunk_for_block_range(
+        chunk: &VerifiedIndexedArtifactChunk,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Self, SyncError> {
+        Self::decode_from_chunk(
+            chunk,
+            Some(WalletScanRowBounds {
+                from_block,
+                to_block,
+            }),
+        )
+    }
+
+    fn decode_from_chunk(
+        chunk: &VerifiedIndexedArtifactChunk,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<Self, SyncError> {
         let envelope = decode_indexed_artifact_chunk(chunk).map_err(wallet_artifact_error)?;
         if envelope.header.dataset_kind != IndexedDatasetKind::WalletScan {
             return Err(wallet_artifact_format(
@@ -620,17 +869,15 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
             ));
         }
 
+        let chunk_bounds = WalletScanChunkBounds::from_descriptor(&chunk.descriptor)?;
+        let checkpoint_block = chunk_bounds.checkpoint_block();
         let mut page = Self {
             transact_commitments: Vec::new(),
             shield_commitments: Vec::new(),
             legacy_encrypted_commitments: Vec::new(),
             legacy_generated_commitments: Vec::new(),
             nullifiers: Vec::new(),
-            checkpoint_block: chunk
-                .descriptor
-                .metadata
-                .checkpoint_block
-                .unwrap_or(envelope.header.range.end),
+            checkpoint_block,
             transact_rows: 0,
             shield_rows: 0,
             legacy_encrypted_rows: 0,
@@ -638,6 +885,7 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
             nullifier_rows: 0,
         };
 
+        let mut row_count = 0_usize;
         for section in &envelope.header.sections {
             let payload = envelope
                 .section_payload(section.section_id)
@@ -646,24 +894,36 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
             let mut cursor = WalletScanArtifactCursor::new(payload);
             match section.section_id {
                 WALLET_TRANSACT_SECTION_ID => {
-                    page.transact_commitments = cursor.read_transact_rows()?;
-                    page.transact_rows = page.transact_commitments.len();
+                    let (rows, decoded_rows) = cursor.read_transact_rows(chunk_bounds, bounds)?;
+                    page.transact_rows = rows.len();
+                    page.transact_commitments = rows;
+                    row_count = row_count.saturating_add(decoded_rows);
                 }
                 WALLET_SHIELD_SECTION_ID => {
-                    page.shield_commitments = cursor.read_shield_rows()?;
-                    page.shield_rows = page.shield_commitments.len();
+                    let (rows, decoded_rows) = cursor.read_shield_rows(chunk_bounds, bounds)?;
+                    page.shield_rows = rows.len();
+                    page.shield_commitments = rows;
+                    row_count = row_count.saturating_add(decoded_rows);
                 }
                 WALLET_NULLIFIER_SECTION_ID => {
-                    page.nullifiers = cursor.read_nullifier_rows()?;
-                    page.nullifier_rows = page.nullifiers.len();
+                    let (rows, decoded_rows) = cursor.read_nullifier_rows(chunk_bounds, bounds)?;
+                    page.nullifier_rows = rows.len();
+                    page.nullifiers = rows;
+                    row_count = row_count.saturating_add(decoded_rows);
                 }
                 WALLET_LEGACY_ENCRYPTED_SECTION_ID => {
-                    page.legacy_encrypted_commitments = cursor.read_legacy_encrypted_rows()?;
-                    page.legacy_encrypted_rows = page.legacy_encrypted_commitments.len();
+                    let (rows, decoded_rows) =
+                        cursor.read_legacy_encrypted_rows(chunk_bounds, bounds)?;
+                    page.legacy_encrypted_rows = rows.len();
+                    page.legacy_encrypted_commitments = rows;
+                    row_count = row_count.saturating_add(decoded_rows);
                 }
                 WALLET_LEGACY_GENERATED_SECTION_ID => {
-                    page.legacy_generated_commitments = cursor.read_legacy_generated_rows()?;
-                    page.legacy_generated_rows = page.legacy_generated_commitments.len();
+                    let (rows, decoded_rows) =
+                        cursor.read_legacy_generated_rows(chunk_bounds, bounds)?;
+                    page.legacy_generated_rows = rows.len();
+                    page.legacy_generated_commitments = rows;
+                    row_count = row_count.saturating_add(decoded_rows);
                 }
                 other => {
                     return Err(wallet_artifact_format(format!(
@@ -674,20 +934,21 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
             cursor.expect_eof("wallet_scan section")?;
         }
 
-        let row_count = page
-            .transact_rows
-            .saturating_add(page.shield_rows)
-            .saturating_add(page.nullifier_rows)
-            .saturating_add(page.legacy_encrypted_rows)
-            .saturating_add(page.legacy_generated_rows);
         if row_count as u64 != envelope.header.row_count {
             return Err(wallet_artifact_format(format!(
                 "wallet_scan row count mismatch: expected {}, got {row_count}",
                 envelope.header.row_count
             )));
         }
-        page.validate_sources_in_range(envelope.header.range.start, envelope.header.range.end)?;
         Ok(page)
+    }
+}
+
+impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
+    type Error = SyncError;
+
+    fn try_from(chunk: &VerifiedIndexedArtifactChunk) -> Result<Self, Self::Error> {
+        Self::decode_from_chunk(chunk, None)
     }
 }
 
@@ -747,7 +1008,11 @@ impl<'a> WalletScanArtifactCursor<'a> {
         Self { bytes, position: 0 }
     }
 
-    fn read_transact_rows(&mut self) -> Result<Vec<IndexedTransactCommitmentInput>, SyncError> {
+    fn read_transact_rows(
+        &mut self,
+        chunk_bounds: WalletScanChunkBounds,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<(Vec<IndexedTransactCommitmentInput>, usize), SyncError> {
         let count = self.read_count("transact count")?;
         let mut rows = Vec::new();
         for _ in 0..count {
@@ -760,20 +1025,27 @@ impl<'a> WalletScanArtifactCursor<'a> {
                     .map_err(|err| {
                         wallet_artifact_format(format!("decode transact ciphertext: {err}"))
                     })?;
-            rows.push(IndexedTransactCommitmentInput {
-                tree_number,
-                tree_position,
-                hash,
-                ciphertext: ciphertext.ciphertext,
-                blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
-                memo: ciphertext.memo,
-                source,
-            });
+            chunk_bounds.validate_source(&source)?;
+            if bounds.is_none_or(|bounds| bounds.contains(&source)) {
+                rows.push(IndexedTransactCommitmentInput {
+                    tree_number,
+                    tree_position,
+                    hash,
+                    ciphertext: ciphertext.ciphertext,
+                    blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
+                    memo: ciphertext.memo,
+                    source,
+                });
+            }
         }
-        Ok(rows)
+        Ok((rows, count))
     }
 
-    fn read_shield_rows(&mut self) -> Result<Vec<IndexedShieldCommitmentInput>, SyncError> {
+    fn read_shield_rows(
+        &mut self,
+        chunk_bounds: WalletScanChunkBounds,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<(Vec<IndexedShieldCommitmentInput>, usize), SyncError> {
         let count = self.read_count("shield count")?;
         let mut rows = Vec::new();
         for _ in 0..count {
@@ -787,36 +1059,48 @@ impl<'a> WalletScanArtifactCursor<'a> {
                 &self.read_bytes("shield ciphertext")?,
             )
             .map_err(|err| wallet_artifact_format(format!("decode shield ciphertext: {err}")))?;
-            rows.push(IndexedShieldCommitmentInput {
-                tree_number,
-                tree_position,
-                preimage,
-                shield_ciphertext,
-                source,
-            });
+            chunk_bounds.validate_source(&source)?;
+            if bounds.is_none_or(|bounds| bounds.contains(&source)) {
+                rows.push(IndexedShieldCommitmentInput {
+                    tree_number,
+                    tree_position,
+                    preimage,
+                    shield_ciphertext,
+                    source,
+                });
+            }
         }
-        Ok(rows)
+        Ok((rows, count))
     }
 
-    fn read_nullifier_rows(&mut self) -> Result<Vec<IndexedNullifierInput>, SyncError> {
+    fn read_nullifier_rows(
+        &mut self,
+        chunk_bounds: WalletScanChunkBounds,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<(Vec<IndexedNullifierInput>, usize), SyncError> {
         let count = self.read_count("nullifier count")?;
         let mut rows = Vec::new();
         for _ in 0..count {
             let source = self.read_source()?;
             let tree_number = self.read_u32("nullifier tree_number")?;
             let nullifier = U256::from_be_bytes(self.read_fixed_32("nullifier")?);
-            rows.push(IndexedNullifierInput {
-                tree_number,
-                nullifier,
-                source,
-            });
+            chunk_bounds.validate_source(&source)?;
+            if bounds.is_none_or(|bounds| bounds.contains(&source)) {
+                rows.push(IndexedNullifierInput {
+                    tree_number,
+                    nullifier,
+                    source,
+                });
+            }
         }
-        Ok(rows)
+        Ok((rows, count))
     }
 
     fn read_legacy_encrypted_rows(
         &mut self,
-    ) -> Result<Vec<IndexedLegacyEncryptedCommitmentInput>, SyncError> {
+        chunk_bounds: WalletScanChunkBounds,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<(Vec<IndexedLegacyEncryptedCommitmentInput>, usize), SyncError> {
         let count = self.read_count("legacy encrypted count")?;
         let mut rows = Vec::new();
         for _ in 0..count {
@@ -830,30 +1114,35 @@ impl<'a> WalletScanArtifactCursor<'a> {
             .map_err(|err| {
                 wallet_artifact_format(format!("decode legacy encrypted ciphertext: {err}"))
             })?;
-            rows.push(IndexedLegacyEncryptedCommitmentInput {
-                tree_number,
-                tree_position,
-                hash,
-                ciphertext: ciphertext
-                    .ciphertext
-                    .map(|value| AlloyFixedBytes::from(value.to_be_bytes::<32>())),
-                ephemeral_keys: ciphertext
-                    .ephemeralKeys
-                    .map(|value| AlloyFixedBytes::from(value.to_be_bytes::<32>())),
-                memo: ciphertext
-                    .memo
-                    .into_iter()
-                    .map(|value| AlloyFixedBytes::from(value.to_be_bytes::<32>()))
-                    .collect(),
-                source,
-            });
+            chunk_bounds.validate_source(&source)?;
+            if bounds.is_none_or(|bounds| bounds.contains(&source)) {
+                rows.push(IndexedLegacyEncryptedCommitmentInput {
+                    tree_number,
+                    tree_position,
+                    hash,
+                    ciphertext: ciphertext
+                        .ciphertext
+                        .map(|value| AlloyFixedBytes::from(value.to_be_bytes::<32>())),
+                    ephemeral_keys: ciphertext
+                        .ephemeralKeys
+                        .map(|value| AlloyFixedBytes::from(value.to_be_bytes::<32>())),
+                    memo: ciphertext
+                        .memo
+                        .into_iter()
+                        .map(|value| AlloyFixedBytes::from(value.to_be_bytes::<32>()))
+                        .collect(),
+                    source,
+                });
+            }
         }
-        Ok(rows)
+        Ok((rows, count))
     }
 
     fn read_legacy_generated_rows(
         &mut self,
-    ) -> Result<Vec<IndexedLegacyGeneratedCommitmentInput>, SyncError> {
+        chunk_bounds: WalletScanChunkBounds,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<(Vec<IndexedLegacyGeneratedCommitmentInput>, usize), SyncError> {
         let count = self.read_count("legacy generated count")?;
         let mut rows = Vec::new();
         for _ in 0..count {
@@ -874,18 +1163,21 @@ impl<'a> WalletScanArtifactCursor<'a> {
             let encrypted_random_data: [u8; 16] = encrypted_random[48..64]
                 .try_into()
                 .expect("encrypted random data slice length");
-            rows.push(IndexedLegacyGeneratedCommitmentInput {
-                tree_number,
-                tree_position,
-                preimage,
-                encrypted_random: (
-                    AlloyFixedBytes::from(encrypted_random_iv_tag),
-                    AlloyFixedBytes::from(encrypted_random_data),
-                ),
-                source,
-            });
+            chunk_bounds.validate_source(&source)?;
+            if bounds.is_none_or(|bounds| bounds.contains(&source)) {
+                rows.push(IndexedLegacyGeneratedCommitmentInput {
+                    tree_number,
+                    tree_position,
+                    preimage,
+                    encrypted_random: (
+                        AlloyFixedBytes::from(encrypted_random_iv_tag),
+                        AlloyFixedBytes::from(encrypted_random_data),
+                    ),
+                    source,
+                });
+            }
         }
-        Ok(rows)
+        Ok((rows, count))
     }
 
     fn read_source(&mut self) -> Result<UtxoSource, SyncError> {
@@ -1063,60 +1355,39 @@ pub(super) async fn wait_or_cancel<T>(
 
 pub(super) async fn send_wallet_startup_events(
     cache_key: &str,
-    events: Vec<BackfillEvent>,
+    applies: Vec<WalletScanApply>,
     done_block: Option<u64>,
     reset_generation: u64,
     sender: &mpsc::Sender<BackfillEvent>,
 ) -> bool {
-    for event in events {
-        let event = backfill_event_at_generation(event, reset_generation);
-        if let Err(err) = sender.send(event).await {
-            debug!(?err, cache_key, "failed to send wallet startup sync event");
-            return false;
+    for apply in applies {
+        let result = send_wallet_scan_apply(cache_key, sender, apply, reset_generation).await;
+        match result {
+            WalletBackfillApplyResult::Committed { .. }
+            | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
+            WalletBackfillApplyResult::Rejected { reason, .. } => {
+                debug!(?reason, cache_key, "wallet startup scan batch rejected");
+                return false;
+            }
         }
     }
     if let Some(last_block) = done_block
-        && let Err(err) = sender
-            .send(BackfillEvent::DoneAtGeneration {
-                last_block,
-                reset_generation,
-            })
-            .await
+        && !matches!(
+            send_wallet_target(cache_key, sender, last_block, reset_generation).await,
+            WalletBackfillFinishResult::Ready { .. }
+        )
     {
-        debug!(?err, cache_key, "failed to send wallet startup sync done");
+        debug!(cache_key, last_block, "wallet startup finish rejected");
         return false;
     }
     true
 }
 
-fn backfill_event_at_generation(event: BackfillEvent, reset_generation: u64) -> BackfillEvent {
-    match event {
-        BackfillEvent::Logs(batch) => BackfillEvent::LogsAtGeneration {
-            batch,
-            reset_generation,
-        },
-        BackfillEvent::IndexedDelta {
-            from_block,
-            to_block,
-            delta,
-            ..
-        } => BackfillEvent::IndexedDelta {
-            from_block,
-            to_block,
-            delta,
-            reset_generation: Some(reset_generation),
-        },
-        BackfillEvent::Done { last_block } => BackfillEvent::DoneAtGeneration {
-            last_block,
-            reset_generation,
-        },
-        event => event,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
 
     use crate::indexed_artifacts::{
         CompressionAlgorithm, DatasetDescriptorMetadata, INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
@@ -1152,13 +1423,31 @@ mod tests {
     #[test]
     fn indexed_wallet_artifact_probe_accepts_latest_below_safe_head() {
         let scope = scope();
-        let manifest = manifest_with_latest_and_catalog(scope.clone(), 149, None);
+        let manifest = manifest_with_latest_and_catalog(
+            scope.clone(),
+            149,
+            Some(IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::Block,
+                start: 100,
+                end: 149,
+            }),
+        );
 
         let probe = IndexedWalletArtifactProbe::from_manifest(&manifest, &scope, 120, 180)
             .expect("partial wallet scan artifacts available");
 
         assert_eq!(probe.latest_indexed_block, 149);
-        assert_eq!(probe.catalog_count, 0);
+        assert_eq!(probe.catalog_count, 1);
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_probe_rejects_latest_without_matching_catalog() {
+        let scope = scope();
+        let manifest = manifest_with_latest_and_catalog(scope.clone(), 149, None);
+
+        let probe = IndexedWalletArtifactProbe::from_manifest(&manifest, &scope, 120, 180);
+
+        assert_eq!(probe, None);
     }
 
     #[test]
@@ -1272,6 +1561,34 @@ mod tests {
     }
 
     #[test]
+    fn indexed_wallet_artifact_page_rejects_duplicate_section_id() {
+        let chunk = wallet_scan_chunk(
+            scope(),
+            100,
+            110,
+            vec![
+                (
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x42; 32]),
+                ),
+                (
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(106, 8, [0x43; 32]),
+                ),
+            ],
+            2,
+        );
+
+        let Err(error) = IndexedWalletPage::try_from(&chunk) else {
+            panic!("duplicate wallet_scan section id should fail");
+        };
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("appears more than once"))
+        );
+    }
+
+    #[test]
     fn indexed_wallet_artifact_page_rejects_out_of_range_source_block() {
         let chunk = wallet_scan_chunk(
             scope(),
@@ -1318,7 +1635,7 @@ mod tests {
 
     #[test]
     fn indexed_wallet_artifact_page_accepts_fully_sparse_requested_range() {
-        let session = artifact_session(200, Vec::new());
+        let session = artifact_session_with_coverage(200, Vec::new(), &[(100, 200)]);
 
         let page = session
             .page_for_block_range(100, 200)
@@ -1334,6 +1651,20 @@ mod tests {
     }
 
     #[test]
+    fn indexed_wallet_artifact_page_rejects_unproven_empty_requested_range() {
+        let session = artifact_session(200, Vec::new());
+
+        let error = match session.page_for_block_range(100, 200) {
+            Ok(_) => panic!("unproven empty artifact coverage should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("coverage does not include"))
+        );
+    }
+
+    #[test]
     fn indexed_wallet_artifact_page_accepts_sparse_requested_prefix_and_suffix() {
         let chunk = wallet_scan_chunk(
             scope(),
@@ -1345,7 +1676,7 @@ mod tests {
             )],
             1,
         );
-        let session = artifact_session(200, vec![chunk]);
+        let session = artifact_session_with_coverage(200, vec![chunk], &[(100, 200)]);
 
         let page = session
             .page_for_block_range(100, 200)
@@ -1379,7 +1710,8 @@ mod tests {
             )],
             1,
         );
-        let session = artifact_session(160, vec![first_chunk, second_chunk]);
+        let session =
+            artifact_session_with_coverage(160, vec![first_chunk, second_chunk], &[(100, 160)]);
 
         let page = session
             .page_for_block_range(100, 160)
@@ -1392,6 +1724,407 @@ mod tests {
         assert_eq!(page.nullifiers[1].source.block_number, 155);
     }
 
+    #[test]
+    fn indexed_wallet_artifact_page_stops_before_unproven_sparse_gap() {
+        let first_chunk = wallet_scan_chunk(
+            scope(),
+            100,
+            110,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(105, 7, [0x11; 32]),
+            )],
+            1,
+        );
+        let second_chunk = wallet_scan_chunk(
+            scope(),
+            150,
+            160,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(155, 7, [0x22; 32]),
+            )],
+            1,
+        );
+        let session = artifact_session(160, vec![first_chunk, second_chunk]);
+
+        let page = session
+            .page_for_block_range(100, 160)
+            .expect("page should stop before unproven coverage gap")
+            .expect("latest indexed block covers range");
+
+        assert_eq!(page.checkpoint_block, 110);
+        assert_eq!(page.nullifier_rows, 1);
+        assert_eq!(page.nullifiers[0].source.block_number, 105);
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_selection_uses_current_replacement_tail() {
+        let scope = scope();
+        let old_tail = with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x11; 32]),
+                )],
+                1,
+            ),
+            1,
+        );
+        let current_tail = with_catalog_generation(
+            wallet_scan_chunk(
+                scope,
+                100,
+                120,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(115, 7, [0x22; 32]),
+                )],
+                1,
+            ),
+            2,
+        );
+
+        let selected = selected_wallet_scan_chunks(&[old_tail, current_tail], 100, 120)
+            .expect("select required current chunks");
+        let session = artifact_session(120, selected);
+        let page = session
+            .page_for_block_range(100, 120)
+            .expect("current tail page should decode")
+            .expect("latest indexed block covers range");
+
+        assert_eq!(page.nullifier_rows, 1);
+        assert_eq!(page.nullifiers[0].source.block_number, 115);
+        assert_eq!(
+            page.nullifiers[0].nullifier,
+            U256::from_be_bytes([0x22; 32])
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_empty_catalog_suppresses_stale_replacement_tail() {
+        let scope = scope();
+        let old_tail = with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x11; 32]),
+                )],
+                1,
+            ),
+            1,
+        );
+        let catalogs = vec![
+            wallet_scan_catalog(1, vec![old_tail.descriptor.clone()]),
+            empty_wallet_scan_catalog(scope.clone(), 2, 100, 110),
+        ];
+
+        let plan =
+            IndexedWalletArtifactSession::select_current_stream_plan(&catalogs, &scope, 100, 110)
+                .expect("empty replacement catalog should plan");
+        assert!(plan.required_current_chunks.is_empty());
+
+        let session = IndexedWalletArtifactSession {
+            probe: IndexedWalletArtifactProbe {
+                latest_indexed_block: 110,
+                catalog_count: catalogs.len(),
+            },
+            chunk_descriptors: plan.required_current_chunks,
+            chunks: Vec::new(),
+            coverage: WalletScanArtifactCoverage::from_descriptors(&plan.required_current_coverage)
+                .expect("planner coverage"),
+        };
+        let page = session
+            .page_for_block_range(100, 110)
+            .expect("empty current page should decode")
+            .expect("latest indexed block covers range");
+
+        assert_eq!(page.checkpoint_block, 110);
+        assert_eq!(page.nullifier_rows, 0);
+        assert!(page.nullifiers.is_empty());
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_selection_rejects_stable_consolidation() {
+        let scope = scope();
+        let sealed_prefix = with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x11; 32]),
+                )],
+                1,
+            ),
+            1,
+        );
+        let generation_tail = with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                111,
+                120,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(115, 7, [0x22; 32]),
+                )],
+                1,
+            ),
+            1,
+        );
+        let consolidated = with_catalog_generation(
+            wallet_scan_chunk(
+                scope,
+                100,
+                120,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(115, 7, [0x33; 32]),
+                )],
+                1,
+            ),
+            2,
+        );
+
+        let error =
+            selected_wallet_scan_chunks(&[sealed_prefix, generation_tail, consolidated], 100, 120)
+                .expect_err("stable consolidation should fail");
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("stable chunk"))
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_selection_rejects_sealed_tail_replacement() {
+        let scope = scope();
+        let sealed_tail = with_chunk_sealed(with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x11; 32]),
+                )],
+                1,
+            ),
+            1,
+        ));
+        let replacement = with_catalog_generation(
+            wallet_scan_chunk(
+                scope,
+                100,
+                120,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(115, 7, [0x22; 32]),
+                )],
+                1,
+            ),
+            2,
+        );
+
+        let error = selected_wallet_scan_chunks(&[sealed_tail, replacement], 100, 120)
+            .expect_err("sealed tail replacement should fail");
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("stable chunk"))
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_selection_rejects_complete_stream_extension() {
+        let scope = scope();
+        let complete_tail = with_stream_complete(with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x11; 32]),
+                )],
+                1,
+            ),
+            1,
+        ));
+        let extension = with_catalog_generation(
+            wallet_scan_chunk(
+                scope,
+                111,
+                120,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(115, 7, [0x22; 32]),
+                )],
+                1,
+            ),
+            2,
+        );
+
+        let error = selected_wallet_scan_chunks(&[complete_tail, extension], 100, 120)
+            .expect_err("complete stream extension should fail");
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("complete tail"))
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_page_rejects_source_after_checkpoint() {
+        let chunk = with_checkpoint_block(
+            wallet_scan_chunk(
+                scope(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(106, 7, [0x42; 32]),
+                )],
+                1,
+            ),
+            105,
+        );
+
+        let error = match IndexedWalletPage::try_from(&chunk) {
+            Ok(_) => panic!("post-checkpoint wallet_scan source should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("exceeds checkpoint"))
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_page_stops_at_checkpointed_chunk() {
+        let chunk = with_checkpoint_block(
+            wallet_scan_chunk(
+                scope(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(104, 7, [0x42; 32]),
+                )],
+                1,
+            ),
+            105,
+        );
+        let session = artifact_session(110, vec![chunk]);
+
+        let page = session
+            .page_for_block_range(100, 110)
+            .expect("checkpointed page should decode")
+            .expect("latest indexed block covers range");
+
+        assert_eq!(page.checkpoint_block, 105);
+        assert_eq!(page.nullifier_rows, 1);
+        assert_eq!(page.nullifiers[0].source.block_number, 104);
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_page_returns_exhaustion_after_open_tail_checkpoint() {
+        let chunk = with_checkpoint_block(
+            wallet_scan_chunk(
+                scope(),
+                100,
+                200,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(140, 7, [0x42; 32]),
+                )],
+                1,
+            ),
+            150,
+        );
+        let session = artifact_session(200, vec![chunk]);
+
+        let first_page = session
+            .page_for_block_range(100, 200)
+            .expect("checkpointed page should decode")
+            .expect("latest indexed block covers range");
+        assert_eq!(first_page.checkpoint_block, 150);
+
+        let next_page = session
+            .page_for_block_range(151, 200)
+            .expect("open tail after checkpoint should not be a format error");
+        assert!(matches!(
+            next_page,
+            IndexedWalletArtifactPageOutcome::Exhausted {
+                checkpoint_block: 150,
+            }
+        ));
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_page_rejects_checkpoint_before_chunk_range() {
+        let chunk = with_checkpoint_block(
+            wallet_scan_chunk(
+                scope(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x42; 32]),
+                )],
+                1,
+            ),
+            90,
+        );
+
+        let error = match IndexedWalletPage::try_from(&chunk) {
+            Ok(_) => panic!("pre-range checkpoint should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, SyncError::UnexpectedFormat(message) if message.contains("before range start"))
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_page_decodes_only_requested_chunk_range() {
+        let valid_chunk = wallet_scan_chunk(
+            scope(),
+            100,
+            110,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(105, 7, [0x11; 32]),
+            )],
+            1,
+        );
+        let invalid_later_chunk = wallet_scan_chunk(
+            scope(),
+            150,
+            160,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(161, 7, [0x22; 32]),
+            )],
+            1,
+        );
+        let session = artifact_session(160, vec![valid_chunk, invalid_later_chunk]);
+
+        let page = session
+            .page_for_block_range(100, 110)
+            .expect("first page should not decode later chunk")
+            .expect("latest indexed block covers range");
+
+        assert_eq!(page.checkpoint_block, 110);
+        assert_eq!(page.nullifier_rows, 1);
+        assert_eq!(page.nullifiers[0].source.block_number, 105);
+    }
+
     fn manifest_with_latest_and_catalog(
         scope: ChainScope,
         latest_block: u64,
@@ -1399,6 +2132,7 @@ mod tests {
     ) -> IndexedArtifactManifest {
         let catalogs = catalog_range
             .map(|range| {
+                let range_end = range.end;
                 vec![IndexedArtifactDescriptor {
                     dataset_kind: IndexedDatasetKind::WalletScan,
                     scope: scope.clone(),
@@ -1409,7 +2143,11 @@ mod tests {
                     byte_size: 1234,
                     encoding_version: INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
                     compression: CompressionAlgorithm::Zstd,
-                    metadata: DatasetDescriptorMetadata::default(),
+                    metadata: DatasetDescriptorMetadata {
+                        catalog_generation: Some(1),
+                        checkpoint_block: Some(range_end),
+                        ..Default::default()
+                    },
                 }]
             })
             .unwrap_or_default();
@@ -1500,6 +2238,7 @@ mod tests {
             encoding_version: INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
             compression: CompressionAlgorithm::None,
             metadata: DatasetDescriptorMetadata {
+                catalog_generation: Some(1),
                 checkpoint_block: Some(end),
                 ..Default::default()
             },
@@ -1512,16 +2251,19 @@ mod tests {
         chunks: Vec<VerifiedIndexedArtifactChunk>,
     ) -> IndexedWalletArtifactSession {
         let mut chunk_descriptors = Vec::new();
-        let mut chunk_pages = Vec::new();
-        for (index, chunk) in chunks.iter().enumerate() {
+        let mut indexed_chunks = Vec::new();
+        let mut coverage = WalletScanArtifactCoverage::default();
+        for (index, chunk) in chunks.into_iter().enumerate() {
             let descriptor = chunk.descriptor.clone();
             let range = descriptor.range.clone();
-            let page = IndexedWalletPage::try_from(chunk).expect("decode wallet scan chunk page");
+            coverage
+                .add_descriptor(&descriptor)
+                .expect("wallet scan test chunk coverage");
             chunk_descriptors.push(descriptor);
-            chunk_pages.push(IndexedWalletArtifactChunkPage {
+            indexed_chunks.push(IndexedWalletArtifactChunk {
                 descriptor_index: index,
                 range,
-                page,
+                chunk,
             });
         }
         IndexedWalletArtifactSession {
@@ -1530,8 +2272,173 @@ mod tests {
                 catalog_count: chunk_descriptors.len(),
             },
             chunk_descriptors,
-            chunk_pages,
+            chunks: indexed_chunks,
+            coverage,
         }
+    }
+
+    fn artifact_session_with_coverage(
+        latest_indexed_block: u64,
+        chunks: Vec<VerifiedIndexedArtifactChunk>,
+        ranges: &[(u64, u64)],
+    ) -> IndexedWalletArtifactSession {
+        let mut session = artifact_session(latest_indexed_block, chunks);
+        session.probe.catalog_count = ranges.len();
+        session.coverage = coverage_from_ranges(ranges);
+        session
+    }
+
+    fn coverage_from_ranges(ranges: &[(u64, u64)]) -> WalletScanArtifactCoverage {
+        let mut coverage = WalletScanArtifactCoverage::default();
+        coverage
+            .ranges
+            .extend(ranges.iter().map(|(start, end)| WalletScanCoverageRange {
+                start: *start,
+                end: *end,
+                checkpoint_block: *end,
+            }));
+        coverage
+            .ranges
+            .sort_by_key(|range| (range.start, range.end));
+        coverage
+    }
+
+    fn selected_wallet_scan_chunks(
+        chunks: &[VerifiedIndexedArtifactChunk],
+        from_block: u64,
+        target_block: u64,
+    ) -> Result<Vec<VerifiedIndexedArtifactChunk>, SyncError> {
+        let scope = chunks
+            .first()
+            .expect("at least one wallet scan chunk")
+            .descriptor
+            .scope
+            .clone();
+        let catalogs = stream_catalogs_for_chunks(chunks);
+        let selected = IndexedWalletArtifactSession::select_current_stream_plan(
+            &catalogs,
+            &scope,
+            from_block,
+            target_block,
+        )?
+        .required_current_chunks;
+        Ok(selected
+            .into_iter()
+            .map(|descriptor| {
+                chunks
+                    .iter()
+                    .find(|chunk| chunk.descriptor == descriptor)
+                    .expect("selected descriptor has chunk bytes")
+                    .clone()
+            })
+            .collect())
+    }
+
+    fn stream_catalogs_for_chunks(
+        chunks: &[VerifiedIndexedArtifactChunk],
+    ) -> Vec<IndexedArtifactStreamCatalog> {
+        let mut by_generation = BTreeMap::<u64, Vec<IndexedArtifactDescriptor>>::new();
+        for chunk in chunks {
+            let generation = chunk
+                .descriptor
+                .metadata
+                .catalog_generation
+                .expect("test chunk generation");
+            by_generation
+                .entry(generation)
+                .or_default()
+                .push(chunk.descriptor.clone());
+        }
+        by_generation
+            .into_iter()
+            .map(|(generation, chunks)| wallet_scan_catalog(generation, chunks))
+            .collect()
+    }
+
+    fn wallet_scan_catalog(
+        generation: u64,
+        chunks: Vec<IndexedArtifactDescriptor>,
+    ) -> IndexedArtifactStreamCatalog {
+        let first = chunks.first().expect("wallet scan test catalog chunk");
+        let start = chunks
+            .iter()
+            .map(|chunk| chunk.range.start)
+            .min()
+            .expect("catalog start");
+        let end = chunks
+            .iter()
+            .map(|chunk| chunk.range.end)
+            .max()
+            .expect("catalog end");
+        let row_count = chunks
+            .iter()
+            .map(|chunk| chunk.row_count)
+            .fold(0_u64, u64::saturating_add);
+        let mut descriptor = first.clone();
+        descriptor.range.start = start;
+        descriptor.range.end = end;
+        descriptor.row_count = row_count;
+        descriptor.cid = format!("bafywalletcatalog-{generation}-{start}-{end}");
+        descriptor.metadata.catalog_generation = Some(generation);
+        descriptor.metadata.checkpoint_block = Some(end);
+        IndexedArtifactStreamCatalog::new(descriptor, chunks)
+    }
+
+    fn empty_wallet_scan_catalog(
+        scope: ChainScope,
+        generation: u64,
+        start: u64,
+        end: u64,
+    ) -> IndexedArtifactStreamCatalog {
+        let descriptor = IndexedArtifactDescriptor {
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope,
+            range: IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::Block,
+                start,
+                end,
+            },
+            row_count: 0,
+            cid: format!("bafywalletcatalog-empty-{generation}-{start}-{end}"),
+            sha256: FixedBytes::from([0xee; 32]),
+            byte_size: 0,
+            encoding_version: INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
+            compression: CompressionAlgorithm::Zstd,
+            metadata: DatasetDescriptorMetadata {
+                catalog_generation: Some(generation),
+                checkpoint_block: Some(end),
+                ..Default::default()
+            },
+        };
+        IndexedArtifactStreamCatalog::new(descriptor, Vec::new())
+    }
+
+    fn with_catalog_generation(
+        mut chunk: VerifiedIndexedArtifactChunk,
+        generation: u64,
+    ) -> VerifiedIndexedArtifactChunk {
+        chunk.descriptor.metadata.catalog_generation = Some(generation);
+        chunk
+    }
+
+    fn with_checkpoint_block(
+        mut chunk: VerifiedIndexedArtifactChunk,
+        checkpoint_block: u64,
+    ) -> VerifiedIndexedArtifactChunk {
+        chunk.descriptor.metadata.checkpoint_block = Some(checkpoint_block);
+        chunk
+    }
+
+    fn with_chunk_sealed(mut chunk: VerifiedIndexedArtifactChunk) -> VerifiedIndexedArtifactChunk {
+        chunk.descriptor.metadata.chunk_sealed = true;
+        chunk
+    }
+
+    fn with_stream_complete(
+        mut chunk: VerifiedIndexedArtifactChunk,
+    ) -> VerifiedIndexedArtifactChunk {
+        chunk.descriptor.metadata.stream_complete = true;
+        chunk
     }
 
     fn nullifier_section(block_number: u64, tree_number: u32, nullifier: [u8; 32]) -> Vec<u8> {
