@@ -43,19 +43,25 @@ impl TxidPublicCache<'_> {
                 local_status == TxidPublicLocalLatestStatus::NeedsValidatedRefresh,
             )
         };
-        let artifact_chunks = match indexed_artifact_source {
-            Some(config) => match self
-                .fetch_artifact_chunks_for_range(
-                    railgun_contract,
-                    config,
-                    http_client,
-                    artifact_from_index,
-                    Some(latest.txid_index),
-                )
-                .await
-            {
-                Ok(chunks) if !chunks.is_empty() => Some(chunks),
-                Ok(_) => None,
+        let artifact_fetch = match indexed_artifact_source {
+            Some(config) => match self.artifact_source(railgun_contract, config, http_client) {
+                Ok(source) => match source
+                    .fetch_current_chunks(artifact_from_index, Some(latest.txid_index))
+                    .await
+                {
+                    Ok(chunks) if !chunks.is_empty() => Some((source, chunks)),
+                    Ok(_) => None,
+                    Err(err) if endpoint.is_some() => {
+                        warn!(
+                            ?err,
+                            chain_id = self.key.chain_id,
+                            txid_version = self.key.txid_version,
+                            "TXID public cache artifact chunks unavailable; falling back to GraphQL"
+                        );
+                        None
+                    }
+                    Err(err) => return Err(err),
+                },
                 Err(err) if endpoint.is_some() => {
                     warn!(
                         ?err,
@@ -69,15 +75,24 @@ impl TxidPublicCache<'_> {
             },
             None => None,
         };
+        let artifact_chunk_refs = artifact_fetch
+            .as_ref()
+            .map(|(_source, chunks)| chunks.as_slice());
 
         self.sync_inner(
             endpoint,
             http_client,
             latest,
-            artifact_chunks.as_deref(),
+            artifact_chunk_refs,
             force_validated_refresh,
         )
-        .await
+        .await?;
+        if let Some((source, _chunks)) = artifact_fetch.as_ref() {
+            source
+                .retain_prior_tail_best_effort(self, artifact_from_index)
+                .await;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -316,33 +331,14 @@ impl TxidPublicCache<'_> {
         railgun_contract: &str,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<u64, TxidPublicCacheError> {
+        let mut retention_after_graphql = None;
         if let Some(config) = indexed_artifact_source {
             let from_index = self
                 .load_or_new_manifest()?
                 .validated_cached_txid_index
                 .map_or(0, |index| index.saturating_add(1));
-            match self
-                .fetch_artifact_chunks_for_range(
-                    railgun_contract,
-                    config,
-                    http_client,
-                    from_index,
-                    None,
-                )
-                .await
-            {
-                Ok(chunks) if !chunks.is_empty() => {
-                    match self
-                        .apply_artifact_chunks_only(&chunks, endpoint.is_some())
-                        .await?
-                    {
-                        Some(applied_rows) if applied_rows > 0 => return Ok(applied_rows),
-                        Some(_) | None if endpoint.is_none() => return Ok(0),
-                        Some(_) | None => {}
-                    }
-                }
-                Ok(_) if endpoint.is_none() => return Ok(0),
-                Ok(_) => {}
+            let source = match self.artifact_source(railgun_contract, config, http_client) {
+                Ok(source) => Some(source),
                 Err(err) if endpoint.is_some() => {
                     warn!(
                         ?err,
@@ -350,15 +346,59 @@ impl TxidPublicCache<'_> {
                         txid_version = self.key.txid_version,
                         "TXID public cache background artifact sync unavailable; falling back to GraphQL"
                     );
+                    None
                 }
                 Err(err) => return Err(err),
+            };
+            if let Some(source) = source {
+                match source.fetch_current_chunks(from_index, None).await {
+                    Ok(chunks) if !chunks.is_empty() => {
+                        match self
+                            .apply_artifact_chunks_only(&chunks, endpoint.is_some())
+                            .await?
+                        {
+                            Some(applied_rows) if applied_rows > 0 => {
+                                source.retain_prior_tail_best_effort(self, from_index).await;
+                                return Ok(applied_rows);
+                            }
+                            Some(_) if endpoint.is_none() => {
+                                source.retain_prior_tail_best_effort(self, from_index).await;
+                                return Ok(0);
+                            }
+                            Some(_) => {
+                                retention_after_graphql = Some((source, from_index));
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(_) if endpoint.is_none() => {
+                        source.retain_prior_tail_best_effort(self, from_index).await;
+                        return Ok(0);
+                    }
+                    Ok(_) => {
+                        retention_after_graphql = Some((source, from_index));
+                    }
+                    Err(err) if endpoint.is_some() => {
+                        warn!(
+                            ?err,
+                            chain_id = self.key.chain_id,
+                            txid_version = self.key.txid_version,
+                            "TXID public cache background artifact sync unavailable; falling back to GraphQL"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
-        match endpoint {
-            Some(endpoint) => self.sync_to_graph_tip(endpoint, http_client).await,
-            None => Ok(0),
+        let fetched_rows = match endpoint {
+            Some(endpoint) => self.sync_to_graph_tip(endpoint, http_client).await?,
+            None => 0,
+        };
+        if let Some((source, from_index)) = retention_after_graphql {
+            source.retain_prior_tail_best_effort(self, from_index).await;
         }
+        Ok(fetched_rows)
     }
 
     #[cfg(test)]
@@ -474,25 +514,19 @@ impl TxidPublicCache<'_> {
         manifest.write_to(self.db, self.key)
     }
 
-    async fn fetch_artifact_chunks_for_range(
+    fn artifact_source(
         &self,
         railgun_contract: &str,
         config: &IndexedArtifactSourceConfig,
         http_client: Option<&reqwest::Client>,
-        from_index: u64,
-        to_index: Option<u64>,
-    ) -> Result<Vec<crate::indexed_artifacts::VerifiedIndexedArtifactChunk>, TxidPublicCacheError>
-    {
+    ) -> Result<artifact::TxidPublicArtifactSource, TxidPublicCacheError> {
         let scope = self.key.artifact_scope(railgun_contract)?;
-        artifact::fetch_txid_public_artifact_chunks(
+        Ok(artifact::TxidPublicArtifactSource::new(
             config,
             http_client,
-            &scope,
+            scope,
             self.key.txid_version,
-            from_index,
-            to_index,
-        )
-        .await
+        ))
     }
 
     async fn apply_artifact_chunks_only(

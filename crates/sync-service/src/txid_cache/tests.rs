@@ -1032,6 +1032,138 @@ async fn txid_public_artifact_only_rejects_different_stream_partition() {
         .await;
 }
 
+#[tokio::test]
+async fn txid_public_ignores_malformed_catalog_for_different_stream_partition() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let artifact_row = indexed_transaction(0x46, 0x04, 0x05, 0x06);
+    let artifact_root = root_for_single_leaf(artifact_row.txid_leaf_hash());
+    let chunk =
+        public_txid_artifact_chunk(0, std::slice::from_ref(&artifact_row), Some(artifact_root));
+    let malformed_other_partition = IndexedArtifactDescriptor {
+        dataset_kind: IndexedDatasetKind::PublicTxid,
+        scope: artifact_scope(),
+        range: IndexedArtifactRange {
+            kind: IndexedArtifactRangeKind::TxidIndex,
+            start: 0,
+            end: 0,
+        },
+        row_count: 1,
+        cid: "bafyignored".to_string(),
+        sha256: FixedBytes::from([0xaa; 32]),
+        byte_size: 1,
+        encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+        compression: CompressionAlgorithm::None,
+        metadata: DatasetDescriptorMetadata {
+            stream_partition: Some("other-txid-version".to_string()),
+            ..DatasetDescriptorMetadata::default()
+        },
+    };
+    let (artifact_source, _artifact_server) = public_txid_artifact_source_with_extra_catalogs(
+        vec![(1, vec![chunk])],
+        vec![malformed_other_partition],
+    );
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(artifact_root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect("different partition catalog must not affect TXID sync");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_accepts_matching_chunk_from_multi_partition_catalog() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let requested_row = indexed_transaction(0x47, 0x04, 0x05, 0x06);
+    let requested_root = root_for_single_leaf(requested_row.txid_leaf_hash());
+    let requested_chunk = public_txid_artifact_chunk(
+        0,
+        std::slice::from_ref(&requested_row),
+        Some(requested_root),
+    );
+    let other_row = indexed_transaction(0x48, 0x07, 0x08, 0x09);
+    let other_root = root_for_single_leaf(other_row.txid_leaf_hash());
+    let mut other_chunk =
+        public_txid_artifact_chunk(0, std::slice::from_ref(&other_row), Some(other_root));
+    other_chunk.descriptor.metadata.stream_partition = Some("other-txid-version".to_string());
+    let (artifact_source, _artifact_server) =
+        public_txid_artifact_source(vec![requested_chunk, other_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(requested_root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect("multi-partition catalog should expose requested TXID chunk");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    let row = super::row_for_txid_index(&manifest, &db, 0)
+        .expect("read requested row")
+        .expect("requested row present");
+    assert_eq!(
+        row.transaction.transaction_hash,
+        requested_row.transaction_hash
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
 async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
     stream_partition: Option<&str>,
 ) {
@@ -1402,6 +1534,699 @@ async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
     assert_eq!(
         first_row.transaction.transaction_hash,
         new_first.transaction_hash
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let original_rows = (0..10)
+        .map(|offset| {
+            let offset = offset as u8;
+            indexed_transaction(0x70 + offset, 0x20 + offset, 0x30 + offset, 0x40 + offset)
+        })
+        .collect::<Vec<_>>();
+    let original_root = txid_root_for_transactions(&original_rows);
+    let original_tail = public_txid_artifact_chunk(0, &original_rows, Some(original_root));
+    let (seed_source, _seed_server) = public_txid_artifact_source(vec![original_tail.clone()]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 9,
+                merkleroot: Some(original_root),
+            },
+            Some(&seed_source),
+        )
+        .await
+        .expect("seed stable prior TXID rows");
+    let before_manifest = cache
+        .load_manifest()
+        .expect("load seeded manifest")
+        .expect("seeded manifest present");
+    let before_row_5 = super::row_for_txid_index(&before_manifest, &db, 5)
+        .expect("read row 5 before invalid repack")
+        .expect("row 5 present before invalid repack");
+    let before_row_9 = super::row_for_txid_index(&before_manifest, &db, 9)
+        .expect("read row 9 before invalid repack")
+        .expect("row 9 present before invalid repack");
+
+    let next_rows = (0..10)
+        .map(|offset| {
+            let offset = offset as u8;
+            indexed_transaction(0x90 + offset, 0x50 + offset, 0x60 + offset, 0x70 + offset)
+        })
+        .collect::<Vec<_>>();
+    let all_rows = original_rows
+        .iter()
+        .chain(next_rows.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_root = txid_root_for_transactions(&all_rows);
+    let current_tail = public_txid_artifact_chunk(10, &next_rows, Some(next_root));
+    let repacked_rows = (0..10)
+        .map(|offset| {
+            let offset = offset as u8;
+            indexed_transaction(0xb0 + offset, 0x80 + offset, 0x90 + offset, 0xa0 + offset)
+        })
+        .collect::<Vec<_>>();
+    let repacked_prefix = original_rows
+        .iter()
+        .take(5)
+        .chain(repacked_rows.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let repacked_root = txid_root_for_transactions(&repacked_prefix);
+    let invalid_repack = public_txid_artifact_chunk(5, &repacked_rows, Some(repacked_root));
+    let (artifact_source, _artifact_server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![original_tail]),
+        (2, vec![current_tail]),
+        (3, vec![invalid_repack]),
+    ]);
+
+    let error = cache
+        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&artifact_source))
+        .await
+        .expect_err("stable prior-tail conflict must reject the invalid current repack");
+
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::MetadataMismatch(message)
+            if message.contains("stable chunk")
+    ));
+    let after_manifest = cache
+        .load_manifest()
+        .expect("load manifest after invalid repack")
+        .expect("manifest present after invalid repack");
+    assert_eq!(after_manifest.validated_cached_txid_index, Some(9));
+    assert_eq!(after_manifest.next_txid_index, 10);
+    let after_row_5 = super::row_for_txid_index(&after_manifest, &db, 5)
+        .expect("read row 5 after invalid repack")
+        .expect("row 5 present after invalid repack");
+    let after_row_9 = super::row_for_txid_index(&after_manifest, &db, 9)
+        .expect("read row 9 after invalid repack")
+        .expect("row 9 present after invalid repack");
+    assert_eq!(
+        after_row_5.transaction.transaction_hash,
+        before_row_5.transaction.transaction_hash
+    );
+    assert_eq!(
+        after_row_9.transaction.transaction_hash,
+        before_row_9.transaction.transaction_hash
+    );
+    assert!(
+        super::row_for_txid_index(&after_manifest, &db, 10)
+            .expect("read row 10 after invalid repack")
+            .is_none(),
+        "invalid stream view must not append current rows after the prior conflict"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_background_retains_prior_tail_when_current_chunk_advances() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x70, 0x02, 0x01, 0x03);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let seed_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(first_root),
+            },
+            Some(&seed_source),
+        )
+        .await
+        .expect("seed first validated row");
+
+    let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let retained_cid = raw_cid(&prior_tail.bytes).to_string();
+    let retained_bytes = prior_tail.bytes.clone();
+    let second = indexed_transaction(0x71, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let current_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (source, _server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![prior_tail.clone()]),
+        (2, vec![prior_tail, current_chunk]),
+    ]);
+
+    let fetched = cache
+        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&source))
+        .await
+        .expect("current chunk should apply and prior tail should be retained");
+
+    assert_eq!(fetched, 1);
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+        .expect("read current row")
+        .expect("current row present");
+    assert_eq!(
+        second_row.transaction.transaction_hash,
+        second.transaction_hash
+    );
+    let meta = db
+        .get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &retained_cid),
+        )
+        .expect("read retained chunk metadata")
+        .expect("prior tail chunk metadata present");
+    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
+    assert_eq!(retained, retained_bytes);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catalog() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x72, 0x02, 0x01, 0x03);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let seed_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(first_root),
+            },
+            Some(&seed_source),
+        )
+        .await
+        .expect("seed first validated row");
+
+    let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let retained_cid = raw_cid(&prior_tail.bytes).to_string();
+    let retained_bytes = prior_tail.bytes.clone();
+    let second = indexed_transaction(0x73, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let current_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (source, _server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![prior_tail]),
+        (2, vec![current_chunk]),
+    ]);
+
+    let fetched = cache
+        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&source))
+        .await
+        .expect("current chunk should apply and non-repeated prior tail should be retained");
+
+    assert_eq!(fetched, 1);
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+        .expect("read current row")
+        .expect("current row present");
+    assert_eq!(
+        second_row.transaction.transaction_hash,
+        second.transaction_hash
+    );
+    let meta = db
+        .get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &retained_cid),
+        )
+        .expect("read retained chunk metadata")
+        .expect("prior tail chunk metadata present");
+    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
+    assert_eq!(retained, retained_bytes);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x64, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x65, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let seed_chunk =
+        public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(prefix_root));
+    let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(prefix_root),
+            },
+            Some(&seed_source),
+        )
+        .await
+        .expect("seed validated artifact progress");
+
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let retained_cid = raw_cid(&prior_tail.bytes).to_string();
+    let retained_bytes = prior_tail.bytes.clone();
+    let current_tail =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (retention_source, _retention_server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![prior_tail.clone()]),
+        (2, vec![prior_tail, current_tail]),
+    ]);
+
+    let fetched = cache
+        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&retention_source))
+        .await
+        .expect("background retention pass should not need current rows");
+
+    assert_eq!(fetched, 0);
+    let meta = db
+        .get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &retained_cid),
+        )
+        .expect("read retained chunk metadata")
+        .expect("prior tail chunk metadata present");
+    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
+    assert_eq!(retained, retained_bytes);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configured() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x6c, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x6d, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let seed_chunk =
+        public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(prefix_root));
+    let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(prefix_root),
+            },
+            Some(&seed_source),
+        )
+        .await
+        .expect("seed validated artifact progress");
+
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let retained_cid = raw_cid(&prior_tail.bytes).to_string();
+    let retained_bytes = prior_tail.bytes.clone();
+    let current_tail =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (retention_source, _retention_server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![prior_tail.clone()]),
+        (2, vec![prior_tail, current_tail]),
+    ]);
+    let (graph_endpoint, graph_requests) = spawn_graphql_response(public_txid_response(vec![]));
+
+    let fetched = cache
+        .sync_to_indexed_tip(
+            Some(&graph_endpoint),
+            None,
+            &railgun_contract,
+            Some(&retention_source),
+        )
+        .await
+        .expect("retention should run after no-progress GraphQL fallback");
+
+    assert_eq!(fetched, 0);
+    let request = graph_requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("GraphQL fallback request received");
+    assert!(request.contains("PublicTxidPage"));
+    let meta = db
+        .get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &retained_cid),
+        )
+        .expect("read retained chunk metadata")
+        .expect("prior tail chunk metadata present");
+    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
+    assert_eq!(retained, retained_bytes);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_optional_prior_tail_failure_does_not_block_current_chunk() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x66, 0x02, 0x01, 0x03);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(first_root),
+            },
+            Some(&first_source),
+        )
+        .await
+        .expect("seed first validated row");
+
+    let mut malformed_prior_tail =
+        public_txid_artifact_chunk_from_payload(0, 0, 1, Vec::new(), Some(first_root));
+    malformed_prior_tail.descriptor.metadata.stream_partition = Some(TEST_TXID_VERSION.to_string());
+    let malformed_cid = raw_cid(&malformed_prior_tail.bytes).to_string();
+    let second = indexed_transaction(0x67, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let current_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (source, _server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![malformed_prior_tail.clone()]),
+        (2, vec![malformed_prior_tail, current_chunk]),
+    ]);
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(prefix_root),
+            },
+            Some(&source),
+        )
+        .await
+        .expect("current chunk should apply despite optional retention failure");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+        .expect("read current row")
+        .expect("current row present");
+    assert_eq!(
+        second_row.transaction.transaction_hash,
+        second.transaction_hash
+    );
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &malformed_cid),
+        )
+        .expect("read malformed chunk metadata")
+        .is_none(),
+        "failed optional retention must not write chunk metadata"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_prior_only_catalog_failure_does_not_block_current_progress() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x6a, 0x02, 0x01, 0x03);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(first_root),
+            },
+            Some(&first_source),
+        )
+        .await
+        .expect("seed first validated row");
+
+    let missing_prior_catalog_bytes = b"missing prior catalog";
+    let missing_prior_catalog = IndexedArtifactDescriptor {
+        dataset_kind: IndexedDatasetKind::PublicTxid,
+        scope: artifact_scope(),
+        range: IndexedArtifactRange {
+            kind: IndexedArtifactRangeKind::TxidIndex,
+            start: 0,
+            end: 0,
+        },
+        row_count: 1,
+        cid: raw_cid(missing_prior_catalog_bytes).to_string(),
+        sha256: FixedBytes::from_slice(&Sha256::digest(missing_prior_catalog_bytes)),
+        byte_size: missing_prior_catalog_bytes.len() as u64,
+        encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+        compression: CompressionAlgorithm::None,
+        metadata: DatasetDescriptorMetadata {
+            catalog_generation: Some(1),
+            stream_partition: Some(TEST_TXID_VERSION.to_string()),
+            ..DatasetDescriptorMetadata::default()
+        },
+    };
+    let second = indexed_transaction(0x6b, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let current_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (source, _server) = public_txid_artifact_source_with_extra_catalogs(
+        vec![(2, vec![current_chunk])],
+        vec![missing_prior_catalog],
+    );
+
+    let fetched = cache
+        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&source))
+        .await
+        .expect("missing prior-only catalog must not block current TXID progress");
+
+    assert_eq!(fetched, 1);
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+        .expect("read current row")
+        .expect("current row present");
+    assert_eq!(
+        second_row.transaction.transaction_hash,
+        second.transaction_hash
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_optional_prior_tail_root_mismatch_does_not_write_retention() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x68, 0x02, 0x01, 0x03);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(first_root),
+            },
+            Some(&first_source),
+        )
+        .await
+        .expect("seed first validated row");
+
+    let wrong_root = FixedBytes::from([0xee; 32]);
+    assert_ne!(wrong_root, first_root);
+    let invalid_prior_tail =
+        public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(wrong_root));
+    let invalid_cid = raw_cid(&invalid_prior_tail.bytes).to_string();
+    let second = indexed_transaction(0x69, 0x04, 0x05, 0x06);
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let current_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (source, _server) = public_txid_artifact_source_with_catalogs(vec![
+        (1, vec![invalid_prior_tail.clone()]),
+        (2, vec![invalid_prior_tail, current_chunk]),
+    ]);
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(prefix_root),
+            },
+            Some(&source),
+        )
+        .await
+        .expect("current chunk should apply despite optional root verification failure");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("manifest present");
+    assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+        .expect("read current row")
+        .expect("current row present");
+    assert_eq!(
+        second_row.transaction.transaction_hash,
+        second.transaction_hash
+    );
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &invalid_cid),
+        )
+        .expect("read invalid retained chunk metadata")
+        .is_none(),
+        "root-mismatched optional retention must not write chunk metadata"
     );
 
     drop(db);
@@ -2553,6 +3378,13 @@ fn public_txid_artifact_source(
 fn public_txid_artifact_source_with_catalogs(
     catalogs: Vec<(u64, Vec<VerifiedIndexedArtifactChunk>)>,
 ) -> (IndexedArtifactSourceConfig, PathServer) {
+    public_txid_artifact_source_with_extra_catalogs(catalogs, Vec::new())
+}
+
+fn public_txid_artifact_source_with_extra_catalogs(
+    catalogs: Vec<(u64, Vec<VerifiedIndexedArtifactChunk>)>,
+    extra_catalog_descriptors: Vec<IndexedArtifactDescriptor>,
+) -> (IndexedArtifactSourceConfig, PathServer) {
     let scope = artifact_scope();
     let mut catalog_descriptors = Vec::new();
     let mut catalog_blocks = Vec::new();
@@ -2606,6 +3438,7 @@ fn public_txid_artifact_source_with_catalogs(
         catalog_blocks.push((catalog_cid, catalog_bytes));
         all_chunks.extend(chunks);
     }
+    catalog_descriptors.extend(extra_catalog_descriptors);
     signed_artifact_source(scope, catalog_descriptors, catalog_blocks, all_chunks)
 }
 
@@ -2778,7 +3611,7 @@ impl PathServer {
             listener.local_addr().expect("local addr")
         ))
         .expect("mock server URL");
-        let request_count = routes.len();
+        let request_count = routes.len().saturating_mul(8);
         let routes = Arc::new(routes);
         std::thread::spawn({
             let routes = Arc::clone(&routes);

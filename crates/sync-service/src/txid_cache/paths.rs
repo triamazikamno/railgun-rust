@@ -36,6 +36,23 @@ pub(super) fn staged_artifact_page_file_name(
     )
 }
 
+pub(super) fn artifact_chunk_blob_id(key: TxidPublicCacheKey<'_>, cid: &str) -> String {
+    format!(
+        "{}|{}|{}|artifact-chunk|{}",
+        key.chain_type, key.chain_id, key.txid_version, cid
+    )
+}
+
+pub(super) fn artifact_chunk_file_name(key: TxidPublicCacheKey<'_>, cid: &str) -> String {
+    format!(
+        "{}-{}-{}-artifact-chunk-{}.bin",
+        key.chain_type,
+        key.chain_id,
+        safe_file_component(key.txid_version),
+        safe_file_component(cid)
+    )
+}
+
 pub(super) fn index_shard_file_name(key: TxidPublicCacheKey<'_>, shard: u8) -> String {
     format!(
         "{}-{}-{}-tx-index-{shard:02x}.msgpack",
