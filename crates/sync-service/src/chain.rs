@@ -1,10 +1,11 @@
 use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
-    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, PublicDataPlaneEpoch, SharedLogBatch,
-    SyncProgressSender, SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult,
-    WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
-    WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletIndexedScanRows,
-    WalletReadiness, WalletScanApply,
+    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, PublicDataPlaneEpoch,
+    PublicScanReadScope, PublicScanSource, SharedLogBatch, SyncProgressSender, SyncProgressStage,
+    SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult,
+    WalletBackfillRejectReason, WalletBackfillResetResult, WalletConfig,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletReadiness, WalletScanApply,
+    WalletScanRows, WalletScanRowsPayload,
 };
 use crate::wallet::{
     WalletHandle, WalletPendingOverlay, WalletWorkerServices, pending_overlay_from_delta,
@@ -38,7 +39,7 @@ use railgun_wallet::scan::parse_indexed_wallet_delta;
 use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
+    WalletLogDelta, WalletScanError, WalletScanInputRows, parse_wallet_delta_from_logs,
 };
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -53,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
 mod backfill;
+mod data_plane;
 mod forest_db;
 mod indexed_wallet;
 mod logs;
@@ -62,6 +64,8 @@ mod types;
 mod workers;
 
 use backfill::*;
+pub(crate) use data_plane::ChainPublicDataPlane;
+use data_plane::PublicScanCoverageWrite;
 use forest_db::*;
 use indexed_wallet::*;
 use logs::*;
@@ -69,6 +73,11 @@ use merkle_artifacts::*;
 use types::*;
 use workers::*;
 
+pub use data_plane::{
+    PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,
+    PublicDataPlaneDiagnostics, PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange,
+    PublicScanRows, PublicScanRowsAnswer, PublicSyncCacheReset,
+};
 pub use types::{ChainError, ChainHandle, ChainService};
 
 fn artifact_chunk_progress(

@@ -831,6 +831,23 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn clear_blob_meta_kind(&self, kind: &str) -> Result<u64, DbError> {
+        let prefix = format!("{kind}|");
+        let range_end = prefix_range_end(&prefix);
+        let txn = self.db.begin_write()?;
+        let removed = {
+            let mut table = txn.open_table(BLOB_INDEX_TABLE)?;
+            let mut removed = 0_u64;
+            table.retain_in(prefix.as_str()..range_end.as_str(), |_, _| {
+                removed = removed.saturating_add(1);
+                false
+            })?;
+            removed
+        };
+        txn.commit()?;
+        Ok(removed)
+    }
+
     pub fn get_merkle_forest_meta(
         &self,
         chain_id: u64,

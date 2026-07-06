@@ -40,7 +40,7 @@ struct WalletScanCommitRequest<'a> {
     active_poi_list_keys: &'a [FixedBytes<32>],
     refresh_poi_statuses: bool,
     mark_syncing_on_commit: bool,
-    public_data_epoch: &'a AtomicU64,
+    public_data_plane: &'a ChainPublicDataPlane,
 }
 
 struct WalletScanCommitOutcome {
@@ -387,7 +387,7 @@ impl WalletScanCommitRequest<'_> {
                 changed: false,
             };
         }
-        if !request.apply.payload.covers(from_block, to_block) {
+        if !request.apply.rows.covers(from_block, to_block) {
             return WalletScanCommitOutcome {
                 result: WalletBackfillApplyResult::Rejected {
                     committed_to: *request.last_scanned,
@@ -417,84 +417,38 @@ impl WalletScanCommitRequest<'_> {
                 changed: false,
             };
         }
-        let current_data_epoch = request.public_data_epoch.load(Ordering::Acquire);
-        if request.apply.data_epoch.value != current_data_epoch {
+        let current_data_epoch = request.public_data_plane.current_epoch();
+        let apply_data_epoch = request.apply.read_scope.epoch();
+        if apply_data_epoch != current_data_epoch {
             return WalletScanCommitOutcome {
                 result: WalletBackfillApplyResult::Rejected {
                     committed_to: *request.last_scanned,
                     reason: WalletBackfillRejectReason::StaleDataPlaneEpoch {
-                        expected: current_data_epoch,
-                        actual: request.apply.data_epoch.value,
+                        expected: current_data_epoch.value,
+                        actual: apply_data_epoch.value,
                     },
                 },
                 changed: false,
             };
         }
 
-        let (delta, last_scanned_block_hash, log_count, source_label) = match request.apply.payload
-        {
-            WalletScanPayload::Logs(batch) => {
-                let filtered_logs: Vec<_> = batch
-                    .logs
-                    .iter()
-                    .filter(|log| {
-                        log.block_number
-                            .is_some_and(|block| block >= from_block && block <= to_block)
-                    })
-                    .cloned()
-                    .collect();
-                let delta = if filtered_logs.is_empty() {
-                    WalletLogDelta {
-                        utxos: Vec::new(),
-                        nullifiers: Vec::new(),
-                        commitment_observations: Vec::new(),
-                    }
-                } else {
-                    match parse_wallet_delta_from_logs(
-                        &filtered_logs,
-                        &batch.block_timestamps,
-                        &request.cfg.scan_keys,
-                    ) {
-                        Ok(delta) => delta,
-                        Err(err) => {
-                            warn!(?err, cache_key = %request.cfg.cache_key, from_block, to_block, "failed to parse wallet scan logs");
-                            return WalletScanCommitOutcome {
-                                result: WalletBackfillApplyResult::Rejected {
-                                    committed_to: *request.last_scanned,
-                                    reason: WalletBackfillRejectReason::ApplyFailed,
-                                },
-                                changed: false,
-                            };
-                        }
-                    }
-                };
-                let last_scanned_block_hash = if batch.to_block == to_block {
-                    batch.to_block_hash
-                } else {
-                    None
-                };
-                (delta, last_scanned_block_hash, filtered_logs.len(), "logs")
+        let source_label = request.apply.rows.source.as_str();
+        let (delta, last_scanned_block_hash, log_count) = match request.apply.rows.payload {
+            WalletScanRowsPayload::Rows(rows) => {
+                let log_count = rows.row_count();
+                let delta = WalletLogDelta::from_rows(&rows, &request.cfg.scan_keys);
+                (delta, request.apply.rows.to_block_hash, log_count)
             }
-            WalletScanPayload::IndexedRows { rows, source, .. } => {
-                let delta = parse_indexed_wallet_delta(
-                    &rows.transact_commitments,
-                    &rows.shield_commitments,
-                    &rows.legacy_encrypted_commitments,
-                    &rows.legacy_generated_commitments,
-                    &rows.nullifiers,
-                    &request.cfg.scan_keys,
-                );
-                let log_count = rows.transact_commitments.len()
-                    + rows.shield_commitments.len()
-                    + rows.legacy_encrypted_commitments.len()
-                    + rows.legacy_generated_commitments.len()
-                    + rows.nullifiers.len();
-                (delta, None, log_count, source.as_str())
+            WalletScanRowsPayload::EmptyCoverage => {
+                let delta = WalletLogDelta {
+                    utxos: Vec::new(),
+                    nullifiers: Vec::new(),
+                    commitment_observations: Vec::new(),
+                };
+                (delta, None, 0)
             }
             #[cfg(test)]
-            WalletScanPayload::IndexedDeltaForTest { delta, source, .. } => {
-                (*delta, None, 0, source.as_str())
-            }
+            WalletScanRowsPayload::IndexedDeltaForTest { delta } => (*delta, None, 0),
         };
 
         let WalletLogDelta {
@@ -582,27 +536,54 @@ impl WalletScanCommitRequest<'_> {
 
         let persist_started = Instant::now();
         let persisted_full_snapshot = match request
-            .persist_state
-            .persist_progress_with_private_effects(
-                request.db,
-                request.cache_store,
-                &authority,
-                WalletProgressPersist {
-                    cache_key: &request.cfg.cache_key,
-                    snapshot: &candidate,
-                    last_scanned: to_block,
-                    last_scanned_block_hash,
-                    changed,
+            .public_data_plane
+            .with_valid_public_scan_read(
+                crate::chain::PublicScanRange::new(from_block, to_block),
+                request.apply.rows.source,
+                request.apply.read_scope,
+                || {
+                    request.persist_state.persist_progress_with_private_effects(
+                        request.db,
+                        request.cache_store,
+                        &authority,
+                        WalletProgressPersist {
+                            cache_key: &request.cfg.cache_key,
+                            snapshot: &candidate,
+                            last_scanned: to_block,
+                            last_scanned_block_hash,
+                            changed,
+                        },
+                        WalletProgressPrivateEffects {
+                            pending_output_context_chain_id: request.cfg.chain.chain_id,
+                            pending_output_context_updates: &pending_output_context_updates,
+                            pending_output_context_deletes: &outcome.spent_output_commitments,
+                            output_poi_recovery_updates: &[],
+                        },
+                    )
                 },
-                WalletProgressPrivateEffects {
-                    pending_output_context_chain_id: request.cfg.chain.chain_id,
-                    pending_output_context_updates: &pending_output_context_updates,
-                    pending_output_context_deletes: &outcome.spent_output_commitments,
-                    output_poi_recovery_updates: &[],
-                },
-            ) {
-            Ok(persisted_full_snapshot) => persisted_full_snapshot,
+            )
+            .await
+        {
+            Ok(Ok(persisted_full_snapshot)) => persisted_full_snapshot,
             Err(err) => {
+                let reason = match err {
+                    crate::chain::PublicDataPlaneError::StaleEpoch { expected, actual } => {
+                        WalletBackfillRejectReason::StaleDataPlaneEpoch { expected, actual }
+                    }
+                    crate::chain::PublicDataPlaneError::InvalidRange { .. }
+                    | crate::chain::PublicDataPlaneError::PublicCacheReset { .. } => {
+                        WalletBackfillRejectReason::ApplyFailed
+                    }
+                };
+                return WalletScanCommitOutcome {
+                    result: WalletBackfillApplyResult::Rejected {
+                        committed_to: *request.last_scanned,
+                        reason,
+                    },
+                    changed: false,
+                };
+            }
+            Ok(Err(err)) => {
                 warn!(?err, cache_key = %request.cfg.cache_key, from_block, to_block, "failed to persist wallet scan candidate");
                 set_wallet_readiness(
                     request.ready_tx,
@@ -713,7 +694,7 @@ pub(crate) fn spawn_wallet_worker(
         forest,
         backfill_tx,
         backfill_sender,
-        public_data_epoch,
+        public_data_plane,
     } = services;
     let cache_store = wallet_cache_store(&db, &cfg);
     let (ready_tx, ready_rx) = watch::channel(false);
@@ -1458,7 +1439,7 @@ pub(crate) fn spawn_wallet_worker(
                                 active_poi_list_keys: &active_poi_list_keys,
                                 refresh_poi_statuses: false,
                                 mark_syncing_on_commit: true,
-                                public_data_epoch: public_data_epoch.as_ref(),
+                                public_data_plane: &public_data_plane,
                             }
                             .commit()
                             .await;
@@ -1626,18 +1607,25 @@ pub(crate) fn spawn_wallet_worker(
                             let poi_status_reader = poi_status_client
                                 .as_ref()
                                 .map(|client| wallet_poi_status_reader_source(client, &cfg));
+                            let apply = match WalletScanApply::rows_from_log_batch(
+                                expected_from_block,
+                                batch.to_block,
+                                batch.clone(),
+                                crate::types::PublicScanSource::Rpc,
+                            ) {
+                                Ok(apply) => apply,
+                                Err(err) => {
+                                    warn!(?err, cache_key = %cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to normalize wallet live logs");
+                                    continue;
+                                }
+                            };
                             let outcome = WalletScanCommitRequest {
                                 db: db.as_ref(),
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
                                 utxos: &utxos,
                                 worker_handle: &worker_handle,
-                                apply: WalletScanApply::logs(
-                                    expected_from_block,
-                                    batch.to_block,
-                                    batch,
-                                    PublicDataPlaneEpoch::new(public_data_epoch.load(Ordering::Acquire)),
-                                ),
+                                apply,
                                 current_reset_generation: reset_generation,
                                 event_reset_generation: reset_generation,
                                 cancel: &cancel,
@@ -1651,7 +1639,7 @@ pub(crate) fn spawn_wallet_worker(
                                 active_poi_list_keys: &active_poi_list_keys,
                                 refresh_poi_statuses: true,
                                 mark_syncing_on_commit: false,
-                                public_data_epoch: public_data_epoch.as_ref(),
+                                public_data_plane: &public_data_plane,
                             }
                             .commit()
                             .await;
@@ -1750,10 +1738,23 @@ mod tests {
     use railgun_wallet::scan::{SpentNullifier, WalletLogDelta};
     use railgun_wallet::{Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 
+    use crate::chain::ChainPublicDataPlane;
     use crate::types::{
         BackfillRequest, ChainKey, LogBatch, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-        PoiReadSource, WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+        PoiReadSource, PublicDataPlaneEpoch, PublicScanReadScope, WalletConfig,
+        WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
     };
+
+    fn test_public_data_plane(db: &Arc<DbStore>) -> ChainPublicDataPlane {
+        ChainPublicDataPlane::new(
+            Arc::clone(db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    const fn test_public_scan_read_scope() -> PublicScanReadScope {
+        PublicScanReadScope::new(PublicDataPlaneEpoch::new(0))
+    }
 
     #[derive(Debug, Clone, Copy, Default)]
     struct FailingCacheStoreState {
@@ -1932,12 +1933,13 @@ mod tests {
     }
 
     fn logs_apply(from_block: u64, to_block: u64) -> WalletScanApply {
-        WalletScanApply::logs(
+        WalletScanApply::rows_from_log_batch(
             from_block,
             to_block,
             logs_payload(from_block, to_block),
-            PublicDataPlaneEpoch::new(0),
+            crate::types::PublicScanSource::Rpc,
         )
+        .expect("normalize empty log payload")
     }
 
     fn logs_payload(from_block: u64, to_block: u64) -> Arc<LogBatch> {
@@ -1947,6 +1949,7 @@ mod tests {
             logs: Vec::new(),
             block_timestamps: HashMap::new(),
             to_block_hash: None,
+            read_scope: test_public_scan_read_scope(),
         })
     }
 
@@ -1959,7 +1962,7 @@ mod tests {
             from_block,
             to_block,
             delta,
-            PublicDataPlaneEpoch::new(0),
+            test_public_scan_read_scope(),
             WalletIndexedCatchUpSource::IndexedArtifacts,
         )
     }
@@ -1997,7 +2000,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -2014,6 +2017,7 @@ mod tests {
                 logs: Vec::new(),
                 block_timestamps: HashMap::new(),
                 to_block_hash: None,
+                read_scope: test_public_scan_read_scope(),
             }))
             .expect("live receiver");
         tokio::task::yield_now().await;
@@ -2064,7 +2068,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg,
             1,
@@ -2087,6 +2091,7 @@ mod tests {
                 logs: Vec::new(),
                 block_timestamps: HashMap::new(),
                 to_block_hash: None,
+                read_scope: test_public_scan_read_scope(),
             }))
             .expect("live receiver");
 
@@ -2135,7 +2140,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -2209,7 +2214,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -2308,7 +2313,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg,
             1,
@@ -2392,7 +2397,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg.clone(),
             1,
@@ -2482,7 +2487,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg.clone(),
             1,
@@ -2561,7 +2566,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -2638,7 +2643,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg,
             1,
@@ -2723,7 +2728,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg.clone(),
             1,
@@ -2790,7 +2795,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg,
             1,
@@ -2872,7 +2877,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg.clone(),
             1,
@@ -2960,7 +2965,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg.clone(),
             1,
@@ -3063,7 +3068,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg.clone(),
             1,
@@ -3082,6 +3087,130 @@ mod tests {
         let commit_cancel = cancel.clone();
         let commit_active_poi_list_keys = active_poi_list_keys.clone();
         let commit_status_reader = Arc::clone(&status_reader);
+        let commit_task = tokio::spawn(async move {
+            let commit_public_data_plane = test_public_data_plane(&commit_db);
+            let mut last_scanned = 100;
+            let mut persist_state = WalletPersistState::default();
+            let mut live_metadata_flush = WalletLiveMetadataFlush::new(100, Instant::now());
+            WalletScanCommitRequest {
+                db: commit_db.as_ref(),
+                cache_store: commit_cache_store.as_ref(),
+                cfg: &commit_cfg,
+                utxos: &commit_handle.utxos,
+                worker_handle: &commit_handle,
+                apply: indexed_delta_batch(
+                    101,
+                    110,
+                    WalletLogDelta {
+                        utxos: vec![wallet_utxo.utxo],
+                        nullifiers: Vec::new(),
+                        commitment_observations: Vec::new(),
+                    },
+                ),
+                current_reset_generation: 0,
+                event_reset_generation: 0,
+                cancel: &commit_cancel,
+                last_scanned: &mut last_scanned,
+                persist_state: &mut persist_state,
+                live_metadata_flush: &mut live_metadata_flush,
+                ready_tx: &ready_tx,
+                readiness_tx: &readiness_tx,
+                poi_submitter: None,
+                poi_status_reader: Some(commit_status_reader.as_ref()),
+                active_poi_list_keys: &commit_active_poi_list_keys,
+                refresh_poi_statuses: true,
+                mark_syncing_on_commit: true,
+                public_data_plane: &commit_public_data_plane,
+            }
+            .commit()
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("status request started")
+            .expect("status request signal sent");
+
+        assert_eq!(handle.advance_reset_generation().await, Some(1));
+        release.send(()).expect("release status reader");
+        let outcome = commit_task.await.expect("commit task");
+
+        assert!(matches!(
+            outcome.result,
+            WalletBackfillApplyResult::Rejected {
+                reason: WalletBackfillRejectReason::StaleGeneration {
+                    expected: 1,
+                    actual: 0,
+                },
+                ..
+            }
+        ));
+        assert!(!outcome.changed);
+        assert_eq!(*readiness_rx.borrow(), WalletReadiness::Syncing);
+        assert_eq!(handle.last_scanned(), 100);
+        assert_eq!(*handle.rev_rx.borrow(), 0);
+        assert!(handle.utxos.read().await.is_empty());
+        assert_eq!(cache_store.state().store_calls, 0);
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_scan_commit_rejects_when_public_data_epoch_changes_during_poi_refresh() {
+        let root_dir = temp_db_root("wallet-scan-commit-public-epoch-race");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let cache_store = Arc::new(FailingCacheStore::default());
+        let mut cfg = wallet_config();
+        cfg.cache_store = Some(cache_store.clone());
+        cfg.poi_read_source = PoiReadSource::PoiProxy;
+        let active_poi_list_keys = default_active_poi_list_keys();
+        let wallet_utxo = test_wallet_utxo(105, 7);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let status_reader = Arc::new(BlockingPoiStatusReader::new(started_tx, release_rx));
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let public_data_plane = test_public_data_plane(&db);
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx,
+                public_data_plane: public_data_plane.clone(),
+            },
+            cfg.clone(),
+            1,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        );
+        let (ready_tx, _ready_rx) = watch::channel(true);
+        let (readiness_tx, readiness_rx) = watch::channel(WalletReadiness::Syncing);
+        let commit_db = Arc::clone(&db);
+        let commit_cache_store = Arc::clone(&cache_store);
+        let commit_cfg = cfg.clone();
+        let commit_handle = handle.clone();
+        let commit_cancel = cancel.clone();
+        let commit_active_poi_list_keys = active_poi_list_keys.clone();
+        let commit_status_reader = Arc::clone(&status_reader);
+        let commit_public_data_plane = public_data_plane.clone();
         let commit_task = tokio::spawn(async move {
             let mut last_scanned = 100;
             let mut persist_state = WalletPersistState::default();
@@ -3114,7 +3243,7 @@ mod tests {
                 active_poi_list_keys: &commit_active_poi_list_keys,
                 refresh_poi_statuses: true,
                 mark_syncing_on_commit: true,
-                public_data_epoch: commit_handle.reset_generation.as_ref(),
+                public_data_plane: &commit_public_data_plane,
             }
             .commit()
             .await
@@ -3124,20 +3253,22 @@ mod tests {
             .expect("status request started")
             .expect("status request signal sent");
 
-        assert_eq!(handle.advance_reset_generation().await, Some(1));
+        public_data_plane
+            .invalidate_public_scan_coverage_from(101)
+            .await;
         release.send(()).expect("release status reader");
         let outcome = commit_task.await.expect("commit task");
 
-        assert!(matches!(
+        assert_eq!(
             outcome.result,
             WalletBackfillApplyResult::Rejected {
-                reason: WalletBackfillRejectReason::StaleGeneration {
+                committed_to: 100,
+                reason: WalletBackfillRejectReason::StaleDataPlaneEpoch {
                     expected: 1,
                     actual: 0,
                 },
-                ..
             }
-        ));
+        );
         assert!(!outcome.changed);
         assert_eq!(*readiness_rx.borrow(), WalletReadiness::Syncing);
         assert_eq!(handle.last_scanned(), 100);
@@ -3175,7 +3306,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -3238,7 +3369,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -3293,7 +3424,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             cfg,
             1,
@@ -3307,12 +3438,13 @@ mod tests {
         assert_eq!(
             send_apply(
                 &backfill_tx,
-                WalletScanApply::logs(
+                WalletScanApply::rows_from_log_batch(
                     120,
                     130,
                     logs_payload(100, 199),
-                    PublicDataPlaneEpoch::new(0),
-                ),
+                    crate::types::PublicScanSource::Rpc,
+                )
+                .expect("normalize shared log payload"),
                 0,
             )
             .await,
@@ -3322,12 +3454,13 @@ mod tests {
         assert_eq!(
             send_apply(
                 &backfill_tx,
-                WalletScanApply::logs(
+                WalletScanApply::rows_from_log_batch(
                     131,
                     199,
                     logs_payload(100, 199),
-                    PublicDataPlaneEpoch::new(0),
-                ),
+                    crate::types::PublicScanSource::Rpc,
+                )
+                .expect("normalize shared log payload"),
                 0,
             )
             .await,
@@ -3371,7 +3504,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -3425,7 +3558,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -3508,7 +3641,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -3635,7 +3768,7 @@ mod tests {
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_epoch: Arc::new(AtomicU64::new(0)),
+                public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
             1,
@@ -3653,6 +3786,7 @@ mod tests {
                     logs: Vec::new(),
                     block_timestamps: HashMap::new(),
                     to_block_hash: None,
+                    read_scope: test_public_scan_read_scope(),
                 }))
                 .expect("live receiver");
         }

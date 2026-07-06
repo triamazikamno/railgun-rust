@@ -110,13 +110,497 @@ pub(in crate::chain) async fn send_wallet_reset(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PublicScanPagePlan {
+    source_range: PublicScanRange,
+}
+
+impl PublicScanPagePlan {
+    fn new(range: PublicScanRange, chain: &ChainConfig) -> Self {
+        let rpc_to = Self::bounded_to_block(range.from_block, range.to_block, chain.block_range);
+        let indexed_page_kind =
+            IndexedWalletPageKind::for_from_block(range.from_block, chain.v2_start_block);
+        let indexed_to = indexed_page_kind.to_block(
+            range.from_block,
+            range.to_block,
+            chain.v2_start_block,
+            chain.indexed_wallet_block_range.max(1),
+        );
+        Self {
+            source_range: PublicScanRange::new(range.from_block, rpc_to.min(indexed_to)),
+        }
+    }
+
+    fn bounded_to_block(from_block: u64, target_block: u64, max_blocks: u64) -> u64 {
+        let max_blocks = max_blocks.max(1);
+        from_block
+            .saturating_add(max_blocks.saturating_sub(1))
+            .min(target_block)
+    }
+}
+
 impl ChainService {
     pub(super) fn next_wallet_reset_intent(&self) -> u64 {
         self.wallet_reset_intent_next.fetch_add(1, Ordering::AcqRel)
     }
 
-    pub(super) fn current_public_data_epoch(&self) -> PublicDataPlaneEpoch {
-        PublicDataPlaneEpoch::new(self.public_data_epoch.load(Ordering::Acquire))
+    pub(super) fn begin_public_scan_read(&self) -> PublicScanReadScope {
+        self.public_data_plane.begin_public_scan_read()
+    }
+
+    #[must_use]
+    pub fn public_data_plane(self: &Arc<Self>) -> PublicDataPlaneHandle {
+        PublicDataPlaneHandle::new(Arc::clone(self))
+    }
+
+    pub async fn public_scan_coverage(
+        &self,
+        range: PublicScanRange,
+    ) -> Result<PublicCoverageAnswer, ChainError> {
+        if !range.is_valid() {
+            return Err(PublicDataPlaneError::InvalidRange {
+                from_block: range.from_block,
+                to_block: range.to_block,
+            }
+            .into());
+        }
+        let cached = self
+            .public_data_plane
+            .cached_public_scan_coverage(range)
+            .await;
+        match &cached {
+            PublicCoverageAnswer::ReplayableEmpty {
+                range: covered_range,
+                source,
+                epoch,
+            }
+            | PublicCoverageAnswer::CoveredWithRows {
+                range: covered_range,
+                source,
+                epoch,
+            } => {
+                self.public_data_plane
+                    .record_source_decision(
+                        PublicDataPlaneDiagnosticKind::SourceSelected,
+                        *source,
+                        *covered_range,
+                        PublicScanReadScope::new(*epoch),
+                        "cached public coverage selected",
+                    )
+                    .await;
+                return Ok(cached);
+            }
+            PublicCoverageAnswer::Missing { .. } => {}
+        }
+
+        match self.public_scan_rows(range).await? {
+            PublicScanRowsAnswer::Rows(rows) => {
+                if rows.row_count() > 0 {
+                    Ok(PublicCoverageAnswer::CoveredWithRows {
+                        range: rows.range,
+                        source: rows.source,
+                        epoch: rows.epoch,
+                    })
+                } else {
+                    Ok(PublicCoverageAnswer::ReplayableEmpty {
+                        range: rows.range,
+                        source: rows.source,
+                        epoch: rows.epoch,
+                    })
+                }
+            }
+            PublicScanRowsAnswer::CompleteCoverage {
+                range,
+                source,
+                row_count,
+                epoch,
+            } => {
+                if row_count > 0 {
+                    Ok(PublicCoverageAnswer::CoveredWithRows {
+                        range,
+                        source,
+                        epoch,
+                    })
+                } else {
+                    Ok(PublicCoverageAnswer::ReplayableEmpty {
+                        range,
+                        source,
+                        epoch,
+                    })
+                }
+            }
+            PublicScanRowsAnswer::Missing { range, epoch } => {
+                Ok(PublicCoverageAnswer::Missing { range, epoch })
+            }
+        }
+    }
+
+    pub async fn public_scan_rows(
+        &self,
+        range: PublicScanRange,
+    ) -> Result<PublicScanRowsAnswer, ChainError> {
+        if !range.is_valid() {
+            return Err(PublicDataPlaneError::InvalidRange {
+                from_block: range.from_block,
+                to_block: range.to_block,
+            }
+            .into());
+        }
+        let plan = PublicScanPagePlan::new(range, &self.chain);
+        let source_range = plan.source_range;
+        if let Some(apply) = self
+            .public_data_plane
+            .cached_empty_wallet_scan_apply(source_range.from_block, source_range.to_block)
+            .await
+        {
+            let read_scope = apply.read_scope;
+            let selected_range = PublicScanRange::new(apply.from_block, apply.to_block);
+            self.public_data_plane
+                .record_source_decision(
+                    PublicDataPlaneDiagnosticKind::SourceSelected,
+                    PublicScanSource::CachedCoverage,
+                    selected_range,
+                    read_scope,
+                    "cached empty public coverage selected",
+                )
+                .await;
+            return self.public_scan_answer_from_apply(apply).await;
+        }
+
+        let mut artifact_fallback_reason = None;
+        if let Some(session) = self
+            .prepare_indexed_wallet_artifact_session_for_label(
+                "public_scan_rows",
+                source_range.from_block,
+                source_range.to_block,
+                None,
+            )
+            .await
+        {
+            let target = session.probe().catch_up_target(source_range.to_block);
+            if source_range.from_block <= target {
+                let read_scope = session.read_scope();
+                self.public_data_plane
+                    .record_source_decision(
+                        PublicDataPlaneDiagnosticKind::SourceSelected,
+                        PublicScanSource::IndexedArtifacts,
+                        PublicScanRange::new(source_range.from_block, target),
+                        read_scope,
+                        "indexed artifact public scan rows selected",
+                    )
+                    .await;
+                match session.page_for_block_range(source_range.from_block, target) {
+                    Ok(IndexedWalletArtifactPageOutcome::Page(page)) => {
+                        let row_count = page.transact_commitments.len()
+                            + page.shield_commitments.len()
+                            + page.legacy_encrypted_commitments.len()
+                            + page.legacy_generated_commitments.len()
+                            + page.nullifiers.len();
+                        let checkpoint = page.checkpoint_block;
+                        self.record_public_scan_coverage_result(
+                            PublicScanRange::new(source_range.from_block, checkpoint),
+                            PublicScanSource::IndexedArtifacts,
+                            row_count,
+                            read_scope,
+                        )
+                        .await?;
+                        let apply = WalletScanApply::indexed_rows(
+                            source_range.from_block,
+                            checkpoint,
+                            page.into_scan_rows(),
+                            read_scope,
+                            WalletIndexedCatchUpSource::IndexedArtifacts,
+                        );
+                        return self.public_scan_answer_from_apply(apply).await;
+                    }
+                    Ok(IndexedWalletArtifactPageOutcome::Exhausted { checkpoint_block }) => {
+                        debug!(
+                            from_block = source_range.from_block,
+                            target,
+                            checkpoint_block,
+                            "indexed artifact public scan rows exhausted; falling back"
+                        );
+                        artifact_fallback_reason = Some(format!(
+                            "indexed artifact exhausted at checkpoint {checkpoint_block}; falling back"
+                        ));
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            from_block = source_range.from_block,
+                            target,
+                            "indexed artifact public scan rows failed; falling back"
+                        );
+                        artifact_fallback_reason = Some(format!("indexed artifact failed: {err}"));
+                    }
+                }
+            }
+        }
+
+        let squid_read_scope = self.begin_public_scan_read();
+        if let Some((client, height)) = self
+            .probe_squid_indexed_wallet_source_for_label("public_scan_rows")
+            .await
+        {
+            let target = height.min(source_range.to_block);
+            if source_range.from_block <= target {
+                let page_kind = IndexedWalletPageKind::for_from_block(
+                    source_range.from_block,
+                    self.chain.v2_start_block,
+                );
+                let to_block = page_kind.to_block(
+                    source_range.from_block,
+                    target,
+                    self.chain.v2_start_block,
+                    self.chain.indexed_wallet_block_range,
+                );
+                if let Some(reason) = artifact_fallback_reason.take() {
+                    self.record_public_scan_fallback(
+                        PublicScanSource::Squid,
+                        PublicScanRange::new(source_range.from_block, to_block),
+                        squid_read_scope,
+                        reason,
+                    )
+                    .await;
+                }
+                self.public_data_plane
+                    .record_source_decision(
+                        PublicDataPlaneDiagnosticKind::SourceSelected,
+                        PublicScanSource::Squid,
+                        PublicScanRange::new(source_range.from_block, to_block),
+                        squid_read_scope,
+                        "Squid public scan rows selected",
+                    )
+                    .await;
+                match IndexedWalletPage::fetch(
+                    &client,
+                    page_kind,
+                    source_range.from_block,
+                    to_block,
+                )
+                .await
+                {
+                    Ok(page) => {
+                        let row_count = page.transact_commitments.len()
+                            + page.shield_commitments.len()
+                            + page.legacy_encrypted_commitments.len()
+                            + page.legacy_generated_commitments.len()
+                            + page.nullifiers.len();
+                        let checkpoint = page.checkpoint_block;
+                        self.record_public_scan_coverage_result(
+                            PublicScanRange::new(source_range.from_block, checkpoint),
+                            PublicScanSource::Squid,
+                            row_count,
+                            squid_read_scope,
+                        )
+                        .await?;
+                        let apply = WalletScanApply::indexed_rows(
+                            source_range.from_block,
+                            checkpoint,
+                            page.into_scan_rows(),
+                            squid_read_scope,
+                            WalletIndexedCatchUpSource::Squid,
+                        );
+                        return self.public_scan_answer_from_apply(apply).await;
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            from_block = source_range.from_block,
+                            to_block,
+                            "Squid public scan rows failed; falling back to RPC"
+                        );
+                        let rpc_source = self.rpc_scan_source_for_range(source_range.from_block);
+                        let rpc_read_scope = self.begin_public_scan_read();
+                        self.record_public_scan_fallback(
+                            rpc_source,
+                            source_range,
+                            rpc_read_scope,
+                            format!("Squid failed: {err}"),
+                        )
+                        .await;
+                        return self
+                            .public_scan_rows_from_rpc(source_range, rpc_read_scope)
+                            .await;
+                    }
+                }
+            }
+        }
+
+        let rpc_read_scope = self.begin_public_scan_read();
+        if let Some(reason) = artifact_fallback_reason.take() {
+            self.record_public_scan_fallback(
+                self.rpc_scan_source_for_range(source_range.from_block),
+                source_range,
+                rpc_read_scope,
+                reason,
+            )
+            .await;
+        }
+        self.public_scan_rows_from_rpc(source_range, rpc_read_scope)
+            .await
+    }
+
+    async fn public_scan_rows_from_rpc(
+        &self,
+        source_range: PublicScanRange,
+        read_scope: PublicScanReadScope,
+    ) -> Result<PublicScanRowsAnswer, ChainError> {
+        let applies = self
+            .fetch_wallet_rpc_backfill_events(
+                source_range.from_block,
+                source_range.to_block,
+                &self.cancel,
+                read_scope,
+            )
+            .await
+            .map_err(|err| match err {
+                WalletStartupSyncError::Cancelled => ChainError::BackfillRequestFailed,
+                WalletStartupSyncError::Chain(err) => err,
+                WalletStartupSyncError::Indexed(err) => ChainError::IndexedCatchUpUnavailable {
+                    from_block: source_range.from_block,
+                    archive_until_block: self.chain.archive_until_block,
+                    reason: err.to_string(),
+                },
+            })?;
+        if let Some(apply) = applies.into_iter().next() {
+            self.public_scan_answer_from_apply(apply).await
+        } else {
+            Ok(PublicScanRowsAnswer::Missing {
+                range: source_range,
+                epoch: self.public_data_plane.current_epoch(),
+            })
+        }
+    }
+
+    pub(super) fn rpc_scan_source_for_range(&self, from_block: u64) -> PublicScanSource {
+        if self.chain.archive_until_block > 0 && from_block <= self.chain.archive_until_block {
+            PublicScanSource::ArchiveRpc
+        } else {
+            PublicScanSource::Rpc
+        }
+    }
+
+    async fn public_scan_answer_from_apply(
+        &self,
+        apply: WalletScanApply,
+    ) -> Result<PublicScanRowsAnswer, ChainError> {
+        let range = PublicScanRange::new(apply.from_block, apply.to_block);
+        let source = apply.rows.source;
+        let read_scope = apply.read_scope;
+        self.public_data_plane
+            .with_valid_public_scan_read(range, source, read_scope, || {
+                PublicScanRowsAnswer::from_wallet_scan_apply(apply)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_public_scan_coverage_result(
+        &self,
+        range: PublicScanRange,
+        source: PublicScanSource,
+        row_count: usize,
+        read_scope: PublicScanReadScope,
+    ) -> Result<PublicDataPlaneEpoch, PublicDataPlaneError> {
+        self.public_data_plane
+            .record_public_scan_coverage(PublicScanCoverageWrite {
+                range,
+                source,
+                row_count,
+                read_scope,
+            })
+            .await
+    }
+
+    async fn record_public_scan_fallback(
+        &self,
+        fallback_source: PublicScanSource,
+        range: PublicScanRange,
+        read_scope: PublicScanReadScope,
+        reason: impl Into<String>,
+    ) {
+        self.public_data_plane
+            .record_source_decision(
+                PublicDataPlaneDiagnosticKind::SourceFallback,
+                fallback_source,
+                range,
+                read_scope,
+                reason,
+            )
+            .await;
+    }
+
+    pub(super) async fn record_public_scan_coverage(
+        &self,
+        range: PublicScanRange,
+        source: PublicScanSource,
+        row_count: usize,
+        read_scope: PublicScanReadScope,
+    ) {
+        if let Err(err) = self
+            .record_public_scan_coverage_result(range, source, row_count, read_scope)
+            .await
+        {
+            debug!(
+                ?err,
+                ?range,
+                ?source,
+                "public scan coverage was not recorded"
+            );
+        }
+    }
+
+    async fn apply_cached_public_scan_coverage(
+        &self,
+        cfg: &WalletConfig,
+        start_block: u64,
+        last_scanned: u64,
+        target_block: u64,
+        sender: &mpsc::Sender<BackfillEvent>,
+        reset_generation: u64,
+    ) -> u64 {
+        let mut checkpoint = last_scanned;
+        loop {
+            let from_block = wallet_backfill_from_block(checkpoint, start_block);
+            if from_block > target_block {
+                return checkpoint;
+            }
+            let Some(apply) = self
+                .public_data_plane
+                .cached_empty_wallet_scan_apply(from_block, target_block)
+                .await
+            else {
+                return checkpoint;
+            };
+            let apply_to = apply.to_block;
+            let read_scope = apply.read_scope;
+            self.public_data_plane
+                .record_source_decision(
+                    PublicDataPlaneDiagnosticKind::SourceSelected,
+                    PublicScanSource::CachedCoverage,
+                    PublicScanRange::new(from_block, apply_to),
+                    read_scope,
+                    "cached empty public coverage selected",
+                )
+                .await;
+            let apply_result =
+                send_wallet_scan_apply(&cfg.cache_key, sender, apply, reset_generation).await;
+            let Some(committed_to) = apply_result.accepted_committed_to() else {
+                debug!(
+                    ?apply_result,
+                    cache_key = %cfg.cache_key,
+                    from_block,
+                    apply_to,
+                    "cached public coverage was not committed"
+                );
+                return checkpoint;
+            };
+            checkpoint = committed_to;
+            if committed_to < apply_to {
+                return checkpoint;
+            }
+        }
     }
 
     pub async fn start(db: Arc<DbStore>, chain: ChainConfig) -> Result<Arc<Self>, ChainError> {
@@ -162,6 +646,8 @@ impl ChainService {
         let (live_log_tx, _live_log_rx) = broadcast::channel(64);
         let (backfill_tx, backfill_rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
+        let public_data_plane =
+            ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
         let service = Arc::new(Self {
             chain,
             db,
@@ -179,7 +665,7 @@ impl ChainService {
             txid_public_cache_started: AtomicBool::new(false),
             wallet_actor_next: AtomicU64::new(1),
             wallet_reset_intent_next: AtomicU64::new(1),
-            public_data_epoch: Arc::new(AtomicU64::new(0)),
+            public_data_plane,
         });
 
         spawn_head_poller(service.clone(), rpcs.clone());
@@ -437,7 +923,7 @@ impl ChainService {
                     forest: self.forest.clone(),
                     backfill_tx: self.backfill_tx.clone(),
                     backfill_sender: backfill_sender.clone(),
-                    public_data_epoch: self.public_data_epoch.clone(),
+                    public_data_plane: self.public_data_plane.clone(),
                 },
                 cfg.clone(),
                 actor_id,
@@ -546,12 +1032,24 @@ impl ChainService {
         &self,
         cfg: &WalletConfig,
         start_block: u64,
-        last_scanned: u64,
+        mut last_scanned: u64,
         sync_target: u64,
         follow_safe_head: bool,
         reset_generation: u64,
         backfill_sender: mpsc::Sender<BackfillEvent>,
     ) {
+        if sync_target > 0 {
+            last_scanned = self
+                .apply_cached_public_scan_coverage(
+                    cfg,
+                    start_block,
+                    last_scanned,
+                    sync_target,
+                    &backfill_sender,
+                    reset_generation,
+                )
+                .await;
+        }
         let from_block = wallet_backfill_from_block(last_scanned, start_block);
 
         // When safe_head has not been set yet (still 0) we cannot tell whether
@@ -768,7 +1266,12 @@ impl ChainService {
         let started = Instant::now();
         let from_block = wallet_backfill_from_block(last_scanned, start_block);
         let events = self
-            .fetch_wallet_rpc_backfill_events(from_block, sync_target, &cancel)
+            .fetch_wallet_rpc_backfill_events(
+                from_block,
+                sync_target,
+                &cancel,
+                self.begin_public_scan_read(),
+            )
             .await?;
         debug!(
             cache_key = %cfg.cache_key,
@@ -846,6 +1349,7 @@ impl ChainService {
             if cancel.is_cancelled() {
                 return Err(WalletStartupSyncError::Cancelled);
             }
+            let read_scope = self.begin_public_scan_read();
             let page_started = Instant::now();
             let page_kind =
                 IndexedWalletPageKind::for_from_block(from_block, self.chain.v2_start_block);
@@ -875,11 +1379,18 @@ impl ChainService {
             let nullifier_rows = page.nullifier_rows;
             let parse_elapsed_ms = parse_started.elapsed().as_millis();
             checkpoint = page.checkpoint_block;
+            self.record_public_scan_coverage(
+                PublicScanRange::new(from_block, checkpoint),
+                PublicScanSource::Squid,
+                row_count,
+                read_scope,
+            )
+            .await;
             events.push(WalletScanApply::indexed_rows(
                 from_block,
                 checkpoint,
-                page.into_scan_rows(WalletIndexedCatchUpSource::Squid),
-                self.current_public_data_epoch(),
+                page.into_scan_rows(),
+                read_scope,
                 WalletIndexedCatchUpSource::Squid,
             ));
             debug!(
@@ -914,7 +1425,12 @@ impl ChainService {
         if checkpoint < sync_target {
             let tail_from = wallet_backfill_from_block(checkpoint, start_block);
             let mut tail_events = self
-                .fetch_wallet_rpc_backfill_events(tail_from, sync_target, &cancel)
+                .fetch_wallet_rpc_backfill_events(
+                    tail_from,
+                    sync_target,
+                    &cancel,
+                    self.begin_public_scan_read(),
+                )
                 .await?;
             events.append(&mut tail_events);
         }
@@ -931,6 +1447,7 @@ impl ChainService {
         from_block: u64,
         to_block: u64,
         cancel: &CancellationToken,
+        read_scope: PublicScanReadScope,
     ) -> Result<Vec<WalletScanApply>, WalletStartupSyncError> {
         if from_block > to_block {
             return Ok(Vec::new());
@@ -941,6 +1458,29 @@ impl ChainService {
             .random_provider()
             .ok_or(ChainError::NoHealthyRpc)?;
         let started = Instant::now();
+        let provider_head = match wait_or_cancel(cancel, rpc.provider.get_block_number()).await? {
+            Ok(provider_head) => provider_head,
+            Err(err) => {
+                let err = ChainError::from(err);
+                if err.should_mark_rpc_unhealthy() {
+                    self.chain.rpcs.mark_bad_provider(&rpc);
+                }
+                return Err(err.into());
+            }
+        };
+        let proven_to_block = provider_head.saturating_sub(self.chain.finality_depth);
+        if from_block > proven_to_block {
+            debug!(
+                from_block,
+                requested_to_block = to_block,
+                provider_head,
+                proven_to_block,
+                finality_depth = self.chain.finality_depth,
+                "RPC wallet scan source has no proven coverage for requested range"
+            );
+            return Ok(Vec::new());
+        }
+        let to_block = to_block.min(proven_to_block);
         let fetch_logs_started = Instant::now();
         let mut logs = match wait_or_cancel(
             cancel,
@@ -1026,6 +1566,7 @@ impl ChainService {
             logs,
             block_timestamps,
             to_block_hash,
+            read_scope,
         });
         debug!(
             from_block,
@@ -1033,20 +1574,42 @@ impl ChainService {
             elapsed_ms = started.elapsed().as_millis(),
             "hedged wallet RPC backfill candidate complete"
         );
-        Ok(vec![WalletScanApply::logs(
-            from_block,
-            to_block,
-            batch,
-            self.current_public_data_epoch(),
-        )])
+        let source = self.rpc_scan_source_for_range(from_block);
+        self.public_data_plane
+            .record_source_decision(
+                PublicDataPlaneDiagnosticKind::SourceSelected,
+                source,
+                PublicScanRange::new(from_block, to_block),
+                read_scope,
+                "RPC wallet backfill source selected",
+            )
+            .await;
+        let apply = WalletScanApply::rows_from_log_batch(from_block, to_block, batch, source)
+            .map_err(ChainError::from)?;
+        self.record_public_scan_coverage(
+            PublicScanRange::new(from_block, to_block),
+            source,
+            apply.row_count(),
+            read_scope,
+        )
+        .await;
+        Ok(vec![apply])
     }
 
     async fn probe_squid_indexed_wallet_source(
         &self,
         cfg: &WalletConfig,
     ) -> Option<(QuickSyncClient, u64)> {
+        self.probe_squid_indexed_wallet_source_for_label(&cfg.cache_key)
+            .await
+    }
+
+    async fn probe_squid_indexed_wallet_source_for_label(
+        &self,
+        cache_key: &str,
+    ) -> Option<(QuickSyncClient, u64)> {
         let Some(endpoint) = self.chain.quick_sync_endpoint.clone() else {
-            debug!(cache_key = %cfg.cache_key, "no indexed endpoint configured; using RPC wallet backfill");
+            debug!(cache_key = %cache_key, "no indexed endpoint configured; using RPC wallet backfill");
             return None;
         };
         let client = match self.chain.http_client.clone() {
@@ -1059,14 +1622,14 @@ impl ChainService {
             Err(err) => {
                 warn!(
                     ?err,
-                    cache_key = %cfg.cache_key,
+                    cache_key = %cache_key,
                     "indexed wallet probe failed; using RPC backfill"
                 );
                 return None;
             }
         };
         debug!(
-            cache_key = %cfg.cache_key,
+            cache_key = %cache_key,
             elapsed_ms = probe_started.elapsed().as_millis(),
             "indexed wallet probe complete"
         );
@@ -1096,16 +1659,39 @@ impl ChainService {
         safe_head: u64,
         progress_tx: Option<&SyncProgressSender>,
     ) -> Option<IndexedWalletArtifactSession> {
+        self.prepare_indexed_wallet_artifact_session_for_label(
+            &cfg.cache_key,
+            from_block,
+            safe_head,
+            progress_tx,
+        )
+        .await
+    }
+
+    async fn prepare_indexed_wallet_artifact_session_for_label(
+        &self,
+        cache_key: &str,
+        from_block: u64,
+        safe_head: u64,
+        progress_tx: Option<&SyncProgressSender>,
+    ) -> Option<IndexedWalletArtifactSession> {
         if self.chain.indexed_artifact_source.is_none() {
             return None;
         }
+        let read_scope = self.begin_public_scan_read();
         let artifact_session_started = Instant::now();
-        match IndexedWalletArtifactSession::prepare(&self.chain, from_block, safe_head, progress_tx)
-            .await
+        match IndexedWalletArtifactSession::prepare(
+            &self.chain,
+            from_block,
+            safe_head,
+            progress_tx,
+            read_scope,
+        )
+        .await
         {
             Ok(Some(session)) => {
                 debug!(
-                    cache_key = %cfg.cache_key,
+                    cache_key = %cache_key,
                     from_block,
                     safe_head,
                     latest_indexed_block = session.latest_indexed_block(),
@@ -1118,7 +1704,7 @@ impl ChainService {
             }
             Ok(None) => {
                 debug!(
-                    cache_key = %cfg.cache_key,
+                    cache_key = %cache_key,
                     from_block,
                     safe_head,
                     elapsed_ms = artifact_session_started.elapsed().as_millis(),
@@ -1129,7 +1715,7 @@ impl ChainService {
             Err(err) => {
                 warn!(
                     ?err,
-                    cache_key = %cfg.cache_key,
+                    cache_key = %cache_key,
                     from_block,
                     safe_head,
                     elapsed_ms = artifact_session_started.elapsed().as_millis(),
@@ -1185,7 +1771,8 @@ impl ChainService {
             debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
             return last_scanned;
         }
-        let from_block = last_scanned.saturating_add(1).max(start_block);
+        let mut last_scanned = last_scanned;
+        let mut from_block = last_scanned.saturating_add(1).max(start_block);
         let progress_tx = cfg
             .progress_tx
             .clone()
@@ -1195,6 +1782,25 @@ impl ChainService {
             debug!(cache_key = %cfg.cache_key, "indexed wallet catch-up already active");
             return last_scanned;
         };
+        let (sender, reset_generation) = queued_sender;
+        let cached_checkpoint = self
+            .apply_cached_public_scan_coverage(
+                cfg,
+                start_block,
+                last_scanned,
+                safe_head,
+                sender,
+                reset_generation,
+            )
+            .await;
+        if cached_checkpoint > last_scanned {
+            last_scanned = cached_checkpoint;
+            from_block = last_scanned.saturating_add(1).max(start_block);
+            if from_block > safe_head {
+                return last_scanned;
+            }
+        }
+        let source_selection_read_scope = self.begin_public_scan_read();
         let mut artifact_session =
             if source_order == IndexedWalletCatchUpSourceOrder::ArtifactsFirst {
                 self.prepare_indexed_wallet_artifact_session(
@@ -1284,9 +1890,25 @@ impl ChainService {
                     false,
                 )
             };
-        let mut from_block = from_block;
         let progress_start = from_block;
         status_guard.set(indexed_source, from_block, target);
+        let source_decision_read_scope = if using_artifact {
+            artifact_session
+                .as_ref()
+                .expect("artifact session is configured for artifact catch-up")
+                .read_scope()
+        } else {
+            source_selection_read_scope
+        };
+        self.public_data_plane
+            .record_source_decision(
+                PublicDataPlaneDiagnosticKind::SourceSelected,
+                indexed_source.into(),
+                PublicScanRange::new(from_block, target),
+                source_decision_read_scope,
+                "indexed wallet catch-up source selected",
+            )
+            .await;
         info!(
             cache_key = %cfg.cache_key,
             indexed_source = indexed_source.as_str(),
@@ -1298,7 +1920,8 @@ impl ChainService {
             "indexed wallet catch-up target"
         );
         if from_block > target {
-            let squid_tail = if using_artifact {
+            let squid_tail_read_scope = using_artifact.then(|| self.begin_public_scan_read());
+            let squid_tail = if squid_tail_read_scope.is_some() {
                 self.probe_squid_tail_after_artifact(cfg, from_block, target, safe_head)
                     .await
             } else {
@@ -1313,6 +1936,15 @@ impl ChainService {
                 indexed_height = height;
                 target = squid_target;
                 status_guard.set(indexed_source, from_block, target);
+                self.public_data_plane
+                    .record_source_decision(
+                        PublicDataPlaneDiagnosticKind::SourceFallback,
+                        PublicScanSource::Squid,
+                        PublicScanRange::new(from_block, target),
+                        squid_tail_read_scope.expect("Squid tail probe has a captured read scope"),
+                        "artifact source exhausted before Squid tail",
+                    )
+                    .await;
                 info!(
                     cache_key = %cfg.cache_key,
                     indexed_source = indexed_source.as_str(),
@@ -1346,7 +1978,8 @@ impl ChainService {
         let mut checkpoint = last_scanned;
         loop {
             if from_block > target {
-                let squid_tail = if using_artifact {
+                let squid_tail_read_scope = using_artifact.then(|| self.begin_public_scan_read());
+                let squid_tail = if squid_tail_read_scope.is_some() {
                     self.probe_squid_tail_after_artifact(cfg, from_block, target, safe_head)
                         .await
                 } else {
@@ -1363,6 +1996,15 @@ impl ChainService {
                 indexed_height = height;
                 target = squid_target;
                 status_guard.set(indexed_source, from_block, target);
+                self.public_data_plane
+                    .record_source_decision(
+                        PublicDataPlaneDiagnosticKind::SourceFallback,
+                        PublicScanSource::Squid,
+                        PublicScanRange::new(from_block, target),
+                        squid_tail_read_scope.expect("Squid tail probe has a captured read scope"),
+                        "artifact source exhausted before Squid tail",
+                    )
+                    .await;
                 info!(
                     cache_key = %cfg.cache_key,
                     indexed_source = indexed_source.as_str(),
@@ -1398,6 +2040,14 @@ impl ChainService {
                 self.chain.indexed_wallet_block_range,
             );
             let fetch_started = Instant::now();
+            let read_scope = if using_artifact {
+                artifact_session
+                    .as_ref()
+                    .expect("artifact session is configured for artifact catch-up")
+                    .read_scope()
+            } else {
+                self.begin_public_scan_read()
+            };
             let page_result = if using_artifact {
                 match artifact_session
                     .as_ref()
@@ -1447,6 +2097,7 @@ impl ChainService {
                             fallback_from = checkpoint,
                             "indexed wallet artifact page failed before checkpoint; falling back to Squid"
                         );
+                        let fallback_read_scope = self.begin_public_scan_read();
                         let Some((client, height)) =
                             self.probe_squid_indexed_wallet_source(cfg).await
                         else {
@@ -1459,6 +2110,15 @@ impl ChainService {
                         indexed_height = height;
                         target = height.min(safe_head);
                         status_guard.set(indexed_source, from_block, target);
+                        self.public_data_plane
+                            .record_source_decision(
+                                PublicDataPlaneDiagnosticKind::SourceFallback,
+                                PublicScanSource::Squid,
+                                PublicScanRange::new(from_block, target),
+                                fallback_read_scope,
+                                "artifact page failed before checkpoint",
+                            )
+                            .await;
                         info!(
                             cache_key = %cfg.cache_key,
                             indexed_source = indexed_source.as_str(),
@@ -1522,6 +2182,18 @@ impl ChainService {
                         indexed_height = session.latest_indexed_block();
                         target = session.probe().catch_up_target(safe_head);
                         status_guard.set(indexed_source, from_block, target);
+                        self.public_data_plane
+                            .record_source_decision(
+                                PublicDataPlaneDiagnosticKind::SourceFallback,
+                                PublicScanSource::IndexedArtifacts,
+                                PublicScanRange::new(from_block, target),
+                                artifact_session
+                                    .as_ref()
+                                    .expect("artifact session is configured for artifact catch-up")
+                                    .read_scope(),
+                                "Squid page failed before checkpoint",
+                            )
+                            .await;
                         info!(
                             cache_key = %cfg.cache_key,
                             indexed_source = indexed_source.as_str(),
@@ -1581,15 +2253,21 @@ impl ChainService {
             let nullifier_rows = page.nullifier_rows;
             let parse_elapsed_ms = parse_started.elapsed().as_millis();
             let page_checkpoint = page.checkpoint_block;
-            let (sender, reset_generation) = queued_sender;
+            self.record_public_scan_coverage(
+                PublicScanRange::new(from_block, page_checkpoint),
+                indexed_source.into(),
+                row_count,
+                read_scope,
+            )
+            .await;
             let apply_result = send_wallet_scan_apply(
                 &cfg.cache_key,
                 sender,
                 WalletScanApply::indexed_rows(
                     from_block,
                     page_checkpoint,
-                    page.into_scan_rows(indexed_source),
-                    self.current_public_data_epoch(),
+                    page.into_scan_rows(),
+                    read_scope,
                     indexed_source,
                 ),
                 reset_generation,

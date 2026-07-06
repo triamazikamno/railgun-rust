@@ -13,6 +13,7 @@ use ed25519_dalek::SigningKey;
 use local_db::{DbConfig, DbStore};
 use merkletree::tree::MerkleForest;
 use multihash_codetable::{Code, MultihashDigest};
+use railgun_wallet::scan::WalletScanInputRows;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -23,15 +24,17 @@ use super::service::{
     wait_for_startup_sync_target, wait_for_wallet_ready,
 };
 use super::{
-    ChainService, CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch,
-    IndexedWalletArtifactProbe, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind, Nullified,
-    Nullifiers, RailgunLegacyShieldEvents, Shield, Transact, WalletBackfill,
-    WalletTailFallbackState, WalletWorkerServices, artifact_failure_can_fallback_to_squid,
-    combined_log_event_signatures_for_range, complete_stream_checkpoint,
-    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
-    send_wallet_startup_events, should_hedge_wallet_startup, spawn_backfill_loop,
-    spawn_wallet_worker, squid_tail_target_after_artifact, wallet_backfill_from_block,
-    wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
+    ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
+    GeneratedCommitmentBatch, IndexedWalletArtifactProbe, IndexedWalletCatchUpSourceOrder,
+    IndexedWalletPageKind, Nullified, Nullifiers, PublicCoverageAnswer,
+    PublicDataPlaneDiagnosticKind, PublicDataPlaneError, PublicScanCoverageWrite, PublicScanRange,
+    PublicScanRowsAnswer, PublicScanSource, RailgunLegacyShieldEvents, Shield, Transact,
+    WalletBackfill, WalletTailFallbackState, WalletWorkerServices,
+    artifact_failure_can_fallback_to_squid, combined_log_event_signatures_for_range,
+    complete_stream_checkpoint, drain_pending_backfill_requests, pending_tip_from_block,
+    pending_tip_provider_covers_target, send_wallet_startup_events, should_hedge_wallet_startup,
+    spawn_backfill_loop, spawn_wallet_worker, squid_tail_target_after_artifact,
+    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
     wallet_reorg_backfill_from_block, wallet_startup_hedge_block_count, wallet_sync_target,
     wallet_tail_fallback_lag_threshold_blocks,
 };
@@ -42,13 +45,14 @@ use crate::indexed_artifacts::{
     IndexedArtifactDescriptor, IndexedArtifactManifest, IndexedArtifactRange,
     IndexedArtifactRangeKind, IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity,
 };
-use crate::types::PublicDataPlaneEpoch;
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, ChainKey, IndexedArtifactManifestSource,
     IndexedArtifactSourceConfig, LogBatch, PoiReadSource, SyncProgressStage,
     WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillRejectReason,
-    WalletConfig, WalletReadiness, WalletReadinessError, WalletScanApply, WalletScanPayload,
+    WalletConfig, WalletIndexedCatchUpSource, WalletReadiness, WalletReadinessError,
+    WalletScanApply, WalletScanRowsPayload,
 };
+use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
@@ -203,7 +207,10 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
     let (forest_last_tx, _forest_last_rx) = watch::channel(0);
     let (live_log_tx, _live_log_rx) = broadcast::channel(8);
     let (backfill_tx, _backfill_rx) = mpsc::channel(8);
-    let public_data_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
     let service = Arc::new(ChainService {
         chain,
         db: Arc::clone(&db),
@@ -221,7 +228,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
-        public_data_epoch,
+        public_data_plane,
     });
     let mut cfg = test_wallet_config(&scope, rpc_url);
     cfg.quick_sync_endpoint = None;
@@ -696,6 +703,40 @@ fn wallet_apply_result_accepted_progress_advances_only_committed_results() {
     );
 }
 
+#[test]
+fn rpc_and_indexed_wallet_scan_applies_use_normalized_rows() {
+    let read_scope = PublicScanReadScope::new(PublicDataPlaneEpoch::new(0));
+    let batch = Arc::new(LogBatch {
+        from_block: 10,
+        to_block: 20,
+        logs: Vec::new(),
+        block_timestamps: HashMap::new(),
+        to_block_hash: Some([7; 32]),
+        read_scope,
+    });
+
+    let rpc_apply = WalletScanApply::rows_from_log_batch(10, 20, batch, PublicScanSource::Rpc)
+        .expect("normalize RPC rows");
+    let indexed_apply = WalletScanApply::indexed_rows(
+        10,
+        20,
+        WalletScanInputRows::default(),
+        read_scope,
+        WalletIndexedCatchUpSource::Squid,
+    );
+
+    assert!(matches!(
+        &rpc_apply.rows.payload,
+        WalletScanRowsPayload::Rows(_)
+    ));
+    assert!(matches!(
+        &indexed_apply.rows.payload,
+        WalletScanRowsPayload::Rows(_)
+    ));
+    assert_eq!(rpc_apply.rows.to_block_hash, Some([7; 32]));
+    assert_eq!(indexed_apply.rows.to_block_hash, None);
+}
+
 #[tokio::test]
 async fn wallet_send_helpers_reject_when_worker_channel_closed() {
     let (sender, receiver) = mpsc::channel(1);
@@ -706,13 +747,15 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
         logs: Vec::new(),
         block_timestamps: HashMap::new(),
         to_block_hash: None,
+        read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
     });
 
     assert_eq!(
         send_wallet_scan_apply(
             "test",
             &sender,
-            WalletScanApply::logs(101, 105, batch, PublicDataPlaneEpoch::new(0)),
+            WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                .expect("normalize empty log payload"),
             0,
         )
         .await,
@@ -777,7 +820,10 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     let (backfill_request_tx, backfill_request_rx) = mpsc::channel(8);
     let loop_cancel = CancellationToken::new();
     let worker_cancel = CancellationToken::new();
-    let public_data_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
     let service = Arc::new(ChainService {
         chain: chain.clone(),
         db: Arc::clone(&db),
@@ -795,7 +841,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
-        public_data_epoch: public_data_epoch.clone(),
+        public_data_plane: public_data_plane.clone(),
     });
     let (wallet_a_tx, wallet_a_rx) = mpsc::channel(8);
     let (wallet_b_tx, wallet_b_rx) = mpsc::channel(8);
@@ -819,7 +865,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx.clone(),
             backfill_sender: wallet_a_tx.clone(),
-            public_data_epoch: public_data_epoch.clone(),
+            public_data_plane: public_data_plane.clone(),
         },
         wallet_a_cfg,
         1,
@@ -838,7 +884,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx.clone(),
             backfill_sender: wallet_b_tx.clone(),
-            public_data_epoch: public_data_epoch.clone(),
+            public_data_plane: public_data_plane.clone(),
         },
         wallet_b_cfg,
         2,
@@ -910,6 +956,13 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             .expect("logs request")
             .contains("eth_getLogs")
     );
+    let diagnostics = public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceSelected
+            && event.source == Some(PublicScanSource::Rpc)
+            && event.range.is_some()
+            && event.epoch == PublicDataPlaneEpoch::new(0)
+    }));
 
     worker_cancel.cancel();
     loop_cancel.cancel();
@@ -965,7 +1018,10 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
     let (forest_last_tx, _forest_last_rx) = watch::channel(0);
     let (live_log_tx, live_log_rx) = broadcast::channel(8);
     let (service_backfill_tx, _service_backfill_rx) = mpsc::channel(1);
-    let public_data_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
     let service = Arc::new(ChainService {
         chain: chain.clone(),
         db: Arc::clone(&db),
@@ -983,7 +1039,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
-        public_data_epoch: public_data_epoch.clone(),
+        public_data_plane: public_data_plane.clone(),
     });
     let (wallet_backfill_tx, wallet_backfill_rx) = mpsc::channel(8);
     let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
@@ -998,7 +1054,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: wallet_backfill_tx.clone(),
-            public_data_epoch,
+            public_data_plane,
         },
         wallet_cfg.clone(),
         1,
@@ -1053,6 +1109,585 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
 }
 
 #[tokio::test]
+async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_apply() {
+    let root_dir = temp_db_root("indexed-wallet-artifact-stale-prepare-scope");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let (artifact_source, block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(scope.clone(), 100, 150, 150);
+    let PathServerBlockControl {
+        request_started,
+        release,
+    } = block;
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = ChainConfig {
+        chain_id: scope.chain_id,
+        contract: scope.railgun_contract,
+        rpcs: Arc::clone(&rpcs),
+        archive_rpc_url: None,
+        archive_until_block: 0,
+        deployment_block: 0,
+        v2_start_block: 0,
+        legacy_shield_block: 0,
+        block_range: 100,
+        indexed_wallet_block_range: 100,
+        poll_interval: Duration::from_millis(1),
+        finality_depth: 0,
+        quick_sync_endpoint: Some(Url::parse("http://127.0.0.1:1").expect("squid url")),
+        indexed_artifact_source: Some(artifact_source.config),
+        anchor_interval: 1000,
+        anchor_retention: 5,
+        http_client: None,
+        progress_tx: None,
+    };
+    let (head_tx, _head_rx) = watch::channel(0);
+    let (safe_head_tx, _safe_head_rx) = watch::channel(150);
+    let (forest_last_tx, _forest_last_rx) = watch::channel(0);
+    let (live_log_tx, live_log_rx) = broadcast::channel(8);
+    let (service_backfill_tx, _service_backfill_rx) = mpsc::channel(1);
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = Arc::new(ChainService {
+        chain: chain.clone(),
+        db: Arc::clone(&db),
+        forest: Arc::new(RwLock::new(MerkleForest::new())),
+        head_tx,
+        safe_head_tx,
+        forest_last_tx,
+        live_log_tx,
+        backfill_tx: service_backfill_tx,
+        archive_provider: None,
+        wallets: RwLock::new(HashMap::new()),
+        cancel: CancellationToken::new(),
+        live_log_task: Mutex::new(None),
+        anchor_last: std::sync::atomic::AtomicU64::new(0),
+        txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+        wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
+        wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
+        public_data_plane: public_data_plane.clone(),
+    });
+    let (wallet_backfill_tx, wallet_backfill_rx) = mpsc::channel(8);
+    let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
+    let worker_cancel = CancellationToken::new();
+    let wallet_cfg = test_wallet_config(
+        &scope,
+        Url::parse("http://127.0.0.1:1").expect("quick-sync url"),
+    );
+    let handle = spawn_wallet_worker(
+        WalletWorkerServices {
+            db: Arc::clone(&db),
+            rpcs,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            backfill_tx: backfill_request_tx,
+            backfill_sender: wallet_backfill_tx.clone(),
+            public_data_plane: public_data_plane.clone(),
+        },
+        wallet_cfg.clone(),
+        1,
+        live_log_rx,
+        wallet_backfill_rx,
+        worker_cancel.clone(),
+        Vec::new(),
+        100,
+    );
+    let catch_up_service = Arc::clone(&service);
+    let catch_up_cfg = wallet_cfg.clone();
+    let catch_up_handle = handle.clone();
+    let catch_up_cancel = worker_cancel.clone();
+    let catch_up_sender = wallet_backfill_tx.clone();
+    let catch_up = tokio::spawn(async move {
+        catch_up_service
+            .indexed_wallet_catch_up(
+                &catch_up_cfg,
+                0,
+                100,
+                150,
+                &catch_up_handle,
+                &catch_up_cancel,
+                IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
+                true,
+                (&catch_up_sender, 0),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            request_started
+                .recv()
+                .expect("artifact manifest fetch started")
+        }),
+    )
+    .await
+    .expect("artifact manifest fetch started")
+    .expect("manifest wait task completed");
+
+    public_data_plane
+        .invalidate_public_scan_coverage_from(101)
+        .await;
+    release.send(()).expect("release artifact manifest fetch");
+    let checkpoint = catch_up.await.expect("indexed catch-up task");
+
+    assert_eq!(checkpoint, 100);
+    assert_eq!(handle.last_scanned(), 100);
+    assert!(matches!(
+        public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(101, 150))
+            .await,
+        PublicCoverageAnswer::Missing { .. }
+    ));
+    let diagnostics = public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::CoverageRejected
+            && event.source == Some(PublicScanSource::IndexedArtifacts)
+            && event.range == Some(PublicScanRange::new(101, 150))
+    }));
+
+    worker_cancel.cancel();
+    drop(db);
+    drop(artifact_source.server);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn public_scan_coverage_arbitrates_uncached_range_through_sources() {
+    let root_dir = temp_db_root("public-coverage-source-arbitration");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let artifact_source = checkpointed_wallet_artifact_source(scope.clone(), 100, 150, 150);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, Arc::clone(&rpcs), Some(artifact_source.config));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+
+    let answer = service
+        .public_data_plane()
+        .public_scan_coverage(PublicScanRange::new(100, 150))
+        .await
+        .expect("public coverage answer");
+
+    assert!(matches!(
+        answer,
+        PublicCoverageAnswer::ReplayableEmpty {
+            range: PublicScanRange {
+                from_block: 100,
+                to_block: 150
+            },
+            source: PublicScanSource::IndexedArtifacts,
+            epoch: PublicDataPlaneEpoch { value: 0 },
+        }
+    ));
+    let diagnostics = public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceSelected
+            && event.source == Some(PublicScanSource::IndexedArtifacts)
+            && event.range == Some(PublicScanRange::new(100, 150))
+    }));
+
+    drop(db);
+    drop(artifact_source.server);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn public_scan_coverage_distinguishes_row_bearing_cached_coverage() {
+    let root_dir = temp_db_root("public-coverage-row-bearing-cache");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let range = PublicScanRange::new(100, 110);
+    public_data_plane
+        .record_public_scan_coverage(PublicScanCoverageWrite {
+            range,
+            source: PublicScanSource::Rpc,
+            row_count: 7,
+            read_scope: public_data_plane.begin_public_scan_read(),
+        })
+        .await
+        .expect("record row-bearing coverage");
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+
+    let answer = service
+        .public_data_plane()
+        .public_scan_coverage(range)
+        .await
+        .expect("public coverage answer");
+
+    assert_eq!(
+        answer,
+        PublicCoverageAnswer::CoveredWithRows {
+            range,
+            source: PublicScanSource::Rpc,
+            epoch: PublicDataPlaneEpoch::new(0),
+        }
+    );
+    assert!(
+        public_data_plane
+            .cached_empty_wallet_scan_apply(range.from_block, range.to_block)
+            .await
+            .is_none(),
+        "row-bearing coverage must not be replayed as empty coverage"
+    );
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn public_scan_rows_rejects_source_result_after_epoch_invalidation() {
+    let root_dir = temp_db_root("public-scan-rows-stale-source-result");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let (artifact_source, block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(scope.clone(), 100, 150, 150);
+    let PathServerBlockControl {
+        request_started,
+        release,
+    } = block;
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, Arc::clone(&rpcs), Some(artifact_source.config));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+    let public_handle = service.public_data_plane();
+    let scan_task = tokio::spawn(async move {
+        public_handle
+            .public_scan_rows(PublicScanRange::new(100, 150))
+            .await
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            request_started
+                .recv()
+                .expect("artifact manifest fetch started")
+        }),
+    )
+    .await
+    .expect("artifact manifest fetch started")
+    .expect("manifest wait task completed");
+    public_data_plane
+        .invalidate_public_scan_coverage_from(100)
+        .await;
+    release.send(()).expect("release artifact manifest fetch");
+
+    let error = scan_task
+        .await
+        .expect("public scan task completed")
+        .expect_err("stale public scan rows must be rejected");
+    assert!(matches!(
+        error,
+        ChainError::PublicDataPlane(PublicDataPlaneError::StaleEpoch {
+            expected: 1,
+            actual: 0
+        })
+    ));
+    let diagnostics = public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::CoverageRejected
+            && event.source == Some(PublicScanSource::IndexedArtifacts)
+            && event.range == Some(PublicScanRange::new(100, 150))
+    }));
+
+    drop(db);
+    drop(artifact_source.server);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn public_scan_rows_rpc_fallback_returns_only_bounded_proven_range() {
+    let root_dir = temp_db_root("public-scan-rpc-bounded-proven-range");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let rpc = JsonRpcServer::spawn(vec![
+        serde_json::json!("0x96"),
+        serde_json::json!([]),
+        serde_json::Value::Null,
+    ]);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.block_range = 100;
+    chain.indexed_wallet_block_range = 1_000;
+    chain.finality_depth = 0;
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+
+    let answer = service
+        .public_data_plane()
+        .public_scan_rows(PublicScanRange::new(100, 500))
+        .await
+        .expect("public scan rows");
+
+    let PublicScanRowsAnswer::Rows(rows) = answer else {
+        panic!("RPC fallback should return normalized rows");
+    };
+    assert_eq!(rows.range, PublicScanRange::new(100, 150));
+    assert_eq!(rows.source, PublicScanSource::Rpc);
+    assert_eq!(rows.row_count(), 0);
+    assert!(matches!(
+        public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(100, 150))
+            .await,
+        PublicCoverageAnswer::ReplayableEmpty { .. }
+    ));
+    assert!(matches!(
+        public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(151, 199))
+            .await,
+        PublicCoverageAnswer::Missing { .. }
+    ));
+    let _block_number_request = rpc
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("block number request");
+    let logs_request = rpc
+        .requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("logs request");
+    assert!(logs_request.contains("eth_getLogs"));
+    assert!(logs_request.contains(r#""fromBlock":"0x64""#));
+    assert!(logs_request.contains(r#""toBlock":"0x96""#));
+    assert!(!logs_request.contains(r#""toBlock":"0x1f4""#));
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn public_scan_rows_records_squid_to_rpc_fallback_diagnostic() {
+    let root_dir = temp_db_root("public-scan-squid-rpc-fallback-diagnostic");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"150"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+        r#"{"errors":[{"message":"boom"}]}"#,
+    ]);
+    let rpc = JsonRpcServer::spawn(vec![
+        serde_json::json!("0x96"),
+        serde_json::json!([]),
+        serde_json::Value::Null,
+    ]);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.quick_sync_endpoint = Some(squid.url.clone());
+    chain.block_range = 100;
+    chain.indexed_wallet_block_range = 100;
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+
+    let answer = service
+        .public_data_plane()
+        .public_scan_rows(PublicScanRange::new(100, 150))
+        .await
+        .expect("public scan rows fallback");
+
+    let PublicScanRowsAnswer::Rows(rows) = answer else {
+        panic!("RPC fallback should return normalized rows");
+    };
+    assert_eq!(rows.range, PublicScanRange::new(100, 150));
+    assert_eq!(rows.source, PublicScanSource::Rpc);
+    let diagnostics = public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceSelected
+            && event.source == Some(PublicScanSource::Squid)
+            && event.range == Some(PublicScanRange::new(100, 150))
+    }));
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceFallback
+            && event.source == Some(PublicScanSource::Rpc)
+            && event.range == Some(PublicScanRange::new(100, 150))
+            && event.reason.contains("Squid failed")
+    }));
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceSelected
+            && event.source == Some(PublicScanSource::Rpc)
+            && event.range == Some(PublicScanRange::new(100, 150))
+    }));
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn public_scan_rows_records_archive_rpc_fallback_diagnostic_at_boundary() {
+    let root_dir = temp_db_root("public-scan-archive-rpc-fallback-diagnostic");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"150"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+        r#"{"errors":[{"message":"boom"}]}"#,
+    ]);
+    let rpc = JsonRpcServer::spawn(vec![
+        serde_json::json!("0x96"),
+        serde_json::json!([]),
+        serde_json::json!([]),
+        serde_json::Value::Null,
+    ]);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.quick_sync_endpoint = Some(squid.url.clone());
+    chain.archive_until_block = 100;
+    chain.block_range = 100;
+    chain.indexed_wallet_block_range = 100;
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+
+    let answer = service
+        .public_data_plane()
+        .public_scan_rows(PublicScanRange::new(100, 150))
+        .await
+        .expect("public scan rows archive fallback");
+
+    let PublicScanRowsAnswer::Rows(rows) = answer else {
+        panic!("Archive RPC fallback should return normalized rows");
+    };
+    assert_eq!(rows.range, PublicScanRange::new(100, 150));
+    assert_eq!(rows.source, PublicScanSource::ArchiveRpc);
+    assert_eq!(
+        public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(100, 150))
+            .await,
+        PublicCoverageAnswer::ReplayableEmpty {
+            range: PublicScanRange::new(100, 150),
+            source: PublicScanSource::ArchiveRpc,
+            epoch: PublicDataPlaneEpoch::new(0),
+        }
+    );
+    let diagnostics = public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceFallback
+            && event.source == Some(PublicScanSource::ArchiveRpc)
+            && event.range == Some(PublicScanRange::new(100, 150))
+            && event.reason.contains("Squid failed")
+    }));
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceSelected
+            && event.source == Some(PublicScanSource::ArchiveRpc)
+            && event.range == Some(PublicScanRange::new(100, 150))
+    }));
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::CoverageRecorded
+            && event.source == Some(PublicScanSource::ArchiveRpc)
+            && event.range == Some(PublicScanRange::new(100, 150))
+    }));
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn chain_shutdown_waits_for_live_log_worker() {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -1086,18 +1721,17 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
         logs: Vec::new(),
         block_timestamps: HashMap::new(),
         to_block_hash: None,
+        read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
     });
 
     let sender_clone = sender.clone();
     let send_task = tokio::spawn(async move {
         send_wallet_startup_events(
             "test",
-            vec![WalletScanApply::logs(
-                101,
-                105,
-                batch,
-                PublicDataPlaneEpoch::new(0),
-            )],
+            vec![
+                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                    .expect("normalize empty log payload"),
+            ],
             Some(105),
             7,
             &sender_clone,
@@ -1115,10 +1749,10 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     };
     assert_eq!(apply.from_block, 101);
     assert_eq!(apply.to_block, 105);
-    let WalletScanPayload::Logs(batch) = apply.payload else {
-        panic!("startup apply should contain logs");
+    let WalletScanRowsPayload::Rows(rows) = apply.rows.payload else {
+        panic!("startup apply should contain normalized rows");
     };
-    assert_eq!(batch.to_block, 105);
+    assert_eq!(rows.row_count(), 0);
     assert_eq!(reset_generation, 7);
     response
         .send(WalletBackfillApplyResult::Committed { committed_to: 105 })
@@ -1140,9 +1774,78 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     assert!(receiver.try_recv().is_err());
 }
 
+fn test_chain_config(
+    scope: &ChainScope,
+    rpcs: Arc<QueryRpcPool>,
+    indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
+) -> ChainConfig {
+    ChainConfig {
+        chain_id: scope.chain_id,
+        contract: scope.railgun_contract,
+        rpcs,
+        archive_rpc_url: None,
+        archive_until_block: 0,
+        deployment_block: 0,
+        v2_start_block: 0,
+        legacy_shield_block: 0,
+        block_range: 100,
+        indexed_wallet_block_range: 100,
+        poll_interval: Duration::from_millis(1),
+        finality_depth: 0,
+        quick_sync_endpoint: None,
+        indexed_artifact_source,
+        anchor_interval: 1000,
+        anchor_retention: 5,
+        http_client: None,
+        progress_tx: None,
+    }
+}
+
+fn test_chain_service(
+    db: Arc<DbStore>,
+    chain: ChainConfig,
+    public_data_plane: ChainPublicDataPlane,
+) -> Arc<ChainService> {
+    let (head_tx, _head_rx) = watch::channel(0);
+    let (safe_head_tx, _safe_head_rx) = watch::channel(0);
+    let (forest_last_tx, _forest_last_rx) = watch::channel(0);
+    let (live_log_tx, _live_log_rx) = broadcast::channel(8);
+    let (backfill_tx, _backfill_rx) = mpsc::channel(1);
+    Arc::new(ChainService {
+        chain,
+        db,
+        forest: Arc::new(RwLock::new(MerkleForest::new())),
+        head_tx,
+        safe_head_tx,
+        forest_last_tx,
+        live_log_tx,
+        backfill_tx,
+        archive_provider: None,
+        wallets: RwLock::new(HashMap::new()),
+        cancel: CancellationToken::new(),
+        live_log_task: Mutex::new(None),
+        anchor_last: std::sync::atomic::AtomicU64::new(0),
+        txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+        wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
+        wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
+        public_data_plane,
+    })
+}
+
 struct TestArtifactSource {
     config: IndexedArtifactSourceConfig,
     server: PathServer,
+}
+
+struct PathServerBlockControl {
+    request_started: std_mpsc::Receiver<()>,
+    release: std_mpsc::Sender<()>,
+}
+
+struct PathServerBlock {
+    path: String,
+    request_started: std_mpsc::Sender<()>,
+    release: std::sync::Mutex<std_mpsc::Receiver<()>>,
 }
 
 struct PathServer {
@@ -1151,6 +1854,39 @@ struct PathServer {
 
 impl PathServer {
     fn spawn(routes: HashMap<String, Vec<u8>>, request_count: usize) -> Self {
+        Self::spawn_with_block(routes, request_count, None)
+    }
+
+    fn spawn_with_blocked_path(
+        routes: HashMap<String, Vec<u8>>,
+        request_count: usize,
+        blocked_path: String,
+    ) -> (Self, PathServerBlockControl) {
+        let (request_started_tx, request_started) = std_mpsc::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let server = Self::spawn_with_block(
+            routes,
+            request_count,
+            Some(Arc::new(PathServerBlock {
+                path: blocked_path,
+                request_started: request_started_tx,
+                release: std::sync::Mutex::new(release_rx),
+            })),
+        );
+        (
+            server,
+            PathServerBlockControl {
+                request_started,
+                release,
+            },
+        )
+    }
+
+    fn spawn_with_block(
+        routes: HashMap<String, Vec<u8>>,
+        request_count: usize,
+        block: Option<Arc<PathServerBlock>>,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind path server");
         let url = Url::parse(&format!(
             "http://{}",
@@ -1164,7 +1900,8 @@ impl PathServer {
                 for _ in 0..request_count {
                     let (stream, _) = listener.accept().expect("accept path request");
                     let routes = Arc::clone(&routes);
-                    std::thread::spawn(move || handle_path_request(stream, routes));
+                    let block = block.clone();
+                    std::thread::spawn(move || handle_path_request(stream, routes, block));
                 }
             }
         });
@@ -1220,8 +1957,26 @@ impl JsonRpcServer {
     }
 }
 
-fn handle_path_request(mut stream: std::net::TcpStream, routes: Arc<HashMap<String, Vec<u8>>>) {
+fn handle_path_request(
+    mut stream: std::net::TcpStream,
+    routes: Arc<HashMap<String, Vec<u8>>>,
+    block: Option<Arc<PathServerBlock>>,
+) {
     let path = read_request_path(&mut stream);
+    if let Some(block) = block.as_ref()
+        && block.path == path
+    {
+        block
+            .request_started
+            .send(())
+            .expect("signal blocked path request");
+        block
+            .release
+            .lock()
+            .expect("blocked path release lock")
+            .recv()
+            .expect("release blocked path request");
+    }
     let (status, reason, body) = routes
         .get(&path)
         .map_or((404_u16, "NOT FOUND", Vec::new()), |body| {
@@ -1327,6 +2082,27 @@ fn checkpointed_wallet_artifact_source(
     end: u64,
     checkpoint_block: u64,
 ) -> TestArtifactSource {
+    checkpointed_wallet_artifact_source_controlled(scope, start, end, checkpoint_block, false).0
+}
+
+fn checkpointed_wallet_artifact_source_with_blocked_manifest(
+    scope: ChainScope,
+    start: u64,
+    end: u64,
+    checkpoint_block: u64,
+) -> (TestArtifactSource, PathServerBlockControl) {
+    let (source, block) =
+        checkpointed_wallet_artifact_source_controlled(scope, start, end, checkpoint_block, true);
+    (source, block.expect("blocked manifest control"))
+}
+
+fn checkpointed_wallet_artifact_source_controlled(
+    scope: ChainScope,
+    start: u64,
+    end: u64,
+    checkpoint_block: u64,
+    block_manifest: bool,
+) -> (TestArtifactSource, Option<PathServerBlockControl>) {
     let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
     let chunk_bytes = empty_wallet_scan_chunk_bytes(&scope, start, end);
     let chunk_cid = raw_cid(&chunk_bytes);
@@ -1382,20 +2158,25 @@ fn checkpointed_wallet_artifact_source(
     );
     manifest.sign_manifest(&signing_key).expect("sign manifest");
     let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest json");
-    let server = PathServer::spawn(
-        HashMap::from([
-            ("/manifest.json".to_string(), manifest_bytes),
-            (
-                format!("/ipfs/{catalog_cid}?format=car&dag-scope=entity"),
-                car_bytes(catalog_cid, &[(catalog_cid, catalog_bytes)]),
-            ),
-            (
-                format!("/ipfs/{chunk_cid}?format=car&dag-scope=entity"),
-                car_bytes(chunk_cid, &[(chunk_cid, chunk_bytes)]),
-            ),
-        ]),
-        3,
-    );
+    let chunk_path = format!("/ipfs/{chunk_cid}?format=car&dag-scope=entity");
+    let routes = HashMap::from([
+        ("/manifest.json".to_string(), manifest_bytes),
+        (
+            format!("/ipfs/{catalog_cid}?format=car&dag-scope=entity"),
+            car_bytes(catalog_cid, &[(catalog_cid, catalog_bytes)]),
+        ),
+        (
+            chunk_path.clone(),
+            car_bytes(chunk_cid, &[(chunk_cid, chunk_bytes)]),
+        ),
+    ]);
+    let (server, block) = if block_manifest {
+        let (server, block) =
+            PathServer::spawn_with_blocked_path(routes, 3, "/manifest.json".to_string());
+        (server, Some(block))
+    } else {
+        (PathServer::spawn(routes, 3), None)
+    };
     let manifest_url = server.url.join("/manifest.json").expect("manifest url");
     let config = IndexedArtifactSourceConfig {
         trusted_publisher_pubkey: FixedBytes::from(signing_key.verifying_key().to_bytes()),
@@ -1405,7 +2186,7 @@ fn checkpointed_wallet_artifact_source(
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
     };
-    TestArtifactSource { config, server }
+    (TestArtifactSource { config, server }, block)
 }
 
 fn wallet_artifact_descriptor(

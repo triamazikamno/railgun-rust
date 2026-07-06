@@ -103,17 +103,14 @@ pub(super) struct IndexedWalletPage {
 }
 
 impl IndexedWalletPage {
-    pub(super) fn into_scan_rows(
-        self,
-        source: WalletIndexedCatchUpSource,
-    ) -> WalletIndexedScanRows {
-        WalletIndexedScanRows {
+    pub(super) fn into_scan_rows(self) -> WalletScanInputRows {
+        WalletScanInputRows {
             transact_commitments: self.transact_commitments,
             shield_commitments: self.shield_commitments,
             legacy_encrypted_commitments: self.legacy_encrypted_commitments,
             legacy_generated_commitments: self.legacy_generated_commitments,
             nullifiers: self.nullifiers,
-            source,
+            commitment_observations: Vec::new(),
         }
     }
 
@@ -347,6 +344,7 @@ pub(super) struct IndexedWalletArtifactSession {
     chunk_descriptors: Vec<IndexedArtifactDescriptor>,
     chunks: Vec<IndexedWalletArtifactChunk>,
     coverage: WalletScanArtifactCoverage,
+    read_scope: PublicScanReadScope,
 }
 
 pub(super) enum IndexedWalletArtifactPageOutcome {
@@ -370,6 +368,7 @@ impl IndexedWalletArtifactSession {
         from_block: u64,
         to_block: u64,
         progress_tx: Option<&SyncProgressSender>,
+        read_scope: PublicScanReadScope,
     ) -> Result<Option<Self>, SyncError> {
         let Some(config) = chain.indexed_artifact_source.clone() else {
             return Ok(None);
@@ -437,6 +436,7 @@ impl IndexedWalletArtifactSession {
             chunk_descriptors,
             chunks: chunks.chunks,
             coverage: descriptors.coverage,
+            read_scope,
         }))
     }
 
@@ -454,6 +454,10 @@ impl IndexedWalletArtifactSession {
 
     pub(super) fn chunk_count(&self) -> usize {
         self.chunk_descriptors.len()
+    }
+
+    pub(super) const fn read_scope(&self) -> PublicScanReadScope {
+        self.read_scope
     }
 
     pub(super) fn page_for_block_range(
@@ -1839,6 +1843,7 @@ mod tests {
             chunks: Vec::new(),
             coverage: WalletScanArtifactCoverage::from_descriptors(&plan.required_current_coverage)
                 .expect("planner coverage"),
+            read_scope: test_public_scan_read_scope(),
         };
         let page = session
             .page_for_block_range(100, 110)
@@ -2274,6 +2279,7 @@ mod tests {
             chunk_descriptors,
             chunks: indexed_chunks,
             coverage,
+            read_scope: test_public_scan_read_scope(),
         }
     }
 
@@ -2286,6 +2292,10 @@ mod tests {
         session.probe.catalog_count = ranges.len();
         session.coverage = coverage_from_ranges(ranges);
         session
+    }
+
+    const fn test_public_scan_read_scope() -> PublicScanReadScope {
+        PublicScanReadScope::new(PublicDataPlaneEpoch::new(0))
     }
 
     fn coverage_from_ranges(ranges: &[(u64, u64)]) -> WalletScanArtifactCoverage {

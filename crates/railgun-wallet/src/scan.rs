@@ -39,6 +39,321 @@ pub struct WalletLogDelta {
     pub commitment_observations: Vec<CommitmentObservation>,
 }
 
+impl WalletLogDelta {
+    #[must_use]
+    pub fn from_rows(rows: &WalletScanInputRows, keys: &WalletScanKeys) -> Self {
+        Self::from_indexed_inputs(
+            &rows.transact_commitments,
+            &rows.shield_commitments,
+            &rows.legacy_encrypted_commitments,
+            &rows.legacy_generated_commitments,
+            &rows.nullifiers,
+            &rows.commitment_observations,
+            keys,
+        )
+    }
+
+    fn from_indexed_inputs(
+        transact_commitments: &[IndexedTransactCommitmentInput],
+        shield_commitments: &[IndexedShieldCommitmentInput],
+        legacy_encrypted_commitments: &[IndexedLegacyEncryptedCommitmentInput],
+        legacy_generated_commitments: &[IndexedLegacyGeneratedCommitmentInput],
+        indexed_nullifiers: &[IndexedNullifierInput],
+        extra_commitment_observations: &[CommitmentObservation],
+        keys: &WalletScanKeys,
+    ) -> Self {
+        let mut utxos = Vec::new();
+        let mut nullifiers = HashMap::new();
+        let mut commitment_observations = extra_commitment_observations.to_vec();
+
+        for commitment in transact_commitments {
+            commitment_observations.push(commitment_observation(
+                commitment.tree_number,
+                commitment.tree_position,
+                commitment.hash,
+                commitment.source.clone(),
+            ));
+            if let Some(utxo) = commitment.scan(keys) {
+                utxos.push(utxo);
+            }
+        }
+
+        for commitment in shield_commitments {
+            commitment_observations.push(commitment_observation(
+                commitment.tree_number,
+                commitment.tree_position,
+                commitment.preimage.hash(),
+                commitment.source.clone(),
+            ));
+            if let Some(utxo) = scan_shield_commitment(
+                commitment.tree_number,
+                commitment.tree_position,
+                &commitment.preimage,
+                &commitment.shield_ciphertext,
+                commitment.source.clone(),
+                keys,
+            ) {
+                utxos.push(utxo);
+            }
+        }
+
+        for commitment in legacy_encrypted_commitments {
+            commitment_observations.push(commitment_observation(
+                commitment.tree_number,
+                commitment.tree_position,
+                commitment.hash,
+                commitment.source.clone(),
+            ));
+            if let Some(utxo) = commitment.scan(keys) {
+                utxos.push(utxo);
+            }
+        }
+
+        for commitment in legacy_generated_commitments {
+            commitment_observations.push(commitment_observation(
+                commitment.tree_number,
+                commitment.tree_position,
+                commitment.preimage.hash(),
+                commitment.source.clone(),
+            ));
+            if let Some(utxo) = commitment.scan(keys) {
+                utxos.push(utxo);
+            }
+        }
+
+        for nullifier in indexed_nullifiers {
+            nullifiers
+                .entry((nullifier.tree_number, nullifier.nullifier))
+                .or_insert_with(|| nullifier.source.clone());
+        }
+
+        Self {
+            utxos,
+            nullifiers: nullifiers
+                .into_iter()
+                .map(|((tree, nullifier), source)| SpentNullifier {
+                    tree,
+                    nullifier,
+                    source,
+                })
+                .collect(),
+            commitment_observations,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct WalletScanInputRows {
+    pub transact_commitments: Vec<IndexedTransactCommitmentInput>,
+    pub shield_commitments: Vec<IndexedShieldCommitmentInput>,
+    pub legacy_encrypted_commitments: Vec<IndexedLegacyEncryptedCommitmentInput>,
+    pub legacy_generated_commitments: Vec<IndexedLegacyGeneratedCommitmentInput>,
+    pub nullifiers: Vec<IndexedNullifierInput>,
+    pub commitment_observations: Vec<CommitmentObservation>,
+}
+
+impl std::fmt::Debug for WalletScanInputRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletScanInputRows")
+            .field("transact_commitments", &self.transact_commitments.len())
+            .field("shield_commitments", &self.shield_commitments.len())
+            .field(
+                "legacy_encrypted_commitments",
+                &self.legacy_encrypted_commitments.len(),
+            )
+            .field(
+                "legacy_generated_commitments",
+                &self.legacy_generated_commitments.len(),
+            )
+            .field("nullifiers", &self.nullifiers.len())
+            .field(
+                "commitment_observations",
+                &self.commitment_observations.len(),
+            )
+            .finish()
+    }
+}
+
+impl WalletScanInputRows {
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.transact_commitments
+            .len()
+            .saturating_add(self.shield_commitments.len())
+            .saturating_add(self.legacy_encrypted_commitments.len())
+            .saturating_add(self.legacy_generated_commitments.len())
+            .saturating_add(self.nullifiers.len())
+            .saturating_add(self.commitment_observations.len())
+    }
+
+    pub fn from_logs(
+        logs: &[Log],
+        block_timestamps: &HashMap<u64, u64>,
+    ) -> Result<Self, WalletScanError> {
+        let mut rows = Self::default();
+
+        for raw_log in logs {
+            let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
+            if topic0 == Transact::SIGNATURE_HASH {
+                let event = Transact::decode_log(&raw_log.inner)?.data;
+
+                let tree_number: u32 = event.treeNumber.to();
+                let start_pos: u64 = event.startPosition.to();
+                let commitment_hashes = &event.hash;
+                let source = source_from_log(raw_log, block_timestamps)?;
+                for (index, ciphertext) in event.ciphertext.iter().enumerate() {
+                    let position = start_pos + index as u64;
+                    if let Some(expected_hash) = commitment_hashes
+                        .get(index)
+                        .map(|hash| U256::from_be_bytes(hash.0))
+                    {
+                        rows.transact_commitments
+                            .push(IndexedTransactCommitmentInput {
+                                tree_number,
+                                tree_position: position,
+                                hash: expected_hash,
+                                ciphertext: ciphertext.ciphertext,
+                                blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
+                                memo: ciphertext.memo.clone(),
+                                source: source.clone(),
+                            });
+                    }
+                }
+            } else if topic0 == Shield::SIGNATURE_HASH {
+                let event = Shield::decode_log(&raw_log.inner)?.data;
+
+                let tree_number: u32 = event.treeNumber.to();
+                let start_pos: u64 = event.startPosition.to();
+                let source = source_from_log(raw_log, block_timestamps)?;
+                rows.push_shield_event_rows(
+                    tree_number,
+                    start_pos,
+                    &event.commitments,
+                    &event.shieldCiphertext,
+                    &source,
+                );
+            } else if topic0 == RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH {
+                let event = RailgunLegacyShieldEvents::Shield::decode_log(&raw_log.inner)?.data;
+
+                let tree_number: u32 = event.treeNumber.to();
+                let start_pos: u64 = event.startPosition.to();
+                let source = source_from_log(raw_log, block_timestamps)?;
+                rows.push_shield_event_rows(
+                    tree_number,
+                    start_pos,
+                    &event.commitments,
+                    &event.shieldCiphertext,
+                    &source,
+                );
+            } else if topic0 == Nullifiers::SIGNATURE_HASH {
+                let event = Nullifiers::decode_log(&raw_log.inner)?.data;
+                let tree_number: u32 = event.treeNumber.to();
+                let source = source_from_log(raw_log, block_timestamps)?;
+                for nullifier in event.nullifier {
+                    rows.nullifiers.push(IndexedNullifierInput {
+                        tree_number,
+                        nullifier,
+                        source: source.clone(),
+                    });
+                }
+            } else if topic0 == Nullified::SIGNATURE_HASH {
+                let event = Nullified::decode_log(&raw_log.inner)?.data;
+                let tree_number: u32 = event.treeNumber.into();
+                let source = source_from_log(raw_log, block_timestamps)?;
+                for nullifier in event.nullifier {
+                    rows.nullifiers.push(IndexedNullifierInput {
+                        tree_number,
+                        nullifier: U256::from_be_bytes(nullifier.0),
+                        source: source.clone(),
+                    });
+                }
+            } else if topic0 == CommitmentBatch::SIGNATURE_HASH {
+                let event = CommitmentBatch::decode_log(&raw_log.inner)?.data;
+
+                let tree_number: u32 = event.treeNumber.to();
+                let start_pos: u64 = event.startPosition.to();
+                let source = source_from_log(raw_log, block_timestamps)?;
+                for (index, ciphertext) in event.ciphertext.iter().enumerate() {
+                    let Some(expected_hash) = event.hash.get(index).copied() else {
+                        continue;
+                    };
+                    let position = start_pos + index as u64;
+                    rows.legacy_encrypted_commitments
+                        .push(IndexedLegacyEncryptedCommitmentInput {
+                            tree_number,
+                            tree_position: position,
+                            hash: expected_hash,
+                            ciphertext: ciphertext
+                                .ciphertext
+                                .map(|value| FixedBytes::from(value.to_be_bytes::<32>())),
+                            ephemeral_keys: ciphertext
+                                .ephemeralKeys
+                                .map(|value| FixedBytes::from(value.to_be_bytes::<32>())),
+                            memo: ciphertext
+                                .memo
+                                .iter()
+                                .copied()
+                                .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
+                                .collect(),
+                            source: source.clone(),
+                        });
+                }
+            } else if topic0 == GeneratedCommitmentBatch::SIGNATURE_HASH {
+                let event = GeneratedCommitmentBatch::decode_log(&raw_log.inner)?.data;
+
+                let tree_number: u32 = event.treeNumber.to();
+                let start_pos: u64 = event.startPosition.to();
+                let source = source_from_log(raw_log, block_timestamps)?;
+                for (index, preimage) in event.commitments.iter().enumerate() {
+                    let Some(encrypted_random) = event.encryptedRandom.get(index) else {
+                        continue;
+                    };
+                    let position = start_pos + index as u64;
+                    rows.legacy_generated_commitments
+                        .push(IndexedLegacyGeneratedCommitmentInput {
+                            tree_number,
+                            tree_position: position,
+                            preimage: preimage.clone(),
+                            encrypted_random: encrypted_random_from_u256(*encrypted_random),
+                            source: source.clone(),
+                        });
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn push_shield_event_rows(
+        &mut self,
+        tree_number: u32,
+        start_pos: u64,
+        commitments: &[CommitmentPreimage],
+        shield_ciphertext: &[ShieldCiphertext],
+        source: &UtxoSource,
+    ) {
+        for (index, preimage) in commitments.iter().enumerate() {
+            let position = start_pos + index as u64;
+            if let Some(ciphertext) = shield_ciphertext.get(index) {
+                self.shield_commitments.push(IndexedShieldCommitmentInput {
+                    tree_number,
+                    tree_position: position,
+                    preimage: preimage.clone(),
+                    shield_ciphertext: ciphertext.clone(),
+                    source: source.clone(),
+                });
+            } else {
+                self.commitment_observations.push(commitment_observation(
+                    tree_number,
+                    position,
+                    preimage.hash(),
+                    source.clone(),
+                ));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitmentObservation {
     pub tree: u32,
@@ -287,183 +602,8 @@ pub fn parse_wallet_delta_from_logs(
     block_timestamps: &HashMap<u64, u64>,
     keys: &WalletScanKeys,
 ) -> Result<WalletLogDelta, WalletScanError> {
-    let mut utxos = Vec::new();
-    let mut nullifiers = HashMap::new();
-    let mut commitment_observations = Vec::new();
-
-    for raw_log in logs {
-        let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
-        if topic0 == Transact::SIGNATURE_HASH {
-            let event = Transact::decode_log(&raw_log.inner)?.data;
-
-            let tree_number: u32 = event.treeNumber.to();
-            let start_pos: u64 = event.startPosition.to();
-            let commitment_hashes = &event.hash;
-            let source = source_from_log(raw_log, block_timestamps)?;
-            for (index, ciphertext) in event.ciphertext.iter().enumerate() {
-                let position = start_pos + index as u64;
-                if let Some(expected_hash) = commitment_hashes
-                    .get(index)
-                    .map(|hash| U256::from_be_bytes(hash.0))
-                {
-                    let input = IndexedTransactCommitmentInput {
-                        tree_number,
-                        tree_position: position,
-                        hash: expected_hash,
-                        ciphertext: ciphertext.ciphertext,
-                        blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
-                        memo: ciphertext.memo.clone(),
-                        source: source.clone(),
-                    };
-                    commitment_observations.push(commitment_observation(
-                        tree_number,
-                        position,
-                        expected_hash,
-                        source.clone(),
-                    ));
-                    if let Some(utxo) = input.scan(keys) {
-                        utxos.push(utxo);
-                    }
-                }
-            }
-        } else if topic0 == Shield::SIGNATURE_HASH {
-            let event = Shield::decode_log(&raw_log.inner)?.data;
-
-            let tree_number: u32 = event.treeNumber.to();
-            let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log, block_timestamps)?;
-            let mut output = WalletScanOutput {
-                utxos: &mut utxos,
-                commitment_observations: &mut commitment_observations,
-            };
-            scan_shield_event_commitments(
-                tree_number,
-                start_pos,
-                &event.commitments,
-                &event.shieldCiphertext,
-                &source,
-                keys,
-                &mut output,
-            );
-        } else if topic0 == RailgunLegacyShieldEvents::Shield::SIGNATURE_HASH {
-            let event = RailgunLegacyShieldEvents::Shield::decode_log(&raw_log.inner)?.data;
-
-            let tree_number: u32 = event.treeNumber.to();
-            let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log, block_timestamps)?;
-            let mut output = WalletScanOutput {
-                utxos: &mut utxos,
-                commitment_observations: &mut commitment_observations,
-            };
-            scan_shield_event_commitments(
-                tree_number,
-                start_pos,
-                &event.commitments,
-                &event.shieldCiphertext,
-                &source,
-                keys,
-                &mut output,
-            );
-        } else if topic0 == Nullifiers::SIGNATURE_HASH {
-            let event = Nullifiers::decode_log(&raw_log.inner)?.data;
-            let tree_number: u32 = event.treeNumber.to();
-            let source = source_from_log(raw_log, block_timestamps)?;
-            for nullifier in event.nullifier {
-                nullifiers
-                    .entry((tree_number, nullifier))
-                    .or_insert_with(|| source.clone());
-            }
-        } else if topic0 == Nullified::SIGNATURE_HASH {
-            let event = Nullified::decode_log(&raw_log.inner)?.data;
-            let tree_number: u32 = event.treeNumber.into();
-            let source = source_from_log(raw_log, block_timestamps)?;
-            for nullifier in event.nullifier {
-                nullifiers
-                    .entry((tree_number, U256::from_be_bytes(nullifier.0)))
-                    .or_insert_with(|| source.clone());
-            }
-        } else if topic0 == CommitmentBatch::SIGNATURE_HASH {
-            let event = CommitmentBatch::decode_log(&raw_log.inner)?.data;
-
-            let tree_number: u32 = event.treeNumber.to();
-            let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log, block_timestamps)?;
-            for (index, ciphertext) in event.ciphertext.iter().enumerate() {
-                let Some(expected_hash) = event.hash.get(index).copied() else {
-                    continue;
-                };
-                let position = start_pos + index as u64;
-                let input = IndexedLegacyEncryptedCommitmentInput {
-                    tree_number,
-                    tree_position: position,
-                    hash: expected_hash,
-                    ciphertext: ciphertext
-                        .ciphertext
-                        .map(|value| FixedBytes::from(value.to_be_bytes::<32>())),
-                    ephemeral_keys: ciphertext
-                        .ephemeralKeys
-                        .map(|value| FixedBytes::from(value.to_be_bytes::<32>())),
-                    memo: ciphertext
-                        .memo
-                        .iter()
-                        .copied()
-                        .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
-                        .collect(),
-                    source: source.clone(),
-                };
-                commitment_observations.push(commitment_observation(
-                    tree_number,
-                    position,
-                    expected_hash,
-                    source.clone(),
-                ));
-                if let Some(utxo) = input.scan(keys) {
-                    utxos.push(utxo);
-                }
-            }
-        } else if topic0 == GeneratedCommitmentBatch::SIGNATURE_HASH {
-            let event = GeneratedCommitmentBatch::decode_log(&raw_log.inner)?.data;
-
-            let tree_number: u32 = event.treeNumber.to();
-            let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log, block_timestamps)?;
-            for (index, preimage) in event.commitments.iter().enumerate() {
-                let Some(encrypted_random) = event.encryptedRandom.get(index) else {
-                    continue;
-                };
-                let position = start_pos + index as u64;
-                let input = IndexedLegacyGeneratedCommitmentInput {
-                    tree_number,
-                    tree_position: position,
-                    preimage: preimage.clone(),
-                    encrypted_random: encrypted_random_from_u256(*encrypted_random),
-                    source: source.clone(),
-                };
-                commitment_observations.push(commitment_observation(
-                    tree_number,
-                    position,
-                    preimage.hash(),
-                    source.clone(),
-                ));
-                if let Some(utxo) = input.scan(keys) {
-                    utxos.push(utxo);
-                }
-            }
-        }
-    }
-
-    Ok(WalletLogDelta {
-        utxos,
-        nullifiers: nullifiers
-            .into_iter()
-            .map(|((tree, nullifier), source)| SpentNullifier {
-                tree,
-                nullifier,
-                source,
-            })
-            .collect(),
-        commitment_observations,
-    })
+    let rows = WalletScanInputRows::from_logs(logs, block_timestamps)?;
+    Ok(WalletLogDelta::from_rows(&rows, keys))
 }
 
 pub fn parse_indexed_wallet_delta(
@@ -474,83 +614,15 @@ pub fn parse_indexed_wallet_delta(
     indexed_nullifiers: &[IndexedNullifierInput],
     keys: &WalletScanKeys,
 ) -> WalletLogDelta {
-    let mut utxos = Vec::new();
-    let mut nullifiers = HashMap::new();
-    let mut commitment_observations = Vec::new();
-
-    for commitment in transact_commitments {
-        commitment_observations.push(commitment_observation(
-            commitment.tree_number,
-            commitment.tree_position,
-            commitment.hash,
-            commitment.source.clone(),
-        ));
-        if let Some(utxo) = commitment.scan(keys) {
-            utxos.push(utxo);
-        }
-    }
-
-    for commitment in shield_commitments {
-        commitment_observations.push(commitment_observation(
-            commitment.tree_number,
-            commitment.tree_position,
-            commitment.preimage.hash(),
-            commitment.source.clone(),
-        ));
-        if let Some(utxo) = scan_shield_commitment(
-            commitment.tree_number,
-            commitment.tree_position,
-            &commitment.preimage,
-            &commitment.shield_ciphertext,
-            commitment.source.clone(),
-            keys,
-        ) {
-            utxos.push(utxo);
-        }
-    }
-
-    for commitment in legacy_encrypted_commitments {
-        commitment_observations.push(commitment_observation(
-            commitment.tree_number,
-            commitment.tree_position,
-            commitment.hash,
-            commitment.source.clone(),
-        ));
-        if let Some(utxo) = commitment.scan(keys) {
-            utxos.push(utxo);
-        }
-    }
-
-    for commitment in legacy_generated_commitments {
-        commitment_observations.push(commitment_observation(
-            commitment.tree_number,
-            commitment.tree_position,
-            commitment.preimage.hash(),
-            commitment.source.clone(),
-        ));
-        if let Some(utxo) = commitment.scan(keys) {
-            utxos.push(utxo);
-        }
-    }
-
-    for nullifier in indexed_nullifiers {
-        nullifiers
-            .entry((nullifier.tree_number, nullifier.nullifier))
-            .or_insert_with(|| nullifier.source.clone());
-    }
-
-    WalletLogDelta {
-        utxos,
-        nullifiers: nullifiers
-            .into_iter()
-            .map(|((tree, nullifier), source)| SpentNullifier {
-                tree,
-                nullifier,
-                source,
-            })
-            .collect(),
-        commitment_observations,
-    }
+    WalletLogDelta::from_indexed_inputs(
+        transact_commitments,
+        shield_commitments,
+        legacy_encrypted_commitments,
+        legacy_generated_commitments,
+        indexed_nullifiers,
+        &[],
+        keys,
+    )
 }
 
 const fn commitment_observation(
@@ -565,43 +637,6 @@ const fn commitment_observation(
         position,
         commitment,
         source,
-    }
-}
-
-struct WalletScanOutput<'a> {
-    utxos: &'a mut Vec<Utxo>,
-    commitment_observations: &'a mut Vec<CommitmentObservation>,
-}
-
-fn scan_shield_event_commitments(
-    tree_number: u32,
-    start_pos: u64,
-    commitments: &[CommitmentPreimage],
-    shield_ciphertext: &[ShieldCiphertext],
-    source: &UtxoSource,
-    keys: &WalletScanKeys,
-    output: &mut WalletScanOutput<'_>,
-) {
-    for (index, preimage) in commitments.iter().enumerate() {
-        let position = start_pos + index as u64;
-        output.commitment_observations.push(commitment_observation(
-            tree_number,
-            position,
-            preimage.hash(),
-            source.clone(),
-        ));
-        if let Some(ciphertext) = shield_ciphertext.get(index)
-            && let Some(utxo) = scan_shield_commitment(
-                tree_number,
-                position,
-                preimage,
-                ciphertext,
-                source.clone(),
-                keys,
-            )
-        {
-            output.utxos.push(utxo);
-        }
     }
 }
 

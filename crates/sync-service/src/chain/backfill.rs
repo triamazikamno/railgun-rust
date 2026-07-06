@@ -264,7 +264,9 @@ impl ChainService {
         if let Err(err) = self.forest_last_tx.send(reset_block) {
             debug!(?err, reset_block, "failed to send forest reset update");
         }
-        self.public_data_epoch.fetch_add(1, Ordering::AcqRel);
+        self.public_data_plane
+            .invalidate_public_scan_coverage_from(reset_block.saturating_add(1))
+            .await;
         info!(
             from = last_processed,
             to = reset_block,

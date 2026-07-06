@@ -1795,6 +1795,7 @@ async fn local_poi_cache_rejected_live_tail_keeps_artifact_checkpoint() {
             updated_at: 1,
         },
         cache,
+        cache_generation: 0,
     };
 
     sync_local_poi_caches(

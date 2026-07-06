@@ -2,7 +2,7 @@ use super::*;
 
 use crate::indexed_artifacts::{ChainScope, ChainType};
 
-pub(super) const TXID_CACHE_BLOB_KIND: &str = "txid_public_cache";
+pub(crate) const TXID_CACHE_BLOB_KIND: &str = "txid_public_cache";
 pub(super) const TXID_CACHE_FORMAT_VERSION: u32 = 2;
 pub(super) const TXID_CACHE_PAGE_SIZE: NonZeroUsize =
     NonZeroUsize::new(10_000).expect("txid cache page size is non-zero");
@@ -78,6 +78,12 @@ impl<'a> TxidPublicCache<'a> {
     pub(crate) const fn new(db: &'a DbStore, key: TxidPublicCacheKey<'a>) -> Self {
         Self { db, key }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TxidPublicCacheReset {
+    pub(crate) blob_entries_removed: u64,
+    pub(crate) files_removed: u64,
 }
 
 #[derive(Debug, Clone)]

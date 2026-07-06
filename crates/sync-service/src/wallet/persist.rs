@@ -49,7 +49,7 @@ pub(crate) struct WalletWorkerServices {
     pub forest: Arc<RwLock<MerkleForest>>,
     pub backfill_tx: mpsc::Sender<crate::types::BackfillRequest>,
     pub backfill_sender: mpsc::Sender<BackfillEvent>,
-    pub public_data_epoch: Arc<AtomicU64>,
+    pub public_data_plane: ChainPublicDataPlane,
 }
 
 pub(super) fn now_epoch_secs() -> u64 {

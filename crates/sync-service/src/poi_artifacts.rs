@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -22,6 +24,38 @@ use crate::types::{PoiArtifactCachePhase, PoiArtifactManifestSource, PoiArtifact
 
 const BLOCKED_SHIELDS_LIST_KEY_FIELD: &str = "blocked_shields.list_key";
 const ENTRY_LIST_KEY_FIELD: &str = "entry.list_key";
+
+static POI_ARTIFACT_CACHE_SYNC_STATE: LazyLock<Mutex<PoiArtifactCacheSyncState>> =
+    LazyLock::new(|| Mutex::new(PoiArtifactCacheSyncState::default()));
+
+#[derive(Default)]
+struct PoiArtifactCacheSyncState {
+    generations: BTreeMap<PathBuf, u64>,
+}
+
+impl PoiArtifactCacheSyncState {
+    fn lock() -> MutexGuard<'static, Self> {
+        POI_ARTIFACT_CACHE_SYNC_STATE
+            .lock()
+            .expect("POI artifact cache sync lock poisoned")
+    }
+
+    fn generation(&mut self, db: &DbStore) -> u64 {
+        *self
+            .generations
+            .entry(db.root_dir().to_path_buf())
+            .or_insert(0)
+    }
+
+    fn bump_generation(&mut self, db: &DbStore) -> u64 {
+        let generation = self
+            .generations
+            .entry(db.root_dir().to_path_buf())
+            .or_insert(0);
+        *generation = generation.saturating_add(1);
+        *generation
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct PoiArtifactProgressEvent {
@@ -240,6 +274,7 @@ impl PoiArtifactIngestor {
         manifest_sequence: u64,
         entry: ManifestEntry,
         proxy_client: &PoiRpcClient,
+        cache_generation: u64,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let started = Instant::now();
         let mut cache = PoiCache::new(identity.clone());
@@ -348,6 +383,7 @@ impl PoiArtifactIngestor {
             manifest_sequence,
             cache,
             entry,
+            cache_generation,
         })
     }
 
@@ -409,6 +445,13 @@ impl PoiArtifactIngestor {
         let last_sequence = persisted
             .as_ref()
             .map(|persisted| persisted.record.last_accepted_manifest_sequence);
+        let cache_generation = persisted.as_ref().map_or_else(
+            || {
+                let mut state = PoiArtifactCacheSyncState::lock();
+                state.generation(db)
+            },
+            |persisted| persisted.cache_generation,
+        );
         let refresh_started = Instant::now();
         let refresh = self
             .refresh_verified_cache(
@@ -417,6 +460,7 @@ impl PoiArtifactIngestor {
                 last_sequence,
                 now,
                 proxy_client,
+                cache_generation,
             )
             .await?;
         let refresh_elapsed_ms = refresh_started.elapsed().as_millis();
@@ -443,14 +487,20 @@ impl PoiArtifactIngestor {
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
         proxy_client: Option<&PoiRpcClient>,
+        cache_generation: u64,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         self.report_progress(PoiArtifactCachePhase::FetchingManifest, None, None);
         let manifest = self.fetch_manifest(last_accepted_sequence, now).await?;
         let entry = manifest_entry_for_identity(&manifest, &identity)?.clone();
 
         if let Some(persisted) = persisted.as_ref()
-            && let Some(refresh) =
-                try_reuse_matching_tip(&identity, manifest.sequence, &entry, persisted)?
+            && let Some(refresh) = try_reuse_matching_tip(
+                &identity,
+                manifest.sequence,
+                &entry,
+                persisted,
+                cache_generation,
+            )?
         {
             return Ok(refresh);
         }
@@ -465,6 +515,7 @@ impl PoiArtifactIngestor {
                     &entry,
                     &persisted,
                     proxy_client,
+                    cache_generation,
                 )
                 .await?
             {
@@ -478,6 +529,7 @@ impl PoiArtifactIngestor {
                     &entry,
                     &persisted,
                     proxy_client,
+                    cache_generation,
                 )
                 .await
             {
@@ -493,8 +545,14 @@ impl PoiArtifactIngestor {
             }
         }
 
-        self.fetch_verified_cache_from_entry(identity, manifest.sequence, entry, proxy_client)
-            .await
+        self.fetch_verified_cache_from_entry(
+            identity,
+            manifest.sequence,
+            entry,
+            proxy_client,
+            cache_generation,
+        )
+        .await
     }
 
     async fn try_incremental_refresh(
@@ -504,6 +562,7 @@ impl PoiArtifactIngestor {
         entry: &ManifestEntry,
         persisted: &PersistedPoiArtifactCache,
         proxy_client: &PoiRpcClient,
+        cache_generation: u64,
     ) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
         let started = Instant::now();
         if !descriptor_matches_record(&entry.base, &persisted.record.base_descriptor) {
@@ -612,6 +671,7 @@ impl PoiArtifactIngestor {
             manifest_sequence,
             cache,
             entry: entry.clone(),
+            cache_generation,
         }))
     }
 
@@ -622,6 +682,7 @@ impl PoiArtifactIngestor {
         entry: &ManifestEntry,
         persisted: &PersistedPoiArtifactCache,
         proxy_client: &PoiRpcClient,
+        cache_generation: u64,
     ) -> Result<Option<PoiArtifactRefresh>, ArtifactSuffixMergeError> {
         let started = Instant::now();
         let local_tip_index = persisted.record.current_tip_index;
@@ -716,6 +777,7 @@ impl PoiArtifactIngestor {
             manifest_sequence,
             cache,
             entry: entry.clone(),
+            cache_generation,
         }))
     }
 
@@ -834,6 +896,7 @@ pub(crate) struct PoiArtifactRefresh {
     pub(crate) manifest_sequence: u64,
     pub(crate) cache: PoiCache,
     pub(crate) entry: ManifestEntry,
+    pub(crate) cache_generation: u64,
 }
 
 impl PoiArtifactRefresh {
@@ -845,6 +908,7 @@ impl PoiArtifactRefresh {
 pub(crate) struct PersistedPoiArtifactCache {
     pub(crate) record: PoiArtifactCacheRecord,
     pub(crate) cache: PoiCache,
+    pub(crate) cache_generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -889,6 +953,8 @@ pub(crate) enum PoiArtifactError {
     ManifestIssuedInFuture,
     #[error("manifest does not contain entry for chain_id={chain_id} list_key={list_key}")]
     MissingManifestEntry { chain_id: u64, list_key: String },
+    #[error("stale POI artifact cache refresh: expected generation {expected}, actual {actual}")]
+    StalePublicCacheGeneration { expected: u64, actual: u64 },
     #[cfg(test)]
     #[error("invalid hex in {field}: {value}")]
     InvalidHex { field: &'static str, value: String },
@@ -936,6 +1002,8 @@ pub(crate) fn load_persisted_cache(
     db: &DbStore,
     identity: &PoiCacheIdentity,
 ) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
+    let mut state = PoiArtifactCacheSyncState::lock();
+    let cache_generation = state.generation(db);
     let Some(record) = db.get_poi_artifact_cache(
         identity.chain_type,
         identity.chain_id,
@@ -946,7 +1014,11 @@ pub(crate) fn load_persisted_cache(
         return Ok(None);
     };
     let cache = PoiCache::from_bytes(&record.cache_payload, identity)?;
-    Ok(Some(PersistedPoiArtifactCache { record, cache }))
+    Ok(Some(PersistedPoiArtifactCache {
+        record,
+        cache,
+        cache_generation,
+    }))
 }
 
 pub(crate) fn persist_refresh(
@@ -954,6 +1026,7 @@ pub(crate) fn persist_refresh(
     identity: &PoiCacheIdentity,
     refresh: &PoiArtifactRefresh,
 ) -> Result<(), PoiArtifactError> {
+    let cache_payload = refresh.cache.to_bytes()?;
     let record = PoiArtifactCacheRecord {
         chain_type: identity.chain_type,
         chain_id: identity.chain_id,
@@ -965,9 +1038,17 @@ pub(crate) fn persist_refresh(
         blocked_shields_descriptor: descriptor_record(&refresh.entry.blocked_shields),
         current_tip_index: refresh.entry.current_tip_index,
         current_tip_root: refresh.entry.current_tip_merkleroot,
-        cache_payload: refresh.cache.to_bytes()?,
+        cache_payload,
         updated_at: 0,
     };
+    let mut state = PoiArtifactCacheSyncState::lock();
+    let current_generation = state.generation(db);
+    if refresh.cache_generation != current_generation {
+        return Err(PoiArtifactError::StalePublicCacheGeneration {
+            expected: current_generation,
+            actual: refresh.cache_generation,
+        });
+    }
     db.put_poi_artifact_cache(&record)?;
     Ok(())
 }
@@ -1148,6 +1229,7 @@ fn try_reuse_matching_tip(
     manifest_sequence: u64,
     entry: &ManifestEntry,
     persisted: &PersistedPoiArtifactCache,
+    cache_generation: u64,
 ) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
     let entry_tip_root = entry.current_tip_merkleroot;
     if persisted.record.current_tip_index == entry.current_tip_index
@@ -1168,6 +1250,7 @@ fn try_reuse_matching_tip(
             manifest_sequence,
             cache: persisted.cache.clone(),
             entry: entry.clone(),
+            cache_generation,
         }));
     }
     Ok(None)
@@ -1254,15 +1337,23 @@ fn common_delta_prefix_len(
         .count()
 }
 
+pub(crate) fn clear_poi_artifact_cache_for_reset(db: &DbStore) -> Result<u64, local_db::DbError> {
+    let mut state = PoiArtifactCacheSyncState::lock();
+    state.bump_generation(db);
+    db.clear_poi_artifact_cache()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
 
     use cid::Cid;
     use ed25519_dalek::{Signer, SigningKey};
+    use local_db::DbConfig;
     use multihash_codetable::{Code, MultihashDigest};
     use poi::artifacts::{
         SnapshotEvent, SnapshotHeader, SnapshotHeaderInput, SnapshotWriter, snapshot::format,
@@ -1442,7 +1533,14 @@ mod tests {
         let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
 
         let refresh = ingestor
-            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .try_artifact_suffix_merge(
+                &identity,
+                5,
+                &entry,
+                &persisted,
+                &client,
+                persisted.cache_generation,
+            )
             .await
             .expect("artifact suffix merge")
             .expect("merge result");
@@ -1515,7 +1613,14 @@ mod tests {
         let persisted = persisted_cache(&identity, cache, 1, root_1, &entry);
 
         let refresh = ingestor
-            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .try_artifact_suffix_merge(
+                &identity,
+                5,
+                &entry,
+                &persisted,
+                &client,
+                persisted.cache_generation,
+            )
             .await
             .expect("artifact suffix merge")
             .expect("merge result");
@@ -1600,7 +1705,14 @@ mod tests {
         persisted.record.blocked_shields_descriptor = descriptor_record(&descriptor("old-blocked"));
 
         let refresh = ingestor
-            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .try_artifact_suffix_merge(
+                &identity,
+                5,
+                &entry,
+                &persisted,
+                &client,
+                persisted.cache_generation,
+            )
             .await
             .expect("artifact suffix merge")
             .expect("merge result");
@@ -1662,7 +1774,14 @@ mod tests {
         let persisted = persisted_cache(&identity, cache, local_tip_index, local_root, &entry);
 
         let refresh = ingestor
-            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .try_artifact_suffix_merge(
+                &identity,
+                5,
+                &entry,
+                &persisted,
+                &client,
+                persisted.cache_generation,
+            )
             .await
             .expect("artifact suffix merge decision");
 
@@ -1709,7 +1828,14 @@ mod tests {
         let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
 
         let error = match ingestor
-            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .try_artifact_suffix_merge(
+                &identity,
+                5,
+                &entry,
+                &persisted,
+                &client,
+                persisted.cache_generation,
+            )
             .await
         {
             Ok(_) => panic!("root validation should fail"),
@@ -1762,7 +1888,14 @@ mod tests {
         let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
 
         let error = match ingestor
-            .try_artifact_suffix_merge(&identity, 5, &entry, &persisted, &client)
+            .try_artifact_suffix_merge(
+                &identity,
+                5,
+                &entry,
+                &persisted,
+                &client,
+                persisted.cache_generation,
+            )
             .await
         {
             Ok(_) => panic!("proxy request failure"),
@@ -1825,6 +1958,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_poi_artifact_refresh_cannot_repopulate_after_reset() {
+        let root_dir = temp_db_root("stale-poi-refresh-after-reset");
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let identity = test_identity();
+        let cache = PoiCache::new(identity.clone());
+        let entry = test_entry(&identity, 0, [0_u8; 32]);
+        let persisted = persisted_cache(&identity, cache, 0, FixedBytes::ZERO, &entry);
+        db.put_poi_artifact_cache(&persisted.record)
+            .expect("store initial POI artifact cache");
+        let loaded = load_persisted_cache(&db, &identity)
+            .expect("load persisted cache")
+            .expect("persisted cache exists");
+        let refresh = PoiArtifactRefresh {
+            manifest_sequence: 5,
+            cache: loaded.cache.clone(),
+            entry: entry.clone(),
+            cache_generation: loaded.cache_generation,
+        };
+
+        let removed = clear_poi_artifact_cache_for_reset(&db).expect("reset POI artifact cache");
+        let error = persist_refresh(&db, &identity, &refresh)
+            .expect_err("stale refresh must not repopulate after reset");
+
+        assert_eq!(removed, 1);
+        assert!(matches!(
+            error,
+            PoiArtifactError::StalePublicCacheGeneration { .. }
+        ));
+        assert!(
+            db.get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("load POI artifact cache after stale persist")
+            .is_none()
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
     fn blocked_shield_artifact_scope_and_signatures_are_verified() {
         let list_key = [
             0xea, 0x4a, 0x6c, 0x63, 0xe2, 0x9c, 0x52, 0x0a, 0xbe, 0xf5, 0x50, 0x7b, 0x13, 0x2e,
@@ -1862,6 +2042,14 @@ mod tests {
 
     fn test_identity() -> PoiCacheIdentity {
         PoiCacheIdentity::new(0, 1, "V2_PoseidonMerkle", FixedBytes::from([0x11; 32]))
+    }
+
+    fn temp_db_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sync-service-poi-artifacts-{name}-{unique}"))
     }
 
     fn signed_identity(signing_key: &SigningKey) -> PoiCacheIdentity {
@@ -2046,6 +2234,7 @@ mod tests {
                 updated_at: 0,
             },
             cache,
+            cache_generation: 0,
         }
     }
 

@@ -588,6 +588,7 @@ pub(super) fn spawn_live_log_loop(
 
                 let from_block = last_processed.saturating_add(1);
                 let to_block = min(from_block + service.chain.block_range - 1, safe_head);
+                let read_scope = service.begin_public_scan_read();
                 let logs_result = tokio::select! {
                     _ = cancel.cancelled() => break,
                     result = service.chain.fetch_logs_for_range(
@@ -644,6 +645,7 @@ pub(super) fn spawn_live_log_loop(
                             logs,
                             block_timestamps,
                             to_block_hash,
+                            read_scope,
                         });
 
                         let batch_hash = batch.to_block_hash;
@@ -869,6 +871,7 @@ pub(super) fn spawn_backfill_loop(
                 continue;
             };
             let to_block = min(from_block + service.chain.block_range - 1, target_block);
+            let read_scope = service.begin_public_scan_read();
             let fetch_logs_started = Instant::now();
             match service
                 .chain
@@ -933,6 +936,7 @@ pub(super) fn spawn_backfill_loop(
                         logs,
                         block_timestamps,
                         to_block_hash,
+                        read_scope,
                     });
 
                     let keys: Vec<String> = cursors.keys().cloned().collect();
@@ -958,18 +962,39 @@ pub(super) fn spawn_backfill_loop(
                         else {
                             continue;
                         };
-                        let apply_result = send_wallet_scan_apply(
-                            &key,
-                            &sender,
-                            WalletScanApply::logs(
-                                apply_from_block,
-                                apply_to_block,
-                                batch.clone(),
-                                service.current_public_data_epoch(),
-                            ),
-                            reset_generation,
-                        )
-                        .await;
+                        let source = service.rpc_scan_source_for_range(apply_from_block);
+                        let apply = match WalletScanApply::rows_from_log_batch(
+                            apply_from_block,
+                            apply_to_block,
+                            batch.clone(),
+                            source,
+                        ) {
+                            Ok(apply) => apply,
+                            Err(err) => {
+                                warn!(?err, cache_key = %key, from_block = apply_from_block, to_block = apply_to_block, "failed to normalize backfill logs");
+                                continue;
+                            }
+                        };
+                        service
+                            .public_data_plane
+                            .record_source_decision(
+                                PublicDataPlaneDiagnosticKind::SourceSelected,
+                                source,
+                                PublicScanRange::new(apply_from_block, apply_to_block),
+                                read_scope,
+                                "RPC wallet backfill source selected",
+                            )
+                            .await;
+                        service
+                            .record_public_scan_coverage(
+                                PublicScanRange::new(apply_from_block, apply_to_block),
+                                source,
+                                apply.row_count(),
+                                read_scope,
+                            )
+                            .await;
+                        let apply_result =
+                            send_wallet_scan_apply(&key, &sender, apply, reset_generation).await;
                         let mut remove_cursor = false;
                         let mut finish_request = None;
                         if let Some(cursor) = cursors.get_mut(&key) {
@@ -1087,18 +1112,6 @@ fn apply_backfill_request(
                     now,
                 ),
             );
-        }
-        BackfillRequest::Reset {
-            cache_key,
-            from_block,
-            reset_generation,
-        } => {
-            if let Some(cursor) = cursors.get_mut(&cache_key) {
-                cursor.mark_progress(from_block, now);
-                cursor.progress_start_block = from_block;
-                cursor.reset_generation = reset_generation;
-                cursor.last_indexed_tail_attempt_at = None;
-            }
         }
         BackfillRequest::Remove { cache_key } => {
             cursors.remove(&cache_key);

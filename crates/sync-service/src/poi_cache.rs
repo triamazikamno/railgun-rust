@@ -14,7 +14,8 @@ use tracing::{Instrument, debug, info, warn};
 use url::Url;
 
 use crate::poi_artifacts::{
-    PersistedPoiArtifactCache, PoiArtifactIngestor, PoiArtifactProgressEvent, load_persisted_cache,
+    PersistedPoiArtifactCache, PoiArtifactIngestor, PoiArtifactProgressEvent,
+    clear_poi_artifact_cache_for_reset, load_persisted_cache,
 };
 use crate::types::{
     LocalPoiCaches, PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
@@ -180,7 +181,7 @@ impl PoiCacheService {
     }
 
     pub async fn reset_poi_artifact_cache(&self) -> Result<u64, local_db::DbError> {
-        let removed = self.db.clear_poi_artifact_cache()?;
+        let removed = clear_poi_artifact_cache_for_reset(&self.db)?;
         let chains: Vec<_> = self
             .chains
             .read()

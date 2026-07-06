@@ -45,11 +45,12 @@ use proof::{
 pub(crate) use proof::{
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
+pub(crate) use sync::reset_txid_public_cache;
 #[cfg(test)]
 pub(crate) use types::TxidPublicCachedTransaction;
 pub(crate) use types::{
-    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
-    TxidPublicProof,
+    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheReset,
+    TxidPublicLatestValidated, TxidPublicProof,
 };
 
 #[cfg(test)]

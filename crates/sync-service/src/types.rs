@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,11 +9,7 @@ use local_db::{DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, 
 use poi::cache::PoiCache;
 #[cfg(test)]
 use railgun_wallet::scan::WalletLogDelta;
-use railgun_wallet::scan::{
-    IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
-    IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    WalletScanKeys,
-};
+use railgun_wallet::scan::{WalletScanError, WalletScanInputRows, WalletScanKeys};
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError, serialize_wallet_utxo};
 use railgun_wallet::{ProverService, WalletUtxo};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
@@ -177,6 +172,37 @@ impl WalletIndexedCatchUpSource {
         match self {
             Self::Squid => "squid",
             Self::IndexedArtifacts => "indexed_artifacts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicScanSource {
+    CachedCoverage,
+    IndexedArtifacts,
+    Squid,
+    Rpc,
+    ArchiveRpc,
+}
+
+impl PublicScanSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CachedCoverage => "cached_coverage",
+            Self::IndexedArtifacts => "indexed_artifacts",
+            Self::Squid => "squid",
+            Self::Rpc => "rpc",
+            Self::ArchiveRpc => "archive_rpc",
+        }
+    }
+}
+
+impl From<WalletIndexedCatchUpSource> for PublicScanSource {
+    fn from(source: WalletIndexedCatchUpSource) -> Self {
+        match source {
+            WalletIndexedCatchUpSource::Squid => Self::Squid,
+            WalletIndexedCatchUpSource::IndexedArtifacts => Self::IndexedArtifacts,
         }
     }
 }
@@ -827,6 +853,7 @@ pub struct LogBatch {
     pub logs: Vec<Log>,
     pub block_timestamps: HashMap<u64, u64>,
     pub to_block_hash: Option<[u8; 32]>,
+    pub read_scope: PublicScanReadScope,
 }
 
 pub type SharedLogBatch = Arc<LogBatch>;
@@ -843,153 +870,221 @@ impl PublicDataPlaneEpoch {
     }
 }
 
-#[derive(Clone)]
-pub struct WalletIndexedScanRows {
-    pub transact_commitments: Vec<IndexedTransactCommitmentInput>,
-    pub shield_commitments: Vec<IndexedShieldCommitmentInput>,
-    pub legacy_encrypted_commitments: Vec<IndexedLegacyEncryptedCommitmentInput>,
-    pub legacy_generated_commitments: Vec<IndexedLegacyGeneratedCommitmentInput>,
-    pub nullifiers: Vec<IndexedNullifierInput>,
-    pub source: WalletIndexedCatchUpSource,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicScanReadScope {
+    epoch: PublicDataPlaneEpoch,
 }
 
-impl fmt::Debug for WalletIndexedScanRows {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WalletIndexedScanRows")
-            .field("transact_commitments", &self.transact_commitments.len())
-            .field("shield_commitments", &self.shield_commitments.len())
-            .field(
-                "legacy_encrypted_commitments",
-                &self.legacy_encrypted_commitments.len(),
-            )
-            .field(
-                "legacy_generated_commitments",
-                &self.legacy_generated_commitments.len(),
-            )
-            .field("nullifiers", &self.nullifiers.len())
-            .field("source", &self.source)
-            .finish()
+impl PublicScanReadScope {
+    #[must_use]
+    pub(crate) const fn new(epoch: PublicDataPlaneEpoch) -> Self {
+        Self { epoch }
+    }
+
+    #[must_use]
+    pub const fn epoch(self) -> PublicDataPlaneEpoch {
+        self.epoch
     }
 }
 
 #[derive(Debug)]
-pub enum WalletScanPayload {
-    Logs(SharedLogBatch),
-    IndexedRows {
-        from_block: u64,
-        to_block: u64,
-        rows: Box<WalletIndexedScanRows>,
-        source: WalletIndexedCatchUpSource,
-    },
+pub(crate) enum WalletScanRowsPayload {
+    Rows(Box<WalletScanInputRows>),
+    EmptyCoverage,
     #[cfg(test)]
     IndexedDeltaForTest {
-        from_block: u64,
-        to_block: u64,
         delta: Box<WalletLogDelta>,
-        source: WalletIndexedCatchUpSource,
     },
 }
 
 #[derive(Debug)]
-pub struct WalletScanApply {
-    pub from_block: u64,
-    pub to_block: u64,
-    pub payload: WalletScanPayload,
-    pub data_epoch: PublicDataPlaneEpoch,
+pub(crate) struct WalletScanRows {
+    pub(crate) from_block: u64,
+    pub(crate) to_block: u64,
+    pub(crate) source: PublicScanSource,
+    pub(crate) to_block_hash: Option<[u8; 32]>,
+    pub(crate) payload: WalletScanRowsPayload,
 }
 
-impl WalletScanApply {
+impl WalletScanRows {
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         from_block: u64,
         to_block: u64,
-        payload: WalletScanPayload,
-        data_epoch: PublicDataPlaneEpoch,
+        source: PublicScanSource,
+        to_block_hash: Option<[u8; 32]>,
+        payload: WalletScanRowsPayload,
     ) -> Self {
         Self {
             from_block,
             to_block,
+            source,
+            to_block_hash,
             payload,
-            data_epoch,
         }
     }
 
     #[must_use]
-    pub fn logs(
-        from_block: u64,
-        to_block: u64,
-        batch: SharedLogBatch,
-        data_epoch: PublicDataPlaneEpoch,
-    ) -> Self {
-        Self::new(
-            from_block,
-            to_block,
-            WalletScanPayload::Logs(batch),
-            data_epoch,
-        )
+    pub(crate) fn covers(&self, from_block: u64, to_block: u64) -> bool {
+        self.from_block == from_block
+            && self.to_block == to_block
+            && match &self.payload {
+                WalletScanRowsPayload::Rows(_) | WalletScanRowsPayload::EmptyCoverage => true,
+                #[cfg(test)]
+                WalletScanRowsPayload::IndexedDeltaForTest { .. } => true,
+            }
     }
 
     #[must_use]
-    pub fn indexed_rows(
+    pub(crate) fn row_count(&self) -> usize {
+        match &self.payload {
+            WalletScanRowsPayload::Rows(rows) => rows.row_count(),
+            WalletScanRowsPayload::EmptyCoverage => 0,
+            #[cfg(test)]
+            WalletScanRowsPayload::IndexedDeltaForTest { .. } => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WalletScanApply {
+    pub(crate) from_block: u64,
+    pub(crate) to_block: u64,
+    pub(crate) rows: WalletScanRows,
+    pub(crate) read_scope: PublicScanReadScope,
+}
+
+impl WalletScanApply {
+    #[must_use]
+    pub(crate) const fn new(
         from_block: u64,
         to_block: u64,
-        rows: WalletIndexedScanRows,
-        data_epoch: PublicDataPlaneEpoch,
-        source: WalletIndexedCatchUpSource,
+        rows: WalletScanRows,
+        read_scope: PublicScanReadScope,
+    ) -> Self {
+        Self {
+            from_block,
+            to_block,
+            rows,
+            read_scope,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn rows(
+        from_block: u64,
+        to_block: u64,
+        rows: WalletScanInputRows,
+        read_scope: PublicScanReadScope,
+        source: PublicScanSource,
+        to_block_hash: Option<[u8; 32]>,
     ) -> Self {
         Self::new(
             from_block,
             to_block,
-            WalletScanPayload::IndexedRows {
+            WalletScanRows::new(
                 from_block,
                 to_block,
-                rows: Box::new(rows),
                 source,
-            },
-            data_epoch,
+                to_block_hash,
+                WalletScanRowsPayload::Rows(Box::new(rows)),
+            ),
+            read_scope,
+        )
+    }
+
+    pub(crate) fn rows_from_log_batch(
+        from_block: u64,
+        to_block: u64,
+        batch: SharedLogBatch,
+        source: PublicScanSource,
+    ) -> Result<Self, WalletScanError> {
+        let read_scope = batch.read_scope;
+        let filtered_logs: Vec<_> = batch
+            .logs
+            .iter()
+            .filter(|log| {
+                log.block_number
+                    .is_some_and(|block| block >= from_block && block <= to_block)
+            })
+            .cloned()
+            .collect();
+        let rows = WalletScanInputRows::from_logs(&filtered_logs, &batch.block_timestamps)?;
+        let to_block_hash = if batch.to_block == to_block {
+            batch.to_block_hash
+        } else {
+            None
+        };
+        Ok(Self::rows(
+            from_block,
+            to_block,
+            rows,
+            read_scope,
+            source,
+            to_block_hash,
+        ))
+    }
+
+    #[must_use]
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.row_count()
+    }
+
+    #[must_use]
+    pub(crate) fn indexed_rows(
+        from_block: u64,
+        to_block: u64,
+        rows: WalletScanInputRows,
+        read_scope: PublicScanReadScope,
+        source: WalletIndexedCatchUpSource,
+    ) -> Self {
+        Self::rows(from_block, to_block, rows, read_scope, source.into(), None)
+    }
+
+    #[must_use]
+    pub(crate) fn empty_coverage(
+        from_block: u64,
+        to_block: u64,
+        read_scope: PublicScanReadScope,
+        source: PublicScanSource,
+    ) -> Self {
+        Self::new(
+            from_block,
+            to_block,
+            WalletScanRows::new(
+                from_block,
+                to_block,
+                source,
+                None,
+                WalletScanRowsPayload::EmptyCoverage,
+            ),
+            read_scope,
         )
     }
 
     #[cfg(test)]
     #[must_use]
-    pub fn indexed_delta_for_test(
+    pub(crate) fn indexed_delta_for_test(
         from_block: u64,
         to_block: u64,
         delta: WalletLogDelta,
-        data_epoch: PublicDataPlaneEpoch,
+        read_scope: PublicScanReadScope,
         source: WalletIndexedCatchUpSource,
     ) -> Self {
         Self::new(
             from_block,
             to_block,
-            WalletScanPayload::IndexedDeltaForTest {
+            WalletScanRows::new(
                 from_block,
                 to_block,
-                delta: Box::new(delta),
-                source,
-            },
-            data_epoch,
+                source.into(),
+                None,
+                WalletScanRowsPayload::IndexedDeltaForTest {
+                    delta: Box::new(delta),
+                },
+            ),
+            read_scope,
         )
-    }
-}
-
-impl WalletScanPayload {
-    #[must_use]
-    pub fn covers(&self, from_block: u64, to_block: u64) -> bool {
-        match self {
-            Self::Logs(batch) => batch.from_block <= from_block && batch.to_block >= to_block,
-            Self::IndexedRows {
-                from_block: payload_from,
-                to_block: payload_to,
-                ..
-            } => *payload_from == from_block && *payload_to == to_block,
-            #[cfg(test)]
-            Self::IndexedDeltaForTest {
-                from_block: payload_from,
-                to_block: payload_to,
-                ..
-            } => *payload_from == from_block && *payload_to == to_block,
-        }
     }
 }
 
@@ -1132,7 +1227,7 @@ impl WalletReadiness {
 }
 
 #[derive(Debug)]
-pub enum BackfillEvent {
+pub(crate) enum BackfillEvent {
     Apply {
         apply: WalletScanApply,
         reset_generation: u64,
@@ -1151,7 +1246,7 @@ pub enum BackfillEvent {
 }
 
 #[derive(Debug)]
-pub enum BackfillRequest {
+pub(crate) enum BackfillRequest {
     Add {
         cache_key: String,
         from_block: u64,
@@ -1161,11 +1256,6 @@ pub enum BackfillRequest {
         reset_generation: u64,
         progress_tx: Option<SyncProgressSender>,
         sender: mpsc::Sender<BackfillEvent>,
-    },
-    Reset {
-        cache_key: String,
-        from_block: u64,
-        reset_generation: u64,
     },
     Remove {
         cache_key: String,

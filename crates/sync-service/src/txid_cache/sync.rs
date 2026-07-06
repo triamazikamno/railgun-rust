@@ -1,5 +1,47 @@
 use super::*;
 
+pub(crate) async fn reset_txid_public_cache(
+    db: &DbStore,
+) -> Result<TxidPublicCacheReset, TxidPublicCacheError> {
+    let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
+    let cache_dir = db.blob_dir().join(TXID_CACHE_BLOB_KIND);
+    let files_removed = match count_path_entries(&cache_dir) {
+        Ok(files_removed) => {
+            match fs::remove_dir_all(&cache_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            files_removed
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => 0,
+        Err(err) => return Err(err.into()),
+    };
+    let blob_entries_removed = db.clear_blob_meta_kind(TXID_CACHE_BLOB_KIND)?;
+    db.ensure_blob_dir(TXID_CACHE_BLOB_KIND)?;
+    Ok(TxidPublicCacheReset {
+        blob_entries_removed,
+        files_removed,
+    })
+}
+
+fn count_path_entries(path: &Path) -> Result<u64, std::io::Error> {
+    if path.is_file() {
+        return Ok(1);
+    }
+    let mut entries = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            entries = entries.saturating_add(count_path_entries(&entry_path)?);
+        } else {
+            entries = entries.saturating_add(1);
+        }
+    }
+    Ok(entries)
+}
+
 impl TxidPublicCache<'_> {
     #[cfg(test)]
     pub(crate) async fn sync(

@@ -200,6 +200,8 @@ pub enum ChainError {
     Snapshot(#[from] PersistError),
     #[error("wallet scan error: {0}")]
     WalletScan(#[from] WalletScanError),
+    #[error("public data-plane error: {0}")]
+    PublicDataPlane(#[from] PublicDataPlaneError),
     #[error("commitment update error: {0}")]
     CommitmentUpdate(#[from] CommitmentUpdateError),
     #[error("db error: {0}")]
@@ -209,11 +211,23 @@ pub enum ChainError {
     #[error("wallet not found")]
     WalletNotFound,
     #[error("wallet reset failed")]
-    WalletResetFailed(#[from] mpsc::error::SendError<BackfillEvent>),
+    WalletResetFailed,
     #[error("wallet reset rejected: {0:?}")]
     WalletResetRejected(WalletBackfillResetResult),
     #[error("backfill request failed")]
-    BackfillRequestFailed(#[from] mpsc::error::SendError<BackfillRequest>),
+    BackfillRequestFailed,
+}
+
+impl From<mpsc::error::SendError<BackfillEvent>> for ChainError {
+    fn from(_: mpsc::error::SendError<BackfillEvent>) -> Self {
+        Self::WalletResetFailed
+    }
+}
+
+impl From<mpsc::error::SendError<BackfillRequest>> for ChainError {
+    fn from(_: mpsc::error::SendError<BackfillRequest>) -> Self {
+        Self::BackfillRequestFailed
+    }
 }
 
 impl ChainError {
@@ -287,5 +301,5 @@ pub struct ChainService {
     pub(super) txid_public_cache_started: AtomicBool,
     pub(super) wallet_actor_next: AtomicU64,
     pub(super) wallet_reset_intent_next: AtomicU64,
-    pub(super) public_data_epoch: Arc<AtomicU64>,
+    pub(super) public_data_plane: ChainPublicDataPlane,
 }

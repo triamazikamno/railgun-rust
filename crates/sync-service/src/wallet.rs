@@ -40,9 +40,7 @@ use poi::poi::{
     BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient,
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
 };
-use railgun_wallet::scan::{
-    CommitmentObservation, WalletLogDelta, parse_indexed_wallet_delta, parse_wallet_delta_from_logs,
-};
+use railgun_wallet::scan::{CommitmentObservation, WalletLogDelta};
 use railgun_wallet::wallet_cache::WalletCacheError;
 use railgun_wallet::{
     Note, PoiStatus, RailgunSpendSigner, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource,
@@ -50,17 +48,18 @@ use railgun_wallet::{
 };
 use url::Url;
 
+use crate::chain::ChainPublicDataPlane;
 use crate::poi_artifacts::{PersistedPoiArtifactCache, PoiArtifactIngestor, load_persisted_cache};
 use crate::txid_cache::{
     TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
 use crate::types::{
-    BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, PublicDataPlaneEpoch,
-    SharedLogBatch, WalletBackfillApplyResult, WalletBackfillFinishResult,
-    WalletBackfillRejectReason, WalletBackfillResetResult, WalletCacheStore, WalletConfig,
-    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness,
-    WalletReadinessError, WalletScanApply, WalletScanPayload,
+    BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch,
+    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillRejectReason,
+    WalletBackfillResetResult, WalletCacheStore, WalletConfig, WalletIndexedCatchUpStatus,
+    WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness, WalletReadinessError,
+    WalletScanApply, WalletScanRowsPayload,
 };
 
 mod delta;
