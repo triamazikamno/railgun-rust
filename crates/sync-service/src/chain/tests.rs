@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, FixedBytes};
 use alloy::sol_types::SolEvent;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
 use local_db::{DbConfig, DbStore};
@@ -27,14 +28,15 @@ use super::{
     ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
     GeneratedCommitmentBatch, IndexedWalletArtifactProbe, IndexedWalletCatchUpSourceOrder,
     IndexedWalletPageKind, Nullified, Nullifiers, PublicCoverageAnswer,
-    PublicDataPlaneDiagnosticKind, PublicDataPlaneError, PublicScanCoverageWrite, PublicScanRange,
-    PublicScanRowsAnswer, PublicScanSource, RailgunLegacyShieldEvents, Shield, Transact,
-    WalletBackfill, WalletTailFallbackState, WalletWorkerServices,
-    artifact_failure_can_fallback_to_squid, combined_log_event_signatures_for_range,
-    complete_stream_checkpoint, drain_pending_backfill_requests, pending_tip_from_block,
-    pending_tip_provider_covers_target, send_wallet_startup_events, should_hedge_wallet_startup,
-    spawn_backfill_loop, spawn_wallet_worker, squid_tail_target_after_artifact,
-    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
+    PublicDataPlaneDiagnosticKind, PublicDataPlaneError, PublicPoiCorpusKey,
+    PublicScanCoverageWrite, PublicScanRange, PublicScanRowsAnswer, PublicScanSource,
+    RailgunLegacyShieldEvents, Shield, Transact, WalletBackfill, WalletTailFallbackState,
+    WalletWorkerServices, artifact_failure_can_fallback_to_squid,
+    combined_log_event_signatures_for_range, complete_stream_checkpoint,
+    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
+    send_wallet_startup_events, should_hedge_wallet_startup, spawn_backfill_loop,
+    spawn_wallet_worker, squid_tail_target_after_artifact, wallet_backfill_from_block,
+    wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
     wallet_reorg_backfill_from_block, wallet_startup_hedge_block_count, wallet_sync_target,
     wallet_tail_fallback_lag_threshold_blocks,
 };
@@ -46,14 +48,15 @@ use crate::indexed_artifacts::{
     IndexedArtifactRangeKind, IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity,
 };
 use crate::types::{
-    BackfillEvent, BackfillRequest, ChainConfig, ChainKey, IndexedArtifactManifestSource,
-    IndexedArtifactSourceConfig, LogBatch, PoiReadSource, WalletBackfillApplyResult,
-    WalletBackfillFinishResult, WalletBackfillLease, WalletBackfillRejectReason, WalletConfig,
-    WalletIndexedCatchUpSource, WalletReadiness, WalletReadinessError, WalletScanApply,
-    WalletScanRowsPayload, WalletSyncToken,
+    BackfillEvent, BackfillRequest, ChainConfig, ChainKey, GlobalPoiPolicy,
+    IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LogBatch,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
+    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillLease,
+    WalletBackfillRejectReason, WalletConfig, WalletIndexedCatchUpSource, WalletReadiness,
+    WalletReadinessError, WalletScanApply, WalletScanRowsPayload, WalletSyncToken,
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
-use crate::wallet::WalletAcceptedBackfillJob;
+use crate::wallet::WalletPoiRuntime;
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
@@ -67,6 +70,35 @@ fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBack
     )
 }
 
+fn test_poi_artifact_source_config() -> PoiArtifactSourceConfig {
+    PoiArtifactSourceConfig {
+        trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+        manifest_source: PoiArtifactManifestSource::Url(
+            Url::parse("http://127.0.0.1:1/poi-manifest.json").expect("POI manifest URL"),
+        ),
+        gateway_urls: Vec::new(),
+        max_manifest_age: None,
+    }
+}
+
+fn test_proxy_poi_policy() -> GlobalPoiPolicy {
+    GlobalPoiPolicy::PoiProxy {
+        rpc_url: Url::parse("http://127.0.0.1:1").expect("POI RPC URL"),
+    }
+}
+
+fn test_wallet_poi_runtime() -> WalletPoiRuntime {
+    WalletPoiRuntime::from_policy(&test_proxy_poi_policy(), None)
+}
+
+fn test_indexed_poi_policy() -> GlobalPoiPolicy {
+    GlobalPoiPolicy::IndexedArtifacts {
+        artifact_source: test_poi_artifact_source_config(),
+        rpc_url: Url::parse("http://127.0.0.1:1").expect("POI RPC URL"),
+        wallet_read_fallback: PoiProxyFallback::Disabled,
+    }
+}
+
 fn test_sync_token(reset_generation: u64, job_id: u64) -> WalletSyncToken {
     WalletSyncToken::for_test(1, 1, reset_generation, job_id)
 }
@@ -76,10 +108,7 @@ fn test_backfill_lease(
     reset_generation: u64,
     job_id: u64,
 ) -> WalletBackfillLease {
-    WalletBackfillLease::for_actor_accepted_job(
-        WalletAcceptedBackfillJob::for_test(test_sync_token(reset_generation, job_id)),
-        sender,
-    )
+    WalletBackfillLease::from_token(test_sync_token(reset_generation, job_id), sender)
 }
 
 fn test_scope() -> ChainScope {
@@ -249,6 +278,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
     );
     let service = Arc::new(ChainService {
         chain,
+        poi_policy: test_proxy_poi_policy(),
         db: Arc::clone(&db),
         forest: Arc::new(RwLock::new(MerkleForest::new())),
         head_tx,
@@ -290,6 +320,87 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
 
     service.unregister_wallet("test").await;
     service.cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn artifact_poi_corpus_survives_wallet_unregister_reregister() {
+    let root_dir = temp_db_root("artifact-poi-corpus-reregister");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::ZERO,
+    };
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let chain = test_chain_config(
+        &scope,
+        Arc::new(QueryRpcPool::new(
+            vec![rpc_url.clone()],
+            Duration::from_secs(1),
+        )),
+        None,
+    );
+    let poi_policy = test_indexed_poi_policy();
+    let public_data_plane = if let GlobalPoiPolicy::IndexedArtifacts {
+        artifact_source,
+        rpc_url,
+        ..
+    } = &poi_policy
+    {
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+        .with_poi_cache_service(Arc::new(
+            crate::poi_cache::PoiCacheService::new(Arc::clone(&db), artifact_source.clone(), None)
+                .with_poi_rpc_url(rpc_url.clone()),
+        ))
+    } else {
+        unreachable!("test policy is artifact-backed")
+    };
+    let service = test_chain_service_with_policy(
+        Arc::clone(&db),
+        chain,
+        public_data_plane.clone(),
+        poi_policy,
+    );
+    let mut cfg = test_wallet_config(&scope, rpc_url);
+    cfg.sync_to_block = Some(0);
+    cfg.use_indexed_wallet_catch_up = false;
+    let corpus_key = PublicPoiCorpusKey::new(0, scope.chain_id, DEFAULT_TXID_VERSION);
+
+    let first = service
+        .register_wallet(cfg.clone())
+        .await
+        .expect("register artifact wallet");
+    let first_corpus = public_data_plane
+        .ensure_poi_corpus(corpus_key.clone())
+        .await
+        .expect("first POI corpus")
+        .local_caches();
+    service.unregister_wallet(&cfg.cache_key).await;
+
+    let second = service
+        .register_wallet(cfg.clone())
+        .await
+        .expect("re-register artifact wallet");
+    let second_corpus = public_data_plane
+        .ensure_poi_corpus(corpus_key)
+        .await
+        .expect("second POI corpus")
+        .local_caches();
+
+    assert_ne!(first.actor_id(), second.actor_id());
+    assert!(Arc::ptr_eq(&first_corpus, &second_corpus));
+    service.unregister_wallet(&cfg.cache_key).await;
+    service.shutdown().await;
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -884,6 +995,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     );
     let service = Arc::new(ChainService {
         chain: chain.clone(),
+        poi_policy: test_proxy_poi_policy(),
         db: Arc::clone(&db),
         forest: Arc::new(RwLock::new(MerkleForest::new())),
         head_tx,
@@ -920,6 +1032,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             rpcs: Arc::clone(&rpcs),
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx.clone(),
             backfill_sender: wallet_a_tx.clone(),
@@ -941,6 +1054,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             rpcs: Arc::clone(&rpcs),
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx.clone(),
             backfill_sender: wallet_b_tx.clone(),
@@ -966,13 +1080,13 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     );
     let wallet_a_token = wallet_a.mint_sync_token(0);
     let wallet_b_token = wallet_b.mint_sync_token(0);
-    let wallet_a_job = send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token)
+    let wallet_a_lease = send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token)
         .await
-        .accepted_job()
+        .accepted_lease()
         .expect("wallet A target accepted");
-    let wallet_b_job = send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token)
+    let wallet_b_lease = send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token)
         .await
-        .accepted_job()
+        .accepted_lease()
         .expect("wallet B target accepted");
     backfill_request_tx
         .send(BackfillRequest::Add {
@@ -981,7 +1095,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             to_block: 199,
             follow_safe_head: false,
             progress_start_block: 100,
-            lease: WalletBackfillLease::for_actor_accepted_job(wallet_a_job, wallet_a_tx),
+            lease: wallet_a_lease,
         })
         .await
         .expect("send wallet A backfill request");
@@ -992,7 +1106,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             to_block: 130,
             follow_safe_head: false,
             progress_start_block: 120,
-            lease: WalletBackfillLease::for_actor_accepted_job(wallet_b_job, wallet_b_tx),
+            lease: wallet_b_lease,
         })
         .await
         .expect("send wallet B backfill request");
@@ -1092,6 +1206,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
     );
     let service = Arc::new(ChainService {
         chain: chain.clone(),
+        poi_policy: test_proxy_poi_policy(),
         db: Arc::clone(&db),
         forest: Arc::new(RwLock::new(MerkleForest::new())),
         head_tx,
@@ -1119,6 +1234,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             rpcs,
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: wallet_backfill_tx.clone(),
@@ -1233,6 +1349,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     );
     let service = Arc::new(ChainService {
         chain: chain.clone(),
+        poi_policy: test_proxy_poi_policy(),
         db: Arc::clone(&db),
         forest: Arc::new(RwLock::new(MerkleForest::new())),
         head_tx,
@@ -1263,6 +1380,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
             rpcs,
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: wallet_backfill_tx.clone(),
@@ -1377,6 +1495,7 @@ async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
             rpcs,
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: backfill_tx.clone(),
@@ -1878,6 +1997,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
             )),
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: worker_tx,
@@ -1928,6 +2048,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     let Some(BackfillEvent::Target {
         target_block,
         token,
+        sender,
         response,
     }) = receiver.recv().await
     else {
@@ -1939,7 +2060,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
         .send(WalletBackfillFinishResult::Accepted {
             committed_to: 100,
             target_block,
-            job: WalletAcceptedBackfillJob::for_test(token),
+            lease: WalletBackfillLease::from_token(token, sender),
         })
         .expect("send initial target result");
 
@@ -1964,6 +2085,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     let Some(BackfillEvent::Target {
         target_block,
         token: finish_token,
+        sender: _,
         response,
     }) = receiver.recv().await
     else {
@@ -2004,6 +2126,7 @@ async fn wallet_startup_events_treat_leading_ready_as_success() {
             )),
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: worker_tx,
@@ -2094,6 +2217,7 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
             )),
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: worker_tx,
@@ -2144,6 +2268,7 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
     let Some(BackfillEvent::Target {
         target_block,
         token,
+        sender,
         response,
     }) = receiver.recv().await
     else {
@@ -2153,7 +2278,7 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
         .send(WalletBackfillFinishResult::Accepted {
             committed_to: 100,
             target_block,
-            job: WalletAcceptedBackfillJob::for_test(token),
+            lease: WalletBackfillLease::from_token(token, sender),
         })
         .expect("send target result");
 
@@ -2202,6 +2327,7 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
             )),
             http_client: None,
             indexed_artifact_source: None,
+            poi_runtime: test_wallet_poi_runtime(),
             forest: Arc::new(RwLock::new(MerkleForest::new())),
             backfill_tx: backfill_request_tx,
             backfill_sender: worker_tx,
@@ -2252,6 +2378,7 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
     let Some(BackfillEvent::Target {
         target_block,
         token,
+        sender,
         response,
     }) = receiver.recv().await
     else {
@@ -2261,7 +2388,7 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
         .send(WalletBackfillFinishResult::Accepted {
             committed_to: 100,
             target_block,
-            job: WalletAcceptedBackfillJob::for_test(token),
+            lease: WalletBackfillLease::from_token(token, sender),
         })
         .expect("send target result");
 
@@ -2316,6 +2443,15 @@ fn test_chain_service(
     chain: ChainConfig,
     public_data_plane: ChainPublicDataPlane,
 ) -> Arc<ChainService> {
+    test_chain_service_with_policy(db, chain, public_data_plane, test_proxy_poi_policy())
+}
+
+fn test_chain_service_with_policy(
+    db: Arc<DbStore>,
+    chain: ChainConfig,
+    public_data_plane: ChainPublicDataPlane,
+    poi_policy: GlobalPoiPolicy,
+) -> Arc<ChainService> {
     let (head_tx, _head_rx) = watch::channel(0);
     let (safe_head_tx, _safe_head_rx) = watch::channel(0);
     let (forest_last_tx, _forest_last_rx) = watch::channel(0);
@@ -2323,6 +2459,7 @@ fn test_chain_service(
     let (backfill_tx, _backfill_rx) = mpsc::channel(1);
     Arc::new(ChainService {
         chain,
+        poi_policy,
         db,
         forest: Arc::new(RwLock::new(MerkleForest::new())),
         head_tx,
@@ -2770,10 +2907,6 @@ fn test_wallet_config(scope: &ChainScope, quick_sync_endpoint: Url) -> WalletCon
         progress_tx: None,
         cache_store: None,
         poi_recovery_prover: None,
-        poi_rpc_url: Url::parse("http://127.0.0.1:1").expect("poi url"),
-        poi_read_source: PoiReadSource::PoiProxy,
-        local_poi_caches: None,
-        manage_local_poi_cache: false,
         use_indexed_wallet_catch_up: true,
     }
 }

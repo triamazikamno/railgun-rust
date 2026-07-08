@@ -291,6 +291,7 @@ pub(super) struct WalletRegistration {
 
 pub struct ChainService {
     pub(super) chain: ChainConfig,
+    pub(super) poi_policy: GlobalPoiPolicy,
     pub(super) db: Arc<DbStore>,
     pub(super) forest: Arc<RwLock<MerkleForest>>,
     pub(super) head_tx: watch::Sender<u64>,

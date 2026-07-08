@@ -155,14 +155,13 @@ fn enqueue_reset_replay_after_commit(
         actor_state.retire_job(token);
         return;
     }
-    let accepted_job = WalletAcceptedBackfillJob::for_actor_accepted_job(token);
     if let Err(err) = backfill_tx.try_send(BackfillRequest::add(
         cfg.cache_key.clone(),
         replay_from,
         pending.replay_plan.target_block,
         pending.replay_plan.follow_safe_head,
         replay_from,
-        WalletBackfillLease::for_actor_accepted_job(accepted_job, backfill_sender.clone()),
+        WalletBackfillLease::from_token(token, backfill_sender.clone()),
     )) {
         warn!(?err, cache_key = %cfg.cache_key, replay_from, target_block = pending.replay_plan.target_block, "wallet reset replay enqueue failed");
         actor_state.fail_job(token, WalletReadinessError::BackfillUnavailable);
@@ -526,23 +525,52 @@ impl WalletPoiStatusReaderSource<'_> {
     }
 }
 
-pub(super) fn wallet_poi_status_reader_source<'a>(
-    remote_client: &'a PoiRpcClient,
-    cfg: &WalletConfig,
-) -> WalletPoiStatusReaderSource<'a> {
-    match &cfg.poi_read_source {
-        PoiReadSource::IndexedArtifacts(_) => {
-            let local_caches = cfg.local_poi_caches.as_ref().cloned().unwrap_or_else(|| {
-                warn!(
-                    cache_key = %cfg.cache_key,
-                    chain_id = cfg.chain.chain_id,
-                    "artifact POI read source missing local cache handle"
-                );
-                Arc::new(RwLock::new(BTreeMap::new()))
-            });
-            WalletPoiStatusReaderSource::Local(LocalPoiStatusReader::new(local_caches))
+impl WalletPoiRuntime {
+    pub(super) async fn status_reader<'a>(
+        &'a self,
+        public_data_plane: &ChainPublicDataPlane,
+        cfg: &WalletConfig,
+        active_list_keys: &[FixedBytes<32>],
+    ) -> Option<WalletPoiStatusReaderSource<'a>> {
+        match self {
+            Self::IndexedArtifacts { .. } => {
+                let key = PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id);
+                if !public_data_plane
+                    .poi_corpus_ready_for_lists(key.clone(), active_list_keys)
+                    .await
+                {
+                    return self
+                        .wallet_read_fallback_enabled()
+                        .then(|| WalletPoiStatusReaderSource::Remote(self.client()));
+                }
+                let corpus = public_data_plane.ensure_poi_corpus(key).await.ok()?;
+                let local_caches = corpus.local_caches();
+                Some(WalletPoiStatusReaderSource::Local(
+                    LocalPoiStatusReader::new(local_caches),
+                ))
+            }
+            Self::PoiProxy { .. } => Some(WalletPoiStatusReaderSource::Remote(self.client())),
         }
-        PoiReadSource::PoiProxy => WalletPoiStatusReaderSource::Remote(remote_client),
+    }
+
+    pub(super) async fn read_available_for_lists(
+        &self,
+        public_data_plane: &ChainPublicDataPlane,
+        cfg: &WalletConfig,
+        active_list_keys: &[FixedBytes<32>],
+    ) -> bool {
+        match self {
+            Self::IndexedArtifacts { .. } => {
+                public_data_plane
+                    .poi_corpus_ready_for_lists(
+                        PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id),
+                        active_list_keys,
+                    )
+                    .await
+                    || self.wallet_read_fallback_enabled()
+            }
+            Self::PoiProxy { .. } => true,
+        }
     }
 }
 
@@ -1017,7 +1045,8 @@ impl WalletScanCommitRequest<'_> {
                         WalletBackfillRejectReason::StaleDataPlaneEpoch { expected, actual }
                     }
                     crate::chain::PublicDataPlaneError::InvalidRange { .. }
-                    | crate::chain::PublicDataPlaneError::PublicCacheReset { .. } => {
+                    | crate::chain::PublicDataPlaneError::PublicCacheReset { .. }
+                    | crate::chain::PublicDataPlaneError::PoiCorpusUnavailable { .. } => {
                         WalletBackfillRejectReason::ApplyFailed
                     }
                 };
@@ -1214,7 +1243,7 @@ pub(crate) async fn spawn_wallet_worker(
     cancel: CancellationToken,
     initial_utxos: Vec<WalletUtxo>,
     initial_last_scanned: u64,
-) -> Result<WalletHandle, WalletCacheError> {
+) -> Result<WalletHandle, ChainError> {
     let utxos = Arc::new(RwLock::new(initial_utxos));
     let pending_overlay = Arc::new(RwLock::new(WalletPendingOverlay::default()));
     let last_scanned_state = Arc::new(AtomicU64::new(initial_last_scanned));
@@ -1226,11 +1255,18 @@ pub(crate) async fn spawn_wallet_worker(
         rpcs,
         http_client,
         indexed_artifact_source,
+        poi_runtime,
         forest,
         backfill_tx,
         backfill_sender,
         public_data_plane,
     } = services;
+    if poi_runtime.is_indexed_artifacts() {
+        public_data_plane
+            .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id))
+            .await
+            .map_err(ChainError::from)?;
+    }
     let cache_store = wallet_cache_store(&db, &cfg);
     let restored_sync_state =
         cache_store.get_wallet_sync_actor_state(cfg.chain.chain_id, &cfg.cache_key)?;
@@ -1276,8 +1312,6 @@ pub(crate) async fn spawn_wallet_worker(
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        poi_read_source: cfg.poi_read_source.clone(),
-        local_poi_caches: cfg.local_poi_caches.clone(),
         pending_overlay_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,
@@ -1309,36 +1343,13 @@ pub(crate) async fn spawn_wallet_worker(
         let mut live_receiver_lagged = false;
         let mut persist_state = WalletPersistState::default();
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
-        let poi_status_client = wallet_poi_status_client(&cfg.poi_rpc_url, http_client.as_ref());
+        let poi_status_client = Some(poi_runtime.client());
         let active_poi_list_keys = default_active_poi_list_keys();
-        let mut last_live_tail_poll = Instant::now();
         let mut pending_reset_retry = tokio::time::interval_at(
             tokio::time::Instant::now() + WALLET_RESET_RETRY_INTERVAL,
             WALLET_RESET_RETRY_INTERVAL,
         );
         pending_reset_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let preloaded_poi_caches = if cfg.manage_local_poi_cache {
-            install_persisted_local_poi_caches(db.as_ref(), &cfg, &active_poi_list_keys).await
-        } else {
-            BTreeMap::new()
-        };
-        let mut startup_artifact_warmup = if cfg.manage_local_poi_cache {
-            spawn_startup_artifact_poi_cache_warmup(
-                Arc::clone(&db),
-                http_client.clone(),
-                cfg.clone(),
-                active_poi_list_keys.clone(),
-                preloaded_poi_caches,
-            )
-        } else {
-            debug!(
-                cache_key = %cfg.cache_key,
-                chain_id = cfg.chain.chain_id,
-                "wallet using externally managed artifact POI cache"
-            );
-            None
-        };
-
         if poi_status_client.is_some() {
             let locked = utxos.read().await;
             debug!(
@@ -1477,7 +1488,7 @@ pub(crate) async fn spawn_wallet_worker(
                 let mut pre_ready_poi_status_rejection = None;
                 let mut pre_ready_poi_status_refresh_elapsed_ms = 0_u128;
                 let mut pre_ready_local_cache_available = false;
-                if let Some(client) = poi_status_client.as_ref() {
+                if poi_status_client.is_some() {
                     let refresh_needed = {
                         let locked = utxos.read().await;
                         wallet_poi_status_refresh_needed_for_selection(
@@ -1487,47 +1498,57 @@ pub(crate) async fn spawn_wallet_worker(
                         )
                     };
                     if refresh_needed {
-                        pre_ready_local_cache_available = local_poi_caches_available_for_lists(
-                            &cfg,
-                            &active_poi_list_keys,
-                        ).await;
+                        pre_ready_local_cache_available = poi_runtime
+                            .read_available_for_lists(
+                                &public_data_plane,
+                                &cfg,
+                                &active_poi_list_keys,
+                            )
+                            .await;
                         if pre_ready_local_cache_available {
                             let status_refresh_started = Instant::now();
-                            let status_reader = wallet_poi_status_reader_source(client, &cfg);
-                            match (WalletPoiStatusRefreshCommitRequest {
-                                cache_store: cache_store.as_ref(),
-                                cfg: &cfg,
-                                utxos: &utxos,
-                                worker_handle: &worker_handle,
-                                last_scanned,
-                                reset_generation: current_reset_generation,
-                                actor_state: &mut actor_state,
-                                persist_state: &mut persist_state,
-                                ready_tx: &ready_tx,
-                                readiness_tx: &readiness_tx,
-                                status_reader: status_reader.as_reader(),
-                                active_poi_list_keys: &active_poi_list_keys,
-                                selection: WalletPoiRefreshSelection::RequiredOrRecoverable,
-                                cancel: &cancel,
-                            })
-                            .commit()
-                            .await
+                            if let Some(status_reader) = poi_runtime
+                                .status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                                .await
                             {
-                                Ok(changed) => pre_ready_poi_status_changed = changed,
-                                Err(reason) => {
-                                    warn!(?reason, cache_key = %cfg.cache_key, "pre-ready wallet POI status refresh rejected");
-                                    pre_ready_poi_status_rejection = Some(reason);
+                                match (WalletPoiStatusRefreshCommitRequest {
+                                    cache_store: cache_store.as_ref(),
+                                    cfg: &cfg,
+                                    utxos: &utxos,
+                                    worker_handle: &worker_handle,
+                                    last_scanned,
+                                    reset_generation: current_reset_generation,
+                                    actor_state: &mut actor_state,
+                                    persist_state: &mut persist_state,
+                                    ready_tx: &ready_tx,
+                                    readiness_tx: &readiness_tx,
+                                    status_reader: status_reader.as_reader(),
+                                    active_poi_list_keys: &active_poi_list_keys,
+                                    selection: WalletPoiRefreshSelection::RequiredOrRecoverable,
+                                    cancel: &cancel,
+                                })
+                                .commit()
+                                .await
+                                {
+                                    Ok(changed) => pre_ready_poi_status_changed = changed,
+                                    Err(reason) => {
+                                        warn!(?reason, cache_key = %cfg.cache_key, "pre-ready wallet POI status refresh rejected");
+                                        pre_ready_poi_status_rejection = Some(reason);
+                                    }
                                 }
+                                pre_ready_poi_status_refresh_elapsed_ms =
+                                    status_refresh_started.elapsed().as_millis();
+                                debug!(
+                                    cache_key = %cfg.cache_key,
+                                    changed = pre_ready_poi_status_changed,
+                                    status_refresh_elapsed_ms = pre_ready_poi_status_refresh_elapsed_ms,
+                                    "pre-ready wallet POI status refresh visible"
+                                );
+                                tokio::task::yield_now().await;
+                            } else {
+                                pre_ready_poi_status_rejection =
+                                    Some(WalletBackfillRejectReason::ApplyFailed);
                             }
-                            pre_ready_poi_status_refresh_elapsed_ms =
-                                status_refresh_started.elapsed().as_millis();
-                            debug!(
-                                cache_key = %cfg.cache_key,
-                                changed = pre_ready_poi_status_changed,
-                                status_refresh_elapsed_ms = pre_ready_poi_status_refresh_elapsed_ms,
-                                "pre-ready wallet POI status refresh visible"
-                            );
-                            tokio::task::yield_now().await;
                         }
                     }
                 }
@@ -1553,7 +1574,7 @@ pub(crate) async fn spawn_wallet_worker(
                 drop(snapshot);
                 tokio::task::yield_now().await;
 
-                if let Some(client) = poi_status_client.as_ref() {
+                if let Some(&client) = poi_status_client.as_ref() {
                     let post_ready_poi_started = Instant::now();
                     let authority = WalletPrivateMutationAuthority::new(
                         &worker_handle,
@@ -1589,15 +1610,13 @@ pub(crate) async fn spawn_wallet_worker(
                             current_reset_generation,
                             &cancel,
                         ).await;
-                        let warmup_wait_started = Instant::now();
-                        let local_cache_available = local_poi_caches_ready_for_refresh(
-                            &mut startup_artifact_warmup,
-                            &cfg,
-                            &active_poi_list_keys,
-                            "post_ready_poi_refresh",
-                        ).await;
-                        let warmup_wait_elapsed_ms =
-                            warmup_wait_started.elapsed().as_millis();
+                        let local_cache_available = poi_runtime
+                            .read_available_for_lists(
+                                &public_data_plane,
+                                &cfg,
+                                &active_poi_list_keys,
+                            )
+                            .await;
                         if !local_cache_available {
                             log_local_poi_cache_unavailable(&cfg, "post_ready_poi_refresh");
                             publish_poi_refreshing(
@@ -1609,8 +1628,11 @@ pub(crate) async fn spawn_wallet_worker(
                             ).await;
                         } else {
                             let status_refresh_started = Instant::now();
-                            let status_reader = wallet_poi_status_reader_source(client, &cfg);
-                            let changed = match (WalletPoiStatusRefreshCommitRequest {
+                            if let Some(status_reader) = poi_runtime
+                                .status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                                .await
+                            {
+                                let changed = match (WalletPoiStatusRefreshCommitRequest {
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
                                 utxos: &utxos,
@@ -1647,6 +1669,8 @@ pub(crate) async fn spawn_wallet_worker(
                             tokio::task::yield_now().await;
                             let pending_verification = verify_submitted_pending_output_pois_with_config_authorized(
                                 &authority,
+                                &public_data_plane,
+                                &poi_runtime,
                                 client,
                                 &cfg,
                                 db.as_ref(),
@@ -1662,20 +1686,24 @@ pub(crate) async fn spawn_wallet_worker(
                                 &cancel,
                             ).await;
                             let output_recovery_started = Instant::now();
-                            let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
+                            let recovered = (OutputPoiRecoveryRun {
                                 authority: &authority,
                                 db: db.as_ref(),
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
+                                public_data_plane: &public_data_plane,
                                 rpcs: rpcs.as_ref(),
                                 http_client: http_client.as_ref(),
                                 indexed_artifact_source: indexed_artifact_source.as_ref(),
+                                poi_runtime: &poi_runtime,
                                 forest: &forest,
                                 utxos: &utxos,
                                 client,
                                 active_list_keys: &active_poi_list_keys,
                                 force_retry: false,
-                            }).await;
+                            })
+                            .recover_missing()
+                            .await;
                             authority
                                 .notify_changed_if(recovered > 0, "post_ready_output_poi_recovery")
                                 .await;
@@ -1687,7 +1715,6 @@ pub(crate) async fn spawn_wallet_worker(
                                 recovered,
                                 pending_observations_elapsed_ms,
                                 local_cache_available,
-                                warmup_wait_elapsed_ms,
                                 status_refresh_elapsed_ms,
                                 output_recovery_elapsed_ms,
                                 pending_completed = pending_verification.completed,
@@ -1696,6 +1723,16 @@ pub(crate) async fn spawn_wallet_worker(
                                 elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
                                 "post-ready wallet POI maintenance complete"
                             );
+                            } else {
+                                log_local_poi_cache_unavailable(&cfg, "post_ready_poi_refresh");
+                                publish_poi_refreshing(
+                                    &poi_refreshing_tx,
+                                    false,
+                                    &worker_handle,
+                                    current_reset_generation,
+                                    &cancel,
+                                ).await;
+                            }
                         }
                     } else {
                         debug!(
@@ -1734,7 +1771,7 @@ pub(crate) async fn spawn_wallet_worker(
                     }
                 }
                 Some(refresh_request) = poi_refresh_rx.recv() => {
-                    let Some(client) = poi_status_client.as_ref() else {
+                    let Some(&client) = poi_status_client.as_ref() else {
                         continue;
                     };
                     if actor_state.pending_reset.is_some() {
@@ -1759,12 +1796,10 @@ pub(crate) async fn spawn_wallet_worker(
                         current_reset_generation,
                         &cancel,
                     ).await;
-                    if !local_poi_caches_ready_for_refresh(
-                        &mut startup_artifact_warmup,
-                        &cfg,
-                        &active_poi_list_keys,
-                        "manual_poi_refresh",
-                    ).await {
+                    if !poi_runtime
+                        .read_available_for_lists(&public_data_plane, &cfg, &active_poi_list_keys)
+                        .await
+                    {
                         log_local_poi_cache_unavailable(&cfg, "manual_poi_refresh");
                         publish_poi_refreshing(
                             &poi_refreshing_tx,
@@ -1775,7 +1810,19 @@ pub(crate) async fn spawn_wallet_worker(
                         ).await;
                         continue;
                     }
-                    let status_reader = wallet_poi_status_reader_source(client, &cfg);
+                    let Some(status_reader) = poi_runtime
+                        .status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                        .await else {
+                        log_local_poi_cache_unavailable(&cfg, "manual_poi_refresh");
+                        publish_poi_refreshing(
+                            &poi_refreshing_tx,
+                            false,
+                            &worker_handle,
+                            current_reset_generation,
+                            &cancel,
+                        ).await;
+                        continue;
+                    };
                     let changed = match (WalletPoiStatusRefreshCommitRequest {
                         cache_store: cache_store.as_ref(),
                         cfg: &cfg,
@@ -1815,6 +1862,8 @@ pub(crate) async fn spawn_wallet_worker(
                     );
                     let pending_verification = verify_submitted_pending_output_pois_with_config_authorized(
                         &authority,
+                        &public_data_plane,
+                        &poi_runtime,
                         client,
                         &cfg,
                         db.as_ref(),
@@ -1850,20 +1899,24 @@ pub(crate) async fn spawn_wallet_worker(
                         "manual wallet POI refresh pending context verification complete"
                     );
                     let recovery_started = Instant::now();
-                    let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
+                    let recovered = (OutputPoiRecoveryRun {
                         authority: &authority,
                         db: db.as_ref(),
                         cache_store: cache_store.as_ref(),
                         cfg: &cfg,
+                        public_data_plane: &public_data_plane,
                         rpcs: rpcs.as_ref(),
                         http_client: http_client.as_ref(),
                         indexed_artifact_source: indexed_artifact_source.as_ref(),
+                        poi_runtime: &poi_runtime,
                         forest: &forest,
                         utxos: &utxos,
                         client,
                         active_list_keys: &active_poi_list_keys,
                         force_retry: refresh_request.force_output_poi_recovery,
-                    }).await;
+                    })
+                    .recover_missing()
+                    .await;
                     let force_submission_retry = refresh_request.force_output_poi_recovery
                         && recovered == 0
                         && forced_pending_attempts == 0;
@@ -2030,16 +2083,10 @@ pub(crate) async fn spawn_wallet_worker(
                     drop(permit);
                 }
                 _ = tokio::time::sleep(WALLET_POI_REFRESH_INTERVAL), if poi_status_client.is_some() && backfill_complete_block.is_some() && actor_state.pending_reset.is_none() => {
-                    let Some(client) = poi_status_client.as_ref() else {
+                    let Some(&client) = poi_status_client.as_ref() else {
                         continue;
                     };
                     let current_reset_generation = actor_state.reset_generation;
-                    if cfg.manage_local_poi_cache
-                        && last_live_tail_poll.elapsed() >= WALLET_POI_LIVE_TAIL_INTERVAL
-                    {
-                        sync_local_poi_live_tails(client, &cfg, &active_poi_list_keys).await;
-                        last_live_tail_poll = Instant::now();
-                    }
                     let now = now_epoch_secs();
                     let selection = WalletPoiRefreshSelection::RecoverableStale { now };
                     let refresh_needed = {
@@ -2056,7 +2103,14 @@ pub(crate) async fn spawn_wallet_worker(
                             current_reset_generation,
                             &cancel,
                         );
-                        if local_poi_caches_available_for_lists(&cfg, &active_poi_list_keys).await {
+                        if poi_runtime
+                            .read_available_for_lists(
+                                &public_data_plane,
+                                &cfg,
+                                &active_poi_list_keys,
+                            )
+                            .await
+                        {
                             mark_valid_output_poi_recoveries_authorized(
                                 &authority,
                                 db.as_ref(),
@@ -2067,6 +2121,8 @@ pub(crate) async fn spawn_wallet_worker(
                             ).await;
                             verify_submitted_pending_output_pois_with_config_authorized(
                                 &authority,
+                                &public_data_plane,
+                                &poi_runtime,
                                 client,
                                 &cfg,
                                 db.as_ref(),
@@ -2094,12 +2150,10 @@ pub(crate) async fn spawn_wallet_worker(
                         current_reset_generation,
                         &cancel,
                     ).await;
-                    if !local_poi_caches_ready_for_refresh(
-                        &mut startup_artifact_warmup,
-                        &cfg,
-                        &active_poi_list_keys,
-                        "periodic_poi_refresh",
-                    ).await {
+                    if !poi_runtime
+                        .read_available_for_lists(&public_data_plane, &cfg, &active_poi_list_keys)
+                        .await
+                    {
                         log_local_poi_cache_unavailable(&cfg, "periodic_poi_refresh");
                         publish_poi_refreshing(
                             &poi_refreshing_tx,
@@ -2110,7 +2164,19 @@ pub(crate) async fn spawn_wallet_worker(
                         ).await;
                         continue;
                     }
-                    let status_reader = wallet_poi_status_reader_source(client, &cfg);
+                    let Some(status_reader) = poi_runtime
+                        .status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                        .await else {
+                        log_local_poi_cache_unavailable(&cfg, "periodic_poi_refresh");
+                        publish_poi_refreshing(
+                            &poi_refreshing_tx,
+                            false,
+                            &worker_handle,
+                            current_reset_generation,
+                            &cancel,
+                        ).await;
+                        continue;
+                    };
                     let changed = match (WalletPoiStatusRefreshCommitRequest {
                         cache_store: cache_store.as_ref(),
                         cfg: &cfg,
@@ -2150,6 +2216,8 @@ pub(crate) async fn spawn_wallet_worker(
                     );
                     let pending_verification = verify_submitted_pending_output_pois_with_config_authorized(
                         &authority,
+                        &public_data_plane,
+                        &poi_runtime,
                         client,
                         &cfg,
                         db.as_ref(),
@@ -2163,20 +2231,24 @@ pub(crate) async fn spawn_wallet_worker(
                         current_reset_generation,
                         &cancel,
                     ).await;
-                    let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
+                    let recovered = (OutputPoiRecoveryRun {
                         authority: &authority,
                         db: db.as_ref(),
                         cache_store: cache_store.as_ref(),
                         cfg: &cfg,
+                        public_data_plane: &public_data_plane,
                         rpcs: rpcs.as_ref(),
                         http_client: http_client.as_ref(),
                         indexed_artifact_source: indexed_artifact_source.as_ref(),
+                        poi_runtime: &poi_runtime,
                         forest: &forest,
                         utxos: &utxos,
                         client,
                         active_list_keys: &active_poi_list_keys,
                         force_retry: false,
-                    }).await;
+                    })
+                    .recover_missing()
+                    .await;
                     authority
                         .notify_changed_if(recovered > 0, "periodic_output_poi_recovery")
                         .await;
@@ -2268,7 +2340,7 @@ pub(crate) async fn spawn_wallet_worker(
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet scan apply result");
                             }
                         }
-                        BackfillEvent::Target { target_block, token, response } => {
+                        BackfillEvent::Target { target_block, token, sender, response } => {
                             let current_reset_generation = actor_state.reset_generation;
                             if let Err(reason) = actor_state.validate_sync_token_current(
                                 token,
@@ -2328,7 +2400,7 @@ pub(crate) async fn spawn_wallet_worker(
                                 let result = WalletBackfillFinishResult::Accepted {
                                     committed_to: last_scanned,
                                     target_block: required_target,
-                                    job: WalletAcceptedBackfillJob::for_actor_accepted_job(token),
+                                    lease: WalletBackfillLease::from_token(token, sender),
                                 };
                                 if let Err(err) = response.send(result) {
                                     debug!(?err, cache_key = %cfg.cache_key, "failed to send pending wallet target result");
@@ -2567,10 +2639,7 @@ pub(crate) async fn spawn_wallet_worker(
                                     batch.to_block,
                                     true,
                                     expected_from_block,
-                                    WalletBackfillLease::for_actor_accepted_job(
-                                        WalletAcceptedBackfillJob::for_actor_accepted_job(token),
-                                        backfill_sender.clone(),
-                                    ),
+                                    WalletBackfillLease::from_token(token, backfill_sender.clone()),
                                 )) {
                                     Ok(()) => {
                                         backfill_complete_block = None;
@@ -2588,21 +2657,23 @@ pub(crate) async fn spawn_wallet_worker(
                                 continue;
                             }
                             live_receiver_lagged = false;
-                            let local_poi_cache_available = local_poi_caches_available_for_lists(
-                                &cfg,
-                                &active_poi_list_keys,
-                            )
-                            .await;
-                            if !local_poi_cache_available {
+                            let poi_read_available = poi_runtime
+                                .read_available_for_lists(
+                                    &public_data_plane,
+                                    &cfg,
+                                    &active_poi_list_keys,
+                                )
+                                .await;
+                            if !poi_read_available {
                                 log_local_poi_cache_unavailable(&cfg, "live_scan_poi_refresh");
                             }
                             let poi_submitter = poi_status_client
                                 .as_ref()
-                                .map(|client| client as &dyn PendingOutputPoiSubmitter);
-                            let poi_status_reader = if local_poi_cache_available {
-                                poi_status_client
-                                    .as_ref()
-                                    .map(|client| wallet_poi_status_reader_source(client, &cfg))
+                                .map(|&client| client as &dyn PendingOutputPoiSubmitter);
+                            let poi_status_reader = if poi_read_available {
+                                poi_runtime
+                                    .status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                                    .await
                             } else {
                                 None
                             };
@@ -2645,7 +2716,7 @@ pub(crate) async fn spawn_wallet_worker(
                                 poi_submitter,
                                 poi_status_reader: poi_status_reader.as_ref().map(WalletPoiStatusReaderSource::as_reader),
                                 active_poi_list_keys: &active_poi_list_keys,
-                                refresh_poi_statuses: local_poi_cache_available,
+                                refresh_poi_statuses: poi_status_reader.is_some(),
                                 mark_syncing_on_commit: false,
                                 public_data_plane: &public_data_plane,
                             }
@@ -2657,35 +2728,41 @@ pub(crate) async fn spawn_wallet_worker(
                             match outcome.result {
                                 WalletBackfillApplyResult::Committed { .. }
                                 | WalletBackfillApplyResult::AlreadyCovered { .. } => {
-                                    if outcome.changed && let Some(client) = poi_status_client.as_ref() {
+                                    if outcome.changed && let Some(&client) = poi_status_client.as_ref() {
                                         let authority = WalletPrivateMutationAuthority::new(
                                             &worker_handle,
                                             current_reset_generation,
                                             &cancel,
                                         );
-                                        if local_poi_cache_available {
+                                        if poi_read_available {
                                             verify_submitted_pending_output_pois_with_config_authorized(
                                                 &authority,
+                                                &public_data_plane,
+                                                &poi_runtime,
                                                 client,
                                                 &cfg,
                                                 db.as_ref(),
                                                 cache_store.as_ref(),
                                                 &active_poi_list_keys,
                                             ).await;
-                                            let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
+                                            let recovered = (OutputPoiRecoveryRun {
                                                 authority: &authority,
                                                 db: db.as_ref(),
                                                 cache_store: cache_store.as_ref(),
                                                 cfg: &cfg,
+                                                public_data_plane: &public_data_plane,
                                                 rpcs: rpcs.as_ref(),
                                                 http_client: http_client.as_ref(),
                                                 indexed_artifact_source: indexed_artifact_source.as_ref(),
+                                                poi_runtime: &poi_runtime,
                                                 forest: &forest,
                                                 utxos: &utxos,
                                                 client,
                                                 active_list_keys: &active_poi_list_keys,
                                                 force_retry: false,
-                                            }).await;
+                                            })
+                                            .recover_missing()
+                                            .await;
                                             authority
                                                 .notify_changed_if(
                                                     recovered > 0,
@@ -2762,15 +2839,23 @@ mod tests {
 
     use crate::chain::ChainPublicDataPlane;
     use crate::types::{
-        BackfillRequest, ChainKey, LogBatch, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-        PoiReadSource, PublicDataPlaneEpoch, PublicScanReadScope, WalletConfig,
-        WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+        BackfillRequest, ChainKey, GlobalPoiPolicy, LogBatch, PublicDataPlaneEpoch,
+        PublicScanReadScope, WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
     };
 
     fn test_public_data_plane(db: &Arc<DbStore>) -> ChainPublicDataPlane {
         ChainPublicDataPlane::new(
             Arc::clone(db),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    fn test_wallet_poi_runtime() -> WalletPoiRuntime {
+        WalletPoiRuntime::from_policy(
+            &GlobalPoiPolicy::PoiProxy {
+                rpc_url: Url::parse("http://127.0.0.1:1").expect("POI RPC URL"),
+            },
+            None,
         )
     }
 
@@ -3026,6 +3111,7 @@ mod tests {
             .send(BackfillEvent::Target {
                 target_block,
                 token,
+                sender: sender.clone(),
                 response,
             })
             .await
@@ -3043,11 +3129,11 @@ mod tests {
             WalletBackfillFinishResult::Accepted {
                 committed_to: actual_committed_to,
                 target_block: actual_target_block,
-                job,
+                lease,
             } => {
                 assert_eq!(actual_committed_to, committed_to);
                 assert_eq!(actual_target_block, target_block);
-                assert_eq!(job.token(), token);
+                assert_eq!(lease.token(), token);
             }
             other => panic!("expected accepted target, got {other:?}"),
         }
@@ -3139,6 +3225,7 @@ mod tests {
         let (backfill_tx, backfill_rx) = mpsc::channel(8);
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
+        let public_data_plane = test_public_data_plane(&db);
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -3148,10 +3235,11 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_plane: test_public_data_plane(&db),
+                public_data_plane: public_data_plane.clone(),
             },
             wallet_config(),
             1,
@@ -3210,6 +3298,7 @@ mod tests {
         let (backfill_tx, backfill_rx) = mpsc::channel(8);
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
+        let public_data_plane = test_public_data_plane(&db);
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -3219,10 +3308,11 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_plane: test_public_data_plane(&db),
+                public_data_plane: public_data_plane.clone(),
             },
             cfg,
             1,
@@ -3285,6 +3375,7 @@ mod tests {
         let (backfill_tx, backfill_rx) = mpsc::channel(8);
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
+        let public_data_plane = test_public_data_plane(&db);
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -3294,10 +3385,11 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
-                public_data_plane: test_public_data_plane(&db),
+                public_data_plane: public_data_plane.clone(),
             },
             wallet_config(),
             1,
@@ -3372,6 +3464,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -3475,6 +3568,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -3562,6 +3656,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -3655,6 +3750,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -3737,6 +3833,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -3825,6 +3922,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -3952,6 +4050,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4033,6 +4132,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4096,6 +4196,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4162,6 +4263,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4224,6 +4326,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4303,6 +4406,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4370,6 +4474,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4478,6 +4583,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4594,6 +4700,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4657,6 +4764,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4738,6 +4846,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4836,6 +4945,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4907,6 +5017,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -4994,6 +5105,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -5103,6 +5215,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -5189,6 +5302,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -5272,6 +5386,7 @@ mod tests {
                     )),
                     http_client: None,
                     indexed_artifact_source: None,
+                    poi_runtime: test_wallet_poi_runtime(),
                     forest: Arc::new(RwLock::new(MerkleForest::new())),
                     backfill_tx: backfill_request_tx,
                     backfill_sender: backfill_tx,
@@ -5325,6 +5440,7 @@ mod tests {
         let (backfill_tx, backfill_rx) = mpsc::channel(8);
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
+        let public_data_plane = test_public_data_plane(&db);
 
         let result = spawn_wallet_worker(
             WalletWorkerServices {
@@ -5335,10 +5451,11 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_plane: test_public_data_plane(&db),
+                public_data_plane: public_data_plane.clone(),
             },
             cfg,
             1,
@@ -5350,7 +5467,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(WalletCacheError::Crypto)));
+        assert!(matches!(
+            result,
+            Err(ChainError::WalletCache(WalletCacheError::Crypto))
+        ));
         cancel.cancel();
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -5382,6 +5502,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -5441,22 +5562,13 @@ mod tests {
         );
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         cache_store.fail_next_store();
-        let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-            trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
-            manifest_source: PoiArtifactManifestSource::Url(
-                Url::parse("http://127.0.0.1:1/manifest").expect("manifest url"),
-            ),
-            gateway_urls: Vec::new(),
-            max_manifest_age: None,
-        });
-        cfg.local_poi_caches = Some(local_caches);
         let (_live_tx, live_rx) = broadcast::channel(8);
         let (backfill_tx, backfill_rx) = mpsc::channel(8);
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
+        let public_data_plane = test_public_data_plane(&db);
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -5466,10 +5578,11 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
-                public_data_plane: test_public_data_plane(&db),
+                public_data_plane: public_data_plane.clone(),
             },
             cfg.clone(),
             1,
@@ -5483,11 +5596,14 @@ mod tests {
         .expect("spawn wallet worker");
         let (ready_tx, ready_rx) = watch::channel(true);
         let (readiness_tx, readiness_rx) = watch::channel(WalletReadiness::Syncing);
-        let remote_client = PoiRpcClient::new(cfg.poi_rpc_url.clone());
-        let status_reader = wallet_poi_status_reader_source(&remote_client, &cfg);
         let mut persist_state = WalletPersistState::default();
         let mut actor_state = WalletActorState::new(1, 1, 0, 100, 0, None);
         let active_poi_list_keys = default_active_poi_list_keys();
+        let poi_runtime = test_wallet_poi_runtime();
+        let status_reader = poi_runtime
+            .status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+            .await
+            .expect("POI status reader");
 
         let result = WalletPoiStatusRefreshCommitRequest {
             cache_store: cache_store.as_ref(),
@@ -5538,7 +5654,6 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        cfg.poi_read_source = PoiReadSource::PoiProxy;
         let active_poi_list_keys = default_active_poi_list_keys();
         let initial_utxo = test_wallet_utxo(105, 7);
         let (started_tx, started_rx) = oneshot::channel();
@@ -5557,6 +5672,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
@@ -5643,7 +5759,6 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        cfg.poi_read_source = PoiReadSource::PoiProxy;
         let active_poi_list_keys = default_active_poi_list_keys();
         let wallet_utxo = test_wallet_utxo(105, 7);
         let (started_tx, started_rx) = oneshot::channel();
@@ -5662,6 +5777,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
@@ -5769,7 +5885,6 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        cfg.poi_read_source = PoiReadSource::PoiProxy;
         let active_poi_list_keys = default_active_poi_list_keys();
         let wallet_utxo = test_wallet_utxo(105, 7);
         let (started_tx, started_rx) = oneshot::channel();
@@ -5789,6 +5904,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
@@ -5908,6 +6024,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -5924,18 +6041,18 @@ mod tests {
         .await
         .expect("spawn wallet worker");
 
+        let token = handle.mint_sync_token(0);
         assert_eq!(
-            send_apply(
-                &handle,
+            send_apply_token(
                 &backfill_tx,
                 indexed_delta_batch(101, 200, empty_delta()),
-                0
+                token,
             )
             .await,
             WalletBackfillApplyResult::Committed { committed_to: 200 }
         );
         assert_eq!(
-            send_target(&handle, &backfill_tx, 200, 0).await,
+            send_target_token(&backfill_tx, 200, token).await,
             WalletBackfillFinishResult::Ready { committed_to: 200 }
         );
 
@@ -5974,6 +6091,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -6031,6 +6149,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -6115,6 +6234,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -6237,6 +6357,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -6325,6 +6446,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -6469,6 +6591,7 @@ mod tests {
                 )),
                 http_client: None,
                 indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
@@ -6575,10 +6698,6 @@ mod tests {
             progress_tx: None,
             cache_store: None,
             poi_recovery_prover: None,
-            poi_rpc_url: Url::parse("http://127.0.0.1:1").expect("poi rpc url"),
-            poi_read_source: PoiReadSource::PoiProxy,
-            local_poi_caches: None,
-            manage_local_poi_cache: false,
             use_indexed_wallet_catch_up: true,
         }
     }

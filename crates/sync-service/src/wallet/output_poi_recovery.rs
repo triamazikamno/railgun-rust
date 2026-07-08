@@ -29,6 +29,7 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
     pub(super) db: &'a DbStore,
     pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
+    pub(super) public_data_plane: &'a ChainPublicDataPlane,
     pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
     pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
@@ -365,7 +366,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         let txid_data_started = Instant::now();
         let txid_data =
             match recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
-                db: request.db,
+                public_data_plane: request.public_data_plane,
                 cfg: request.cfg,
                 poi_client: request.poi_client,
                 http_client: request.http_client,

@@ -1,7 +1,6 @@
 pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
 pub const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_secs(60);
 pub(super) const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-pub(super) const WALLET_POI_LIVE_TAIL_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(super) const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
@@ -99,8 +98,6 @@ pub struct WalletHandle {
     pub rev_rx: watch::Receiver<u64>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
     pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
-    pub(super) poi_read_source: PoiReadSource,
-    pub(super) local_poi_caches: Option<WalletLocalPoiCaches>,
     pub(super) pending_overlay_tx: mpsc::Sender<WalletPendingOverlayRequest>,
     pub(super) poi_refresh_tx: mpsc::Sender<WalletPoiRefreshRequest>,
     pub(super) indexed_catch_up_status_tx: mpsc::Sender<WalletIndexedCatchUpCommand>,
@@ -122,29 +119,6 @@ impl WalletActorTokenAuthority<'_> {
     #[must_use]
     pub(crate) const fn actor_id(&self) -> u64 {
         self.handle.actor_id
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WalletAcceptedBackfillJob {
-    token: WalletSyncToken,
-}
-
-impl WalletAcceptedBackfillJob {
-    #[must_use]
-    pub(super) const fn for_actor_accepted_job(token: WalletSyncToken) -> Self {
-        Self { token }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn for_test(token: WalletSyncToken) -> Self {
-        Self { token }
-    }
-
-    #[must_use]
-    pub(crate) const fn token(self) -> WalletSyncToken {
-        self.token
     }
 }
 
@@ -506,6 +480,18 @@ impl WalletHandle {
         )
     }
 
+    pub(crate) async fn start_backfill(
+        &self,
+        cache_key: &str,
+        sender: &mpsc::Sender<BackfillEvent>,
+        reset_generation: u64,
+        target_block: u64,
+    ) -> WalletBackfillFinishResult {
+        let lease =
+            WalletBackfillLease::from_token(self.mint_sync_token(reset_generation), sender.clone());
+        lease.finish(cache_key, target_block).await
+    }
+
     pub(crate) fn mint_reset_token(&self, intent_id: u64) -> WalletResetToken {
         WalletResetToken::mint(WalletActorTokenAuthority { handle: self }, intent_id)
     }
@@ -805,16 +791,6 @@ impl WalletHandle {
             })
             .await
             .is_ok()
-    }
-
-    #[must_use]
-    pub const fn poi_read_source(&self) -> &PoiReadSource {
-        &self.poi_read_source
-    }
-
-    #[must_use]
-    pub fn local_poi_caches(&self) -> Option<WalletLocalPoiCaches> {
-        self.local_poi_caches.clone()
     }
 }
 

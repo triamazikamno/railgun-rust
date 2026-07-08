@@ -18,9 +18,9 @@ pub use manager::{SyncManager, SyncManagerError};
 pub use poi_cache::PoiCacheService;
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
-    IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LocalPoiCaches,
+    GlobalPoiPolicy, IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LocalPoiCaches,
     PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, PublicScanSource,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource,
     SyncProgressSender, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletCacheStore,
     WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletLocalPoiCaches,
 };

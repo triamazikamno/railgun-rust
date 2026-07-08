@@ -7,7 +7,7 @@ use local_db::DbStore;
 
 use crate::chain::ChainHandle;
 use crate::chain::{ChainError, ChainService};
-use crate::types::{ChainConfig, ChainKey, WalletConfig};
+use crate::types::{ChainConfig, ChainKey, GlobalPoiPolicy, WalletConfig};
 use crate::wallet::WalletHandle;
 
 #[derive(Debug, thiserror::Error)]
@@ -22,13 +22,15 @@ pub enum SyncManagerError {
 
 pub struct SyncManager {
     db: Arc<DbStore>,
+    poi_policy: GlobalPoiPolicy,
     chains: RwLock<HashMap<ChainKey, Arc<ChainService>>>,
 }
 
 impl SyncManager {
-    pub fn new(db: Arc<DbStore>) -> Self {
+    pub fn new(db: Arc<DbStore>, poi_policy: GlobalPoiPolicy) -> Self {
         Self {
             db,
+            poi_policy,
             chains: RwLock::new(HashMap::new()),
         }
     }
@@ -42,7 +44,8 @@ impl SyncManager {
             return Ok(Arc::clone(existing));
         }
 
-        let service = ChainService::start(Arc::clone(&self.db), cfg).await?;
+        let service =
+            ChainService::start(Arc::clone(&self.db), cfg, self.poi_policy.clone()).await?;
         self.chains.write().await.insert(key, Arc::clone(&service));
         Ok(service)
     }

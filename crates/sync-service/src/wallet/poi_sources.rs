@@ -104,6 +104,22 @@ impl LocalPoiMerkleProofSource {
         Self { caches }
     }
 
+    pub(super) async fn available_for_lists(
+        &self,
+        chain_id: u64,
+        active_list_keys: &[FixedBytes<32>],
+    ) -> bool {
+        let caches = self.caches.read().await;
+        active_list_keys.iter().all(|list_key| {
+            caches.get(list_key).is_some_and(|cache| {
+                cache.identity().chain_type == EVM_CHAIN_TYPE
+                    && cache.identity().chain_id == chain_id
+                    && cache.identity().txid_version == DEFAULT_TXID_VERSION
+                    && cache.progress().next_event_index > 0
+            })
+        })
+    }
+
     pub(super) async fn check_commitments_available(
         &self,
         txid_version: &str,

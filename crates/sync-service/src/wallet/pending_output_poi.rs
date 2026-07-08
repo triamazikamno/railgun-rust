@@ -1010,32 +1010,50 @@ pub(super) struct PendingOutputPoiVerificationOutcome {
 
 #[cfg(test)]
 pub(super) async fn verify_submitted_pending_output_pois_with_config(
+    public_data_plane: &ChainPublicDataPlane,
+    poi_runtime: &WalletPoiRuntime,
     remote_client: &PoiRpcClient,
     cfg: &WalletConfig,
     db: &DbStore,
     active_list_keys: &[FixedBytes<32>],
 ) -> PendingOutputPoiVerificationOutcome {
-    match &cfg.poi_read_source {
-        PoiReadSource::IndexedArtifacts(_) => {
-            let local_caches = cfg.local_poi_caches.as_ref().cloned().unwrap_or_else(|| {
-                warn!(
-                    cache_key = %cfg.cache_key,
-                    chain_id = cfg.chain.chain_id,
-                    "artifact POI read source missing local cache handle"
-                );
-                Arc::new(RwLock::new(BTreeMap::new()))
-            });
-            let reader = LocalPoiStatusReader::new(local_caches);
-            verify_submitted_pending_output_pois(
-                &reader,
-                db,
-                cfg.chain.chain_id,
-                &cfg.cache_key,
-                active_list_keys,
-            )
-            .await
+    match poi_runtime {
+        WalletPoiRuntime::IndexedArtifacts { .. } => {
+            let corpus = public_data_plane
+                .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id))
+                .await
+                .ok();
+            if let Some(corpus) = corpus
+                && public_data_plane
+                    .poi_corpus_ready_for_lists(
+                        PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id),
+                        active_list_keys,
+                    )
+                    .await
+            {
+                let reader = LocalPoiStatusReader::new(corpus.local_caches());
+                verify_submitted_pending_output_pois(
+                    &reader,
+                    db,
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    active_list_keys,
+                )
+                .await
+            } else if poi_runtime.wallet_read_fallback_enabled() {
+                verify_submitted_pending_output_pois(
+                    remote_client,
+                    db,
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    active_list_keys,
+                )
+                .await
+            } else {
+                PendingOutputPoiVerificationOutcome::default()
+            }
         }
-        PoiReadSource::PoiProxy => {
+        WalletPoiRuntime::PoiProxy { .. } => {
             verify_submitted_pending_output_pois(
                 remote_client,
                 db,
@@ -1050,6 +1068,8 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config(
 
 pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
     authority: &WalletPrivateMutationAuthority<'_>,
+    public_data_plane: &ChainPublicDataPlane,
+    poi_runtime: &WalletPoiRuntime,
     remote_client: &PoiRpcClient,
     cfg: &WalletConfig,
     db: &DbStore,
@@ -1063,32 +1083,54 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
             return PendingOutputPoiVerificationOutcome::default();
         }
     };
-    let outcome = match &cfg.poi_read_source {
-        PoiReadSource::IndexedArtifacts(_) => {
-            if !local_poi_caches_available_for_lists(cfg, active_list_keys).await {
-                warn!(
-                    cache_key = %cfg.cache_key,
-                    chain_id = cfg.chain.chain_id,
-                    "artifact POI local cache unavailable; skipping submitted pending output POI verification"
-                );
-                return PendingOutputPoiVerificationOutcome::default();
+    let outcome = match poi_runtime {
+        WalletPoiRuntime::IndexedArtifacts { .. } => {
+            let key = PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id);
+            if !public_data_plane
+                .poi_corpus_ready_for_lists(key.clone(), active_list_keys)
+                .await
+            {
+                if poi_runtime.wallet_read_fallback_enabled() {
+                    verify_submitted_pending_output_pois_inner(
+                        authority,
+                        &permit,
+                        remote_client,
+                        db,
+                        cfg,
+                        cache_store,
+                        active_list_keys,
+                    )
+                    .await
+                } else {
+                    warn!(
+                        cache_key = %cfg.cache_key,
+                        chain_id = cfg.chain.chain_id,
+                        "artifact POI local cache unavailable; skipping submitted pending output POI verification"
+                    );
+                    PendingOutputPoiVerificationOutcome::default()
+                }
+            } else {
+                let corpus = match public_data_plane.ensure_poi_corpus(key).await {
+                    Ok(corpus) => corpus,
+                    Err(err) => {
+                        warn!(?err, cache_key = %cfg.cache_key, "artifact POI corpus unavailable");
+                        return PendingOutputPoiVerificationOutcome::default();
+                    }
+                };
+                let reader = LocalPoiStatusReader::new(corpus.local_caches());
+                verify_submitted_pending_output_pois_inner(
+                    authority,
+                    &permit,
+                    &reader,
+                    db,
+                    cfg,
+                    cache_store,
+                    active_list_keys,
+                )
+                .await
             }
-            let Some(local_caches) = cfg.local_poi_caches.as_ref().cloned() else {
-                return PendingOutputPoiVerificationOutcome::default();
-            };
-            let reader = LocalPoiStatusReader::new(local_caches);
-            verify_submitted_pending_output_pois_inner(
-                authority,
-                &permit,
-                &reader,
-                db,
-                cfg,
-                cache_store,
-                active_list_keys,
-            )
-            .await
         }
-        PoiReadSource::PoiProxy => {
+        WalletPoiRuntime::PoiProxy { .. } => {
             verify_submitted_pending_output_pois_inner(
                 authority,
                 &permit,

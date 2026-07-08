@@ -285,47 +285,33 @@ impl ChainService {
             }
             let replay_from =
                 wallet_backfill_from_block(reset_result.committed_to(), registration.start_block);
-            let token = registration.handle.mint_sync_token(reset_generation);
-            let target_result = super::service::send_wallet_target(
-                cache_key,
-                &registration.backfill_sender,
-                sync_target,
-                token,
-            )
-            .await;
-            debug!(?target_result, cache_key = %cache_key, "wallet reorg target update result");
-            if matches!(target_result, WalletBackfillFinishResult::Ready { .. }) {
-                continue;
-            }
-            let Some(accepted_job) = target_result.accepted_job() else {
-                super::service::send_wallet_job_retired(
+            let target_result = registration
+                .handle
+                .start_backfill(
                     cache_key,
                     &registration.backfill_sender,
-                    token,
+                    reset_generation,
+                    sync_target,
                 )
                 .await;
-                continue;
+            debug!(?target_result, cache_key = %cache_key, "wallet reorg target update result");
+            let lease = match target_result {
+                WalletBackfillFinishResult::Ready { .. } => continue,
+                WalletBackfillFinishResult::Accepted { lease, .. } => lease,
+                WalletBackfillFinishResult::Rejected { .. } => continue,
             };
-            let lease = WalletBackfillLease::for_actor_accepted_job(
-                accepted_job,
-                registration.backfill_sender.clone(),
-            );
             if let Err(err) = self.backfill_tx.try_send(BackfillRequest::add(
                 cache_key.clone(),
                 replay_from,
                 sync_target,
                 registration.sync_to_block.is_none(),
                 replay_from,
-                lease,
+                lease.clone(),
             )) {
                 warn!(?err, cache_key = %cache_key, "failed to enqueue wallet backfill");
-                super::service::send_wallet_job_failed(
-                    cache_key,
-                    &registration.backfill_sender,
-                    token,
-                    WalletReadinessError::BackfillUnavailable,
-                )
-                .await;
+                lease
+                    .fail(cache_key, WalletReadinessError::BackfillUnavailable)
+                    .await;
             }
         }
     }

@@ -41,11 +41,62 @@ pub(crate) fn wallet_poi_status_client(
     })
 }
 
+pub(crate) enum WalletPoiRuntime {
+    IndexedArtifacts {
+        client: PoiRpcClient,
+        wallet_read_fallback: PoiProxyFallback,
+    },
+    PoiProxy {
+        client: PoiRpcClient,
+    },
+}
+
+impl WalletPoiRuntime {
+    pub(crate) fn from_policy(
+        policy: &GlobalPoiPolicy,
+        http_client: Option<&reqwest::Client>,
+    ) -> Self {
+        let client = wallet_poi_status_client(policy.rpc_url(), http_client)
+            .expect("POI RPC client construction is infallible");
+        match policy {
+            GlobalPoiPolicy::IndexedArtifacts {
+                wallet_read_fallback,
+                ..
+            } => Self::IndexedArtifacts {
+                client,
+                wallet_read_fallback: *wallet_read_fallback,
+            },
+            GlobalPoiPolicy::PoiProxy { .. } => Self::PoiProxy { client },
+        }
+    }
+
+    pub(crate) const fn client(&self) -> &PoiRpcClient {
+        match self {
+            Self::IndexedArtifacts { client, .. } | Self::PoiProxy { client } => client,
+        }
+    }
+
+    pub(crate) const fn is_indexed_artifacts(&self) -> bool {
+        matches!(self, Self::IndexedArtifacts { .. })
+    }
+
+    pub(crate) const fn wallet_read_fallback_enabled(&self) -> bool {
+        matches!(
+            self,
+            Self::IndexedArtifacts {
+                wallet_read_fallback: PoiProxyFallback::OnCorpusUnavailable,
+                ..
+            }
+        )
+    }
+}
+
 pub(crate) struct WalletWorkerServices {
     pub db: Arc<DbStore>,
     pub rpcs: Arc<QueryRpcPool>,
     pub http_client: Option<reqwest::Client>,
     pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
+    pub poi_runtime: WalletPoiRuntime,
     pub forest: Arc<RwLock<MerkleForest>>,
     pub backfill_tx: mpsc::Sender<crate::types::BackfillRequest>,
     pub backfill_sender: mpsc::Sender<BackfillEvent>,
@@ -214,9 +265,11 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) db: &'a DbStore,
     pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
+    pub(super) public_data_plane: &'a ChainPublicDataPlane,
     pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
     pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
+    pub(super) poi_runtime: &'a WalletPoiRuntime,
     pub(super) forest: &'a Arc<RwLock<MerkleForest>>,
     pub(super) utxos: &'a Arc<RwLock<Vec<WalletUtxo>>>,
     pub(super) client: &'a PoiRpcClient,
@@ -224,71 +277,91 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) force_retry: bool,
 }
 
-pub(super) async fn recover_missing_output_pois_from_wallet(
-    run: OutputPoiRecoveryRun<'_>,
-) -> usize {
-    if run.cfg.spending_public_key.is_none() || run.cfg.poi_recovery_prover.is_none() {
-        return 0;
-    }
-    let permit = match run.authority.acquire().await {
-        Ok(permit) => permit,
-        Err(reason) => {
-            debug!(?reason, cache_key = %run.cfg.cache_key, "output POI recovery skipped");
+impl OutputPoiRecoveryRun<'_> {
+    pub(super) async fn recover_missing(self) -> usize {
+        if self.cfg.spending_public_key.is_none() || self.cfg.poi_recovery_prover.is_none() {
             return 0;
         }
-    };
-    let snapshot = run.utxos.read().await.clone();
-    mark_valid_output_poi_recoveries(
-        &permit,
-        run.db,
-        run.cache_store,
-        run.cfg,
-        &snapshot,
-        run.active_list_keys,
-    )
-    .await;
-    if output_poi_recovery_candidates(&snapshot, run.active_list_keys).is_empty() {
-        return 0;
-    }
-    let forest = run.forest.read().await.clone();
-    let local_proof_source = match &run.cfg.poi_read_source {
-        PoiReadSource::IndexedArtifacts(_) => {
-            if !local_poi_caches_available_for_lists(run.cfg, run.active_list_keys).await {
-                log_local_poi_cache_unavailable(run.cfg, "output_poi_recovery");
+        let permit = match self.authority.acquire().await {
+            Ok(permit) => permit,
+            Err(reason) => {
+                debug!(?reason, cache_key = %self.cfg.cache_key, "output POI recovery skipped");
                 return 0;
             }
-            let Some(local_caches) = run.cfg.local_poi_caches.as_ref().cloned() else {
-                return 0;
-            };
-            Some(LocalPoiMerkleProofSource::new(local_caches))
+        };
+        let snapshot = self.utxos.read().await.clone();
+        mark_valid_output_poi_recoveries(
+            &permit,
+            self.db,
+            self.cache_store,
+            self.cfg,
+            &snapshot,
+            self.active_list_keys,
+        )
+        .await;
+        if output_poi_recovery_candidates(&snapshot, self.active_list_keys).is_empty() {
+            return 0;
         }
-        PoiReadSource::PoiProxy => None,
-    };
-    let proof_source: &(dyn PoiMerkleProofSource + '_);
-    if let Some(source) = local_proof_source.as_ref() {
-        proof_source = source;
-    } else {
-        proof_source = run.client;
+        let forest = self.forest.read().await.clone();
+        let local_proof_source = match self.poi_runtime {
+            WalletPoiRuntime::IndexedArtifacts { .. } => {
+                let corpus = self
+                    .public_data_plane
+                    .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id))
+                    .await
+                    .ok();
+                match corpus {
+                    Some(corpus) => {
+                        let local_caches = corpus.local_caches();
+                        let source = LocalPoiMerkleProofSource::new(local_caches);
+                        if source
+                            .available_for_lists(self.cfg.chain.chain_id, self.active_list_keys)
+                            .await
+                        {
+                            Some(source)
+                        } else if self.poi_runtime.wallet_read_fallback_enabled() {
+                            None
+                        } else {
+                            log_local_poi_cache_unavailable(self.cfg, "output_poi_recovery");
+                            return 0;
+                        }
+                    }
+                    None if self.poi_runtime.wallet_read_fallback_enabled() => None,
+                    None => {
+                        log_local_poi_cache_unavailable(self.cfg, "output_poi_recovery");
+                        return 0;
+                    }
+                }
+            }
+            WalletPoiRuntime::PoiProxy { .. } => None,
+        };
+        let proof_source: &(dyn PoiMerkleProofSource + '_);
+        if let Some(source) = local_proof_source.as_ref() {
+            proof_source = source;
+        } else {
+            proof_source = self.client;
+        }
+        let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
+            authority: self.authority,
+            permit: &permit,
+            db: self.db,
+            cache_store: self.cache_store,
+            cfg: self.cfg,
+            public_data_plane: self.public_data_plane,
+            rpcs: self.rpcs,
+            http_client: self.http_client,
+            indexed_artifact_source: self.indexed_artifact_source,
+            forest: &forest,
+            poi_client: self.client,
+            proof_source,
+            local_proof_source: local_proof_source.as_ref(),
+            submitter: self.client,
+            active_list_keys: self.active_list_keys,
+            wallet_utxos: &snapshot,
+            force_retry: self.force_retry,
+        })
+        .await;
+        drop(permit);
+        recovered
     }
-    let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
-        authority: run.authority,
-        permit: &permit,
-        db: run.db,
-        cache_store: run.cache_store,
-        cfg: run.cfg,
-        rpcs: run.rpcs,
-        http_client: run.http_client,
-        indexed_artifact_source: run.indexed_artifact_source,
-        forest: &forest,
-        poi_client: run.client,
-        proof_source,
-        local_proof_source: local_proof_source.as_ref(),
-        submitter: run.client,
-        active_list_keys: run.active_list_keys,
-        wallet_utxos: &snapshot,
-        force_retry: run.force_retry,
-    })
-    .await;
-    drop(permit);
-    recovered
 }

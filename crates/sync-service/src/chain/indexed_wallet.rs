@@ -1,7 +1,5 @@
 use super::*;
 
-use crate::chain::service::{send_wallet_job_retired, send_wallet_scan_apply, send_wallet_target};
-
 use std::time::SystemTime;
 
 use alloy::primitives::{FixedBytes as AlloyFixedBytes, U256};
@@ -1395,43 +1393,78 @@ pub(super) async fn send_wallet_startup_events(
     sender: &mpsc::Sender<BackfillEvent>,
     handle: &WalletHandle,
 ) -> bool {
-    let token = handle.mint_sync_token(reset_generation);
     let target_block =
         done_block.unwrap_or_else(|| applies.last().map_or(0, |apply| apply.to_block));
-    if target_block > 0 {
-        let target_result = send_wallet_target(cache_key, sender, target_block, token).await;
-        if matches!(target_result, WalletBackfillFinishResult::Ready { .. }) {
-            return true;
+    let lease = if target_block > 0 {
+        match handle
+            .start_backfill(cache_key, sender, reset_generation, target_block)
+            .await
+        {
+            WalletBackfillFinishResult::Ready { .. } => return true,
+            WalletBackfillFinishResult::Accepted { lease, .. } => Some(lease),
+            WalletBackfillFinishResult::Rejected { .. } => return false,
         }
-        if !matches!(target_result, WalletBackfillFinishResult::Accepted { .. }) {
-            send_wallet_job_retired(cache_key, sender, token).await;
-            return false;
-        }
-    }
+    } else {
+        None
+    };
     for apply in applies {
-        let result = send_wallet_scan_apply(cache_key, sender, apply, token).await;
+        let result = if let Some(lease) = lease.as_ref() {
+            lease.apply(cache_key, apply).await
+        } else {
+            let target_block = apply.to_block;
+            match handle
+                .start_backfill(cache_key, sender, reset_generation, target_block)
+                .await
+            {
+                WalletBackfillFinishResult::Ready { committed_to } => {
+                    WalletBackfillApplyResult::AlreadyCovered { committed_to }
+                }
+                WalletBackfillFinishResult::Accepted { lease, .. } => {
+                    let result = lease.apply(cache_key, apply).await;
+                    lease.retire(cache_key).await;
+                    result
+                }
+                WalletBackfillFinishResult::Rejected {
+                    committed_to,
+                    reason,
+                } => WalletBackfillApplyResult::Rejected {
+                    committed_to,
+                    reason,
+                },
+            }
+        };
         match result {
             WalletBackfillApplyResult::Committed { .. }
             | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
             WalletBackfillApplyResult::Rejected { reason, .. } => {
                 debug!(?reason, cache_key, "wallet startup scan batch rejected");
-                send_wallet_job_retired(cache_key, sender, token).await;
+                if let Some(lease) = lease.as_ref() {
+                    lease.retire(cache_key).await;
+                }
                 return false;
             }
         }
     }
     if let Some(last_block) = done_block
         && !matches!(
-            send_wallet_target(cache_key, sender, last_block, token).await,
+            lease
+                .as_ref()
+                .expect("startup done block has an accepted lease")
+                .finish(cache_key, last_block)
+                .await,
             WalletBackfillFinishResult::Ready { .. }
         )
     {
         debug!(cache_key, last_block, "wallet startup finish rejected");
-        send_wallet_job_retired(cache_key, sender, token).await;
+        if let Some(lease) = lease.as_ref() {
+            lease.retire(cache_key).await;
+        }
         return false;
     }
     if done_block.is_none() && target_block > 0 {
-        send_wallet_job_retired(cache_key, sender, token).await;
+        if let Some(lease) = lease.as_ref() {
+            lease.retire(cache_key).await;
+        }
     }
     true
 }

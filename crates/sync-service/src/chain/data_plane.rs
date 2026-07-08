@@ -1,20 +1,31 @@
 use super::*;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::{FixedBytes, U256};
 use local_db::{BlobMeta, DbStore};
+use merkletree::tree::MerkleProof;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::indexed_artifacts::{
     IndexedArtifactDescriptor, IndexedArtifactRangeKind, IndexedDatasetKind,
     VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
 };
 use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
-use crate::txid_cache::reset_txid_public_cache;
+use crate::poi_cache::PoiCacheService;
+use crate::txid_cache::{
+    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
+    reset_txid_public_cache, txid_public_proof_for_recovered_output,
+    txid_public_proof_for_recovered_output_at_index,
+};
+use crate::types::{IndexedArtifactSourceConfig, LocalPoiCaches};
 
 const PUBLIC_DATA_PLANE_DIAGNOSTIC_LIMIT: usize = 128;
 const WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND: &str = "wallet_scan_artifact_chunks";
@@ -89,6 +100,112 @@ pub struct PublicScanRows {
     pub to_block_hash: Option<[u8; 32]>,
     pub rows: WalletScanInputRows,
     pub epoch: PublicDataPlaneEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PublicPoiCorpusKey {
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: String,
+}
+
+impl PublicPoiCorpusKey {
+    pub(crate) fn new(chain_type: u8, chain_id: u64, txid_version: impl Into<String>) -> Self {
+        Self {
+            chain_type,
+            chain_id,
+            txid_version: txid_version.into(),
+        }
+    }
+
+    pub(crate) fn wallet_default(chain_id: u64) -> Self {
+        Self::new(EVM_CHAIN_TYPE, chain_id, DEFAULT_TXID_VERSION)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PublicPoiCorpusHandle {
+    local_caches: LocalPoiCaches,
+}
+
+impl PublicPoiCorpusHandle {
+    #[must_use]
+    pub(crate) fn local_caches(&self) -> LocalPoiCaches {
+        self.local_caches.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicTxidCacheKey {
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: String,
+}
+
+impl PublicTxidCacheKey {
+    pub(crate) fn new(chain_type: u8, chain_id: u64, txid_version: impl Into<String>) -> Self {
+        Self {
+            chain_type,
+            chain_id,
+            txid_version: txid_version.into(),
+        }
+    }
+
+    fn as_cache_key(&self) -> TxidPublicCacheKey<'_> {
+        TxidPublicCacheKey {
+            chain_type: self.chain_type,
+            chain_id: self.chain_id,
+            txid_version: &self.txid_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicTxidLatestValidated {
+    pub txid_index: u64,
+    pub merkleroot: Option<FixedBytes<32>>,
+}
+
+impl From<TxidPublicLatestValidated> for PublicTxidLatestValidated {
+    fn from(latest: TxidPublicLatestValidated) -> Self {
+        Self {
+            txid_index: latest.txid_index,
+            merkleroot: latest.merkleroot,
+        }
+    }
+}
+
+impl From<PublicTxidLatestValidated> for TxidPublicLatestValidated {
+    fn from(latest: PublicTxidLatestValidated) -> Self {
+        Self {
+            txid_index: latest.txid_index,
+            merkleroot: latest.merkleroot,
+        }
+    }
+}
+
+pub(crate) struct PublicTxidSyncRequest<'a> {
+    pub key: PublicTxidCacheKey,
+    pub endpoint: Option<&'a Url>,
+    pub http_client: Option<&'a reqwest::Client>,
+    pub railgun_contract: &'a str,
+    pub latest: PublicTxidLatestValidated,
+    pub indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
+}
+
+pub(crate) struct PublicTxidProofRequest {
+    pub key: PublicTxidCacheKey,
+    pub target_txid_index: Option<u64>,
+    pub expected_leaf_hash: U256,
+    pub output_start_global: u128,
+    pub latest: PublicTxidLatestValidated,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PublicTxidProof {
+    pub target_txid_index: u64,
+    pub root_txid_index: u64,
+    pub proof: MerkleProof,
 }
 
 #[derive(Clone)]
@@ -235,6 +352,8 @@ pub enum PublicDataPlaneError {
     StaleEpoch { expected: u64, actual: u64 },
     #[error("public cache reset failed: {reason}")]
     PublicCacheReset { reason: String },
+    #[error("POI corpus is unavailable for chain {chain_id} and txid version {txid_version}")]
+    PoiCorpusUnavailable { chain_id: u64, txid_version: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +516,7 @@ impl PublicCoverageStore {
 struct ChainPublicDataPlaneState {
     coverage: PublicCoverageStore,
     diagnostics: Vec<PublicDataPlaneDiagnostic>,
+    poi_corpora: BTreeMap<PublicPoiCorpusKey, LocalPoiCaches>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,12 +558,13 @@ impl ChainPublicDataPlaneState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ChainPublicDataPlane {
     db: Arc<DbStore>,
     epoch: Arc<AtomicU64>,
     state: Arc<Mutex<ChainPublicDataPlaneState>>,
     commit_fence: Arc<Mutex<()>>,
+    poi_cache_service: Option<Arc<PoiCacheService>>,
 }
 
 impl ChainPublicDataPlane {
@@ -454,6 +575,19 @@ impl ChainPublicDataPlane {
             epoch,
             state: Arc::new(Mutex::new(ChainPublicDataPlaneState::default())),
             commit_fence: Arc::new(Mutex::new(())),
+            poi_cache_service: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_poi_cache_service(mut self, service: Arc<PoiCacheService>) -> Self {
+        self.poi_cache_service = Some(service);
+        self
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if let Some(service) = self.poi_cache_service.as_ref() {
+            service.shutdown();
         }
     }
 
@@ -537,12 +671,20 @@ impl ChainPublicDataPlane {
         let wallet_scan_chunk_reset = self
             .reset_wallet_scan_artifact_chunk_cache()
             .map_err(|reason| PublicDataPlaneError::PublicCacheReset { reason })?;
-        let poi_cache_entries_removed =
+        let poi_cache_entries_removed = if let Some(service) = self.poi_cache_service.as_ref() {
+            service.reset_poi_artifact_cache().await.map_err(|err| {
+                PublicDataPlaneError::PublicCacheReset {
+                    reason: err.to_string(),
+                }
+            })?
+        } else {
+            self.clear_in_memory_poi_corpora().await;
             clear_poi_artifact_cache_for_reset(&self.db).map_err(|err| {
                 PublicDataPlaneError::PublicCacheReset {
                     reason: err.to_string(),
                 }
-            })?;
+            })?
+        };
         Ok(PublicSyncCacheReset {
             previous_epoch,
             new_epoch,
@@ -554,6 +696,128 @@ impl ChainPublicDataPlane {
             txid_blob_entries_removed: txid_reset.blob_entries_removed,
             txid_files_removed: txid_reset.files_removed,
             poi_cache_entries_removed,
+        })
+    }
+
+    pub(crate) async fn ensure_poi_corpus(
+        &self,
+        key: PublicPoiCorpusKey,
+    ) -> Result<PublicPoiCorpusHandle, PublicDataPlaneError> {
+        if let Some(existing) = self.state.lock().await.poi_corpora.get(&key).cloned() {
+            return Ok(PublicPoiCorpusHandle {
+                local_caches: existing,
+            });
+        }
+        let Some(service) = self.poi_cache_service.as_ref() else {
+            return Err(PublicDataPlaneError::PoiCorpusUnavailable {
+                chain_id: key.chain_id,
+                txid_version: key.txid_version,
+            });
+        };
+        let local_caches = service.start_chain(key.chain_id).await;
+        let mut state = self.state.lock().await;
+        let local_caches = state
+            .poi_corpora
+            .entry(key)
+            .or_insert_with(|| local_caches.clone())
+            .clone();
+        Ok(PublicPoiCorpusHandle { local_caches })
+    }
+
+    pub(crate) async fn poi_corpus_ready_for_lists(
+        &self,
+        key: PublicPoiCorpusKey,
+        active_list_keys: &[FixedBytes<32>],
+    ) -> bool {
+        if active_list_keys.is_empty() {
+            return true;
+        }
+        let Ok(corpus) = self.ensure_poi_corpus(key.clone()).await else {
+            return false;
+        };
+        let local_caches = corpus.local_caches();
+        let caches = local_caches.read().await;
+        active_list_keys.iter().all(|list_key| {
+            caches.get(list_key).is_some_and(|cache| {
+                cache.identity().chain_type == key.chain_type
+                    && cache.identity().chain_id == key.chain_id
+                    && cache.identity().txid_version == key.txid_version
+                    && (cache.progress().next_event_index > 0
+                        || cache.progress().next_leaf_index > 0)
+            })
+        })
+    }
+
+    async fn clear_in_memory_poi_corpora(&self) {
+        let corpora = self
+            .state
+            .lock()
+            .await
+            .poi_corpora
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for corpus in corpora {
+            corpus.write().await.clear();
+        }
+    }
+
+    pub(crate) fn cached_txid_latest_validated(
+        &self,
+        key: &PublicTxidCacheKey,
+    ) -> Result<Option<PublicTxidLatestValidated>, TxidPublicCacheError> {
+        let cache = TxidPublicCache::new(self.db.as_ref(), key.as_cache_key());
+        cache
+            .cached_latest_validated()
+            .map(|latest| latest.map(Into::into))
+    }
+
+    pub(crate) async fn sync_txid_public_cache(
+        &self,
+        request: PublicTxidSyncRequest<'_>,
+    ) -> Result<(), TxidPublicCacheError> {
+        let cache = TxidPublicCache::new(self.db.as_ref(), request.key.as_cache_key());
+        cache
+            .sync_with_artifact_source(
+                request.endpoint,
+                request.http_client,
+                request.railgun_contract,
+                request.latest.into(),
+                request.indexed_artifact_source,
+            )
+            .await
+    }
+
+    pub(crate) fn txid_public_proof(
+        &self,
+        request: PublicTxidProofRequest,
+    ) -> Result<PublicTxidProof, TxidPublicCacheError> {
+        let key = request.key.as_cache_key();
+        let latest = request.latest;
+        let proof = if let Some(target_txid_index) = request.target_txid_index {
+            txid_public_proof_for_recovered_output_at_index(
+                self.db.as_ref(),
+                key,
+                target_txid_index,
+                request.expected_leaf_hash,
+                request.output_start_global,
+                latest.txid_index,
+                latest.merkleroot,
+            )
+        } else {
+            txid_public_proof_for_recovered_output(
+                self.db.as_ref(),
+                key,
+                request.expected_leaf_hash,
+                request.output_start_global,
+                latest.txid_index,
+                latest.merkleroot,
+            )
+        }?;
+        Ok(PublicTxidProof {
+            target_txid_index: proof.target_txid_index,
+            root_txid_index: proof.root_txid_index,
+            proof: proof.proof,
         })
     }
 
@@ -1043,9 +1307,98 @@ mod tests {
         ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
         INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION, IndexedArtifactRange,
     };
+    use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
     use alloy::primitives::Address;
     use local_db::{BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord};
+    use poi::cache::{PoiCache, PoiCacheIdentity};
+    use poi::poi::PoiEventType;
     use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn poi_corpus_registry_reuses_chain_scoped_handle() {
+        let (data_plane, root_dir) = test_data_plane_with_poi_service("poi-corpus-reuse");
+        let key = PublicPoiCorpusKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION);
+        let first = data_plane
+            .ensure_poi_corpus(key.clone())
+            .await
+            .expect("first POI corpus");
+
+        let second = data_plane
+            .ensure_poi_corpus(key.clone())
+            .await
+            .expect("second POI corpus");
+        assert!(Arc::ptr_eq(&first.local_caches(), &second.local_caches()));
+        assert_eq!(data_plane.state.lock().await.poi_corpora.len(), 1);
+        let list_key = FixedBytes::from([0x11; 32]);
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            key.chain_type,
+            key.chain_id,
+            &key.txid_version,
+            list_key,
+        ));
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x22; 32],
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply POI event");
+        first.local_caches().write().await.insert(list_key, cache);
+        assert!(
+            data_plane
+                .poi_corpus_ready_for_lists(key.clone(), &[list_key])
+                .await
+        );
+        data_plane
+            .reset_public_cache()
+            .await
+            .expect("reset public cache");
+        assert!(
+            !data_plane
+                .poi_corpus_ready_for_lists(key, &[list_key])
+                .await
+        );
+        drop(data_plane);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn poi_corpus_requires_chain_owned_service() {
+        let (data_plane, root_dir) = test_data_plane("poi-corpus-no-service");
+        let key = PublicPoiCorpusKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION);
+
+        let error = match data_plane.ensure_poi_corpus(key).await {
+            Ok(_) => panic!("POI corpus should require a chain-owned service"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            PublicDataPlaneError::PoiCorpusUnavailable {
+                chain_id: 1,
+                txid_version: DEFAULT_TXID_VERSION.to_string(),
+            }
+        );
+        drop(data_plane);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn txid_latest_marker_read_is_data_plane_operation() {
+        let (data_plane, root_dir) = test_data_plane("txid-latest-empty");
+        let key = PublicTxidCacheKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION);
+
+        assert_eq!(
+            data_plane
+                .cached_txid_latest_validated(&key)
+                .expect("read empty TXID public cache"),
+            None
+        );
+
+        drop(data_plane);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
 
     #[tokio::test]
     async fn public_scan_coverage_rejects_stale_epoch_write() {
@@ -1677,6 +2030,26 @@ mod tests {
     fn test_data_plane(name: &str) -> (ChainPublicDataPlane, PathBuf) {
         let (db, root_dir) = test_db(name);
         let data_plane = ChainPublicDataPlane::new(db, Arc::new(AtomicU64::new(0)));
+        (data_plane, root_dir)
+    }
+
+    fn test_data_plane_with_poi_service(name: &str) -> (ChainPublicDataPlane, PathBuf) {
+        let (db, root_dir) = test_db(name);
+        let poi_cache_service = PoiCacheService::new(
+            Arc::clone(&db),
+            PoiArtifactSourceConfig {
+                trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+                manifest_source: PoiArtifactManifestSource::Url(
+                    Url::parse("http://127.0.0.1:1/poi-manifest.json").expect("POI manifest URL"),
+                ),
+                gateway_urls: Vec::new(),
+                max_manifest_age: None,
+            },
+            None,
+        )
+        .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("POI RPC URL"));
+        let data_plane = ChainPublicDataPlane::new(db, Arc::new(AtomicU64::new(0)))
+            .with_poi_cache_service(Arc::new(poi_cache_service));
         (data_plane, root_dir)
     }
 

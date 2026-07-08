@@ -7,7 +7,7 @@ pub(in crate::wallet) struct RecoveredOutputTxidData {
 }
 
 pub(in crate::wallet) struct PublicCacheTxidRecoveryRequest<'a> {
-    pub(in crate::wallet) db: &'a DbStore,
+    pub(in crate::wallet) public_data_plane: &'a ChainPublicDataPlane,
     pub(in crate::wallet) cfg: &'a WalletConfig,
     pub(in crate::wallet) poi_client: &'a PoiRpcClient,
     pub(in crate::wallet) http_client: Option<&'a reqwest::Client>,
@@ -22,7 +22,7 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
     request: PublicCacheTxidRecoveryRequest<'_>,
 ) -> Result<RecoveredOutputTxidData, RecoveryFailure> {
     let PublicCacheTxidRecoveryRequest {
-        db,
+        public_data_plane,
         cfg,
         poi_client,
         http_client,
@@ -40,21 +40,15 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
-    let cache_key = TxidPublicCacheKey {
-        chain_type: EVM_CHAIN_TYPE,
-        chain_id: cfg.chain.chain_id,
-        txid_version: DEFAULT_TXID_VERSION,
-    };
-    let cache = TxidPublicCache::new(db, cache_key);
+    let cache_key =
+        PublicTxidCacheKey::new(EVM_CHAIN_TYPE, cfg.chain.chain_id, DEFAULT_TXID_VERSION);
     let latest_validated_started = Instant::now();
     let required_txid_index = recovery_chunk.target_txid_index.unwrap_or(0);
-    let (latest_validated_index, latest_validated_root, latest_validated_source) = match cache
-        .cached_latest_validated()
+    let (latest_validated, latest_validated_source) = match public_data_plane
+        .cached_txid_latest_validated(&cache_key)
         .map_err(txid_public_cache_failure)?
     {
-        Some(latest) if latest.txid_index >= required_txid_index => {
-            (latest.txid_index, latest.merkleroot, "cache")
-        }
+        Some(latest) if latest.txid_index >= required_txid_index => (latest, "cache"),
         _ => {
             let latest_validated = poi_client
                 .latest_validated_railgun_txid(
@@ -70,27 +64,25 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
                         OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                     )
                 })?;
-            let latest = TxidPublicLatestValidated {
+            let latest = PublicTxidLatestValidated {
                 txid_index: latest_validated_txid_index(&latest_validated)?,
                 merkleroot: latest_validated_txid_root(&latest_validated)?,
             };
-            (latest.txid_index, latest.merkleroot, "rpc")
+            (latest, "rpc")
         }
     };
     let latest_validated_elapsed_ms = latest_validated_started.elapsed().as_millis();
     let cache_sync_started = Instant::now();
     let railgun_contract = cfg.chain.contract.to_string();
-    cache
-        .sync_with_artifact_source(
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: cache_key.clone(),
             endpoint,
             http_client,
-            &railgun_contract,
-            TxidPublicLatestValidated {
-                txid_index: latest_validated_index,
-                merkleroot: latest_validated_root,
-            },
+            railgun_contract: &railgun_contract,
+            latest: latest_validated,
             indexed_artifact_source,
-        )
+        })
         .await
         .map_err(txid_public_cache_failure)?;
     let cache_sync_elapsed_ms = cache_sync_started.elapsed().as_millis();
@@ -101,27 +93,15 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         U256::from(recovery_chunk.output_start_global),
     );
     let proof_started = Instant::now();
-    let cached = if let Some(target_txid_index) = recovery_chunk.target_txid_index {
-        txid_public_proof_for_recovered_output_at_index(
-            db,
-            cache_key,
-            target_txid_index,
-            expected_leaf,
-            recovery_chunk.output_start_global,
-            latest_validated_index,
-            latest_validated_root,
-        )
-    } else {
-        txid_public_proof_for_recovered_output(
-            db,
-            cache_key,
-            expected_leaf,
-            recovery_chunk.output_start_global,
-            latest_validated_index,
-            latest_validated_root,
-        )
-    }
-    .map_err(txid_public_cache_failure)?;
+    let cached = public_data_plane
+        .txid_public_proof(PublicTxidProofRequest {
+            key: cache_key,
+            target_txid_index: recovery_chunk.target_txid_index,
+            expected_leaf_hash: expected_leaf,
+            output_start_global: recovery_chunk.output_start_global,
+            latest: latest_validated,
+        })
+        .map_err(txid_public_cache_failure)?;
     let proof_elapsed_ms = proof_started.elapsed().as_millis();
     let target_tree = cached.target_txid_index / TREE_LEAF_COUNT;
     let target_index = cached.target_txid_index % TREE_LEAF_COUNT;

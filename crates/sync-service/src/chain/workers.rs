@@ -1,9 +1,5 @@
 use super::*;
 
-use crate::chain::service::{
-    send_wallet_job_failed, send_wallet_job_retired, send_wallet_scan_apply, send_wallet_target,
-};
-
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
 const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -318,25 +314,17 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                             "indexed wallet ready-tail fallback triggered"
                         );
                         let reset_generation = candidate.handle.reset_generation();
-                        let token = candidate.handle.mint_sync_token(reset_generation);
-                        let target_result = send_wallet_target(
+                        let target_result = candidate.handle.start_backfill(
                             &candidate.cache_key,
                             &candidate.sender,
+                            reset_generation,
                             candidate.target_block,
-                            token,
                         )
                         .await;
-                        if matches!(target_result, WalletBackfillFinishResult::Ready { .. }) {
-                            continue;
-                        }
-                        let Some(accepted_job) = target_result.accepted_job() else {
-                            send_wallet_job_retired(
-                                &candidate.cache_key,
-                                &candidate.sender,
-                                token,
-                            )
-                            .await;
-                            continue;
+                        let lease = match target_result {
+                            WalletBackfillFinishResult::Ready { .. } => continue,
+                            WalletBackfillFinishResult::Accepted { lease, .. } => lease,
+                            WalletBackfillFinishResult::Rejected { .. } => continue,
                         };
                         let Some(checkpoint) = service
                             .try_indexed_wallet_tail_catch_up(
@@ -359,10 +347,7 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                 candidate.target_block,
                                 candidate.follow_safe_head,
                                 candidate.from_block,
-                                WalletBackfillLease::for_actor_accepted_job(
-                                    accepted_job,
-                                    candidate.sender.clone(),
-                                ),
+                                lease.clone(),
                             )) {
                                 warn!(
                                     ?err,
@@ -371,13 +356,12 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                     target_block = candidate.target_block,
                                     "failed to enqueue ready-tail fallback backfill"
                                 );
-                                send_wallet_job_failed(
-                                    &candidate.cache_key,
-                                    &candidate.sender,
-                                    token,
-                                    WalletReadinessError::BackfillUnavailable,
-                                )
-                                .await;
+                                lease
+                                    .fail(
+                                        &candidate.cache_key,
+                                        WalletReadinessError::BackfillUnavailable,
+                                    )
+                                    .await;
                             }
                             continue;
                         };
@@ -388,10 +372,7 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                 candidate.target_block,
                                 candidate.follow_safe_head,
                                 candidate.from_block,
-                                WalletBackfillLease::for_actor_accepted_job(
-                                    accepted_job,
-                                    candidate.sender.clone(),
-                                ),
+                                lease.clone(),
                             )) {
                                 warn!(
                                     ?err,
@@ -400,32 +381,22 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                     target_block = candidate.target_block,
                                     "failed to enqueue ready-tail no-progress backfill"
                                 );
-                                send_wallet_job_failed(
-                                    &candidate.cache_key,
-                                    &candidate.sender,
-                                    token,
-                                    WalletReadinessError::BackfillUnavailable,
-                                )
-                                .await;
+                                lease
+                                    .fail(
+                                        &candidate.cache_key,
+                                        WalletReadinessError::BackfillUnavailable,
+                                    )
+                                    .await;
                             }
                             continue;
                         }
                         if checkpoint >= candidate.target_block {
-                            let result = send_wallet_target(
-                                &candidate.cache_key,
-                                &candidate.sender,
-                                candidate.target_block,
-                                token,
-                            )
-                            .await;
+                            let result = lease
+                                .finish(&candidate.cache_key, candidate.target_block)
+                                .await;
                             debug!(?result, cache_key = %candidate.cache_key, "ready-tail indexed wallet finish result");
                             if !matches!(result, WalletBackfillFinishResult::Ready { .. }) {
-                                send_wallet_job_retired(
-                                    &candidate.cache_key,
-                                    &candidate.sender,
-                                    token,
-                                )
-                                .await;
+                                lease.retire(&candidate.cache_key).await;
                             }
                         } else if let Err(err) = service.backfill_tx.try_send(BackfillRequest::add(
                                 candidate.cache_key.clone(),
@@ -433,10 +404,7 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                 candidate.target_block,
                                 candidate.follow_safe_head,
                                 candidate.from_block,
-                                WalletBackfillLease::for_actor_accepted_job(
-                                    accepted_job,
-                                    candidate.sender.clone(),
-                                ),
+                                lease.clone(),
                             ))
                         {
                             warn!(
@@ -446,13 +414,12 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                 target_block = candidate.target_block,
                                 "failed to enqueue ready-tail remainder backfill"
                             );
-                            send_wallet_job_failed(
-                                &candidate.cache_key,
-                                &candidate.sender,
-                                token,
-                                WalletReadinessError::BackfillUnavailable,
-                            )
-                            .await;
+                            lease
+                                .fail(
+                                    &candidate.cache_key,
+                                    WalletReadinessError::BackfillUnavailable,
+                                )
+                                .await;
                         } else {
                             debug!(
                                 cache_key = %candidate.cache_key,
@@ -813,23 +780,19 @@ pub(super) fn spawn_backfill_loop(
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in done_keys {
-                let Some((sender, target_block, token)) = cursors.get(&key).map(|cursor| {
-                    (
-                        cursor.lease.sender().clone(),
-                        cursor.target_block,
-                        cursor.lease.token(),
-                    )
-                }) else {
+                let Some((lease, target_block)) = cursors
+                    .get(&key)
+                    .map(|cursor| (cursor.lease.clone(), cursor.target_block))
+                else {
                     continue;
                 };
-                let result = send_wallet_target(&key, &sender, target_block, token).await;
+                let result = lease.finish(&key, target_block).await;
                 let remove_cursor = wallet_finish_result_removes_cursor(&result);
                 let committed_to = result.committed_to();
                 debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
                 if remove_cursor {
                     if let Some(cursor) = cursors.remove(&key) {
-                        send_wallet_job_retired(&key, cursor.lease.sender(), cursor.lease.token())
-                            .await;
+                        cursor.lease.retire(&key).await;
                     }
                 } else if let Some(cursor) = cursors.get_mut(&key) {
                     cursor.retry_after_rejected_finish(committed_to, Instant::now());
@@ -896,19 +859,13 @@ pub(super) fn spawn_backfill_loop(
                 if let Some(last_block) = completed_last_block
                     && let Some(lease) = cursors.get(&key).map(|cursor| cursor.lease.clone())
                 {
-                    let result =
-                        send_wallet_target(&key, lease.sender(), last_block, lease.token()).await;
+                    let result = lease.finish(&key, last_block).await;
                     let remove_cursor = wallet_finish_result_removes_cursor(&result);
                     let committed_to = result.committed_to();
                     debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
                     if remove_cursor {
                         if let Some(cursor) = cursors.remove(&key) {
-                            send_wallet_job_retired(
-                                &key,
-                                cursor.lease.sender(),
-                                cursor.lease.token(),
-                            )
-                            .await;
+                            cursor.lease.retire(&key).await;
                         }
                     } else if let Some(cursor) = cursors.get_mut(&key) {
                         cursor.retry_after_rejected_finish(committed_to, Instant::now());
@@ -1017,7 +974,7 @@ pub(super) fn spawn_backfill_loop(
                     let keys: Vec<String> = cursors.keys().cloned().collect();
                     let latest_safe_head = *safe_head_rx.borrow();
                     for key in keys {
-                        let Some((sender, token, apply_from_block, apply_to_block)) =
+                        let Some((lease, apply_from_block, apply_to_block)) =
                             cursors.get(&key).and_then(|cursor| {
                                 if cursor.target_block == 0
                                     || cursor.from_block > cursor.target_block
@@ -1026,12 +983,7 @@ pub(super) fn spawn_backfill_loop(
                                 }
                                 let apply_to_block = min(to_block, cursor.target_block);
                                 (cursor.from_block <= apply_to_block).then(|| {
-                                    (
-                                        cursor.lease.sender().clone(),
-                                        cursor.lease.token(),
-                                        cursor.from_block,
-                                        apply_to_block,
-                                    )
+                                    (cursor.lease.clone(), cursor.from_block, apply_to_block)
                                 })
                             })
                         else {
@@ -1068,8 +1020,7 @@ pub(super) fn spawn_backfill_loop(
                                 read_scope,
                             )
                             .await;
-                        let apply_result =
-                            send_wallet_scan_apply(&key, &sender, apply, token).await;
+                        let apply_result = lease.apply(&key, apply).await;
                         let mut remove_cursor = false;
                         let mut finish_request = None;
                         if let Some(cursor) = cursors.get_mut(&key) {
@@ -1078,11 +1029,8 @@ pub(super) fn spawn_backfill_loop(
                                     .mark_progress(committed_to.saturating_add(1), Instant::now());
                                 cursor.refresh_target(latest_safe_head);
                                 if cursor.from_block > cursor.target_block {
-                                    finish_request = Some((
-                                        cursor.lease.sender().clone(),
-                                        cursor.target_block,
-                                        cursor.lease.token(),
-                                    ));
+                                    finish_request =
+                                        Some((cursor.lease.clone(), cursor.target_block));
                                 }
                             } else {
                                 warn!(?apply_result, cache_key = %key, "wallet backfill logs rejected");
@@ -1114,9 +1062,8 @@ pub(super) fn spawn_backfill_loop(
                                 }
                             }
                         }
-                        if let Some((sender, target_block, token)) = finish_request {
-                            let result =
-                                send_wallet_target(&key, &sender, target_block, token).await;
+                        if let Some((lease, target_block)) = finish_request {
+                            let result = lease.finish(&key, target_block).await;
                             remove_cursor = wallet_finish_result_removes_cursor(&result);
                             let committed_to = result.committed_to();
                             debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
@@ -1126,12 +1073,7 @@ pub(super) fn spawn_backfill_loop(
                         }
                         if remove_cursor {
                             if let Some(cursor) = cursors.remove(&key) {
-                                send_wallet_job_retired(
-                                    &key,
-                                    cursor.lease.sender(),
-                                    cursor.lease.token(),
-                                )
-                                .await;
+                                cursor.lease.retire(&key).await;
                             }
                         }
                     }
@@ -1189,7 +1131,7 @@ async fn apply_backfill_request(
                     active_token = ?previous.lease.token(),
                     "stale wallet backfill request ignored"
                 );
-                send_wallet_job_retired(&cache_key, lease.sender(), incoming_token).await;
+                lease.retire(&cache_key).await;
                 return;
             }
 
@@ -1207,22 +1149,12 @@ async fn apply_backfill_request(
             if let Some(previous) = previous
                 && previous_token != Some(incoming_token)
             {
-                send_wallet_job_retired(
-                    &cache_key,
-                    previous.lease.sender(),
-                    previous.lease.token(),
-                )
-                .await;
+                previous.lease.retire(&cache_key).await;
             }
         }
         BackfillRequest::Remove { cache_key } => {
             if let Some(previous) = cursors.remove(&cache_key) {
-                send_wallet_job_retired(
-                    &cache_key,
-                    previous.lease.sender(),
-                    previous.lease.token(),
-                )
-                .await;
+                previous.lease.retire(&cache_key).await;
             }
         }
     }

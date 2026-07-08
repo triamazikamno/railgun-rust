@@ -6,32 +6,33 @@ use super::{
     WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL,
     WALLET_POI_RECOVERABLE_REFRESH_AFTER, WALLET_POI_STATUS_BATCH_SIZE, WalletHandle,
     WalletLiveMetadataFlush, WalletNullifierIndex, WalletPendingOverlay, WalletPendingSpent,
-    WalletPersistState, WalletPoiRefreshRequest, WalletPoiRefreshSelection,
+    WalletPersistState, WalletPoiRefreshRequest, WalletPoiRefreshSelection, WalletPoiRuntime,
     WalletPrivateMutationAuthority, WalletProgressPersist, apply_wallet_delta_to_vec,
     apply_wallet_delta_to_vec_with_outcome, build_output_poi_recovery_chunk,
     decode_railgun_transactions, discard_pending_output_poi_contexts_for_spent_outputs,
-    force_resubmit_matching_pending_output_pois, install_persisted_local_poi_caches,
-    install_tailed_poi_cache_if_current, local_poi_caches_available_for_lists, now_epoch_secs,
-    output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
+    force_resubmit_matching_pending_output_pois, install_tailed_poi_cache_if_current,
+    now_epoch_secs, output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
     output_start_global_position, pending_output_poi_context_matches_wallet_utxo,
     pending_output_poi_submit_identity, pending_overlay_from_delta,
     preflight_local_output_poi_input_proofs, process_pending_output_poi_observations,
     process_pending_output_poi_observations_authorized,
     process_pending_output_poi_observations_inner, recovered_output_txid_data_from_public_cache,
     recovery_input_merkle_tree_for_root, refresh_wallet_poi_statuses_selected, rewind_wallet_utxos,
-    spawn_startup_artifact_poi_cache_warmup, spent_source_for_utxo, sync_live_poi_event_tail,
-    sync_local_poi_caches, verify_submitted_pending_output_pois,
+    spent_source_for_utxo, sync_live_poi_event_tail, verify_submitted_pending_output_pois,
     verify_submitted_pending_output_pois_authorized,
     verify_submitted_pending_output_pois_authorized_with_projection,
     verify_submitted_pending_output_pois_with_config, wallet_poi_status_client,
-    wallet_poi_status_reader_source, wallet_poi_status_refresh_needed,
-    wallet_poi_status_refresh_needed_for_selection,
+    wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
 };
-use crate::poi_artifacts::PersistedPoiArtifactCache;
-use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey, TxidPublicLatestValidated};
+use crate::chain::{
+    ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey as DataPlanePublicTxidCacheKey,
+    PublicTxidLatestValidated as DataPlanePublicTxidLatestValidated, PublicTxidProofRequest,
+    PublicTxidSyncRequest,
+};
 use crate::types::{
-    ChainKey, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, WalletCacheStore,
-    WalletConfig, WalletPrivateCommit, WalletReadiness, WalletSyncActorStateCommit,
+    ChainKey, GlobalPoiPolicy, PoiArtifactManifestSource, PoiArtifactSourceConfig,
+    PoiProxyFallback, WalletCacheStore, WalletConfig, WalletPrivateCommit, WalletReadiness,
+    WalletSyncActorStateCommit,
 };
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
@@ -46,21 +47,17 @@ use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::notes::Note;
 use broadcaster_core::transact::{
     MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash,
+    railgun_txid_leaf_hash_with_output_start,
 };
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use local_db::{
     DbConfig, DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheRecord,
-    PoiArtifactDescriptorRecord, WalletMeta, WalletSyncActorStateRecord,
+    PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta, WalletSyncActorStateRecord,
 };
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleTreeUpdate};
-use poi::artifacts::{ArtifactDescriptor, Manifest, ManifestEntry};
 use poi::cache::{PoiCache, PoiCacheIdentity};
 use poi::error::PoiError;
-use poi::poi::{
-    BlindedCommitmentData, DEFAULT_WALLET_POI_RPC_URL, PoiEventType, PoiRpcClient,
-    SingleCommitmentProofContext,
-};
+use poi::poi::{BlindedCommitmentData, PoiEventType, PoiRpcClient, SingleCommitmentProofContext};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
 use railgun_wallet::tx::{PoiMerkleProofSource, PreTransactionPoiError};
@@ -122,12 +119,67 @@ fn wallet_config(nullifying_key: U256) -> WalletConfig {
         progress_tx: None,
         cache_store: None,
         poi_recovery_prover: None,
-        poi_rpc_url: Url::parse(DEFAULT_WALLET_POI_RPC_URL).expect("default POI RPC URL"),
-        poi_read_source: PoiReadSource::PoiProxy,
-        local_poi_caches: None,
-        manage_local_poi_cache: true,
         use_indexed_wallet_catch_up: true,
     }
+}
+
+fn test_poi_artifact_source_config() -> PoiArtifactSourceConfig {
+    PoiArtifactSourceConfig {
+        trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+        manifest_source: PoiArtifactManifestSource::Url(
+            Url::parse("http://127.0.0.1:1/poi-manifest.json").expect("POI manifest URL"),
+        ),
+        gateway_urls: Vec::new(),
+        max_manifest_age: None,
+    }
+}
+
+fn test_artifact_poi_runtime() -> WalletPoiRuntime {
+    WalletPoiRuntime::from_policy(
+        &GlobalPoiPolicy::IndexedArtifacts {
+            artifact_source: test_poi_artifact_source_config(),
+            rpc_url: Url::parse("http://127.0.0.1:1").expect("POI RPC URL"),
+            wallet_read_fallback: PoiProxyFallback::Disabled,
+        },
+        None,
+    )
+}
+
+fn test_artifact_poi_runtime_with_fallback(rpc_url: Url) -> WalletPoiRuntime {
+    WalletPoiRuntime::from_policy(
+        &GlobalPoiPolicy::IndexedArtifacts {
+            artifact_source: test_poi_artifact_source_config(),
+            rpc_url,
+            wallet_read_fallback: PoiProxyFallback::OnCorpusUnavailable,
+        },
+        None,
+    )
+}
+
+fn test_public_data_plane_with_poi_service(db: &Arc<DbStore>) -> ChainPublicDataPlane {
+    ChainPublicDataPlane::new(Arc::clone(db), Arc::new(AtomicU64::new(0))).with_poi_cache_service(
+        Arc::new(
+            crate::poi_cache::PoiCacheService::new(
+                Arc::clone(db),
+                test_poi_artifact_source_config(),
+                None,
+            )
+            .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("POI RPC URL")),
+        ),
+    )
+}
+
+async fn seed_data_plane_poi_cache(
+    public_data_plane: &ChainPublicDataPlane,
+    chain_id: u64,
+    list_key: FixedBytes<32>,
+    cache: PoiCache,
+) {
+    let corpus = public_data_plane
+        .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(chain_id))
+        .await
+        .expect("POI corpus");
+    corpus.local_caches().write().await.insert(list_key, cache);
 }
 
 fn test_wallet_utxo(position: u64) -> WalletUtxo {
@@ -160,8 +212,6 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        poi_read_source: PoiReadSource::PoiProxy,
-        local_poi_caches: None,
         pending_overlay_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,
@@ -1422,41 +1472,53 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
     .into_bytes();
     let (graph_endpoint, _graph_requests) = spawn_http_response(graph_response).await;
     let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-    let cache_key = TxidPublicCacheKey {
-        chain_type: EVM_CHAIN_TYPE,
-        chain_id: 1,
-        txid_version: DEFAULT_TXID_VERSION,
-    };
-    TxidPublicCache::new(&store, cache_key)
-        .sync(
-            &graph_endpoint,
-            None,
-            TxidPublicLatestValidated {
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane =
+        ChainPublicDataPlane::new(Arc::clone(&store), Arc::new(AtomicU64::new(0)));
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: DataPlanePublicTxidCacheKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION),
+            endpoint: Some(&graph_endpoint),
+            http_client: None,
+            railgun_contract: "0x0000000000000000000000000000000000000000",
+            latest: DataPlanePublicTxidLatestValidated {
                 txid_index: 0,
                 merkleroot: None,
             },
-        )
+            indexed_artifact_source: None,
+        })
         .await
-        .expect("seed public txid cache");
+        .expect("seed public txid cache through typed data plane");
+    let expected_leaf = railgun_txid_leaf_hash_with_output_start(
+        recovery_chunk.chunk.railgun_txid(),
+        u64::from(recovery_chunk.chunk.tree_number),
+        U256::from(recovery_chunk.output_start_global),
+    );
+    let direct_proof = public_data_plane
+        .txid_public_proof(PublicTxidProofRequest {
+            key: DataPlanePublicTxidCacheKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION),
+            target_txid_index: recovery_chunk.target_txid_index,
+            expected_leaf_hash: expected_leaf,
+            output_start_global: recovery_chunk.output_start_global,
+            latest: DataPlanePublicTxidLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+        })
+        .expect("typed data-plane TXID proof");
+    assert_eq!(direct_proof.target_txid_index, 0);
     let poi_mock = spawn_poi_rpc(serde_json::json!(false)).await;
     let poi_client = PoiRpcClient::new(poi_mock.url.clone());
     let mut cfg = wallet_config(scan_keys.nullifying_key);
     cfg.quick_sync_endpoint = Some(graph_endpoint);
-    cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-        trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
-        manifest_source: PoiArtifactManifestSource::Url(
-            Url::parse("http://127.0.0.1:1/manifest").expect("manifest URL"),
-        ),
-        gateway_urls: vec![Url::parse("http://127.0.0.1:1").expect("gateway URL")],
-        max_manifest_age: None,
-    });
 
     let failure = recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
-        db: &store,
+        public_data_plane: &public_data_plane,
         cfg: &cfg,
         poi_client: &poi_client,
         http_client: None,
@@ -1605,20 +1667,22 @@ async fn indexed_artifacts_status_refresh_does_not_call_remote_pois_per_list() {
         }])
         .expect("apply artifact event");
     cache.accept_current_roots();
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
-    let mut cfg = wallet_config(U256::ZERO);
-    cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-        trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
-        manifest_source: PoiArtifactManifestSource::Url(
-            Url::parse("http://127.0.0.1:1/manifest").expect("artifact URL"),
-        ),
-        gateway_urls: vec![Url::parse("http://127.0.0.1:1").expect("gateway URL")],
-        max_manifest_age: None,
-    });
-    cfg.local_poi_caches = Some(local_caches);
+    let cfg = wallet_config(U256::ZERO);
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    seed_data_plane_poi_cache(&public_data_plane, cfg.chain.chain_id, list_key, cache).await;
     let mock = spawn_poi_rpc(serde_json::json!({})).await;
-    let remote_client = PoiRpcClient::new(mock.url.clone());
-    let status_reader = wallet_poi_status_reader_source(&remote_client, &cfg);
+    let poi_runtime = test_artifact_poi_runtime();
+    let status_reader = poi_runtime
+        .status_reader(&public_data_plane, &cfg, &list_keys)
+        .await
+        .expect("local POI status reader");
 
     let changed = refresh_wallet_poi_statuses_selected(
         status_reader.as_reader(),
@@ -1640,301 +1704,8 @@ async fn indexed_artifacts_status_refresh_does_not_call_remote_pois_per_list() {
             .is_err(),
         "remote ppoi_pois_per_list should not be called"
     );
-}
-
-#[tokio::test]
-async fn indexed_artifacts_startup_warms_cache_even_when_status_refresh_not_needed() {
-    let list_key = FixedBytes::from([0x11; 32]);
-    let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
-    let mut cache = PoiCache::new(identity.clone());
-    cache
-        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
-            event_index: 0,
-            blinded_commitment: [0x33; 32],
-            signature: [0_u8; 64],
-            event_type: PoiEventType::Transact,
-        }])
-        .expect("apply artifact event");
-    let expected_root = *cache.current_roots().get(&0).expect("current root");
-    cache.accept_current_roots();
-
-    let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
-    let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
-    let entry = ManifestEntry {
-        list_key,
-        chain_id: 1,
-        base: base_descriptor.clone(),
-        deltas: Vec::new(),
-        retained_deltas: Vec::new(),
-        blocked_shields: blocked_descriptor.clone(),
-        current_tip_index: 0,
-        current_tip_merkleroot: expected_root,
-    };
-
-    let root_dir = temp_db_root();
-    fs::create_dir_all(&root_dir).expect("create temp db root");
-    let key_path = root_dir.join("publisher.key");
-    fs::write(&key_path, [0x07_u8; 32]).expect("write publisher key");
-    let signing_key = poi::artifacts::manifest::load_publisher_signing_key(&key_path)
-        .expect("load publisher key");
-    let trusted_publisher_pubkey = FixedBytes::from(signing_key.verifying_key().to_bytes());
-    let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, FixedBytes::ZERO, vec![entry]);
-    manifest.sign_manifest(&signing_key).expect("sign manifest");
-    let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
-    let (manifest_url, requests) = spawn_http_response(manifest_bytes).await;
-
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("open temp db"),
-    );
-    db.put_poi_artifact_cache(&PoiArtifactCacheRecord {
-        chain_type: identity.chain_type,
-        chain_id: identity.chain_id,
-        txid_version: identity.txid_version.clone(),
-        list_key,
-        last_accepted_manifest_sequence: 6,
-        base_descriptor: descriptor_record(&base_descriptor),
-        applied_delta_descriptors: Vec::new(),
-        blocked_shields_descriptor: descriptor_record(&blocked_descriptor),
-        current_tip_index: 0,
-        current_tip_root: expected_root,
-        cache_payload: cache.to_bytes().expect("cache payload"),
-        updated_at: 1,
-    })
-    .expect("seed artifact cache");
-
-    let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
-    let mut cfg = wallet_config(U256::ZERO);
-    cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-        trusted_publisher_pubkey,
-        manifest_source: PoiArtifactManifestSource::Url(manifest_url.clone()),
-        gateway_urls: vec![manifest_url],
-        max_manifest_age: None,
-    });
-    cfg.local_poi_caches = Some(Arc::clone(&local_caches));
-
-    let handle = spawn_startup_artifact_poi_cache_warmup(
-        Arc::clone(&db),
-        None,
-        cfg,
-        vec![list_key],
-        BTreeMap::new(),
-    )
-    .expect("startup warmup spawned");
-    handle.await.expect("startup warmup joined");
-
-    let request = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("manifest request");
-    assert!(request.starts_with("GET / HTTP/1.1"));
-    let locked = local_caches.read().await;
-    let mut warmed = locked.get(&list_key).expect("warmed local cache").clone();
-    assert_eq!(warmed.current_roots().get(&0), Some(&expected_root));
-    let persisted = db
-        .get_poi_artifact_cache(
-            identity.chain_type,
-            identity.chain_id,
-            &identity.txid_version,
-            &identity.list_key,
-        )
-        .expect("read persisted artifact cache")
-        .expect("persisted artifact cache");
-    assert_eq!(persisted.last_accepted_manifest_sequence, 7);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
-async fn local_poi_cache_rejected_live_tail_keeps_artifact_checkpoint() {
-    let list_key = FixedBytes::from([0x11; 32]);
-    let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
-    let artifact_commitment = FixedBytes::from([0x33; 32]);
-    let tailed_commitment = FixedBytes::from([0x44; 32]);
-    let mut cache = PoiCache::new(identity.clone());
-    cache
-        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
-            event_index: 0,
-            blinded_commitment: *artifact_commitment,
-            signature: [0_u8; 64],
-            event_type: PoiEventType::Transact,
-        }])
-        .expect("apply artifact event");
-    let expected_root = *cache.current_roots().get(&0).expect("current root");
-    cache.accept_current_roots();
-
-    let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
-    let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
-    let entry = ManifestEntry {
-        list_key,
-        chain_id: 1,
-        base: base_descriptor.clone(),
-        deltas: Vec::new(),
-        retained_deltas: Vec::new(),
-        blocked_shields: blocked_descriptor.clone(),
-        current_tip_index: 0,
-        current_tip_merkleroot: expected_root,
-    };
-
-    let root_dir = temp_db_root();
-    fs::create_dir_all(&root_dir).expect("create temp db root");
-    let key_path = root_dir.join("publisher.key");
-    fs::write(&key_path, [0x08_u8; 32]).expect("write publisher key");
-    let signing_key = poi::artifacts::manifest::load_publisher_signing_key(&key_path)
-        .expect("load publisher key");
-    let trusted_publisher_pubkey = FixedBytes::from(signing_key.verifying_key().to_bytes());
-    let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, FixedBytes::ZERO, vec![entry]);
-    manifest.sign_manifest(&signing_key).expect("sign manifest");
-    let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
-    let (manifest_url, manifest_requests) = spawn_http_response(manifest_bytes).await;
-    let poi_mock = spawn_poi_rpc_sequence(vec![
-        serde_json::to_value(vec![U256::from_be_bytes(tailed_commitment.0)]).expect("leaves JSON"),
-        serde_json::json!(false),
-    ])
-    .await;
-
-    let db = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-    let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
-    let mut cfg = wallet_config(U256::ZERO);
-    cfg.poi_rpc_url = poi_mock.url.clone();
-    cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-        trusted_publisher_pubkey,
-        manifest_source: PoiArtifactManifestSource::Url(manifest_url.clone()),
-        gateway_urls: vec![manifest_url],
-        max_manifest_age: None,
-    });
-    cfg.local_poi_caches = Some(Arc::clone(&local_caches));
-    let persisted = PersistedPoiArtifactCache {
-        record: PoiArtifactCacheRecord {
-            chain_type: identity.chain_type,
-            chain_id: identity.chain_id,
-            txid_version: identity.txid_version.clone(),
-            list_key,
-            last_accepted_manifest_sequence: 6,
-            base_descriptor: descriptor_record(&base_descriptor),
-            applied_delta_descriptors: Vec::new(),
-            blocked_shields_descriptor: descriptor_record(&blocked_descriptor),
-            current_tip_index: 0,
-            current_tip_root: expected_root,
-            cache_payload: cache.to_bytes().expect("cache payload"),
-            updated_at: 1,
-        },
-        cache,
-        cache_generation: 0,
-    };
-
-    sync_local_poi_caches(
-        &db,
-        None,
-        &cfg,
-        &[list_key],
-        BTreeMap::from([(list_key, persisted)]),
-    )
-    .await;
-
-    let manifest_request = manifest_requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("manifest request");
-    assert!(manifest_request.starts_with("GET / HTTP/1.1"));
-    let leaf_request = poi_mock
-        .requests
-        .recv_timeout(Duration::from_secs(2))
-        .expect("remote leaf request");
-    assert_eq!(leaf_request["method"], "ppoi_poi_merkletree_leaves");
-    let validate_request = poi_mock
-        .requests
-        .recv_timeout(Duration::from_secs(2))
-        .expect("remote root validation request");
-    assert_eq!(validate_request["method"], "ppoi_validate_poi_merkleroots");
-
-    let locked = local_caches.read().await;
-    let installed = locked.get(&list_key).expect("installed cache");
-    assert_eq!(installed.progress().next_event_index, 1);
-    assert_eq!(installed.status(&artifact_commitment), PoiStatus::Valid);
-    assert_eq!(installed.status(&tailed_commitment), PoiStatus::Missing);
-
-    drop(locked);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
-async fn startup_installs_persisted_artifact_cache_before_warmup() {
-    let list_key = FixedBytes::from([0x11; 32]);
-    let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
-    let mut cache = PoiCache::new(identity.clone());
-    cache
-        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
-            event_index: 0,
-            blinded_commitment: [0x44; 32],
-            signature: [0_u8; 64],
-            event_type: PoiEventType::Transact,
-        }])
-        .expect("apply artifact event");
-    let expected_root = *cache.current_roots().get(&0).expect("current root");
-    cache.accept_current_roots();
-
-    let root_dir = temp_db_root();
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("open temp db"),
-    );
-    let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
-    let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
-    db.put_poi_artifact_cache(&PoiArtifactCacheRecord {
-        chain_type: identity.chain_type,
-        chain_id: identity.chain_id,
-        txid_version: identity.txid_version.clone(),
-        list_key,
-        last_accepted_manifest_sequence: 6,
-        base_descriptor: descriptor_record(&base_descriptor),
-        applied_delta_descriptors: Vec::new(),
-        blocked_shields_descriptor: descriptor_record(&blocked_descriptor),
-        current_tip_index: 0,
-        current_tip_root: expected_root,
-        cache_payload: cache.to_bytes().expect("cache payload"),
-        updated_at: 1,
-    })
-    .expect("seed artifact cache");
-
-    let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
-    let mut cfg = wallet_config(U256::ZERO);
-    cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-        trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
-        manifest_source: PoiArtifactManifestSource::Url(
-            Url::parse("http://127.0.0.1:1/manifest").expect("manifest URL"),
-        ),
-        gateway_urls: vec![Url::parse("http://127.0.0.1:1").expect("gateway URL")],
-        max_manifest_age: None,
-    });
-    cfg.local_poi_caches = Some(Arc::clone(&local_caches));
-
-    assert!(!local_poi_caches_available_for_lists(&cfg, &[list_key]).await);
-    let installed = install_persisted_local_poi_caches(db.as_ref(), &cfg, &[list_key]).await;
-
-    assert_eq!(installed.len(), 1);
-    assert!(installed.contains_key(&list_key));
-    assert!(local_poi_caches_available_for_lists(&cfg, &[list_key]).await);
-    let locked = local_caches.read().await;
-    let mut installed_cache = locked.get(&list_key).expect("installed cache").clone();
-    assert_eq!(
-        installed_cache.current_roots().get(&0),
-        Some(&expected_root)
-    );
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-fn descriptor_record(descriptor: &ArtifactDescriptor) -> PoiArtifactDescriptorRecord {
-    PoiArtifactDescriptorRecord {
-        cid: descriptor.cid.clone(),
-        sha256: hex::encode_prefixed(descriptor.sha256),
-        byte_size: descriptor.byte_size,
-    }
 }
 
 #[tokio::test]
@@ -1949,11 +1720,25 @@ async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_inges
         }
     }))
     .await;
-    let remote_client = PoiRpcClient::new(mock.url.clone());
-    let mut cfg = wallet_config(U256::ZERO);
-    cfg.poi_read_source = PoiReadSource::PoiProxy;
-    cfg.local_poi_caches = Some(Arc::new(RwLock::new(BTreeMap::new())));
-    let status_reader = wallet_poi_status_reader_source(&remote_client, &cfg);
+    let cfg = wallet_config(U256::ZERO);
+    let poi_runtime = WalletPoiRuntime::from_policy(
+        &GlobalPoiPolicy::PoiProxy {
+            rpc_url: mock.url.clone(),
+        },
+        None,
+    );
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let status_reader = poi_runtime
+        .status_reader(&public_data_plane, &cfg, &list_keys)
+        .await
+        .expect("remote POI status reader");
 
     let changed = refresh_wallet_poi_statuses_selected(
         status_reader.as_reader(),
@@ -1974,6 +1759,119 @@ async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_inges
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
         Some(&PoiStatus::Valid)
     );
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn indexed_artifacts_proxy_fallback_calls_remote_when_corpus_unavailable() {
+    let list_key = FixedBytes::from([0x12; 32]);
+    let list_keys = vec![list_key];
+    let mut wallet_utxos = vec![test_wallet_utxo(1)];
+    let blinded_commitment = wallet_utxos[0].utxo.poi.blinded_commitment;
+    let mock = spawn_poi_rpc(serde_json::json!({
+        hex::encode_prefixed(blinded_commitment): {
+            hex::encode(list_key): "Valid",
+        }
+    }))
+    .await;
+    let cfg = wallet_config(U256::ZERO);
+    let poi_runtime = test_artifact_poi_runtime_with_fallback(mock.url.clone());
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    let status_reader = poi_runtime
+        .status_reader(&public_data_plane, &cfg, &list_keys)
+        .await
+        .expect("fallback POI status reader");
+
+    let changed = refresh_wallet_poi_statuses_selected(
+        status_reader.as_reader(),
+        cfg.chain.chain_id,
+        &list_keys,
+        &mut wallet_utxos,
+        WalletPoiRefreshSelection::RequiredOrRecoverable,
+    )
+    .await;
+
+    assert!(changed);
+    assert_eq!(
+        wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+        Some(&PoiStatus::Valid)
+    );
+    let request = mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("remote fallback status request");
+    assert_eq!(request["method"], "ppoi_pois_per_list");
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn indexed_artifacts_proxy_fallback_does_not_probe_remote_for_ready_local_missing() {
+    let list_key = FixedBytes::from([0x13; 32]);
+    let list_keys = vec![list_key];
+    let mut wallet_utxos = vec![test_wallet_utxo(1)];
+    let mock = spawn_poi_rpc(serde_json::json!({})).await;
+    let cfg = wallet_config(U256::ZERO);
+    let poi_runtime = test_artifact_poi_runtime_with_fallback(mock.url.clone());
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    let mut cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        cfg.chain.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: [0x99; 32],
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("apply artifact event");
+    cache.accept_current_roots();
+    seed_data_plane_poi_cache(&public_data_plane, cfg.chain.chain_id, list_key, cache).await;
+    let status_reader = poi_runtime
+        .status_reader(&public_data_plane, &cfg, &list_keys)
+        .await
+        .expect("local POI status reader");
+
+    let changed = refresh_wallet_poi_statuses_selected(
+        status_reader.as_reader(),
+        cfg.chain.chain_id,
+        &list_keys,
+        &mut wallet_utxos,
+        WalletPoiRefreshSelection::RequiredOrRecoverable,
+    )
+    .await;
+
+    assert!(changed);
+    assert_eq!(
+        wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+        Some(&PoiStatus::Missing)
+    );
+    assert!(
+        mock.requests
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "ready local missing must not trigger remote fallback"
+    );
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
@@ -3109,10 +3007,13 @@ async fn submitted_pending_output_poi_verification_allows_retry_after_missing_de
 #[tokio::test]
 async fn indexed_artifacts_pending_verification_uses_local_cache_without_remote_status() {
     let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane = test_public_data_plane_with_poi_service(&store);
     let chain_id = 1;
     let output_commitment = FixedBytes::from([0x94; 32]);
     let list_key = FixedBytes::from([0x95; 32]);
@@ -3144,23 +3045,21 @@ async fn indexed_artifacts_pending_verification_uses_local_cache_without_remote_
     cache
         .apply_poi_leaves(0, &[U256::from_be_bytes(derived_blinded_commitment.0)])
         .expect("apply local POI leaf");
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
-    let mut cfg = wallet_config(U256::ZERO);
-    cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
-        trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
-        manifest_source: PoiArtifactManifestSource::Url(
-            Url::parse("http://127.0.0.1:1/manifest").expect("artifact URL"),
-        ),
-        gateway_urls: vec![Url::parse("http://127.0.0.1:1").expect("gateway URL")],
-        max_manifest_age: None,
-    });
-    cfg.local_poi_caches = Some(local_caches);
+    let cfg = wallet_config(U256::ZERO);
+    seed_data_plane_poi_cache(&public_data_plane, chain_id, list_key, cache).await;
     let mock = spawn_poi_rpc(serde_json::json!({})).await;
     let remote_client = PoiRpcClient::new(mock.url.clone());
+    let poi_runtime = test_artifact_poi_runtime();
 
-    let outcome =
-        verify_submitted_pending_output_pois_with_config(&remote_client, &cfg, &store, &[list_key])
-            .await;
+    let outcome = verify_submitted_pending_output_pois_with_config(
+        &public_data_plane,
+        &poi_runtime,
+        &remote_client,
+        &cfg,
+        store.as_ref(),
+        &[list_key],
+    )
+    .await;
 
     assert_eq!(outcome.completed, 1);
     assert!(
@@ -3948,8 +3847,6 @@ fn notify_changed_increments_revision() {
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        poi_read_source: PoiReadSource::PoiProxy,
-        local_poi_caches: None,
         pending_overlay_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,
@@ -3991,8 +3888,6 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        poi_read_source: PoiReadSource::PoiProxy,
-        local_poi_caches: None,
         pending_overlay_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,

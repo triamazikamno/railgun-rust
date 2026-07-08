@@ -1,13 +1,15 @@
 use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
-    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, PublicDataPlaneEpoch,
+    BackfillEvent, BackfillRequest, ChainConfig, GlobalPoiPolicy, LogBatch, PublicDataPlaneEpoch,
     PublicScanReadScope, PublicScanSource, SharedLogBatch, SyncProgressSender, SyncProgressStage,
     SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillLease,
     WalletBackfillRejectReason, WalletBackfillResetResult, WalletConfig,
     WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletReadiness, WalletReadinessError,
-    WalletResetReplayPlan, WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncToken,
+    WalletResetReplayPlan, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
 };
-use crate::wallet::{WalletHandle, WalletWorkerServices, spawn_wallet_worker, wallet_cache_store};
+use crate::wallet::{
+    WalletHandle, WalletPoiRuntime, WalletWorkerServices, spawn_wallet_worker, wallet_cache_store,
+};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, FixedBytes};
 use alloy::sol_types::SolEvent;
@@ -62,8 +64,11 @@ mod types;
 mod workers;
 
 use backfill::*;
-pub(crate) use data_plane::ChainPublicDataPlane;
 use data_plane::PublicScanCoverageWrite;
+pub(crate) use data_plane::{
+    ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated,
+    PublicTxidProofRequest, PublicTxidSyncRequest,
+};
 use forest_db::*;
 use indexed_wallet::*;
 use logs::*;

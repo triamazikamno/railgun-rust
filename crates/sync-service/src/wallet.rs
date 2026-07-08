@@ -35,7 +35,7 @@ use local_db::{
     WalletPendingResetRecord, WalletSyncActorStateRecord,
 };
 use poi::artifacts::SnapshotEvent;
-use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError, PoiCacheIdentity};
+use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError};
 use poi::error::{PoiError, PoiRpcError};
 use poi::poi::{
     BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient,
@@ -49,20 +49,19 @@ use railgun_wallet::{
 };
 use url::Url;
 
-use crate::chain::ChainPublicDataPlane;
-use crate::poi_artifacts::{PersistedPoiArtifactCache, PoiArtifactIngestor, load_persisted_cache};
-use crate::txid_cache::{
-    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
-    txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
+use crate::chain::{
+    ChainError, ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey,
+    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidSyncRequest,
 };
+use crate::txid_cache::TxidPublicCacheError;
 use crate::types::{
-    BackfillEvent, BackfillRequest, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch,
-    SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult,
-    WalletBackfillLease, WalletBackfillRejectReason, WalletBackfillResetResult, WalletCacheStore,
-    WalletConfig, WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit,
-    WalletReadiness, WalletReadinessError, WalletResetReplayPlan, WalletResetToken,
-    WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit,
-    WalletSyncToken,
+    BackfillEvent, BackfillRequest, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback,
+    SharedLogBatch, SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult,
+    WalletBackfillFinishResult, WalletBackfillLease, WalletBackfillRejectReason,
+    WalletBackfillResetResult, WalletCacheStore, WalletConfig, WalletIndexedCatchUpStatus,
+    WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness, WalletReadinessError,
+    WalletResetReplayPlan, WalletResetToken, WalletScanApply, WalletScanRows,
+    WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
 };
 
 mod delta;
@@ -78,12 +77,13 @@ mod worker;
 use delta::*;
 use handle::*;
 pub(crate) use handle::{
-    WalletAcceptedBackfillJob, WalletActorTokenAuthority, WalletIndexedCatchUpLease,
-    WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
+    WalletActorTokenAuthority, WalletIndexedCatchUpLease, WalletPrivateMutationAuthority,
+    WalletPrivateMutationPermit,
 };
 use local_poi_cache::*;
 use output_poi_recovery::*;
 use pending_output_poi::*;
+pub(crate) use persist::WalletPoiRuntime;
 use persist::*;
 use poi_refresh::*;
 use poi_sources::*;
@@ -99,8 +99,6 @@ pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
 pub(crate) use poi_refresh::LivePoiTailError;
 pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
-#[cfg(test)]
-use worker::wallet_poi_status_reader_source;
 pub(crate) use worker::{spawn_wallet_worker, wallet_cache_store};
 
 #[cfg(test)]

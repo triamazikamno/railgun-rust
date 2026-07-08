@@ -16,10 +16,11 @@ use railgun_wallet::scan::{WalletScanError, WalletScanInputRows, WalletScanKeys}
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError, serialize_wallet_utxo};
 use railgun_wallet::{ProverService, WalletUtxo};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tracing::warn;
 use url::Url;
 
 use crate::indexed_artifacts::{ChainScope, ChainType};
-use crate::wallet::{WalletAcceptedBackfillJob, WalletActorTokenAuthority};
+use crate::wallet::WalletActorTokenAuthority;
 
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
 
@@ -325,10 +326,43 @@ pub enum PoiArtifactManifestSource {
     IpnsName(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoiProxyFallback {
+    Disabled,
+    OnCorpusUnavailable,
+}
+
+impl PoiProxyFallback {
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::OnCorpusUnavailable)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PoiReadSource {
-    IndexedArtifacts(PoiArtifactSourceConfig),
-    PoiProxy,
+pub enum GlobalPoiPolicy {
+    IndexedArtifacts {
+        artifact_source: PoiArtifactSourceConfig,
+        rpc_url: Url,
+        wallet_read_fallback: PoiProxyFallback,
+    },
+    PoiProxy {
+        rpc_url: Url,
+    },
+}
+
+impl GlobalPoiPolicy {
+    #[must_use]
+    pub const fn rpc_url(&self) -> &Url {
+        match self {
+            Self::IndexedArtifacts { rpc_url, .. } | Self::PoiProxy { rpc_url } => rpc_url,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_indexed_artifacts(&self) -> bool {
+        matches!(self, Self::IndexedArtifacts { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -767,10 +801,6 @@ pub struct WalletConfig {
     pub progress_tx: Option<SyncProgressSender>,
     pub cache_store: Option<Arc<dyn WalletCacheStore>>,
     pub poi_recovery_prover: Option<ProverService>,
-    pub poi_rpc_url: Url,
-    pub poi_read_source: PoiReadSource,
-    pub local_poi_caches: Option<WalletLocalPoiCaches>,
-    pub manage_local_poi_cache: bool,
     pub use_indexed_wallet_catch_up: bool,
 }
 
@@ -1225,7 +1255,7 @@ pub enum WalletBackfillFinishResult {
     Accepted {
         committed_to: u64,
         target_block: u64,
-        job: WalletAcceptedBackfillJob,
+        lease: WalletBackfillLease,
     },
     Ready {
         committed_to: u64,
@@ -1247,9 +1277,9 @@ impl WalletBackfillFinishResult {
     }
 
     #[must_use]
-    pub const fn accepted_job(&self) -> Option<WalletAcceptedBackfillJob> {
+    pub fn accepted_lease(&self) -> Option<WalletBackfillLease> {
         match self {
-            Self::Accepted { job, .. } => Some(*job),
+            Self::Accepted { lease, .. } => Some(lease.clone()),
             Self::Ready { .. } | Self::Rejected { .. } => None,
         }
     }
@@ -1432,10 +1462,18 @@ impl WalletResetToken {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WalletBackfillLease {
+pub struct WalletBackfillLease {
     token: WalletSyncToken,
     sender: mpsc::Sender<BackfillEvent>,
 }
+
+impl PartialEq for WalletBackfillLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+    }
+}
+
+impl Eq for WalletBackfillLease {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WalletResetReplayPlan {
@@ -1456,14 +1494,8 @@ impl WalletResetReplayPlan {
 }
 
 impl WalletBackfillLease {
-    pub(crate) fn for_actor_accepted_job(
-        job: WalletAcceptedBackfillJob,
-        sender: mpsc::Sender<BackfillEvent>,
-    ) -> Self {
-        Self {
-            token: job.token(),
-            sender,
-        }
+    pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
+        Self { token, sender }
     }
 
     pub(crate) const fn token(&self) -> WalletSyncToken {
@@ -1489,6 +1521,103 @@ impl WalletBackfillLease {
     pub(crate) fn sender(&self) -> &mpsc::Sender<BackfillEvent> {
         &self.sender
     }
+
+    pub(crate) async fn apply(
+        &self,
+        cache_key: &str,
+        apply: WalletScanApply,
+    ) -> WalletBackfillApplyResult {
+        let requested_to = apply.to_block;
+        let (response, result_rx) = oneshot::channel();
+        if let Err(err) = self
+            .sender
+            .send(BackfillEvent::Apply {
+                apply,
+                token: self.token,
+                response,
+            })
+            .await
+        {
+            warn!(?err, cache_key, "failed to send wallet scan batch");
+            return WalletBackfillApplyResult::Rejected {
+                committed_to: requested_to.saturating_sub(1),
+                reason: WalletBackfillRejectReason::Shutdown,
+            };
+        }
+        match result_rx.await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(?err, cache_key, "wallet scan batch response dropped");
+                WalletBackfillApplyResult::Rejected {
+                    committed_to: requested_to.saturating_sub(1),
+                    reason: WalletBackfillRejectReason::Shutdown,
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn finish(
+        &self,
+        cache_key: &str,
+        target_block: u64,
+    ) -> WalletBackfillFinishResult {
+        let (response, result_rx) = oneshot::channel();
+        if let Err(err) = self
+            .sender
+            .send(BackfillEvent::Target {
+                target_block,
+                token: self.token,
+                sender: self.sender.clone(),
+                response,
+            })
+            .await
+        {
+            warn!(
+                ?err,
+                cache_key, target_block, "failed to send wallet target update"
+            );
+            return WalletBackfillFinishResult::Rejected {
+                committed_to: target_block.saturating_sub(1),
+                reason: WalletBackfillRejectReason::Shutdown,
+            };
+        }
+        match result_rx.await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key, target_block, "wallet target response dropped"
+                );
+                WalletBackfillFinishResult::Rejected {
+                    committed_to: target_block.saturating_sub(1),
+                    reason: WalletBackfillRejectReason::Shutdown,
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn retire(&self, cache_key: &str) {
+        if let Err(err) = self
+            .sender
+            .send(BackfillEvent::JobRetired { token: self.token })
+            .await
+        {
+            warn!(?err, cache_key, "failed to send wallet job retirement");
+        }
+    }
+
+    pub(crate) async fn fail(&self, cache_key: &str, reason: WalletReadinessError) {
+        if let Err(err) = self
+            .sender
+            .send(BackfillEvent::JobFailed {
+                token: self.token,
+                reason,
+            })
+            .await
+        {
+            warn!(?err, cache_key, "failed to send wallet job failure");
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1501,6 +1630,7 @@ pub(crate) enum BackfillEvent {
     Target {
         target_block: u64,
         token: WalletSyncToken,
+        sender: mpsc::Sender<BackfillEvent>,
         response: oneshot::Sender<WalletBackfillFinishResult>,
     },
     JobFailed {
