@@ -72,19 +72,6 @@ impl WalletHandle {
             }
         }
     }
-
-    pub(crate) fn notify_changed(&self) {
-        let rev = self.rev_rx.borrow().wrapping_add(1);
-        if let Err(err) = self.rev_tx.send(rev) {
-            debug!(?err, cache_key = %self.cache_key, "failed to send wallet revision");
-        }
-    }
-
-    pub(super) fn notify_if_changed(&self, changed: bool) {
-        if changed {
-            self.notify_changed();
-        }
-    }
 }
 
 #[derive(Default)]
@@ -96,15 +83,13 @@ pub(super) struct WalletPersistState {
 impl WalletPersistState {
     pub(super) fn persist_progress(
         &mut self,
-        db: &DbStore,
         cache_store: &dyn WalletCacheStore,
-        authority: &WalletPrivateMutationAuthority<'_>,
+        permit: &WalletPrivateMutationPermit<'_>,
         request: WalletProgressPersist<'_>,
     ) -> Result<bool, WalletCacheError> {
         self.persist_progress_with_private_effects(
-            db,
             cache_store,
-            authority,
+            permit,
             request,
             WalletProgressPrivateEffects::default(),
         )
@@ -112,9 +97,8 @@ impl WalletPersistState {
 
     pub(super) fn persist_progress_with_private_effects(
         &mut self,
-        db: &DbStore,
         cache_store: &dyn WalletCacheStore,
-        authority: &WalletPrivateMutationAuthority<'_>,
+        permit: &WalletPrivateMutationPermit<'_>,
         request: WalletProgressPersist<'_>,
         effects: WalletProgressPrivateEffects<'_>,
     ) -> Result<bool, WalletCacheError> {
@@ -122,20 +106,17 @@ impl WalletPersistState {
             request.changed || self.needs_full_persist || self.pending_cache_reset.is_some();
         if full_persist {
             let persist_started = Instant::now();
-            return match cache_store.commit_wallet_private_state(
-                db,
-                WalletPrivateCommit::new(
-                    authority,
-                    effects.pending_output_context_chain_id,
-                    request.snapshot,
-                    true,
-                    request.last_scanned,
-                    request.last_scanned_block_hash,
-                    effects.pending_output_context_updates,
-                    effects.pending_output_context_deletes,
-                    effects.output_poi_recovery_updates,
-                ),
-            ) {
+            return match cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
+                permit,
+                effects.pending_output_context_chain_id,
+                request.snapshot,
+                true,
+                request.last_scanned,
+                request.last_scanned_block_hash,
+                effects.pending_output_context_updates,
+                effects.pending_output_context_deletes,
+                effects.output_poi_recovery_updates,
+            )) {
                 Ok(()) => {
                     self.needs_full_persist = false;
                     self.pending_cache_reset = None;
@@ -166,20 +147,17 @@ impl WalletPersistState {
         }
 
         let meta_started = Instant::now();
-        cache_store.commit_wallet_private_state(
-            db,
-            WalletPrivateCommit::new(
-                authority,
-                effects.pending_output_context_chain_id,
-                request.snapshot,
-                false,
-                request.last_scanned,
-                request.last_scanned_block_hash,
-                effects.pending_output_context_updates,
-                effects.pending_output_context_deletes,
-                effects.output_poi_recovery_updates,
-            ),
-        )?;
+        cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
+            permit,
+            effects.pending_output_context_chain_id,
+            request.snapshot,
+            false,
+            request.last_scanned,
+            request.last_scanned_block_hash,
+            effects.pending_output_context_updates,
+            effects.pending_output_context_deletes,
+            effects.output_poi_recovery_updates,
+        ))?;
         debug!(
             cache_key = %request.cache_key,
             last_scanned = request.last_scanned,
@@ -232,9 +210,7 @@ pub(super) struct WalletProgressPrivateEffects<'a> {
 }
 
 pub(super) struct OutputPoiRecoveryRun<'a> {
-    pub(super) worker_handle: &'a WalletHandle,
-    pub(super) reset_generation: u64,
-    pub(super) cancel: &'a CancellationToken,
+    pub(super) authority: &'a WalletPrivateMutationAuthority<'a>,
     pub(super) db: &'a DbStore,
     pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
@@ -254,13 +230,8 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
     if run.cfg.spending_public_key.is_none() || run.cfg.poi_recovery_prover.is_none() {
         return 0;
     }
-    let authority = WalletPrivateMutationAuthority {
-        handle: run.worker_handle,
-        reset_generation: run.reset_generation,
-        cancel: run.cancel,
-    };
-    let guard = match authority.acquire().await {
-        Ok(guard) => guard,
+    let permit = match run.authority.acquire().await {
+        Ok(permit) => permit,
         Err(reason) => {
             debug!(?reason, cache_key = %run.cfg.cache_key, "output POI recovery skipped");
             return 0;
@@ -268,7 +239,7 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
     };
     let snapshot = run.utxos.read().await.clone();
     mark_valid_output_poi_recoveries(
-        &authority,
+        &permit,
         run.db,
         run.cache_store,
         run.cfg,
@@ -277,25 +248,18 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
     )
     .await;
     if output_poi_recovery_candidates(&snapshot, run.active_list_keys).is_empty() {
-        drop(guard);
         return 0;
     }
     let forest = run.forest.read().await.clone();
     let local_proof_source = match &run.cfg.poi_read_source {
         PoiReadSource::IndexedArtifacts(_) => {
-            let local_caches = run
-                .cfg
-                .local_poi_caches
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| {
-                    warn!(
-                        cache_key = %run.cfg.cache_key,
-                        chain_id = run.cfg.chain.chain_id,
-                        "artifact POI read source missing local cache handle"
-                    );
-                    Arc::new(RwLock::new(BTreeMap::new()))
-                });
+            if !local_poi_caches_available_for_lists(run.cfg, run.active_list_keys).await {
+                log_local_poi_cache_unavailable(run.cfg, "output_poi_recovery");
+                return 0;
+            }
+            let Some(local_caches) = run.cfg.local_poi_caches.as_ref().cloned() else {
+                return 0;
+            };
             Some(LocalPoiMerkleProofSource::new(local_caches))
         }
         PoiReadSource::PoiProxy => None,
@@ -307,7 +271,8 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
         proof_source = run.client;
     }
     let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
-        authority: &authority,
+        authority: run.authority,
+        permit: &permit,
         db: run.db,
         cache_store: run.cache_store,
         cfg: run.cfg,
@@ -324,6 +289,6 @@ pub(super) async fn recover_missing_output_pois_from_wallet(
         force_retry: run.force_retry,
     })
     .await;
-    drop(guard);
+    drop(permit);
     recovered
 }

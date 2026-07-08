@@ -298,6 +298,7 @@ impl TxidPublicCache<'_> {
                     source_hash: Some(chunk.descriptor.sha256.0),
                     created_at: existing.map_or(now, |meta| meta.created_at),
                     updated_at: now,
+                    last_accessed_at: now,
                     last_block: chunk.descriptor.metadata.checkpoint_block,
                 },
             )?;

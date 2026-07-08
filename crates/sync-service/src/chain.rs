@@ -2,15 +2,12 @@ use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, LogBatch, PublicDataPlaneEpoch,
     PublicScanReadScope, PublicScanSource, SharedLogBatch, SyncProgressSender, SyncProgressStage,
-    SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult,
+    SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillLease,
     WalletBackfillRejectReason, WalletBackfillResetResult, WalletConfig,
-    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletReadiness, WalletScanApply,
-    WalletScanRows, WalletScanRowsPayload,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletReadiness, WalletReadinessError,
+    WalletResetReplayPlan, WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncToken,
 };
-use crate::wallet::{
-    WalletHandle, WalletPendingOverlay, WalletWorkerServices, pending_overlay_from_delta,
-    spawn_wallet_worker, wallet_cache_store,
-};
+use crate::wallet::{WalletHandle, WalletWorkerServices, spawn_wallet_worker, wallet_cache_store};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, FixedBytes};
 use alloy::sol_types::SolEvent;
@@ -39,8 +36,9 @@ use railgun_wallet::scan::parse_indexed_wallet_delta;
 use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    WalletLogDelta, WalletScanError, WalletScanInputRows, parse_wallet_delta_from_logs,
+    WalletScanError, WalletScanInputRows,
 };
+use railgun_wallet::wallet_cache::WalletCacheError;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

@@ -31,7 +31,7 @@ use crate::poi_artifacts::PersistedPoiArtifactCache;
 use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey, TxidPublicLatestValidated};
 use crate::types::{
     ChainKey, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, WalletCacheStore,
-    WalletConfig, WalletPrivateCommit, WalletReadiness,
+    WalletConfig, WalletPrivateCommit, WalletReadiness, WalletSyncActorStateCommit,
 };
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
@@ -51,7 +51,7 @@ use broadcaster_core::tree::TREE_LEAF_COUNT;
 use local_db::{
     DbConfig, DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheRecord,
-    PoiArtifactDescriptorRecord, WalletMeta,
+    PoiArtifactDescriptorRecord, WalletMeta, WalletSyncActorStateRecord,
 };
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleTreeUpdate};
 use poi::artifacts::{ArtifactDescriptor, Manifest, ManifestEntry};
@@ -71,7 +71,7 @@ use railgun_wallet::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -143,8 +143,10 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
+    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::channel(1);
     WalletHandle {
         cache_key: "cache-key".to_string(),
+        chain_id: 1,
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
         authority_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -152,16 +154,17 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
         last_scanned: Arc::new(AtomicU64::new(0)),
         reset_generation: Arc::new(AtomicU64::new(0)),
+        next_sync_job_id: Arc::new(AtomicU64::new(1)),
         ready_rx,
         readiness_rx,
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        indexed_catch_up_active: Arc::new(AtomicBool::new(false)),
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         pending_overlay_tx,
         poi_refresh_tx,
+        indexed_catch_up_status_tx,
         rev_tx,
         indexed_catch_up_tx,
     }
@@ -977,12 +980,19 @@ struct RecordingCacheState {
     fail_next_store: bool,
 }
 
-#[derive(Default)]
 struct RecordingCacheStore {
+    db: Arc<DbStore>,
     state: Mutex<RecordingCacheState>,
 }
 
 impl RecordingCacheStore {
+    fn new(db: Arc<DbStore>) -> Self {
+        Self {
+            db,
+            state: Mutex::default(),
+        }
+    }
+
     fn fail_next_store(&self) {
         self.state.lock().expect("cache state").fail_next_store = true;
     }
@@ -995,7 +1005,6 @@ impl RecordingCacheStore {
 impl WalletCacheStore for RecordingCacheStore {
     fn commit_wallet_private_state(
         &self,
-        db: &DbStore,
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
         if commit.replace_wallet_utxos() {
@@ -1009,17 +1018,20 @@ impl WalletCacheStore for RecordingCacheStore {
             self.state.lock().expect("cache state").meta_calls += 1;
         }
         for record in commit.pending_output_context_updates() {
-            db.put_pending_output_poi_context(record)?;
+            self.db.put_pending_output_poi_context(record)?;
         }
         for output_commitment in commit.pending_output_context_deletes() {
-            db.delete_pending_output_poi_context(
+            self.db.delete_pending_output_poi_context(
                 commit.pending_output_context_chain_id(),
                 commit.wallet_id(),
                 output_commitment,
             )?;
         }
         for record in commit.output_poi_recovery_updates() {
-            db.put_output_poi_recovery(record)?;
+            self.db.put_output_poi_recovery(record)?;
+        }
+        if let Some(state) = commit.sync_actor_state() {
+            self.db.put_wallet_sync_actor_state(state)?;
         }
         Ok(())
     }
@@ -1030,6 +1042,22 @@ impl WalletCacheStore for RecordingCacheStore {
 
     fn get_wallet_meta(&self, _wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
         Ok(None)
+    }
+
+    fn get_wallet_sync_actor_state(
+        &self,
+        _chain_id: u64,
+        _wallet_id: &str,
+    ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError> {
+        Ok(None)
+    }
+
+    fn put_wallet_sync_actor_state(
+        &self,
+        commit: WalletSyncActorStateCommit<'_>,
+    ) -> Result<(), WalletCacheError> {
+        self.db.put_wallet_sync_actor_state(commit.state())?;
+        Ok(())
     }
 }
 
@@ -2863,11 +2891,7 @@ async fn authorized_pending_output_verification_updates_wallet_poi_projection() 
     let mut handle = test_wallet_handle(vec![wallet_utxo]);
     handle.cache_key = cfg.cache_key.clone();
     let cancel = CancellationToken::new();
-    let authority = WalletPrivateMutationAuthority {
-        handle: &handle,
-        reset_generation: 0,
-        cancel: &cancel,
-    };
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
     let client = RecordingPoiStatusClient::default();
     let revision_before = *handle.rev_rx.borrow();
 
@@ -3244,11 +3268,7 @@ async fn authorized_pending_output_submission_cancels_without_mutating_context()
     let task_submitter = Arc::clone(&submitter);
     let task_cfg = cfg.clone();
     let task = tokio::spawn(async move {
-        let authority = WalletPrivateMutationAuthority {
-            handle: &task_handle,
-            reset_generation: 0,
-            cancel: &task_cancel,
-        };
+        let authority = WalletPrivateMutationAuthority::new(&task_handle, 0, &task_cancel);
         process_pending_output_poi_observations_authorized(
             &authority,
             task_store.as_ref(),
@@ -3320,11 +3340,7 @@ async fn authorized_pending_output_verification_skips_changed_context_after_awai
     let task_cancel = cancel.clone();
     let task_reader = Arc::clone(&reader);
     let task = tokio::spawn(async move {
-        let authority = WalletPrivateMutationAuthority {
-            handle: &task_handle,
-            reset_generation: 0,
-            cancel: &task_cancel,
-        };
+        let authority = WalletPrivateMutationAuthority::new(&task_handle, 0, &task_cancel);
         verify_submitted_pending_output_pois_authorized(
             &authority,
             task_reader.as_ref(),
@@ -3764,31 +3780,29 @@ fn forced_output_poi_recovery_retry_ignores_future_retry_for_retryable_status() 
     assert!(missing_outputs.retry_allowed(11, true));
 }
 
-#[test]
-fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
+#[tokio::test]
+async fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
     let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-    let cache_store = RecordingCacheStore::default();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cache_store = RecordingCacheStore::new(Arc::clone(&store));
     cache_store.fail_next_store();
     let snapshot = Vec::new();
     let handle = test_wallet_handle(snapshot.clone());
     let cancel = CancellationToken::new();
-    let authority = WalletPrivateMutationAuthority {
-        handle: &handle,
-        reset_generation: 0,
-        cancel: &cancel,
-    };
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let permit = authority.acquire().await.expect("wallet authority");
     let mut persist_state = WalletPersistState::default();
 
     assert!(
         persist_state
             .persist_progress(
-                &store,
                 &cache_store,
-                &authority,
+                &permit,
                 WalletProgressPersist {
                     cache_key: "wallet",
                     snapshot: &snapshot,
@@ -3805,9 +3819,8 @@ fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
 
     let persisted_full_snapshot = persist_state
         .persist_progress(
-            &store,
             &cache_store,
-            &authority,
+            &permit,
             WalletProgressPersist {
                 cache_key: "wallet",
                 snapshot: &snapshot,
@@ -3824,9 +3837,8 @@ fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
 
     let persisted_full_snapshot = persist_state
         .persist_progress(
-            &store,
             &cache_store,
-            &authority,
+            &permit,
             WalletProgressPersist {
                 cache_key: "wallet",
                 snapshot: &snapshot,
@@ -3844,23 +3856,22 @@ fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds() {
+#[tokio::test]
+async fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds() {
     let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-    let cache_store = RecordingCacheStore::default();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cache_store = RecordingCacheStore::new(Arc::clone(&store));
     cache_store.fail_next_store();
     let snapshot = Vec::new();
     let handle = test_wallet_handle(snapshot.clone());
     let cancel = CancellationToken::new();
-    let authority = WalletPrivateMutationAuthority {
-        handle: &handle,
-        reset_generation: 0,
-        cancel: &cancel,
-    };
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let permit = authority.acquire().await.expect("wallet authority");
     let mut persist_state = WalletPersistState {
         needs_full_persist: true,
         pending_cache_reset: Some(9),
@@ -3869,9 +3880,8 @@ fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds() {
     assert!(
         persist_state
             .persist_progress(
-                &store,
                 &cache_store,
-                &authority,
+                &permit,
                 WalletProgressPersist {
                     cache_key: "wallet",
                     snapshot: &snapshot,
@@ -3889,9 +3899,8 @@ fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds() {
 
     let persisted_full_snapshot = persist_state
         .persist_progress(
-            &store,
             &cache_store,
-            &authority,
+            &permit,
             WalletProgressPersist {
                 cache_key: "wallet",
                 snapshot: &snapshot,
@@ -3922,8 +3931,10 @@ fn notify_changed_increments_revision() {
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
+    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::channel(1);
     let handle = WalletHandle {
         cache_key: "cache-key".to_string(),
+        chain_id: 1,
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
         authority_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3931,16 +3942,17 @@ fn notify_changed_increments_revision() {
         pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
         last_scanned: Arc::new(AtomicU64::new(0)),
         reset_generation: Arc::new(AtomicU64::new(0)),
+        next_sync_job_id: Arc::new(AtomicU64::new(1)),
         ready_rx,
         readiness_rx,
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        indexed_catch_up_active: Arc::new(AtomicBool::new(false)),
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         pending_overlay_tx,
         poi_refresh_tx,
+        indexed_catch_up_status_tx,
         rev_tx,
         indexed_catch_up_tx,
     };
@@ -3962,8 +3974,10 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel::<WalletPoiRefreshRequest>(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
+    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::channel(1);
     let handle = WalletHandle {
         cache_key: "cache-key".to_string(),
+        chain_id: 1,
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
         authority_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3971,16 +3985,17 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
         last_scanned: Arc::new(AtomicU64::new(0)),
         reset_generation: Arc::new(AtomicU64::new(0)),
+        next_sync_job_id: Arc::new(AtomicU64::new(1)),
         ready_rx,
         readiness_rx,
         rev_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
-        indexed_catch_up_active: Arc::new(AtomicBool::new(false)),
         poi_read_source: PoiReadSource::PoiProxy,
         local_poi_caches: None,
         pending_overlay_tx,
         poi_refresh_tx,
+        indexed_catch_up_status_tx,
         rev_tx,
         indexed_catch_up_tx,
     };

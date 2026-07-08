@@ -32,8 +32,8 @@ pub(super) async fn process_pending_output_poi_observations_authorized(
     let Some(submitter) = submitter else {
         return 0;
     };
-    let guard = match authority.acquire().await {
-        Ok(guard) => guard,
+    let permit = match authority.acquire().await {
+        Ok(permit) => permit,
         Err(reason) => {
             debug!(
                 ?reason,
@@ -46,6 +46,7 @@ pub(super) async fn process_pending_output_poi_observations_authorized(
     };
     let submitted_contexts = match submit_observed_pending_output_pois_inner(
         authority,
+        &permit,
         db,
         cache_store,
         cfg,
@@ -66,7 +67,7 @@ pub(super) async fn process_pending_output_poi_observations_authorized(
             0
         }
     };
-    drop(guard);
+    drop(permit);
     if submitted_contexts > 0 {
         debug!(
             chain_id = cfg.chain.chain_id,
@@ -199,6 +200,7 @@ pub(super) fn pending_output_poi_observation_updates(
 
 pub(super) async fn submit_observed_pending_output_pois_inner(
     authority: &WalletPrivateMutationAuthority<'_>,
+    permit: &WalletPrivateMutationPermit<'_>,
     db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
@@ -207,10 +209,12 @@ pub(super) async fn submit_observed_pending_output_pois_inner(
     force_submission_retry: bool,
 ) -> Result<usize, local_db::DbError> {
     submit_observed_pending_output_pois_impl(
-        Some(authority),
-        Some((cfg, active_list_keys)),
+        authority,
+        permit,
+        cfg,
+        active_list_keys,
         db,
-        Some(cache_store),
+        cache_store,
         cfg.chain.chain_id,
         &cfg.cache_key,
         submitter,
@@ -219,32 +223,13 @@ pub(super) async fn submit_observed_pending_output_pois_inner(
     .await
 }
 
-#[cfg(test)]
-async fn submit_observed_pending_output_pois_unchecked(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    submitter: &dyn PendingOutputPoiSubmitter,
-    force_submission_retry: bool,
-) -> Result<usize, local_db::DbError> {
-    submit_observed_pending_output_pois_impl(
-        None,
-        None,
-        db,
-        None,
-        chain_id,
-        wallet_id,
-        submitter,
-        force_submission_retry,
-    )
-    .await
-}
-
 async fn submit_observed_pending_output_pois_impl(
-    authority: Option<&WalletPrivateMutationAuthority<'_>>,
-    validation: Option<(&WalletConfig, &[FixedBytes<32>])>,
+    authority: &WalletPrivateMutationAuthority<'_>,
+    permit: &WalletPrivateMutationPermit<'_>,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
     db: &DbStore,
-    cache_store: Option<&dyn WalletCacheStore>,
+    cache_store: &dyn WalletCacheStore,
     chain_id: u64,
     wallet_id: &str,
     submitter: &dyn PendingOutputPoiSubmitter,
@@ -270,22 +255,19 @@ async fn submit_observed_pending_output_pois_impl(
         {
             missing_list_keys = record.list_keys();
         }
-        if let Some((_, active_list_keys)) = validation {
-            missing_list_keys.retain(|list_key| active_list_keys.contains(list_key));
-        }
+        missing_list_keys.retain(|list_key| active_list_keys.contains(list_key));
         if missing_list_keys.is_empty() {
             continue;
         }
-        if let (Some(authority), Some((cfg, active_list_keys))) = (authority, validation)
-            && !pending_output_poi_submission_plan_current(
-                authority,
-                db,
-                cfg,
-                active_list_keys,
-                &record,
-                &missing_list_keys,
-            )
-            .await?
+        if !pending_output_poi_submission_plan_current(
+            authority,
+            db,
+            cfg,
+            active_list_keys,
+            &record,
+            &missing_list_keys,
+        )
+        .await?
         {
             continue;
         }
@@ -293,9 +275,7 @@ async fn submit_observed_pending_output_pois_impl(
         if pre_transaction_pois.len() != missing_list_keys.len() {
             record.terminal_error =
                 Some("missing pre-transaction POI for pending output".to_string());
-            if let Some(authority) = authority
-                && let Err(reason) = authority.revalidate()
-            {
+            if let Err(reason) = authority.revalidate() {
                 debug!(
                     ?reason,
                     chain_id,
@@ -305,24 +285,17 @@ async fn submit_observed_pending_output_pois_impl(
                 );
                 continue;
             }
-            if let (Some(authority), Some(cache_store), Some((cfg, _))) =
-                (authority, cache_store, validation)
+            if let Err(err) = commit_pending_output_poi_side_effects(
+                permit,
+                cache_store,
+                cfg,
+                std::slice::from_ref(&record),
+                &[],
+            )
+            .await
             {
-                if let Err(err) = commit_pending_output_poi_side_effects(
-                    authority,
-                    db,
-                    cache_store,
-                    cfg,
-                    std::slice::from_ref(&record),
-                    &[],
-                )
-                .await
-                {
-                    warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to atomically persist pending output POI terminal state");
-                    continue;
-                }
-            } else {
-                db.put_pending_output_poi_context(&record)?;
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to atomically persist pending output POI terminal state");
+                continue;
             }
             continue;
         }
@@ -362,7 +335,7 @@ async fn submit_observed_pending_output_pois_impl(
             pre_tx_poi_lists = context.pre_transaction_pois_per_txid_leaf_per_list.len(),
             "submitting pending output POI context"
         );
-        let submit_result = submit_pending_output_poi_context_with_authority(
+        let submit_result = submit_pending_output_poi_context_with_cancel(
             authority,
             submitter,
             chain_id,
@@ -374,8 +347,182 @@ async fn submit_observed_pending_output_pois_impl(
         .await;
         match submit_result {
             Ok(()) => {
-                if !pending_output_poi_context_still_current_impl(
-                    authority, db, chain_id, wallet_id, &record,
+                if !pending_output_poi_submission_side_effect_current(
+                    authority,
+                    db,
+                    &record,
+                    cfg,
+                    active_list_keys,
+                    &submitted_list_keys,
+                )
+                .await?
+                {
+                    continue;
+                }
+                for list_key in &submitted_list_keys {
+                    if !record.submitted_poi_list_keys.contains(list_key) {
+                        record.submitted_poi_list_keys.push(*list_key);
+                    }
+                }
+                let recovery_update = pending_output_poi_recovery_update(
+                    db,
+                    chain_id,
+                    &record,
+                    &observation,
+                    now,
+                    OutputPoiRecoveryAction::Submitted {
+                        retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+                    },
+                )?;
+                if let Err(err) = commit_pending_output_poi_side_effects(
+                    permit,
+                    cache_store,
+                    cfg,
+                    std::slice::from_ref(&record),
+                    std::slice::from_ref(&recovery_update),
+                )
+                .await
+                {
+                    warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to atomically persist pending output POI submitted state");
+                    continue;
+                }
+                submitted_contexts += 1;
+            }
+            Err(err) => {
+                if !pending_output_poi_submission_side_effect_current(
+                    authority,
+                    db,
+                    &record,
+                    cfg,
+                    active_list_keys,
+                    &submitted_list_keys,
+                )
+                .await?
+                {
+                    continue;
+                }
+                if let Some(mut recovery) = recovery.clone() {
+                    if let Err(reason) = authority.revalidate() {
+                        debug!(
+                            ?reason,
+                            chain_id,
+                            wallet_id = %record.wallet_id,
+                            commitment = %hex::encode(record.output_commitment),
+                            "pending output POI submit-failure side effect rejected"
+                        );
+                        continue;
+                    }
+                    recovery.apply_action(
+                        OutputPoiRecoveryAction::SubmitFailed {
+                            error: err.to_string(),
+                            retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                        },
+                        now,
+                    );
+                    if let Err(err) = commit_pending_output_poi_side_effects(
+                        permit,
+                        cache_store,
+                        cfg,
+                        &[],
+                        std::slice::from_ref(&recovery),
+                    )
+                    .await
+                    {
+                        warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to atomically persist pending output POI submit-failure state");
+                    }
+                }
+                warn!(
+                    ?err,
+                    chain_id,
+                    commitment = %hex::encode(record.output_commitment),
+                    "pending output POI submission failed; keeping context retryable"
+                );
+            }
+        }
+    }
+    Ok(submitted_contexts)
+}
+
+#[cfg(test)]
+async fn submit_observed_pending_output_pois_unchecked(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    submitter: &dyn PendingOutputPoiSubmitter,
+    force_submission_retry: bool,
+) -> Result<usize, local_db::DbError> {
+    let records = db.list_pending_output_poi_contexts(chain_id, wallet_id)?;
+    let mut submitted_contexts = 0;
+    let now = now_epoch_secs();
+    for mut record in records {
+        let Some(observation) = record.observation.clone() else {
+            continue;
+        };
+        if record.terminal_error.is_some() {
+            continue;
+        }
+        let recovery =
+            db.get_output_poi_recovery(chain_id, &record.wallet_id, &record.output_commitment)?;
+        let mut missing_list_keys = record.missing_list_keys();
+        if missing_list_keys.is_empty()
+            && recovery
+                .as_ref()
+                .is_some_and(|record| record.submission_retry_allowed(now, force_submission_retry))
+        {
+            missing_list_keys = record.list_keys();
+        }
+        if missing_list_keys.is_empty() {
+            continue;
+        }
+        let pre_transaction_pois = record.retain_poi_lists(&missing_list_keys);
+        if pre_transaction_pois.len() != missing_list_keys.len() {
+            record.terminal_error =
+                Some("missing pre-transaction POI for pending output".to_string());
+            db.put_pending_output_poi_context(&record)?;
+            continue;
+        }
+        let context = SingleCommitmentProofContext {
+            txid_version: record.txid_version.clone(),
+            railgun_txid: record.railgun_txid,
+            utxo_tree_in: record.utxo_tree_in,
+            commitment: record.output_commitment,
+            npk: record.output_npk,
+            pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
+        };
+        let Some(submit_identity) = pending_output_poi_submit_identity(&record, &observation)
+        else {
+            warn!(
+                chain_id,
+                commitment = %hex::encode(record.output_commitment),
+                output_tree = observation.output_tree,
+                output_position = observation.output_position,
+                "pending output POI context has invalid output tree"
+            );
+            continue;
+        };
+        let submitted_list_keys = missing_list_keys.clone();
+        debug!(
+            chain_id,
+            wallet_id = %record.wallet_id,
+            commitment = %hex::encode(record.output_commitment),
+            derived_blinded_commitment = %hex::encode(submit_identity.derived_blinded_commitment),
+            source_tx_hash = %hex::encode(observation.tx_hash),
+            list_keys = ?submitted_list_keys,
+            "submitting unchecked pending output POI context"
+        );
+        match submit_pending_output_poi_context_unchecked(
+            submitter,
+            chain_id,
+            &record,
+            &context,
+            &observation,
+            &submitted_list_keys,
+        )
+        .await
+        {
+            Ok(()) => {
+                if !pending_output_poi_context_still_current_unchecked(
+                    db, chain_id, wallet_id, &record,
                 )? {
                     continue;
                 }
@@ -394,47 +541,17 @@ async fn submit_observed_pending_output_pois_impl(
                         retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
                     },
                 )?;
-                if let (Some(authority), Some(cache_store), Some((cfg, _))) =
-                    (authority, cache_store, validation)
-                {
-                    if let Err(err) = commit_pending_output_poi_side_effects(
-                        authority,
-                        db,
-                        cache_store,
-                        cfg,
-                        std::slice::from_ref(&record),
-                        std::slice::from_ref(&recovery_update),
-                    )
-                    .await
-                    {
-                        warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to atomically persist pending output POI submitted state");
-                        continue;
-                    }
-                } else {
-                    db.put_pending_output_poi_context(&record)?;
-                    db.put_output_poi_recovery(&recovery_update)?;
-                }
+                db.put_pending_output_poi_context(&record)?;
+                db.put_output_poi_recovery(&recovery_update)?;
                 submitted_contexts += 1;
             }
             Err(err) => {
-                if !pending_output_poi_context_still_current_impl(
-                    authority, db, chain_id, wallet_id, &record,
+                if !pending_output_poi_context_still_current_unchecked(
+                    db, chain_id, wallet_id, &record,
                 )? {
                     continue;
                 }
                 if let Some(mut recovery) = recovery.clone() {
-                    if let Some(authority) = authority
-                        && let Err(reason) = authority.revalidate()
-                    {
-                        debug!(
-                            ?reason,
-                            chain_id,
-                            wallet_id = %record.wallet_id,
-                            commitment = %hex::encode(record.output_commitment),
-                            "pending output POI submit-failure side effect rejected"
-                        );
-                        continue;
-                    }
                     recovery.apply_action(
                         OutputPoiRecoveryAction::SubmitFailed {
                             error: err.to_string(),
@@ -442,24 +559,7 @@ async fn submit_observed_pending_output_pois_impl(
                         },
                         now,
                     );
-                    if let (Some(authority), Some(cache_store), Some((cfg, _))) =
-                        (authority, cache_store, validation)
-                    {
-                        if let Err(err) = commit_pending_output_poi_side_effects(
-                            authority,
-                            db,
-                            cache_store,
-                            cfg,
-                            &[],
-                            std::slice::from_ref(&recovery),
-                        )
-                        .await
-                        {
-                            warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to atomically persist pending output POI submit-failure state");
-                        }
-                    } else {
-                        db.put_output_poi_recovery(&recovery)?;
-                    }
+                    db.put_output_poi_recovery(&recovery)?;
                 }
                 warn!(
                     ?err,
@@ -482,28 +582,7 @@ pub(super) async fn submit_pending_output_poi_context_with_cancel(
     observation: &PendingOutputPoiObservation,
     submitted_list_keys: &[FixedBytes<32>],
 ) -> Result<(), PoiError> {
-    submit_pending_output_poi_context_with_authority(
-        Some(authority),
-        submitter,
-        chain_id,
-        record,
-        context,
-        observation,
-        submitted_list_keys,
-    )
-    .await
-}
-
-async fn submit_pending_output_poi_context_with_authority(
-    authority: Option<&WalletPrivateMutationAuthority<'_>>,
-    submitter: &dyn PendingOutputPoiSubmitter,
-    chain_id: u64,
-    record: &PendingOutputPoiContextRecord,
-    context: &SingleCommitmentProofContext,
-    observation: &PendingOutputPoiObservation,
-    submitted_list_keys: &[FixedBytes<32>],
-) -> Result<(), PoiError> {
-    let submit = submit_pending_output_poi_context(
+    let submit = submit_pending_output_poi_context_unchecked(
         submitter,
         chain_id,
         record,
@@ -511,12 +590,9 @@ async fn submit_pending_output_poi_context_with_authority(
         observation,
         submitted_list_keys,
     );
-    let Some(authority) = authority else {
-        return submit.await;
-    };
     tokio::select! {
         biased;
-        () = authority.cancel.cancelled() => Err(PoiError::MerkleRootsRejected),
+        () = authority.cancelled() => Err(PoiError::MerkleRootsRejected),
         result = submit => result,
     }
 }
@@ -545,8 +621,8 @@ pub(super) fn new_pending_output_poi_recovery_record(
     }
 }
 
-fn put_pending_output_poi_recovery_record_impl(
-    authority: Option<&WalletPrivateMutationAuthority<'_>>,
+#[cfg(test)]
+fn put_pending_output_poi_recovery_record_unchecked(
     db: &DbStore,
     chain_id: u64,
     record: &PendingOutputPoiContextRecord,
@@ -554,18 +630,6 @@ fn put_pending_output_poi_recovery_record_impl(
     now: u64,
     action: OutputPoiRecoveryAction,
 ) -> Result<(), local_db::DbError> {
-    if let Some(authority) = authority
-        && let Err(reason) = authority.revalidate()
-    {
-        debug!(
-            ?reason,
-            chain_id,
-            wallet_id = %record.wallet_id,
-            commitment = %hex::encode(record.output_commitment),
-            "pending output POI recovery side effect rejected"
-        );
-        return Ok(());
-    }
     let recovery =
         pending_output_poi_recovery_update(db, chain_id, record, observation, now, action)?;
     db.put_output_poi_recovery(&recovery)
@@ -596,35 +660,35 @@ pub(super) fn pending_output_poi_recovery_update(
 }
 
 pub(super) async fn commit_pending_output_poi_side_effects(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    db: &DbStore,
+    permit: &WalletPrivateMutationPermit<'_>,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     pending_updates: &[PendingOutputPoiContextRecord],
     recovery_updates: &[OutputPoiRecoveryRecord],
 ) -> Result<(), WalletCacheError> {
-    let snapshot = authority.handle.utxos.read().await;
-    authority
-        .revalidate()
+    let snapshot = permit
+        .wallet_utxos()
+        .await
         .map_err(|_| WalletCacheError::Crypto)?;
-    cache_store.commit_wallet_private_state(
-        db,
-        WalletPrivateCommit::new(
-            authority,
-            cfg.chain.chain_id,
-            &snapshot,
-            false,
-            authority.handle.last_scanned(),
-            None,
-            pending_updates,
-            &[],
-            recovery_updates,
-        ),
-    )
+    let last_scanned = permit
+        .last_scanned()
+        .map_err(|_| WalletCacheError::Crypto)?;
+    permit.revalidate().map_err(|_| WalletCacheError::Crypto)?;
+    cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
+        permit,
+        cfg.chain.chain_id,
+        &snapshot,
+        false,
+        last_scanned,
+        None,
+        pending_updates,
+        &[],
+        recovery_updates,
+    ))
 }
 
-fn ensure_pending_output_poi_submission_state_impl(
-    authority: Option<&WalletPrivateMutationAuthority<'_>>,
+#[cfg(test)]
+fn ensure_pending_output_poi_submission_state_unchecked(
     db: &DbStore,
     chain_id: u64,
     record: &PendingOutputPoiContextRecord,
@@ -637,8 +701,7 @@ fn ensure_pending_output_poi_submission_state_impl(
     {
         return Ok(());
     }
-    put_pending_output_poi_recovery_record_impl(
-        authority,
+    put_pending_output_poi_recovery_record_unchecked(
         db,
         chain_id,
         record,
@@ -650,7 +713,27 @@ fn ensure_pending_output_poi_submission_state_impl(
     )
 }
 
+#[cfg(test)]
 pub(super) async fn submit_pending_output_poi_context(
+    submitter: &dyn PendingOutputPoiSubmitter,
+    chain_id: u64,
+    record: &PendingOutputPoiContextRecord,
+    context: &SingleCommitmentProofContext,
+    observation: &PendingOutputPoiObservation,
+    submitted_list_keys: &[FixedBytes<32>],
+) -> Result<(), PoiError> {
+    submit_pending_output_poi_context_unchecked(
+        submitter,
+        chain_id,
+        record,
+        context,
+        observation,
+        submitted_list_keys,
+    )
+    .await
+}
+
+async fn submit_pending_output_poi_context_unchecked(
     submitter: &dyn PendingOutputPoiSubmitter,
     chain_id: u64,
     record: &PendingOutputPoiContextRecord,
@@ -741,7 +824,7 @@ pub(super) fn pending_output_poi_context_matches_wallet_utxo(
     })
 }
 
-async fn pending_output_poi_submission_plan_current(
+pub(super) async fn pending_output_poi_submission_plan_current(
     authority: &WalletPrivateMutationAuthority<'_>,
     db: &DbStore,
     cfg: &WalletConfig,
@@ -793,12 +876,23 @@ async fn pending_output_poi_submission_plan_current(
         );
         return Ok(false);
     }
-    let snapshot = authority.handle.utxos.read().await;
+    let snapshot = match authority.wallet_utxos().await {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            debug!(
+                ?reason,
+                chain_id = cfg.chain.chain_id,
+                wallet_id = %cfg.cache_key,
+                commitment = %hex::encode(expected.output_commitment),
+                "pending output POI submission skipped before wallet state check"
+            );
+            return Ok(false);
+        }
+    };
     let matches_current = snapshot.iter().any(|wallet_utxo| {
         !wallet_utxo.is_spent()
             && pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, expected)
     });
-    drop(snapshot);
     if !matches_current {
         debug!(
             chain_id = cfg.chain.chain_id,
@@ -821,6 +915,25 @@ async fn pending_output_poi_submission_plan_current(
     Ok(true)
 }
 
+async fn pending_output_poi_submission_side_effect_current(
+    authority: &WalletPrivateMutationAuthority<'_>,
+    db: &DbStore,
+    expected: &PendingOutputPoiContextRecord,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    submitted_list_keys: &[FixedBytes<32>],
+) -> Result<bool, local_db::DbError> {
+    pending_output_poi_submission_plan_current(
+        authority,
+        db,
+        cfg,
+        active_list_keys,
+        expected,
+        submitted_list_keys,
+    )
+    .await
+}
+
 pub(super) fn pending_output_poi_context_still_current(
     authority: &WalletPrivateMutationAuthority<'_>,
     db: &DbStore,
@@ -828,35 +941,7 @@ pub(super) fn pending_output_poi_context_still_current(
     wallet_id: &str,
     expected: &PendingOutputPoiContextRecord,
 ) -> Result<bool, local_db::DbError> {
-    pending_output_poi_context_still_current_impl(
-        Some(authority),
-        db,
-        chain_id,
-        wallet_id,
-        expected,
-    )
-}
-
-#[cfg(test)]
-pub(super) fn pending_output_poi_context_still_current_unchecked(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    expected: &PendingOutputPoiContextRecord,
-) -> Result<bool, local_db::DbError> {
-    pending_output_poi_context_still_current_impl(None, db, chain_id, wallet_id, expected)
-}
-
-fn pending_output_poi_context_still_current_impl(
-    authority: Option<&WalletPrivateMutationAuthority<'_>>,
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    expected: &PendingOutputPoiContextRecord,
-) -> Result<bool, local_db::DbError> {
-    if let Some(authority) = authority
-        && let Err(reason) = authority.revalidate()
-    {
+    if let Err(reason) = authority.revalidate() {
         debug!(
             ?reason,
             chain_id,
@@ -866,6 +951,25 @@ fn pending_output_poi_context_still_current_impl(
         );
         return Ok(false);
     }
+    pending_output_poi_context_still_current_impl(db, chain_id, wallet_id, expected)
+}
+
+#[cfg(test)]
+pub(super) fn pending_output_poi_context_still_current_unchecked(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    expected: &PendingOutputPoiContextRecord,
+) -> Result<bool, local_db::DbError> {
+    pending_output_poi_context_still_current_impl(db, chain_id, wallet_id, expected)
+}
+
+fn pending_output_poi_context_still_current_impl(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    expected: &PendingOutputPoiContextRecord,
+) -> Result<bool, local_db::DbError> {
     let Some(current) =
         db.get_pending_output_poi_context(chain_id, wallet_id, &expected.output_commitment)?
     else {
@@ -952,8 +1056,8 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
     cache_store: &dyn WalletCacheStore,
     active_list_keys: &[FixedBytes<32>],
 ) -> PendingOutputPoiVerificationOutcome {
-    let guard = match authority.acquire().await {
-        Ok(guard) => guard,
+    let permit = match authority.acquire().await {
+        Ok(permit) => permit,
         Err(reason) => {
             debug!(?reason, cache_key = %cfg.cache_key, "pending output POI verification skipped");
             return PendingOutputPoiVerificationOutcome::default();
@@ -961,40 +1065,43 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
     };
     let outcome = match &cfg.poi_read_source {
         PoiReadSource::IndexedArtifacts(_) => {
-            let local_caches = cfg.local_poi_caches.as_ref().cloned().unwrap_or_else(|| {
+            if !local_poi_caches_available_for_lists(cfg, active_list_keys).await {
                 warn!(
                     cache_key = %cfg.cache_key,
                     chain_id = cfg.chain.chain_id,
-                    "artifact POI read source missing local cache handle"
+                    "artifact POI local cache unavailable; skipping submitted pending output POI verification"
                 );
-                Arc::new(RwLock::new(BTreeMap::new()))
-            });
+                return PendingOutputPoiVerificationOutcome::default();
+            }
+            let Some(local_caches) = cfg.local_poi_caches.as_ref().cloned() else {
+                return PendingOutputPoiVerificationOutcome::default();
+            };
             let reader = LocalPoiStatusReader::new(local_caches);
             verify_submitted_pending_output_pois_inner(
                 authority,
+                &permit,
                 &reader,
                 db,
-                cfg.chain.chain_id,
-                &cfg.cache_key,
+                cfg,
+                cache_store,
                 active_list_keys,
-                Some(PendingOutputPoiProjectionCommit { cfg, cache_store }),
             )
             .await
         }
         PoiReadSource::PoiProxy => {
             verify_submitted_pending_output_pois_inner(
                 authority,
+                &permit,
                 remote_client,
                 db,
-                cfg.chain.chain_id,
-                &cfg.cache_key,
+                cfg,
+                cache_store,
                 active_list_keys,
-                Some(PendingOutputPoiProjectionCommit { cfg, cache_store }),
             )
             .await
         }
     };
-    drop(guard);
+    drop(permit);
     outcome
 }
 
@@ -1007,8 +1114,8 @@ pub(super) async fn verify_submitted_pending_output_pois_authorized(
     wallet_id: &str,
     active_list_keys: &[FixedBytes<32>],
 ) -> PendingOutputPoiVerificationOutcome {
-    let guard = match authority.acquire().await {
-        Ok(guard) => guard,
+    let permit = match authority.acquire().await {
+        Ok(permit) => permit,
         Err(reason) => {
             debug!(
                 ?reason,
@@ -1017,17 +1124,16 @@ pub(super) async fn verify_submitted_pending_output_pois_authorized(
             return PendingOutputPoiVerificationOutcome::default();
         }
     };
-    let outcome = verify_submitted_pending_output_pois_inner(
+    let outcome = verify_submitted_pending_output_pois_check_only(
         authority,
         status_reader,
         db,
         chain_id,
         wallet_id,
         active_list_keys,
-        None,
     )
     .await;
-    drop(guard);
+    drop(permit);
     outcome
 }
 
@@ -1040,8 +1146,8 @@ pub(super) async fn verify_submitted_pending_output_pois_authorized_with_project
     cache_store: &dyn WalletCacheStore,
     active_list_keys: &[FixedBytes<32>],
 ) -> PendingOutputPoiVerificationOutcome {
-    let guard = match authority.acquire().await {
-        Ok(guard) => guard,
+    let permit = match authority.acquire().await {
+        Ok(permit) => permit,
         Err(reason) => {
             debug!(?reason, cache_key = %cfg.cache_key, "pending output POI verification skipped");
             return PendingOutputPoiVerificationOutcome::default();
@@ -1049,15 +1155,15 @@ pub(super) async fn verify_submitted_pending_output_pois_authorized_with_project
     };
     let outcome = verify_submitted_pending_output_pois_inner(
         authority,
+        &permit,
         status_reader,
         db,
-        cfg.chain.chain_id,
-        &cfg.cache_key,
+        cfg,
+        cache_store,
         active_list_keys,
-        Some(PendingOutputPoiProjectionCommit { cfg, cache_store }),
     )
     .await;
-    drop(guard);
+    drop(permit);
     outcome
 }
 
@@ -1081,21 +1187,21 @@ pub(super) async fn verify_submitted_pending_output_pois(
 
 async fn verify_submitted_pending_output_pois_inner(
     authority: &WalletPrivateMutationAuthority<'_>,
+    permit: &WalletPrivateMutationPermit<'_>,
     status_reader: &dyn PoiStatusReader,
     db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
+    cfg: &WalletConfig,
+    cache_store: &dyn WalletCacheStore,
     active_list_keys: &[FixedBytes<32>],
-    projection_commit: Option<PendingOutputPoiProjectionCommit<'_>>,
 ) -> PendingOutputPoiVerificationOutcome {
     verify_submitted_pending_output_pois_impl(
-        Some(authority),
+        authority,
+        permit,
         status_reader,
         db,
-        chain_id,
-        wallet_id,
+        cfg,
+        cache_store,
         active_list_keys,
-        projection_commit,
     )
     .await
 }
@@ -1108,25 +1214,17 @@ async fn verify_submitted_pending_output_pois_unchecked(
     wallet_id: &str,
     active_list_keys: &[FixedBytes<32>],
 ) -> PendingOutputPoiVerificationOutcome {
-    verify_submitted_pending_output_pois_impl(
-        None,
+    verify_submitted_pending_output_pois_unchecked_impl(
         status_reader,
         db,
         chain_id,
         wallet_id,
         active_list_keys,
-        None,
     )
     .await
 }
 
-#[derive(Clone, Copy)]
-struct PendingOutputPoiProjectionCommit<'a> {
-    cfg: &'a WalletConfig,
-    cache_store: &'a dyn WalletCacheStore,
-}
-
-async fn pending_output_poi_context_has_current_wallet_utxo(
+pub(super) async fn pending_output_poi_context_has_current_wallet_utxo(
     authority: &WalletPrivateMutationAuthority<'_>,
     cfg: &WalletConfig,
     record: &PendingOutputPoiContextRecord,
@@ -1141,12 +1239,23 @@ async fn pending_output_poi_context_has_current_wallet_utxo(
         );
         return false;
     }
-    let snapshot = authority.handle.utxos.read().await;
+    let snapshot = match authority.wallet_utxos().await {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            debug!(
+                ?reason,
+                chain_id = cfg.chain.chain_id,
+                wallet_id = %cfg.cache_key,
+                commitment = %hex::encode(record.output_commitment),
+                "pending output POI verification skipped before wallet state check"
+            );
+            return false;
+        }
+    };
     let matches_current = snapshot.iter().any(|wallet_utxo| {
         !wallet_utxo.is_spent()
             && pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, record)
     });
-    drop(snapshot);
     if !matches_current {
         debug!(
             chain_id = cfg.chain.chain_id,
@@ -1171,6 +1280,7 @@ async fn pending_output_poi_context_has_current_wallet_utxo(
 
 async fn commit_verified_pending_output_poi_context(
     authority: &WalletPrivateMutationAuthority<'_>,
+    permit: &WalletPrivateMutationPermit<'_>,
     db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
@@ -1182,7 +1292,19 @@ async fn commit_verified_pending_output_poi_context(
         return Ok(false);
     }
 
-    let mut candidate = authority.handle.utxos.read().await.clone();
+    let mut candidate = match authority.wallet_utxos().await {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            debug!(
+                ?reason,
+                chain_id = cfg.chain.chain_id,
+                wallet_id = %cfg.cache_key,
+                commitment = %hex::encode(record.output_commitment),
+                "verified pending output POI commit skipped before wallet state snapshot"
+            );
+            return Ok(false);
+        }
+    };
     let Some(wallet_utxo) = candidate.iter_mut().find(|wallet_utxo| {
         !wallet_utxo.is_spent()
             && pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, record)
@@ -1229,20 +1351,19 @@ async fn commit_verified_pending_output_poi_context(
         );
         return Ok(false);
     }
-    cache_store.commit_wallet_private_state(
-        db,
-        WalletPrivateCommit::new(
-            authority,
-            cfg.chain.chain_id,
-            &candidate,
-            changed,
-            authority.handle.last_scanned(),
-            None,
-            &[],
-            &pending_context_deletes,
-            &recovery_updates,
-        ),
-    )?;
+    cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
+        permit,
+        cfg.chain.chain_id,
+        &candidate,
+        changed,
+        permit
+            .last_scanned()
+            .map_err(|_| WalletCacheError::Crypto)?,
+        None,
+        &[],
+        &pending_context_deletes,
+        &recovery_updates,
+    ))?;
     if let Err(reason) = authority.revalidate() {
         debug!(
             ?reason,
@@ -1254,21 +1375,338 @@ async fn commit_verified_pending_output_poi_context(
         return Ok(false);
     }
     if changed {
-        let mut locked = authority.handle.utxos.write().await;
-        *locked = candidate;
+        if let Err(reason) = permit.replace_wallet_utxos(candidate).await {
+            debug!(
+                ?reason,
+                chain_id = cfg.chain.chain_id,
+                wallet_id = %cfg.cache_key,
+                commitment = %hex::encode(record.output_commitment),
+                "verified pending output POI runtime swap rejected"
+            );
+            return Ok(false);
+        }
     }
-    authority.handle.notify_if_changed(changed);
+    if let Err(reason) = authority.revalidate() {
+        debug!(
+            ?reason,
+            chain_id = cfg.chain.chain_id,
+            wallet_id = %cfg.cache_key,
+            commitment = %hex::encode(record.output_commitment),
+            "verified pending output POI revision publication rejected"
+        );
+        return Ok(false);
+    }
+    permit
+        .notify_if_changed(changed)
+        .map_err(|_| WalletCacheError::Crypto)?;
     Ok(true)
 }
 
 async fn verify_submitted_pending_output_pois_impl(
-    authority: Option<&WalletPrivateMutationAuthority<'_>>,
+    authority: &WalletPrivateMutationAuthority<'_>,
+    permit: &WalletPrivateMutationPermit<'_>,
+    status_reader: &dyn PoiStatusReader,
+    db: &DbStore,
+    cfg: &WalletConfig,
+    cache_store: &dyn WalletCacheStore,
+    active_list_keys: &[FixedBytes<32>],
+) -> PendingOutputPoiVerificationOutcome {
+    let chain_id = cfg.chain.chain_id;
+    let wallet_id = cfg.cache_key.as_str();
+    let records = match db.list_pending_output_poi_contexts(chain_id, wallet_id) {
+        Ok(records) => records,
+        Err(err) => {
+            warn!(
+                ?err,
+                chain_id, wallet_id, "failed to list pending output POI contexts"
+            );
+            return PendingOutputPoiVerificationOutcome {
+                errors: 1,
+                ..PendingOutputPoiVerificationOutcome::default()
+            };
+        }
+    };
+    let now = now_epoch_secs();
+    let mut outcome = PendingOutputPoiVerificationOutcome::default();
+    for record in records {
+        if record.terminal_error.is_some() || record.submitted_poi_list_keys.is_empty() {
+            continue;
+        }
+        let Some(observation) = record.observation.as_ref() else {
+            continue;
+        };
+        let required_list_keys = record
+            .list_keys()
+            .into_iter()
+            .filter(|list_key| active_list_keys.contains(list_key))
+            .collect::<Vec<_>>();
+        if required_list_keys.is_empty()
+            || required_list_keys
+                .iter()
+                .any(|list_key| !record.submitted_poi_list_keys.contains(list_key))
+        {
+            continue;
+        }
+        let Some(identity) = pending_output_poi_submit_identity(&record, observation) else {
+            continue;
+        };
+        if !pending_output_poi_context_has_current_wallet_utxo(authority, cfg, &record).await {
+            continue;
+        }
+        let statuses = match status_reader
+            .pois_per_list(
+                &record.txid_version,
+                EVM_CHAIN_TYPE,
+                chain_id,
+                &required_list_keys,
+                &[BlindedCommitmentData::transact(
+                    identity.derived_blinded_commitment,
+                )],
+            )
+            .await
+        {
+            Ok(mut statuses) => statuses
+                .remove(&identity.derived_blinded_commitment)
+                .unwrap_or_default(),
+            Err(err) => {
+                outcome.errors += 1;
+                warn!(
+                    ?err,
+                    chain_id,
+                    wallet_id = %record.wallet_id,
+                    commitment = %hex::encode(record.output_commitment),
+                    "failed to verify submitted pending output POI status"
+                );
+                continue;
+            }
+        };
+        match pending_output_poi_context_still_current(authority, db, chain_id, wallet_id, &record)
+        {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                outcome.errors += 1;
+                warn!(
+                    ?err,
+                    chain_id,
+                    wallet_id = %record.wallet_id,
+                    commitment = %hex::encode(record.output_commitment),
+                    "failed to revalidate submitted pending output POI context"
+                );
+                continue;
+            }
+        }
+        let all_valid = required_list_keys
+            .iter()
+            .all(|list_key| statuses.get(list_key) == Some(&PoiStatus::Valid));
+        if all_valid {
+            match commit_verified_pending_output_poi_context(
+                authority,
+                permit,
+                db,
+                cache_store,
+                cfg,
+                &record,
+                &required_list_keys,
+                now,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => {
+                    outcome.errors += 1;
+                    warn!(
+                        ?err,
+                        chain_id,
+                        wallet_id = %record.wallet_id,
+                        commitment = %hex::encode(record.output_commitment),
+                        "failed to commit verified pending output POI projection"
+                    );
+                    continue;
+                }
+            }
+            outcome.completed += 1;
+            debug!(
+                chain_id,
+                wallet_id = %record.wallet_id,
+                output_role = ?record.output_role,
+                commitment = %hex::encode(record.output_commitment),
+                derived_blinded_commitment = %hex::encode(identity.derived_blinded_commitment),
+                list_keys = ?required_list_keys,
+                "verified pending output POI context"
+            );
+        } else {
+            if !pending_output_poi_context_has_current_wallet_utxo(authority, cfg, &record).await {
+                continue;
+            }
+            match db.get_output_poi_recovery(chain_id, &record.wallet_id, &record.output_commitment)
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let recovery_update = match pending_output_poi_recovery_update(
+                        db,
+                        chain_id,
+                        &record,
+                        observation,
+                        now,
+                        OutputPoiRecoveryAction::Submitted {
+                            retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+                        },
+                    ) {
+                        Ok(recovery) => recovery,
+                        Err(err) => {
+                            outcome.errors += 1;
+                            warn!(
+                                ?err,
+                                chain_id,
+                                wallet_id = %record.wallet_id,
+                                commitment = %hex::encode(record.output_commitment),
+                                "failed to prepare pending output POI submission state"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(err) = commit_pending_output_poi_side_effects(
+                        permit,
+                        cache_store,
+                        cfg,
+                        &[],
+                        std::slice::from_ref(&recovery_update),
+                    )
+                    .await
+                    {
+                        outcome.errors += 1;
+                        warn!(
+                            ?err,
+                            chain_id,
+                            wallet_id = %record.wallet_id,
+                            commitment = %hex::encode(record.output_commitment),
+                            "failed to commit pending output POI submission state"
+                        );
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    outcome.errors += 1;
+                    warn!(
+                        ?err,
+                        chain_id,
+                        wallet_id = %record.wallet_id,
+                        commitment = %hex::encode(record.output_commitment),
+                        "failed to load pending output POI submission state"
+                    );
+                    continue;
+                }
+            }
+            outcome.pending += 1;
+        }
+    }
+    if outcome.completed > 0 || outcome.pending > 0 || outcome.errors > 0 {
+        debug!(
+            chain_id,
+            completed = outcome.completed,
+            pending = outcome.pending,
+            errors = outcome.errors,
+            "verified submitted pending output POI contexts"
+        );
+    }
+    outcome
+}
+
+#[cfg(test)]
+async fn verify_submitted_pending_output_pois_check_only(
+    authority: &WalletPrivateMutationAuthority<'_>,
     status_reader: &dyn PoiStatusReader,
     db: &DbStore,
     chain_id: u64,
     wallet_id: &str,
     active_list_keys: &[FixedBytes<32>],
-    projection_commit: Option<PendingOutputPoiProjectionCommit<'_>>,
+) -> PendingOutputPoiVerificationOutcome {
+    let mut outcome = PendingOutputPoiVerificationOutcome::default();
+    let records = match db.list_pending_output_poi_contexts(chain_id, wallet_id) {
+        Ok(records) => records,
+        Err(err) => {
+            warn!(
+                ?err,
+                chain_id, wallet_id, "failed to list pending output POI contexts"
+            );
+            outcome.errors += 1;
+            return outcome;
+        }
+    };
+    for record in records {
+        if record.terminal_error.is_some() || record.submitted_poi_list_keys.is_empty() {
+            continue;
+        }
+        let Some(observation) = record.observation.as_ref() else {
+            continue;
+        };
+        let required_list_keys = record
+            .list_keys()
+            .into_iter()
+            .filter(|list_key| active_list_keys.contains(list_key))
+            .collect::<Vec<_>>();
+        if required_list_keys.is_empty()
+            || required_list_keys
+                .iter()
+                .any(|list_key| !record.submitted_poi_list_keys.contains(list_key))
+        {
+            continue;
+        }
+        let Some(identity) = pending_output_poi_submit_identity(&record, observation) else {
+            continue;
+        };
+        let statuses = match status_reader
+            .pois_per_list(
+                &record.txid_version,
+                EVM_CHAIN_TYPE,
+                chain_id,
+                &required_list_keys,
+                &[BlindedCommitmentData::transact(
+                    identity.derived_blinded_commitment,
+                )],
+            )
+            .await
+        {
+            Ok(mut statuses) => statuses
+                .remove(&identity.derived_blinded_commitment)
+                .unwrap_or_default(),
+            Err(err) => {
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to verify submitted pending output POI status");
+                outcome.errors += 1;
+                continue;
+            }
+        };
+        match pending_output_poi_context_still_current(authority, db, chain_id, wallet_id, &record)
+        {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to revalidate submitted pending output POI context");
+                outcome.errors += 1;
+                continue;
+            }
+        }
+        if required_list_keys
+            .iter()
+            .all(|list_key| statuses.get(list_key) == Some(&PoiStatus::Valid))
+        {
+            outcome.completed += 1;
+        } else {
+            outcome.pending += 1;
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+async fn verify_submitted_pending_output_pois_unchecked_impl(
+    status_reader: &dyn PoiStatusReader,
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    active_list_keys: &[FixedBytes<32>],
 ) -> PendingOutputPoiVerificationOutcome {
     let records = match db.list_pending_output_poi_contexts(chain_id, wallet_id) {
         Ok(records) => records,
@@ -1307,12 +1745,6 @@ async fn verify_submitted_pending_output_pois_impl(
         let Some(identity) = pending_output_poi_submit_identity(&record, observation) else {
             continue;
         };
-        if let (Some(authority), Some(commit)) = (authority, projection_commit)
-            && !pending_output_poi_context_has_current_wallet_utxo(authority, commit.cfg, &record)
-                .await
-        {
-            continue;
-        }
         let statuses = match status_reader
             .pois_per_list(
                 &record.txid_version,
@@ -1329,31 +1761,17 @@ async fn verify_submitted_pending_output_pois_impl(
                 .remove(&identity.derived_blinded_commitment)
                 .unwrap_or_default(),
             Err(err) => {
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to verify submitted pending output POI status");
                 outcome.errors += 1;
-                warn!(
-                    ?err,
-                    chain_id,
-                    wallet_id = %record.wallet_id,
-                    commitment = %hex::encode(record.output_commitment),
-                    "failed to verify submitted pending output POI status"
-                );
                 continue;
             }
         };
-        match pending_output_poi_context_still_current_impl(
-            authority, db, chain_id, wallet_id, &record,
-        ) {
+        match pending_output_poi_context_still_current_unchecked(db, chain_id, wallet_id, &record) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(err) => {
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to revalidate submitted pending output POI context");
                 outcome.errors += 1;
-                warn!(
-                    ?err,
-                    chain_id,
-                    wallet_id = %record.wallet_id,
-                    commitment = %hex::encode(record.output_commitment),
-                    "failed to revalidate submitted pending output POI context"
-                );
                 continue;
             }
         }
@@ -1361,180 +1779,35 @@ async fn verify_submitted_pending_output_pois_impl(
             .iter()
             .all(|list_key| statuses.get(list_key) == Some(&PoiStatus::Valid));
         if all_valid {
-            if let (Some(authority), Some(commit)) = (authority, projection_commit) {
-                match commit_verified_pending_output_poi_context(
-                    authority,
-                    db,
-                    commit.cache_store,
-                    commit.cfg,
-                    &record,
-                    &required_list_keys,
-                    now,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(err) => {
-                        outcome.errors += 1;
-                        warn!(
-                            ?err,
-                            chain_id,
-                            wallet_id = %record.wallet_id,
-                            commitment = %hex::encode(record.output_commitment),
-                            "failed to commit verified pending output POI projection"
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                if let Some(authority) = authority
-                    && let Err(reason) = authority.revalidate()
-                {
-                    debug!(
-                        ?reason,
-                        chain_id,
-                        wallet_id = %record.wallet_id,
-                        commitment = %hex::encode(record.output_commitment),
-                        "pending output POI verification side effect rejected"
-                    );
-                    continue;
-                }
-                if let Err(err) = db.delete_pending_output_poi_context(
-                    chain_id,
-                    wallet_id,
-                    &record.output_commitment,
-                ) {
-                    outcome.errors += 1;
-                    warn!(
-                        ?err,
-                        chain_id,
-                        wallet_id = %record.wallet_id,
-                        commitment = %hex::encode(record.output_commitment),
-                        "failed to delete verified pending output POI context"
-                    );
-                    continue;
-                }
-                if let Ok(Some(mut recovery)) = db.get_output_poi_recovery(
-                    chain_id,
-                    &record.wallet_id,
-                    &record.output_commitment,
-                ) {
-                    recovery.apply_action(OutputPoiRecoveryAction::Valid, now);
-                    if let Err(err) = db.put_output_poi_recovery(&recovery) {
-                        warn!(
-                            ?err,
-                            chain_id,
-                            wallet_id = %record.wallet_id,
-                            commitment = %hex::encode(record.output_commitment),
-                            "failed to mark pending output POI recovery valid"
-                        );
-                    }
+            if let Err(err) =
+                db.delete_pending_output_poi_context(chain_id, wallet_id, &record.output_commitment)
+            {
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to delete verified pending output POI context");
+                outcome.errors += 1;
+                continue;
+            }
+            if let Ok(Some(mut recovery)) =
+                db.get_output_poi_recovery(chain_id, &record.wallet_id, &record.output_commitment)
+            {
+                recovery.apply_action(OutputPoiRecoveryAction::Valid, now);
+                if let Err(err) = db.put_output_poi_recovery(&recovery) {
+                    warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to mark pending output POI recovery valid");
                 }
             }
             outcome.completed += 1;
-            debug!(
-                chain_id,
-                wallet_id = %record.wallet_id,
-                output_role = ?record.output_role,
-                commitment = %hex::encode(record.output_commitment),
-                derived_blinded_commitment = %hex::encode(identity.derived_blinded_commitment),
-                list_keys = ?required_list_keys,
-                "verified pending output POI context"
-            );
         } else {
-            if let (Some(authority), Some(commit)) = (authority, projection_commit) {
-                match db.get_output_poi_recovery(
-                    chain_id,
-                    &record.wallet_id,
-                    &record.output_commitment,
-                ) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        let recovery_update = match pending_output_poi_recovery_update(
-                            db,
-                            chain_id,
-                            &record,
-                            observation,
-                            now,
-                            OutputPoiRecoveryAction::Submitted {
-                                retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-                            },
-                        ) {
-                            Ok(recovery) => recovery,
-                            Err(err) => {
-                                outcome.errors += 1;
-                                warn!(
-                                    ?err,
-                                    chain_id,
-                                    wallet_id = %record.wallet_id,
-                                    commitment = %hex::encode(record.output_commitment),
-                                    "failed to prepare pending output POI submission state"
-                                );
-                                continue;
-                            }
-                        };
-                        if let Err(err) = commit_pending_output_poi_side_effects(
-                            authority,
-                            db,
-                            commit.cache_store,
-                            commit.cfg,
-                            &[],
-                            std::slice::from_ref(&recovery_update),
-                        )
-                        .await
-                        {
-                            outcome.errors += 1;
-                            warn!(
-                                ?err,
-                                chain_id,
-                                wallet_id = %record.wallet_id,
-                                commitment = %hex::encode(record.output_commitment),
-                                "failed to commit pending output POI submission state"
-                            );
-                            continue;
-                        }
-                    }
-                    Err(err) => {
-                        outcome.errors += 1;
-                        warn!(
-                            ?err,
-                            chain_id,
-                            wallet_id = %record.wallet_id,
-                            commitment = %hex::encode(record.output_commitment),
-                            "failed to load pending output POI submission state"
-                        );
-                        continue;
-                    }
-                }
-            } else if let Err(err) = ensure_pending_output_poi_submission_state_impl(
-                authority,
+            if let Err(err) = ensure_pending_output_poi_submission_state_unchecked(
                 db,
                 chain_id,
                 &record,
                 observation,
                 now,
             ) {
+                warn!(?err, chain_id, wallet_id = %record.wallet_id, commitment = %hex::encode(record.output_commitment), "failed to persist pending output POI submission state");
                 outcome.errors += 1;
-                warn!(
-                    ?err,
-                    chain_id,
-                    wallet_id = %record.wallet_id,
-                    commitment = %hex::encode(record.output_commitment),
-                    "failed to persist pending output POI submission state"
-                );
             }
             outcome.pending += 1;
         }
-    }
-    if outcome.completed > 0 || outcome.pending > 0 || outcome.errors > 0 {
-        debug!(
-            chain_id,
-            completed = outcome.completed,
-            pending = outcome.pending,
-            errors = outcome.errors,
-            "verified submitted pending output POI contexts"
-        );
     }
     outcome
 }

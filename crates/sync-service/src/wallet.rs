@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -25,13 +25,14 @@ use railgun_wallet::tx::{
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
 use local_db::{
     DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
+    WalletPendingResetRecord, WalletSyncActorStateRecord,
 };
 use poi::artifacts::SnapshotEvent;
 use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError, PoiCacheIdentity};
@@ -55,11 +56,13 @@ use crate::txid_cache::{
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
 use crate::types::{
-    BackfillEvent, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch,
-    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillRejectReason,
-    WalletBackfillResetResult, WalletCacheStore, WalletConfig, WalletIndexedCatchUpStatus,
-    WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness, WalletReadinessError,
-    WalletScanApply, WalletScanRowsPayload,
+    BackfillEvent, BackfillRequest, IndexedArtifactSourceConfig, PoiReadSource, SharedLogBatch,
+    SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult,
+    WalletBackfillLease, WalletBackfillRejectReason, WalletBackfillResetResult, WalletCacheStore,
+    WalletConfig, WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit,
+    WalletReadiness, WalletReadinessError, WalletResetReplayPlan, WalletResetToken,
+    WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit,
+    WalletSyncToken,
 };
 
 mod delta;
@@ -73,8 +76,11 @@ mod poi_sources;
 mod worker;
 
 use delta::*;
-pub(crate) use handle::WalletPrivateMutationAuthority;
 use handle::*;
+pub(crate) use handle::{
+    WalletAcceptedBackfillJob, WalletActorTokenAuthority, WalletIndexedCatchUpLease,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
+};
 use local_poi_cache::*;
 use output_poi_recovery::*;
 use pending_output_poi::*;

@@ -19,6 +19,8 @@ const MERKLE_FOREST_INDEX_TABLE: TableDefinition<&str, &[u8]> =
 const ZKEY_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zkey_index");
 const WALLET_UTXO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_utxo");
 const WALLET_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_meta");
+const WALLET_SYNC_ACTOR_STATE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("wallet_sync_actor_state_v1");
 const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_pending");
 const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
@@ -41,6 +43,7 @@ pub enum LocalDbTable {
     ZkeyIndex,
     WalletUtxo,
     WalletMeta,
+    WalletSyncActorState,
     PendingFeeNoteAssurance,
     TerminalFeeNoteAssurance,
     PendingOutputPoiContext,
@@ -58,6 +61,7 @@ pub enum LocalDbTableDecodeKind {
     ZkeyMeta,
     WalletUtxo,
     WalletMeta,
+    WalletSyncActorState,
     PendingFeeNoteAssurance,
     TerminalFeeNoteAssurance,
     PendingOutputPoiContext,
@@ -106,6 +110,11 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::WalletMeta,
     },
     LocalDbTableInfo {
+        table: LocalDbTable::WalletSyncActorState,
+        name: "wallet_sync_actor_state_v1",
+        decode_kind: LocalDbTableDecodeKind::WalletSyncActorState,
+    },
+    LocalDbTableInfo {
         table: LocalDbTable::PendingFeeNoteAssurance,
         name: "fee_note_assurance_pending",
         decode_kind: LocalDbTableDecodeKind::PendingFeeNoteAssurance,
@@ -152,6 +161,7 @@ impl LocalDbTable {
             Self::ZkeyIndex => ZKEY_INDEX_TABLE,
             Self::WalletUtxo => WALLET_UTXO_TABLE,
             Self::WalletMeta => WALLET_META_TABLE,
+            Self::WalletSyncActorState => WALLET_SYNC_ACTOR_STATE_TABLE,
             Self::PendingFeeNoteAssurance => PENDING_FEE_NOTE_ASSURANCE_TABLE,
             Self::TerminalFeeNoteAssurance => TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
             Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
@@ -177,7 +187,7 @@ const META_KEY: &str = "meta";
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct DbConfig {
@@ -255,6 +265,8 @@ pub struct BlobMeta {
     pub source_hash: Option<[u8; 32]>,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub last_accessed_at: u64,
     pub last_block: Option<u64>,
 }
 
@@ -287,6 +299,44 @@ pub struct WalletMeta {
     pub updated_at: u64,
     #[serde(default)]
     pub last_scanned_block_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalletPendingResetRecord {
+    pub intent_id: u64,
+    pub from_block: u64,
+    #[serde(default)]
+    pub replay_start_block: u64,
+    #[serde(default)]
+    pub replay_target_block: u64,
+    #[serde(default)]
+    pub follow_safe_head: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalletSyncActorStateRecord {
+    pub chain_id: u64,
+    pub wallet_id: String,
+    pub highest_accepted_reset_intent: u64,
+    pub pending_reset: Option<WalletPendingResetRecord>,
+    pub updated_at: u64,
+}
+
+impl WalletSyncActorStateRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(self.chain_id, &self.wallet_id)
+    }
+
+    #[must_use]
+    pub fn key_for(chain_id: u64, wallet_id: &str) -> String {
+        format!("{chain_id}|{wallet_id}")
+    }
+
+    #[must_use]
+    pub fn prefix_for_chain(chain_id: u64) -> String {
+        format!("{chain_id}|")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -970,11 +1020,23 @@ impl DbStore {
         wallet_id: &str,
         utxos: Option<&[(String, Vec<u8>)]>,
         meta: Option<&WalletMeta>,
+        sync_actor_state: Option<&WalletSyncActorStateRecord>,
         pending_output_context_updates: &[PendingOutputPoiContextRecord],
         pending_output_context_delete_chain_id: u64,
         pending_output_context_deletes: &[FixedBytes<32>],
         output_poi_recovery_updates: &[OutputPoiRecoveryRecord],
     ) -> Result<(), DbError> {
+        if let Some(state) = sync_actor_state
+            && (state.chain_id != pending_output_context_delete_chain_id
+                || state.wallet_id != wallet_id)
+        {
+            return Err(DbError::InvalidWalletPrivateCommitNamespace {
+                expected_chain_id: pending_output_context_delete_chain_id,
+                expected_wallet_id: wallet_id.to_string(),
+                actual_chain_id: state.chain_id,
+                actual_wallet_id: state.wallet_id.clone(),
+            });
+        }
         for record in pending_output_context_updates {
             if record.chain_id != pending_output_context_delete_chain_id
                 || record.wallet_id != wallet_id
@@ -1015,6 +1077,13 @@ impl DbStore {
                 let data = encode(meta)?;
                 let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
                 meta_table.insert(wallet_id, data.as_slice())?;
+            }
+
+            if let Some(state) = sync_actor_state {
+                let key = state.key();
+                let data = encode(state)?;
+                let mut state_table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
+                state_table.insert(key.as_str(), data.as_slice())?;
             }
 
             if !pending_output_context_updates.is_empty()
@@ -1085,6 +1154,43 @@ impl DbStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub fn get_wallet_sync_actor_state(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+    ) -> Result<Option<WalletSyncActorStateRecord>, DbError> {
+        let key = WalletSyncActorStateRecord::key_for(chain_id, wallet_id);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(decode(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_wallet_sync_actor_state(
+        &self,
+        record: &WalletSyncActorStateRecord,
+    ) -> Result<(), DbError> {
+        let key = record.key();
+        let data = encode(record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_wallet_sync_actor_states_for_chain(
+        &self,
+        chain_id: u64,
+    ) -> Result<Vec<WalletSyncActorStateRecord>, DbError> {
+        let prefix = WalletSyncActorStateRecord::prefix_for_chain(chain_id);
+        self.list_decoded_by_prefix(WALLET_SYNC_ACTOR_STATE_TABLE, &prefix)
     }
 
     pub fn get_poi_artifact_cache(
@@ -1481,6 +1587,7 @@ impl DbStore {
         txn.open_table(ZKEY_INDEX_TABLE)?;
         txn.open_table(WALLET_UTXO_TABLE)?;
         txn.open_table(WALLET_META_TABLE)?;
+        txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
         txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;

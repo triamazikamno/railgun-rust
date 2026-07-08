@@ -2,6 +2,7 @@ use super::{
     CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, OutputPoiRecoveryRecord,
     OutputPoiRecoveryStatus, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
     PendingOutputPoiRole, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, WalletMeta,
+    WalletPendingResetRecord, WalletSyncActorStateRecord,
 };
 use alloy::primitives::{Bytes, FixedBytes, U256};
 use alloy::uint;
@@ -409,6 +410,56 @@ fn app_settings_records_are_transactional_plaintext_records() {
             .expect("load deleted settings")
             .is_none()
     );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_sync_actor_state_records_round_trip_and_list_by_chain() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+
+    let record = WalletSyncActorStateRecord {
+        chain_id: 1,
+        wallet_id: "wallet-a".to_string(),
+        highest_accepted_reset_intent: 9,
+        pending_reset: Some(WalletPendingResetRecord {
+            intent_id: 9,
+            from_block: 42,
+            replay_start_block: 40,
+            replay_target_block: 100,
+            follow_safe_head: true,
+        }),
+        updated_at: 123,
+    };
+    store
+        .put_wallet_sync_actor_state(&record)
+        .expect("store wallet sync actor state");
+    store
+        .put_wallet_sync_actor_state(&WalletSyncActorStateRecord {
+            chain_id: 2,
+            wallet_id: "wallet-b".to_string(),
+            highest_accepted_reset_intent: 1,
+            pending_reset: None,
+            updated_at: 456,
+        })
+        .expect("store other chain wallet sync actor state");
+
+    assert_eq!(
+        store
+            .get_wallet_sync_actor_state(1, "wallet-a")
+            .expect("load wallet sync actor state")
+            .expect("wallet sync actor state present"),
+        record
+    );
+    let chain_records = store
+        .list_wallet_sync_actor_states_for_chain(1)
+        .expect("list wallet sync actor states");
+    assert_eq!(chain_records, vec![record]);
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

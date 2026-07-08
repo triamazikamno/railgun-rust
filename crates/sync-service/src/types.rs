@@ -5,7 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, FixedBytes, U256, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
-use local_db::{DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, WalletMeta};
+use local_db::{
+    DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, WalletMeta,
+    WalletSyncActorStateRecord,
+};
 use poi::cache::PoiCache;
 #[cfg(test)]
 use railgun_wallet::scan::WalletLogDelta;
@@ -16,6 +19,7 @@ use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use url::Url;
 
 use crate::indexed_artifacts::{ChainScope, ChainType};
+use crate::wallet::{WalletAcceptedBackfillJob, WalletActorTokenAuthority};
 
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
 
@@ -542,16 +546,37 @@ pub struct WalletPrivateCommit<'a> {
     replace_wallet_utxos: bool,
     last_scanned_block: u64,
     last_scanned_block_hash: Option<[u8; 32]>,
+    sync_actor_state: Option<&'a WalletSyncActorStateRecord>,
     pending_output_context_chain_id: u64,
     pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
     pending_output_context_deletes: &'a [FixedBytes<32>],
     output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
 }
 
+pub struct WalletSyncActorStateCommit<'a> {
+    state: &'a WalletSyncActorStateRecord,
+}
+
+impl<'a> WalletSyncActorStateCommit<'a> {
+    #[must_use]
+    pub(crate) fn new(
+        permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
+        state: &'a WalletSyncActorStateRecord,
+    ) -> Self {
+        debug_assert_eq!(permit.wallet_id(), state.wallet_id.as_str());
+        Self { state }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &WalletSyncActorStateRecord {
+        self.state
+    }
+}
+
 impl<'a> WalletPrivateCommit<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        authority: &'a crate::wallet::WalletPrivateMutationAuthority<'_>,
+        permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
         chain_id: u64,
         utxos: &'a [WalletUtxo],
         replace_wallet_utxos: bool,
@@ -562,11 +587,12 @@ impl<'a> WalletPrivateCommit<'a> {
         output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
     ) -> Self {
         Self {
-            wallet_id: authority.wallet_id(),
+            wallet_id: permit.wallet_id(),
             utxos,
             replace_wallet_utxos,
             last_scanned_block,
             last_scanned_block_hash,
+            sync_actor_state: None,
             pending_output_context_chain_id: chain_id,
             pending_output_context_updates,
             pending_output_context_deletes,
@@ -600,6 +626,20 @@ impl<'a> WalletPrivateCommit<'a> {
     }
 
     #[must_use]
+    pub const fn with_sync_actor_state(
+        mut self,
+        sync_actor_state: &'a WalletSyncActorStateRecord,
+    ) -> Self {
+        self.sync_actor_state = Some(sync_actor_state);
+        self
+    }
+
+    #[must_use]
+    pub const fn sync_actor_state(&self) -> Option<&WalletSyncActorStateRecord> {
+        self.sync_actor_state
+    }
+
+    #[must_use]
     pub const fn pending_output_context_chain_id(&self) -> u64 {
         self.pending_output_context_chain_id
     }
@@ -623,19 +663,28 @@ impl<'a> WalletPrivateCommit<'a> {
 pub trait WalletCacheStore: Send + Sync {
     fn commit_wallet_private_state(
         &self,
-        db: &DbStore,
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError>;
 
     fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
 
     fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError>;
+
+    fn get_wallet_sync_actor_state(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+    ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError>;
+
+    fn put_wallet_sync_actor_state(
+        &self,
+        commit: WalletSyncActorStateCommit<'_>,
+    ) -> Result<(), WalletCacheError>;
 }
 
 impl WalletCacheStore for DbStore {
     fn commit_wallet_private_state(
         &self,
-        _db: &DbStore,
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
         let utxo_entries = if commit.replace_wallet_utxos() {
@@ -652,6 +701,7 @@ impl WalletCacheStore for DbStore {
             commit.wallet_id(),
             utxo_entries.as_deref(),
             Some(&meta),
+            commit.sync_actor_state(),
             commit.pending_output_context_updates(),
             commit.pending_output_context_chain_id(),
             commit.pending_output_context_deletes(),
@@ -666,6 +716,23 @@ impl WalletCacheStore for DbStore {
 
     fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
         Ok(DbStore::get_wallet_meta(self, wallet_id)?)
+    }
+
+    fn get_wallet_sync_actor_state(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+    ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError> {
+        Ok(DbStore::get_wallet_sync_actor_state(
+            self, chain_id, wallet_id,
+        )?)
+    }
+
+    fn put_wallet_sync_actor_state(
+        &self,
+        commit: WalletSyncActorStateCommit<'_>,
+    ) -> Result<(), WalletCacheError> {
+        Ok(DbStore::put_wallet_sync_actor_state(self, commit.state())?)
     }
 }
 
@@ -1155,6 +1222,11 @@ impl WalletBackfillApplyResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletBackfillFinishResult {
+    Accepted {
+        committed_to: u64,
+        target_block: u64,
+        job: WalletAcceptedBackfillJob,
+    },
     Ready {
         committed_to: u64,
     },
@@ -1168,7 +1240,17 @@ impl WalletBackfillFinishResult {
     #[must_use]
     pub const fn committed_to(&self) -> u64 {
         match self {
-            Self::Ready { committed_to } | Self::Rejected { committed_to, .. } => *committed_to,
+            Self::Accepted { committed_to, .. }
+            | Self::Ready { committed_to }
+            | Self::Rejected { committed_to, .. } => *committed_to,
+        }
+    }
+
+    #[must_use]
+    pub const fn accepted_job(&self) -> Option<WalletAcceptedBackfillJob> {
+        match self {
+            Self::Accepted { job, .. } => Some(*job),
+            Self::Ready { .. } | Self::Rejected { .. } => None,
         }
     }
 }
@@ -1188,6 +1270,15 @@ pub enum WalletBackfillResetResult {
 
 impl WalletBackfillResetResult {
     #[must_use]
+    pub const fn committed_to(&self) -> u64 {
+        match self {
+            Self::Accepted { committed_to, .. } | Self::Rejected { committed_to, .. } => {
+                *committed_to
+            }
+        }
+    }
+
+    #[must_use]
     pub const fn reset_generation(&self) -> Option<u64> {
         match self {
             Self::Accepted {
@@ -1195,6 +1286,17 @@ impl WalletBackfillResetResult {
             } => Some(*reset_generation),
             Self::Rejected { .. } => None,
         }
+    }
+
+    #[must_use]
+    pub const fn committed(&self) -> bool {
+        matches!(
+            self,
+            Self::Accepted {
+                committed: true,
+                ..
+            }
+        )
     }
 }
 
@@ -1226,21 +1328,192 @@ impl WalletReadiness {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct WalletSyncToken {
+    chain_id: u64,
+    actor_id: u64,
+    reset_generation: u64,
+    job_id: u64,
+}
+
+impl WalletSyncToken {
+    #[must_use]
+    pub(crate) fn mint(
+        authority: WalletActorTokenAuthority<'_>,
+        reset_generation: u64,
+        job_id: u64,
+    ) -> Self {
+        Self {
+            chain_id: authority.chain_id(),
+            actor_id: authority.actor_id(),
+            reset_generation,
+            job_id,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_test(
+        chain_id: u64,
+        actor_id: u64,
+        reset_generation: u64,
+        job_id: u64,
+    ) -> Self {
+        Self {
+            chain_id,
+            actor_id,
+            reset_generation,
+            job_id,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn chain_id(self) -> u64 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub(crate) const fn actor_id(self) -> u64 {
+        self.actor_id
+    }
+
+    #[must_use]
+    pub(crate) const fn reset_generation(self) -> u64 {
+        self.reset_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn job_id(self) -> u64 {
+        self.job_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct WalletResetToken {
+    chain_id: u64,
+    actor_id: u64,
+    intent_id: u64,
+}
+
+impl WalletResetToken {
+    #[must_use]
+    pub(crate) fn mint(authority: WalletActorTokenAuthority<'_>, intent_id: u64) -> Self {
+        Self {
+            chain_id: authority.chain_id(),
+            actor_id: authority.actor_id(),
+            intent_id,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_test(chain_id: u64, actor_id: u64, intent_id: u64) -> Self {
+        Self {
+            chain_id,
+            actor_id,
+            intent_id,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn chain_id(self) -> u64 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub(crate) const fn actor_id(self) -> u64 {
+        self.actor_id
+    }
+
+    #[must_use]
+    pub(crate) const fn intent_id(self) -> u64 {
+        self.intent_id
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WalletBackfillLease {
+    token: WalletSyncToken,
+    sender: mpsc::Sender<BackfillEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalletResetReplayPlan {
+    pub(crate) start_block: u64,
+    pub(crate) target_block: u64,
+    pub(crate) follow_safe_head: bool,
+}
+
+impl WalletResetReplayPlan {
+    #[must_use]
+    pub(crate) const fn new(start_block: u64, target_block: u64, follow_safe_head: bool) -> Self {
+        Self {
+            start_block,
+            target_block,
+            follow_safe_head,
+        }
+    }
+}
+
+impl WalletBackfillLease {
+    pub(crate) fn for_actor_accepted_job(
+        job: WalletAcceptedBackfillJob,
+        sender: mpsc::Sender<BackfillEvent>,
+    ) -> Self {
+        Self {
+            token: job.token(),
+            sender,
+        }
+    }
+
+    pub(crate) const fn token(&self) -> WalletSyncToken {
+        self.token
+    }
+
+    pub(crate) fn supersedes(&self, active: &Self) -> bool {
+        let incoming = self.token();
+        let active = active.token();
+        (
+            incoming.chain_id(),
+            incoming.actor_id(),
+            incoming.reset_generation(),
+            incoming.job_id(),
+        ) > (
+            active.chain_id(),
+            active.actor_id(),
+            active.reset_generation(),
+            active.job_id(),
+        )
+    }
+
+    pub(crate) fn sender(&self) -> &mpsc::Sender<BackfillEvent> {
+        &self.sender
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum BackfillEvent {
     Apply {
         apply: WalletScanApply,
-        reset_generation: u64,
+        token: WalletSyncToken,
         response: oneshot::Sender<WalletBackfillApplyResult>,
     },
     Target {
         target_block: u64,
-        reset_generation: u64,
+        token: WalletSyncToken,
         response: oneshot::Sender<WalletBackfillFinishResult>,
     },
+    JobFailed {
+        token: WalletSyncToken,
+        reason: WalletReadinessError,
+    },
+    JobRetired {
+        token: WalletSyncToken,
+    },
     Reset {
-        intent_id: u64,
+        token: WalletResetToken,
         from_block: u64,
+        replay_plan: WalletResetReplayPlan,
         response: oneshot::Sender<WalletBackfillResetResult>,
     },
 }
@@ -1253,11 +1526,29 @@ pub(crate) enum BackfillRequest {
         to_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
-        reset_generation: u64,
-        progress_tx: Option<SyncProgressSender>,
-        sender: mpsc::Sender<BackfillEvent>,
+        lease: WalletBackfillLease,
     },
     Remove {
         cache_key: String,
     },
+}
+
+impl BackfillRequest {
+    pub(crate) fn add(
+        cache_key: impl Into<String>,
+        from_block: u64,
+        to_block: u64,
+        follow_safe_head: bool,
+        progress_start_block: u64,
+        lease: WalletBackfillLease,
+    ) -> Self {
+        Self::Add {
+            cache_key: cache_key.into(),
+            from_block,
+            to_block,
+            follow_safe_head,
+            progress_start_block,
+            lease,
+        }
+    }
 }

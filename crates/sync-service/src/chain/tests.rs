@@ -47,12 +47,13 @@ use crate::indexed_artifacts::{
 };
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, ChainKey, IndexedArtifactManifestSource,
-    IndexedArtifactSourceConfig, LogBatch, PoiReadSource, SyncProgressStage,
-    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillRejectReason,
-    WalletConfig, WalletIndexedCatchUpSource, WalletReadiness, WalletReadinessError,
-    WalletScanApply, WalletScanRowsPayload,
+    IndexedArtifactSourceConfig, LogBatch, PoiReadSource, WalletBackfillApplyResult,
+    WalletBackfillFinishResult, WalletBackfillLease, WalletBackfillRejectReason, WalletConfig,
+    WalletIndexedCatchUpSource, WalletReadiness, WalletReadinessError, WalletScanApply,
+    WalletScanRowsPayload, WalletSyncToken,
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
+use crate::wallet::WalletAcceptedBackfillJob;
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
@@ -61,11 +62,32 @@ fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBack
         target_block,
         follow_safe_head,
         100,
-        0,
-        None,
-        sender,
+        test_backfill_lease(sender, 0, 1),
         std::time::Instant::now(),
     )
+}
+
+fn test_sync_token(reset_generation: u64, job_id: u64) -> WalletSyncToken {
+    WalletSyncToken::for_test(1, 1, reset_generation, job_id)
+}
+
+fn test_backfill_lease(
+    sender: mpsc::Sender<BackfillEvent>,
+    reset_generation: u64,
+    job_id: u64,
+) -> WalletBackfillLease {
+    WalletBackfillLease::for_actor_accepted_job(
+        WalletAcceptedBackfillJob::for_test(test_sync_token(reset_generation, job_id)),
+        sender,
+    )
+}
+
+fn test_scope() -> ChainScope {
+    ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::ZERO,
+    }
 }
 
 #[test]
@@ -120,7 +142,14 @@ fn zero_wallet_backfill_target_initializes_from_safe_head() {
 #[test]
 fn wallet_backfill_persistence_retry_keeps_replay_start() {
     let now = std::time::Instant::now();
-    let mut cursor = WalletBackfill::new(100, 120, false, 100, 1, None, mpsc::channel(1).0, now);
+    let mut cursor = WalletBackfill::new(
+        100,
+        120,
+        false,
+        100,
+        test_backfill_lease(mpsc::channel(1).0, 1, 1),
+        now,
+    );
 
     cursor.retry_after_rejected_apply(120, now);
 
@@ -130,7 +159,14 @@ fn wallet_backfill_persistence_retry_keeps_replay_start() {
 #[test]
 fn wallet_backfill_retryable_finish_rewinds_cursor_instead_of_removing() {
     let now = std::time::Instant::now();
-    let mut cursor = WalletBackfill::new(121, 120, false, 100, 1, None, mpsc::channel(1).0, now);
+    let mut cursor = WalletBackfill::new(
+        121,
+        120,
+        false,
+        100,
+        test_backfill_lease(mpsc::channel(1).0, 1, 1),
+        now,
+    );
     let result = WalletBackfillFinishResult::Rejected {
         committed_to: 120,
         reason: WalletBackfillRejectReason::PersistenceFailed,
@@ -239,6 +275,8 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         service.register_wallet(cfg.clone()),
         service.register_wallet(cfg),
     );
+    let first = first.expect("register first wallet");
+    let second = second.expect("register second wallet");
 
     assert_eq!(first.actor_id(), second.actor_id());
     assert_eq!(first.actor_id(), 1);
@@ -256,38 +294,10 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn wallet_backfill_progress_tracks_cursor_range() {
-    let (sender, _receiver) = mpsc::channel(1);
-    let (progress_tx, progress_rx) = watch::channel(None);
-    let mut cursor = WalletBackfill::new(
-        100,
-        0,
-        false,
-        100,
-        0,
-        Some(progress_tx),
-        sender,
-        std::time::Instant::now(),
-    );
-
-    cursor.send_progress(100);
-    assert!(progress_rx.borrow().is_none());
-
-    cursor.refresh_target(200);
-    cursor.send_progress(150);
-
-    let progress = (*progress_rx.borrow()).expect("progress update should be emitted");
-    assert_eq!(progress.stage, SyncProgressStage::IndexingUtxos);
-    assert_eq!(progress.start_block, 100);
-    assert_eq!(progress.current_block, 150);
-    assert_eq!(progress.target_block, 200);
-}
-
-#[test]
-fn active_backfill_drains_reset_replacement_request() {
+#[tokio::test]
+async fn active_backfill_drains_reset_replacement_request() {
     let (request_tx, mut request_rx) = mpsc::channel(4);
-    let (old_sender, _old_receiver) = mpsc::channel(1);
+    let (old_sender, mut old_receiver) = mpsc::channel(1);
     let (new_sender, _new_receiver) = mpsc::channel(1);
     let mut cursors = HashMap::new();
     cursors.insert(
@@ -297,9 +307,7 @@ fn active_backfill_drains_reset_replacement_request() {
             1_000,
             true,
             100,
-            0,
-            None,
-            old_sender,
+            test_backfill_lease(old_sender, 0, 1),
             std::time::Instant::now(),
         ),
     );
@@ -311,20 +319,71 @@ fn active_backfill_drains_reset_replacement_request() {
             to_block: 150,
             follow_safe_head: true,
             progress_start_block: 80,
-            reset_generation: 1,
-            progress_tx: None,
-            sender: new_sender,
+            lease: test_backfill_lease(new_sender, 1, 2),
         })
         .expect("queue reset replacement backfill");
 
-    drain_pending_backfill_requests(&mut request_rx, &mut cursors);
+    drain_pending_backfill_requests(&mut request_rx, &mut cursors).await;
 
     let cursor = cursors.get("test").expect("cursor retained");
     assert_eq!(cursor.from_block, 80);
     assert_eq!(cursor.target_block, 150);
     assert!(cursor.follow_safe_head);
     assert_eq!(cursor.progress_start_block, 80);
-    assert_eq!(cursor.reset_generation, 1);
+    assert_eq!(cursor.lease.token().reset_generation(), 1);
+    match old_receiver.recv().await.expect("old job retired") {
+        BackfillEvent::JobRetired { token } => {
+            assert_eq!(token.job_id(), 1);
+            assert_eq!(token.reset_generation(), 0);
+        }
+        event => panic!("unexpected retirement event: {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn active_backfill_ignores_stale_replacement_request() {
+    let (request_tx, mut request_rx) = mpsc::channel(4);
+    let (active_sender, mut active_receiver) = mpsc::channel(1);
+    let (stale_sender, mut stale_receiver) = mpsc::channel(1);
+    let mut cursors = HashMap::new();
+    cursors.insert(
+        "test".to_string(),
+        WalletBackfill::new(
+            100,
+            1_000,
+            true,
+            100,
+            test_backfill_lease(active_sender, 1, 2),
+            std::time::Instant::now(),
+        ),
+    );
+
+    request_tx
+        .try_send(BackfillRequest::Add {
+            cache_key: "test".to_string(),
+            from_block: 80,
+            to_block: 150,
+            follow_safe_head: true,
+            progress_start_block: 80,
+            lease: test_backfill_lease(stale_sender, 0, 1),
+        })
+        .expect("queue stale replacement backfill");
+
+    drain_pending_backfill_requests(&mut request_rx, &mut cursors).await;
+
+    let cursor = cursors.get("test").expect("active cursor retained");
+    assert_eq!(cursor.from_block, 100);
+    assert_eq!(cursor.target_block, 1_000);
+    assert_eq!(cursor.lease.token().reset_generation(), 1);
+    assert_eq!(cursor.lease.token().job_id(), 2);
+    match stale_receiver.recv().await.expect("stale job retired") {
+        BackfillEvent::JobRetired { token } => {
+            assert_eq!(token.job_id(), 1);
+            assert_eq!(token.reset_generation(), 0);
+        }
+        event => panic!("unexpected retirement event: {event:?}"),
+    }
+    assert!(active_receiver.try_recv().is_err());
 }
 
 #[test]
@@ -344,9 +403,7 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
         160,
         true,
         100,
-        0,
-        None,
-        sender,
+        test_backfill_lease(sender, 0, 1),
         now - std::time::Duration::from_secs(20),
     );
 
@@ -749,6 +806,7 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
         to_block_hash: None,
         read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
     });
+    let token = test_sync_token(0, 1);
 
     assert_eq!(
         send_wallet_scan_apply(
@@ -756,7 +814,7 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
             &sender,
             WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
                 .expect("normalize empty log payload"),
-            0,
+            token,
         )
         .await,
         WalletBackfillApplyResult::Rejected {
@@ -765,7 +823,7 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
         }
     );
     assert_eq!(
-        send_wallet_target("test", &sender, 105, 0).await,
+        send_wallet_target("test", &sender, 105, token).await,
         WalletBackfillFinishResult::Rejected {
             committed_to: 104,
             reason: WalletBackfillRejectReason::Shutdown,
@@ -874,7 +932,9 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         worker_cancel.clone(),
         Vec::new(),
         99,
-    );
+    )
+    .await
+    .expect("spawn wallet a");
     let wallet_b = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
@@ -893,7 +953,9 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         worker_cancel.clone(),
         Vec::new(),
         119,
-    );
+    )
+    .await
+    .expect("spawn wallet b");
     spawn_backfill_loop(
         Arc::clone(&service),
         backfill_request_rx,
@@ -902,6 +964,16 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         safe_head_rx,
         loop_cancel.clone(),
     );
+    let wallet_a_token = wallet_a.mint_sync_token(0);
+    let wallet_b_token = wallet_b.mint_sync_token(0);
+    let wallet_a_job = send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token)
+        .await
+        .accepted_job()
+        .expect("wallet A target accepted");
+    let wallet_b_job = send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token)
+        .await
+        .accepted_job()
+        .expect("wallet B target accepted");
     backfill_request_tx
         .send(BackfillRequest::Add {
             cache_key: "wallet-a".to_string(),
@@ -909,9 +981,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             to_block: 199,
             follow_safe_head: false,
             progress_start_block: 100,
-            reset_generation: 0,
-            progress_tx: None,
-            sender: wallet_a_tx,
+            lease: WalletBackfillLease::for_actor_accepted_job(wallet_a_job, wallet_a_tx),
         })
         .await
         .expect("send wallet A backfill request");
@@ -922,9 +992,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             to_block: 130,
             follow_safe_head: false,
             progress_start_block: 120,
-            reset_generation: 0,
-            progress_tx: None,
-            sender: wallet_b_tx,
+            lease: WalletBackfillLease::for_actor_accepted_job(wallet_b_job, wallet_b_tx),
         })
         .await
         .expect("send wallet B backfill request");
@@ -1063,7 +1131,9 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         worker_cancel.clone(),
         Vec::new(),
         100,
-    );
+    )
+    .await
+    .expect("spawn wallet worker");
 
     let checkpoint = service
         .indexed_wallet_catch_up(
@@ -1087,7 +1157,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             .borrow()
             .as_ref()
             .map(|status| status.source),
-        None
+        Some(WalletIndexedCatchUpSource::Squid)
     );
     let probe_request = squid
         .requests
@@ -1205,7 +1275,9 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         worker_cancel.clone(),
         Vec::new(),
         100,
-    );
+    )
+    .await
+    .expect("spawn wallet worker");
     let catch_up_service = Arc::clone(&service);
     let catch_up_cfg = wallet_cfg.clone();
     let catch_up_handle = handle.clone();
@@ -1262,6 +1334,77 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     worker_cancel.cancel();
     drop(db);
     drop(artifact_source.server);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
+    let root_dir = temp_db_root("cached-coverage-no-intermediate-ready");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+    let cfg = test_wallet_config(&scope, Url::parse("http://127.0.0.1:1").expect("url"));
+    public_data_plane
+        .record_public_scan_coverage(PublicScanCoverageWrite {
+            range: PublicScanRange::new(101, 150),
+            source: PublicScanSource::Rpc,
+            row_count: 0,
+            read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
+        })
+        .await
+        .expect("record cached coverage");
+    let (_live_tx, live_rx) = broadcast::channel(8);
+    let (backfill_tx, backfill_rx) = mpsc::channel(8);
+    let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let handle = spawn_wallet_worker(
+        WalletWorkerServices {
+            db: Arc::clone(&db),
+            rpcs,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            backfill_tx: backfill_request_tx,
+            backfill_sender: backfill_tx.clone(),
+            public_data_plane: public_data_plane.clone(),
+        },
+        cfg.clone(),
+        1,
+        live_rx,
+        backfill_rx,
+        cancel.clone(),
+        Vec::new(),
+        100,
+    )
+    .await
+    .expect("spawn wallet worker");
+
+    let outcome = service
+        .apply_cached_public_scan_coverage(&cfg, 0, 100, 200, &handle, &backfill_tx, 0)
+        .await;
+
+    assert_eq!(outcome.checkpoint, 150);
+    assert!(!outcome.finished);
+    assert_eq!(handle.last_scanned(), 150);
+    assert_eq!(handle.readiness(), WalletReadiness::Syncing);
+    assert!(!*handle.ready_rx.borrow());
+
+    cancel.cancel();
+    drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
@@ -1714,6 +1857,48 @@ async fn chain_shutdown_waits_for_live_log_worker() {
 
 #[tokio::test]
 async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs() {
+    let root_dir = temp_db_root("wallet-startup-events-token");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cancel = CancellationToken::new();
+    let (_live_tx, live_rx) = broadcast::channel(1);
+    let (worker_tx, worker_rx) = mpsc::channel(1);
+    let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
+    let scope = test_scope();
+    let handle = spawn_wallet_worker(
+        WalletWorkerServices {
+            db: Arc::clone(&db),
+            rpcs: Arc::new(QueryRpcPool::new(
+                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                Duration::from_secs(1),
+            )),
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            backfill_tx: backfill_request_tx,
+            backfill_sender: worker_tx,
+            public_data_plane: ChainPublicDataPlane::new(
+                Arc::clone(&db),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        },
+        test_wallet_config(
+            &scope,
+            Url::parse("http://127.0.0.1:1").expect("quick sync url"),
+        ),
+        1,
+        live_rx,
+        worker_rx,
+        cancel.clone(),
+        Vec::new(),
+        100,
+    )
+    .await
+    .expect("spawn wallet worker");
     let (sender, mut receiver) = mpsc::channel(4);
     let batch = Arc::new(LogBatch {
         from_block: 101,
@@ -1735,13 +1920,32 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
             Some(105),
             7,
             &sender_clone,
+            &handle,
         )
         .await
     });
 
+    let Some(BackfillEvent::Target {
+        target_block,
+        token,
+        response,
+    }) = receiver.recv().await
+    else {
+        panic!("startup target should accept the token first");
+    };
+    assert_eq!(target_block, 105);
+    assert_eq!(token.reset_generation(), 7);
+    response
+        .send(WalletBackfillFinishResult::Accepted {
+            committed_to: 100,
+            target_block,
+            job: WalletAcceptedBackfillJob::for_test(token),
+        })
+        .expect("send initial target result");
+
     let Some(BackfillEvent::Apply {
         apply,
-        reset_generation,
+        token: apply_token,
         response,
     }) = receiver.recv().await
     else {
@@ -1753,25 +1957,331 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
         panic!("startup apply should contain normalized rows");
     };
     assert_eq!(rows.row_count(), 0);
-    assert_eq!(reset_generation, 7);
+    assert_eq!(apply_token, token);
     response
         .send(WalletBackfillApplyResult::Committed { committed_to: 105 })
         .expect("send apply result");
     let Some(BackfillEvent::Target {
         target_block,
-        reset_generation,
+        token: finish_token,
         response,
     }) = receiver.recv().await
     else {
         panic!("startup target should be sent after logs");
     };
     assert_eq!(target_block, 105);
-    assert_eq!(reset_generation, 7);
+    assert_eq!(finish_token, token);
     response
         .send(WalletBackfillFinishResult::Ready { committed_to: 105 })
         .expect("send target result");
     assert!(send_task.await.expect("send task completed"));
     assert!(receiver.try_recv().is_err());
+    cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_startup_events_treat_leading_ready_as_success() {
+    let root_dir = temp_db_root("wallet-startup-events-leading-ready");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cancel = CancellationToken::new();
+    let (_live_tx, live_rx) = broadcast::channel(1);
+    let (worker_tx, worker_rx) = mpsc::channel(1);
+    let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
+    let scope = test_scope();
+    let handle = spawn_wallet_worker(
+        WalletWorkerServices {
+            db: Arc::clone(&db),
+            rpcs: Arc::new(QueryRpcPool::new(
+                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                Duration::from_secs(1),
+            )),
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            backfill_tx: backfill_request_tx,
+            backfill_sender: worker_tx,
+            public_data_plane: ChainPublicDataPlane::new(
+                Arc::clone(&db),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        },
+        test_wallet_config(
+            &scope,
+            Url::parse("http://127.0.0.1:1").expect("quick sync url"),
+        ),
+        1,
+        live_rx,
+        worker_rx,
+        cancel.clone(),
+        Vec::new(),
+        105,
+    )
+    .await
+    .expect("spawn wallet worker");
+    let (sender, mut receiver) = mpsc::channel(4);
+    let batch = Arc::new(LogBatch {
+        from_block: 101,
+        to_block: 105,
+        logs: Vec::new(),
+        block_timestamps: HashMap::new(),
+        to_block_hash: None,
+        read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
+    });
+
+    let sender_clone = sender.clone();
+    let send_task = tokio::spawn(async move {
+        send_wallet_startup_events(
+            "test",
+            vec![
+                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                    .expect("normalize empty log payload"),
+            ],
+            Some(105),
+            0,
+            &sender_clone,
+            &handle,
+        )
+        .await
+    });
+
+    let Some(BackfillEvent::Target {
+        target_block,
+        response,
+        ..
+    }) = receiver.recv().await
+    else {
+        panic!("startup target should be sent");
+    };
+    assert_eq!(target_block, 105);
+    response
+        .send(WalletBackfillFinishResult::Ready { committed_to: 105 })
+        .expect("send ready target result");
+    assert!(send_task.await.expect("send task completed"));
+    assert!(receiver.try_recv().is_err());
+
+    cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_startup_events_retire_token_on_apply_failure() {
+    let root_dir = temp_db_root("wallet-startup-events-retire-failure");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cancel = CancellationToken::new();
+    let (_live_tx, live_rx) = broadcast::channel(1);
+    let (worker_tx, worker_rx) = mpsc::channel(1);
+    let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
+    let scope = test_scope();
+    let handle = spawn_wallet_worker(
+        WalletWorkerServices {
+            db: Arc::clone(&db),
+            rpcs: Arc::new(QueryRpcPool::new(
+                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                Duration::from_secs(1),
+            )),
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            backfill_tx: backfill_request_tx,
+            backfill_sender: worker_tx,
+            public_data_plane: ChainPublicDataPlane::new(
+                Arc::clone(&db),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        },
+        test_wallet_config(
+            &scope,
+            Url::parse("http://127.0.0.1:1").expect("quick sync url"),
+        ),
+        1,
+        live_rx,
+        worker_rx,
+        cancel.clone(),
+        Vec::new(),
+        100,
+    )
+    .await
+    .expect("spawn wallet worker");
+    let (sender, mut receiver) = mpsc::channel(4);
+    let batch = Arc::new(LogBatch {
+        from_block: 101,
+        to_block: 105,
+        logs: Vec::new(),
+        block_timestamps: HashMap::new(),
+        to_block_hash: None,
+        read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
+    });
+
+    let sender_clone = sender.clone();
+    let send_task = tokio::spawn(async move {
+        send_wallet_startup_events(
+            "test",
+            vec![
+                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                    .expect("normalize empty log payload"),
+            ],
+            Some(105),
+            0,
+            &sender_clone,
+            &handle,
+        )
+        .await
+    });
+
+    let Some(BackfillEvent::Target {
+        target_block,
+        token,
+        response,
+    }) = receiver.recv().await
+    else {
+        panic!("startup target should be sent");
+    };
+    response
+        .send(WalletBackfillFinishResult::Accepted {
+            committed_to: 100,
+            target_block,
+            job: WalletAcceptedBackfillJob::for_test(token),
+        })
+        .expect("send target result");
+
+    let Some(BackfillEvent::Apply { response, .. }) = receiver.recv().await else {
+        panic!("startup apply should be sent");
+    };
+    response
+        .send(WalletBackfillApplyResult::Rejected {
+            committed_to: 100,
+            reason: WalletBackfillRejectReason::ApplyFailed,
+        })
+        .expect("send apply failure");
+
+    let Some(BackfillEvent::JobRetired { token: retired }) = receiver.recv().await else {
+        panic!("startup token should be retired");
+    };
+    assert_eq!(retired, token);
+    assert!(!send_task.await.expect("send task completed"));
+    assert!(receiver.try_recv().is_err());
+
+    cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_startup_events_retire_partial_token_without_done_block() {
+    let root_dir = temp_db_root("wallet-startup-events-retire-partial");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cancel = CancellationToken::new();
+    let (_live_tx, live_rx) = broadcast::channel(1);
+    let (worker_tx, worker_rx) = mpsc::channel(1);
+    let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
+    let scope = test_scope();
+    let handle = spawn_wallet_worker(
+        WalletWorkerServices {
+            db: Arc::clone(&db),
+            rpcs: Arc::new(QueryRpcPool::new(
+                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                Duration::from_secs(1),
+            )),
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            backfill_tx: backfill_request_tx,
+            backfill_sender: worker_tx,
+            public_data_plane: ChainPublicDataPlane::new(
+                Arc::clone(&db),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        },
+        test_wallet_config(
+            &scope,
+            Url::parse("http://127.0.0.1:1").expect("quick sync url"),
+        ),
+        1,
+        live_rx,
+        worker_rx,
+        cancel.clone(),
+        Vec::new(),
+        100,
+    )
+    .await
+    .expect("spawn wallet worker");
+    let (sender, mut receiver) = mpsc::channel(4);
+    let batch = Arc::new(LogBatch {
+        from_block: 101,
+        to_block: 105,
+        logs: Vec::new(),
+        block_timestamps: HashMap::new(),
+        to_block_hash: None,
+        read_scope: PublicScanReadScope::new(PublicDataPlaneEpoch::new(0)),
+    });
+
+    let sender_clone = sender.clone();
+    let send_task = tokio::spawn(async move {
+        send_wallet_startup_events(
+            "test",
+            vec![
+                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                    .expect("normalize empty log payload"),
+            ],
+            None,
+            0,
+            &sender_clone,
+            &handle,
+        )
+        .await
+    });
+
+    let Some(BackfillEvent::Target {
+        target_block,
+        token,
+        response,
+    }) = receiver.recv().await
+    else {
+        panic!("startup target should be sent");
+    };
+    response
+        .send(WalletBackfillFinishResult::Accepted {
+            committed_to: 100,
+            target_block,
+            job: WalletAcceptedBackfillJob::for_test(token),
+        })
+        .expect("send target result");
+
+    let Some(BackfillEvent::Apply { response, .. }) = receiver.recv().await else {
+        panic!("startup apply should be sent");
+    };
+    response
+        .send(WalletBackfillApplyResult::Committed { committed_to: 105 })
+        .expect("send apply success");
+
+    let Some(BackfillEvent::JobRetired { token: retired }) = receiver.recv().await else {
+        panic!("partial startup token should be retired");
+    };
+    assert_eq!(retired, token);
+    assert!(send_task.await.expect("send task completed"));
+    assert!(receiver.try_recv().is_err());
+
+    cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 fn test_chain_config(

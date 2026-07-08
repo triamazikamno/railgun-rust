@@ -1,10 +1,8 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use alloy::primitives::Address as ContractAddress;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::notes::Note;
 use broadcaster_core::utxo::{Utxo, UtxoPoiMetadata, UtxoSource, WalletUtxo};
-use local_db::{DbError, DbStore, WalletMeta};
+use local_db::{DbError, DbStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -105,10 +103,6 @@ impl CachedWalletUtxo {
             spent: self.spent.map(CachedUtxoSource::into_source),
         }
     }
-
-    fn utxo_id(&self) -> String {
-        format!("{}:{}", self.tree, self.position)
-    }
 }
 
 pub fn serialize_wallet_utxo(utxo: &WalletUtxo) -> Result<Vec<u8>, WalletCacheError> {
@@ -142,48 +136,10 @@ pub fn wallet_cache_key(
 }
 
 pub trait WalletCacheDbExt {
-    fn store_wallet_utxos(
-        &self,
-        wallet_id: &str,
-        utxos: &[WalletUtxo],
-        last_scanned_block: Option<u64>,
-        last_scanned_block_hash: Option<[u8; 32]>,
-    ) -> Result<(), WalletCacheError>;
-
     fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
 }
 
 impl WalletCacheDbExt for DbStore {
-    fn store_wallet_utxos(
-        &self,
-        wallet_id: &str,
-        utxos: &[WalletUtxo],
-        last_scanned_block: Option<u64>,
-        last_scanned_block_hash: Option<[u8; 32]>,
-    ) -> Result<(), WalletCacheError> {
-        let utxo_entries: Vec<(String, Vec<u8>)> = utxos
-            .iter()
-            .map(|utxo| {
-                let cached = CachedWalletUtxo::from(utxo);
-                let payload = serialize_wallet_utxo(utxo)?;
-                Ok((cached.utxo_id(), payload))
-            })
-            .collect::<Result<_, WalletCacheError>>()?;
-
-        let meta = last_scanned_block
-            .map(|block| {
-                Ok::<_, WalletCacheError>(WalletMeta {
-                    last_scanned_block: block,
-                    updated_at: now_epoch_secs()?,
-                    last_scanned_block_hash,
-                })
-            })
-            .transpose()?;
-
-        self.batch_store_wallet_utxos(wallet_id, &utxo_entries, meta.as_ref())?;
-        Ok(())
-    }
-
     fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
         let entries = self.list_wallet_utxos(wallet_id)?;
         let mut out = Vec::with_capacity(entries.len());
@@ -192,13 +148,6 @@ impl WalletCacheDbExt for DbStore {
         }
         Ok(out)
     }
-}
-
-fn now_epoch_secs() -> Result<u64, std::io::Error> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]

@@ -6,9 +6,7 @@ pub(super) struct WalletBackfill {
     pub(super) target_block: u64,
     pub(super) follow_safe_head: bool,
     pub(super) progress_start_block: u64,
-    pub(super) reset_generation: u64,
-    pub(super) progress_tx: Option<SyncProgressSender>,
-    pub(super) sender: mpsc::Sender<BackfillEvent>,
+    pub(super) lease: WalletBackfillLease,
     pub(super) last_advanced_at: Instant,
     pub(super) last_indexed_tail_attempt_at: Option<Instant>,
 }
@@ -69,9 +67,7 @@ impl WalletBackfill {
         target_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
-        reset_generation: u64,
-        progress_tx: Option<SyncProgressSender>,
-        sender: mpsc::Sender<BackfillEvent>,
+        lease: WalletBackfillLease,
         now: Instant,
     ) -> Self {
         Self {
@@ -79,9 +75,7 @@ impl WalletBackfill {
             target_block,
             follow_safe_head,
             progress_start_block,
-            reset_generation,
-            progress_tx,
-            sender,
+            lease,
             last_advanced_at: now,
             last_indexed_tail_attempt_at: None,
         }
@@ -96,21 +90,6 @@ impl WalletBackfill {
         } else if self.target_block == 0 {
             self.target_block = safe_head;
         }
-    }
-
-    pub(super) fn send_progress(&self, current_block: u64) {
-        if self.target_block == 0 {
-            return;
-        }
-        send_sync_progress(
-            self.progress_tx.as_ref(),
-            SyncProgressUpdate::new(
-                SyncProgressStage::IndexingUtxos,
-                self.progress_start_block,
-                current_block,
-                self.target_block,
-            ),
-        );
     }
 
     pub(super) fn mark_progress(&mut self, from_block: u64, now: Instant) {
@@ -281,11 +260,18 @@ impl ChainService {
             let from_block =
                 wallet_reorg_backfill_from_block(reset_from_block, registration.start_block);
             let sync_target = wallet_sync_target(safe_head, registration.sync_to_block);
+            let replay_plan = WalletResetReplayPlan::new(
+                registration.start_block,
+                sync_target,
+                registration.sync_to_block.is_none(),
+            );
             let reset_result = send_wallet_reset(
                 cache_key,
                 &registration.backfill_sender,
+                &registration.handle,
                 self.next_wallet_reset_intent(),
                 from_block,
+                replay_plan,
                 registration.handle.last_scanned(),
             )
             .await;
@@ -293,34 +279,53 @@ impl ChainService {
                 debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
                 continue;
             };
+            if !reset_result.committed() {
+                debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted and pending durable replay");
+                continue;
+            }
+            let replay_from =
+                wallet_backfill_from_block(reset_result.committed_to(), registration.start_block);
+            let token = registration.handle.mint_sync_token(reset_generation);
             let target_result = super::service::send_wallet_target(
                 cache_key,
                 &registration.backfill_sender,
                 sync_target,
-                reset_generation,
+                token,
             )
             .await;
             debug!(?target_result, cache_key = %cache_key, "wallet reorg target update result");
-            if self
-                .backfill_tx
-                .send(BackfillRequest::Add {
-                    cache_key: cache_key.clone(),
-                    from_block,
-                    to_block: sync_target,
-                    follow_safe_head: registration.sync_to_block.is_none(),
-                    progress_start_block: from_block,
-                    reset_generation,
-                    progress_tx: registration
-                        .cfg
-                        .progress_tx
-                        .clone()
-                        .or_else(|| self.chain.progress_tx.clone()),
-                    sender: registration.backfill_sender.clone(),
-                })
-                .await
-                .is_err()
-            {
-                warn!(cache_key = %cache_key, "failed to enqueue wallet backfill");
+            if matches!(target_result, WalletBackfillFinishResult::Ready { .. }) {
+                continue;
+            }
+            let Some(accepted_job) = target_result.accepted_job() else {
+                super::service::send_wallet_job_retired(
+                    cache_key,
+                    &registration.backfill_sender,
+                    token,
+                )
+                .await;
+                continue;
+            };
+            let lease = WalletBackfillLease::for_actor_accepted_job(
+                accepted_job,
+                registration.backfill_sender.clone(),
+            );
+            if let Err(err) = self.backfill_tx.try_send(BackfillRequest::add(
+                cache_key.clone(),
+                replay_from,
+                sync_target,
+                registration.sync_to_block.is_none(),
+                replay_from,
+                lease,
+            )) {
+                warn!(?err, cache_key = %cache_key, "failed to enqueue wallet backfill");
+                super::service::send_wallet_job_failed(
+                    cache_key,
+                    &registration.backfill_sender,
+                    token,
+                    WalletReadinessError::BackfillUnavailable,
+                )
+                .await;
             }
         }
     }

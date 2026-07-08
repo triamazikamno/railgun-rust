@@ -191,6 +191,7 @@ fn write_wasm_module_cache(
             source_hash: Some(wasm_hash),
             created_at,
             updated_at: now,
+            last_accessed_at: now,
             last_block: None,
         },
     )?;

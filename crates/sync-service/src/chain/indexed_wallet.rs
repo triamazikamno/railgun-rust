@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::chain::service::{send_wallet_scan_apply, send_wallet_target};
+use crate::chain::service::{send_wallet_job_retired, send_wallet_scan_apply, send_wallet_target};
 
 use std::time::SystemTime;
 
@@ -25,12 +25,6 @@ const WALLET_SHIELD_SECTION_ID: u16 = 2;
 const WALLET_NULLIFIER_SECTION_ID: u16 = 3;
 const WALLET_LEGACY_ENCRYPTED_SECTION_ID: u16 = 4;
 const WALLET_LEGACY_GENERATED_SECTION_ID: u16 = 5;
-const WALLET_ARTIFACT_PROGRESS_TOTAL: u64 = 100;
-const WALLET_ARTIFACT_MANIFEST_START_PROGRESS: u64 = 5;
-const WALLET_ARTIFACT_MANIFEST_DONE_PROGRESS: u64 = 15;
-const WALLET_ARTIFACT_CHUNK_START_PROGRESS: u64 = 25;
-const WALLET_ARTIFACT_CHUNK_DONE_PROGRESS: u64 = 100;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexedWalletArtifactProbe {
     pub(super) latest_indexed_block: u64,
@@ -367,8 +361,8 @@ impl IndexedWalletArtifactSession {
         chain: &ChainConfig,
         from_block: u64,
         to_block: u64,
-        progress_tx: Option<&SyncProgressSender>,
         read_scope: PublicScanReadScope,
+        public_data_plane: &ChainPublicDataPlane,
     ) -> Result<Option<Self>, SyncError> {
         let Some(config) = chain.indexed_artifact_source.clone() else {
             return Ok(None);
@@ -378,18 +372,10 @@ impl IndexedWalletArtifactSession {
         let client = IndexedArtifactManifestClient::new(config, http_client);
         let started = Instant::now();
         let manifest_started = Instant::now();
-        send_wallet_artifact_preparation_progress(
-            progress_tx,
-            WALLET_ARTIFACT_MANIFEST_START_PROGRESS,
-        );
         let manifest = client
             .fetch_manifest(&scope, None, SystemTime::now())
             .await
             .map_err(wallet_artifact_error)?;
-        send_wallet_artifact_preparation_progress(
-            progress_tx,
-            WALLET_ARTIFACT_MANIFEST_DONE_PROGRESS,
-        );
         let manifest_elapsed_ms = manifest_started.elapsed().as_millis();
         let Some(probe) =
             IndexedWalletArtifactProbe::from_manifest(&manifest, &scope, from_block, to_block)
@@ -403,7 +389,12 @@ impl IndexedWalletArtifactSession {
         let descriptor_started = Instant::now();
         let descriptors =
             Self::fetch_descriptors(&client, chain_entry, &scope, from_block, target_block).await?;
-        let chunk_descriptors = descriptors.chunk_descriptors;
+        let IndexedWalletArtifactDescriptorFetchResult {
+            chunk_descriptors,
+            chunk_retention_descriptors,
+            optional_prior_tail_retention,
+            coverage,
+        } = descriptors;
         let descriptor_elapsed_ms = descriptor_started.elapsed().as_millis();
         debug!(
             from_block,
@@ -419,7 +410,20 @@ impl IndexedWalletArtifactSession {
         );
         let indexed_chunk_descriptors: Vec<_> =
             chunk_descriptors.iter().cloned().enumerate().collect();
-        let chunks = Self::fetch_chunks(&client, &indexed_chunk_descriptors, progress_tx).await?;
+        let chunks = Self::fetch_chunks(
+            &client,
+            &indexed_chunk_descriptors,
+            &chunk_retention_descriptors,
+            public_data_plane,
+        )
+        .await?;
+        Self::retain_optional_prior_tail_chunks(
+            &client,
+            &optional_prior_tail_retention,
+            &chunk_retention_descriptors,
+            public_data_plane,
+        )
+        .await;
         debug!(
             from_block,
             to_block,
@@ -435,7 +439,7 @@ impl IndexedWalletArtifactSession {
             probe,
             chunk_descriptors,
             chunks: chunks.chunks,
-            coverage: descriptors.coverage,
+            coverage,
             read_scope,
         }))
     }
@@ -594,8 +598,12 @@ impl IndexedWalletArtifactSession {
             Self::select_current_stream_plan(&candidate_catalogs, scope, from_block, target_block)?;
         let coverage =
             WalletScanArtifactCoverage::from_descriptors(&plan.required_current_coverage)?;
+        let mut chunk_retention_descriptors = plan.required_current_coverage.clone();
+        chunk_retention_descriptors.extend_from_slice(&plan.optional_prior_tail_retention);
         Ok(IndexedWalletArtifactDescriptorFetchResult {
             chunk_descriptors: plan.required_current_chunks,
+            chunk_retention_descriptors,
+            optional_prior_tail_retention: plan.optional_prior_tail_retention,
             coverage,
         })
     }
@@ -623,35 +631,93 @@ impl IndexedWalletArtifactSession {
     async fn fetch_chunks(
         client: &IndexedArtifactManifestClient,
         chunk_descriptors: &[(usize, IndexedArtifactDescriptor)],
-        progress_tx: Option<&SyncProgressSender>,
+        chunk_retention_descriptors: &[IndexedArtifactDescriptor],
+        public_data_plane: &ChainPublicDataPlane,
     ) -> Result<IndexedWalletArtifactChunkFetchResult, SyncError> {
         let descriptors: Vec<_> = chunk_descriptors
             .iter()
             .map(|(_, descriptor)| descriptor.clone())
             .collect();
-        send_wallet_artifact_chunk_progress(progress_tx, 0, descriptors.len());
         let fetch_started = Instant::now();
-        let chunks = client
-            .fetch_chunks_bounded_with_progress(&descriptors, |completed_chunks, total_chunks| {
-                send_wallet_artifact_chunk_progress(progress_tx, completed_chunks, total_chunks);
-            })
-            .await
-            .map_err(wallet_artifact_error)?;
-        let fetch_verify_elapsed_ms = fetch_started.elapsed().as_millis();
-        let mut indexed_chunks = Vec::with_capacity(chunks.len());
-        for ((descriptor_index, _), chunk) in chunk_descriptors.iter().zip(chunks) {
-            let range = chunk.descriptor.range.clone();
-            indexed_chunks.push(IndexedWalletArtifactChunk {
-                descriptor_index: *descriptor_index,
-                range,
-                chunk,
-            });
+        let mut indexed_chunks = Vec::with_capacity(chunk_descriptors.len());
+        let mut missing = Vec::new();
+        for (descriptor_index, descriptor) in chunk_descriptors {
+            if let Some(chunk) = public_data_plane.cached_wallet_scan_artifact_chunk(descriptor) {
+                indexed_chunks.push((*descriptor_index, chunk));
+            } else {
+                missing.push((*descriptor_index, descriptor.clone()));
+            }
         }
+
+        let missing_descriptors: Vec<_> = missing
+            .iter()
+            .map(|(_, descriptor)| descriptor.clone())
+            .collect();
+        if !missing_descriptors.is_empty() {
+            let fetched_chunks = client
+                .fetch_chunks_bounded(&missing_descriptors)
+                .await
+                .map_err(wallet_artifact_error)?;
+            for ((descriptor_index, _), chunk) in missing.into_iter().zip(fetched_chunks) {
+                indexed_chunks.push((descriptor_index, chunk));
+            }
+        }
+        let fetch_verify_elapsed_ms = fetch_started.elapsed().as_millis();
+        let all_chunks: Vec<_> = indexed_chunks
+            .iter()
+            .map(|(_, chunk)| chunk.clone())
+            .collect();
+        let retained_chunks = public_data_plane
+            .retain_wallet_scan_artifact_chunks(&all_chunks, chunk_retention_descriptors);
+        debug!(
+            requested_chunks = descriptors.len(),
+            cache_hits = descriptors.len().saturating_sub(missing_descriptors.len()),
+            fetched_chunks = missing_descriptors.len(),
+            retained_chunks,
+            "wallet-scan artifact chunks resolved through public cache"
+        );
+        let mut indexed_chunks: Vec<_> = indexed_chunks
+            .into_iter()
+            .map(|(descriptor_index, chunk)| {
+                let range = chunk.descriptor.range.clone();
+                IndexedWalletArtifactChunk {
+                    descriptor_index,
+                    range,
+                    chunk,
+                }
+            })
+            .collect();
         indexed_chunks.sort_by_key(|chunk| (chunk.range.start, chunk.range.end));
         Ok(IndexedWalletArtifactChunkFetchResult {
             chunks: indexed_chunks,
             fetch_verify_elapsed_ms,
         })
+    }
+
+    async fn retain_optional_prior_tail_chunks(
+        client: &IndexedArtifactManifestClient,
+        optional_descriptors: &[IndexedArtifactDescriptor],
+        chunk_retention_descriptors: &[IndexedArtifactDescriptor],
+        public_data_plane: &ChainPublicDataPlane,
+    ) {
+        if optional_descriptors.is_empty() {
+            return;
+        }
+        match client.fetch_chunks_bounded(optional_descriptors).await {
+            Ok(chunks) => {
+                let retained = public_data_plane
+                    .retain_wallet_scan_artifact_chunks(&chunks, chunk_retention_descriptors);
+                debug!(
+                    requested = optional_descriptors.len(),
+                    retained, "retained optional wallet-scan prior-tail artifact chunks"
+                );
+            }
+            Err(err) => warn!(
+                ?err,
+                requested = optional_descriptors.len(),
+                "failed best-effort wallet-scan prior-tail artifact retention"
+            ),
+        }
     }
 }
 
@@ -668,6 +734,8 @@ struct IndexedWalletArtifactChunkFetchResult {
 
 struct IndexedWalletArtifactDescriptorFetchResult {
     chunk_descriptors: Vec<IndexedArtifactDescriptor>,
+    chunk_retention_descriptors: Vec<IndexedArtifactDescriptor>,
+    optional_prior_tail_retention: Vec<IndexedArtifactDescriptor>,
     coverage: WalletScanArtifactCoverage,
 }
 
@@ -954,44 +1022,6 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {
     fn try_from(chunk: &VerifiedIndexedArtifactChunk) -> Result<Self, Self::Error> {
         Self::decode_from_chunk(chunk, None)
     }
-}
-
-fn send_wallet_artifact_chunk_progress(
-    progress_tx: Option<&SyncProgressSender>,
-    completed_chunks: usize,
-    total_chunks: usize,
-) {
-    let total = u64::try_from(total_chunks).unwrap_or(u64::MAX);
-    let current_progress = artifact_chunk_progress(
-        completed_chunks,
-        total_chunks,
-        WALLET_ARTIFACT_CHUNK_START_PROGRESS,
-        WALLET_ARTIFACT_CHUNK_DONE_PROGRESS,
-    );
-    send_sync_progress(
-        progress_tx,
-        SyncProgressUpdate::artifact_chunk(
-            SyncProgressStage::PreparingUtxoIndex,
-            current_progress,
-            WALLET_ARTIFACT_PROGRESS_TOTAL,
-            u64::try_from(completed_chunks).unwrap_or(total).min(total),
-            total,
-        ),
-    );
-}
-
-fn send_wallet_artifact_preparation_progress(
-    progress_tx: Option<&SyncProgressSender>,
-    current_progress: u64,
-) {
-    send_sync_progress(
-        progress_tx,
-        SyncProgressUpdate::artifact_preparation(
-            SyncProgressStage::PreparingUtxoIndex,
-            current_progress,
-            WALLET_ARTIFACT_PROGRESS_TOTAL,
-        ),
-    );
 }
 
 pub(super) const fn artifact_failure_can_fallback_to_squid(
@@ -1363,26 +1393,45 @@ pub(super) async fn send_wallet_startup_events(
     done_block: Option<u64>,
     reset_generation: u64,
     sender: &mpsc::Sender<BackfillEvent>,
+    handle: &WalletHandle,
 ) -> bool {
+    let token = handle.mint_sync_token(reset_generation);
+    let target_block =
+        done_block.unwrap_or_else(|| applies.last().map_or(0, |apply| apply.to_block));
+    if target_block > 0 {
+        let target_result = send_wallet_target(cache_key, sender, target_block, token).await;
+        if matches!(target_result, WalletBackfillFinishResult::Ready { .. }) {
+            return true;
+        }
+        if !matches!(target_result, WalletBackfillFinishResult::Accepted { .. }) {
+            send_wallet_job_retired(cache_key, sender, token).await;
+            return false;
+        }
+    }
     for apply in applies {
-        let result = send_wallet_scan_apply(cache_key, sender, apply, reset_generation).await;
+        let result = send_wallet_scan_apply(cache_key, sender, apply, token).await;
         match result {
             WalletBackfillApplyResult::Committed { .. }
             | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
             WalletBackfillApplyResult::Rejected { reason, .. } => {
                 debug!(?reason, cache_key, "wallet startup scan batch rejected");
+                send_wallet_job_retired(cache_key, sender, token).await;
                 return false;
             }
         }
     }
     if let Some(last_block) = done_block
         && !matches!(
-            send_wallet_target(cache_key, sender, last_block, reset_generation).await,
+            send_wallet_target(cache_key, sender, last_block, token).await,
             WalletBackfillFinishResult::Ready { .. }
         )
     {
         debug!(cache_key, last_block, "wallet startup finish rejected");
+        send_wallet_job_retired(cache_key, sender, token).await;
         return false;
+    }
+    if done_block.is_none() && target_block > 0 {
+        send_wallet_job_retired(cache_key, sender, token).await;
     }
     true
 }

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::wallet::WalletIndexedCatchUpLease;
+
 pub(super) const EVM_CHAIN_TYPE: u8 = 0;
 pub(super) const TXID_PUBLIC_CACHE_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -93,18 +95,16 @@ pub(super) enum IndexedWalletCatchUpSourceOrder {
 pub(super) struct WalletIndexedCatchUpStatusGuard<'a> {
     handle: &'a WalletHandle,
     expose_status: bool,
-    claimed: bool,
+    lease: Option<WalletIndexedCatchUpLease>,
 }
 
 impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
-    pub(super) fn claim(handle: &'a WalletHandle, expose_status: bool) -> Option<Self> {
-        if !handle.try_claim_indexed_catch_up() {
-            return None;
-        }
+    pub(super) async fn claim(handle: &'a WalletHandle, expose_status: bool) -> Option<Self> {
+        let lease = handle.try_claim_indexed_catch_up().await?;
         Some(Self {
             handle,
             expose_status,
-            claimed: true,
+            lease: Some(lease),
         })
     }
 
@@ -114,21 +114,25 @@ impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
         from_block: u64,
         target_block: u64,
     ) {
-        if self.expose_status {
-            self.handle
-                .set_indexed_catch_up(WalletIndexedCatchUpStatus {
+        if self.expose_status
+            && let Some(lease) = self.lease
+        {
+            self.handle.set_indexed_catch_up(
+                lease,
+                WalletIndexedCatchUpStatus {
                     source,
                     from_block,
                     target_block,
-                });
+                },
+            );
         }
     }
 }
 
 impl Drop for WalletIndexedCatchUpStatusGuard<'_> {
     fn drop(&mut self) {
-        if self.claimed {
-            self.handle.clear_indexed_catch_up();
+        if let Some(lease) = self.lease.take() {
+            self.handle.clear_indexed_catch_up(lease);
         }
     }
 }
@@ -206,6 +210,8 @@ pub enum ChainError {
     CommitmentUpdate(#[from] CommitmentUpdateError),
     #[error("db error: {0}")]
     Db(#[from] local_db::DbError),
+    #[error("wallet cache error: {0}")]
+    WalletCache(#[from] WalletCacheError),
     #[error("no healthy rpc available")]
     NoHealthyRpc,
     #[error("wallet not found")]
@@ -258,7 +264,6 @@ impl ChainError {
 #[derive(Clone)]
 pub(super) struct PendingTipWalletRegistration {
     pub(super) cache_key: String,
-    pub(super) cfg: WalletConfig,
     pub(super) handle: WalletHandle,
     pub(super) reset_generation: u64,
     pub(super) last_scanned: u64,

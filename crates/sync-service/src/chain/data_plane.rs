@@ -1,9 +1,25 @@
 use super::*;
 
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use local_db::{BlobMeta, DbStore};
+use sha2::{Digest, Sha256};
+
+use crate::indexed_artifacts::{
+    IndexedArtifactDescriptor, IndexedArtifactRangeKind, IndexedDatasetKind,
+    VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
+};
 use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
 use crate::txid_cache::reset_txid_public_cache;
 
 const PUBLIC_DATA_PLANE_DIAGNOSTIC_LIMIT: usize = 128;
+const WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND: &str = "wallet_scan_artifact_chunks";
+const WALLET_SCAN_ARTIFACT_CHUNK_CACHE_FORMAT_VERSION: u32 = 1;
+static WALLET_SCAN_ARTIFACT_CHUNK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicScanRange {
@@ -42,6 +58,10 @@ pub(crate) struct PublicScanCoverageWrite {
     pub source: PublicScanSource,
     pub row_count: usize,
     pub read_scope: PublicScanReadScope,
+}
+
+pub(crate) struct PublicScanCommitPermit {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +192,7 @@ impl PublicScanRowsAnswer {
 pub enum PublicDataPlaneDiagnosticKind {
     SourceSelected,
     SourceFallback,
+    ArtifactProgress,
     CoverageRecorded,
     CoverageRejected,
     CoverageInvalidated,
@@ -199,6 +220,8 @@ pub struct PublicSyncCacheReset {
     pub new_epoch: PublicDataPlaneEpoch,
     pub coverage_entries_removed: usize,
     pub diagnostics_removed: usize,
+    pub wallet_scan_artifact_chunk_entries_removed: u64,
+    pub wallet_scan_artifact_chunk_files_removed: u64,
     pub txid_blob_entries_removed: u64,
     pub txid_files_removed: u64,
     pub poi_cache_entries_removed: u64,
@@ -376,6 +399,12 @@ struct ChainPublicDataPlaneState {
     diagnostics: Vec<PublicDataPlaneDiagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalletScanArtifactChunkCacheReset {
+    blob_entries_removed: u64,
+    files_removed: u64,
+}
+
 impl ChainPublicDataPlaneState {
     fn insert_canonical_coverage(&mut self, record: PublicScanCoverageRecord) {
         self.coverage.insert_canonical(record);
@@ -505,6 +534,9 @@ impl ChainPublicDataPlane {
             .map_err(|err| PublicDataPlaneError::PublicCacheReset {
                 reason: err.to_string(),
             })?;
+        let wallet_scan_chunk_reset = self
+            .reset_wallet_scan_artifact_chunk_cache()
+            .map_err(|reason| PublicDataPlaneError::PublicCacheReset { reason })?;
         let poi_cache_entries_removed =
             clear_poi_artifact_cache_for_reset(&self.db).map_err(|err| {
                 PublicDataPlaneError::PublicCacheReset {
@@ -516,9 +548,180 @@ impl ChainPublicDataPlane {
             new_epoch,
             coverage_entries_removed,
             diagnostics_removed,
+            wallet_scan_artifact_chunk_entries_removed: wallet_scan_chunk_reset
+                .blob_entries_removed,
+            wallet_scan_artifact_chunk_files_removed: wallet_scan_chunk_reset.files_removed,
             txid_blob_entries_removed: txid_reset.blob_entries_removed,
             txid_files_removed: txid_reset.files_removed,
             poi_cache_entries_removed,
+        })
+    }
+
+    pub(crate) fn cached_wallet_scan_artifact_chunk(
+        &self,
+        descriptor: &IndexedArtifactDescriptor,
+    ) -> Option<VerifiedIndexedArtifactChunk> {
+        if !wallet_scan_artifact_descriptor_matches_cache_kind(descriptor) {
+            return None;
+        }
+        let id = wallet_scan_artifact_chunk_blob_id(descriptor);
+        let meta = match self
+            .db
+            .get_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, &id)
+        {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return None,
+            Err(err) => {
+                debug!(?err, cid = %descriptor.cid, "failed to read wallet-scan artifact chunk cache metadata");
+                return None;
+            }
+        };
+        if meta.format_version != WALLET_SCAN_ARTIFACT_CHUNK_CACHE_FORMAT_VERSION
+            || meta.source_hash != Some(descriptor.sha256.0)
+        {
+            debug!(cid = %descriptor.cid, "wallet-scan artifact chunk cache metadata did not match descriptor");
+            return None;
+        }
+        let path = self.db.resolve_path(&meta.relative_path);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => return None,
+            Err(err) => {
+                debug!(?err, path = %path.display(), cid = %descriptor.cid, "failed to read cached wallet-scan artifact chunk");
+                return None;
+            }
+        };
+        let content_hash: [u8; 32] = Sha256::digest(&bytes).into();
+        if content_hash != meta.content_hash {
+            debug!(cid = %descriptor.cid, "cached wallet-scan artifact chunk content hash mismatch");
+            return None;
+        }
+        match verify_chunk_bytes(descriptor.clone(), bytes) {
+            Ok(chunk) => {
+                self.touch_wallet_scan_artifact_chunk_cache(&id, meta);
+                Some(chunk)
+            }
+            Err(err) => {
+                debug!(?err, cid = %descriptor.cid, "cached wallet-scan artifact chunk failed descriptor verification");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn retain_wallet_scan_artifact_chunks(
+        &self,
+        chunks: &[VerifiedIndexedArtifactChunk],
+        retention_descriptors: &[IndexedArtifactDescriptor],
+    ) -> usize {
+        let mut retained = 0_usize;
+        for chunk in chunks {
+            if !wallet_scan_artifact_descriptor_is_stable(&chunk.descriptor, retention_descriptors)
+            {
+                continue;
+            }
+            match self.retain_wallet_scan_artifact_chunk(chunk) {
+                Ok(()) => retained = retained.saturating_add(1),
+                Err(reason) => {
+                    warn!(cid = %chunk.descriptor.cid, %reason, "failed to retain wallet-scan artifact chunk")
+                }
+            }
+        }
+        retained
+    }
+
+    fn retain_wallet_scan_artifact_chunk(
+        &self,
+        chunk: &VerifiedIndexedArtifactChunk,
+    ) -> Result<(), String> {
+        if !wallet_scan_artifact_descriptor_matches_cache_kind(&chunk.descriptor) {
+            return Ok(());
+        }
+        let id = wallet_scan_artifact_chunk_blob_id(&chunk.descriptor);
+        let name = wallet_scan_artifact_chunk_file_name(&chunk.descriptor);
+        let path = self
+            .db
+            .blob_path(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, &name);
+        write_wallet_scan_artifact_chunk_file(self.db.as_ref(), &path, &chunk.bytes)
+            .map_err(|err| err.to_string())?;
+        let now = wallet_scan_artifact_now_epoch_secs().map_err(|err| err.to_string())?;
+        let existing = self
+            .db
+            .get_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, &id)
+            .map_err(|err| err.to_string())?;
+        self.db
+            .put_blob_meta(
+                WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND,
+                &id,
+                &BlobMeta {
+                    format_version: WALLET_SCAN_ARTIFACT_CHUNK_CACHE_FORMAT_VERSION,
+                    relative_path: DbStore::relative_blob_path(
+                        WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND,
+                        &name,
+                    ),
+                    content_hash: Sha256::digest(&chunk.bytes).into(),
+                    source_hash: Some(chunk.descriptor.sha256.0),
+                    created_at: existing.map_or(now, |meta| meta.created_at),
+                    updated_at: now,
+                    last_accessed_at: now,
+                    last_block: chunk.descriptor.metadata.checkpoint_block,
+                },
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn touch_wallet_scan_artifact_chunk_cache(&self, id: &str, mut meta: BlobMeta) {
+        match wallet_scan_artifact_now_epoch_secs() {
+            Ok(now) => {
+                meta.last_accessed_at = now;
+                if let Err(err) =
+                    self.db
+                        .put_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, id, &meta)
+                {
+                    debug!(
+                        ?err,
+                        id, "failed to update wallet-scan artifact chunk cache access time"
+                    );
+                }
+            }
+            Err(err) => {
+                debug!(
+                    ?err,
+                    id, "failed to compute wallet-scan artifact chunk cache access time"
+                );
+            }
+        }
+    }
+
+    fn reset_wallet_scan_artifact_chunk_cache(
+        &self,
+    ) -> Result<WalletScanArtifactChunkCacheReset, String> {
+        let cache_dir = self
+            .db
+            .blob_dir()
+            .join(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND);
+        let files_removed = match count_path_entries(&cache_dir) {
+            Ok(files_removed) => {
+                match fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.to_string()),
+                }
+                files_removed
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.to_string()),
+        };
+        let blob_entries_removed = self
+            .db
+            .clear_blob_meta_kind(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
+            .map_err(|err| err.to_string())?;
+        self.db
+            .ensure_blob_dir(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
+            .map_err(|err| err.to_string())?;
+        Ok(WalletScanArtifactChunkCacheReset {
+            blob_entries_removed,
+            files_removed,
         })
     }
 
@@ -601,20 +804,19 @@ impl ChainPublicDataPlane {
         Self::validate_public_scan_read_locked(&mut state, current_epoch, range, source, read_scope)
     }
 
-    pub(crate) async fn with_valid_public_scan_read<T>(
+    pub(crate) async fn public_scan_commit_permit(
         &self,
         range: PublicScanRange,
         source: PublicScanSource,
         read_scope: PublicScanReadScope,
-        commit: impl FnOnce() -> T,
-    ) -> Result<T, PublicDataPlaneError> {
+    ) -> Result<PublicScanCommitPermit, PublicDataPlaneError> {
         if !range.is_valid() {
             return Err(PublicDataPlaneError::InvalidRange {
                 from_block: range.from_block,
                 to_block: range.to_block,
             });
         }
-        let _commit_guard = self.commit_fence.lock().await;
+        let commit_guard = Arc::clone(&self.commit_fence).lock_owned().await;
         {
             let mut state = self.state.lock().await;
             let current_epoch = self.current_epoch();
@@ -626,7 +828,9 @@ impl ChainPublicDataPlane {
                 read_scope,
             )?;
         }
-        Ok(commit())
+        Ok(PublicScanCommitPermit {
+            _guard: commit_guard,
+        })
     }
 
     pub(crate) async fn invalidate_public_scan_coverage_from(
@@ -701,6 +905,124 @@ impl ChainPublicDataPlane {
     }
 }
 
+fn wallet_scan_artifact_descriptor_matches_cache_kind(
+    descriptor: &IndexedArtifactDescriptor,
+) -> bool {
+    descriptor.dataset_kind == IndexedDatasetKind::WalletScan
+        && descriptor.range.kind == IndexedArtifactRangeKind::Block
+}
+
+fn wallet_scan_artifact_descriptor_is_stable(
+    descriptor: &IndexedArtifactDescriptor,
+    selected_descriptors: &[IndexedArtifactDescriptor],
+) -> bool {
+    if !wallet_scan_artifact_descriptor_matches_cache_kind(descriptor) {
+        return false;
+    }
+    if descriptor.metadata.chunk_sealed || descriptor.metadata.stream_complete {
+        return true;
+    }
+    selected_descriptors.iter().any(|other| {
+        wallet_scan_artifact_same_stream(descriptor, other)
+            && other.range.start > descriptor.range.start
+    })
+}
+
+fn wallet_scan_artifact_same_stream(
+    left: &IndexedArtifactDescriptor,
+    right: &IndexedArtifactDescriptor,
+) -> bool {
+    left.dataset_kind == right.dataset_kind
+        && left.scope == right.scope
+        && left.range.kind == right.range.kind
+}
+
+fn wallet_scan_artifact_chunk_blob_id(descriptor: &IndexedArtifactDescriptor) -> String {
+    format!(
+        "{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
+        descriptor.dataset_kind,
+        format_scope(&descriptor.scope),
+        descriptor.range.kind,
+        descriptor.range.start,
+        descriptor.range.end,
+        descriptor.row_count,
+        descriptor.cid,
+        descriptor.byte_size,
+        descriptor.encoding_version,
+        descriptor.compression,
+        descriptor
+            .metadata
+            .catalog_generation
+            .map_or_else(|| "none".to_string(), |generation| generation.to_string()),
+        descriptor
+            .metadata
+            .stream_partition
+            .as_deref()
+            .unwrap_or("none"),
+        descriptor.metadata.stream_complete,
+        descriptor.metadata.chunk_sealed,
+        descriptor
+            .metadata
+            .checkpoint_block
+            .map_or_else(|| "none".to_string(), |checkpoint| checkpoint.to_string()),
+    )
+}
+
+fn wallet_scan_artifact_chunk_file_name(descriptor: &IndexedArtifactDescriptor) -> String {
+    format!(
+        "wallet-scan-artifact-chunk-{}.bin",
+        safe_file_component(&descriptor.cid)
+    )
+}
+
+fn safe_file_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_wallet_scan_artifact_chunk_file(
+    db: &DbStore,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), std::io::Error> {
+    db.ensure_blob_dir(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
+        .map_err(std::io::Error::other)?;
+    let nonce = WALLET_SCAN_ARTIFACT_CHUNK_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
+    fs::write(&temp_path, bytes)?;
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn count_path_entries(path: &Path) -> Result<u64, std::io::Error> {
+    if path.is_file() {
+        return Ok(1);
+    }
+    let mut entries = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            entries = entries.saturating_add(count_path_entries(&entry_path)?);
+        } else {
+            entries = entries.saturating_add(1);
+        }
+    }
+    Ok(entries)
+}
+
+fn wallet_scan_artifact_now_epoch_secs() -> Result<u64, std::time::SystemTimeError> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CoverageForRange {
     covered_to: u64,
@@ -717,12 +1039,17 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use crate::indexed_artifacts::{
+        ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
+        INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION, IndexedArtifactRange,
+    };
+    use alloy::primitives::Address;
     use local_db::{BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord};
     use sha2::{Digest, Sha256};
 
     #[tokio::test]
     async fn public_scan_coverage_rejects_stale_epoch_write() {
-        let (_db, data_plane, root_dir) = test_data_plane("stale-coverage-write");
+        let (data_plane, root_dir) = test_data_plane("stale-coverage-write");
         data_plane.invalidate_public_scan_coverage_from(100).await;
 
         let error = data_plane
@@ -754,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_empty_wallet_scan_apply_reuses_only_empty_cached_coverage() {
-        let (_db, data_plane, root_dir) = test_data_plane("cached-empty-coverage");
+        let (data_plane, root_dir) = test_data_plane("cached-empty-coverage");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
                 range: PublicScanRange::new(100, 110),
@@ -794,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_public_coverage_writes_replace_canonical_coverage() {
-        let (_db, data_plane, root_dir) = test_data_plane("duplicate-coverage-row-count");
+        let (data_plane, root_dir) = test_data_plane("duplicate-coverage-row-count");
         let range = PublicScanRange::new(100, 110);
         for _ in 0..2 {
             data_plane
@@ -827,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_public_coverage_writes_preserve_replayable_remainders() {
-        let (_db, data_plane, root_dir) = test_data_plane("overlapping-coverage-remainders");
+        let (data_plane, root_dir) = test_data_plane("overlapping-coverage-remainders");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
                 range: PublicScanRange::new(100, 200),
@@ -872,7 +1199,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_bearing_cached_coverage_is_not_replayable_empty() {
-        let (_db, data_plane, root_dir) = test_data_plane("partial-coverage-no-row-count");
+        let (data_plane, root_dir) = test_data_plane("partial-coverage-no-row-count");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
                 range: PublicScanRange::new(100, 120),
@@ -912,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidation_removes_or_restamps_stale_coverage_records() {
-        let (_db, data_plane, root_dir) = test_data_plane("coverage-invalidation-stale-cleanup");
+        let (data_plane, root_dir) = test_data_plane("coverage-invalidation-stale-cleanup");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
                 range: PublicScanRange::new(1, 9),
@@ -960,7 +1287,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidation_trims_spanning_coverage_record() {
-        let (_db, data_plane, root_dir) = test_data_plane("coverage-invalidation-trim");
+        let (data_plane, root_dir) = test_data_plane("coverage-invalidation-trim");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
                 range: PublicScanRange::new(1, 20),
@@ -999,7 +1326,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_cache_reset_clears_coverage_and_advances_epoch() {
-        let (_db, data_plane, root_dir) = test_data_plane("public-cache-reset-coverage");
+        let (data_plane, root_dir) = test_data_plane("public-cache-reset-coverage");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
                 range: PublicScanRange::new(1, 2),
@@ -1039,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_cache_reset_clears_durable_public_txid_and_poi_cache() {
-        let (db, data_plane, root_dir) = test_data_plane("public-cache-reset-durable");
+        let (db, data_plane, root_dir) = test_data_plane_with_db("public-cache-reset-durable");
         let txid_kind = "txid_public_cache";
         let txid_name = "stale.msgpack";
         let txid_id = "stale-entry";
@@ -1056,6 +1383,7 @@ mod tests {
                 source_hash: None,
                 created_at: 1,
                 updated_at: 1,
+                last_accessed_at: 1,
                 last_block: None,
             },
         )
@@ -1081,6 +1409,16 @@ mod tests {
             updated_at: 1,
         })
         .expect("put poi artifact cache");
+        let wallet_scan_chunk = test_wallet_scan_chunk(1, 2, &[1, 2, 3], |metadata| {
+            metadata.chunk_sealed = true;
+        });
+        assert_eq!(
+            data_plane.retain_wallet_scan_artifact_chunks(
+                std::slice::from_ref(&wallet_scan_chunk),
+                std::slice::from_ref(&wallet_scan_chunk.descriptor),
+            ),
+            1
+        );
 
         assert!(
             db.get_blob_meta(txid_kind, txid_id)
@@ -1100,6 +1438,8 @@ mod tests {
 
         assert_eq!(reset.txid_blob_entries_removed, 1);
         assert!(reset.txid_files_removed >= 1);
+        assert_eq!(reset.wallet_scan_artifact_chunk_entries_removed, 1);
+        assert!(reset.wallet_scan_artifact_chunk_files_removed >= 1);
         assert_eq!(reset.poi_cache_entries_removed, 1);
         assert!(
             db.get_blob_meta(txid_kind, txid_id)
@@ -1112,6 +1452,112 @@ mod tests {
                 .expect("get poi cache after reset")
                 .is_none()
         );
+        assert!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&wallet_scan_chunk.descriptor)
+                .is_none()
+        );
+
+        drop(data_plane);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_scan_artifact_chunk_cache_reuses_only_stable_descriptor_matches() {
+        let (db, data_plane, root_dir) = test_data_plane_with_db("wallet-scan-chunk-cache");
+        let stable_chunk = test_wallet_scan_chunk(1, 10, &[1, 2, 3], |_| {});
+        let transient_tail = test_wallet_scan_chunk(11, 20, &[4, 5, 6], |_| {});
+        let selected = vec![
+            stable_chunk.descriptor.clone(),
+            transient_tail.descriptor.clone(),
+        ];
+
+        let retained = data_plane.retain_wallet_scan_artifact_chunks(
+            &[stable_chunk.clone(), transient_tail.clone()],
+            &selected,
+        );
+
+        assert_eq!(retained, 1);
+        assert_eq!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&stable_chunk.descriptor)
+                .expect("stable chunk cached")
+                .bytes,
+            stable_chunk.bytes
+        );
+        assert!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&transient_tail.descriptor)
+                .is_none(),
+            "unsealed final wallet-scan tails stay transient"
+        );
+
+        let mut mismatched_descriptor = stable_chunk.descriptor.clone();
+        mismatched_descriptor.metadata.chunk_sealed = true;
+        assert!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&mismatched_descriptor)
+                .is_none(),
+            "descriptor identity must match before cached bytes are reused"
+        );
+
+        let sealed_tail = test_wallet_scan_chunk(21, 30, &[7, 8, 9], |metadata| {
+            metadata.chunk_sealed = true;
+        });
+        assert_eq!(
+            data_plane.retain_wallet_scan_artifact_chunks(
+                std::slice::from_ref(&sealed_tail),
+                std::slice::from_ref(&sealed_tail.descriptor),
+            ),
+            1
+        );
+        assert!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&sealed_tail.descriptor)
+                .is_some(),
+            "explicitly sealed final chunks are retained"
+        );
+
+        let context_only_successor = test_wallet_scan_chunk(41, 50, &[10, 11, 12], |_| {});
+        let predecessor = test_wallet_scan_chunk(31, 40, &[13, 14, 15], |_| {});
+        assert_eq!(
+            data_plane.retain_wallet_scan_artifact_chunks(
+                std::slice::from_ref(&predecessor),
+                &[
+                    predecessor.descriptor.clone(),
+                    context_only_successor.descriptor.clone(),
+                ],
+            ),
+            1,
+            "planner retention context may include chunks outside the request"
+        );
+        let predecessor_id = wallet_scan_artifact_chunk_blob_id(&predecessor.descriptor);
+        let mut predecessor_meta = db
+            .get_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, &predecessor_id)
+            .expect("read predecessor meta")
+            .expect("predecessor cached");
+        predecessor_meta.last_accessed_at = 0;
+        db.put_blob_meta(
+            WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND,
+            &predecessor_id,
+            &predecessor_meta,
+        )
+        .expect("reset access time");
+        assert!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&predecessor.descriptor)
+                .is_some(),
+            "verified cache hit should be reused"
+        );
+        let touched_meta = db
+            .get_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, &predecessor_id)
+            .expect("read touched predecessor meta")
+            .expect("predecessor meta retained");
+        assert!(
+            touched_meta.last_accessed_at > 0,
+            "verified cache hits update access time"
+        );
 
         drop(data_plane);
         drop(db);
@@ -1120,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_data_plane_diagnostics_record_source_fallback() {
-        let (_db, data_plane, root_dir) = test_data_plane("data-plane-diagnostics");
+        let (data_plane, root_dir) = test_data_plane("data-plane-diagnostics");
         let stale_scope = data_plane.begin_public_scan_read();
         data_plane.invalidate_public_scan_coverage_from(10).await;
         data_plane
@@ -1164,7 +1610,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_scan_epoch_validation_rejects_stale_apply_epoch() {
-        let (_db, data_plane, root_dir) = test_data_plane("stale-apply-epoch");
+        let (data_plane, root_dir) = test_data_plane("stale-apply-epoch");
         data_plane.invalidate_public_scan_coverage_from(10).await;
 
         let error = data_plane
@@ -1189,20 +1635,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn validated_public_scan_commit_blocks_epoch_invalidation_until_commit_finishes() {
-        let (_db, data_plane, root_dir) = test_data_plane("validated-commit-epoch-guard");
+        let (data_plane, root_dir) = test_data_plane("validated-commit-epoch-guard");
         let read_scope = data_plane.begin_public_scan_read();
         let range = PublicScanRange::new(10, 20);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let commit_plane = data_plane.clone();
         let commit_task = tokio::spawn(async move {
-            commit_plane
-                .with_valid_public_scan_read(range, PublicScanSource::Rpc, read_scope, move || {
-                    let _ = entered_tx.send(());
-                    release_rx.recv().expect("release commit");
-                })
+            let permit = commit_plane
+                .public_scan_commit_permit(range, PublicScanSource::Rpc, read_scope)
                 .await
                 .expect("validated commit");
+            let _ = entered_tx.send(());
+            release_rx.recv().expect("release commit");
+            drop(permit);
         });
         entered_rx.await.expect("commit closure entered");
 
@@ -1228,7 +1674,19 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
-    fn test_data_plane(name: &str) -> (Arc<DbStore>, ChainPublicDataPlane, PathBuf) {
+    fn test_data_plane(name: &str) -> (ChainPublicDataPlane, PathBuf) {
+        let (db, root_dir) = test_db(name);
+        let data_plane = ChainPublicDataPlane::new(db, Arc::new(AtomicU64::new(0)));
+        (data_plane, root_dir)
+    }
+
+    fn test_data_plane_with_db(name: &str) -> (Arc<DbStore>, ChainPublicDataPlane, PathBuf) {
+        let (db, root_dir) = test_db(name);
+        let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+        (db, data_plane, root_dir)
+    }
+
+    fn test_db(name: &str) -> (Arc<DbStore>, PathBuf) {
         let root_dir = temp_db_root(name);
         let db = Arc::new(
             DbStore::open(DbConfig {
@@ -1236,8 +1694,52 @@ mod tests {
             })
             .expect("open db"),
         );
-        let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
-        (db, data_plane, root_dir)
+        (db, root_dir)
+    }
+
+    fn test_wallet_scan_chunk<F>(
+        start: u64,
+        end: u64,
+        bytes: &[u8],
+        update_metadata: F,
+    ) -> VerifiedIndexedArtifactChunk
+    where
+        F: FnOnce(&mut DatasetDescriptorMetadata),
+    {
+        let mut metadata = DatasetDescriptorMetadata {
+            catalog_generation: Some(1),
+            checkpoint_block: Some(end),
+            ..Default::default()
+        };
+        update_metadata(&mut metadata);
+        let descriptor = IndexedArtifactDescriptor {
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: test_wallet_scan_scope(),
+            range: IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::Block,
+                start,
+                end,
+            },
+            row_count: 0,
+            cid: format!("test-wallet-scan-{start}-{end}"),
+            sha256: FixedBytes::from_slice(&Sha256::digest(bytes)),
+            byte_size: u64::try_from(bytes.len()).expect("test chunk byte size"),
+            encoding_version: INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
+            compression: CompressionAlgorithm::None,
+            metadata,
+        };
+        VerifiedIndexedArtifactChunk {
+            descriptor,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn test_wallet_scan_scope() -> ChainScope {
+        ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: 1,
+            railgun_contract: Address::from([0x11; 20]),
+        }
     }
 
     fn temp_db_root(name: &str) -> PathBuf {

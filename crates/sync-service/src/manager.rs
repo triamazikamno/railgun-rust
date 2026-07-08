@@ -80,7 +80,7 @@ impl SyncManager {
             .get(&cfg.chain)
             .cloned()
             .ok_or(SyncManagerError::ChainNotFound)?;
-        Ok(chain.register_wallet(cfg).await)
+        Ok(chain.register_wallet(cfg).await?)
     }
 
     pub async fn chain_handle(&self, chain: &ChainKey) -> Option<ChainHandle> {
