@@ -279,44 +279,7 @@ impl ChainService {
                 debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
                 continue;
             };
-            if !reset_result.committed() {
-                debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted and pending durable replay");
-                continue;
-            }
-            let Some(progress) = registration.handle.schedulable_progress() else {
-                debug!(cache_key = %cache_key, "wallet reorg reset committed but view not yet schedulable");
-                continue;
-            };
-            let replay_from =
-                wallet_backfill_from_block(reset_result.committed_to(), registration.start_block);
-            let target_result = registration
-                .handle
-                .start_backfill(
-                    cache_key,
-                    &registration.backfill_sender,
-                    progress,
-                    sync_target,
-                )
-                .await;
-            debug!(?target_result, cache_key = %cache_key, "wallet reorg target update result");
-            let lease = match target_result {
-                WalletBackfillFinishResult::Ready { .. } => continue,
-                WalletBackfillFinishResult::Accepted { lease, .. } => lease,
-                WalletBackfillFinishResult::Rejected { .. } => continue,
-            };
-            if let Err(err) = self.backfill_tx.try_send(BackfillRequest::add(
-                cache_key.clone(),
-                replay_from,
-                sync_target,
-                registration.sync_to_block.is_none(),
-                replay_from,
-                lease.clone(),
-            )) {
-                warn!(?err, cache_key = %cache_key, "failed to enqueue wallet backfill");
-                lease
-                    .fail(cache_key, WalletReadinessError::BackfillUnavailable)
-                    .await;
-            }
+            debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted for actor-owned replay");
         }
     }
 

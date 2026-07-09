@@ -7,9 +7,7 @@ use crate::types::{
     WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletReadiness, WalletReadinessError,
     WalletResetReplayPlan, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
 };
-use crate::wallet::{
-    WalletHandle, WalletPoiRuntime, WalletWorkerServices, spawn_wallet_worker, wallet_cache_store,
-};
+use crate::wallet::{WalletHandle, WalletPoiRuntime, WalletWorkerServices, wallet_cache_store};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, FixedBytes};
 use alloy::sol_types::SolEvent;
@@ -67,7 +65,7 @@ use backfill::*;
 use data_plane::PublicScanCoverageWrite;
 pub(crate) use data_plane::{
     ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated,
-    PublicTxidProofRequest, PublicTxidSyncRequest,
+    PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest,
 };
 use forest_db::*;
 use indexed_wallet::*;

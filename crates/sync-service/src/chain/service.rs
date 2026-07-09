@@ -831,44 +831,10 @@ impl ChainService {
             return Err(ChainError::WalletResetRejected(reset_result));
         };
         if !reset_result.committed() {
-            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset accepted and pending durable replay");
-            return Ok(());
+            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset accepted and pending actor-owned replay");
+        } else {
+            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset rewind committed; actor owns replay admission");
         }
-        let Some(progress) = handle.schedulable_progress() else {
-            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset committed but view not yet schedulable");
-            return Ok(());
-        };
-        let replay_from = wallet_backfill_from_block(reset_result.committed_to(), start_block);
-        let target_result = handle
-            .start_backfill(cache_key, &backfill_sender, progress, sync_target)
-            .await;
-        let lease = match target_result {
-            WalletBackfillFinishResult::Ready { .. } => {
-                info!(cache_key = %cache_key, from_block = reset_from, "wallet reset replay already covered");
-                return Ok(());
-            }
-            WalletBackfillFinishResult::Accepted { lease, .. } => lease,
-            WalletBackfillFinishResult::Rejected { .. } => {
-                warn!(?target_result, cache_key = %cache_key, "wallet reset target was not accepted");
-                return Err(ChainError::BackfillRequestFailed);
-            }
-        };
-        if let Err(err) = self.backfill_tx.try_send(BackfillRequest::add(
-            cache_key.to_string(),
-            replay_from,
-            sync_target,
-            sync_to_block.is_none(),
-            replay_from,
-            lease.clone(),
-        )) {
-            warn!(?err, cache_key = %cache_key, "wallet reset backfill enqueue failed");
-            lease
-                .fail(cache_key, WalletReadinessError::BackfillUnavailable)
-                .await;
-            return Err(ChainError::BackfillRequestFailed);
-        }
-
-        info!(cache_key = %cache_key, from_block = reset_from, replay_from, "wallet reset requested");
         Ok(())
     }
 
@@ -1002,7 +968,7 @@ impl ChainService {
         let cancel = self.cancel.child_token();
         let live_rx = self.live_log_tx.subscribe();
         let (backfill_sender, backfill_rx) = mpsc::channel(128);
-        let handle = spawn_wallet_worker(
+        let prepared: crate::wallet::PreparedWalletWorker = crate::wallet::prepare_wallet_worker(
             WalletWorkerServices {
                 db: self.db.clone(),
                 rpcs: self.chain.rpcs.clone(),
@@ -1027,8 +993,9 @@ impl ChainService {
         )
         .await?;
 
-        {
+        let handle = {
             let mut wallets = self.wallets.write().await;
+            let handle = prepared.handle().clone();
             wallets.insert(
                 cache_key.clone(),
                 WalletRegistration {
@@ -1040,7 +1007,14 @@ impl ChainService {
                     sync_to_block: cfg.sync_to_block,
                 },
             );
-        }
+            match prepared.activate() {
+                Ok(handle) => handle,
+                Err(err) => {
+                    wallets.remove(&cache_key);
+                    return Err(err);
+                }
+            }
+        };
 
         self.spawn_txid_public_cache_loop_when_ready(handle.readiness_rx.clone(), cancel.clone());
 

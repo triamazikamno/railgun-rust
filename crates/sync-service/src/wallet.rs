@@ -51,8 +51,10 @@ use url::Url;
 
 use crate::chain::{
     ChainError, ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey,
-    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidSyncRequest,
+    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
+    PublicTxidSyncRequest,
 };
+use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::txid_cache::TxidPublicCacheError;
 use crate::types::{
     BackfillEvent, BackfillRequest, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback,
@@ -111,7 +113,9 @@ pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
 pub(crate) use poi_refresh::LivePoiTailError;
 pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
-pub(crate) use worker::{spawn_wallet_worker, wallet_cache_store};
+#[cfg(test)]
+pub(crate) use worker::spawn_wallet_worker;
+pub(crate) use worker::{PreparedWalletWorker, prepare_wallet_worker, wallet_cache_store};
 
 #[cfg(test)]
 mod tests;

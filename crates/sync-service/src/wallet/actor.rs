@@ -11,7 +11,7 @@
 //!    (cursor + generation from one view snapshot; never authority generation).
 //!
 //! Lifecycle is separate from [`CancellationToken`]: cancel stops async work and may
-//! drive Active → Stopping; publication authority is lifecycle-based.
+//! drive Prepared/Active → Stopping; publication authority is lifecycle-based.
 //!
 //! The lifecycle fence is a short `std::sync::Mutex` used only for lifecycle transitions
 //! and Active/Stopping private applies. It must never be held across remote I/O.
@@ -23,18 +23,20 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub(crate) enum WalletActorLifecycle {
+    /// Bootstrap may apply durable state, but the actor is not registered or mailbox-active yet.
+    Prepared = 0,
     /// Normal apply and publish.
-    Active = 0,
+    Active = 1,
     /// Cancel observed while still current; exactly one terminal Shutdown publish; no durable commits.
-    Stopping = 1,
+    Stopping = 2,
     /// Unregistered or replaced; publish nothing, apply nothing.
-    Retired = 2,
+    Retired = 3,
 }
 
 impl WalletActorLifecycle {
     /// Durable private commits and non-terminal publications.
     pub(crate) const fn allows_durable_commits(self) -> bool {
-        matches!(self, Self::Active)
+        matches!(self, Self::Prepared | Self::Active)
     }
 
     /// Terminal Shutdown readiness only.
@@ -63,9 +65,17 @@ impl Default for WalletActorLifecycleCell {
 
 impl WalletActorLifecycleCell {
     pub(crate) fn new() -> Self {
+        Self::with_state(WalletActorLifecycle::Active)
+    }
+
+    pub(crate) fn new_prepared() -> Self {
+        Self::with_state(WalletActorLifecycle::Prepared)
+    }
+
+    fn with_state(state: WalletActorLifecycle) -> Self {
         Self {
             fence: Mutex::new(LifecycleInner {
-                state: WalletActorLifecycle::Active,
+                state,
                 terminal_shutdown_published: false,
             }),
         }
@@ -83,11 +93,26 @@ impl WalletActorLifecycleCell {
         self.with_fence(|inner| inner.state)
     }
 
-    /// Active → Stopping. Returns true if this call performed the transition.
+    /// Prepared/Active → Stopping. Returns true if this call performed the transition.
     pub(crate) fn mark_stopping(&self) -> bool {
         self.with_fence(|inner| {
-            if inner.state == WalletActorLifecycle::Active {
+            if matches!(
+                inner.state,
+                WalletActorLifecycle::Prepared | WalletActorLifecycle::Active
+            ) {
                 inner.state = WalletActorLifecycle::Stopping;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Prepared → Active. Registration must be installed before this transition.
+    pub(crate) fn activate(&self) -> bool {
+        self.with_fence(|inner| {
+            if inner.state == WalletActorLifecycle::Prepared {
+                inner.state = WalletActorLifecycle::Active;
                 true
             } else {
                 false
@@ -126,8 +151,8 @@ impl WalletActorLifecycleCell {
         })
     }
 
-    /// Runs `apply` only while lifecycle is Active and `is_current` is true, holding the
-    /// lifecycle fence for the entire synchronous apply (never across remote I/O).
+    /// Runs `apply` only while lifecycle allows private commits and `is_current` is true,
+    /// holding the lifecycle fence for the entire synchronous apply (never across remote I/O).
     ///
     /// The apply token is lifetime-bound via HRTB so it cannot escape the closure.
     pub(crate) fn with_active_apply<R>(
@@ -146,7 +171,7 @@ impl WalletActorLifecycleCell {
     }
 }
 
-/// Proof that a private apply is running under the lifecycle fence while Active.
+/// Proof that a private apply is running under the lifecycle fence while apply-authorized.
 /// Lifetime is bound to the fence hold; cannot escape [`WalletActorLifecycleCell::with_active_apply`].
 #[derive(Debug)]
 pub(crate) struct WalletActorApplyToken<'a> {

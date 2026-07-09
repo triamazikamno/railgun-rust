@@ -35,9 +35,9 @@ use super::{
     combined_log_event_signatures_for_range, complete_stream_checkpoint,
     drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
     send_wallet_startup_events, should_hedge_wallet_startup, spawn_backfill_loop,
-    spawn_wallet_worker, squid_tail_target_after_artifact, wallet_backfill_from_block,
-    wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
-    wallet_reorg_backfill_from_block, wallet_startup_hedge_block_count, wallet_sync_target,
+    squid_tail_target_after_artifact, wallet_backfill_from_block, wallet_backfill_lag_blocks,
+    wallet_finish_result_removes_cursor, wallet_reorg_backfill_from_block,
+    wallet_startup_hedge_block_count, wallet_sync_target,
     wallet_tail_fallback_lag_threshold_blocks,
 };
 use crate::indexed_artifacts::{
@@ -57,6 +57,7 @@ use crate::types::{
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
 use crate::wallet::WalletPoiRuntime;
+use crate::wallet::spawn_wallet_worker;
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);

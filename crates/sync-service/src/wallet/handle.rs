@@ -611,7 +611,7 @@ impl WalletPrivateMutationPermit<'_> {
         })
     }
 
-    /// Publish readiness/ready under the lifecycle fence (Active only).
+    /// Publish readiness/ready under the lifecycle fence while apply-authorized.
     pub(super) fn publish_readiness(
         &self,
         ready_tx: &watch::Sender<bool>,
@@ -652,7 +652,11 @@ impl WalletHandle {
         self.lifecycle.get()
     }
 
-    /// Active → Stopping. Used when cancel is observed for a still-current actor.
+    pub(crate) fn activate_actor(&self) -> bool {
+        self.lifecycle.activate()
+    }
+
+    /// Prepared/Active → Stopping. Used when cancel is observed for a still-current actor.
     pub(crate) fn mark_stopping(&self) -> bool {
         self.lifecycle.mark_stopping()
     }
