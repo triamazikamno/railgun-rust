@@ -100,7 +100,7 @@ pub struct WalletHandle {
     pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
     pub(super) pending_overlay_tx: mpsc::Sender<WalletPendingOverlayRequest>,
     pub(super) poi_refresh_tx: mpsc::Sender<WalletPoiRefreshRequest>,
-    pub(super) indexed_catch_up_status_tx: mpsc::Sender<WalletIndexedCatchUpCommand>,
+    pub(super) indexed_catch_up_status_tx: mpsc::UnboundedSender<WalletIndexedCatchUpCommand>,
     pub(super) rev_tx: watch::Sender<u64>,
     pub(super) indexed_catch_up_tx: watch::Sender<Option<WalletIndexedCatchUpStatus>>,
 }
@@ -312,22 +312,6 @@ impl WalletPrivateMutationPermit<'_> {
         Ok(())
     }
 
-    pub(super) fn publish_readiness(
-        &self,
-        ready_tx: &watch::Sender<bool>,
-        readiness_tx: &watch::Sender<WalletReadiness>,
-        readiness: WalletReadiness,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        self.revalidate()?;
-        if let Err(err) = readiness_tx.send(readiness.clone()) {
-            debug!(?err, cache_key = %self.handle.cache_key, "failed to send wallet readiness state");
-        }
-        if let Err(err) = ready_tx.send(readiness.is_ready()) {
-            debug!(?err, cache_key = %self.handle.cache_key, "failed to send ready state");
-        }
-        Ok(())
-    }
-
     pub(super) fn publish_progress(
         &self,
         progress_tx: Option<&SyncProgressSender>,
@@ -531,7 +515,7 @@ impl WalletHandle {
     ) {
         if let Err(err) = self
             .indexed_catch_up_status_tx
-            .try_send(WalletIndexedCatchUpCommand::Publish { lease, status })
+            .send(WalletIndexedCatchUpCommand::Publish { lease, status })
         {
             debug!(?err, cache_key = %self.cache_key, "failed to request indexed wallet catch-up status publication");
         }
@@ -542,7 +526,6 @@ impl WalletHandle {
         if self
             .indexed_catch_up_status_tx
             .send(WalletIndexedCatchUpCommand::Claim { response })
-            .await
             .is_err()
         {
             return None;
@@ -553,7 +536,7 @@ impl WalletHandle {
     pub(crate) fn clear_indexed_catch_up(&self, lease: WalletIndexedCatchUpLease) {
         if let Err(err) = self
             .indexed_catch_up_status_tx
-            .try_send(WalletIndexedCatchUpCommand::Clear { lease })
+            .send(WalletIndexedCatchUpCommand::Clear { lease })
         {
             debug!(?err, cache_key = %self.cache_key, "failed to request indexed wallet catch-up status clear");
         }

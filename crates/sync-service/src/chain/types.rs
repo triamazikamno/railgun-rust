@@ -301,6 +301,7 @@ pub struct ChainService {
     pub(super) backfill_tx: mpsc::Sender<BackfillRequest>,
     pub(super) archive_provider: Option<DynProvider>,
     pub(super) wallets: RwLock<HashMap<String, WalletRegistration>>,
+    pub(super) wallet_registration_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) cancel: CancellationToken,
     pub(super) live_log_task: Mutex<Option<JoinHandle<()>>>,
     pub(super) anchor_last: AtomicU64,

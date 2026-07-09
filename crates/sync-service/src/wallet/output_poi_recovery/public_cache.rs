@@ -217,7 +217,10 @@ pub(super) fn txid_public_cache_failure(err: TxidPublicCacheError) -> RecoveryFa
         | TxidPublicCacheError::Decode(_)
         | TxidPublicCacheError::Sync(_)
         | TxidPublicCacheError::Artifact(_)
-        | TxidPublicCacheError::MetadataMismatch(_) => OutputPoiRecoveryStatus::TxFetchFailed,
+        | TxidPublicCacheError::MetadataMismatch(_)
+        | TxidPublicCacheError::StalePublicCacheGeneration { .. } => {
+            OutputPoiRecoveryStatus::TxFetchFailed
+        }
     };
     let message = format!("TXID public cache failed: {err}");
     if matches!(status, OutputPoiRecoveryStatus::UnsupportedShape) {

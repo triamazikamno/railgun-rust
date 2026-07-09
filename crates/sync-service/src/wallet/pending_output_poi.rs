@@ -223,6 +223,49 @@ pub(super) async fn submit_observed_pending_output_pois_inner(
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOutputPoiSubmissionKind {
+    Missing,
+    RetrySubmitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingOutputPoiSubmissionPlan {
+    kind: PendingOutputPoiSubmissionKind,
+    list_keys: Vec<FixedBytes<32>>,
+    recovery_fingerprint: Option<Vec<u8>>,
+    force_submission_retry: bool,
+}
+
+impl PendingOutputPoiSubmissionPlan {
+    fn missing(list_keys: Vec<FixedBytes<32>>) -> Self {
+        Self {
+            kind: PendingOutputPoiSubmissionKind::Missing,
+            list_keys,
+            recovery_fingerprint: None,
+            force_submission_retry: false,
+        }
+    }
+
+    fn retry_submitted(
+        list_keys: Vec<FixedBytes<32>>,
+        recovery: &OutputPoiRecoveryRecord,
+        force_submission_retry: bool,
+    ) -> Self {
+        Self {
+            kind: PendingOutputPoiSubmissionKind::RetrySubmitted,
+            list_keys,
+            recovery_fingerprint: output_poi_recovery_fingerprint(recovery),
+            force_submission_retry,
+        }
+    }
+
+    fn retain_active(&mut self, active_list_keys: &[FixedBytes<32>]) {
+        self.list_keys
+            .retain(|list_key| active_list_keys.contains(list_key));
+    }
+}
+
 async fn submit_observed_pending_output_pois_impl(
     authority: &WalletPrivateMutationAuthority<'_>,
     permit: &WalletPrivateMutationPermit<'_>,
@@ -247,16 +290,19 @@ async fn submit_observed_pending_output_pois_impl(
         }
         let recovery =
             db.get_output_poi_recovery(chain_id, &record.wallet_id, &record.output_commitment)?;
-        let mut missing_list_keys = record.missing_list_keys();
-        if missing_list_keys.is_empty()
-            && recovery
-                .as_ref()
-                .is_some_and(|record| record.submission_retry_allowed(now, force_submission_retry))
+        let mut plan = PendingOutputPoiSubmissionPlan::missing(record.missing_list_keys());
+        if plan.list_keys.is_empty()
+            && let Some(recovery) = recovery.as_ref()
+            && recovery.submission_retry_allowed(now, force_submission_retry)
         {
-            missing_list_keys = record.list_keys();
+            plan = PendingOutputPoiSubmissionPlan::retry_submitted(
+                record.list_keys(),
+                recovery,
+                force_submission_retry,
+            );
         }
-        missing_list_keys.retain(|list_key| active_list_keys.contains(list_key));
-        if missing_list_keys.is_empty() {
+        plan.retain_active(active_list_keys);
+        if plan.list_keys.is_empty() {
             continue;
         }
         if !pending_output_poi_submission_plan_current(
@@ -265,14 +311,14 @@ async fn submit_observed_pending_output_pois_impl(
             cfg,
             active_list_keys,
             &record,
-            &missing_list_keys,
+            &plan,
         )
         .await?
         {
             continue;
         }
-        let pre_transaction_pois = record.retain_poi_lists(&missing_list_keys);
-        if pre_transaction_pois.len() != missing_list_keys.len() {
+        let pre_transaction_pois = record.retain_poi_lists(&plan.list_keys);
+        if pre_transaction_pois.len() != plan.list_keys.len() {
             record.terminal_error =
                 Some("missing pre-transaction POI for pending output".to_string());
             if let Err(reason) = authority.revalidate() {
@@ -318,7 +364,7 @@ async fn submit_observed_pending_output_pois_impl(
             );
             continue;
         };
-        let submitted_list_keys = missing_list_keys.clone();
+        let submitted_list_keys = plan.list_keys.clone();
         debug!(
             chain_id,
             wallet_id = %record.wallet_id,
@@ -353,7 +399,7 @@ async fn submit_observed_pending_output_pois_impl(
                     &record,
                     cfg,
                     active_list_keys,
-                    &submitted_list_keys,
+                    &plan,
                 )
                 .await?
                 {
@@ -395,7 +441,7 @@ async fn submit_observed_pending_output_pois_impl(
                     &record,
                     cfg,
                     active_list_keys,
-                    &submitted_list_keys,
+                    &plan,
                 )
                 .await?
                 {
@@ -824,13 +870,13 @@ pub(super) fn pending_output_poi_context_matches_wallet_utxo(
     })
 }
 
-pub(super) async fn pending_output_poi_submission_plan_current(
+async fn pending_output_poi_submission_plan_current(
     authority: &WalletPrivateMutationAuthority<'_>,
     db: &DbStore,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
     expected: &PendingOutputPoiContextRecord,
-    submitted_list_keys: &[FixedBytes<32>],
+    plan: &PendingOutputPoiSubmissionPlan,
 ) -> Result<bool, local_db::DbError> {
     if let Err(reason) = authority.revalidate() {
         debug!(
@@ -861,20 +907,71 @@ pub(super) async fn pending_output_poi_submission_plan_current(
         );
         return Ok(false);
     }
-    let mut current_missing = current.missing_list_keys();
-    current_missing.retain(|list_key| active_list_keys.contains(list_key));
-    if submitted_list_keys.is_empty()
-        || submitted_list_keys
+    if plan.list_keys.is_empty()
+        || plan
+            .list_keys
             .iter()
-            .any(|list_key| !current_missing.contains(list_key))
+            .any(|list_key| !active_list_keys.contains(list_key))
     {
-        debug!(
-            chain_id = cfg.chain.chain_id,
-            wallet_id = %cfg.cache_key,
-            commitment = %hex::encode(expected.output_commitment),
-            "pending output POI submission skipped; missing-list state changed"
-        );
         return Ok(false);
+    }
+    match plan.kind {
+        PendingOutputPoiSubmissionKind::Missing => {
+            let mut current_missing = current.missing_list_keys();
+            current_missing.retain(|list_key| active_list_keys.contains(list_key));
+            if plan
+                .list_keys
+                .iter()
+                .any(|list_key| !current_missing.contains(list_key))
+            {
+                debug!(
+                    chain_id = cfg.chain.chain_id,
+                    wallet_id = %cfg.cache_key,
+                    commitment = %hex::encode(expected.output_commitment),
+                    "pending output POI submission skipped; missing-list state changed"
+                );
+                return Ok(false);
+            }
+        }
+        PendingOutputPoiSubmissionKind::RetrySubmitted => {
+            let current_list_keys = current.list_keys();
+            if plan.list_keys.iter().any(|list_key| {
+                !current_list_keys.contains(list_key)
+                    || !current.submitted_poi_list_keys.contains(list_key)
+            }) {
+                debug!(
+                    chain_id = cfg.chain.chain_id,
+                    wallet_id = %cfg.cache_key,
+                    commitment = %hex::encode(expected.output_commitment),
+                    "pending output POI retry skipped; submitted-list state changed"
+                );
+                return Ok(false);
+            }
+            let Some(expected_fingerprint) = plan.recovery_fingerprint.as_ref() else {
+                return Ok(false);
+            };
+            let current_recovery = db.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &expected.output_commitment,
+            )?;
+            let current_fingerprint = current_recovery
+                .as_ref()
+                .and_then(output_poi_recovery_fingerprint);
+            if current_fingerprint.as_ref() != Some(expected_fingerprint)
+                || !current_recovery.as_ref().is_some_and(|record| {
+                    record.submission_retry_allowed(now_epoch_secs(), plan.force_submission_retry)
+                })
+            {
+                debug!(
+                    chain_id = cfg.chain.chain_id,
+                    wallet_id = %cfg.cache_key,
+                    commitment = %hex::encode(expected.output_commitment),
+                    "pending output POI retry skipped; recovery state changed"
+                );
+                return Ok(false);
+            }
+        }
     }
     let snapshot = match authority.wallet_utxos().await {
         Ok(snapshot) => snapshot,
@@ -902,6 +999,23 @@ pub(super) async fn pending_output_poi_submission_plan_current(
         );
         return Ok(false);
     }
+    let still_needs_poi = snapshot.iter().any(|wallet_utxo| {
+        !wallet_utxo.is_spent()
+            && pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, expected)
+            && wallet_utxo
+                .utxo
+                .poi
+                .has_recoverable_status_for_lists(&plan.list_keys)
+    });
+    if !still_needs_poi {
+        debug!(
+            chain_id = cfg.chain.chain_id,
+            wallet_id = %cfg.cache_key,
+            commitment = %hex::encode(expected.output_commitment),
+            "pending output POI submission skipped; output no longer needs POI"
+        );
+        return Ok(false);
+    }
     if let Err(reason) = authority.revalidate() {
         debug!(
             ?reason,
@@ -921,17 +1035,10 @@ async fn pending_output_poi_submission_side_effect_current(
     expected: &PendingOutputPoiContextRecord,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
-    submitted_list_keys: &[FixedBytes<32>],
+    plan: &PendingOutputPoiSubmissionPlan,
 ) -> Result<bool, local_db::DbError> {
-    pending_output_poi_submission_plan_current(
-        authority,
-        db,
-        cfg,
-        active_list_keys,
-        expected,
-        submitted_list_keys,
-    )
-    .await
+    pending_output_poi_submission_plan_current(authority, db, cfg, active_list_keys, expected, plan)
+        .await
 }
 
 pub(super) fn pending_output_poi_context_still_current(
@@ -998,6 +1105,10 @@ fn pending_output_poi_context_still_current_impl(
 fn pending_output_poi_context_fingerprint(
     record: &PendingOutputPoiContextRecord,
 ) -> Option<Vec<u8>> {
+    rmp_serde::to_vec(record).ok()
+}
+
+fn output_poi_recovery_fingerprint(record: &OutputPoiRecoveryRecord) -> Option<Vec<u8>> {
     rmp_serde::to_vec(record).ok()
 }
 

@@ -35,12 +35,52 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
     pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(super) forest: &'a MerkleForest,
     pub(super) poi_client: &'a PoiRpcClient,
-    pub(super) proof_source: &'a (dyn PoiMerkleProofSource + 'a),
-    pub(super) local_proof_source: Option<&'a LocalPoiMerkleProofSource>,
+    pub(super) poi_runtime: &'a WalletPoiRuntime,
     pub(super) submitter: &'a dyn PendingOutputPoiSubmitter,
     pub(super) active_list_keys: &'a [FixedBytes<32>],
     pub(super) wallet_utxos: &'a [WalletUtxo],
     pub(super) force_retry: bool,
+}
+
+enum OutputPoiProofSourceResolution {
+    Local(LocalPoiMerkleProofSource),
+    RemoteFallback,
+    Unavailable,
+}
+
+impl OutputPoiRecoveryRequest<'_> {
+    async fn local_proof_source_if_ready(&self) -> Option<LocalPoiMerkleProofSource> {
+        match self.poi_runtime {
+            WalletPoiRuntime::IndexedArtifacts { .. } => {
+                let corpus = self
+                    .public_data_plane
+                    .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id))
+                    .await
+                    .ok()?;
+                let source = LocalPoiMerkleProofSource::new(corpus.local_caches());
+                source
+                    .available_for_lists(self.cfg.chain.chain_id, self.active_list_keys)
+                    .await
+                    .then_some(source)
+            }
+            WalletPoiRuntime::PoiProxy { .. } => None,
+        }
+    }
+
+    async fn resolve_proof_source(&self) -> OutputPoiProofSourceResolution {
+        match self.poi_runtime {
+            WalletPoiRuntime::IndexedArtifacts { .. } => {
+                if let Some(source) = self.local_proof_source_if_ready().await {
+                    OutputPoiProofSourceResolution::Local(source)
+                } else if self.poi_runtime.wallet_read_fallback_enabled() {
+                    OutputPoiProofSourceResolution::RemoteFallback
+                } else {
+                    OutputPoiProofSourceResolution::Unavailable
+                }
+            }
+            WalletPoiRuntime::PoiProxy { .. } => OutputPoiProofSourceResolution::RemoteFallback,
+        }
+    }
 }
 
 pub(super) struct WalletNullifierIndex<'a> {
@@ -408,6 +448,35 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             "output POI recovery TXID data recovered"
         );
 
+        let proof_source_resolution = request.resolve_proof_source().await;
+        let proof_source: &dyn PoiMerkleProofSource = match &proof_source_resolution {
+            OutputPoiProofSourceResolution::Local(source) => source,
+            OutputPoiProofSourceResolution::RemoteFallback => request.poi_client,
+            OutputPoiProofSourceResolution::Unavailable => {
+                if !request.candidate_still_current(candidate).await {
+                    continue;
+                }
+                log_local_poi_cache_unavailable(
+                    request.cfg,
+                    "output_poi_recovery_proof_generation",
+                );
+                record_output_poi_recovery_failure(
+                    request.permit,
+                    request.db,
+                    request.cache_store,
+                    request.cfg,
+                    candidate,
+                    RecoveryFailure::retryable(
+                        OutputPoiRecoveryStatus::ProofGenerationFailed,
+                        "local POI proof source unavailable",
+                        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                    ),
+                    now,
+                )
+                .await;
+                continue;
+            }
+        };
         let proof_generation_started = Instant::now();
         match generate_post_transaction_pois(PostTransactionPoiGenerationRequest {
             chunk: &recovery_chunk.chunk,
@@ -416,7 +485,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             chain_id: request.cfg.chain.chain_id,
             txid_version: Some(DEFAULT_TXID_VERSION),
             required_poi_list_keys: request.active_list_keys,
-            proof_source: request.proof_source,
+            proof_source,
             prover,
             verify_proof: OUTPUT_POI_RECOVERY_VERIFY_PROOF,
         })
@@ -1169,10 +1238,10 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
         "output POI recovery transaction input decoded"
     );
 
-    if request.local_proof_source.is_some() {
+    if let Some(local_proof_source) = request.local_proof_source_if_ready().await {
         let preflight_started = Instant::now();
         match preflight_local_output_poi_input_proofs(
-            request.local_proof_source,
+            Some(&local_proof_source),
             request.cfg,
             candidate,
             request.wallet_utxos,

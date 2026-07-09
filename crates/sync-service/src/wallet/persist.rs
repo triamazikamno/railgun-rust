@@ -302,45 +302,20 @@ impl OutputPoiRecoveryRun<'_> {
         if output_poi_recovery_candidates(&snapshot, self.active_list_keys).is_empty() {
             return 0;
         }
-        let forest = self.forest.read().await.clone();
-        let local_proof_source = match self.poi_runtime {
-            WalletPoiRuntime::IndexedArtifacts { .. } => {
-                let corpus = self
-                    .public_data_plane
-                    .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id))
-                    .await
-                    .ok();
-                match corpus {
-                    Some(corpus) => {
-                        let local_caches = corpus.local_caches();
-                        let source = LocalPoiMerkleProofSource::new(local_caches);
-                        if source
-                            .available_for_lists(self.cfg.chain.chain_id, self.active_list_keys)
-                            .await
-                        {
-                            Some(source)
-                        } else if self.poi_runtime.wallet_read_fallback_enabled() {
-                            None
-                        } else {
-                            log_local_poi_cache_unavailable(self.cfg, "output_poi_recovery");
-                            return 0;
-                        }
-                    }
-                    None if self.poi_runtime.wallet_read_fallback_enabled() => None,
-                    None => {
-                        log_local_poi_cache_unavailable(self.cfg, "output_poi_recovery");
-                        return 0;
-                    }
-                }
-            }
-            WalletPoiRuntime::PoiProxy { .. } => None,
-        };
-        let proof_source: &(dyn PoiMerkleProofSource + '_);
-        if let Some(source) = local_proof_source.as_ref() {
-            proof_source = source;
-        } else {
-            proof_source = self.client;
+        if matches!(self.poi_runtime, WalletPoiRuntime::IndexedArtifacts { .. })
+            && !self.poi_runtime.wallet_read_fallback_enabled()
+            && !self
+                .public_data_plane
+                .poi_corpus_ready_for_lists(
+                    PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id),
+                    self.active_list_keys,
+                )
+                .await
+        {
+            log_local_poi_cache_unavailable(self.cfg, "output_poi_recovery");
+            return 0;
         }
+        let forest = self.forest.read().await.clone();
         let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
             authority: self.authority,
             permit: &permit,
@@ -353,8 +328,7 @@ impl OutputPoiRecoveryRun<'_> {
             indexed_artifact_source: self.indexed_artifact_source,
             forest: &forest,
             poi_client: self.client,
-            proof_source,
-            local_proof_source: local_proof_source.as_ref(),
+            poi_runtime: self.poi_runtime,
             submitter: self.client,
             active_list_keys: self.active_list_keys,
             wallet_utxos: &snapshot,

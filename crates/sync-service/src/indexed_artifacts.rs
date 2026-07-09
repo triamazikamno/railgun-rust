@@ -15,7 +15,8 @@ pub use railgun_indexed_artifacts::{
     IndexedArtifactCatalog, IndexedArtifactChainEntry, IndexedArtifactChunkEnvelope,
     IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection, IndexedArtifactDescriptor,
     IndexedArtifactError, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
-    IndexedArtifactStreamCatalog, IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactStreamCatalog, IndexedArtifactStreamCoverage,
+    IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
     IndexedArtifactStreamPlanError, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
     LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm, format_scope,
 };

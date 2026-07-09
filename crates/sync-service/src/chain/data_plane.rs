@@ -75,6 +75,10 @@ pub(crate) struct PublicScanCommitPermit {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
+pub(crate) struct PublicCacheCommitPermit {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicCoverageAnswer {
     ReplayableEmpty {
@@ -861,10 +865,7 @@ impl ChainPublicDataPlane {
             return None;
         }
         match verify_chunk_bytes(descriptor.clone(), bytes) {
-            Ok(chunk) => {
-                self.touch_wallet_scan_artifact_chunk_cache(&id, meta);
-                Some(chunk)
-            }
+            Ok(chunk) => Some(chunk),
             Err(err) => {
                 debug!(?err, cid = %descriptor.cid, "cached wallet-scan artifact chunk failed descriptor verification");
                 None
@@ -872,11 +873,21 @@ impl ChainPublicDataPlane {
         }
     }
 
-    pub(crate) fn retain_wallet_scan_artifact_chunks(
+    pub(crate) async fn retain_wallet_scan_artifact_chunks(
         &self,
         chunks: &[VerifiedIndexedArtifactChunk],
         retention_descriptors: &[IndexedArtifactDescriptor],
+        read_scope: PublicScanReadScope,
     ) -> usize {
+        let Ok(_permit) = self
+            .public_cache_commit_permit(
+                read_scope,
+                "stale wallet-scan artifact chunk retention epoch",
+            )
+            .await
+        else {
+            return 0;
+        };
         let mut retained = 0_usize;
         for chunk in chunks {
             if !wallet_scan_artifact_descriptor_is_stable(&chunk.descriptor, retention_descriptors)
@@ -932,29 +943,6 @@ impl ChainPublicDataPlane {
             )
             .map_err(|err| err.to_string())?;
         Ok(())
-    }
-
-    fn touch_wallet_scan_artifact_chunk_cache(&self, id: &str, mut meta: BlobMeta) {
-        match wallet_scan_artifact_now_epoch_secs() {
-            Ok(now) => {
-                meta.last_accessed_at = now;
-                if let Err(err) =
-                    self.db
-                        .put_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, id, &meta)
-                {
-                    debug!(
-                        ?err,
-                        id, "failed to update wallet-scan artifact chunk cache access time"
-                    );
-                }
-            }
-            Err(err) => {
-                debug!(
-                    ?err,
-                    id, "failed to compute wallet-scan artifact chunk cache access time"
-                );
-            }
-        }
     }
 
     fn reset_wallet_scan_artifact_chunk_cache(
@@ -1093,6 +1081,32 @@ impl ChainPublicDataPlane {
             )?;
         }
         Ok(PublicScanCommitPermit {
+            _guard: commit_guard,
+        })
+    }
+
+    async fn public_cache_commit_permit(
+        &self,
+        read_scope: PublicScanReadScope,
+        reason: impl Into<String>,
+    ) -> Result<PublicCacheCommitPermit, PublicDataPlaneError> {
+        let commit_guard = Arc::clone(&self.commit_fence).lock_owned().await;
+        let mut state = self.state.lock().await;
+        let current_epoch = self.current_epoch();
+        if current_epoch != read_scope.epoch() {
+            state.push_diagnostic(PublicDataPlaneDiagnostic {
+                kind: PublicDataPlaneDiagnosticKind::CoverageRejected,
+                source: None,
+                range: None,
+                reason: reason.into(),
+                epoch: current_epoch,
+            });
+            return Err(PublicDataPlaneError::StaleEpoch {
+                expected: current_epoch.value,
+                actual: read_scope.epoch().value,
+            });
+        }
+        Ok(PublicCacheCommitPermit {
             _guard: commit_guard,
         })
     }
@@ -1766,10 +1780,13 @@ mod tests {
             metadata.chunk_sealed = true;
         });
         assert_eq!(
-            data_plane.retain_wallet_scan_artifact_chunks(
-                std::slice::from_ref(&wallet_scan_chunk),
-                std::slice::from_ref(&wallet_scan_chunk.descriptor),
-            ),
+            data_plane
+                .retain_wallet_scan_artifact_chunks(
+                    std::slice::from_ref(&wallet_scan_chunk),
+                    std::slice::from_ref(&wallet_scan_chunk.descriptor),
+                    data_plane.begin_public_scan_read(),
+                )
+                .await,
             1
         );
 
@@ -1826,10 +1843,13 @@ mod tests {
             transient_tail.descriptor.clone(),
         ];
 
-        let retained = data_plane.retain_wallet_scan_artifact_chunks(
-            &[stable_chunk.clone(), transient_tail.clone()],
-            &selected,
-        );
+        let retained = data_plane
+            .retain_wallet_scan_artifact_chunks(
+                &[stable_chunk.clone(), transient_tail.clone()],
+                &selected,
+                data_plane.begin_public_scan_read(),
+            )
+            .await;
 
         assert_eq!(retained, 1);
         assert_eq!(
@@ -1859,10 +1879,13 @@ mod tests {
             metadata.chunk_sealed = true;
         });
         assert_eq!(
-            data_plane.retain_wallet_scan_artifact_chunks(
-                std::slice::from_ref(&sealed_tail),
-                std::slice::from_ref(&sealed_tail.descriptor),
-            ),
+            data_plane
+                .retain_wallet_scan_artifact_chunks(
+                    std::slice::from_ref(&sealed_tail),
+                    std::slice::from_ref(&sealed_tail.descriptor),
+                    data_plane.begin_public_scan_read(),
+                )
+                .await,
             1
         );
         assert!(
@@ -1875,13 +1898,16 @@ mod tests {
         let context_only_successor = test_wallet_scan_chunk(41, 50, &[10, 11, 12], |_| {});
         let predecessor = test_wallet_scan_chunk(31, 40, &[13, 14, 15], |_| {});
         assert_eq!(
-            data_plane.retain_wallet_scan_artifact_chunks(
-                std::slice::from_ref(&predecessor),
-                &[
-                    predecessor.descriptor.clone(),
-                    context_only_successor.descriptor.clone(),
-                ],
-            ),
+            data_plane
+                .retain_wallet_scan_artifact_chunks(
+                    std::slice::from_ref(&predecessor),
+                    &[
+                        predecessor.descriptor.clone(),
+                        context_only_successor.descriptor.clone(),
+                    ],
+                    data_plane.begin_public_scan_read(),
+                )
+                .await,
             1,
             "planner retention context may include chunks outside the request"
         );
@@ -1903,13 +1929,13 @@ mod tests {
                 .is_some(),
             "verified cache hit should be reused"
         );
-        let touched_meta = db
+        let untouched_meta = db
             .get_blob_meta(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, &predecessor_id)
-            .expect("read touched predecessor meta")
+            .expect("read predecessor meta after cache hit")
             .expect("predecessor meta retained");
-        assert!(
-            touched_meta.last_accessed_at > 0,
-            "verified cache hits update access time"
+        assert_eq!(
+            untouched_meta.last_accessed_at, 0,
+            "verified cache hits must remain read-only"
         );
 
         drop(data_plane);

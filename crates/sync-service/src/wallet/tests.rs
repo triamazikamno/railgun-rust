@@ -195,7 +195,7 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
-    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::channel(1);
+    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     WalletHandle {
         cache_key: "cache-key".to_string(),
         chain_id: 1,
@@ -2839,6 +2839,116 @@ async fn authorized_pending_output_verification_updates_wallet_poi_projection() 
 }
 
 #[tokio::test]
+async fn authorized_pending_output_poi_retry_resubmits_submitted_lists() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let chain_id = 1;
+    let list_key = FixedBytes::from([0x95; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = "wallet-1".to_string();
+    let wallet_utxo = test_wallet_utxo(15);
+    let output_commitment = wallet_utxo.utxo.poi.commitment;
+    let mut pending = matching_pending_output_record(&cfg, &wallet_utxo, list_key);
+    pending.submitted_poi_list_keys = vec![list_key];
+    store
+        .put_pending_output_poi_context(&pending)
+        .expect("store pending context");
+    let now = now_epoch_secs();
+    store
+        .put_output_poi_recovery(&output_poi_recovery_record(
+            chain_id,
+            &cfg.cache_key,
+            output_commitment,
+            OutputPoiRecoveryStatus::Submitted,
+            Some(now.saturating_sub(1)),
+        ))
+        .expect("store recovery");
+    let mut handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let submitter = RecordingPendingOutputPoiSubmitter::default();
+
+    let submitted = process_pending_output_poi_observations_authorized(
+        &authority,
+        &store,
+        &store,
+        &cfg,
+        &[list_key],
+        Some(&submitter),
+        false,
+    )
+    .await;
+
+    assert_eq!(submitted, 1);
+    assert_eq!(
+        submitter.calls(),
+        vec![(
+            output_commitment,
+            u64::from(wallet_utxo.utxo.tree),
+            wallet_utxo.utxo.position,
+        ),]
+    );
+    let recovery = store
+        .get_output_poi_recovery(chain_id, &cfg.cache_key, &output_commitment)
+        .expect("load recovery")
+        .expect("recovery present");
+    assert_eq!(recovery.status, OutputPoiRecoveryStatus::Submitted);
+    assert_eq!(recovery.attempt_count, 1);
+    assert!(recovery.next_retry_at.is_some_and(|next| next > now));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn authorized_pending_output_poi_skips_output_that_no_longer_needs_poi() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let list_key = FixedBytes::from([0x96; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = "wallet-1".to_string();
+    let mut wallet_utxo = test_wallet_utxo(16);
+    wallet_utxo
+        .utxo
+        .poi
+        .statuses
+        .insert(list_key, PoiStatus::Valid);
+    let pending = matching_pending_output_record(&cfg, &wallet_utxo, list_key);
+    store
+        .put_pending_output_poi_context(&pending)
+        .expect("store pending context");
+    let mut handle = test_wallet_handle(vec![wallet_utxo]);
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let submitter = RecordingPendingOutputPoiSubmitter::default();
+
+    let submitted = process_pending_output_poi_observations_authorized(
+        &authority,
+        &store,
+        &store,
+        &cfg,
+        &[list_key],
+        Some(&submitter),
+        false,
+    )
+    .await;
+
+    assert_eq!(submitted, 0);
+    assert!(submitter.calls().is_empty());
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn pending_output_poi_maintenance_is_scoped_to_wallet_id() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
@@ -3830,7 +3940,7 @@ fn notify_changed_increments_revision() {
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
-    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::channel(1);
+    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
         cache_key: "cache-key".to_string(),
         chain_id: 1,
@@ -3871,7 +3981,7 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel::<WalletPoiRefreshRequest>(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
-    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::channel(1);
+    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
         cache_key: "cache-key".to_string(),
         chain_id: 1,

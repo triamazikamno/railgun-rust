@@ -5,7 +5,7 @@ use crate::indexed_artifacts::{
     IndexedArtifactRangeKind, IndexedArtifactStreamCatalog, IndexedArtifactStreamPartitionPolicy,
     IndexedArtifactStreamPlan, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
     VerifiedIndexedArtifactChunk, VerifiedIndexedArtifactChunkStager,
-    decode_indexed_artifact_chunk,
+    decode_indexed_artifact_chunk, verify_chunk_bytes,
 };
 
 use broadcaster_core::transact::{
@@ -41,6 +41,7 @@ impl TxidPublicArtifactSource {
 
     pub(crate) async fn fetch_current_chunks(
         &self,
+        cache: &TxidPublicCache<'_>,
         from_index: u64,
         to_index: Option<u64>,
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, TxidPublicCacheError> {
@@ -88,16 +89,31 @@ impl TxidPublicArtifactSource {
             ),
         )
         .map_err(|err| TxidPublicCacheError::MetadataMismatch(err.to_string()))?;
-        self.client
-            .fetch_chunks_bounded(&plan.required_current_chunks)
-            .await
-            .map_err(TxidPublicCacheError::from)
+        let mut chunks = Vec::with_capacity(plan.required_current_chunks.len());
+        let mut missing = Vec::new();
+        for descriptor in &plan.required_current_chunks {
+            if let Some(chunk) = cache.cached_artifact_chunk(descriptor) {
+                chunks.push(chunk);
+            } else {
+                missing.push(descriptor.clone());
+            }
+        }
+        if !missing.is_empty() {
+            chunks.extend(
+                self.client
+                    .fetch_chunks_bounded(&missing)
+                    .await
+                    .map_err(TxidPublicCacheError::from)?,
+            );
+        }
+        Ok(chunks)
     }
 
     pub(crate) async fn retain_prior_tail_best_effort(
         &self,
         cache: &TxidPublicCache<'_>,
         from_index: u64,
+        read_scope: TxidPublicCacheReadScope,
     ) {
         let manifest = match self
             .client
@@ -167,8 +183,12 @@ impl TxidPublicArtifactSource {
                 return;
             }
         };
-        self.retain_optional_prior_tail_chunks(cache, &plan.optional_prior_tail_retention)
-            .await;
+        self.retain_optional_prior_tail_chunks(
+            cache,
+            &plan.optional_prior_tail_retention,
+            read_scope,
+        )
+        .await;
     }
 
     fn catalog_may_contain_txid_partition(&self, descriptor: &IndexedArtifactDescriptor) -> bool {
@@ -228,31 +248,38 @@ impl TxidPublicArtifactSource {
         &self,
         cache: &TxidPublicCache<'_>,
         descriptors: &[crate::indexed_artifacts::IndexedArtifactDescriptor],
+        read_scope: TxidPublicCacheReadScope,
     ) {
         if descriptors.is_empty() {
             return;
         }
         match self.client.fetch_chunks_bounded(descriptors).await {
-            Ok(chunks) => match cache.retain_artifact_chunks(&chunks) {
-                Ok(retained) => {
-                    debug!(
-                        chain_id = cache.key.chain_id,
-                        txid_version = cache.key.txid_version,
-                        retained,
-                        requested = descriptors.len(),
-                        "retained optional public TXID prior-tail artifact chunks"
-                    );
+            Ok(chunks) => {
+                match cache
+                    .begin_write_for_scope(read_scope)
+                    .await
+                    .and_then(|permit| permit.retain_artifact_chunks(&chunks))
+                {
+                    Ok(retained) => {
+                        debug!(
+                            chain_id = cache.key.chain_id,
+                            txid_version = cache.key.txid_version,
+                            retained,
+                            requested = descriptors.len(),
+                            "retained optional public TXID prior-tail artifact chunks"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            chain_id = cache.key.chain_id,
+                            txid_version = cache.key.txid_version,
+                            requested = descriptors.len(),
+                            "failed best-effort public TXID prior-tail retention"
+                        );
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        chain_id = cache.key.chain_id,
-                        txid_version = cache.key.txid_version,
-                        requested = descriptors.len(),
-                        "failed best-effort public TXID prior-tail retention"
-                    );
-                }
-            },
+            }
             Err(err) => {
                 warn!(
                     ?err,
@@ -267,28 +294,101 @@ impl TxidPublicArtifactSource {
 }
 
 impl TxidPublicCache<'_> {
-    fn retain_artifact_chunks(
+    fn cached_artifact_chunk(
+        &self,
+        descriptor: &IndexedArtifactDescriptor,
+    ) -> Option<VerifiedIndexedArtifactChunk> {
+        if descriptor.dataset_kind != IndexedDatasetKind::PublicTxid
+            || descriptor.range.kind != IndexedArtifactRangeKind::TxidIndex
+            || descriptor.scope.chain_id != self.key.chain_id
+            || descriptor.metadata.stream_partition.as_deref() != Some(self.key.txid_version)
+        {
+            return None;
+        }
+        let id = artifact_chunk_blob_id(self.key, &descriptor.cid);
+        let meta = match self.db.get_blob_meta(TXID_CACHE_BLOB_KIND, &id) {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return None,
+            Err(err) => {
+                debug!(?err, cid = %descriptor.cid, "failed to read public TXID artifact chunk cache metadata");
+                return None;
+            }
+        };
+        if meta.format_version != TXID_CACHE_FORMAT_VERSION
+            || meta.source_hash != Some(descriptor.sha256.0)
+        {
+            debug!(cid = %descriptor.cid, "public TXID artifact chunk cache metadata did not match descriptor");
+            return None;
+        }
+        let path = self.db.resolve_path(&meta.relative_path);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => return None,
+            Err(err) => {
+                debug!(?err, path = %path.display(), cid = %descriptor.cid, "failed to read cached public TXID artifact chunk");
+                return None;
+            }
+        };
+        let content_hash: [u8; 32] = Sha256::digest(&bytes).into();
+        if content_hash != meta.content_hash {
+            debug!(cid = %descriptor.cid, "cached public TXID artifact chunk content hash mismatch");
+            return None;
+        }
+        match verify_chunk_bytes(descriptor.clone(), bytes) {
+            Ok(chunk) => Some(chunk),
+            Err(err) => {
+                debug!(?err, cid = %descriptor.cid, "cached public TXID artifact chunk failed descriptor verification");
+                None
+            }
+        }
+    }
+}
+
+impl TxidPublicCacheWritePermit<'_> {
+    pub(super) fn retain_current_artifact_chunks(
+        &self,
+        chunks: &[VerifiedIndexedArtifactChunk],
+        from_index: u64,
+        latest_txid_index: Option<u64>,
+    ) -> Result<usize, TxidPublicCacheError> {
+        let current_chunks = chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.descriptor.range.end >= from_index
+                    && latest_txid_index.is_none_or(|latest_txid_index| {
+                        chunk.descriptor.range.end < latest_txid_index
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.retain_artifact_chunks(&current_chunks)
+    }
+
+    pub(super) fn retain_artifact_chunks(
         &self,
         chunks: &[VerifiedIndexedArtifactChunk],
     ) -> Result<usize, TxidPublicCacheError> {
         let now = now_epoch_secs()?;
-        let manifest = self.load_or_new_manifest()?;
+        let cache = self.cache();
+        let manifest = cache.load_or_new_manifest()?;
+        let db = self.db();
+        let key = self.key();
         for chunk in chunks {
             let pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
             verify_declared_merkle_root(
                 &chunk.descriptor.metadata.root,
                 &manifest,
-                self.db,
+                db,
                 chunk.descriptor.range.start,
                 chunk.descriptor.range.end,
                 &pages,
             )?;
-            let id = artifact_chunk_blob_id(self.key, &chunk.descriptor.cid);
-            let name = artifact_chunk_file_name(self.key, &chunk.descriptor.cid);
-            let path = self.db.blob_path(TXID_CACHE_BLOB_KIND, &name);
-            write_blob_file(self.db, &path, &chunk.bytes)?;
-            let existing = self.db.get_blob_meta(TXID_CACHE_BLOB_KIND, &id)?;
-            self.db.put_blob_meta(
+            let id = artifact_chunk_blob_id(key, &chunk.descriptor.cid);
+            let name = artifact_chunk_file_name(key, &chunk.descriptor.cid);
+            let path = db.blob_path(TXID_CACHE_BLOB_KIND, &name);
+            write_blob_file(db, &path, &chunk.bytes)?;
+            let existing = db.get_blob_meta(TXID_CACHE_BLOB_KIND, &id)?;
+            db.put_blob_meta(
                 TXID_CACHE_BLOB_KIND,
                 &id,
                 &BlobMeta {
@@ -311,21 +411,20 @@ impl TxidPublicCacheManifest {
     #[cfg(test)]
     pub(crate) fn apply_artifact_chunks(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         chunks: &[VerifiedIndexedArtifactChunk],
     ) -> Result<u64, TxidPublicCacheError> {
-        self.apply_artifact_chunks_bounded(db, key, chunks, None, None)
+        self.apply_artifact_chunks_bounded(permit, chunks, None, None)
     }
 
     pub(crate) fn apply_artifact_chunks_bounded(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         chunks: &[VerifiedIndexedArtifactChunk],
         to_index: Option<u64>,
         latest_validated_merkleroot: Option<FixedBytes<32>>,
     ) -> Result<u64, TxidPublicCacheError> {
+        let db = permit.db();
         let Some(next_range_start) = self
             .validated_cached_txid_index
             .map_or(Some(0), |index| index.checked_add(1))
@@ -407,9 +506,9 @@ impl TxidPublicCacheManifest {
             for page in pages {
                 let row_count = page.rows.len() as u64;
                 if page.start_index < self.next_txid_index {
-                    self.insert_or_replace_staged_artifact_page(db, key, &page)?;
+                    self.insert_or_replace_staged_artifact_page(permit, &page)?;
                 } else {
-                    self.append_staged_artifact_page(db, key, &page)?;
+                    self.append_staged_artifact_page(permit, &page)?;
                 }
                 applied_rows = applied_rows.saturating_add(row_count);
             }

@@ -105,6 +105,11 @@ struct WalletResetCommitOutcome {
     committed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalletActorBootstrapResult {
+    RestoredResetAttempted { result: WalletBackfillResetResult },
+}
+
 enum WalletBackfillDoneOutcome {
     Finished,
     Rejected(WalletBackfillRejectReason),
@@ -134,6 +139,15 @@ fn wallet_sync_actor_state_record(
 
 fn reset_replay_from_block(last_scanned: u64, start_block: u64) -> u64 {
     last_scanned.saturating_add(1).max(start_block)
+}
+
+fn signal_restored_reset_attempt(
+    startup_replay_tx: &mut Option<oneshot::Sender<WalletActorBootstrapResult>>,
+    result: WalletBackfillResetResult,
+) {
+    if let Some(tx) = startup_replay_tx.take() {
+        let _ = tx.send(WalletActorBootstrapResult::RestoredResetAttempted { result });
+    }
 }
 
 fn enqueue_reset_replay_after_commit(
@@ -500,14 +514,17 @@ impl WalletActorState {
 
     fn reduce_and_publish_readiness(
         &mut self,
-        permit: &WalletPrivateMutationPermit<'_>,
         ready_tx: &watch::Sender<bool>,
         readiness_tx: &watch::Sender<WalletReadiness>,
-    ) -> Result<(), WalletBackfillRejectReason> {
+    ) {
         let readiness = self.derived_readiness();
-        permit.publish_readiness(ready_tx, readiness_tx, readiness.clone())?;
+        if let Err(err) = readiness_tx.send(readiness.clone()) {
+            debug!(?err, "failed to send wallet readiness state");
+        }
+        if let Err(err) = ready_tx.send(readiness.is_ready()) {
+            debug!(?err, "failed to send ready state");
+        }
         self.readiness = readiness.clone();
-        Ok(())
     }
 }
 
@@ -802,11 +819,9 @@ impl WalletPoiStatusRefreshCommitRequest<'_> {
             request
                 .actor_state
                 .fail_readiness(WalletReadinessError::PersistenceFailed);
-            request.actor_state.reduce_and_publish_readiness(
-                &permit,
-                request.ready_tx,
-                request.readiness_tx,
-            )?;
+            request
+                .actor_state
+                .reduce_and_publish_readiness(request.ready_tx, request.readiness_tx);
             return Err(WalletBackfillRejectReason::PersistenceFailed);
         }
         request.actor_state.clear_persistence_failure();
@@ -816,6 +831,9 @@ impl WalletPoiStatusRefreshCommitRequest<'_> {
             permit.revalidate()?;
             *locked = candidate;
         }
+        request
+            .actor_state
+            .reduce_and_publish_readiness(request.ready_tx, request.readiness_tx);
         permit.notify_changed()?;
         drop(permit);
         debug!(
@@ -1013,11 +1031,9 @@ impl WalletScanCommitRequest<'_> {
                 request
                     .actor_state
                     .fail_readiness(WalletReadinessError::PersistenceFailed);
-                let _ = request.actor_state.reduce_and_publish_readiness(
-                    &permit,
-                    request.ready_tx,
-                    request.readiness_tx,
-                );
+                request
+                    .actor_state
+                    .reduce_and_publish_readiness(request.ready_tx, request.readiness_tx);
                 return WalletScanCommitOutcome {
                     result: WalletBackfillApplyResult::Rejected {
                         committed_to: *request.last_scanned,
@@ -1094,11 +1110,9 @@ impl WalletScanCommitRequest<'_> {
                 request
                     .actor_state
                     .fail_readiness(WalletReadinessError::PersistenceFailed);
-                let _ = request.actor_state.reduce_and_publish_readiness(
-                    &permit,
-                    request.ready_tx,
-                    request.readiness_tx,
-                );
+                request
+                    .actor_state
+                    .reduce_and_publish_readiness(request.ready_tx, request.readiness_tx);
                 return WalletScanCommitOutcome {
                     result: WalletBackfillApplyResult::Rejected {
                         committed_to: *request.last_scanned,
@@ -1169,19 +1183,9 @@ impl WalletScanCommitRequest<'_> {
         }
         if request.mark_syncing_on_commit {
             request.actor_state.update_cursor(to_block);
-            if let Err(reason) = request.actor_state.reduce_and_publish_readiness(
-                &permit,
-                request.ready_tx,
-                request.readiness_tx,
-            ) {
-                return WalletScanCommitOutcome {
-                    result: WalletBackfillApplyResult::Rejected {
-                        committed_to: *request.last_scanned,
-                        reason,
-                    },
-                    changed: false,
-                };
-            }
+            request
+                .actor_state
+                .reduce_and_publish_readiness(request.ready_tx, request.readiness_tx);
         }
         drop(public_scan_permit);
         drop(permit);
@@ -1293,7 +1297,7 @@ pub(crate) async fn spawn_wallet_worker(
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel(1);
     let (pending_overlay_tx, mut pending_overlay_rx) = mpsc::channel(8);
-    let (indexed_catch_up_status_tx, mut indexed_catch_up_status_rx) = mpsc::channel(8);
+    let (indexed_catch_up_status_tx, mut indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let (poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let handle = WalletHandle {
@@ -1370,25 +1374,7 @@ pub(crate) async fn spawn_wallet_worker(
         );
         macro_rules! publish_readiness {
             () => {{
-                let authority = WalletPrivateMutationAuthority::new(
-                    &worker_handle,
-                    actor_state.reset_generation,
-                    &cancel,
-                );
-                match authority.acquire().await {
-                    Ok(permit) => {
-                        if let Err(reason) = actor_state.reduce_and_publish_readiness(
-                            &permit,
-                            &ready_tx,
-                            &readiness_tx,
-                        ) {
-                            debug!(?reason, cache_key = %cfg.cache_key, "wallet readiness publication rejected");
-                        }
-                    }
-                    Err(reason) => {
-                        debug!(?reason, cache_key = %cfg.cache_key, "wallet readiness publication skipped");
-                    }
-                }
+                actor_state.reduce_and_publish_readiness(&ready_tx, &readiness_tx);
             }};
         }
         macro_rules! try_commit_pending_reset {
@@ -1749,12 +1735,9 @@ pub(crate) async fn spawn_wallet_worker(
             }};
         }
         if actor_state.pending_reset.is_some() {
-            let _ = try_commit_pending_reset!(true);
-        }
-        if actor_state.pending_reset.is_none()
-            && let Some(tx) = startup_replay_tx.take()
-        {
-            let _ = tx.send(());
+            if let Some(outcome) = try_commit_pending_reset!(true) {
+                signal_restored_reset_attempt(&mut startup_replay_tx, outcome.result.clone());
+            }
         }
 
         loop {
@@ -1763,11 +1746,7 @@ pub(crate) async fn spawn_wallet_worker(
                 _ = pending_reset_retry.tick(), if actor_state.pending_reset.is_some() => {
                     if let Some(outcome) = try_commit_pending_reset!(true) {
                         debug!(?outcome.result, cache_key = %cfg.cache_key, "wallet pending reset retry completed");
-                    }
-                    if actor_state.pending_reset.is_none()
-                        && let Some(tx) = startup_replay_tx.take()
-                    {
-                        let _ = tx.send(());
+                        signal_restored_reset_attempt(&mut startup_replay_tx, outcome.result.clone());
                     }
                 }
                 Some(refresh_request) = poi_refresh_rx.recv() => {
@@ -1953,13 +1932,8 @@ pub(crate) async fn spawn_wallet_worker(
                                     let token =
                                         worker_handle.mint_sync_token(actor_state.reset_generation);
                                     let lease = if actor_state.accept_indexed_catch_up(token) {
-                                        if let Err(reason) = actor_state.reduce_and_publish_readiness(
-                                            &permit,
-                                            &ready_tx,
-                                            &readiness_tx,
-                                        ) {
-                                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up readiness publication rejected");
-                                        }
+                                        actor_state
+                                            .reduce_and_publish_readiness(&ready_tx, &readiness_tx);
                                         Some(WalletIndexedCatchUpLease::for_actor_accepted_job(
                                             token,
                                         ))
@@ -1983,13 +1957,8 @@ pub(crate) async fn spawn_wallet_worker(
                                         if let Err(reason) = permit.publish_indexed_catch_up(None) {
                                             debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status clear rejected");
                                         }
-                                        if let Err(reason) = actor_state.reduce_and_publish_readiness(
-                                            &permit,
-                                            &ready_tx,
-                                            &readiness_tx,
-                                        ) {
-                                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up readiness clear rejected");
-                                        }
+                                        actor_state
+                                            .reduce_and_publish_readiness(&ready_tx, &readiness_tx);
                                     } else {
                                         debug!(cache_key = %cfg.cache_key, token = ?lease.token(), "stale indexed wallet catch-up status clear ignored");
                                     }
@@ -2439,10 +2408,8 @@ pub(crate) async fn spawn_wallet_worker(
                                 }
                                 WalletBackfillDoneOutcome::Rejected(reason) => {
                                     if reason == WalletBackfillRejectReason::PersistenceFailed {
-                                        actor_state.fail_job(
-                                            token,
-                                            WalletReadinessError::PersistenceFailed,
-                                        );
+                                        actor_state
+                                            .fail_readiness(WalletReadinessError::PersistenceFailed);
                                     } else {
                                         actor_state.retire_job(token);
                                     }
@@ -2589,11 +2556,7 @@ pub(crate) async fn spawn_wallet_worker(
                             {
                                 debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status reset clear rejected");
                             }
-                            let _ = actor_state.reduce_and_publish_readiness(
-                                &acceptance_permit,
-                                &ready_tx,
-                                &readiness_tx,
-                            );
+                            actor_state.reduce_and_publish_readiness(&ready_tx, &readiness_tx);
                             drop(acceptance_permit);
                             let outcome = try_commit_pending_reset!(false)
                                 .expect("pending reset was installed before commit");
@@ -2791,7 +2754,17 @@ pub(crate) async fn spawn_wallet_worker(
     }.instrument(tracing::info_span!("wallet", chain_id)));
 
     if wait_for_initial_reset_replay {
-        let _ = startup_replay_rx.await;
+        match startup_replay_rx.await {
+            Ok(WalletActorBootstrapResult::RestoredResetAttempted { result }) => {
+                debug!(?result, "wallet restored reset bootstrap attempt completed");
+            }
+            Err(err) => {
+                debug!(
+                    ?err,
+                    "wallet restored reset bootstrap attempt sender dropped"
+                );
+            }
+        }
     }
 
     Ok(handle)
@@ -5346,7 +5319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_worker_restored_pending_reset_waits_for_durable_replay() {
+    async fn wallet_worker_restored_pending_reset_returns_after_first_failed_replay_attempt() {
         let root_dir = temp_db_root("wallet-reset-restore-failed-replay");
         let db = Arc::new(
             DbStore::open(DbConfig {
@@ -5376,7 +5349,7 @@ mod tests {
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let handle = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_millis(500),
             spawn_wallet_worker(
                 WalletWorkerServices {
                     db: Arc::clone(&db),
@@ -5402,20 +5375,20 @@ mod tests {
             ),
         )
         .await
-        .expect("restored reset retry should complete before handle is returned")
+        .expect("restored reset first attempt should complete before handle is returned")
         .expect("spawn wallet worker");
 
-        assert_eq!(cache_store.state().store_calls, 2);
+        assert_eq!(cache_store.state().store_calls, 1);
         assert_eq!(handle.reset_generation(), 1);
-        assert_eq!(handle.last_scanned(), 99);
-        assert!(handle.utxos.read().await.is_empty());
+        assert_eq!(handle.last_scanned(), 120);
+        assert_eq!(handle.utxos.read().await.len(), 1);
         assert_eq!(handle.readiness(), WalletReadiness::Syncing);
         assert!(
             cache_store
                 .actor_state()
                 .expect("restored actor state")
                 .pending_reset
-                .is_none()
+                .is_some()
         );
 
         cancel.cancel();
@@ -5472,6 +5445,65 @@ mod tests {
             Err(ChainError::WalletCache(WalletCacheError::Crypto))
         ));
         cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_publishes_shutdown_readiness_on_cancel() {
+        let root_dir = temp_db_root("wallet-shutdown-readiness");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let cfg = wallet_config();
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx,
+                public_data_plane: test_public_data_plane(&db),
+            },
+            cfg,
+            1,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            0,
+        )
+        .await
+        .expect("spawn wallet worker");
+        let mut readiness_rx = handle.readiness_rx.clone();
+
+        cancel.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *readiness_rx.borrow() != WalletReadiness::Shutdown {
+                readiness_rx
+                    .changed()
+                    .await
+                    .expect("shutdown readiness should be published before channel closes");
+            }
+        })
+        .await
+        .expect("shutdown readiness published");
+        assert_eq!(handle.readiness(), WalletReadiness::Shutdown);
+
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }

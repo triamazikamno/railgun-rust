@@ -415,10 +415,66 @@ impl IndexedArtifactStreamCatalog {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedArtifactStreamCoverage {
+    pub dataset_kind: IndexedDatasetKind,
+    pub scope: ChainScope,
+    pub range: IndexedArtifactRange,
+    pub checkpoint_block: Option<u64>,
+    pub catalog_generation: Option<u64>,
+    pub stream_partition: Option<String>,
+    pub stream_complete: bool,
+}
+
+impl IndexedArtifactStreamCoverage {
+    fn from_descriptor(descriptor: &IndexedArtifactDescriptor) -> Self {
+        Self {
+            dataset_kind: descriptor.dataset_kind,
+            scope: descriptor.scope.clone(),
+            range: descriptor.range.clone(),
+            checkpoint_block: descriptor.metadata.checkpoint_block,
+            catalog_generation: descriptor.metadata.catalog_generation,
+            stream_partition: descriptor.metadata.stream_partition.clone(),
+            stream_complete: descriptor.metadata.stream_complete,
+        }
+    }
+
+    fn with_range(&self, start: u64, end: u64) -> Option<Self> {
+        if start > end {
+            return None;
+        }
+        let checkpoint_block = match self.checkpoint_block {
+            Some(checkpoint_block) if checkpoint_block < start => return None,
+            Some(checkpoint_block) => Some(checkpoint_block.min(end)),
+            None => None,
+        };
+        let mut coverage = self.clone();
+        coverage.range.start = start;
+        coverage.range.end = end;
+        coverage.checkpoint_block = checkpoint_block;
+        Some(coverage)
+    }
+
+    fn split_around(&self, start: u64, end: u64) -> Vec<Self> {
+        let mut entries = Vec::new();
+        if self.range.start < start
+            && let Some(left) = self.with_range(self.range.start, start.saturating_sub(1))
+        {
+            entries.push(left);
+        }
+        if end < self.range.end
+            && let Some(right) = self.with_range(end.saturating_add(1), self.range.end)
+        {
+            entries.push(right);
+        }
+        entries
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexedArtifactStreamPlan {
     pub required_current_chunks: Vec<IndexedArtifactDescriptor>,
-    pub required_current_coverage: Vec<IndexedArtifactDescriptor>,
+    pub required_current_coverage: Vec<IndexedArtifactStreamCoverage>,
     pub optional_prior_tail_retention: Vec<IndexedArtifactDescriptor>,
 }
 
@@ -463,6 +519,7 @@ impl IndexedArtifactStreamPlan {
                         descriptor.clone(),
                         generation,
                         catalog_stream_key,
+                        catalog.chunks.is_empty(),
                     ));
             }
             for chunk in catalog.chunks.iter().filter(|chunk| {
@@ -500,7 +557,7 @@ impl IndexedArtifactStreamPlan {
         }
 
         required_current_chunks.sort_by(cmp_descriptor);
-        required_current_coverage.sort_by(cmp_descriptor);
+        required_current_coverage.sort_by(cmp_stream_coverage);
         optional_prior_tail_retention.sort_by(cmp_descriptor);
         Ok(Self {
             required_current_chunks,
@@ -562,8 +619,8 @@ impl ArtifactStreamKey {
         entries: &[StreamCoverageEntry],
     ) -> Result<(), IndexedArtifactStreamPlanError> {
         for window in entries.windows(2) {
-            let left = &window[0].descriptor;
-            let right = &window[1].descriptor;
+            let left = &window[0].coverage;
+            let right = &window[1].coverage;
             if left.range.intersects(right.range.start, right.range.end) {
                 return Err(IndexedArtifactStreamPlanError::SameGenerationOverlap {
                     generation,
@@ -679,6 +736,7 @@ impl StreamPlanEntry {
         if self.descriptor.range.intersects(request.start, request.end) {
             Some(SupersededRequestedRange {
                 stream_key: self.stream_key.clone(),
+                generation: self.generation,
                 start: self.descriptor.range.start.max(request.start),
                 end: self.descriptor.range.end.min(request.end),
             })
@@ -705,9 +763,10 @@ struct StreamPlanInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StreamCoverageEntry {
-    descriptor: IndexedArtifactDescriptor,
+    coverage: IndexedArtifactStreamCoverage,
     generation: u64,
     stream_key: ArtifactStreamKey,
+    empty_catalog: bool,
 }
 
 impl StreamCoverageEntry {
@@ -715,26 +774,42 @@ impl StreamCoverageEntry {
         descriptor: IndexedArtifactDescriptor,
         generation: u64,
         stream_key: ArtifactStreamKey,
+        empty_catalog: bool,
     ) -> Self {
         Self {
-            descriptor,
+            coverage: IndexedArtifactStreamCoverage::from_descriptor(&descriptor),
             generation,
             stream_key,
+            empty_catalog,
         }
     }
 
     fn cmp_for_plan(left: &Self, right: &Self) -> Ordering {
         left.stream_key
             .cmp(&right.stream_key)
-            .then_with(|| cmp_range(&left.descriptor.range, &right.descriptor.range))
+            .then_with(|| cmp_range(&left.coverage.range, &right.coverage.range))
             .then_with(|| left.generation.cmp(&right.generation))
-            .then_with(|| left.descriptor.cid.cmp(&right.descriptor.cid))
+            .then_with(|| left.empty_catalog.cmp(&right.empty_catalog))
+    }
+
+    fn split_around(&self, start: u64, end: u64) -> Vec<Self> {
+        self.coverage
+            .split_around(start, end)
+            .into_iter()
+            .map(|coverage| Self {
+                coverage,
+                generation: self.generation,
+                stream_key: self.stream_key.clone(),
+                empty_catalog: self.empty_catalog,
+            })
+            .collect()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SupersededRequestedRange {
     stream_key: ArtifactStreamKey,
+    generation: u64,
     start: u64,
     end: u64,
 }
@@ -748,8 +823,10 @@ impl SupersededRequestedRange {
             .chain(
                 coverage
                     .iter()
-                    .filter(|entry| entry.stream_key == self.stream_key)
-                    .map(|entry| (entry.descriptor.range.start, entry.descriptor.range.end)),
+                    .filter(|entry| {
+                        entry.stream_key == self.stream_key && entry.generation > self.generation
+                    })
+                    .map(|entry| (entry.coverage.range.start, entry.coverage.range.end)),
             )
             .filter(|(start, end)| *start <= self.end && self.start <= *end)
             .collect::<Vec<_>>();
@@ -775,6 +852,7 @@ struct ArtifactStreamPlanner<'a> {
     current: Vec<StreamPlanEntry>,
     current_coverage: Vec<StreamCoverageEntry>,
     complete_tail_end: Option<u64>,
+    complete_coverage_ranges: Vec<(u64, u64)>,
     superseded_requested_ranges: Vec<SupersededRequestedRange>,
 }
 
@@ -790,6 +868,7 @@ impl<'a> ArtifactStreamPlanner<'a> {
             current: Vec::new(),
             current_coverage: Vec::new(),
             complete_tail_end: None,
+            complete_coverage_ranges: Vec::new(),
             superseded_requested_ranges: Vec::new(),
         };
 
@@ -841,25 +920,26 @@ impl<'a> ArtifactStreamPlanner<'a> {
         &mut self,
         coverage: StreamCoverageEntry,
     ) -> Result<(), IndexedArtifactStreamPlanError> {
-        self.reject_if_extends_complete_tail(coverage.descriptor.range.end)?;
+        self.reject_if_extends_complete_tail(coverage.coverage.range.end)?;
         if let Some(complete_tail) = self
             .current
             .iter()
             .find(|current| current.is_complete_tail())
-            && coverage.descriptor.range.end > complete_tail.descriptor.range.end
+            && coverage.coverage.range.end > complete_tail.descriptor.range.end
         {
             return Err(IndexedArtifactStreamPlanError::StreamCompleteExtended {
                 complete_end: complete_tail.descriptor.range.end,
-                attempted_end: coverage.descriptor.range.end,
+                attempted_end: coverage.coverage.range.end,
             });
         }
 
         let mut remove_indexes = Vec::new();
         for (index, existing) in self.current.iter().enumerate() {
-            if !existing.descriptor.range.intersects(
-                coverage.descriptor.range.start,
-                coverage.descriptor.range.end,
-            ) {
+            if !existing
+                .descriptor
+                .range
+                .intersects(coverage.coverage.range.start, coverage.coverage.range.end)
+            {
                 continue;
             }
 
@@ -877,21 +957,34 @@ impl<'a> ArtifactStreamPlanner<'a> {
             self.current.remove(index);
         }
 
-        self.current_coverage.retain(|existing| {
-            !existing.descriptor.range.intersects(
-                coverage.descriptor.range.start,
-                coverage.descriptor.range.end,
-            ) || existing.generation >= coverage.generation
-        });
+        let mut retained_coverage = Vec::with_capacity(self.current_coverage.len());
+        for existing in self.current_coverage.drain(..) {
+            if !existing
+                .coverage
+                .range
+                .intersects(coverage.coverage.range.start, coverage.coverage.range.end)
+                || existing.generation >= coverage.generation
+            {
+                retained_coverage.push(existing);
+            } else {
+                retained_coverage.extend(
+                    existing
+                        .split_around(coverage.coverage.range.start, coverage.coverage.range.end),
+                );
+            }
+        }
+        self.current_coverage = retained_coverage;
         if self.current_coverage.iter().all(|existing| {
             existing.generation != coverage.generation
-                || !existing.descriptor.range.intersects(
-                    coverage.descriptor.range.start,
-                    coverage.descriptor.range.end,
-                )
+                || !existing
+                    .coverage
+                    .range
+                    .intersects(coverage.coverage.range.start, coverage.coverage.range.end)
         }) {
-            if coverage.descriptor.metadata.stream_complete {
-                self.mark_complete_tail(coverage.descriptor.range.end);
+            if coverage.empty_catalog && coverage.coverage.stream_complete {
+                self.mark_complete_tail(coverage.coverage.range.end);
+                self.complete_coverage_ranges
+                    .push((coverage.coverage.range.start, coverage.coverage.range.end));
             }
             self.current_coverage.push(coverage);
         }
@@ -903,6 +996,10 @@ impl<'a> ArtifactStreamPlanner<'a> {
         entry: StreamPlanEntry,
     ) -> Result<(), IndexedArtifactStreamPlanError> {
         self.reject_if_extends_complete_tail(entry.descriptor.range.end)?;
+        self.reject_if_intersects_complete_coverage(
+            entry.descriptor.range.start,
+            entry.descriptor.range.end,
+        )?;
         if let Some(complete_tail) = self
             .current
             .iter()
@@ -987,6 +1084,27 @@ impl<'a> ArtifactStreamPlanner<'a> {
         );
     }
 
+    fn reject_if_intersects_complete_coverage(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<(), IndexedArtifactStreamPlanError> {
+        if let Some((existing_start, existing_end)) = self
+            .complete_coverage_ranges
+            .iter()
+            .copied()
+            .find(|(existing_start, existing_end)| *existing_start <= end && start <= *existing_end)
+        {
+            return Err(IndexedArtifactStreamPlanError::StableChunkConflict {
+                existing_start,
+                existing_end,
+                attempted_start: start,
+                attempted_end: end,
+            });
+        }
+        Ok(())
+    }
+
     fn finish(mut self) -> Result<IndexedArtifactStreamPlan, IndexedArtifactStreamPlanError> {
         self.current.sort_by(StreamPlanEntry::cmp_for_plan);
         self.current_coverage
@@ -1012,7 +1130,9 @@ impl<'a> ArtifactStreamPlanner<'a> {
                 .intersects(self.request.start, self.request.end)
             {
                 required_current_chunks.push(entry.descriptor.clone());
-                required_current_coverage.push(entry.descriptor.clone());
+                required_current_coverage.push(IndexedArtifactStreamCoverage::from_descriptor(
+                    &entry.descriptor,
+                ));
             } else if entry.descriptor.range.end < self.request.start
                 && entry.is_retainable_prior_tail(&self.current)
             {
@@ -1024,11 +1144,11 @@ impl<'a> ArtifactStreamPlanner<'a> {
                 .into_iter()
                 .filter(|entry| {
                     entry
-                        .descriptor
+                        .coverage
                         .range
                         .intersects(self.request.start, self.request.end)
                 })
-                .map(|entry| entry.descriptor),
+                .map(|entry| entry.coverage),
         );
 
         Ok(IndexedArtifactStreamPlan {
@@ -1892,6 +2012,20 @@ fn cmp_descriptor(left: &IndexedArtifactDescriptor, right: &IndexedArtifactDescr
     })
 }
 
+fn cmp_stream_coverage(
+    left: &IndexedArtifactStreamCoverage,
+    right: &IndexedArtifactStreamCoverage,
+) -> Ordering {
+    dataset_kind_order(left.dataset_kind)
+        .cmp(&dataset_kind_order(right.dataset_kind))
+        .then_with(|| cmp_chain_scope(&left.scope, &right.scope))
+        .then_with(|| cmp_range(&left.range, &right.range))
+        .then_with(|| left.catalog_generation.cmp(&right.catalog_generation))
+        .then_with(|| left.stream_partition.cmp(&right.stream_partition))
+        .then_with(|| left.stream_complete.cmp(&right.stream_complete))
+        .then_with(|| left.checkpoint_block.cmp(&right.checkpoint_block))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmp_descriptor_parts(
     left_dataset_kind: IndexedDatasetKind,
@@ -2407,6 +2541,78 @@ mod tests {
     }
 
     #[test]
+    fn stream_planner_partial_newer_coverage_preserves_older_remainders() {
+        let older_coverage = empty_catalog(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            100,
+            200,
+            1,
+        );
+        let newer_coverage = empty_catalog(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            150,
+            160,
+            2,
+        );
+
+        let plan = IndexedArtifactStreamPlan::plan(
+            &[older_coverage, newer_coverage],
+            &StreamFixture::request(
+                IndexedDatasetKind::WalletScan,
+                IndexedArtifactRangeKind::Block,
+                100,
+                200,
+            ),
+        )
+        .expect("partial newer coverage keeps older non-overlapping coverage");
+
+        assert!(plan.required_current_chunks.is_empty());
+        assert_eq!(
+            coverage_ranges(&plan),
+            vec![(100, 149), (150, 160), (161, 200)]
+        );
+    }
+
+    #[test]
+    fn stream_planner_partial_newer_coverage_preserves_non_empty_catalog_remainders() {
+        let older_chunk = StreamFixture::descriptor(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            120,
+            130,
+            1,
+        );
+        let older_sparse_coverage = catalog_with_range(1, 100, 200, vec![older_chunk.clone()]);
+        let newer_coverage = empty_catalog(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            150,
+            160,
+            2,
+        );
+
+        let plan = IndexedArtifactStreamPlan::plan(
+            &[older_sparse_coverage, newer_coverage],
+            &StreamFixture::request(
+                IndexedDatasetKind::WalletScan,
+                IndexedArtifactRangeKind::Block,
+                100,
+                200,
+            ),
+        )
+        .expect("partial newer coverage keeps sparse catalog remainders");
+
+        assert_eq!(required_cids(&plan), vec![older_chunk.cid]);
+        let ranges = coverage_ranges(&plan);
+        assert!(ranges.contains(&(100, 149)));
+        assert!(ranges.contains(&(150, 160)));
+        assert!(ranges.contains(&(161, 200)));
+        assert!(!ranges.contains(&(100, 200)));
+    }
+
+    #[test]
     fn stream_planner_empty_catalog_does_not_suppress_stable_chunks() {
         let sealed_tail = StreamFixture::descriptor(
             IndexedDatasetKind::WalletScan,
@@ -2830,6 +3036,46 @@ mod tests {
     }
 
     #[test]
+    fn stream_planner_rejects_chunk_inside_complete_empty_coverage() {
+        let mut complete_coverage = empty_catalog(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            100,
+            200,
+            1,
+        );
+        complete_coverage.descriptor.metadata.stream_complete = true;
+        let later_in_range = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            150,
+            160,
+            2,
+        );
+
+        assert!(matches!(
+            IndexedArtifactStreamPlan::plan(
+                &[
+                    complete_coverage,
+                    catalog_for_descriptors(Some(2), vec![later_in_range]),
+                ],
+                &StreamFixture::request(
+                    IndexedDatasetKind::PublicTxid,
+                    IndexedArtifactRangeKind::TxidIndex,
+                    100,
+                    200,
+                ),
+            ),
+            Err(IndexedArtifactStreamPlanError::StableChunkConflict {
+                existing_start: 100,
+                existing_end: 200,
+                attempted_start: 150,
+                attempted_end: 160,
+            })
+        ));
+    }
+
+    #[test]
     fn stream_planner_allows_repeated_complete_tail() {
         let first_chunk = StreamFixture::descriptor(
             IndexedDatasetKind::PublicTxid,
@@ -3176,6 +3422,19 @@ mod tests {
         );
         descriptor.metadata.catalog_generation = generation;
         IndexedArtifactStreamCatalog::new(descriptor, chunks)
+    }
+
+    fn catalog_with_range(
+        generation: u64,
+        start: u64,
+        end: u64,
+        chunks: Vec<IndexedArtifactDescriptor>,
+    ) -> IndexedArtifactStreamCatalog {
+        let mut catalog = catalog_for_descriptors(Some(generation), chunks);
+        catalog.descriptor.range.start = start;
+        catalog.descriptor.range.end = end;
+        catalog.descriptor.cid = format!("bafy-catalog-{generation}-{start}-{end}");
+        catalog
     }
 
     fn empty_catalog(

@@ -83,9 +83,10 @@ impl TxidPublicCacheManifest {
 
     pub(super) fn write_to(
         &self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
     ) -> Result<(), TxidPublicCacheError> {
+        let db = permit.db();
+        let key = permit.key();
         let name = manifest_file_name(key);
         let path = db.blob_path(TXID_CACHE_BLOB_KIND, &name);
         let bytes = rmp_serde::to_vec_named(self)?;
@@ -112,30 +113,27 @@ impl TxidPublicCacheManifest {
 
     pub(super) fn append_page(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         page: &TxidPublicCachePage,
     ) -> Result<(), TxidPublicCacheError> {
-        self.append_page_with_mode(db, key, page, TxidPublicCachePageWriteMode::Stable)
+        self.append_page_with_mode(permit, page, TxidPublicCachePageWriteMode::Stable)
     }
 
     pub(super) fn append_staged_artifact_page(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         page: &TxidPublicCachePage,
     ) -> Result<(), TxidPublicCacheError> {
-        self.append_page_with_mode(db, key, page, TxidPublicCachePageWriteMode::StagedArtifact)
+        self.append_page_with_mode(permit, page, TxidPublicCachePageWriteMode::StagedArtifact)
     }
 
     fn append_page_with_mode(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         page: &TxidPublicCachePage,
         mode: TxidPublicCachePageWriteMode,
     ) -> Result<(), TxidPublicCacheError> {
-        let page_ref = page.write_with_mode(db, key, mode)?;
+        let page_ref = page.write_with_mode(permit, mode)?;
         self.next_txid_index = self
             .next_txid_index
             .max(page.start_index.saturating_add(page.rows.len() as u64));
@@ -146,22 +144,19 @@ impl TxidPublicCacheManifest {
 
     pub(super) fn insert_or_replace_page(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         page: &TxidPublicCachePage,
     ) -> Result<(), TxidPublicCacheError> {
-        self.insert_or_replace_page_with_mode(db, key, page, TxidPublicCachePageWriteMode::Stable)
+        self.insert_or_replace_page_with_mode(permit, page, TxidPublicCachePageWriteMode::Stable)
     }
 
     pub(super) fn insert_or_replace_staged_artifact_page(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         page: &TxidPublicCachePage,
     ) -> Result<(), TxidPublicCacheError> {
         self.insert_or_replace_page_with_mode(
-            db,
-            key,
+            permit,
             page,
             TxidPublicCachePageWriteMode::StagedArtifact,
         )
@@ -169,11 +164,11 @@ impl TxidPublicCacheManifest {
 
     fn insert_or_replace_page_with_mode(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         page: &TxidPublicCachePage,
         mode: TxidPublicCachePageWriteMode,
     ) -> Result<(), TxidPublicCacheError> {
+        let db = permit.db();
         let page_end = page.start_index.saturating_add(page.rows.len() as u64);
         let mut pages = Vec::with_capacity(self.pages.len() + 1);
         for page_ref in std::mem::take(&mut self.pages) {
@@ -191,7 +186,7 @@ impl TxidPublicCacheManifest {
                 .cloned()
                 .collect();
             if let Some(page_ref) =
-                TxidPublicCachePage::write_rows_with_mode(db, key, before_rows, mode)?
+                TxidPublicCachePage::write_rows_with_mode(permit, before_rows, mode)?
             {
                 pages.push(page_ref);
             }
@@ -202,13 +197,13 @@ impl TxidPublicCacheManifest {
                 .filter(|row| row.txid_index >= page_end)
                 .collect();
             if let Some(page_ref) =
-                TxidPublicCachePage::write_rows_with_mode(db, key, after_rows, mode)?
+                TxidPublicCachePage::write_rows_with_mode(permit, after_rows, mode)?
             {
                 pages.push(page_ref);
             }
         }
 
-        pages.push(page.write_with_mode(db, key, mode)?);
+        pages.push(page.write_with_mode(permit, mode)?);
         pages.sort_by_key(|page_ref| page_ref.start_index);
         self.next_txid_index = self.next_txid_index.max(page_end);
         self.pages = pages;
@@ -219,10 +214,11 @@ impl TxidPublicCacheManifest {
 impl TxidPublicCachePage {
     fn write_with_mode(
         &self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         mode: TxidPublicCachePageWriteMode,
     ) -> Result<TxidPublicCachePageRef, TxidPublicCacheError> {
+        let db = permit.db();
+        let key = permit.key();
         let name = match mode {
             TxidPublicCachePageWriteMode::Stable => page_file_name(key, self.start_index),
             TxidPublicCachePageWriteMode::StagedArtifact => {
@@ -240,8 +236,7 @@ impl TxidPublicCachePage {
     }
 
     fn write_rows_with_mode(
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         rows: Vec<TxidPublicCacheRow>,
         mode: TxidPublicCachePageWriteMode,
     ) -> Result<Option<TxidPublicCachePageRef>, TxidPublicCacheError> {
@@ -253,6 +248,6 @@ impl TxidPublicCachePage {
             start_index: first.txid_index,
             rows,
         };
-        page.write_with_mode(db, key, mode).map(Some)
+        page.write_with_mode(permit, mode).map(Some)
     }
 }

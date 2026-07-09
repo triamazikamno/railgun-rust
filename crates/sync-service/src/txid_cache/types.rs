@@ -8,7 +8,38 @@ pub(super) const TXID_CACHE_PAGE_SIZE: NonZeroUsize =
     NonZeroUsize::new(10_000).expect("txid cache page size is non-zero");
 pub(super) static TXID_CACHE_SYNC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+pub(super) static TXID_CACHE_SYNC_STATE: LazyLock<std::sync::Mutex<TxidPublicCacheSyncState>> =
+    LazyLock::new(|| std::sync::Mutex::new(TxidPublicCacheSyncState::default()));
 pub(super) static TXID_CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Default)]
+pub(super) struct TxidPublicCacheSyncState {
+    generations: BTreeMap<PathBuf, u64>,
+}
+
+impl TxidPublicCacheSyncState {
+    pub(super) fn lock() -> std::sync::MutexGuard<'static, Self> {
+        TXID_CACHE_SYNC_STATE
+            .lock()
+            .expect("TXID public cache sync state lock poisoned")
+    }
+
+    pub(super) fn generation(&mut self, db: &DbStore) -> u64 {
+        *self
+            .generations
+            .entry(db.root_dir().to_path_buf())
+            .or_insert(0)
+    }
+
+    pub(super) fn bump_generation(&mut self, db: &DbStore) -> u64 {
+        let generation = self
+            .generations
+            .entry(db.root_dir().to_path_buf())
+            .or_insert(0);
+        *generation = generation.saturating_add(1);
+        *generation
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum TxidPublicCacheError {
@@ -41,6 +72,8 @@ pub(crate) enum TxidPublicCacheError {
     RootMismatch,
     #[error("TXID cache metadata mismatch: {0}")]
     MetadataMismatch(String),
+    #[error("stale TXID public cache generation: expected {expected}, actual {actual}")]
+    StalePublicCacheGeneration { expected: u64, actual: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,9 +107,69 @@ pub(crate) struct TxidPublicCache<'a> {
     pub(crate) key: TxidPublicCacheKey<'a>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TxidPublicCacheReadScope {
+    generation: u64,
+}
+
+pub(super) struct TxidPublicCacheWritePermit<'a> {
+    cache: TxidPublicCache<'a>,
+    scope: TxidPublicCacheReadScope,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
 impl<'a> TxidPublicCache<'a> {
     pub(crate) const fn new(db: &'a DbStore, key: TxidPublicCacheKey<'a>) -> Self {
         Self { db, key }
+    }
+
+    pub(super) async fn begin_write(&self) -> TxidPublicCacheWritePermit<'a> {
+        let guard = TXID_CACHE_SYNC_LOCK.lock().await;
+        let scope = TxidPublicCacheReadScope {
+            generation: TxidPublicCacheSyncState::lock().generation(self.db),
+        };
+        TxidPublicCacheWritePermit {
+            cache: *self,
+            scope,
+            _guard: guard,
+        }
+    }
+
+    pub(super) async fn begin_write_for_scope(
+        &self,
+        scope: TxidPublicCacheReadScope,
+    ) -> Result<TxidPublicCacheWritePermit<'a>, TxidPublicCacheError> {
+        let guard = TXID_CACHE_SYNC_LOCK.lock().await;
+        let current_generation = TxidPublicCacheSyncState::lock().generation(self.db);
+        if scope.generation != current_generation {
+            return Err(TxidPublicCacheError::StalePublicCacheGeneration {
+                expected: current_generation,
+                actual: scope.generation,
+            });
+        }
+        Ok(TxidPublicCacheWritePermit {
+            cache: *self,
+            scope,
+            _guard: guard,
+        })
+    }
+}
+
+impl<'a> TxidPublicCacheWritePermit<'a> {
+    pub(super) const fn cache(&self) -> TxidPublicCache<'a> {
+        self.cache
+    }
+
+    pub(super) const fn db(&self) -> &'a DbStore {
+        self.cache.db
+    }
+
+    pub(super) const fn key(&self) -> TxidPublicCacheKey<'a> {
+        self.cache.key
+    }
+
+    pub(super) const fn scope(&self) -> TxidPublicCacheReadScope {
+        self.scope
     }
 }
 

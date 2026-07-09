@@ -141,29 +141,28 @@ pub(crate) fn txid_public_transaction_for_recovered_output(
             required_index: 0,
         })?;
     manifest.validate_for(key)?;
-    let row = find_public_recovery_transaction_in_manifest(
-        &manifest,
-        db,
-        key,
-        tx_hash,
-        output_commitment,
-    )?;
+    let row = find_target_row_by_hash_index(&manifest, db, key, tx_hash, output_commitment)?
+        .map_or_else(
+            || find_target_row_by_scan(&manifest, db, tx_hash, output_commitment),
+            Ok,
+        )?;
     Ok(row.into())
 }
 
 #[cfg(test)]
 pub(super) fn find_public_recovery_transaction_in_manifest(
     manifest: &TxidPublicCacheManifest,
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
+    permit: &TxidPublicCacheWritePermit<'_>,
     tx_hash: FixedBytes<32>,
     output_commitment: FixedBytes<32>,
 ) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
+    let db = permit.db();
+    let key = permit.key();
     if let Some(row) = find_target_row_by_hash_index(manifest, db, key, tx_hash, output_commitment)?
     {
         return Ok(row);
     }
-    rebuild_index_for_manifest(manifest, db, key)?;
+    rebuild_index_for_manifest(manifest, permit)?;
     if let Some(row) = find_target_row_by_hash_index(manifest, db, key, tx_hash, output_commitment)?
     {
         return Ok(row);

@@ -4,6 +4,7 @@ pub(crate) async fn reset_txid_public_cache(
     db: &DbStore,
 ) -> Result<TxidPublicCacheReset, TxidPublicCacheError> {
     let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
+    TxidPublicCacheSyncState::lock().bump_generation(db);
     let cache_dir = db.blob_dir().join(TXID_CACHE_BLOB_KIND);
     let files_removed = match count_path_entries(&cache_dir) {
         Ok(files_removed) => {
@@ -50,7 +51,10 @@ impl TxidPublicCache<'_> {
         http_client: Option<&reqwest::Client>,
         latest: TxidPublicLatestValidated,
     ) -> Result<(), TxidPublicCacheError> {
-        self.sync_inner(Some(endpoint), http_client, latest, None, false)
+        let permit = self.begin_write().await;
+        let read_scope = permit.scope();
+        drop(permit);
+        self.sync_inner(Some(endpoint), http_client, latest, None, false, read_scope)
             .await
     }
 
@@ -62,15 +66,17 @@ impl TxidPublicCache<'_> {
         latest: TxidPublicLatestValidated,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<(), TxidPublicCacheError> {
-        let (artifact_from_index, force_validated_refresh) = {
-            let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
-            let mut manifest = self.load_or_new_manifest()?;
+        let (artifact_from_index, force_validated_refresh, read_scope) = {
+            let permit = self.begin_write().await;
+            let read_scope = permit.scope();
+            let cache = permit.cache();
+            let mut manifest = cache.load_or_new_manifest()?;
             let progress_reconciled = manifest.reconcile_validated_progress_for_latest(latest);
-            let local_status = manifest.local_latest_status(self.db, latest)?;
+            let local_status = manifest.local_latest_status(permit.db(), latest)?;
             if local_status == TxidPublicLocalLatestStatus::Satisfied {
                 if progress_reconciled || !manifest.latest_validated_matches(latest) {
-                    manifest.commit_latest_validated_if_supported(self.db, latest)?;
-                    manifest.write_to(self.db, self.key)?;
+                    manifest.commit_latest_validated_if_supported(permit.db(), latest)?;
+                    manifest.write_to(&permit)?;
                 }
                 debug!(
                     chain_id = self.key.chain_id,
@@ -83,12 +89,13 @@ impl TxidPublicCache<'_> {
             (
                 manifest.artifact_fetch_start_index(latest, local_status),
                 local_status == TxidPublicLocalLatestStatus::NeedsValidatedRefresh,
+                read_scope,
             )
         };
         let artifact_fetch = match indexed_artifact_source {
             Some(config) => match self.artifact_source(railgun_contract, config, http_client) {
                 Ok(source) => match source
-                    .fetch_current_chunks(artifact_from_index, Some(latest.txid_index))
+                    .fetch_current_chunks(self, artifact_from_index, Some(latest.txid_index))
                     .await
                 {
                     Ok(chunks) if !chunks.is_empty() => Some((source, chunks)),
@@ -127,11 +134,26 @@ impl TxidPublicCache<'_> {
             latest,
             artifact_chunk_refs,
             force_validated_refresh,
+            read_scope,
         )
         .await?;
-        if let Some((source, _chunks)) = artifact_fetch.as_ref() {
+        if let Some((source, chunks)) = artifact_fetch.as_ref() {
+            let permit = self.begin_write_for_scope(read_scope).await?;
+            let retained = permit.retain_current_artifact_chunks(
+                chunks,
+                artifact_from_index,
+                Some(latest.txid_index),
+            )?;
+            debug!(
+                chain_id = self.key.chain_id,
+                txid_version = self.key.txid_version,
+                retained,
+                current_chunks = chunks.len(),
+                "retained current public TXID artifact chunks"
+            );
+            drop(permit);
             source
-                .retain_prior_tail_best_effort(self, artifact_from_index)
+                .retain_prior_tail_best_effort(self, artifact_from_index, read_scope)
                 .await;
         }
         Ok(())
@@ -145,8 +167,18 @@ impl TxidPublicCache<'_> {
         latest: TxidPublicLatestValidated,
         artifact_chunks: Option<&[crate::indexed_artifacts::VerifiedIndexedArtifactChunk]>,
     ) -> Result<(), TxidPublicCacheError> {
-        self.sync_inner(Some(endpoint), http_client, latest, artifact_chunks, false)
-            .await
+        let permit = self.begin_write().await;
+        let read_scope = permit.scope();
+        drop(permit);
+        self.sync_inner(
+            Some(endpoint),
+            http_client,
+            latest,
+            artifact_chunks,
+            false,
+            read_scope,
+        )
+        .await
     }
 
     async fn sync_inner(
@@ -156,20 +188,22 @@ impl TxidPublicCache<'_> {
         latest: TxidPublicLatestValidated,
         artifact_chunks: Option<&[crate::indexed_artifacts::VerifiedIndexedArtifactChunk]>,
         force_validated_refresh: bool,
+        read_scope: TxidPublicCacheReadScope,
     ) -> Result<(), TxidPublicCacheError> {
-        let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
+        let permit = self.begin_write_for_scope(read_scope).await?;
         let started = std::time::Instant::now();
-        let mut manifest = self.load_or_new_manifest()?;
+        let cache = permit.cache();
+        let mut manifest = cache.load_or_new_manifest()?;
         if force_validated_refresh {
             manifest.validated_cached_txid_index = None;
         } else {
             manifest.reconcile_validated_progress_for_latest(latest);
         }
         if !force_validated_refresh
-            && manifest.commit_latest_validated_if_supported(self.db, latest)?
+            && manifest.commit_latest_validated_if_supported(permit.db(), latest)?
                 == TxidPublicLocalLatestStatus::Satisfied
         {
-            manifest.write_to(self.db, self.key)?;
+            manifest.write_to(&permit)?;
             debug!(
                 chain_id = self.key.chain_id,
                 txid_version = self.key.txid_version,
@@ -183,8 +217,7 @@ impl TxidPublicCache<'_> {
         let mut fetched_rows = 0_u64;
         if let Some(chunks) = artifact_chunks.filter(|chunks| !chunks.is_empty()) {
             if let Some(applied_rows) = manifest.apply_artifact_chunks_with_progress_guard(
-                self.db,
-                self.key,
+                &permit,
                 chunks,
                 Some(latest.txid_index),
                 latest.merkleroot,
@@ -240,13 +273,7 @@ impl TxidPublicCache<'_> {
         };
         if refresh_needed && let Some(client) = client.as_ref() {
             let refresh = manifest
-                .refresh_validated_range(
-                    self.db,
-                    client,
-                    self.key,
-                    refresh_start,
-                    latest.txid_index,
-                )
+                .refresh_validated_range(&permit, client, refresh_start, latest.txid_index)
                 .await?;
             fetched_rows = fetched_rows.saturating_add(refresh.fetched_rows);
             if let Some(refreshed_to) = refresh.refreshed_to {
@@ -267,8 +294,8 @@ impl TxidPublicCache<'_> {
             }
             let row_count = rows.len() as u64;
             let page = TxidPublicCachePage::from_indexed_transactions(start_index, rows);
-            manifest.insert_or_replace_page(self.db, self.key, &page)?;
-            rebuild_index_for_manifest(&manifest, self.db, self.key)?;
+            manifest.insert_or_replace_page(&permit, &page)?;
+            rebuild_index_for_manifest(&manifest, &permit)?;
             manifest.validated_cached_txid_index = Some(start_index.saturating_add(row_count - 1));
             fetched_rows = fetched_rows.saturating_add(row_count);
             debug!(
@@ -287,7 +314,7 @@ impl TxidPublicCache<'_> {
             }
         }
 
-        let latest_status = manifest.commit_latest_validated_if_supported(self.db, latest)?;
+        let latest_status = manifest.commit_latest_validated_if_supported(permit.db(), latest)?;
         if latest_status != TxidPublicLocalLatestStatus::Satisfied {
             return Err(manifest.unsupported_latest_error(
                 latest,
@@ -296,7 +323,7 @@ impl TxidPublicCache<'_> {
             ));
         }
 
-        manifest.write_to(self.db, self.key)?;
+        manifest.write_to(&permit)?;
         info!(
             chain_id = self.key.chain_id,
             txid_version = self.key.txid_version,
@@ -317,9 +344,10 @@ impl TxidPublicCache<'_> {
         endpoint: &Url,
         http_client: Option<&reqwest::Client>,
     ) -> Result<u64, TxidPublicCacheError> {
-        let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
+        let permit = self.begin_write().await;
         let started = std::time::Instant::now();
-        let mut manifest = self.load_or_new_manifest()?;
+        let cache = permit.cache();
+        let mut manifest = cache.load_or_new_manifest()?;
         let client = match http_client.cloned() {
             Some(http_client) => QuickSyncClient::with_http_client(endpoint.clone(), http_client),
             None => QuickSyncClient::new(endpoint.clone()),
@@ -337,8 +365,8 @@ impl TxidPublicCache<'_> {
             }
             let row_count = rows.len() as u64;
             let page = TxidPublicCachePage::from_indexed_transactions(start_index, rows);
-            manifest.append_page(self.db, self.key, &page)?;
-            update_index_for_page(self.db, self.key, &page)?;
+            manifest.append_page(&permit, &page)?;
+            update_index_for_page(&permit, &page)?;
             fetched_rows = fetched_rows.saturating_add(row_count);
             debug!(
                 chain_id = self.key.chain_id,
@@ -354,7 +382,7 @@ impl TxidPublicCache<'_> {
             }
         }
 
-        manifest.write_to(self.db, self.key)?;
+        manifest.write_to(&permit)?;
         debug!(
             chain_id = self.key.chain_id,
             txid_version = self.key.txid_version,
@@ -375,10 +403,16 @@ impl TxidPublicCache<'_> {
     ) -> Result<u64, TxidPublicCacheError> {
         let mut retention_after_graphql = None;
         if let Some(config) = indexed_artifact_source {
-            let from_index = self
-                .load_or_new_manifest()?
-                .validated_cached_txid_index
-                .map_or(0, |index| index.saturating_add(1));
+            let (read_scope, from_index) = {
+                let permit = self.begin_write().await;
+                let read_scope = permit.scope();
+                let from_index = permit
+                    .cache()
+                    .load_or_new_manifest()?
+                    .validated_cached_txid_index
+                    .map_or(0, |index| index.saturating_add(1));
+                (read_scope, from_index)
+            };
             let source = match self.artifact_source(railgun_contract, config, http_client) {
                 Ok(source) => Some(source),
                 Err(err) if endpoint.is_some() => {
@@ -393,32 +427,49 @@ impl TxidPublicCache<'_> {
                 Err(err) => return Err(err),
             };
             if let Some(source) = source {
-                match source.fetch_current_chunks(from_index, None).await {
+                match source.fetch_current_chunks(self, from_index, None).await {
                     Ok(chunks) if !chunks.is_empty() => {
                         match self
-                            .apply_artifact_chunks_only(&chunks, endpoint.is_some())
+                            .apply_artifact_chunks_only(&chunks, endpoint.is_some(), read_scope)
                             .await?
                         {
                             Some(applied_rows) if applied_rows > 0 => {
-                                source.retain_prior_tail_best_effort(self, from_index).await;
+                                let permit = self.begin_write_for_scope(read_scope).await?;
+                                let retained = permit
+                                    .retain_current_artifact_chunks(&chunks, from_index, None)?;
+                                debug!(
+                                    chain_id = self.key.chain_id,
+                                    txid_version = self.key.txid_version,
+                                    retained,
+                                    current_chunks = chunks.len(),
+                                    "retained current public TXID artifact chunks"
+                                );
+                                drop(permit);
+                                source
+                                    .retain_prior_tail_best_effort(self, from_index, read_scope)
+                                    .await;
                                 return Ok(applied_rows);
                             }
                             Some(_) if endpoint.is_none() => {
-                                source.retain_prior_tail_best_effort(self, from_index).await;
+                                source
+                                    .retain_prior_tail_best_effort(self, from_index, read_scope)
+                                    .await;
                                 return Ok(0);
                             }
                             Some(_) => {
-                                retention_after_graphql = Some((source, from_index));
+                                retention_after_graphql = Some((source, from_index, read_scope));
                             }
                             None => {}
                         }
                     }
                     Ok(_) if endpoint.is_none() => {
-                        source.retain_prior_tail_best_effort(self, from_index).await;
+                        source
+                            .retain_prior_tail_best_effort(self, from_index, read_scope)
+                            .await;
                         return Ok(0);
                     }
                     Ok(_) => {
-                        retention_after_graphql = Some((source, from_index));
+                        retention_after_graphql = Some((source, from_index, read_scope));
                     }
                     Err(err) if endpoint.is_some() => {
                         warn!(
@@ -437,8 +488,10 @@ impl TxidPublicCache<'_> {
             Some(endpoint) => self.sync_to_graph_tip(endpoint, http_client).await?,
             None => 0,
         };
-        if let Some((source, from_index)) = retention_after_graphql {
-            source.retain_prior_tail_best_effort(self, from_index).await;
+        if let Some((source, from_index, read_scope)) = retention_after_graphql {
+            source
+                .retain_prior_tail_best_effort(self, from_index, read_scope)
+                .await;
         }
         Ok(fetched_rows)
     }
@@ -452,13 +505,13 @@ impl TxidPublicCache<'_> {
         output_commitment: FixedBytes<32>,
         page_size: NonZeroUsize,
     ) -> Result<TxidPublicCachedTransaction, TxidPublicCacheError> {
-        let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
+        let permit = self.begin_write().await;
         let started = std::time::Instant::now();
-        let mut manifest = self.load_or_new_manifest()?;
+        let cache = permit.cache();
+        let mut manifest = cache.load_or_new_manifest()?;
         match find_public_recovery_transaction_in_manifest(
             &manifest,
-            self.db,
-            self.key,
+            &permit,
             tx_hash,
             output_commitment,
         ) {
@@ -482,21 +535,21 @@ impl TxidPublicCache<'_> {
                 .fetch_public_txid_page(start_index, page_size)
                 .await?;
             if rows.is_empty() {
-                manifest.write_to(self.db, self.key)?;
+                manifest.write_to(&permit)?;
                 return Err(TxidPublicCacheError::MissingTarget);
             }
             let row_count = rows.len() as u64;
             let page = TxidPublicCachePage::from_indexed_transactions(start_index, rows);
             if start_index < manifest.next_txid_index {
-                manifest.insert_or_replace_page(self.db, self.key, &page)?;
-                rebuild_index_for_manifest(&manifest, self.db, self.key)?;
+                manifest.insert_or_replace_page(&permit, &page)?;
+                rebuild_index_for_manifest(&manifest, &permit)?;
             } else {
-                manifest.append_page(self.db, self.key, &page)?;
-                update_index_for_page(self.db, self.key, &page)?;
+                manifest.append_page(&permit, &page)?;
+                update_index_for_page(&permit, &page)?;
             }
             next_index = start_index.saturating_add(row_count);
             fetched_rows = fetched_rows.saturating_add(row_count);
-            manifest.write_to(self.db, self.key)?;
+            manifest.write_to(&permit)?;
             debug!(
                 chain_id = self.key.chain_id,
                 start_index,
@@ -550,10 +603,10 @@ impl TxidPublicCache<'_> {
         &self,
         latest: TxidPublicLatestValidated,
     ) -> Result<(), TxidPublicCacheError> {
-        let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
-        let mut manifest = self.load_or_new_manifest()?;
+        let permit = self.begin_write().await;
+        let mut manifest = permit.cache().load_or_new_manifest()?;
         manifest.set_latest_validated(latest);
-        manifest.write_to(self.db, self.key)
+        manifest.write_to(&permit)
     }
 
     fn artifact_source(
@@ -575,12 +628,12 @@ impl TxidPublicCache<'_> {
         &self,
         chunks: &[crate::indexed_artifacts::VerifiedIndexedArtifactChunk],
         graphql_fallback_available: bool,
+        read_scope: TxidPublicCacheReadScope,
     ) -> Result<Option<u64>, TxidPublicCacheError> {
-        let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
-        let mut manifest = self.load_or_new_manifest()?;
+        let permit = self.begin_write_for_scope(read_scope).await?;
+        let mut manifest = permit.cache().load_or_new_manifest()?;
         manifest.apply_artifact_chunks_with_progress_guard(
-            self.db,
-            self.key,
+            &permit,
             chunks,
             None,
             None,
@@ -789,28 +842,27 @@ impl TxidPublicCacheManifest {
 
     fn apply_artifact_chunks_with_progress_guard(
         &mut self,
-        db: &DbStore,
-        key: TxidPublicCacheKey<'_>,
+        permit: &TxidPublicCacheWritePermit<'_>,
         chunks: &[crate::indexed_artifacts::VerifiedIndexedArtifactChunk],
         to_index: Option<u64>,
         latest_validated_merkleroot: Option<FixedBytes<32>>,
         graphql_fallback_available: bool,
     ) -> Result<Option<u64>, TxidPublicCacheError> {
+        let key = permit.key();
         let artifact_started = std::time::Instant::now();
         let previous_progress = self.validated_cached_txid_index;
         let mut artifact_manifest = self.clone();
         match artifact_manifest.apply_artifact_chunks_bounded(
-            db,
-            key,
+            permit,
             chunks,
             to_index,
             latest_validated_merkleroot,
         ) {
             Ok(applied_rows) => {
                 *self = artifact_manifest;
-                self.write_to(db, key)?;
+                self.write_to(permit)?;
                 if applied_rows > 0 {
-                    rebuild_index_for_manifest(self, db, key)?;
+                    rebuild_index_for_manifest(self, permit)?;
                 }
                 info!(
                     chain_id = key.chain_id,
@@ -842,12 +894,12 @@ impl TxidPublicCacheManifest {
 
     async fn refresh_validated_range(
         &mut self,
-        db: &DbStore,
+        permit: &TxidPublicCacheWritePermit<'_>,
         client: &QuickSyncClient,
-        key: TxidPublicCacheKey<'_>,
         start_index: u64,
         end_index: u64,
     ) -> Result<TxidPublicCacheRefresh, TxidPublicCacheError> {
+        let key = permit.key();
         let mut fetched_rows = 0_u64;
         let mut refreshed_to = None;
         let mut next_index = start_index;
@@ -864,7 +916,7 @@ impl TxidPublicCacheManifest {
             }
             let row_count = rows.len() as u64;
             let page = TxidPublicCachePage::from_indexed_transactions(next_index, rows);
-            self.insert_or_replace_page(db, key, &page)?;
+            self.insert_or_replace_page(permit, &page)?;
             fetched_rows = fetched_rows.saturating_add(row_count);
             refreshed_to = Some(next_index.saturating_add(row_count - 1));
             debug!(
@@ -886,7 +938,7 @@ impl TxidPublicCacheManifest {
             }
         }
         if fetched_rows > 0 {
-            rebuild_index_for_manifest(self, db, key)?;
+            rebuild_index_for_manifest(self, permit)?;
         }
         Ok(TxidPublicCacheRefresh {
             fetched_rows,

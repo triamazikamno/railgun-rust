@@ -103,6 +103,15 @@ impl PublicScanPagePlan {
 }
 
 impl ChainService {
+    async fn wallet_registration_gate(&self, cache_key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.wallet_registration_gates.lock().await;
+        Arc::clone(
+            gates
+                .entry(cache_key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     pub(super) fn next_wallet_reset_intent(&self) -> u64 {
         self.wallet_reset_intent_next.fetch_add(1, Ordering::AcqRel)
     }
@@ -704,6 +713,7 @@ impl ChainService {
             backfill_tx,
             archive_provider: archive_provider.clone(),
             wallets: RwLock::new(HashMap::new()),
+            wallet_registration_gates: Mutex::new(HashMap::new()),
             cancel: cancel.clone(),
             live_log_task: Mutex::new(None),
             anchor_last: AtomicU64::new(last_anchor),
@@ -932,6 +942,15 @@ impl ChainService {
             return Ok(existing.handle.clone());
         }
 
+        let registration_gate = self.wallet_registration_gate(&cache_key).await;
+        let _registration_guard = registration_gate.lock().await;
+        if let Some(existing) = self.wallets.read().await.get(&cache_key) {
+            if existing.handle.readiness().is_ready() {
+                self.spawn_txid_public_cache_loop_once();
+            }
+            return Ok(existing.handle.clone());
+        }
+
         let mut cfg = cfg;
         let start_block = cfg.start_block.unwrap_or(self.chain.deployment_block);
         cfg.start_block = Some(start_block);
@@ -978,44 +997,37 @@ impl ChainService {
             last_scanned = start_block.saturating_sub(1);
         }
 
-        let (handle, cancel, backfill_sender) = {
+        let actor_id = self.wallet_actor_next.fetch_add(1, Ordering::AcqRel);
+        let cancel = self.cancel.child_token();
+        let live_rx = self.live_log_tx.subscribe();
+        let (backfill_sender, backfill_rx) = mpsc::channel(128);
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: self.db.clone(),
+                rpcs: self.chain.rpcs.clone(),
+                http_client: self.chain.http_client.clone(),
+                indexed_artifact_source: self.chain.indexed_artifact_source.clone(),
+                poi_runtime: WalletPoiRuntime::from_policy(
+                    &self.poi_policy,
+                    self.chain.http_client.as_ref(),
+                ),
+                forest: self.forest.clone(),
+                backfill_tx: self.backfill_tx.clone(),
+                backfill_sender: backfill_sender.clone(),
+                public_data_plane: self.public_data_plane.clone(),
+            },
+            cfg.clone(),
+            actor_id,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            initial_utxos,
+            last_scanned,
+        )
+        .await?;
+
+        {
             let mut wallets = self.wallets.write().await;
-            if let Some(existing) = wallets.get(&cache_key) {
-                if existing.handle.readiness().is_ready() {
-                    self.spawn_txid_public_cache_loop_once();
-                }
-                return Ok(existing.handle.clone());
-            }
-
-            let actor_id = self.wallet_actor_next.fetch_add(1, Ordering::AcqRel);
-            let cancel = self.cancel.child_token();
-            let live_rx = self.live_log_tx.subscribe();
-            let (backfill_sender, backfill_rx) = mpsc::channel(128);
-            let handle = spawn_wallet_worker(
-                WalletWorkerServices {
-                    db: self.db.clone(),
-                    rpcs: self.chain.rpcs.clone(),
-                    http_client: self.chain.http_client.clone(),
-                    indexed_artifact_source: self.chain.indexed_artifact_source.clone(),
-                    poi_runtime: WalletPoiRuntime::from_policy(
-                        &self.poi_policy,
-                        self.chain.http_client.as_ref(),
-                    ),
-                    forest: self.forest.clone(),
-                    backfill_tx: self.backfill_tx.clone(),
-                    backfill_sender: backfill_sender.clone(),
-                    public_data_plane: self.public_data_plane.clone(),
-                },
-                cfg.clone(),
-                actor_id,
-                live_rx,
-                backfill_rx,
-                cancel.clone(),
-                initial_utxos,
-                last_scanned,
-            )
-            .await?;
-
             wallets.insert(
                 cache_key.clone(),
                 WalletRegistration {
@@ -1027,8 +1039,7 @@ impl ChainService {
                     sync_to_block: cfg.sync_to_block,
                 },
             );
-            (handle, cancel, backfill_sender)
-        };
+        }
 
         self.spawn_txid_public_cache_loop_when_ready(handle.readiness_rx.clone(), cancel.clone());
 

@@ -732,7 +732,10 @@ async fn txid_public_cache_rejects_oversized_graph_offset_without_writing_page()
         validated_cached_txid_index: None,
         pages: Vec::new(),
     };
-    manifest.write_to(&db, key).expect("seed manifest");
+    {
+        let permit = cache.begin_write().await;
+        manifest.write_to(&permit).expect("seed manifest");
+    }
     //noinspection HttpUrlsUsage
     let endpoint = Url::parse("http://127.0.0.1:1/graphql").expect("unused mock URL");
 
@@ -782,9 +785,11 @@ async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
         validated_cached_txid_index: Some(0),
         pages: Vec::new(),
     };
-    manifest
-        .write_to(&db, key)
-        .expect("seed unsupported marker");
+    {
+        let cache = TxidPublicCache::new(&db, key);
+        let permit = cache.begin_write().await;
+        manifest.write_to(&permit).expect("seed unsupported marker");
+    }
 
     let latest = TxidPublicCache::new(&db, key)
         .cached_latest_validated()
@@ -799,8 +804,8 @@ async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_roots() {
+#[tokio::test]
+async fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_roots() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -819,12 +824,15 @@ fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_roots() 
         public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(second_root)),
         public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root)),
     ];
-    let mut manifest = TxidPublicCache::new(&db, key)
+    let cache = TxidPublicCache::new(&db, key);
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
         .load_or_new_manifest()
         .expect("load manifest");
 
     let applied = manifest
-        .apply_artifact_chunks(&db, key, &chunks)
+        .apply_artifact_chunks(&permit, &chunks)
         .expect("apply artifact chunks");
 
     assert_eq!(applied, 2);
@@ -844,12 +852,13 @@ fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_roots() 
         second.transaction_hash
     );
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress() {
+#[tokio::test]
+async fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -864,16 +873,23 @@ fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress() {
     let row = indexed_transaction(0x11, 0x02, 0x01, 0x03);
     let root = root_for_single_leaf(row.txid_leaf_hash());
     let chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
-    let mut manifest = cache.load_or_new_manifest().expect("load manifest");
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
+        .load_or_new_manifest()
+        .expect("load manifest");
     let applied = manifest
-        .apply_artifact_chunks(&db, key, std::slice::from_ref(&chunk))
+        .apply_artifact_chunks(&permit, std::slice::from_ref(&chunk))
         .expect("initial artifact chunk applies");
     assert_eq!(applied, 1);
-    manifest.write_to(&db, key).expect("write manifest");
-    let mut reloaded = cache.load_or_new_manifest().expect("reload manifest");
+    manifest.write_to(&permit).expect("write manifest");
+    let mut reloaded = permit
+        .cache()
+        .load_or_new_manifest()
+        .expect("reload manifest");
 
     let stale_applied = reloaded
-        .apply_artifact_chunks(&db, key, std::slice::from_ref(&chunk))
+        .apply_artifact_chunks(&permit, std::slice::from_ref(&chunk))
         .expect("stale artifact chunk should be ignored");
 
     assert_eq!(stale_applied, 0);
@@ -884,8 +900,7 @@ fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress() {
     let spanning_chunk = public_txid_artifact_chunk(0, &[row, second], Some(spanning_root));
     let stale_bounded_applied = reloaded
         .apply_artifact_chunks_bounded(
-            &db,
-            key,
+            &permit,
             std::slice::from_ref(&spanning_chunk),
             Some(0),
             Some(root),
@@ -894,6 +909,7 @@ fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress() {
     assert_eq!(stale_bounded_applied, 0);
     assert_eq!(reloaded.validated_cached_txid_index, Some(0));
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -1744,6 +1760,73 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
 }
 
 #[tokio::test]
+async fn txid_public_validated_artifact_retains_non_final_current_chunk() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x74, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x75, 0x04, 0x05, 0x06);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let first_cid = raw_cid(&first_chunk.bytes).to_string();
+    let first_bytes = first_chunk.bytes.clone();
+    let second_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let second_cid = raw_cid(&second_chunk.bytes).to_string();
+    let (source, _server) = public_txid_artifact_source(vec![first_chunk, second_chunk]);
+    let railgun_contract = format!(
+        "0x{}",
+        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
+    );
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            &railgun_contract,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(prefix_root),
+            },
+            Some(&source),
+        )
+        .await
+        .expect("validated artifact sync applies current chunks");
+
+    let first_meta = db
+        .get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &first_cid),
+        )
+        .expect("read first chunk metadata")
+        .expect("non-final current chunk metadata present");
+    let retained_first = fs::read(db.resolve_path(&first_meta.relative_path))
+        .expect("read retained first current chunk");
+    assert_eq!(retained_first, first_bytes);
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &second_cid),
+        )
+        .expect("read final current chunk metadata")
+        .is_none(),
+        "final latest chunk should not be retained as reusable prior context"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catalog() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -1963,6 +2046,54 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
         .expect("prior tail chunk metadata present");
     let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
     assert_eq!(retained, retained_bytes);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_stale_retention_scope_does_not_write_raw_artifact_chunk() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let row = indexed_transaction(0x7c, 0x02, 0x01, 0x03);
+    let root = root_for_single_leaf(row.txid_leaf_hash());
+    let chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
+    let cid = raw_cid(&chunk.bytes).to_string();
+    let permit = cache.begin_write().await;
+    let read_scope = permit.scope();
+    drop(permit);
+
+    super::reset_txid_public_cache(&db)
+        .await
+        .expect("reset public TXID cache");
+    let err = cache
+        .begin_write_for_scope(read_scope)
+        .await
+        .and_then(|permit| permit.retain_artifact_chunks(std::slice::from_ref(&chunk)))
+        .expect_err("stale retention scope must not acquire a write permit");
+
+    assert!(matches!(
+        err,
+        super::TxidPublicCacheError::StalePublicCacheGeneration { .. }
+    ));
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &cid),
+        )
+        .expect("read stale retained chunk metadata")
+        .is_none(),
+        "stale retention must not recreate raw artifact metadata after reset"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -2925,8 +3056,8 @@ async fn txid_public_cache_falls_back_to_graphql_when_artifact_descriptors_are_u
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_chunk_rejects_same_tree_boundary_crossing() {
+#[tokio::test]
+async fn txid_public_artifact_chunk_rejects_same_tree_boundary_crossing() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2946,13 +3077,16 @@ fn txid_public_artifact_chunk_rejects_same_tree_boundary_crossing() {
         &rows,
         Some(FixedBytes::from([0x44; 32])),
     );
-    let mut manifest = TxidPublicCache::new(&db, key)
+    let cache = TxidPublicCache::new(&db, key);
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
         .load_or_new_manifest()
         .expect("load manifest");
     manifest.validated_cached_txid_index = Some(TREE_LEAF_COUNT - 2);
 
     let error = manifest
-        .apply_artifact_chunks(&db, key, &[chunk])
+        .apply_artifact_chunks(&permit, &[chunk])
         .expect_err("same-tree boundary crossing should fail");
 
     assert!(matches!(
@@ -2965,12 +3099,13 @@ fn txid_public_artifact_chunk_rejects_same_tree_boundary_crossing() {
         Some(TREE_LEAF_COUNT - 2)
     );
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_chunk_waits_for_missing_prefix_rows() {
+#[tokio::test]
+async fn txid_public_artifact_chunk_waits_for_missing_prefix_rows() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2985,13 +3120,16 @@ fn txid_public_artifact_chunk_waits_for_missing_prefix_rows() {
     let second = indexed_transaction(0x22, 0x04, 0x05, 0x06);
     let prefix_root = txid_root_for_transactions(&[first, second.clone()]);
     let chunk = public_txid_artifact_chunk(1, &[second], Some(prefix_root));
-    let mut manifest = TxidPublicCache::new(&db, key)
+    let cache = TxidPublicCache::new(&db, key);
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
         .load_or_new_manifest()
         .expect("load manifest");
     manifest.validated_cached_txid_index = Some(0);
 
     let error = manifest
-        .apply_artifact_chunks(&db, key, &[chunk])
+        .apply_artifact_chunks(&permit, &[chunk])
         .expect_err("missing prefix row should fail");
 
     assert!(matches!(
@@ -3000,12 +3138,13 @@ fn txid_public_artifact_chunk_waits_for_missing_prefix_rows() {
     ));
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_chunk_rejects_prefix_root_mismatch() {
+#[tokio::test]
+async fn txid_public_artifact_chunk_rejects_prefix_root_mismatch() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3020,17 +3159,20 @@ fn txid_public_artifact_chunk_rejects_prefix_root_mismatch() {
     let second = indexed_transaction(0x22, 0x04, 0x05, 0x06);
     let first_root = txid_root_for_transactions(std::slice::from_ref(&first));
     let first_chunk = public_txid_artifact_chunk(0, &[first], Some(first_root));
-    let mut manifest = TxidPublicCache::new(&db, key)
+    let cache = TxidPublicCache::new(&db, key);
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
         .load_or_new_manifest()
         .expect("load manifest");
     manifest
-        .apply_artifact_chunks(&db, key, &[first_chunk])
+        .apply_artifact_chunks(&permit, &[first_chunk])
         .expect("seed prefix row");
     let bad_second_chunk =
         public_txid_artifact_chunk(1, &[second], Some(FixedBytes::from([0xee; 32])));
 
     let error = manifest
-        .apply_artifact_chunks(&db, key, &[bad_second_chunk])
+        .apply_artifact_chunks(&permit, &[bad_second_chunk])
         .expect_err("prefix root mismatch should fail");
 
     assert!(matches!(
@@ -3040,12 +3182,13 @@ fn txid_public_artifact_chunk_rejects_prefix_root_mismatch() {
     ));
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_chunk_rejects_missing_root_without_progress() {
+#[tokio::test]
+async fn txid_public_artifact_chunk_rejects_missing_root_without_progress() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3058,12 +3201,15 @@ fn txid_public_artifact_chunk_rejects_missing_root_without_progress() {
     };
     let row = indexed_transaction(0x11, 0x02, 0x01, 0x03);
     let chunk = public_txid_artifact_chunk(0, &[row], None);
-    let mut manifest = TxidPublicCache::new(&db, key)
+    let cache = TxidPublicCache::new(&db, key);
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
         .load_or_new_manifest()
         .expect("load manifest");
 
     let error = manifest
-        .apply_artifact_chunks(&db, key, &[chunk])
+        .apply_artifact_chunks(&permit, &[chunk])
         .expect_err("missing root should fail");
 
     assert!(matches!(
@@ -3074,12 +3220,13 @@ fn txid_public_artifact_chunk_rejects_missing_root_without_progress() {
     assert_eq!(manifest.validated_cached_txid_index, None);
     assert!(manifest.pages.is_empty());
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
+#[tokio::test]
+async fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3092,12 +3239,15 @@ fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
     };
     let row = indexed_transaction(0x11, 0x02, 0x01, 0x03);
     let chunk = public_txid_artifact_chunk(0, &[row], Some(FixedBytes::from([0xff; 32])));
-    let mut manifest = TxidPublicCache::new(&db, key)
+    let cache = TxidPublicCache::new(&db, key);
+    let permit = cache.begin_write().await;
+    let mut manifest = permit
+        .cache()
         .load_or_new_manifest()
         .expect("load manifest");
 
     let error = manifest
-        .apply_artifact_chunks(&db, key, &[chunk])
+        .apply_artifact_chunks(&permit, &[chunk])
         .expect_err("root mismatch should fail");
 
     assert!(matches!(
@@ -3108,6 +3258,7 @@ fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
     assert_eq!(manifest.validated_cached_txid_index, None);
     assert!(manifest.pages.is_empty());
 
+    drop(permit);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

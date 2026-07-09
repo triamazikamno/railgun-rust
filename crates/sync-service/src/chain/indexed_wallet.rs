@@ -13,7 +13,7 @@ use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
     IndexedArtifactManifest, IndexedArtifactManifestClient, IndexedArtifactManifestError,
     IndexedArtifactRange, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
-    IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactStreamCoverage, IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
     IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
     decode_indexed_artifact_chunk,
 };
@@ -413,6 +413,7 @@ impl IndexedWalletArtifactSession {
             &indexed_chunk_descriptors,
             &chunk_retention_descriptors,
             public_data_plane,
+            read_scope,
         )
         .await?;
         Self::retain_optional_prior_tail_chunks(
@@ -420,6 +421,7 @@ impl IndexedWalletArtifactSession {
             &optional_prior_tail_retention,
             &chunk_retention_descriptors,
             public_data_plane,
+            read_scope,
         )
         .await;
         debug!(
@@ -594,9 +596,8 @@ impl IndexedWalletArtifactSession {
         }
         let plan =
             Self::select_current_stream_plan(&candidate_catalogs, scope, from_block, target_block)?;
-        let coverage =
-            WalletScanArtifactCoverage::from_descriptors(&plan.required_current_coverage)?;
-        let mut chunk_retention_descriptors = plan.required_current_coverage.clone();
+        let coverage = WalletScanArtifactCoverage::from_coverage(&plan.required_current_coverage)?;
+        let mut chunk_retention_descriptors = plan.required_current_chunks.clone();
         chunk_retention_descriptors.extend_from_slice(&plan.optional_prior_tail_retention);
         Ok(IndexedWalletArtifactDescriptorFetchResult {
             chunk_descriptors: plan.required_current_chunks,
@@ -631,6 +632,7 @@ impl IndexedWalletArtifactSession {
         chunk_descriptors: &[(usize, IndexedArtifactDescriptor)],
         chunk_retention_descriptors: &[IndexedArtifactDescriptor],
         public_data_plane: &ChainPublicDataPlane,
+        read_scope: PublicScanReadScope,
     ) -> Result<IndexedWalletArtifactChunkFetchResult, SyncError> {
         let descriptors: Vec<_> = chunk_descriptors
             .iter()
@@ -666,7 +668,12 @@ impl IndexedWalletArtifactSession {
             .map(|(_, chunk)| chunk.clone())
             .collect();
         let retained_chunks = public_data_plane
-            .retain_wallet_scan_artifact_chunks(&all_chunks, chunk_retention_descriptors);
+            .retain_wallet_scan_artifact_chunks(
+                &all_chunks,
+                chunk_retention_descriptors,
+                read_scope,
+            )
+            .await;
         debug!(
             requested_chunks = descriptors.len(),
             cache_hits = descriptors.len().saturating_sub(missing_descriptors.len()),
@@ -697,6 +704,7 @@ impl IndexedWalletArtifactSession {
         optional_descriptors: &[IndexedArtifactDescriptor],
         chunk_retention_descriptors: &[IndexedArtifactDescriptor],
         public_data_plane: &ChainPublicDataPlane,
+        read_scope: PublicScanReadScope,
     ) {
         if optional_descriptors.is_empty() {
             return;
@@ -704,7 +712,12 @@ impl IndexedWalletArtifactSession {
         match client.fetch_chunks_bounded(optional_descriptors).await {
             Ok(chunks) => {
                 let retained = public_data_plane
-                    .retain_wallet_scan_artifact_chunks(&chunks, chunk_retention_descriptors);
+                    .retain_wallet_scan_artifact_chunks(
+                        &chunks,
+                        chunk_retention_descriptors,
+                        read_scope,
+                    )
+                    .await;
                 debug!(
                     requested = optional_descriptors.len(),
                     retained, "retained optional wallet-scan prior-tail artifact chunks"
@@ -743,19 +756,32 @@ struct WalletScanArtifactCoverage {
 }
 
 impl WalletScanArtifactCoverage {
-    fn from_descriptors(descriptors: &[IndexedArtifactDescriptor]) -> Result<Self, SyncError> {
+    fn from_coverage(coverage_ranges: &[IndexedArtifactStreamCoverage]) -> Result<Self, SyncError> {
         let mut coverage = Self::default();
-        for descriptor in descriptors {
-            coverage.add_descriptor(descriptor)?;
+        for range in coverage_ranges {
+            coverage.add_range(range)?;
         }
         Ok(coverage)
     }
 
-    fn add_descriptor(&mut self, descriptor: &IndexedArtifactDescriptor) -> Result<(), SyncError> {
+    fn add_range(&mut self, coverage: &IndexedArtifactStreamCoverage) -> Result<(), SyncError> {
         self.ranges
-            .push(WalletScanCoverageRange::from_descriptor(descriptor)?);
+            .push(WalletScanCoverageRange::from_coverage(coverage)?);
         self.ranges.sort_by_key(|range| (range.start, range.end));
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn add_descriptor(&mut self, descriptor: &IndexedArtifactDescriptor) -> Result<(), SyncError> {
+        self.add_range(&IndexedArtifactStreamCoverage {
+            dataset_kind: descriptor.dataset_kind,
+            scope: descriptor.scope.clone(),
+            range: descriptor.range.clone(),
+            checkpoint_block: descriptor.metadata.checkpoint_block,
+            catalog_generation: descriptor.metadata.catalog_generation,
+            stream_partition: descriptor.metadata.stream_partition.clone(),
+            stream_complete: descriptor.metadata.stream_complete,
+        })
     }
 
     fn checkpoint_for_range(
@@ -822,11 +848,11 @@ struct WalletScanCoverageRange {
 }
 
 impl WalletScanCoverageRange {
-    fn from_descriptor(descriptor: &IndexedArtifactDescriptor) -> Result<Self, SyncError> {
-        let checkpoint_block = wallet_scan_descriptor_checkpoint_block(descriptor, "coverage")?;
+    fn from_coverage(coverage: &IndexedArtifactStreamCoverage) -> Result<Self, SyncError> {
+        let checkpoint_block = wallet_scan_coverage_checkpoint_block(coverage)?;
         Ok(Self {
-            start: descriptor.range.start,
-            end: descriptor.range.end,
+            start: coverage.range.start,
+            end: coverage.range.end,
             checkpoint_block,
         })
     }
@@ -888,6 +914,25 @@ fn wallet_scan_descriptor_checkpoint_block(
         return Err(wallet_artifact_format(format!(
             "wallet_scan {descriptor_kind} checkpoint block {checkpoint_block} is before range start {}",
             descriptor.range.start
+        )));
+    }
+    Ok(checkpoint_block)
+}
+
+fn wallet_scan_coverage_checkpoint_block(
+    coverage: &IndexedArtifactStreamCoverage,
+) -> Result<u64, SyncError> {
+    let checkpoint_block = coverage.checkpoint_block.unwrap_or(coverage.range.end);
+    if checkpoint_block > coverage.range.end {
+        return Err(wallet_artifact_format(format!(
+            "wallet_scan coverage checkpoint block {checkpoint_block} exceeds range end {}",
+            coverage.range.end
+        )));
+    }
+    if checkpoint_block < coverage.range.start {
+        return Err(wallet_artifact_format(format!(
+            "wallet_scan coverage checkpoint block {checkpoint_block} is before range start {}",
+            coverage.range.start
         )));
     }
     Ok(checkpoint_block)
@@ -1923,7 +1968,7 @@ mod tests {
             },
             chunk_descriptors: plan.required_current_chunks,
             chunks: Vec::new(),
-            coverage: WalletScanArtifactCoverage::from_descriptors(&plan.required_current_coverage)
+            coverage: WalletScanArtifactCoverage::from_coverage(&plan.required_current_coverage)
                 .expect("planner coverage"),
             read_scope: test_public_scan_read_scope(),
         };

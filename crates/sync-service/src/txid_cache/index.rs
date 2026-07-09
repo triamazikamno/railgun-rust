@@ -28,10 +28,11 @@ impl TxidPublicCachePageRef {
 }
 
 pub(super) fn update_index_for_page(
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
+    permit: &TxidPublicCacheWritePermit<'_>,
     page: &TxidPublicCachePage,
 ) -> Result<(), TxidPublicCacheError> {
+    let db = permit.db();
+    let key = permit.key();
     let mut entries_by_shard: BTreeMap<u8, Vec<TxidPublicCacheIndexEntry>> = BTreeMap::new();
     for (row_offset, row) in page.rows.iter().enumerate() {
         entries_by_shard
@@ -52,28 +53,29 @@ pub(super) fn update_index_for_page(
             .retain(|entry| entry.txid_index < page.start_index || entry.txid_index >= page_end);
         index.entries.append(&mut new_entries);
         index.entries.sort_by_key(|entry| entry.txid_index);
-        write_index_shard(db, key, &index)?;
+        write_index_shard(permit, &index)?;
     }
     Ok(())
 }
 
 pub(super) fn rebuild_index_for_manifest(
     manifest: &TxidPublicCacheManifest,
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
+    permit: &TxidPublicCacheWritePermit<'_>,
 ) -> Result<(), TxidPublicCacheError> {
-    clear_index_shards(db, key)?;
+    let db = permit.db();
+    clear_index_shards(permit)?;
     for page_ref in &manifest.pages {
         let page = page_ref.read(db)?;
-        update_index_for_page(db, key, &page)?;
+        update_index_for_page(permit, &page)?;
     }
     Ok(())
 }
 
 pub(super) fn clear_index_shards(
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
+    permit: &TxidPublicCacheWritePermit<'_>,
 ) -> Result<(), TxidPublicCacheError> {
+    let db = permit.db();
+    let key = permit.key();
     for shard in u8::MIN..=u8::MAX {
         let path = db.blob_path(TXID_CACHE_BLOB_KIND, &index_shard_file_name(key, shard));
         match fs::remove_file(path) {
@@ -120,10 +122,11 @@ pub(super) fn load_index_shard(
 }
 
 pub(super) fn write_index_shard(
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
+    permit: &TxidPublicCacheWritePermit<'_>,
     index: &TxidPublicCacheIndexShard,
 ) -> Result<(), TxidPublicCacheError> {
+    let db = permit.db();
+    let key = permit.key();
     let path = db.blob_path(
         TXID_CACHE_BLOB_KIND,
         &index_shard_file_name(key, index.shard),
