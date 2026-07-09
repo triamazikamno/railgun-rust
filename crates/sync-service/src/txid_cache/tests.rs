@@ -13,11 +13,11 @@ use crate::indexed_artifacts::{
     VerifiedIndexedArtifactChunk,
 };
 use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
-use alloy::primitives::{FixedBytes, U64, U256};
+use alloy::primitives::{Address, FixedBytes, U64, U256};
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
-use local_db::{DbConfig, DbStore};
+use local_db::{BlobMeta, DbConfig, DbStore};
 use merkletree::quick::IndexedRailgunTransaction;
 use merkletree::tree::DenseMerkleTree;
 use multihash_codetable::{Code, MultihashDigest};
@@ -60,6 +60,224 @@ fn safe_file_component_replaces_path_separators() {
 }
 
 #[tokio::test]
+async fn txid_public_cache_isolates_contracts_on_the_same_chain_and_db() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key_a = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: Address::from([0xaa; 20]),
+        txid_version: TEST_TXID_VERSION,
+    };
+    let key_b = TxidPublicCacheKey {
+        railgun_contract: Address::from([0xbb; 20]),
+        ..key_a
+    };
+    let row_a = indexed_transaction(0x31, 0x02, 0x01, 0x03);
+    let row_b = indexed_transaction(0x32, 0x04, 0x05, 0x06);
+
+    for (key, row) in [(key_a, row_a.clone()), (key_b, row_b.clone())] {
+        let cache = TxidPublicCache::new(&db, key);
+        let permit = cache.begin_write().await;
+        let mut manifest = permit
+            .cache()
+            .load_or_new_manifest()
+            .expect("load contract manifest");
+        let page = super::TxidPublicCachePage::from_indexed_transactions(key, 0, vec![row]);
+        manifest.append_page(&permit, &page).expect("append page");
+        super::update_index_for_page(&permit, &page).expect("write contract index");
+        manifest.validated_cached_txid_index = Some(0);
+        manifest.latest_validated_txid_index = Some(0);
+        manifest.write_to(&permit).expect("write contract manifest");
+    }
+
+    let manifest_a = TxidPublicCache::new(&db, key_a)
+        .load_manifest()
+        .expect("load contract A manifest")
+        .expect("contract A manifest present");
+    let manifest_b = TxidPublicCache::new(&db, key_b)
+        .load_manifest()
+        .expect("load contract B manifest")
+        .expect("contract B manifest present");
+    assert_eq!(manifest_a.railgun_contract, key_a.railgun_contract);
+    assert_eq!(manifest_b.railgun_contract, key_b.railgun_contract);
+    assert_ne!(super::cache_id(key_a), super::cache_id(key_b));
+    assert_ne!(
+        super::manifest_file_name(key_a),
+        super::manifest_file_name(key_b)
+    );
+    assert_ne!(
+        super::page_file_name(key_a, 0),
+        super::page_file_name(key_b, 0)
+    );
+    assert_ne!(
+        super::index_shard_file_name(key_a, 0x31),
+        super::index_shard_file_name(key_b, 0x31)
+    );
+    assert_ne!(
+        super::artifact_chunk_blob_id(key_a, "shared-cid"),
+        super::artifact_chunk_blob_id(key_b, "shared-cid")
+    );
+    assert_ne!(
+        super::artifact_chunk_file_name(key_a, "shared-cid"),
+        super::artifact_chunk_file_name(key_b, "shared-cid")
+    );
+
+    let retained_chunk = public_txid_artifact_chunk(
+        0,
+        std::slice::from_ref(&row_b),
+        Some(root_for_single_leaf(row_b.txid_leaf_hash())),
+    );
+    let retained_cid = retained_chunk.descriptor.cid.clone();
+    let permit = TxidPublicCache::new(&db, key_b).begin_write().await;
+    permit
+        .retain_artifact_chunks(std::slice::from_ref(&retained_chunk))
+        .expect("retain contract B raw chunk");
+    drop(permit);
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key_b, &retained_cid),
+        )
+        .expect("read contract B retained chunk")
+        .is_some()
+    );
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key_a, &retained_cid),
+        )
+        .expect("read contract A retained chunk")
+        .is_none()
+    );
+
+    let page_a = manifest_a.pages[0]
+        .read(&db, key_a)
+        .expect("read contract A page");
+    let page_b = manifest_b.pages[0]
+        .read(&db, key_b)
+        .expect("read contract B page");
+    assert_ne!(
+        manifest_a.pages[0].relative_path,
+        manifest_b.pages[0].relative_path
+    );
+    assert_eq!(page_a.railgun_contract, key_a.railgun_contract);
+    assert_eq!(page_b.railgun_contract, key_b.railgun_contract);
+    assert_eq!(
+        page_a.rows[0].transaction.transaction_hash,
+        row_a.transaction_hash
+    );
+    assert_eq!(
+        page_b.rows[0].transaction.transaction_hash,
+        row_b.transaction_hash
+    );
+    let index_a = super::load_index_shard(&db, key_a, 0x31).expect("read contract A index");
+    let index_b = super::load_index_shard(&db, key_b, 0x32).expect("read contract B index");
+    assert_eq!(index_a.railgun_contract, key_a.railgun_contract);
+    assert_eq!(index_b.railgun_contract, key_b.railgun_contract);
+    assert_eq!(index_a.entries.len(), 1);
+    assert_eq!(index_b.entries.len(), 1);
+    assert!(
+        super::load_index_shard(&db, key_b, 0x31)
+            .expect("read isolated contract B index shard")
+            .entries
+            .is_empty()
+    );
+    assert!(matches!(
+        manifest_a.pages[0].read(&db, key_b),
+        Err(super::TxidPublicCacheError::MetadataMismatch(_))
+    ));
+    assert!(matches!(
+        txid_public_proof_for_recovered_output(
+            &db,
+            key_b,
+            row_a.txid_leaf_hash(),
+            row_a.output_start_global(),
+            0,
+            None,
+        ),
+        Err(super::TxidPublicCacheError::MissingTarget)
+    ));
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_cache_v3_rebuild_leaves_contractless_v2_cache_untouched() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let legacy_id = format!("0|1|{TEST_TXID_VERSION}");
+    let legacy_name = "0-1-V2_PoseidonMerkle-manifest.msgpack";
+    let legacy_bytes = b"contractless-v2-cache";
+    let legacy_path = db.blob_path(super::TXID_CACHE_BLOB_KIND, legacy_name);
+    db.ensure_blob_dir(super::TXID_CACHE_BLOB_KIND)
+        .expect("ensure TXID cache dir");
+    fs::write(&legacy_path, legacy_bytes).expect("write v2 cache file");
+    db.put_blob_meta(
+        super::TXID_CACHE_BLOB_KIND,
+        &legacy_id,
+        &BlobMeta {
+            format_version: 2,
+            relative_path: DbStore::relative_blob_path(super::TXID_CACHE_BLOB_KIND, legacy_name),
+            content_hash: Sha256::digest(legacy_bytes).into(),
+            source_hash: None,
+            created_at: 1,
+            updated_at: 1,
+            last_accessed_at: 1,
+            last_block: None,
+        },
+    )
+    .expect("write v2 cache metadata");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: Address::from([0xcc; 20]),
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    assert!(cache.load_manifest().expect("load v3 cache").is_none());
+
+    let permit = cache.begin_write().await;
+    permit
+        .cache()
+        .load_or_new_manifest()
+        .expect("new v3 manifest")
+        .write_to(&permit)
+        .expect("write v3 manifest");
+    drop(permit);
+
+    assert!(
+        legacy_path.exists(),
+        "v2 cache file must not be destructively migrated"
+    );
+    assert!(
+        db.get_blob_meta(super::TXID_CACHE_BLOB_KIND, &legacy_id)
+            .expect("read v2 metadata")
+            .is_some(),
+        "v2 cache metadata must remain untouched"
+    );
+    let v3_meta = db
+        .get_blob_meta(super::TXID_CACHE_BLOB_KIND, &super::cache_id(key))
+        .expect("read v3 metadata")
+        .expect("v3 metadata present");
+    assert_eq!(v3_meta.format_version, 3);
+    assert_ne!(
+        v3_meta.relative_path,
+        DbStore::relative_blob_path(super::TXID_CACHE_BLOB_KIND, legacy_name)
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_cache_syncs_broad_page_and_builds_proof() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -72,6 +290,7 @@ async fn txid_public_cache_syncs_broad_page_and_builds_proof() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -91,7 +310,7 @@ async fn txid_public_cache_syncs_broad_page_and_builds_proof() {
         .load_manifest()
         .expect("load manifest")
         .expect("manifest present");
-    let page = manifest.pages[0].read(&db).expect("read page");
+    let page = manifest.pages[0].read(&db, key).expect("read page");
     let expected_leaf = U256::from_be_bytes(page.rows[0].txid_leaf_hash.0);
     let index_entries = index_entries_for_hash(&db, key, page.rows[0].transaction.transaction_hash)
         .expect("read tx hash index");
@@ -167,6 +386,7 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -250,6 +470,7 @@ async fn txid_public_cache_lookup_prefers_validated_duplicate_over_unvalidated_s
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -318,6 +539,7 @@ async fn txid_public_cache_recovery_catchup_stops_after_target_page() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -360,6 +582,7 @@ async fn txid_public_cache_recovery_refreshes_rewritten_rows_below_high_water_ma
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -437,6 +660,7 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -544,6 +768,7 @@ async fn txid_public_latest_validated_waits_for_graph_tip_sync_manifest_write() 
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let graph_row = indexed_transaction(0x33, 0x07, 0x08, 0x09);
@@ -612,18 +837,15 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let first = indexed_transaction(0x41, 0x02, 0x01, 0x03);
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![first_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     let fetched = TxidPublicCache::new(db.as_ref(), key)
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&artifact_source))
+        .sync_to_indexed_tip(None, None, Some(&artifact_source))
         .await
         .expect("seed artifact cache");
     assert_eq!(fetched, 1);
@@ -654,14 +876,12 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
         .expect("graph-tip request received");
 
     let local_db = Arc::clone(&db);
-    let local_railgun_contract = railgun_contract.clone();
     let unavailable_source = unavailable_artifact_source();
     let local_handle = tokio::spawn(async move {
         TxidPublicCache::new(local_db.as_ref(), key)
             .sync_with_artifact_source(
                 None,
                 None,
-                &local_railgun_contract,
                 TxidPublicLatestValidated {
                     txid_index: 0,
                     merkleroot: Some(first_root),
@@ -716,6 +936,7 @@ async fn txid_public_cache_rejects_oversized_graph_offset_without_writing_page()
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -724,6 +945,7 @@ async fn txid_public_cache_rejects_oversized_graph_offset_without_writing_page()
         format_version: super::TXID_CACHE_FORMAT_VERSION,
         chain_type: key.chain_type,
         chain_id: key.chain_id,
+        railgun_contract: key.railgun_contract,
         txid_version: key.txid_version.to_string(),
         page_size: super::TXID_CACHE_PAGE_SIZE.get(),
         next_txid_index,
@@ -771,12 +993,14 @@ async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let manifest = super::TxidPublicCacheManifest {
         format_version: super::TXID_CACHE_FORMAT_VERSION,
         chain_type: key.chain_type,
         chain_id: key.chain_id,
+        railgun_contract: key.railgun_contract,
         txid_version: key.txid_version.to_string(),
         page_size: super::TXID_CACHE_PAGE_SIZE.get(),
         next_txid_index: 1,
@@ -814,6 +1038,7 @@ async fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_ro
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let first = indexed_transaction(0x11, 0x02, 0x01, 0x03);
@@ -867,6 +1092,7 @@ async fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress()
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -943,6 +1169,7 @@ async fn txid_public_artifact_failure_before_progress_falls_back_to_graphql() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -994,6 +1221,7 @@ async fn txid_public_artifact_only_failure_before_progress_returns_error() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1004,16 +1232,11 @@ async fn txid_public_artifact_only_failure_before_progress_returns_error() {
         Some(FixedBytes::from([0xff; 32])),
     );
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![bad_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     let error = cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(root_for_single_leaf(artifact_row.txid_leaf_hash())),
@@ -1058,6 +1281,7 @@ async fn txid_public_ignores_malformed_catalog_for_different_stream_partition() 
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1088,16 +1312,11 @@ async fn txid_public_ignores_malformed_catalog_for_different_stream_partition() 
         vec![(1, vec![chunk])],
         vec![malformed_other_partition],
     );
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(artifact_root),
@@ -1127,6 +1346,7 @@ async fn txid_public_accepts_matching_chunk_from_multi_partition_catalog() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1144,16 +1364,11 @@ async fn txid_public_accepts_matching_chunk_from_multi_partition_catalog() {
     other_chunk.descriptor.metadata.stream_partition = Some("other-txid-version".to_string());
     let (artifact_source, _artifact_server) =
         public_txid_artifact_source(vec![requested_chunk, other_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(requested_root),
@@ -1191,6 +1406,7 @@ async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1200,16 +1416,11 @@ async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
         public_txid_artifact_chunk(0, std::slice::from_ref(&artifact_row), Some(artifact_root));
     chunk.descriptor.metadata.stream_partition = stream_partition.map(str::to_string);
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     let error = cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(artifact_root),
@@ -1245,20 +1456,16 @@ async fn txid_public_artifact_only_empty_source_does_not_write_latest_marker() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
     let (artifact_source, _artifact_server) = public_txid_empty_artifact_source();
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     let error = cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: None,
@@ -1301,6 +1508,7 @@ async fn txid_public_full_range_artifact_root_mismatch_falls_back_to_graphql() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1356,6 +1564,7 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1376,7 +1585,9 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
         .expect("manifest present");
     assert_eq!(before_manifest.pages.len(), 1);
     let persisted_page_ref = before_manifest.pages[0].clone();
-    let before_page = persisted_page_ref.read(&db).expect("read persisted page");
+    let before_page = persisted_page_ref
+        .read(&db, key)
+        .expect("read persisted page");
     assert_eq!(before_page.rows.len(), 2);
 
     let artifact_first = indexed_transaction(0x41, 0x07, 0x08, 0x09);
@@ -1412,7 +1623,7 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
     assert_eq!(after_manifest.validated_cached_txid_index, Some(1));
     assert_eq!(after_manifest.latest_validated_merkleroot, Some(graph_root));
     let after_page = after_manifest.pages[0]
-        .read(&db)
+        .read(&db, key)
         .expect("read fallback page");
     assert_eq!(after_page.rows.len(), 2);
     assert_eq!(
@@ -1442,6 +1653,7 @@ async fn txid_public_cache_prefers_configured_artifact_source_before_graphql() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1454,15 +1666,10 @@ async fn txid_public_cache_prefers_configured_artifact_source_before_graphql() {
     let (graph_endpoint, graph_requests) =
         spawn_graphql_response(public_txid_response(vec![graph_row]));
 
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             Some(&graph_endpoint),
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(artifact_root),
@@ -1505,6 +1712,7 @@ async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1519,16 +1727,11 @@ async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
         (1, vec![old_tail]),
         (2, vec![replacement]),
     ]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(new_root),
@@ -1566,6 +1769,7 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1578,15 +1782,10 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
     let original_root = txid_root_for_transactions(&original_rows);
     let original_tail = public_txid_artifact_chunk(0, &original_rows, Some(original_root));
     let (seed_source, _seed_server) = public_txid_artifact_source(vec![original_tail.clone()]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 9,
                 merkleroot: Some(original_root),
@@ -1640,7 +1839,7 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
     ]);
 
     let error = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&artifact_source))
+        .sync_to_indexed_tip(None, None, Some(&artifact_source))
         .await
         .expect_err("stable prior-tail conflict must reject the invalid current repack");
 
@@ -1690,6 +1889,7 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1697,15 +1897,10 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let seed_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -1728,7 +1923,7 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
     ]);
 
     let fetched = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&source))
+        .sync_to_indexed_tip(None, None, Some(&source))
         .await
         .expect("current chunk should apply and prior tail should be retained");
 
@@ -1769,6 +1964,7 @@ async fn txid_public_validated_artifact_retains_non_final_current_chunk() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1783,16 +1979,11 @@ async fn txid_public_validated_artifact_retains_non_final_current_chunk() {
         public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
     let second_cid = raw_cid(&second_chunk.bytes).to_string();
     let (source, _server) = public_txid_artifact_source(vec![first_chunk, second_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(prefix_root),
@@ -1836,6 +2027,7 @@ async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catal
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1843,15 +2035,10 @@ async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catal
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let seed_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -1874,7 +2061,7 @@ async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catal
     ]);
 
     let fetched = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&source))
+        .sync_to_indexed_tip(None, None, Some(&source))
         .await
         .expect("current chunk should apply and non-repeated prior tail should be retained");
 
@@ -1915,6 +2102,7 @@ async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1924,15 +2112,10 @@ async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
     let seed_chunk =
         public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(prefix_root));
     let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(prefix_root),
@@ -1954,7 +2137,7 @@ async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
     ]);
 
     let fetched = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&retention_source))
+        .sync_to_indexed_tip(None, None, Some(&retention_source))
         .await
         .expect("background retention pass should not need current rows");
 
@@ -1983,6 +2166,7 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -1992,15 +2176,10 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
     let seed_chunk =
         public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(prefix_root));
     let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(prefix_root),
@@ -2023,12 +2202,7 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
     let (graph_endpoint, graph_requests) = spawn_graphql_response(public_txid_response(vec![]));
 
     let fetched = cache
-        .sync_to_indexed_tip(
-            Some(&graph_endpoint),
-            None,
-            &railgun_contract,
-            Some(&retention_source),
-        )
+        .sync_to_indexed_tip(Some(&graph_endpoint), None, Some(&retention_source))
         .await
         .expect("retention should run after no-progress GraphQL fallback");
 
@@ -2061,6 +2235,7 @@ async fn txid_public_stale_retention_scope_does_not_write_raw_artifact_chunk() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2109,6 +2284,7 @@ async fn txid_public_optional_prior_tail_failure_does_not_block_current_chunk() 
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2116,15 +2292,10 @@ async fn txid_public_optional_prior_tail_failure_does_not_block_current_chunk() 
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -2151,7 +2322,6 @@ async fn txid_public_optional_prior_tail_failure_does_not_block_current_chunk() 
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(prefix_root),
@@ -2197,6 +2367,7 @@ async fn txid_public_prior_only_catalog_failure_does_not_block_current_progress(
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2204,15 +2375,10 @@ async fn txid_public_prior_only_catalog_failure_does_not_block_current_progress(
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -2253,7 +2419,7 @@ async fn txid_public_prior_only_catalog_failure_does_not_block_current_progress(
     );
 
     let fetched = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&source))
+        .sync_to_indexed_tip(None, None, Some(&source))
         .await
         .expect("missing prior-only catalog must not block current TXID progress");
 
@@ -2285,6 +2451,7 @@ async fn txid_public_optional_prior_tail_root_mismatch_does_not_write_retention(
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2292,15 +2459,10 @@ async fn txid_public_optional_prior_tail_root_mismatch_does_not_write_retention(
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -2328,7 +2490,6 @@ async fn txid_public_optional_prior_tail_root_mismatch_does_not_write_retention(
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(prefix_root),
@@ -2374,6 +2535,7 @@ async fn txid_public_cache_skips_unavailable_artifact_when_local_cache_is_suffic
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2381,16 +2543,11 @@ async fn txid_public_cache_skips_unavailable_artifact_when_local_cache_is_suffic
     let root = root_for_single_leaf(row.txid_leaf_hash());
     let artifact_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(root),
@@ -2405,7 +2562,6 @@ async fn txid_public_cache_skips_unavailable_artifact_when_local_cache_is_suffic
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(root),
@@ -2434,6 +2590,7 @@ async fn txid_public_cache_accepts_rootless_same_index_latest_from_local_rows() 
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2441,16 +2598,11 @@ async fn txid_public_cache_accepts_rootless_same_index_latest_from_local_rows() 
     let root = root_for_single_leaf(row.txid_leaf_hash());
     let artifact_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(root),
@@ -2465,7 +2617,6 @@ async fn txid_public_cache_accepts_rootless_same_index_latest_from_local_rows() 
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: None,
@@ -2503,6 +2654,7 @@ async fn txid_public_cache_skips_unavailable_artifact_when_background_cache_is_s
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2510,13 +2662,9 @@ async fn txid_public_cache_skips_unavailable_artifact_when_background_cache_is_s
     let root = root_for_single_leaf(row.txid_leaf_hash());
     let artifact_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     let fetched = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&artifact_source))
+        .sync_to_indexed_tip(None, None, Some(&artifact_source))
         .await
         .expect("seed background artifact cache");
     assert_eq!(fetched, 1);
@@ -2533,7 +2681,6 @@ async fn txid_public_cache_skips_unavailable_artifact_when_background_cache_is_s
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(root),
@@ -2568,6 +2715,7 @@ async fn txid_public_cache_rollback_without_root_clamps_validated_progress() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2576,16 +2724,11 @@ async fn txid_public_cache_rollback_without_root_clamps_validated_progress() {
     let root = txid_root_for_transactions(&[first.clone(), second.clone()]);
     let artifact_chunk = public_txid_artifact_chunk(0, &[first.clone(), second], Some(root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(root),
@@ -2600,7 +2743,6 @@ async fn txid_public_cache_rollback_without_root_clamps_validated_progress() {
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: None,
@@ -2636,6 +2778,7 @@ async fn txid_public_cache_rejects_root_mismatched_high_water_without_correction
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2644,12 +2787,8 @@ async fn txid_public_cache_rejects_root_mismatched_high_water_without_correction
     let stale_chunk =
         public_txid_artifact_chunk(0, std::slice::from_ref(&stale_row), Some(stale_root));
     let (stale_source, _stale_server) = public_txid_artifact_source(vec![stale_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     let fetched = cache
-        .sync_to_indexed_tip(None, None, &railgun_contract, Some(&stale_source))
+        .sync_to_indexed_tip(None, None, Some(&stale_source))
         .await
         .expect("seed background artifact cache");
     assert_eq!(fetched, 1);
@@ -2669,7 +2808,6 @@ async fn txid_public_cache_rejects_root_mismatched_high_water_without_correction
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(corrected_root),
@@ -2706,6 +2844,7 @@ async fn txid_public_cache_background_falls_back_to_graphql_after_zero_artifact_
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2715,18 +2854,9 @@ async fn txid_public_cache_background_falls_back_to_graphql_after_zero_artifact_
     let graph_row = indexed_transaction(0x52, 0x04, 0x05, 0x06);
     let (graph_endpoint, graph_requests) =
         spawn_graphql_response(public_txid_response(vec![graph_row.clone()]));
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     let fetched = cache
-        .sync_to_indexed_tip(
-            Some(&graph_endpoint),
-            None,
-            &railgun_contract,
-            Some(&artifact_source),
-        )
+        .sync_to_indexed_tip(Some(&graph_endpoint), None, Some(&artifact_source))
         .await
         .expect("GraphQL fallback should fill the missing prefix");
 
@@ -2759,6 +2889,7 @@ async fn txid_public_cache_truncates_artifact_chunk_past_latest_validated() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2770,15 +2901,10 @@ async fn txid_public_cache_truncates_artifact_chunk_past_latest_validated() {
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
     let graph_endpoint = Url::parse("http://127.0.0.1:1/graphql").expect("unused mock URL");
 
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             Some(&graph_endpoint),
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -2818,6 +2944,7 @@ async fn txid_public_cache_artifact_only_truncates_spanning_chunk_to_validated_p
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2826,16 +2953,11 @@ async fn txid_public_cache_artifact_only_truncates_spanning_chunk_to_validated_p
     let chunk_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
     let spanning_chunk = public_txid_artifact_chunk(0, &[first.clone(), second], Some(chunk_root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![spanning_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
 
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: None,
@@ -2875,6 +2997,7 @@ async fn txid_public_cache_artifact_only_advances_from_inside_chunk() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2883,15 +3006,10 @@ async fn txid_public_cache_artifact_only_advances_from_inside_chunk() {
     let first_root = txid_root_for_transactions(std::slice::from_ref(&first));
     let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let (first_source, _first_server) = public_txid_artifact_source(vec![first_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(first_root),
@@ -2908,7 +3026,6 @@ async fn txid_public_cache_artifact_only_advances_from_inside_chunk() {
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 1,
                 merkleroot: Some(chunk_root),
@@ -2943,6 +3060,7 @@ async fn txid_public_cache_artifact_only_refreshes_changed_validated_root() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -2950,15 +3068,10 @@ async fn txid_public_cache_artifact_only_refreshes_changed_validated_root() {
     let old_root = root_for_single_leaf(old_row.txid_leaf_hash());
     let old_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&old_row), Some(old_root));
     let (old_source, _old_server) = public_txid_artifact_source(vec![old_chunk]);
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(old_root),
@@ -2976,7 +3089,6 @@ async fn txid_public_cache_artifact_only_refreshes_changed_validated_root() {
         .sync_with_artifact_source(
             None,
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(new_root),
@@ -3011,6 +3123,7 @@ async fn txid_public_cache_falls_back_to_graphql_when_artifact_descriptors_are_u
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let cache = TxidPublicCache::new(&db, key);
@@ -3020,15 +3133,10 @@ async fn txid_public_cache_falls_back_to_graphql_when_artifact_descriptors_are_u
     let (graph_endpoint, graph_requests) =
         spawn_graphql_response(public_txid_response(vec![graph_row.clone()]));
 
-    let railgun_contract = format!(
-        "0x{}",
-        alloy::hex::encode(artifact_scope().railgun_contract.as_slice())
-    );
     cache
         .sync_with_artifact_source(
             Some(&graph_endpoint),
             None,
-            &railgun_contract,
             TxidPublicLatestValidated {
                 txid_index: 0,
                 merkleroot: Some(graph_root),
@@ -3066,6 +3174,7 @@ async fn txid_public_artifact_chunk_rejects_same_tree_boundary_crossing() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let rows = vec![
@@ -3114,6 +3223,7 @@ async fn txid_public_artifact_chunk_waits_for_missing_prefix_rows() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let first = indexed_transaction(0x11, 0x02, 0x01, 0x03);
@@ -3153,6 +3263,7 @@ async fn txid_public_artifact_chunk_rejects_prefix_root_mismatch() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let first = indexed_transaction(0x11, 0x02, 0x01, 0x03);
@@ -3197,6 +3308,7 @@ async fn txid_public_artifact_chunk_rejects_missing_root_without_progress() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let row = indexed_transaction(0x11, 0x02, 0x01, 0x03);
@@ -3235,6 +3347,7 @@ async fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
     let key = TxidPublicCacheKey {
         chain_type: 0,
         chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
         txid_version: "V2_PoseidonMerkle",
     };
     let row = indexed_transaction(0x11, 0x02, 0x01, 0x03);

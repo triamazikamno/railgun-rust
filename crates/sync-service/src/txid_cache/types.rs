@@ -3,7 +3,7 @@ use super::*;
 use crate::indexed_artifacts::{ChainScope, ChainType};
 
 pub(crate) const TXID_CACHE_BLOB_KIND: &str = "txid_public_cache";
-pub(super) const TXID_CACHE_FORMAT_VERSION: u32 = 2;
+pub(super) const TXID_CACHE_FORMAT_VERSION: u32 = 3;
 pub(super) const TXID_CACHE_PAGE_SIZE: NonZeroUsize =
     NonZeroUsize::new(10_000).expect("txid cache page size is non-zero");
 pub(super) static TXID_CACHE_SYNC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -80,23 +80,22 @@ pub(crate) enum TxidPublicCacheError {
 pub(crate) struct TxidPublicCacheKey<'a> {
     pub chain_type: u8,
     pub chain_id: u64,
+    pub railgun_contract: Address,
     pub txid_version: &'a str,
 }
 
 impl TxidPublicCacheKey<'_> {
-    pub(crate) fn artifact_scope(
-        self,
-        railgun_contract: &str,
-    ) -> Result<ChainScope, TxidPublicCacheError> {
-        let railgun_contract = railgun_contract.parse::<Address>().map_err(|err| {
-            TxidPublicCacheError::MetadataMismatch(format!(
-                "invalid railgun contract address: {err}"
-            ))
-        })?;
+    pub(crate) fn artifact_scope(self) -> Result<ChainScope, TxidPublicCacheError> {
+        if self.chain_type != 0 {
+            return Err(TxidPublicCacheError::MetadataMismatch(format!(
+                "unsupported TXID cache chain type {}",
+                self.chain_type
+            )));
+        }
         Ok(ChainScope {
             chain_type: ChainType::Evm,
             chain_id: self.chain_id,
-            railgun_contract,
+            railgun_contract: self.railgun_contract,
         })
     }
 }
@@ -204,6 +203,7 @@ pub(super) struct TxidPublicCacheManifest {
     pub(super) format_version: u32,
     pub(super) chain_type: u8,
     pub(super) chain_id: u64,
+    pub(super) railgun_contract: Address,
     pub(super) txid_version: String,
     pub(super) page_size: usize,
     pub(super) next_txid_index: u64,
@@ -230,14 +230,36 @@ pub(super) struct TxidPublicCachePageRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TxidPublicCachePage {
     pub(super) format_version: u32,
+    pub(super) chain_type: u8,
+    pub(super) chain_id: u64,
+    pub(super) railgun_contract: Address,
+    pub(super) txid_version: String,
     pub(super) start_index: u64,
     pub(super) rows: Vec<TxidPublicCacheRow>,
 }
 
-impl TryFrom<Vec<TxidPublicCacheRow>> for TxidPublicCachePage {
-    type Error = TxidPublicCacheError;
+impl TxidPublicCachePage {
+    pub(super) fn validate_for(
+        &self,
+        key: TxidPublicCacheKey<'_>,
+    ) -> Result<(), TxidPublicCacheError> {
+        if self.format_version != TXID_CACHE_FORMAT_VERSION
+            || self.chain_type != key.chain_type
+            || self.chain_id != key.chain_id
+            || self.railgun_contract != key.railgun_contract
+            || self.txid_version != key.txid_version
+        {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "page cache identity mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
 
-    fn try_from(rows: Vec<TxidPublicCacheRow>) -> Result<Self, Self::Error> {
+    pub(super) fn from_rows(
+        key: TxidPublicCacheKey<'_>,
+        rows: Vec<TxidPublicCacheRow>,
+    ) -> Result<Self, TxidPublicCacheError> {
         let Some(first) = rows.first() else {
             return Err(TxidPublicCacheError::MetadataMismatch(
                 "TXID public cache page cannot be empty".to_string(),
@@ -245,19 +267,26 @@ impl TryFrom<Vec<TxidPublicCacheRow>> for TxidPublicCachePage {
         };
         Ok(Self {
             format_version: TXID_CACHE_FORMAT_VERSION,
+            chain_type: key.chain_type,
+            chain_id: key.chain_id,
+            railgun_contract: key.railgun_contract,
+            txid_version: key.txid_version.to_string(),
             start_index: first.txid_index,
             rows,
         })
     }
-}
 
-impl TxidPublicCachePage {
     pub(super) fn from_indexed_transactions(
+        key: TxidPublicCacheKey<'_>,
         start_index: u64,
         rows: Vec<IndexedRailgunTransaction>,
     ) -> Self {
         Self {
             format_version: TXID_CACHE_FORMAT_VERSION,
+            chain_type: key.chain_type,
+            chain_id: key.chain_id,
+            railgun_contract: key.railgun_contract,
+            txid_version: key.txid_version.to_string(),
             start_index,
             rows: rows
                 .into_iter()
@@ -277,6 +306,7 @@ impl TxidPublicCachePage {
     }
 
     pub(super) fn pages_from_rows(
+        key: TxidPublicCacheKey<'_>,
         rows: Vec<TxidPublicCacheRow>,
     ) -> Result<Vec<Self>, TxidPublicCacheError> {
         let page_size = TXID_CACHE_PAGE_SIZE.get();
@@ -287,11 +317,11 @@ impl TxidPublicCachePage {
             if page_rows.len() == page_size {
                 let full_page_rows =
                     std::mem::replace(&mut page_rows, Vec::with_capacity(page_size));
-                pages.push(full_page_rows.try_into()?);
+                pages.push(Self::from_rows(key, full_page_rows)?);
             }
         }
         if !page_rows.is_empty() {
-            pages.push(page_rows.try_into()?);
+            pages.push(Self::from_rows(key, page_rows)?);
         }
         Ok(pages)
     }
@@ -300,6 +330,10 @@ impl TxidPublicCachePage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TxidPublicCacheIndexShard {
     pub(super) format_version: u32,
+    pub(super) chain_type: u8,
+    pub(super) chain_id: u64,
+    pub(super) railgun_contract: Address,
+    pub(super) txid_version: String,
     pub(super) shard: u8,
     pub(super) entries: Vec<TxidPublicCacheIndexEntry>,
 }

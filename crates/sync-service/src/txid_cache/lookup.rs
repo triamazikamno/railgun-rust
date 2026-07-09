@@ -8,7 +8,7 @@ pub(super) fn find_target_row(
 ) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
     let mut found = None;
     for page_ref in &manifest.pages {
-        let page = page_ref.read(db)?;
+        let page = page_ref.read(db, manifest.cache_key())?;
         for row in page.rows {
             if row.txid_leaf_hash == expected_leaf_hash
                 && row.transaction.output_start_global() == output_start_global
@@ -37,7 +37,7 @@ pub(super) fn read_tree_leaves(
         if page_end <= start || page_ref.start_index >= range_end {
             continue;
         }
-        let page = page_ref.read(db)?;
+        let page = page_ref.read(db, manifest.cache_key())?;
         for row in page.rows {
             if row.txid_index >= start && row.txid_index < range_end {
                 let index = (row.txid_index - start) as usize;

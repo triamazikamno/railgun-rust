@@ -32,8 +32,9 @@ use super::{
 use crate::chain::{
     ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey as DataPlanePublicTxidCacheKey,
     PublicTxidLatestValidated as DataPlanePublicTxidLatestValidated, PublicTxidProofRequest,
-    PublicTxidSyncRequest,
+    PublicTxidProofTarget, PublicTxidSyncRequest,
 };
+use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::types::{
     ChainKey, GlobalPoiPolicy, PoiArtifactManifestSource, PoiArtifactSourceConfig,
     PoiProxyFallback, WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletPrivateCommit,
@@ -1503,7 +1504,7 @@ fn output_poi_recovery_reports_missing_private_output_indexes() {
 }
 
 #[tokio::test]
-async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_context() {
+async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() {
     let spending_public_key = [uint!(4_U256), uint!(5_U256)];
     let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
     let mut input = test_wallet_utxo(0);
@@ -1551,20 +1552,36 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
 
     let graph_response = serde_json::json!({
         "data": {
-            "transactions": [{
-                "id": "0x01",
-                "blockNumber": output.utxo.source.block_number.to_string(),
-                "blockTimestamp": output.utxo.source.block_timestamp.to_string(),
-                "transactionHash": hex::encode_prefixed(output.utxo.source.tx_hash),
-                "merkleRoot": hex::encode_prefixed(FixedBytes::from(merkle_root.to_be_bytes::<32>())),
-                "nullifiers": [hex::encode_prefixed(transaction.nullifiers[0])],
-                "commitments": [hex::encode_prefixed(output.utxo.poi.commitment)],
-                "boundParamsHash": hex::encode_prefixed(FixedBytes::from(bound_params_hash.to_be_bytes::<32>())),
-                "hasUnshield": false,
-                "utxoTreeIn": wallet_utxos[0].utxo.tree.to_string(),
-                "utxoTreeOut": output.utxo.tree.to_string(),
-                "utxoBatchStartPositionOut": output.utxo.position.to_string(),
-            }]
+            "transactions": [
+                {
+                    "id": "0x00",
+                    "blockNumber": "1",
+                    "blockTimestamp": "1700000001",
+                    "transactionHash": hex::encode_prefixed(FixedBytes::<32>::from([0x99; 32])),
+                    "merkleRoot": hex::encode_prefixed(FixedBytes::<32>::from([0x98; 32])),
+                    "nullifiers": ["0xaa"],
+                    "commitments": ["0xbb"],
+                    "boundParamsHash": "0xcc",
+                    "hasUnshield": false,
+                    "utxoTreeIn": "0",
+                    "utxoTreeOut": "0",
+                    "utxoBatchStartPositionOut": "0",
+                },
+                {
+                    "id": "0x01",
+                    "blockNumber": output.utxo.source.block_number.to_string(),
+                    "blockTimestamp": output.utxo.source.block_timestamp.to_string(),
+                    "transactionHash": hex::encode_prefixed(output.utxo.source.tx_hash),
+                    "merkleRoot": hex::encode_prefixed(FixedBytes::from(merkle_root.to_be_bytes::<32>())),
+                    "nullifiers": [hex::encode_prefixed(transaction.nullifiers[0])],
+                    "commitments": [hex::encode_prefixed(output.utxo.poi.commitment)],
+                    "boundParamsHash": hex::encode_prefixed(FixedBytes::from(bound_params_hash.to_be_bytes::<32>())),
+                    "hasUnshield": false,
+                    "utxoTreeIn": wallet_utxos[0].utxo.tree.to_string(),
+                    "utxoTreeOut": output.utxo.tree.to_string(),
+                    "utxoBatchStartPositionOut": output.utxo.position.to_string(),
+                }
+            ]
         }
     })
     .to_string()
@@ -1579,12 +1596,16 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
     );
     let public_data_plane =
         ChainPublicDataPlane::new(Arc::clone(&store), Arc::new(AtomicU64::new(0)));
+    let txid_scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::ZERO,
+    };
     public_data_plane
         .sync_txid_public_cache(PublicTxidSyncRequest {
-            key: DataPlanePublicTxidCacheKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION),
+            key: DataPlanePublicTxidCacheKey::new(txid_scope.clone(), DEFAULT_TXID_VERSION),
             endpoint: Some(&graph_endpoint),
             http_client: None,
-            railgun_contract: "0x0000000000000000000000000000000000000000",
             latest: DataPlanePublicTxidLatestValidated {
                 txid_index: 0,
                 merkleroot: None,
@@ -1598,25 +1619,35 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
         u64::from(recovery_chunk.chunk.tree_number),
         U256::from(recovery_chunk.output_start_global),
     );
-    let direct_proof = public_data_plane
+    let direct_error = public_data_plane
         .txid_public_proof(PublicTxidProofRequest {
-            key: DataPlanePublicTxidCacheKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION),
-            target_txid_index: recovery_chunk.target_txid_index,
-            expected_leaf_hash: expected_leaf,
-            output_start_global: recovery_chunk.output_start_global,
-            latest: DataPlanePublicTxidLatestValidated {
-                txid_index: 0,
-                merkleroot: None,
+            key: DataPlanePublicTxidCacheKey::new(txid_scope, DEFAULT_TXID_VERSION),
+            target: PublicTxidProofTarget::UnknownIndex {
+                expected_leaf_hash: expected_leaf,
+                output_start_global: recovery_chunk.output_start_global,
             },
         })
-        .expect("typed data-plane TXID proof");
-    assert_eq!(direct_proof.target_txid_index, 0);
-    let poi_mock = spawn_poi_rpc(serde_json::json!(false)).await;
+        .expect_err("stale marker must not prove the unknown target beyond it");
+    assert!(matches!(
+        direct_error,
+        crate::txid_cache::TxidPublicCacheError::CacheNotReady {
+            required_index: 1,
+            ..
+        }
+    ));
+    let poi_mock = spawn_poi_rpc_sequence(vec![
+        serde_json::json!({
+            "validatedTxidIndex": 1,
+            "validatedMerkleroot": null,
+        }),
+        serde_json::json!(true),
+    ])
+    .await;
     let poi_client = PoiRpcClient::new(poi_mock.url.clone());
     let mut cfg = wallet_config(scan_keys.nullifying_key);
     cfg.quick_sync_endpoint = Some(graph_endpoint);
 
-    let failure = recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
+    let recovered = recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
         public_data_plane: &public_data_plane,
         cfg: &cfg,
         poi_client: &poi_client,
@@ -1628,21 +1659,31 @@ async fn public_cache_txid_recovery_rejects_poi_rejected_root_before_persisting_
         started: Instant::now(),
     })
     .await
-    .expect_err("POI-rejected root should fail public-cache TXID recovery");
+    .expect("current marker sync should recover the unknown target");
 
-    assert_eq!(failure.status, OutputPoiRecoveryStatus::MissingMerkleProof);
-    assert!(failure.message.contains("POI node rejected"));
+    assert_eq!(recovered.target_txid_index, 1);
+    let latest_request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("latest validated marker request");
+    assert_eq!(latest_request["method"], "ppoi_validated_txid");
     let validate_request = poi_mock
         .requests
         .recv_timeout(Duration::from_secs(2))
         .expect("root validation request");
     assert_eq!(validate_request["method"], "ppoi_validate_txid_merkleroot");
-    assert!(
-        store
-            .list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)
-            .expect("list pending contexts")
-            .is_empty()
-    );
+    let latest = public_data_plane
+        .cached_txid_latest_validated(&DataPlanePublicTxidCacheKey::new(
+            ChainScope {
+                chain_type: ChainType::Evm,
+                chain_id: cfg.chain.chain_id,
+                railgun_contract: cfg.chain.contract,
+            },
+            DEFAULT_TXID_VERSION,
+        ))
+        .expect("read refreshed marker")
+        .expect("refreshed marker present");
+    assert_eq!(latest.txid_index, 1);
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

@@ -16,6 +16,11 @@ pub(crate) fn txid_public_proof_for_recovered_output(
             required_index: latest_validated_txid_index,
         })?;
     manifest.validate_for(key)?;
+    validate_proof_marker(
+        &manifest,
+        latest_validated_txid_index,
+        latest_validated_merkleroot,
+    )?;
     let expected_leaf_hash = FixedBytes::from(expected_leaf_hash.to_be_bytes::<32>());
     let target = find_target_row(&manifest, db, expected_leaf_hash, output_start_global)?;
     txid_public_proof_for_target_row(
@@ -44,6 +49,11 @@ pub(crate) fn txid_public_proof_for_recovered_output_at_index(
             required_index: latest_validated_txid_index,
         })?;
     manifest.validate_for(key)?;
+    validate_proof_marker(
+        &manifest,
+        latest_validated_txid_index,
+        latest_validated_merkleroot,
+    )?;
     validated_root_txid_index(&manifest, target_txid_index, latest_validated_txid_index)?;
     let target = row_for_txid_index(&manifest, db, target_txid_index)?.ok_or(
         TxidPublicCacheError::MissingLeaf {
@@ -63,6 +73,37 @@ pub(crate) fn txid_public_proof_for_recovered_output_at_index(
         latest_validated_txid_index,
         latest_validated_merkleroot,
     )
+}
+
+fn validate_proof_marker(
+    manifest: &TxidPublicCacheManifest,
+    latest_validated_txid_index: u64,
+    latest_validated_merkleroot: Option<FixedBytes<32>>,
+) -> Result<(), TxidPublicCacheError> {
+    match manifest.latest_validated_txid_index {
+        Some(index) if index == latest_validated_txid_index => {}
+        Some(index) if index < latest_validated_txid_index => {
+            return Err(TxidPublicCacheError::CacheNotReady {
+                next_index: index.saturating_add(1),
+                required_index: latest_validated_txid_index,
+            });
+        }
+        Some(index) => {
+            return Err(TxidPublicCacheError::MetadataMismatch(format!(
+                "TXID proof marker {latest_validated_txid_index} is stale; cached marker is {index}"
+            )));
+        }
+        None => {
+            return Err(TxidPublicCacheError::CacheNotReady {
+                next_index: 0,
+                required_index: latest_validated_txid_index,
+            });
+        }
+    }
+    if manifest.latest_validated_merkleroot != latest_validated_merkleroot {
+        return Err(TxidPublicCacheError::RootMismatch);
+    }
+    Ok(())
 }
 
 pub(super) fn txid_public_proof_for_target_row(
@@ -201,7 +242,7 @@ pub(super) fn find_target_row_by_scan(
 ) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
     let mut found = RecoveredOutputMatch::default();
     for page_ref in &manifest.pages {
-        let page = page_ref.read(db)?;
+        let page = page_ref.read(db, manifest.cache_key())?;
         for row in page.rows {
             found.remember(manifest, row, tx_hash, output_commitment)?;
         }
@@ -276,7 +317,7 @@ fn row_for_index_entry(
     else {
         return Ok(None);
     };
-    let page = page_ref.read(db)?;
+    let page = page_ref.read(db, manifest.cache_key())?;
     let Some(row) = page.rows.get(entry.row_offset as usize).cloned() else {
         return Ok(None);
     };
@@ -299,7 +340,7 @@ pub(super) fn row_for_txid_index(
     }) else {
         return Ok(None);
     };
-    let page = page_ref.read(db)?;
+    let page = page_ref.read(db, manifest.cache_key())?;
     let offset = (txid_index - page_ref.start_index) as usize;
     let Some(row) = page.rows.get(offset).cloned() else {
         return Ok(None);

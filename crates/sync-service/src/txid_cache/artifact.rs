@@ -298,9 +298,10 @@ impl TxidPublicCache<'_> {
         &self,
         descriptor: &IndexedArtifactDescriptor,
     ) -> Option<VerifiedIndexedArtifactChunk> {
+        let scope = self.key.artifact_scope().ok()?;
         if descriptor.dataset_kind != IndexedDatasetKind::PublicTxid
             || descriptor.range.kind != IndexedArtifactRangeKind::TxidIndex
-            || descriptor.scope.chain_id != self.key.chain_id
+            || descriptor.scope != scope
             || descriptor.metadata.stream_partition.as_deref() != Some(self.key.txid_version)
         {
             return None;
@@ -374,6 +375,13 @@ impl TxidPublicCacheWritePermit<'_> {
         let db = self.db();
         let key = self.key();
         for chunk in chunks {
+            if chunk.descriptor.scope != key.artifact_scope()?
+                || chunk.descriptor.metadata.stream_partition.as_deref() != Some(key.txid_version)
+            {
+                return Err(TxidPublicCacheError::MetadataMismatch(
+                    "retained public_txid artifact cache identity mismatch".to_string(),
+                ));
+            }
             let pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
             verify_declared_merkle_root(
                 &chunk.descriptor.metadata.root,
@@ -558,7 +566,23 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for Vec<TxidPublicCachePage> {
             envelope.header.range.end,
             envelope.header.row_count,
         )?;
-        TxidPublicCachePage::pages_from_rows(rows)
+        let txid_version = chunk
+            .descriptor
+            .metadata
+            .stream_partition
+            .as_deref()
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "public_txid artifact missing stream partition".to_string(),
+                )
+            })?;
+        let key = TxidPublicCacheKey {
+            chain_type: 0,
+            chain_id: chunk.descriptor.scope.chain_id,
+            railgun_contract: chunk.descriptor.scope.railgun_contract,
+            txid_version,
+        };
+        TxidPublicCachePage::pages_from_rows(key, rows)
     }
 }
 
@@ -638,15 +662,25 @@ fn materialize_pages_for_apply(
 }
 
 fn truncate_pages_to_range_end(
-    pages: Vec<TxidPublicCachePage>,
+    mut pages: Vec<TxidPublicCachePage>,
     range_end: u64,
 ) -> Result<Vec<TxidPublicCachePage>, TxidPublicCacheError> {
-    let rows = pages
-        .into_iter()
-        .flat_map(|page| page.rows)
-        .take_while(|row| row.txid_index <= range_end)
-        .collect::<Vec<_>>();
-    TxidPublicCachePage::pages_from_rows(rows)
+    for page in &mut pages {
+        page.rows.retain(|row| row.txid_index <= range_end);
+    }
+    pages.retain(|page| !page.rows.is_empty());
+    for page in &mut pages {
+        page.start_index = page
+            .rows
+            .first()
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "truncated public_txid page cannot be empty".to_string(),
+                )
+            })?
+            .txid_index;
+    }
+    Ok(pages)
 }
 
 struct PublicTxidCursor<'a> {

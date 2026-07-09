@@ -62,7 +62,6 @@ impl TxidPublicCache<'_> {
         &self,
         endpoint: Option<&Url>,
         http_client: Option<&reqwest::Client>,
-        railgun_contract: &str,
         latest: TxidPublicLatestValidated,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<(), TxidPublicCacheError> {
@@ -93,7 +92,7 @@ impl TxidPublicCache<'_> {
             )
         };
         let artifact_fetch = match indexed_artifact_source {
-            Some(config) => match self.artifact_source(railgun_contract, config, http_client) {
+            Some(config) => match self.artifact_source(config, http_client) {
                 Ok(source) => match source
                     .fetch_current_chunks(self, artifact_from_index, Some(latest.txid_index))
                     .await
@@ -293,7 +292,7 @@ impl TxidPublicCache<'_> {
                 break;
             }
             let row_count = rows.len() as u64;
-            let page = TxidPublicCachePage::from_indexed_transactions(start_index, rows);
+            let page = TxidPublicCachePage::from_indexed_transactions(self.key, start_index, rows);
             manifest.insert_or_replace_page(&permit, &page)?;
             rebuild_index_for_manifest(&manifest, &permit)?;
             manifest.validated_cached_txid_index = Some(start_index.saturating_add(row_count - 1));
@@ -364,7 +363,7 @@ impl TxidPublicCache<'_> {
                 break;
             }
             let row_count = rows.len() as u64;
-            let page = TxidPublicCachePage::from_indexed_transactions(start_index, rows);
+            let page = TxidPublicCachePage::from_indexed_transactions(self.key, start_index, rows);
             manifest.append_page(&permit, &page)?;
             update_index_for_page(&permit, &page)?;
             fetched_rows = fetched_rows.saturating_add(row_count);
@@ -398,7 +397,6 @@ impl TxidPublicCache<'_> {
         &self,
         endpoint: Option<&Url>,
         http_client: Option<&reqwest::Client>,
-        railgun_contract: &str,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<u64, TxidPublicCacheError> {
         let mut retention_after_graphql = None;
@@ -413,7 +411,7 @@ impl TxidPublicCache<'_> {
                     .map_or(0, |index| index.saturating_add(1));
                 (read_scope, from_index)
             };
-            let source = match self.artifact_source(railgun_contract, config, http_client) {
+            let source = match self.artifact_source(config, http_client) {
                 Ok(source) => Some(source),
                 Err(err) if endpoint.is_some() => {
                     warn!(
@@ -539,7 +537,7 @@ impl TxidPublicCache<'_> {
                 return Err(TxidPublicCacheError::MissingTarget);
             }
             let row_count = rows.len() as u64;
-            let page = TxidPublicCachePage::from_indexed_transactions(start_index, rows);
+            let page = TxidPublicCachePage::from_indexed_transactions(self.key, start_index, rows);
             if start_index < manifest.next_txid_index {
                 manifest.insert_or_replace_page(&permit, &page)?;
                 rebuild_index_for_manifest(&manifest, &permit)?;
@@ -611,11 +609,10 @@ impl TxidPublicCache<'_> {
 
     fn artifact_source(
         &self,
-        railgun_contract: &str,
         config: &IndexedArtifactSourceConfig,
         http_client: Option<&reqwest::Client>,
     ) -> Result<artifact::TxidPublicArtifactSource, TxidPublicCacheError> {
-        let scope = self.key.artifact_scope(railgun_contract)?;
+        let scope = self.key.artifact_scope()?;
         Ok(artifact::TxidPublicArtifactSource::new(
             config,
             http_client,
@@ -791,7 +788,7 @@ impl TxidPublicCacheManifest {
                     index: expected_index,
                 });
             }
-            let page = page_ref.read(db)?;
+            let page = page_ref.read(db, self.cache_key())?;
             if page.rows.len() as u64 != page_ref.row_count {
                 return Err(TxidPublicCacheError::MetadataMismatch(
                     "page row count mismatch".to_string(),
@@ -915,7 +912,7 @@ impl TxidPublicCacheManifest {
                 break;
             }
             let row_count = rows.len() as u64;
-            let page = TxidPublicCachePage::from_indexed_transactions(next_index, rows);
+            let page = TxidPublicCachePage::from_indexed_transactions(key, next_index, rows);
             self.insert_or_replace_page(permit, &page)?;
             fetched_rows = fetched_rows.saturating_add(row_count);
             refreshed_to = Some(next_index.saturating_add(row_count - 1));

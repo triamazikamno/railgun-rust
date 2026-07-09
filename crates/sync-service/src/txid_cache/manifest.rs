@@ -12,6 +12,7 @@ impl From<TxidPublicCacheKey<'_>> for TxidPublicCacheManifest {
             format_version: TXID_CACHE_FORMAT_VERSION,
             chain_type: key.chain_type,
             chain_id: key.chain_id,
+            railgun_contract: key.railgun_contract,
             txid_version: key.txid_version.to_string(),
             page_size: TXID_CACHE_PAGE_SIZE.get(),
             next_txid_index: 0,
@@ -50,6 +51,9 @@ impl TxidPublicCache<'_> {
         let Some(meta) = self.db.get_blob_meta(TXID_CACHE_BLOB_KIND, &id)? else {
             return Ok(None);
         };
+        if meta.format_version != TXID_CACHE_FORMAT_VERSION {
+            return Ok(None);
+        }
         let path = self.db.resolve_path(&meta.relative_path);
         match fs::read(path) {
             Ok(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
@@ -72,6 +76,7 @@ impl TxidPublicCacheManifest {
         }
         if self.chain_type != key.chain_type
             || self.chain_id != key.chain_id
+            || self.railgun_contract != key.railgun_contract
             || self.txid_version != key.txid_version
         {
             return Err(TxidPublicCacheError::MetadataMismatch(
@@ -81,12 +86,22 @@ impl TxidPublicCacheManifest {
         Ok(())
     }
 
+    pub(super) fn cache_key(&self) -> TxidPublicCacheKey<'_> {
+        TxidPublicCacheKey {
+            chain_type: self.chain_type,
+            chain_id: self.chain_id,
+            railgun_contract: self.railgun_contract,
+            txid_version: &self.txid_version,
+        }
+    }
+
     pub(super) fn write_to(
         &self,
         permit: &TxidPublicCacheWritePermit<'_>,
     ) -> Result<(), TxidPublicCacheError> {
         let db = permit.db();
         let key = permit.key();
+        self.validate_for(key)?;
         let name = manifest_file_name(key);
         let path = db.blob_path(TXID_CACHE_BLOB_KIND, &name);
         let bytes = rmp_serde::to_vec_named(self)?;
@@ -178,7 +193,7 @@ impl TxidPublicCacheManifest {
                 continue;
             }
 
-            let existing = page_ref.read(db)?;
+            let existing = page_ref.read(db, self.cache_key())?;
             let before_rows: Vec<_> = existing
                 .rows
                 .iter()
@@ -219,6 +234,7 @@ impl TxidPublicCachePage {
     ) -> Result<TxidPublicCachePageRef, TxidPublicCacheError> {
         let db = permit.db();
         let key = permit.key();
+        self.validate_for(key)?;
         let name = match mode {
             TxidPublicCachePageWriteMode::Stable => page_file_name(key, self.start_index),
             TxidPublicCachePageWriteMode::StagedArtifact => {
@@ -240,14 +256,10 @@ impl TxidPublicCachePage {
         rows: Vec<TxidPublicCacheRow>,
         mode: TxidPublicCachePageWriteMode,
     ) -> Result<Option<TxidPublicCachePageRef>, TxidPublicCacheError> {
-        let Some(first) = rows.first() else {
+        if rows.is_empty() {
             return Ok(None);
-        };
-        let page = Self {
-            format_version: TXID_CACHE_FORMAT_VERSION,
-            start_index: first.txid_index,
-            rows,
-        };
+        }
+        let page = Self::from_rows(permit.key(), rows)?;
         page.write_with_mode(permit, mode).map(Some)
     }
 }

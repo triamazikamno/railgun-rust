@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::indexed_artifacts::{
-    IndexedArtifactDescriptor, IndexedArtifactRangeKind, IndexedDatasetKind,
+    ChainScope, ChainType, IndexedArtifactDescriptor, IndexedArtifactRangeKind, IndexedDatasetKind,
     VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
 };
 use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
@@ -141,24 +141,25 @@ impl PublicPoiCorpusHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublicTxidCacheKey {
-    pub chain_type: u8,
-    pub chain_id: u64,
+    pub scope: ChainScope,
     pub txid_version: String,
 }
 
 impl PublicTxidCacheKey {
-    pub(crate) fn new(chain_type: u8, chain_id: u64, txid_version: impl Into<String>) -> Self {
+    pub(crate) fn new(scope: ChainScope, txid_version: impl Into<String>) -> Self {
         Self {
-            chain_type,
-            chain_id,
+            scope,
             txid_version: txid_version.into(),
         }
     }
 
     fn as_cache_key(&self) -> TxidPublicCacheKey<'_> {
         TxidPublicCacheKey {
-            chain_type: self.chain_type,
-            chain_id: self.chain_id,
+            chain_type: match self.scope.chain_type {
+                ChainType::Evm => EVM_CHAIN_TYPE,
+            },
+            chain_id: self.scope.chain_id,
+            railgun_contract: self.scope.railgun_contract,
             txid_version: &self.txid_version,
         }
     }
@@ -192,21 +193,54 @@ pub(crate) struct PublicTxidSyncRequest<'a> {
     pub key: PublicTxidCacheKey,
     pub endpoint: Option<&'a Url>,
     pub http_client: Option<&'a reqwest::Client>,
-    pub railgun_contract: &'a str,
     pub latest: PublicTxidLatestValidated,
     pub indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PublicTxidProofTarget {
+    KnownIndex {
+        txid_index: u64,
+        expected_leaf_hash: U256,
+        output_start_global: u128,
+    },
+    UnknownIndex {
+        expected_leaf_hash: U256,
+        output_start_global: u128,
+    },
+}
+
+impl PublicTxidProofTarget {
+    pub(crate) const fn txid_index(self) -> Option<u64> {
+        match self {
+            Self::KnownIndex { txid_index, .. } => Some(txid_index),
+            Self::UnknownIndex { .. } => None,
+        }
+    }
+
+    const fn proof_inputs(self) -> (U256, u128) {
+        match self {
+            Self::KnownIndex {
+                expected_leaf_hash,
+                output_start_global,
+                ..
+            }
+            | Self::UnknownIndex {
+                expected_leaf_hash,
+                output_start_global,
+            } => (expected_leaf_hash, output_start_global),
+        }
+    }
+}
+
 pub(crate) struct PublicTxidProofRequest {
     pub key: PublicTxidCacheKey,
-    pub target_txid_index: Option<u64>,
-    pub expected_leaf_hash: U256,
-    pub output_start_global: u128,
-    pub latest: PublicTxidLatestValidated,
+    pub target: PublicTxidProofTarget,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PublicTxidProof {
+    pub latest_validated: PublicTxidLatestValidated,
     pub target_txid_index: u64,
     pub root_txid_index: u64,
     pub proof: MerkleProof,
@@ -785,7 +819,6 @@ impl ChainPublicDataPlane {
             .sync_with_artifact_source(
                 request.endpoint,
                 request.http_client,
-                request.railgun_contract,
                 request.latest.into(),
                 request.indexed_artifact_source,
             )
@@ -797,28 +830,44 @@ impl ChainPublicDataPlane {
         request: PublicTxidProofRequest,
     ) -> Result<PublicTxidProof, TxidPublicCacheError> {
         let key = request.key.as_cache_key();
-        let latest = request.latest;
-        let proof = if let Some(target_txid_index) = request.target_txid_index {
-            txid_public_proof_for_recovered_output_at_index(
+        let cache = TxidPublicCache::new(self.db.as_ref(), key);
+        let latest =
+            cache
+                .cached_latest_validated()?
+                .ok_or(TxidPublicCacheError::CacheNotReady {
+                    next_index: 0,
+                    required_index: request.target.txid_index().unwrap_or(0),
+                })?;
+        let (expected_leaf_hash, output_start_global) = request.target.proof_inputs();
+        let proof = match request.target {
+            PublicTxidProofTarget::KnownIndex { txid_index, .. } => {
+                txid_public_proof_for_recovered_output_at_index(
+                    self.db.as_ref(),
+                    key,
+                    txid_index,
+                    expected_leaf_hash,
+                    output_start_global,
+                    latest.txid_index,
+                    latest.merkleroot,
+                )
+            }
+            PublicTxidProofTarget::UnknownIndex { .. } => txid_public_proof_for_recovered_output(
                 self.db.as_ref(),
                 key,
-                target_txid_index,
-                request.expected_leaf_hash,
-                request.output_start_global,
+                expected_leaf_hash,
+                output_start_global,
                 latest.txid_index,
                 latest.merkleroot,
-            )
-        } else {
-            txid_public_proof_for_recovered_output(
-                self.db.as_ref(),
-                key,
-                request.expected_leaf_hash,
-                request.output_start_global,
-                latest.txid_index,
-                latest.merkleroot,
-            )
+            ),
         }?;
+        if proof.target_txid_index > latest.txid_index || proof.root_txid_index > latest.txid_index
+        {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "TXID proof extends beyond its validated marker".to_string(),
+            ));
+        }
         Ok(PublicTxidProof {
+            latest_validated: latest.into(),
             target_txid_index: proof.target_txid_index,
             root_txid_index: proof.root_txid_index,
             proof: proof.proof,
@@ -1401,7 +1450,7 @@ mod tests {
     #[tokio::test]
     async fn txid_latest_marker_read_is_data_plane_operation() {
         let (data_plane, root_dir) = test_data_plane("txid-latest-empty");
-        let key = PublicTxidCacheKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION);
+        let key = PublicTxidCacheKey::new(test_wallet_scan_scope(), DEFAULT_TXID_VERSION);
 
         assert_eq!(
             data_plane

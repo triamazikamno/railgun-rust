@@ -549,7 +549,7 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
         return;
     }
     let chain_id = service.chain.chain_id;
-    let railgun_contract = service.chain.contract.to_string();
+    let railgun_contract = service.chain.contract;
     let http_client = service.chain.http_client.clone();
     let db = service.db.clone();
     tokio::spawn(
@@ -558,6 +558,7 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
                 let key = TxidPublicCacheKey {
                     chain_type: EVM_CHAIN_TYPE,
                     chain_id,
+                    railgun_contract,
                     txid_version: DEFAULT_TXID_VERSION,
                 };
                 let cache = TxidPublicCache::new(&db, key);
@@ -565,7 +566,6 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
                     .sync_to_indexed_tip(
                         endpoint.as_ref(),
                         http_client.as_ref(),
-                        &railgun_contract,
                         indexed_artifact_source.as_ref(),
                     )
                     .await

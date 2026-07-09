@@ -14,10 +14,20 @@ pub(super) fn write_blob_file(
 }
 
 impl TxidPublicCachePageRef {
-    pub(super) fn read(&self, db: &DbStore) -> Result<TxidPublicCachePage, TxidPublicCacheError> {
+    pub(super) fn read(
+        &self,
+        db: &DbStore,
+        key: TxidPublicCacheKey<'_>,
+    ) -> Result<TxidPublicCachePage, TxidPublicCacheError> {
         let bytes = fs::read(db.resolve_path(&self.relative_path))?;
         let page: TxidPublicCachePage = rmp_serde::from_slice(&bytes)?;
-        if page.format_version != TXID_CACHE_FORMAT_VERSION || page.start_index != self.start_index
+        if page.format_version != TXID_CACHE_FORMAT_VERSION
+            || page.chain_type != key.chain_type
+            || page.chain_id != key.chain_id
+            || page.railgun_contract != key.railgun_contract
+            || page.txid_version != key.txid_version
+            || page.start_index != self.start_index
+            || page.rows.len() as u64 != self.row_count
         {
             return Err(TxidPublicCacheError::MetadataMismatch(
                 "page metadata mismatch".to_string(),
@@ -65,7 +75,7 @@ pub(super) fn rebuild_index_for_manifest(
     let db = permit.db();
     clear_index_shards(permit)?;
     for page_ref in &manifest.pages {
-        let page = page_ref.read(db)?;
+        let page = page_ref.read(db, manifest.cache_key())?;
         update_index_for_page(permit, &page)?;
     }
     Ok(())
@@ -111,12 +121,20 @@ pub(super) fn load_index_shard(
         Ok(bytes) => {
             let index: TxidPublicCacheIndexShard = rmp_serde::from_slice(&bytes)?;
             if index.format_version == TXID_CACHE_FORMAT_VERSION && index.shard == shard {
-                Ok(index)
+                if index.chain_type == key.chain_type
+                    && index.chain_id == key.chain_id
+                    && index.railgun_contract == key.railgun_contract
+                    && index.txid_version == key.txid_version
+                {
+                    Ok(index)
+                } else {
+                    Ok(empty_index_shard(key, shard))
+                }
             } else {
-                Ok(empty_index_shard(shard))
+                Ok(empty_index_shard(key, shard))
             }
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(empty_index_shard(shard)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(empty_index_shard(key, shard)),
         Err(err) => Err(err.into()),
     }
 }
@@ -127,6 +145,16 @@ pub(super) fn write_index_shard(
 ) -> Result<(), TxidPublicCacheError> {
     let db = permit.db();
     let key = permit.key();
+    if index.format_version != TXID_CACHE_FORMAT_VERSION
+        || index.chain_type != key.chain_type
+        || index.chain_id != key.chain_id
+        || index.railgun_contract != key.railgun_contract
+        || index.txid_version != key.txid_version
+    {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "index shard cache identity mismatch".to_string(),
+        ));
+    }
     let path = db.blob_path(
         TXID_CACHE_BLOB_KIND,
         &index_shard_file_name(key, index.shard),
@@ -135,9 +163,16 @@ pub(super) fn write_index_shard(
     write_blob_file(db, &path, &bytes)
 }
 
-pub(super) const fn empty_index_shard(shard: u8) -> TxidPublicCacheIndexShard {
+pub(super) fn empty_index_shard(
+    key: TxidPublicCacheKey<'_>,
+    shard: u8,
+) -> TxidPublicCacheIndexShard {
     TxidPublicCacheIndexShard {
         format_version: TXID_CACHE_FORMAT_VERSION,
+        chain_type: key.chain_type,
+        chain_id: key.chain_id,
+        railgun_contract: key.railgun_contract,
+        txid_version: key.txid_version.to_string(),
         shard,
         entries: Vec::new(),
     }
