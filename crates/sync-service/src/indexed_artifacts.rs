@@ -11,10 +11,15 @@ pub use railgun_indexed_artifacts::{
     ChainScope, ChainType, ChunkError as IndexedArtifactChunkError, CompressionAlgorithm,
     DatasetDescriptorMetadata, INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
     INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION, INDEXED_ARTIFACT_CHUNK_MAGIC,
+    INDEXED_ARTIFACT_COMMITMENTS_MAX_DECODED_ENVELOPE_BYTES,
     INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION, INDEXED_ARTIFACT_MAX_COMPRESSED_CHUNK_BYTES,
-    IndexedArtifactCatalog, IndexedArtifactChainEntry, IndexedArtifactChunkEnvelope,
-    IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection, IndexedArtifactDescriptor,
-    IndexedArtifactError, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
+    INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES,
+    INDEXED_ARTIFACT_MERKLE_CHECKPOINT_MAX_DECODED_ENVELOPE_BYTES,
+    INDEXED_ARTIFACT_PUBLIC_TXID_MAX_DECODED_ENVELOPE_BYTES,
+    INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES, IndexedArtifactCatalog,
+    IndexedArtifactChainEntry, IndexedArtifactChunkEnvelope, IndexedArtifactChunkEnvelopeHeader,
+    IndexedArtifactChunkSection, IndexedArtifactDescriptor, IndexedArtifactError,
+    IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
     IndexedArtifactStreamCatalog, IndexedArtifactStreamCoverage,
     IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
     IndexedArtifactStreamPlanError, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
@@ -50,7 +55,7 @@ impl VerifiedIndexedArtifactCatalog {
 
 struct FetchedIndexedArtifactChunk {
     index: usize,
-    byte_size: u64,
+    in_flight_byte_charge: u64,
     chunk: VerifiedIndexedArtifactChunk,
     gateway_host: String,
     gateway_index: usize,
@@ -368,6 +373,14 @@ impl IndexedArtifactManifestClient {
         }
         let batch_started = Instant::now();
         let max_in_flight_bytes = self.config.max_in_flight_bytes;
+        let in_flight_byte_charges = descriptors
+            .iter()
+            .map(|descriptor| {
+                descriptor
+                    .decoded_envelope_byte_size_charge()
+                    .map(|decoded_byte_size| descriptor.byte_size.max(decoded_byte_size))
+            })
+            .collect::<Result<Vec<_>, IndexedArtifactChunkError>>()?;
         let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
         let mut results = vec![None; descriptors.len()];
         let mut next_index = 0;
@@ -381,14 +394,15 @@ impl IndexedArtifactManifestClient {
         while next_index < descriptors.len() || !in_flight.is_empty() {
             while next_index < descriptors.len() && in_flight.len() < concurrency {
                 let descriptor = descriptors[next_index].clone();
-                if descriptor.byte_size > max_in_flight_bytes {
+                let in_flight_byte_charge = in_flight_byte_charges[next_index];
+                if in_flight_byte_charge > max_in_flight_bytes {
                     return Err(IndexedArtifactManifestError::ChunkExceedsInFlightBudget {
                         cid: descriptor.cid,
-                        byte_size: descriptor.byte_size,
+                        byte_size: in_flight_byte_charge,
                         max_in_flight_bytes,
                     });
                 }
-                let next_in_flight_bytes = in_flight_bytes.saturating_add(descriptor.byte_size);
+                let next_in_flight_bytes = in_flight_bytes.saturating_add(in_flight_byte_charge);
                 if next_in_flight_bytes > max_in_flight_bytes {
                     byte_budget_waits = byte_budget_waits.saturating_add(1);
                     debug!(
@@ -397,6 +411,7 @@ impl IndexedArtifactManifestClient {
                         range_end = descriptor.range.end,
                         next_index,
                         next_byte_size = descriptor.byte_size,
+                        next_in_flight_byte_charge = in_flight_byte_charge,
                         in_flight_chunks = in_flight.len(),
                         in_flight_bytes,
                         max_in_flight_bytes,
@@ -461,7 +476,7 @@ impl IndexedArtifactManifestClient {
                     };
                     Ok::<_, IndexedArtifactManifestError>(FetchedIndexedArtifactChunk {
                         index,
-                        byte_size,
+                        in_flight_byte_charge,
                         chunk,
                         gateway_host,
                         gateway_index,
@@ -477,7 +492,7 @@ impl IndexedArtifactManifestClient {
                 continue;
             };
             let fetched = completed?;
-            in_flight_bytes = in_flight_bytes.saturating_sub(fetched.byte_size);
+            in_flight_bytes = in_flight_bytes.saturating_sub(fetched.in_flight_byte_charge);
             completed_chunks += 1;
             on_chunk_verified(completed_chunks, total_chunks);
             debug!(
@@ -485,7 +500,8 @@ impl IndexedArtifactManifestClient {
                 dataset_kind = ?fetched.chunk.descriptor.dataset_kind,
                 range_start = fetched.chunk.descriptor.range.start,
                 range_end = fetched.chunk.descriptor.range.end,
-                byte_size = fetched.byte_size,
+                byte_size = fetched.chunk.descriptor.byte_size,
+                in_flight_byte_charge = fetched.in_flight_byte_charge,
                 index = fetched.index,
                 completed_chunks,
                 total_chunks,
@@ -781,6 +797,7 @@ fn validate_chunk_descriptor_scope(
             chunk_end: chunk.range.end,
         });
     }
+    chunk.decoded_envelope_byte_size_charge()?;
     Ok(())
 }
 
@@ -1029,6 +1046,8 @@ pub enum IndexedArtifactManifestError {
     },
     #[error("indexed artifact chunk byte size {actual} exceeds maximum {maximum}")]
     ChunkTooLarge { actual: u64, maximum: u64 },
+    #[error("indexed artifact decoded chunk envelope byte size {actual} exceeds maximum {maximum}")]
+    ChunkDecodedEnvelopeTooLarge { actual: u64, maximum: u64 },
     #[error("indexed artifact chunk decompression failed")]
     ChunkDecompression { source: std::io::Error },
     #[error("indexed artifact chunk has wrong magic bytes")]
@@ -1109,12 +1128,16 @@ pub enum IndexedArtifactManifestError {
         "indexed artifact chunk descriptor byte size mismatch: expected {expected}, got {actual}"
     )]
     ChunkDescriptorByteSizeMismatch { expected: u64, actual: u64 },
+    #[error(
+        "indexed artifact chunk descriptor decoded envelope byte size mismatch: expected {expected}, got {actual}"
+    )]
+    ChunkDescriptorDecodedEnvelopeByteSizeMismatch { expected: u64, actual: u64 },
     #[error("indexed artifact chunk format failed: {message}")]
     ChunkFormat { message: String },
     #[error("indexed artifact chunk concurrency must be greater than zero")]
     InvalidChunkConcurrency,
     #[error(
-        "indexed artifact chunk {cid} byte size {byte_size} exceeds in-flight byte budget {max_in_flight_bytes}"
+        "indexed artifact chunk {cid} resource charge {byte_size} exceeds in-flight byte budget {max_in_flight_bytes}"
     )]
     ChunkExceedsInFlightBudget {
         cid: String,
@@ -1215,6 +1238,9 @@ impl From<IndexedArtifactChunkError> for IndexedArtifactManifestError {
             IndexedArtifactChunkError::ChunkTooLarge { actual, maximum } => {
                 Self::ChunkTooLarge { actual, maximum }
             }
+            IndexedArtifactChunkError::DecodedEnvelopeTooLarge { actual, maximum } => {
+                Self::ChunkDecodedEnvelopeTooLarge { actual, maximum }
+            }
             IndexedArtifactChunkError::InvalidChunkPlanningConfig {
                 soft_min,
                 target,
@@ -1241,6 +1267,10 @@ impl From<IndexedArtifactChunkError> for IndexedArtifactManifestError {
             IndexedArtifactChunkError::DescriptorByteSizeMismatch { expected, actual } => {
                 Self::ChunkDescriptorByteSizeMismatch { expected, actual }
             }
+            IndexedArtifactChunkError::DescriptorDecodedEnvelopeByteSizeMismatch {
+                expected,
+                actual,
+            } => Self::ChunkDescriptorDecodedEnvelopeByteSizeMismatch { expected, actual },
             IndexedArtifactChunkError::DescriptorEncodingVersionMismatch { expected, actual } => {
                 Self::ChunkDescriptorEncodingVersionMismatch { expected, actual }
             }
@@ -2072,6 +2102,53 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn bounded_chunk_fetch_rejects_advertised_decoded_size_before_network() {
+        let bytes = b"oversized decoded envelope".to_vec();
+        let mut descriptor = chunk_descriptor_for_bytes(scope(), 0, 1, raw_cid(&bytes), &bytes);
+        descriptor.metadata.decoded_envelope_byte_size =
+            Some(IndexedDatasetKind::WalletScan.decoded_envelope_byte_limit() + 1);
+        let client =
+            IndexedArtifactManifestClient::new(config([7_u8; 32], None), reqwest::Client::new());
+
+        let error = client
+            .fetch_chunks_bounded(&[descriptor])
+            .await
+            .expect_err("oversized decoded envelope rejected before retrieval");
+
+        assert!(matches!(
+            error,
+            IndexedArtifactManifestError::ChunkDecodedEnvelopeTooLarge {
+                actual,
+                maximum: INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES,
+            } if actual == INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_chunk_fetch_charges_legacy_descriptor_at_dataset_cap() {
+        let bytes = b"legacy descriptor".to_vec();
+        let mut descriptor = chunk_descriptor_for_bytes(scope(), 0, 1, raw_cid(&bytes), &bytes);
+        descriptor.metadata.decoded_envelope_byte_size = None;
+        let mut source_config = config([7_u8; 32], None);
+        source_config.max_in_flight_bytes =
+            INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES - 1;
+        let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
+
+        let error = client
+            .fetch_chunks_bounded(&[descriptor])
+            .await
+            .expect_err("legacy descriptor charged at dataset cap");
+
+        assert!(matches!(
+            error,
+            IndexedArtifactManifestError::ChunkExceedsInFlightBudget {
+                byte_size: INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn stager_holds_later_chunks_until_gap_is_filled() {
         let scope = scope();
@@ -2401,7 +2478,12 @@ mod tests {
             byte_size: u64::try_from(bytes.len()).expect("chunk size"),
             encoding_version: INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
             compression: CompressionAlgorithm::Zstd,
-            metadata: DatasetDescriptorMetadata::default(),
+            metadata: DatasetDescriptorMetadata {
+                decoded_envelope_byte_size: Some(
+                    u64::try_from(bytes.len()).expect("decoded envelope size"),
+                ),
+                ..DatasetDescriptorMetadata::default()
+            },
         }
     }
 

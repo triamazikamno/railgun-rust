@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    io::Read,
 };
 
 use alloy_primitives::{Address, FixedBytes, hex};
@@ -12,6 +13,11 @@ pub const INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION: u16 = 1;
 pub const INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION: u16 = 1;
 pub const INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION: u16 = 2;
 pub const INDEXED_ARTIFACT_MAX_COMPRESSED_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+pub const INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
+pub const INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
+pub const INDEXED_ARTIFACT_PUBLIC_TXID_MAX_DECODED_ENVELOPE_BYTES: u64 = 32 * 1024 * 1024;
+pub const INDEXED_ARTIFACT_COMMITMENTS_MAX_DECODED_ENVELOPE_BYTES: u64 = 8 * 1024 * 1024;
+pub const INDEXED_ARTIFACT_MERKLE_CHECKPOINT_MAX_DECODED_ENVELOPE_BYTES: u64 = 4 * 1024 * 1024;
 
 pub const CHUNK_FORMAT_VERSION: u16 = INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION;
 pub const TARGET_COMPRESSED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
@@ -21,6 +27,7 @@ pub const MAX_COMPRESSED_CHUNK_BYTES: u64 = INDEXED_ARTIFACT_MAX_COMPRESSED_CHUN
 
 pub const INDEXED_ARTIFACT_CHUNK_MAGIC: &[u8; 8] = b"RGIDXCH\0";
 const ZSTD_LEVEL: i32 = 3;
+const ZSTD_WINDOW_LOG_MAX: u32 = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedArtifactManifest {
@@ -182,6 +189,18 @@ pub enum IndexedDatasetKind {
     PublicTxid,
 }
 
+impl IndexedDatasetKind {
+    #[must_use]
+    pub const fn decoded_envelope_byte_limit(self) -> u64 {
+        match self {
+            Self::WalletScan => INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES,
+            Self::PublicTxid => INDEXED_ARTIFACT_PUBLIC_TXID_MAX_DECODED_ENVELOPE_BYTES,
+            Self::Commitments => INDEXED_ARTIFACT_COMMITMENTS_MAX_DECODED_ENVELOPE_BYTES,
+            Self::MerkleCheckpoint => INDEXED_ARTIFACT_MERKLE_CHECKPOINT_MAX_DECODED_ENVELOPE_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedArtifactDescriptor {
     pub dataset_kind: IndexedDatasetKind,
@@ -223,6 +242,26 @@ impl IndexedArtifactDescriptor {
     pub fn with_inherited_catalog_generation(mut self, catalog: &Self) -> Self {
         self.metadata.catalog_generation = catalog.metadata.catalog_generation;
         self
+    }
+
+    #[must_use]
+    pub fn with_decoded_envelope_byte_size(mut self, byte_size: u64) -> Self {
+        self.metadata.decoded_envelope_byte_size = Some(byte_size);
+        self
+    }
+
+    pub fn decoded_envelope_byte_size_charge(&self) -> Result<u64, ChunkError> {
+        let maximum = self
+            .dataset_kind
+            .decoded_envelope_byte_limit()
+            .min(INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES);
+        match self.metadata.decoded_envelope_byte_size {
+            Some(actual) if actual > maximum => {
+                Err(ChunkError::DecodedEnvelopeTooLarge { actual, maximum })
+            }
+            Some(actual) => Ok(actual),
+            None => Ok(maximum),
+        }
     }
 }
 
@@ -326,6 +365,8 @@ pub struct DatasetDescriptorMetadata {
     pub stream_complete: bool,
     #[serde(default)]
     pub chunk_sealed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoded_envelope_byte_size: Option<u64>,
 }
 
 impl DatasetDescriptorMetadata {
@@ -344,6 +385,10 @@ impl DatasetDescriptorMetadata {
             .then_with(|| self.stream_partition.cmp(&other.stream_partition))
             .then_with(|| self.stream_complete.cmp(&other.stream_complete))
             .then_with(|| self.chunk_sealed.cmp(&other.chunk_sealed))
+            .then_with(|| {
+                self.decoded_envelope_byte_size
+                    .cmp(&other.decoded_envelope_byte_size)
+            })
     }
 }
 
@@ -1190,19 +1235,36 @@ impl IndexedArtifactDescriptor {
             && self.stream_partition_for_identity() == other.stream_partition_for_identity()
             && self.metadata.stream_complete == other.metadata.stream_complete
             && self.metadata.chunk_sealed == other.metadata.chunk_sealed
+            && match (
+                self.metadata.decoded_envelope_byte_size,
+                other.metadata.decoded_envelope_byte_size,
+            ) {
+                (Some(left), Some(right)) => left == right,
+                (None, _) | (_, None) => true,
+            }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ChunkEnvelope {
     pub header: ChunkEnvelopeHeader,
-    pub payload: Vec<u8>,
+    decoded_bytes: Vec<u8>,
+    payload_offset: usize,
 }
 
 impl ChunkEnvelope {
     #[must_use]
     pub const fn new(header: ChunkEnvelopeHeader, payload: Vec<u8>) -> Self {
-        Self { header, payload }
+        Self {
+            header,
+            decoded_bytes: payload,
+            payload_offset: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.decoded_bytes[self.payload_offset..]
     }
 
     pub fn section_payload(&self, section_id: u16) -> Result<&[u8], ChunkError> {
@@ -1217,14 +1279,14 @@ impl ChunkEnvelope {
                 section_id,
                 offset: section.offset,
                 byte_length: section.byte_length,
-                payload_len: u64::try_from(self.payload.len()).unwrap_or(u64::MAX),
+                payload_len: u64::try_from(self.payload().len()).unwrap_or(u64::MAX),
             })?;
         let length =
             usize::try_from(section.byte_length).map_err(|_| ChunkError::SectionOutOfBounds {
                 section_id,
                 offset: section.offset,
                 byte_length: section.byte_length,
-                payload_len: u64::try_from(self.payload.len()).unwrap_or(u64::MAX),
+                payload_len: u64::try_from(self.payload().len()).unwrap_or(u64::MAX),
             })?;
         let end = start
             .checked_add(length)
@@ -1232,20 +1294,20 @@ impl ChunkEnvelope {
                 section_id,
                 offset: section.offset,
                 byte_length: section.byte_length,
-                payload_len: u64::try_from(self.payload.len()).unwrap_or(u64::MAX),
+                payload_len: u64::try_from(self.payload().len()).unwrap_or(u64::MAX),
             })?;
-        self.payload
+        self.payload()
             .get(start..end)
             .ok_or_else(|| ChunkError::SectionOutOfBounds {
                 section_id,
                 offset: section.offset,
                 byte_length: section.byte_length,
-                payload_len: u64::try_from(self.payload.len()).unwrap_or(u64::MAX),
+                payload_len: u64::try_from(self.payload().len()).unwrap_or(u64::MAX),
             })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ChunkError> {
-        self.header.validate_for_payload(&self.payload)?;
+        self.header.validate_for_payload(self.payload())?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(INDEXED_ARTIFACT_CHUNK_MAGIC);
         write_u16(&mut bytes, self.header.format_version);
@@ -1273,11 +1335,37 @@ impl ChunkEnvelope {
             write_u64(&mut bytes, section.offset);
             write_u64(&mut bytes, section.byte_length);
         }
-        bytes.extend_from_slice(&self.payload);
+        bytes.extend_from_slice(self.payload());
         Ok(bytes)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ChunkError> {
+        validate_decoded_envelope_size(bytes.len(), INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES)?;
+        let (header, payload_offset) = Self::decode_header(bytes)?;
+        header.validate_for_payload(&bytes[payload_offset..])?;
+        Ok(Self {
+            header,
+            decoded_bytes: bytes.to_vec(),
+            payload_offset,
+        })
+    }
+
+    fn decode_owned(decoded_bytes: Vec<u8>) -> Result<Self, ChunkError> {
+        validate_decoded_envelope_size(
+            decoded_bytes.len(),
+            INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES,
+        )?;
+        let (header, payload_offset) = Self::decode_header(&decoded_bytes)?;
+        header.validate_for_payload(&decoded_bytes[payload_offset..])?;
+
+        Ok(Self {
+            header,
+            decoded_bytes,
+            payload_offset,
+        })
+    }
+
+    fn decode_header(bytes: &[u8]) -> Result<(ChunkEnvelopeHeader, usize), ChunkError> {
         let mut cursor = Cursor::new(bytes);
         let magic = cursor.read_exact(INDEXED_ARTIFACT_CHUNK_MAGIC.len(), "magic")?;
         if magic != INDEXED_ARTIFACT_CHUNK_MAGIC {
@@ -1289,6 +1377,7 @@ impl ChunkEnvelope {
             return Err(ChunkError::UnsupportedFormatVersion(format_version));
         }
         let dataset_kind = parse_dataset_kind(cursor.read_u8("dataset_kind")?)?;
+        validate_decoded_envelope_size(bytes.len(), dataset_kind.decoded_envelope_byte_limit())?;
         let chain_type = parse_chain_type(cursor.read_u8("chain_type")?)?;
         let chain_id = cursor.read_u64("chain_id")?;
         let railgun_contract = cursor
@@ -1311,7 +1400,6 @@ impl ChunkEnvelope {
                 byte_length: cursor.read_u64("section_byte_length")?,
             });
         }
-        let payload = bytes[cursor.position..].to_vec();
         let header = ChunkEnvelopeHeader {
             format_version,
             dataset_kind,
@@ -1325,11 +1413,17 @@ impl ChunkEnvelope {
             uncompressed_length,
             sections,
         };
-        header.validate_for_payload(&payload)?;
-
-        Ok(Self { header, payload })
+        Ok((header, cursor.position))
     }
 }
+
+impl PartialEq for ChunkEnvelope {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.payload() == other.payload()
+    }
+}
+
+impl Eq for ChunkEnvelope {}
 
 pub type IndexedArtifactChunkEnvelope = ChunkEnvelope;
 
@@ -1439,6 +1533,15 @@ pub fn decode_chunk_bytes(
     descriptor: &IndexedArtifactDescriptor,
     bytes: &[u8],
 ) -> Result<ChunkEnvelope, ChunkError> {
+    let decoded_limit = descriptor.decoded_envelope_byte_size_charge()?;
+    decode_chunk_bytes_with_limit(descriptor, bytes, decoded_limit)
+}
+
+fn decode_chunk_bytes_with_limit(
+    descriptor: &IndexedArtifactDescriptor,
+    bytes: &[u8],
+    decoded_limit: u64,
+) -> Result<ChunkEnvelope, ChunkError> {
     if descriptor.byte_size > MAX_COMPRESSED_CHUNK_BYTES {
         return Err(ChunkError::ChunkTooLarge {
             actual: descriptor.byte_size,
@@ -1458,8 +1561,18 @@ pub fn decode_chunk_bytes(
             actual,
         });
     }
-    let uncompressed = decompress_bytes(bytes, descriptor.compression)?;
-    let envelope = ChunkEnvelope::decode(&uncompressed)?;
+    let decoded_bytes = decompress_bytes_with_limit(bytes, descriptor.compression, decoded_limit)?;
+    let actual_decoded_size =
+        u64::try_from(decoded_bytes.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
+    if let Some(expected) = descriptor.metadata.decoded_envelope_byte_size
+        && expected != actual_decoded_size
+    {
+        return Err(ChunkError::DescriptorDecodedEnvelopeByteSizeMismatch {
+            expected,
+            actual: actual_decoded_size,
+        });
+    }
+    let envelope = ChunkEnvelope::decode_owned(decoded_bytes)?;
     validate_descriptor_matches_header(descriptor, &envelope.header)?;
     Ok(envelope)
 }
@@ -1481,10 +1594,44 @@ pub fn decompress_bytes(
     bytes: &[u8],
     compression: CompressionAlgorithm,
 ) -> Result<Vec<u8>, ChunkError> {
+    decompress_bytes_with_limit(
+        bytes,
+        compression,
+        INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES,
+    )
+}
+
+fn validate_decoded_envelope_size(actual: usize, maximum: u64) -> Result<(), ChunkError> {
+    let actual = u64::try_from(actual).map_err(|_| ChunkError::PayloadTooLarge)?;
+    if actual > maximum {
+        return Err(ChunkError::DecodedEnvelopeTooLarge { actual, maximum });
+    }
+    Ok(())
+}
+
+fn decompress_bytes_with_limit(
+    bytes: &[u8],
+    compression: CompressionAlgorithm,
+    maximum_decoded_bytes: u64,
+) -> Result<Vec<u8>, ChunkError> {
     match compression {
-        CompressionAlgorithm::None => Ok(bytes.to_vec()),
+        CompressionAlgorithm::None => {
+            validate_decoded_envelope_size(bytes.len(), maximum_decoded_bytes)?;
+            Ok(bytes.to_vec())
+        }
         CompressionAlgorithm::Zstd => {
-            zstd::stream::decode_all(std::io::Cursor::new(bytes)).map_err(ChunkError::Compression)
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))
+                .map_err(ChunkError::Compression)?;
+            decoder
+                .window_log_max(ZSTD_WINDOW_LOG_MAX)
+                .map_err(ChunkError::Compression)?;
+            let mut decoded = Vec::new();
+            decoder
+                .take(maximum_decoded_bytes.saturating_add(1))
+                .read_to_end(&mut decoded)
+                .map_err(ChunkError::Compression)?;
+            validate_decoded_envelope_size(decoded.len(), maximum_decoded_bytes)?;
+            Ok(decoded)
         }
     }
 }
@@ -1734,6 +1881,8 @@ pub enum ChunkError {
     PayloadTooLarge,
     #[error("chunk byte size {actual} exceeds maximum {maximum}")]
     ChunkTooLarge { actual: u64, maximum: u64 },
+    #[error("decoded chunk envelope byte size {actual} exceeds maximum {maximum}")]
+    DecodedEnvelopeTooLarge { actual: u64, maximum: u64 },
     #[error(
         "invalid chunk planning config: soft_min={soft_min}, target={target}, soft_max={soft_max}, hard_max={hard_max}"
     )]
@@ -1751,6 +1900,10 @@ pub enum ChunkError {
     ChunkPlanningOverflow,
     #[error("chunk descriptor byte size mismatch: expected {expected}, got {actual}")]
     DescriptorByteSizeMismatch { expected: u64, actual: u64 },
+    #[error(
+        "chunk descriptor decoded envelope byte size mismatch: expected {expected}, got {actual}"
+    )]
+    DescriptorDecodedEnvelopeByteSizeMismatch { expected: u64, actual: u64 },
     #[error("chunk descriptor encoding version mismatch: expected {expected}, got {actual}")]
     DescriptorEncodingVersionMismatch { expected: u16, actual: u16 },
     #[error("chunk descriptor dataset mismatch: expected {expected:?}, got {actual:?}")]
@@ -2139,6 +2292,7 @@ mod tests {
                 stream_partition: Some("txid-v3:list-a".to_string()),
                 stream_complete: true,
                 chunk_sealed: true,
+                decoded_envelope_byte_size: Some(123),
                 ..Default::default()
             },
         };
@@ -2158,6 +2312,7 @@ mod tests {
         assert!(json.contains("\"stream_partition\":\"txid-v3:list-a\""));
         assert!(json.contains("\"stream_complete\":true"));
         assert!(json.contains("\"chunk_sealed\":true"));
+        assert!(json.contains("\"decoded_envelope_byte_size\":123"));
     }
 
     #[test]
@@ -2272,7 +2427,246 @@ mod tests {
         let decoded = ChunkEnvelope::decode(&encoded).expect("decode envelope");
 
         assert_eq!(decoded, envelope);
+        assert_eq!(decoded.payload(), b"abcdef");
         assert_eq!(decoded.section_payload(1).expect("section"), b"bcd");
+    }
+
+    #[test]
+    fn decoded_envelope_sections_borrow_the_single_owned_buffer() {
+        let envelope = ChunkEnvelope::new(
+            ChunkEnvelopeHeader::new(
+                IndexedDatasetKind::PublicTxid,
+                scope(),
+                range(IndexedArtifactRangeKind::TxidIndex, 0, 2),
+                3,
+                6,
+                vec![ChunkSection {
+                    section_id: 1,
+                    offset: 1,
+                    byte_length: 3,
+                }],
+            ),
+            b"abcdef".to_vec(),
+        );
+
+        let decoded = ChunkEnvelope::decode_owned(envelope.encode().expect("encode envelope"))
+            .expect("decode envelope");
+        let payload = decoded.payload();
+        let section = decoded.section_payload(1).expect("section");
+
+        assert!(decoded.payload_offset > 0);
+        assert_eq!(section.as_ptr(), payload[1..].as_ptr());
+        assert_eq!(section, b"bcd");
+    }
+
+    #[test]
+    fn chunk_decode_counts_the_full_envelope_against_advertised_size() {
+        let envelope = ChunkEnvelope::new(
+            ChunkEnvelopeHeader::new(
+                IndexedDatasetKind::PublicTxid,
+                scope(),
+                range(IndexedArtifactRangeKind::TxidIndex, 0, 2),
+                3,
+                6,
+                vec![ChunkSection {
+                    section_id: 1,
+                    offset: 0,
+                    byte_length: 6,
+                }],
+            ),
+            b"abcdef".to_vec(),
+        );
+        let encoded = envelope.encode().expect("encode envelope");
+        let compressed = compress_bytes(&encoded, CompressionAlgorithm::Zstd).expect("compress");
+        let mut descriptor = descriptor(
+            IndexedDatasetKind::PublicTxid,
+            scope(),
+            IndexedArtifactRangeKind::TxidIndex,
+            0,
+            2,
+        );
+        descriptor.row_count = 3;
+        descriptor.byte_size = u64::try_from(compressed.len()).expect("compressed size");
+        descriptor.metadata.decoded_envelope_byte_size =
+            Some(u64::try_from(encoded.len()).expect("decoded size"));
+
+        let decoded = decode_chunk_bytes(&descriptor, &compressed).expect("exact size decodes");
+
+        assert_eq!(decoded, envelope);
+        descriptor.metadata.decoded_envelope_byte_size = Some(
+            u64::try_from(encoded.len())
+                .expect("decoded size")
+                .saturating_sub(1),
+        );
+        assert!(matches!(
+            decode_chunk_bytes(&descriptor, &compressed),
+            Err(ChunkError::DecodedEnvelopeTooLarge { actual, maximum })
+                if actual == u64::try_from(encoded.len()).expect("decoded size")
+                    && maximum + 1 == actual
+        ));
+
+        descriptor.metadata.decoded_envelope_byte_size =
+            Some(u64::try_from(encoded.len()).expect("decoded size") + 1);
+        assert!(matches!(
+            decode_chunk_bytes(&descriptor, &compressed),
+            Err(ChunkError::DescriptorDecodedEnvelopeByteSizeMismatch { expected, actual })
+                if expected == actual + 1
+                    && actual == u64::try_from(encoded.len()).expect("decoded size")
+        ));
+    }
+
+    #[test]
+    fn legacy_chunk_decode_obeys_injected_dataset_bound() {
+        let envelope = ChunkEnvelope::new(
+            ChunkEnvelopeHeader::new(
+                IndexedDatasetKind::Commitments,
+                scope(),
+                range(IndexedArtifactRangeKind::TreePosition, 0, 0),
+                1,
+                4,
+                vec![ChunkSection {
+                    section_id: 1,
+                    offset: 0,
+                    byte_length: 4,
+                }],
+            ),
+            b"data".to_vec(),
+        );
+        let encoded = envelope.encode().expect("encode envelope");
+        let compressed = compress_bytes(&encoded, CompressionAlgorithm::Zstd).expect("compress");
+        let mut descriptor = descriptor(
+            IndexedDatasetKind::Commitments,
+            scope(),
+            IndexedArtifactRangeKind::TreePosition,
+            0,
+            0,
+        );
+        descriptor.row_count = 1;
+        descriptor.byte_size = u64::try_from(compressed.len()).expect("compressed size");
+        let injected_limit = u64::try_from(encoded.len())
+            .expect("decoded size")
+            .saturating_sub(1);
+
+        assert!(matches!(
+            decode_chunk_bytes_with_limit(&descriptor, &compressed, injected_limit),
+            Err(ChunkError::DecodedEnvelopeTooLarge { actual, maximum })
+                if actual == injected_limit + 1 && maximum == injected_limit
+        ));
+    }
+
+    #[test]
+    fn limited_zstd_decode_accepts_exact_boundary_and_rejects_one_more_byte() {
+        const LIMIT: u64 = 1_024;
+        let exact = vec![0x5a; LIMIT as usize];
+        let exact_compressed =
+            compress_bytes(&exact, CompressionAlgorithm::Zstd).expect("compress");
+
+        assert_eq!(
+            decompress_bytes_with_limit(&exact_compressed, CompressionAlgorithm::Zstd, LIMIT)
+                .expect("exact limit decodes"),
+            exact
+        );
+
+        let oversized = vec![0x5a; LIMIT as usize + 1];
+        let oversized_compressed =
+            compress_bytes(&oversized, CompressionAlgorithm::Zstd).expect("compress");
+        assert!(matches!(
+            decompress_bytes_with_limit(&oversized_compressed, CompressionAlgorithm::Zstd, LIMIT),
+            Err(ChunkError::DecodedEnvelopeTooLarge {
+                actual: 1_025,
+                maximum: LIMIT
+            })
+        ));
+    }
+
+    #[test]
+    fn limited_zstd_decode_rejects_tiny_expansion_bomb() {
+        const LIMIT: u64 = 128;
+        let expanded = vec![0_u8; 16 * 1_024];
+        let compressed =
+            compress_bytes(&expanded, CompressionAlgorithm::Zstd).expect("compress bomb fixture");
+        assert!(compressed.len() < LIMIT as usize);
+
+        assert!(matches!(
+            decompress_bytes_with_limit(&compressed, CompressionAlgorithm::Zstd, LIMIT),
+            Err(ChunkError::DecodedEnvelopeTooLarge {
+                actual: 129,
+                maximum: LIMIT
+            })
+        ));
+    }
+
+    #[test]
+    fn zstd_decode_rejects_frames_above_window_log_limit() {
+        // Empty frame with a non-single-segment 64 MiB window (window_log 26).
+        let oversized_window_frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x80, 0x01, 0x00, 0x00];
+
+        assert!(matches!(
+            decompress_bytes_with_limit(&oversized_window_frame, CompressionAlgorithm::Zstd, 64),
+            Err(ChunkError::Compression(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_envelope_dataset_caps_are_fixed_and_absolute() {
+        assert_eq!(
+            IndexedDatasetKind::WalletScan.decoded_envelope_byte_limit(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            IndexedDatasetKind::PublicTxid.decoded_envelope_byte_limit(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            IndexedDatasetKind::Commitments.decoded_envelope_byte_limit(),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            IndexedDatasetKind::MerkleCheckpoint.decoded_envelope_byte_limit(),
+            4 * 1024 * 1024
+        );
+        for dataset_kind in [
+            IndexedDatasetKind::WalletScan,
+            IndexedDatasetKind::PublicTxid,
+            IndexedDatasetKind::Commitments,
+            IndexedDatasetKind::MerkleCheckpoint,
+        ] {
+            let maximum = dataset_kind.decoded_envelope_byte_limit();
+            assert!(maximum <= INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES);
+            let mut descriptor =
+                descriptor(dataset_kind, scope(), IndexedArtifactRangeKind::Block, 0, 0);
+            descriptor.metadata.decoded_envelope_byte_size = Some(maximum + 1);
+            assert!(matches!(
+                descriptor.decoded_envelope_byte_size_charge(),
+                Err(ChunkError::DecodedEnvelopeTooLarge {
+                    actual,
+                    maximum: enforced_maximum,
+                }) if actual == maximum + 1 && enforced_maximum == maximum
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_descriptor_without_decoded_size_uses_dataset_cap() {
+        let descriptor = descriptor(
+            IndexedDatasetKind::Commitments,
+            scope(),
+            IndexedArtifactRangeKind::TreePosition,
+            0,
+            0,
+        );
+        let json = serde_json::to_string(&descriptor).expect("serialize legacy descriptor");
+
+        assert!(!json.contains("decoded_envelope_byte_size"));
+        let decoded: IndexedArtifactDescriptor =
+            serde_json::from_str(&json).expect("deserialize legacy descriptor");
+        assert_eq!(decoded.metadata.decoded_envelope_byte_size, None);
+        assert_eq!(
+            decoded
+                .decoded_envelope_byte_size_charge()
+                .expect("legacy charge"),
+            INDEXED_ARTIFACT_COMMITMENTS_MAX_DECODED_ENVELOPE_BYTES
+        );
     }
 
     #[test]
@@ -3100,6 +3494,50 @@ mod tests {
         .expect("identical complete tail may repeat");
 
         assert_eq!(required_cids(&plan), vec![first_chunk.cid]);
+    }
+
+    #[test]
+    fn stream_planner_allows_decoded_size_metadata_rollout_for_stable_chunk() {
+        let legacy = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            0,
+            9,
+            1,
+        )
+        .sealed();
+        let mut enriched = legacy.clone();
+        enriched.metadata.catalog_generation = Some(2);
+        enriched.metadata.decoded_envelope_byte_size = Some(123);
+
+        let plan = plan_from_descriptors(
+            &[legacy.clone(), enriched.clone()],
+            &StreamFixture::request(
+                IndexedDatasetKind::PublicTxid,
+                IndexedArtifactRangeKind::TxidIndex,
+                0,
+                9,
+            ),
+        )
+        .expect("optional decoded-size metadata may be added to a stable chunk");
+
+        assert_eq!(required_cids(&plan), vec![legacy.cid]);
+
+        let mut conflicting = enriched.clone();
+        conflicting.metadata.catalog_generation = Some(3);
+        conflicting.metadata.decoded_envelope_byte_size = Some(124);
+        assert!(matches!(
+            plan_from_descriptors(
+                &[enriched, conflicting],
+                &StreamFixture::request(
+                    IndexedDatasetKind::PublicTxid,
+                    IndexedArtifactRangeKind::TxidIndex,
+                    0,
+                    9,
+                ),
+            ),
+            Err(IndexedArtifactStreamPlanError::StableChunkConflict { .. })
+        ));
     }
 
     #[test]
