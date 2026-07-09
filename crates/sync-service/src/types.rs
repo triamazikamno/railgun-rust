@@ -594,6 +594,7 @@ pub struct WalletSyncActorStateCommit<'a> {
 impl<'a> WalletSyncActorStateCommit<'a> {
     #[must_use]
     pub(crate) fn new(
+        _token: &crate::wallet::WalletActorCommitToken<'_>,
         permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
         state: &'a WalletSyncActorStateRecord,
     ) -> Self {
@@ -610,6 +611,7 @@ impl<'a> WalletSyncActorStateCommit<'a> {
 impl<'a> WalletPrivateCommit<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        _token: &crate::wallet::WalletActorCommitToken<'_>,
         permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
         chain_id: u64,
         utxos: &'a [WalletUtxo],
@@ -1285,12 +1287,251 @@ impl WalletBackfillFinishResult {
     }
 }
 
+/// Pending tip overlay (chain + local) projected against the current cursor.
+#[derive(Debug, Clone, Default)]
+pub struct WalletPendingOverlay {
+    pub new_utxos: Vec<WalletUtxo>,
+    pub pending_spent: Vec<WalletPendingSpent>,
+    pub local_pending_spent: Vec<WalletPendingSpent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletPendingSpent {
+    pub tree: u32,
+    pub position: u64,
+    pub tx_hash: Option<FixedBytes<32>>,
+    pub block_number: Option<u64>,
+    pub block_timestamp: Option<u64>,
+}
+
+impl WalletPendingSpent {
+    #[must_use]
+    pub const fn key(&self) -> (u32, u64) {
+        (self.tree, self.position)
+    }
+
+    pub fn from_source(utxo: &railgun_wallet::Utxo, source: railgun_wallet::UtxoSource) -> Self {
+        Self {
+            tree: utxo.tree,
+            position: utxo.position,
+            tx_hash: Some(source.tx_hash),
+            block_number: Some(source.block_number),
+            block_timestamp: Some(source.block_timestamp),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn submitted(
+        utxo: &railgun_wallet::Utxo,
+        tx_hash: Option<FixedBytes<32>>,
+        now: u64,
+    ) -> Self {
+        Self {
+            tree: utxo.tree,
+            position: utxo.position,
+            tx_hash,
+            block_number: None,
+            block_timestamp: Some(now),
+        }
+    }
+}
+
+/// Coherent current private wallet projection (only valid when not reset-pending).
+///
+/// Includes confirmed UTXOs and pending tip overlay. Published atomically via
+/// [`WalletViewState::Current`]; public observers must not read live mirrors.
+#[derive(Debug, Clone)]
+pub struct WalletCurrentSnapshot {
+    pub last_scanned: u64,
+    pub utxos: Arc<[WalletUtxo]>,
+    pub pending_overlay: Arc<WalletPendingOverlay>,
+    pub revision: u64,
+    pub reset_generation: u64,
+}
+
+impl WalletCurrentSnapshot {
+    #[must_use]
+    pub fn new(
+        last_scanned: u64,
+        revision: u64,
+        reset_generation: u64,
+        utxos: impl Into<Arc<[WalletUtxo]>>,
+        pending_overlay: impl Into<Arc<WalletPendingOverlay>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            last_scanned,
+            utxos: utxos.into(),
+            pending_overlay: pending_overlay.into(),
+            revision,
+            reset_generation,
+        })
+    }
+}
+
+/// Generation-scoped public progress taken from one [`WalletViewState`] observation.
+///
+/// This is the **only** capability that authorizes generation-scoped public chain work
+/// (backfill, indexed catch-up, lag/tail fallback). Call sites must not compose a public
+/// cursor with a separately loaded generation, and bare `reset_generation: u64` is not a
+/// public scheduling input.
+///
+/// Deferred work stores this ticket and revalidates it before start; range and generation
+/// travel as one unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletSchedulableProgress {
+    pub last_scanned: u64,
+    pub reset_generation: u64,
+}
+
+impl WalletSchedulableProgress {
+    /// Still current if `now` is Current and same generation. Returns the refreshed snapshot
+    /// (cursor may have advanced within the generation).
+    #[must_use]
+    pub const fn revalidate(self, now: Option<Self>) -> Option<Self> {
+        match now {
+            Some(now) if now.reset_generation == self.reset_generation => Some(now),
+            _ => None,
+        }
+    }
+
+    /// True when `now` is still the same scheduling generation.
+    #[must_use]
+    pub const fn still_current(self, now: Option<Self>) -> bool {
+        self.revalidate(now).is_some()
+    }
+}
+
+/// Single-source public private-view state for a wallet actor.
+///
+/// While [`ResetPending`](Self::ResetPending), public readers must not treat
+/// pre-reset private projection (cursor, UTXOs, pending overlay) as current.
+///
+/// [`Current`](Self::Current) carries the full published projection. Authority generation
+/// (token invalidation) may advance before the view is republished; schedulers must not
+/// mix those surfaces.
+#[derive(Debug, Clone)]
+pub enum WalletViewState {
+    /// Full private projection; the only public source for UTXOs / pending overlay.
+    Current(Arc<WalletCurrentSnapshot>),
+    ResetPending {
+        intent_id: u64,
+        from_block: u64,
+        reset_generation: u64,
+    },
+}
+
+impl PartialEq for WalletViewState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Current(left), Self::Current(right)) => {
+                left.last_scanned == right.last_scanned
+                    && left.revision == right.revision
+                    && left.reset_generation == right.reset_generation
+                    && Arc::ptr_eq(&left.utxos, &right.utxos)
+                    && Arc::ptr_eq(&left.pending_overlay, &right.pending_overlay)
+            }
+            (
+                Self::ResetPending {
+                    intent_id: li,
+                    from_block: lf,
+                    reset_generation: lg,
+                },
+                Self::ResetPending {
+                    intent_id: ri,
+                    from_block: rf,
+                    reset_generation: rg,
+                },
+            ) => li == ri && lf == rf && lg == rg,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WalletViewState {}
+
+impl WalletViewState {
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current(_))
+    }
+
+    #[must_use]
+    pub fn current_snapshot(&self) -> Option<Arc<WalletCurrentSnapshot>> {
+        match self {
+            Self::Current(snapshot) => Some(Arc::clone(snapshot)),
+            Self::ResetPending { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn last_scanned_current(&self) -> Option<u64> {
+        match self {
+            Self::Current(snapshot) => Some(snapshot.last_scanned),
+            Self::ResetPending { .. } => None,
+        }
+    }
+
+    /// Public schedulable progress from this snapshot, if view is current.
+    #[must_use]
+    pub fn schedulable_progress(&self) -> Option<WalletSchedulableProgress> {
+        match self {
+            Self::Current(snapshot) => Some(WalletSchedulableProgress {
+                last_scanned: snapshot.last_scanned,
+                reset_generation: snapshot.reset_generation,
+            }),
+            Self::ResetPending { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn reset_generation(&self) -> u64 {
+        match self {
+            Self::Current(snapshot) => snapshot.reset_generation,
+            Self::ResetPending {
+                reset_generation, ..
+            } => *reset_generation,
+        }
+    }
+}
+
+/// Status of the CommitResetRewind transition after AcceptReset has already succeeded
+/// (or for restored/retry rewinds of an already-accepted pending reset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletResetRewindStatus {
+    /// Rewind durably applied; mirrors match rewound state.
+    Committed { committed_to: u64 },
+    /// Accept holds; rewind not done yet (shutdown, persist fail, retrying).
+    Pending {
+        committed_to: u64,
+        /// Diagnostic only — never upgrades accept to Rejected.
+        last_attempt: Option<WalletBackfillRejectReason>,
+    },
+}
+
+impl WalletResetRewindStatus {
+    #[must_use]
+    pub const fn committed_to(&self) -> u64 {
+        match self {
+            Self::Committed { committed_to } | Self::Pending { committed_to, .. } => *committed_to,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+}
+
+/// Public result of a wallet reset request.
+///
+/// **Invariant:** once AcceptReset has durably succeeded, the result is always
+/// [`Accepted`](Self::Accepted) with a rewind status. [`Rejected`](Self::Rejected)
+/// means the reset was never accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletBackfillResetResult {
     Accepted {
         reset_generation: u64,
-        committed_to: u64,
-        committed: bool,
+        rewind: WalletResetRewindStatus,
     },
     Rejected {
         committed_to: u64,
@@ -1300,11 +1541,41 @@ pub enum WalletBackfillResetResult {
 
 impl WalletBackfillResetResult {
     #[must_use]
+    pub const fn accepted_committed(reset_generation: u64, committed_to: u64) -> Self {
+        Self::Accepted {
+            reset_generation,
+            rewind: WalletResetRewindStatus::Committed { committed_to },
+        }
+    }
+
+    #[must_use]
+    pub const fn accepted_pending(
+        reset_generation: u64,
+        committed_to: u64,
+        last_attempt: Option<WalletBackfillRejectReason>,
+    ) -> Self {
+        Self::Accepted {
+            reset_generation,
+            rewind: WalletResetRewindStatus::Pending {
+                committed_to,
+                last_attempt,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn rejected(committed_to: u64, reason: WalletBackfillRejectReason) -> Self {
+        Self::Rejected {
+            committed_to,
+            reason,
+        }
+    }
+
+    #[must_use]
     pub const fn committed_to(&self) -> u64 {
         match self {
-            Self::Accepted { committed_to, .. } | Self::Rejected { committed_to, .. } => {
-                *committed_to
-            }
+            Self::Accepted { rewind, .. } => rewind.committed_to(),
+            Self::Rejected { committed_to, .. } => *committed_to,
         }
     }
 
@@ -1323,10 +1594,15 @@ impl WalletBackfillResetResult {
         matches!(
             self,
             Self::Accepted {
-                committed: true,
+                rewind: WalletResetRewindStatus::Committed { .. },
                 ..
             }
         )
+    }
+
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted { .. })
     }
 }
 

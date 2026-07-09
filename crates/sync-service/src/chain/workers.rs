@@ -92,22 +92,26 @@ pub(super) async fn refresh_pending_tip_overlays(
         let wallets = service.wallets.read().await;
         wallets
             .iter()
-            .map(|(cache_key, registration)| {
+            .filter_map(|(cache_key, registration)| {
                 let handle = registration.handle.clone();
-                let last_scanned = handle.last_scanned();
-                let from_block =
-                    pending_tip_from_block(safe_head, last_scanned, service.chain.block_range);
+                // One view snapshot: cursor + generation (never authority gen alone).
+                let progress = handle.schedulable_progress()?;
+                let from_block = pending_tip_from_block(
+                    safe_head,
+                    progress.last_scanned,
+                    service.chain.block_range,
+                );
                 let target_block = registration
                     .sync_to_block
                     .map_or(head, |limit| limit.min(head));
-                PendingTipWalletRegistration {
+                Some(PendingTipWalletRegistration {
                     cache_key: cache_key.clone(),
                     handle,
-                    reset_generation: registration.handle.reset_generation(),
-                    last_scanned,
+                    reset_generation: progress.reset_generation,
+                    last_scanned: progress.last_scanned,
                     from_block,
                     target_block,
-                }
+                })
             })
             .collect::<Vec<_>>()
     };
@@ -268,6 +272,9 @@ pub(super) async fn clear_pending_tip_overlays(registrations: Vec<PendingTipWall
 
 struct WalletLagFallbackCandidate {
     cache_key: String,
+    /// Full public progress ticket that justified this range.
+    progress: crate::types::WalletSchedulableProgress,
+    start_block: u64,
     from_block: u64,
     target_block: u64,
     lag_blocks: u64,
@@ -305,22 +312,34 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                         wallet_lag_fallback_candidates(&service, &mut states, safe_head, now).await;
 
                     for candidate in candidates {
+                        // Revalidate the full ticket; never re-read generation alone.
+                        let Some(progress) = candidate
+                            .handle
+                            .revalidate_schedulable_progress(candidate.progress)
+                        else {
+                            continue;
+                        };
+                        let from_block = wallet_backfill_from_block(
+                            progress.last_scanned,
+                            candidate.start_block,
+                        );
                         info!(
                             cache_key = %candidate.cache_key,
-                            from_block = candidate.from_block,
+                            from_block,
                             target_block = candidate.target_block,
                             lag_blocks = candidate.lag_blocks,
                             stalled_secs = INDEXED_TAIL_FALLBACK_MIN_STALL.as_secs(),
                             "indexed wallet ready-tail fallback triggered"
                         );
-                        let reset_generation = candidate.handle.reset_generation();
-                        let target_result = candidate.handle.start_backfill(
-                            &candidate.cache_key,
-                            &candidate.sender,
-                            reset_generation,
-                            candidate.target_block,
-                        )
-                        .await;
+                        let target_result = candidate
+                            .handle
+                            .start_backfill(
+                                &candidate.cache_key,
+                                &candidate.sender,
+                                progress,
+                                candidate.target_block,
+                            )
+                            .await;
                         let lease = match target_result {
                             WalletBackfillFinishResult::Ready { .. } => continue,
                             WalletBackfillFinishResult::Accepted { lease, .. } => lease,
@@ -329,30 +348,31 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                         let Some(checkpoint) = service
                             .try_indexed_wallet_tail_catch_up(
                                 &candidate.cache_key,
-                                candidate.from_block,
+                                from_block,
                                 candidate.target_block,
+                                progress,
                                 &candidate.sender,
                             )
                             .await
                         else {
                             debug!(
                                 cache_key = %candidate.cache_key,
-                                from_block = candidate.from_block,
+                                from_block,
                                 target_block = candidate.target_block,
                                 "indexed wallet ready-tail fallback unavailable"
                             );
                             if let Err(err) = service.backfill_tx.try_send(BackfillRequest::add(
                                 candidate.cache_key.clone(),
-                                candidate.from_block,
+                                from_block,
                                 candidate.target_block,
                                 candidate.follow_safe_head,
-                                candidate.from_block,
+                                from_block,
                                 lease.clone(),
                             )) {
                                 warn!(
                                     ?err,
                                     cache_key = %candidate.cache_key,
-                                    from_block = candidate.from_block,
+                                    from_block,
                                     target_block = candidate.target_block,
                                     "failed to enqueue ready-tail fallback backfill"
                                 );
@@ -365,19 +385,19 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                             }
                             continue;
                         };
-                        if checkpoint < candidate.from_block {
+                        if checkpoint < from_block {
                             if let Err(err) = service.backfill_tx.try_send(BackfillRequest::add(
                                 candidate.cache_key.clone(),
-                                candidate.from_block,
+                                from_block,
                                 candidate.target_block,
                                 candidate.follow_safe_head,
-                                candidate.from_block,
+                                from_block,
                                 lease.clone(),
                             )) {
                                 warn!(
                                     ?err,
                                     cache_key = %candidate.cache_key,
-                                    from_block = candidate.from_block,
+                                    from_block,
                                     target_block = candidate.target_block,
                                     "failed to enqueue ready-tail no-progress backfill"
                                 );
@@ -399,14 +419,14 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                                 lease.retire(&candidate.cache_key).await;
                             }
                         } else if let Err(err) = service.backfill_tx.try_send(BackfillRequest::add(
-                                candidate.cache_key.clone(),
-                                checkpoint.saturating_add(1),
-                                candidate.target_block,
-                                candidate.follow_safe_head,
-                                candidate.from_block,
-                                lease.clone(),
-                            ))
-                        {
+                            candidate.cache_key.clone(),
+                            checkpoint.saturating_add(1),
+                            candidate.target_block,
+                            candidate.follow_safe_head,
+                            from_block,
+                            lease.clone(),
+                        )) {
+
                             warn!(
                                 ?err,
                                 cache_key = %candidate.cache_key,
@@ -465,7 +485,8 @@ async fn wallet_lag_fallback_candidates(
                 return None;
             }
 
-            let last_scanned = registration.handle.last_scanned();
+            let progress = registration.handle.schedulable_progress()?;
+            let last_scanned = progress.last_scanned;
             let target_block = wallet_sync_target(safe_head, registration.sync_to_block);
             let from_block = wallet_backfill_from_block(last_scanned, registration.start_block);
             let state = states
@@ -487,6 +508,8 @@ async fn wallet_lag_fallback_candidates(
             state.mark_indexed_tail_attempt(now);
             Some(WalletLagFallbackCandidate {
                 cache_key: cache_key.clone(),
+                progress,
+                start_block: registration.start_block,
                 from_block,
                 target_block,
                 lag_blocks,
@@ -812,19 +835,26 @@ pub(super) fn spawn_backfill_loop(
                         let lag_blocks =
                             wallet_backfill_lag_blocks(cursor.from_block, cursor.target_block);
                         cursor.mark_indexed_tail_attempt(now);
+                        let progress = crate::types::WalletSchedulableProgress {
+                            last_scanned: cursor.from_block.saturating_sub(1),
+                            reset_generation: cursor.lease.token().reset_generation(),
+                        };
                         Some((
                             key.clone(),
                             cursor.from_block,
                             cursor.target_block,
                             lag_blocks,
                             cursor.lease.sender().clone(),
+                            progress,
                         ))
                     } else {
                         None
                     }
                 })
                 .collect();
-            for (key, from_block, target_block, lag_blocks, sender) in indexed_tail_attempts {
+            for (key, from_block, target_block, lag_blocks, sender, progress) in
+                indexed_tail_attempts
+            {
                 info!(
                     cache_key = %key,
                     from_block,
@@ -834,7 +864,13 @@ pub(super) fn spawn_backfill_loop(
                     "indexed wallet tail fallback triggered"
                 );
                 let Some(checkpoint) = service
-                    .try_indexed_wallet_tail_catch_up(&key, from_block, target_block, &sender)
+                    .try_indexed_wallet_tail_catch_up(
+                        &key,
+                        from_block,
+                        target_block,
+                        progress,
+                        &sender,
+                    )
                     .await
                 else {
                     debug!(

@@ -555,11 +555,11 @@ impl ChainService {
         target_block: u64,
         handle: &WalletHandle,
         sender: &mpsc::Sender<BackfillEvent>,
-        reset_generation: u64,
+        progress: crate::types::WalletSchedulableProgress,
     ) -> CachedPublicScanApplyOutcome {
         let mut checkpoint = last_scanned;
         let target_result = handle
-            .start_backfill(&cfg.cache_key, sender, reset_generation, target_block)
+            .start_backfill(&cfg.cache_key, sender, progress, target_block)
             .await;
         let lease = match target_result {
             WalletBackfillFinishResult::Ready { committed_to } => {
@@ -823,10 +823,10 @@ impl ChainService {
             reset_intent_id,
             reset_from,
             replay_plan,
-            handle.last_scanned(),
+            handle.last_scanned_raw(),
         )
         .await;
-        let Some(reset_generation) = reset_result.reset_generation() else {
+        if reset_result.reset_generation().is_none() {
             warn!(?reset_result, cache_key = %cache_key, from_block = reset_from, "wallet reset rejected");
             return Err(ChainError::WalletResetRejected(reset_result));
         };
@@ -834,9 +834,13 @@ impl ChainService {
             info!(cache_key = %cache_key, from_block = reset_from, "wallet reset accepted and pending durable replay");
             return Ok(());
         }
+        let Some(progress) = handle.schedulable_progress() else {
+            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset committed but view not yet schedulable");
+            return Ok(());
+        };
         let replay_from = wallet_backfill_from_block(reset_result.committed_to(), start_block);
         let target_result = handle
-            .start_backfill(cache_key, &backfill_sender, reset_generation, sync_target)
+            .start_backfill(cache_key, &backfill_sender, progress, sync_target)
             .await;
         let lease = match target_result {
             WalletBackfillFinishResult::Ready { .. } => {
@@ -873,6 +877,7 @@ impl ChainService {
         cache_key: &str,
         from_block: u64,
         target_block: u64,
+        progress: crate::types::WalletSchedulableProgress,
         sender: &mpsc::Sender<BackfillEvent>,
     ) -> Option<u64> {
         if from_block > target_block {
@@ -892,7 +897,10 @@ impl ChainService {
                 registration.cancel.clone(),
             )
         };
-        let reset_generation = handle.reset_generation();
+        // Ticket must still match current view generation before using the range.
+        let Some(progress) = handle.revalidate_schedulable_progress(progress) else {
+            return None;
+        };
         let last_scanned = from_block.saturating_sub(1);
         let started = Instant::now();
         let checkpoint = self
@@ -905,7 +913,7 @@ impl ChainService {
                 &cancel,
                 IndexedWalletCatchUpSourceOrder::SquidFirst,
                 true,
-                (sender, reset_generation),
+                (sender, progress),
             )
             .await;
         if checkpoint < from_block {
@@ -935,13 +943,6 @@ impl ChainService {
         cfg: WalletConfig,
     ) -> Result<WalletHandle, ChainError> {
         let cache_key = cfg.cache_key.clone();
-        if let Some(existing) = self.wallets.read().await.get(&cache_key) {
-            if existing.handle.readiness().is_ready() {
-                self.spawn_txid_public_cache_loop_once();
-            }
-            return Ok(existing.handle.clone());
-        }
-
         let registration_gate = self.wallet_registration_gate(&cache_key).await;
         let _registration_guard = registration_gate.lock().await;
         if let Some(existing) = self.wallets.read().await.get(&cache_key) {
@@ -1048,7 +1049,6 @@ impl ChainService {
         let catch_up_handle = handle.clone();
         let catch_up_cancel = cancel;
         tokio::spawn(async move {
-            let startup_reset_generation = catch_up_handle.reset_generation();
             let Some(sync_target) = wait_for_startup_sync_target(
                 service.safe_head_tx.subscribe(),
                 catch_up_cfg.sync_to_block,
@@ -1060,14 +1060,19 @@ impl ChainService {
                 return;
             };
 
-            let actor_last_scanned = catch_up_handle.last_scanned();
+            // Only schedule from one public view snapshot (cursor + generation).
+            let Some(startup) = catch_up_handle
+                .wait_schedulable_progress(&catch_up_cancel)
+                .await
+            else {
+                return;
+            };
             if service
                 .hedged_wallet_startup_sync(
                     &catch_up_cfg,
                     start_block,
-                    actor_last_scanned,
+                    startup,
                     sync_target,
-                    startup_reset_generation,
                     backfill_sender.clone(),
                     &catch_up_handle,
                     &catch_up_cancel,
@@ -1077,7 +1082,22 @@ impl ChainService {
                 return;
             }
 
-            let mut checkpoint = catch_up_handle.last_scanned();
+            let Some(checkpoint_progress) = catch_up_handle
+                .wait_schedulable_progress(&catch_up_cancel)
+                .await
+            else {
+                return;
+            };
+            let Some(progress) = startup.revalidate(Some(checkpoint_progress)) else {
+                debug!(
+                    cache_key = %catch_up_cfg.cache_key,
+                    startup_reset_generation = startup.reset_generation,
+                    current_reset_generation = checkpoint_progress.reset_generation,
+                    "wallet startup sync superseded by reset"
+                );
+                return;
+            };
+            let mut checkpoint = progress.last_scanned;
             if catch_up_cfg.use_indexed_wallet_catch_up {
                 checkpoint = service
                     .indexed_wallet_catch_up(
@@ -1089,7 +1109,7 @@ impl ChainService {
                         &catch_up_cancel,
                         IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
                         false,
-                        (&backfill_sender, startup_reset_generation),
+                        (&backfill_sender, progress),
                     )
                     .await;
             } else {
@@ -1098,15 +1118,18 @@ impl ChainService {
             if catch_up_cancel.is_cancelled() {
                 return;
             }
-            if catch_up_handle.reset_generation() != startup_reset_generation {
+            // Superseded if view generation advanced or reset-pending (no public progress).
+            let Some(progress) = catch_up_handle.revalidate_schedulable_progress(startup) else {
                 debug!(
                     cache_key = %catch_up_cfg.cache_key,
-                    startup_reset_generation,
-                    current_reset_generation = catch_up_handle.reset_generation(),
+                    startup_reset_generation = startup.reset_generation,
+                    current_reset_generation = ?catch_up_handle
+                        .view_state()
+                        .reset_generation(),
                     "wallet startup sync superseded by reset"
                 );
                 return;
-            }
+            };
             service
                 .enqueue_wallet_backfill(
                     &catch_up_cfg,
@@ -1115,7 +1138,7 @@ impl ChainService {
                     sync_target,
                     catch_up_cfg.sync_to_block.is_none(),
                     &catch_up_handle,
-                    startup_reset_generation,
+                    progress,
                     backfill_sender,
                 )
                 .await;
@@ -1132,7 +1155,7 @@ impl ChainService {
         sync_target: u64,
         follow_safe_head: bool,
         handle: &WalletHandle,
-        reset_generation: u64,
+        progress: crate::types::WalletSchedulableProgress,
         backfill_sender: mpsc::Sender<BackfillEvent>,
     ) {
         if sync_target > 0 {
@@ -1144,7 +1167,7 @@ impl ChainService {
                     sync_target,
                     handle,
                     &backfill_sender,
-                    reset_generation,
+                    progress,
                 )
                 .await;
             last_scanned = cached_outcome.checkpoint;
@@ -1161,12 +1184,7 @@ impl ChainService {
 
         if needs_backfill {
             let target_result = handle
-                .start_backfill(
-                    &cfg.cache_key,
-                    &backfill_sender,
-                    reset_generation,
-                    sync_target,
-                )
+                .start_backfill(&cfg.cache_key, &backfill_sender, progress, sync_target)
                 .await;
             debug!(?target_result, cache_key = %cfg.cache_key, "wallet target update result");
             let lease = match target_result {
@@ -1193,12 +1211,7 @@ impl ChainService {
             }
         } else {
             let result = handle
-                .start_backfill(
-                    &cfg.cache_key,
-                    &backfill_sender,
-                    reset_generation,
-                    sync_target,
-                )
+                .start_backfill(&cfg.cache_key, &backfill_sender, progress, sync_target)
                 .await;
             debug!(?result, cache_key = %cfg.cache_key, "wallet finish result");
         }
@@ -1208,13 +1221,13 @@ impl ChainService {
         self: &Arc<Self>,
         cfg: &WalletConfig,
         start_block: u64,
-        last_scanned: u64,
+        progress: crate::types::WalletSchedulableProgress,
         sync_target: u64,
-        reset_generation: u64,
         backfill_sender: mpsc::Sender<BackfillEvent>,
         handle: &WalletHandle,
         cancel: &CancellationToken,
     ) -> bool {
+        let last_scanned = progress.last_scanned;
         if !cfg.use_indexed_wallet_catch_up
             || self.chain.quick_sync_endpoint.is_none()
             || !should_hedge_wallet_startup(
@@ -1290,11 +1303,14 @@ impl ChainService {
                     let follow_safe_head = cfg.sync_to_block.is_none();
                     let winner = candidate.strategy;
                     let candidate_elapsed_ms = candidate.elapsed_ms;
+                    let Some(progress) = handle.revalidate_schedulable_progress(progress) else {
+                        return false;
+                    };
                     let sent = send_wallet_startup_events(
                         &cfg.cache_key,
                         candidate.applies,
                         Some(sync_target),
-                        reset_generation,
+                        progress,
                         &backfill_sender,
                         handle,
                     )
@@ -1307,7 +1323,7 @@ impl ChainService {
                             sync_target,
                             true,
                             handle,
-                            reset_generation,
+                            progress,
                             backfill_sender.clone(),
                         )
                         .await;
@@ -1854,30 +1870,44 @@ impl ChainService {
     }
 
     pub async fn unregister_wallet(&self, cache_key: &str) {
+        let registration_gate = self.wallet_registration_gate(cache_key).await;
+        let _registration_guard = registration_gate.lock().await;
         let registration = {
             let mut wallets = self.wallets.write().await;
-            let Some(registration) = wallets.get(cache_key) else {
-                return;
-            };
-            registration.cancel.cancel();
-            registration.handle.retire_actor().await;
             wallets.remove(cache_key)
         };
-        if registration.is_some() {
-            if self
-                .backfill_tx
-                .send(BackfillRequest::Remove {
-                    cache_key: cache_key.to_string(),
-                })
-                .await
-                .is_err()
-            {
-                warn!(cache_key = %cache_key, "failed to remove backfill cursor");
-            }
+        let Some(registration) = registration else {
+            return;
+        };
+        // Retire before cancel so the old actor cannot publish Shutdown (or anything else)
+        // during unregister. retire_actor is a thin lifecycle fence (no authority_lock wait).
+        registration.handle.retire_actor();
+        registration.cancel.cancel();
+        if self
+            .backfill_tx
+            .send(BackfillRequest::Remove {
+                cache_key: cache_key.to_string(),
+            })
+            .await
+            .is_err()
+        {
+            warn!(cache_key = %cache_key, "failed to remove backfill cursor");
         }
     }
 
     pub async fn shutdown(&self) {
+        // Transition current wallets to Stopping under the lifecycle fence before cancel,
+        // so new Active applies stop; workers still publish terminal Shutdown once.
+        let handles: Vec<_> = {
+            let wallets = self.wallets.read().await;
+            wallets
+                .values()
+                .map(|registration| registration.handle.clone())
+                .collect()
+        };
+        for handle in handles {
+            let _ = handle.mark_stopping();
+        }
         self.cancel.cancel();
         self.public_data_plane.shutdown();
         await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;
@@ -1893,7 +1923,10 @@ impl ChainService {
         cancel: &CancellationToken,
         source_order: IndexedWalletCatchUpSourceOrder,
         expose_status: bool,
-        queued_sender: (&mpsc::Sender<BackfillEvent>, u64),
+        queued_sender: (
+            &mpsc::Sender<BackfillEvent>,
+            crate::types::WalletSchedulableProgress,
+        ),
     ) -> u64 {
         if safe_head == 0 {
             debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
@@ -1907,7 +1940,7 @@ impl ChainService {
             debug!(cache_key = %cfg.cache_key, "indexed wallet catch-up already active");
             return last_scanned;
         };
-        let (sender, reset_generation) = queued_sender;
+        let (sender, progress) = queued_sender;
         let cached_outcome = self
             .apply_cached_public_scan_coverage(
                 cfg,
@@ -1916,7 +1949,7 @@ impl ChainService {
                 safe_head,
                 handle,
                 sender,
-                reset_generation,
+                progress,
             )
             .await;
         if cached_outcome.checkpoint > last_scanned {
@@ -2098,7 +2131,7 @@ impl ChainService {
         }
         let mut checkpoint = last_scanned;
         let target_result = handle
-            .start_backfill(&cfg.cache_key, sender, reset_generation, target)
+            .start_backfill(&cfg.cache_key, sender, progress, target)
             .await;
         let lease = match target_result {
             WalletBackfillFinishResult::Ready { committed_to } => return committed_to,
@@ -2402,7 +2435,7 @@ impl ChainService {
                 from_block,
                 to_block,
                 checkpoint,
-                reset_generation,
+                reset_generation = progress.reset_generation,
                 transact_rows,
                 shield_rows,
                 legacy_encrypted_rows,

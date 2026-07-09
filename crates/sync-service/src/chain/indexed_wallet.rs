@@ -1434,7 +1434,7 @@ pub(super) async fn send_wallet_startup_events(
     cache_key: &str,
     applies: Vec<WalletScanApply>,
     done_block: Option<u64>,
-    reset_generation: u64,
+    progress: crate::types::WalletSchedulableProgress,
     sender: &mpsc::Sender<BackfillEvent>,
     handle: &WalletHandle,
 ) -> bool {
@@ -1442,7 +1442,7 @@ pub(super) async fn send_wallet_startup_events(
         done_block.unwrap_or_else(|| applies.last().map_or(0, |apply| apply.to_block));
     let lease = if target_block > 0 {
         match handle
-            .start_backfill(cache_key, sender, reset_generation, target_block)
+            .start_backfill(cache_key, sender, progress, target_block)
             .await
         {
             WalletBackfillFinishResult::Ready { .. } => return true,
@@ -1458,7 +1458,7 @@ pub(super) async fn send_wallet_startup_events(
         } else {
             let target_block = apply.to_block;
             match handle
-                .start_backfill(cache_key, sender, reset_generation, target_block)
+                .start_backfill(cache_key, sender, progress, target_block)
                 .await
             {
                 WalletBackfillFinishResult::Ready { committed_to } => {

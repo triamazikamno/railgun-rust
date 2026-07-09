@@ -70,7 +70,9 @@ impl WalletPoiRuntime {
         }
     }
 
-    pub(crate) const fn client(&self) -> &PoiRpcClient {
+    /// Raw client for public POI operations and for constructing the private gateway.
+    /// Wallet-private effects must not call this client directly.
+    pub(crate) const fn public_client(&self) -> &PoiRpcClient {
         match self {
             Self::IndexedArtifacts { client, .. } | Self::PoiProxy { client } => client,
         }
@@ -153,11 +155,28 @@ impl WalletPersistState {
         request: WalletProgressPersist<'_>,
         effects: WalletProgressPrivateEffects<'_>,
     ) -> Result<bool, WalletCacheError> {
+        permit
+            .with_durable_apply(|token| {
+                self.commit_progress_with_token(cache_store, permit, &token, request, effects)
+            })
+            .map_err(|_| WalletCacheError::Crypto)?
+    }
+
+    /// Durable progress commit under an existing active-apply token (no re-fence).
+    pub(super) fn commit_progress_with_token(
+        &mut self,
+        cache_store: &dyn WalletCacheStore,
+        permit: &WalletPrivateMutationPermit<'_>,
+        token: &WalletActorCommitToken<'_>,
+        request: WalletProgressPersist<'_>,
+        effects: WalletProgressPrivateEffects<'_>,
+    ) -> Result<bool, WalletCacheError> {
         let full_persist =
             request.changed || self.needs_full_persist || self.pending_cache_reset.is_some();
         if full_persist {
             let persist_started = Instant::now();
             return match cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
+                token,
                 permit,
                 effects.pending_output_context_chain_id,
                 request.snapshot,
@@ -199,6 +218,7 @@ impl WalletPersistState {
 
         let meta_started = Instant::now();
         cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
+            token,
             permit,
             effects.pending_output_context_chain_id,
             request.snapshot,
@@ -273,6 +293,7 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) forest: &'a Arc<RwLock<MerkleForest>>,
     pub(super) utxos: &'a Arc<RwLock<Vec<WalletUtxo>>>,
     pub(super) client: &'a PoiRpcClient,
+    pub(super) private_poi: &'a WalletPrivatePoiClients,
     pub(super) active_list_keys: &'a [FixedBytes<32>],
     pub(super) force_retry: bool,
 }
@@ -282,16 +303,13 @@ impl OutputPoiRecoveryRun<'_> {
         if self.cfg.spending_public_key.is_none() || self.cfg.poi_recovery_prover.is_none() {
             return 0;
         }
-        let permit = match self.authority.acquire().await {
-            Ok(permit) => permit,
-            Err(reason) => {
-                debug!(?reason, cache_key = %self.cfg.cache_key, "output POI recovery skipped");
-                return 0;
-            }
-        };
+        if let Err(reason) = self.authority.revalidate() {
+            debug!(?reason, cache_key = %self.cfg.cache_key, "output POI recovery skipped");
+            return 0;
+        }
         let snapshot = self.utxos.read().await.clone();
         mark_valid_output_poi_recoveries(
-            &permit,
+            self.authority,
             self.db,
             self.cache_store,
             self.cfg,
@@ -316,9 +334,8 @@ impl OutputPoiRecoveryRun<'_> {
             return 0;
         }
         let forest = self.forest.read().await.clone();
-        let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
+        recover_missing_output_pois(OutputPoiRecoveryRequest {
             authority: self.authority,
-            permit: &permit,
             db: self.db,
             cache_store: self.cache_store,
             cfg: self.cfg,
@@ -328,14 +345,12 @@ impl OutputPoiRecoveryRun<'_> {
             indexed_artifact_source: self.indexed_artifact_source,
             forest: &forest,
             poi_client: self.client,
+            private_poi: self.private_poi,
             poi_runtime: self.poi_runtime,
-            submitter: self.client,
             active_list_keys: self.active_list_keys,
             wallet_utxos: &snapshot,
             force_retry: self.force_retry,
         })
-        .await;
-        drop(permit);
-        recovered
+        .await
     }
 }

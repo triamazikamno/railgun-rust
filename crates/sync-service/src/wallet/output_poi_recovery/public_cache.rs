@@ -32,14 +32,9 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         recovery_chunk,
         started,
     } = request;
+    // Protocol C1: local-first public cache. Consult validated local state before requiring network.
     let endpoint = cfg.quick_sync_endpoint.as_ref();
-    if endpoint.is_none() && indexed_artifact_source.is_none() {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            "no quick-sync endpoint configured for TXID proof recovery",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
+    let has_network_source = endpoint.is_some() || indexed_artifact_source.is_some();
     let cache_key =
         PublicTxidCacheKey::new(EVM_CHAIN_TYPE, cfg.chain.chain_id, DEFAULT_TXID_VERSION);
     let latest_validated_started = Instant::now();
@@ -49,6 +44,13 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         .map_err(txid_public_cache_failure)?
     {
         Some(latest) if latest.txid_index >= required_txid_index => (latest, "cache"),
+        _ if !has_network_source => {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::TxFetchFailed,
+                "no quick-sync endpoint configured for TXID proof recovery and local TXID cache does not cover the recovery target",
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            ));
+        }
         _ => {
             let latest_validated = poi_client
                 .latest_validated_railgun_txid(

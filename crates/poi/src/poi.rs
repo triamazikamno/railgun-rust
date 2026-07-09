@@ -737,6 +737,16 @@ pub struct PoiRpcClient {
     next_id: std::sync::atomic::AtomicU64,
 }
 
+impl Clone for PoiRpcClient {
+    fn clone(&self) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            http: self.http.clone(),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
 impl PoiRpcClient {
     #[must_use]
     pub fn new(base_url: Url) -> Self {

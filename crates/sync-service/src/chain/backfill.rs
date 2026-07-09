@@ -272,10 +272,10 @@ impl ChainService {
                 self.next_wallet_reset_intent(),
                 from_block,
                 replay_plan,
-                registration.handle.last_scanned(),
+                registration.handle.last_scanned_raw(),
             )
             .await;
-            let Some(reset_generation) = reset_result.reset_generation() else {
+            if reset_result.reset_generation().is_none() {
                 debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
                 continue;
             };
@@ -283,6 +283,10 @@ impl ChainService {
                 debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted and pending durable replay");
                 continue;
             }
+            let Some(progress) = registration.handle.schedulable_progress() else {
+                debug!(cache_key = %cache_key, "wallet reorg reset committed but view not yet schedulable");
+                continue;
+            };
             let replay_from =
                 wallet_backfill_from_block(reset_result.committed_to(), registration.start_block);
             let target_result = registration
@@ -290,7 +294,7 @@ impl ChainService {
                 .start_backfill(
                     cache_key,
                     &registration.backfill_sender,
-                    reset_generation,
+                    progress,
                     sync_target,
                 )
                 .await;

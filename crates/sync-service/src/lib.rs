@@ -22,7 +22,8 @@ pub use types::{
     PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource,
     SyncProgressSender, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletCacheStore,
-    WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletLocalPoiCaches,
+    WalletConfig, WalletCurrentSnapshot, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+    WalletLocalPoiCaches, WalletSchedulableProgress, WalletViewState,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

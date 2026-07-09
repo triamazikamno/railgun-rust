@@ -58,40 +58,52 @@ use crate::types::{
     BackfillEvent, BackfillRequest, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback,
     SharedLogBatch, SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult,
     WalletBackfillFinishResult, WalletBackfillLease, WalletBackfillRejectReason,
-    WalletBackfillResetResult, WalletCacheStore, WalletConfig, WalletIndexedCatchUpStatus,
-    WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness, WalletReadinessError,
-    WalletResetReplayPlan, WalletResetToken, WalletScanApply, WalletScanRows,
-    WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
+    WalletBackfillResetResult, WalletCacheStore, WalletConfig, WalletCurrentSnapshot,
+    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness,
+    WalletReadinessError, WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken,
+    WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit,
+    WalletSyncToken, WalletViewState,
 };
 
+mod actor;
 mod delta;
 mod handle;
 mod local_poi_cache;
 mod output_poi_recovery;
 mod pending_output_poi;
 mod persist;
+mod poi_maintenance;
 mod poi_refresh;
 mod poi_sources;
+mod private_remote;
 mod worker;
 
+pub(crate) use actor::{
+    PoiRemoteJobKey, WalletActorApplyToken, WalletActorCommitToken, WalletActorCredential,
+    WalletActorLifecycle, WalletActorLifecycleCell, WalletRemoteDone,
+};
 use delta::*;
 use handle::*;
 pub(crate) use handle::{
-    WalletActorTokenAuthority, WalletIndexedCatchUpLease, WalletPrivateMutationAuthority,
-    WalletPrivateMutationPermit,
+    OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,
+    WalletIndexedCatchUpLease, WalletPrivateApplyClient, WalletPrivateApplyRequest,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
 };
 use local_poi_cache::*;
 use output_poi_recovery::*;
 use pending_output_poi::*;
 pub(crate) use persist::WalletPoiRuntime;
 use persist::*;
+use poi_maintenance::*;
 use poi_refresh::*;
 use poi_sources::*;
+use private_remote::*;
 
+pub use crate::types::{WalletPendingOverlay, WalletPendingSpent};
 #[cfg(test)]
 pub(crate) use delta::apply_wallet_delta_to_vec;
 pub(crate) use delta::pending_overlay_from_delta;
-pub use handle::{WalletHandle, WalletPendingOverlay, WalletPendingSpent};
+pub use handle::WalletHandle;
 #[cfg(test)]
 pub(crate) use pending_output_poi::process_pending_output_poi_observations;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};

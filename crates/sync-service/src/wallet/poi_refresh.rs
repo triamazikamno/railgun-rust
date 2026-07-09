@@ -111,6 +111,118 @@ pub(super) async fn refresh_wallet_poi_statuses_selected(
     changed
 }
 
+/// Remote general-status refresh for PoiProxy / artifact fallback jobs.
+///
+/// Every batch is a separately authorized private disclosure. Results re-enter the
+/// actor as a pure intent and are folded against the current UTXO set before commit.
+pub(super) async fn refresh_wallet_poi_statuses_remote_authorized(
+    authority: &WalletPrivateMutationAuthority<'_>,
+    private_poi: &WalletPrivatePoiClients,
+    db: &DbStore,
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    selection: WalletPoiRefreshSelection,
+) -> bool {
+    if active_list_keys.is_empty() {
+        return false;
+    }
+    let snapshot = match authority.wallet_utxos().await {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            debug!(?reason, cache_key = %cfg.cache_key, "remote wallet POI status refresh skipped");
+            return false;
+        }
+    };
+    let candidate_utxos = snapshot
+        .iter()
+        .filter(|wallet_utxo| {
+            !wallet_utxo.is_spent() && selection.matches_wallet_utxo(wallet_utxo, active_list_keys)
+        })
+        .collect::<Vec<_>>();
+    let candidates = candidate_utxos
+        .iter()
+        .map(|wallet_utxo| {
+            BlindedCommitmentData::new(
+                wallet_utxo.utxo.poi.blinded_commitment,
+                blinded_commitment_type(wallet_utxo.utxo.poi.commitment_kind),
+            )
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return false;
+    }
+    let expected_poi_by_blinded_commitment = candidate_utxos
+        .iter()
+        .map(|wallet_utxo| {
+            (
+                wallet_utxo.utxo.poi.blinded_commitment,
+                wallet_utxo.utxo.poi.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut statuses_by_blinded_commitment = BTreeMap::new();
+    for chunk in candidates.chunks(WALLET_POI_STATUS_BATCH_SIZE) {
+        let request_data = chunk.to_vec();
+        let request_commitments = request_data
+            .iter()
+            .map(|data| data.blinded_commitment)
+            .collect::<Vec<_>>();
+        let response = private_poi
+            .pois_per_list(
+                || async {
+                    let current = authority.wallet_utxos().await?;
+                    Ok::<bool, WalletBackfillRejectReason>(request_commitments.iter().all(
+                        |commitment| {
+                            current.iter().any(|utxo| {
+                                !utxo.is_spent() && utxo.utxo.poi.blinded_commitment == *commitment
+                            })
+                        },
+                    ))
+                },
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                cfg.chain.chain_id,
+                active_list_keys,
+                &request_data,
+            )
+            .await;
+        match response {
+            Ok(statuses) => statuses_by_blinded_commitment.extend(statuses),
+            Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Subject)) => continue,
+            Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Authority)) => break,
+            Err(WalletPrivateRemoteError::Check(reason)) => {
+                debug!(?reason, cache_key = %cfg.cache_key, "remote wallet POI status check rejected");
+                break;
+            }
+            Err(WalletPrivateRemoteError::Remote(error)) => {
+                warn!(?error, cache_key = %cfg.cache_key, "remote wallet POI status batch failed");
+            }
+        }
+    }
+    if statuses_by_blinded_commitment.is_empty() {
+        return false;
+    }
+
+    matches!(
+        apply_poi_private_delta(
+            authority,
+            db,
+            cache_store,
+            cfg,
+            PoiPrivateDelta::PoiStatusRefresh {
+                active_list_keys,
+                expected_poi_by_blinded_commitment: &expected_poi_by_blinded_commitment,
+                statuses_by_blinded_commitment: &statuses_by_blinded_commitment,
+                refreshed_at: now_epoch_secs(),
+            },
+        )
+        .await,
+        Ok(PoiPrivateApplyOutcome::Applied { utxo_changed: true })
+    )
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LivePoiTailOutcome {
     pub(crate) events: usize,

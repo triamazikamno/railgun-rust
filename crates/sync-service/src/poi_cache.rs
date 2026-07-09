@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use alloy::hex;
@@ -44,6 +45,7 @@ struct ChainPoiCacheLoop {
     preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
     cancel: CancellationToken,
+    install_epoch: Arc<AtomicU64>,
 }
 
 pub struct PoiCacheService {
@@ -54,6 +56,8 @@ pub struct PoiCacheService {
     chains: RwLock<HashMap<u64, ChainPoiCacheState>>,
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
     cancel: CancellationToken,
+    /// Protocol C2: bumped on public POI cache reset; in-flight sync installs must match.
+    install_epoch: Arc<AtomicU64>,
 }
 
 impl PoiCacheService {
@@ -72,6 +76,7 @@ impl PoiCacheService {
             chains: RwLock::new(HashMap::new()),
             progress_tx,
             cancel: CancellationToken::new(),
+            install_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -152,6 +157,7 @@ impl PoiCacheService {
             preloaded_caches,
             progress_tx: self.progress_tx.clone(),
             cancel: self.cancel.child_token(),
+            install_epoch: Arc::clone(&self.install_epoch),
         });
         local_caches
     }
@@ -176,6 +182,7 @@ impl PoiCacheService {
             chain_id,
             local_caches,
             self.progress_tx.clone(),
+            Arc::clone(&self.install_epoch),
         );
         true
     }
@@ -217,6 +224,13 @@ impl PoiCacheService {
             );
         }
 
+        // Invalidate any in-flight install that started before this reset.
+        let epoch = self.install_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        debug!(
+            epoch,
+            "POI artifact cache install epoch advanced after reset"
+        );
+
         for (chain_id, local_caches) in chains {
             spawn_chain_poi_cache_resync(
                 Arc::clone(&self.db),
@@ -226,6 +240,7 @@ impl PoiCacheService {
                 chain_id,
                 local_caches,
                 self.progress_tx.clone(),
+                Arc::clone(&self.install_epoch),
             );
         }
 
@@ -422,6 +437,7 @@ fn spawn_chain_poi_cache_resync(
     chain_id: u64,
     local_caches: LocalPoiCaches,
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
+    install_epoch: Arc<AtomicU64>,
 ) {
     tokio::spawn(
         async move {
@@ -436,6 +452,7 @@ fn spawn_chain_poi_cache_resync(
                 &active_list_keys,
                 BTreeMap::new(),
                 &progress_tx,
+                &install_epoch,
             )
             .await;
         }
@@ -470,6 +487,7 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
                 &task.active_list_keys,
                 std::mem::take(&mut task.preloaded_caches),
                 &task.progress_tx,
+                &task.install_epoch,
             )
             .await;
             last_artifact_sync = Instant::now();
@@ -503,7 +521,9 @@ async fn sync_chain_poi_artifact_caches(
     active_list_keys: &[FixedBytes<32>],
     mut preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
     progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
+    install_epoch: &AtomicU64,
 ) {
+    let expected_install_epoch = install_epoch.load(Ordering::Acquire);
     let total_lists = active_list_keys.len();
     if total_lists == 0 {
         send_poi_artifact_cache_progress(
@@ -643,10 +663,29 @@ async fn sync_chain_poi_artifact_caches(
                 let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
                 let install_started = Instant::now();
                 let install_lock_started = Instant::now();
-                let mut caches = local_caches.write().await;
+                let installed = if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
+                    debug!(
+                        chain_id,
+                        list_key = %hex::encode(list_key),
+                        expected_install_epoch,
+                        "artifact POI cache install skipped; install epoch advanced (public cache reset)"
+                    );
+                    false
+                } else {
+                    let mut caches = local_caches.write().await;
+                    if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
+                        debug!(
+                            chain_id,
+                            list_key = %hex::encode(list_key),
+                            expected_install_epoch,
+                            "artifact POI cache install skipped under lock; install epoch advanced"
+                        );
+                        false
+                    } else {
+                        install_cache_if_not_behind(&mut caches, *list_key, cache)
+                    }
+                };
                 let install_lock_wait_elapsed_ms = install_lock_started.elapsed().as_millis();
-                let installed = install_cache_if_not_behind(&mut caches, *list_key, cache);
-                drop(caches);
                 debug!(
                     chain_id,
                     list_key = %hex::encode(list_key),
@@ -694,14 +733,33 @@ async fn sync_chain_poi_artifact_caches(
                                 ),
                             }
                         }
-                        let mut caches = local_caches.write().await;
-                        let installed = install_cache_if_not_behind(&mut caches, *list_key, cache);
-                        if !installed {
+                        if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
                             debug!(
                                 chain_id,
                                 list_key = %hex::encode(list_key),
-                                "persisted artifact POI cache install skipped; current cache is newer"
+                                expected_install_epoch,
+                                "persisted artifact POI cache install skipped; install epoch advanced"
                             );
+                        } else {
+                            let mut caches = local_caches.write().await;
+                            if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
+                                debug!(
+                                    chain_id,
+                                    list_key = %hex::encode(list_key),
+                                    expected_install_epoch,
+                                    "persisted artifact POI cache install skipped under lock; install epoch advanced"
+                                );
+                            } else {
+                                let installed =
+                                    install_cache_if_not_behind(&mut caches, *list_key, cache);
+                                if !installed {
+                                    debug!(
+                                        chain_id,
+                                        list_key = %hex::encode(list_key),
+                                        "persisted artifact POI cache install skipped; current cache is newer"
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(None) => {}

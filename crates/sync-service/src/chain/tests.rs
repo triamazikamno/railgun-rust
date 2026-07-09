@@ -1114,8 +1114,8 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         .expect("send wallet B backfill request");
 
     tokio::time::timeout(Duration::from_secs(2), async {
-        while wallet_a.last_scanned() != 199
-            || wallet_b.last_scanned() != 130
+        while wallet_a.last_scanned() != Some(199)
+            || wallet_b.last_scanned() != Some(130)
             || !wallet_a.readiness().is_ready()
             || !wallet_b.readiness().is_ready()
         {
@@ -1125,8 +1125,8 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     .await
     .expect("wallet backfill loop completed");
 
-    assert_eq!(wallet_a.last_scanned(), 199);
-    assert_eq!(wallet_b.last_scanned(), 130);
+    assert_eq!(wallet_a.last_scanned(), Some(199));
+    assert_eq!(wallet_b.last_scanned(), Some(130));
     assert_eq!(
         db.get_wallet_meta("wallet-b")
             .expect("wallet B meta read")
@@ -1264,12 +1264,18 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             &worker_cancel,
             IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
             true,
-            (&wallet_backfill_tx, 0),
+            (
+                &wallet_backfill_tx,
+                crate::types::WalletSchedulableProgress {
+                    last_scanned: 100,
+                    reset_generation: 0,
+                },
+            ),
         )
         .await;
 
     assert_eq!(checkpoint, 200);
-    assert_eq!(handle.last_scanned(), 200);
+    assert_eq!(handle.last_scanned(), Some(200));
     assert_eq!(
         handle
             .indexed_catch_up_rx
@@ -1416,7 +1422,13 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
                 &catch_up_cancel,
                 IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
                 true,
-                (&catch_up_sender, 0),
+                (
+                    &catch_up_sender,
+                    crate::types::WalletSchedulableProgress {
+                        last_scanned: 100,
+                        reset_generation: 0,
+                    },
+                ),
             )
             .await
     });
@@ -1439,7 +1451,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     let checkpoint = catch_up.await.expect("indexed catch-up task");
 
     assert_eq!(checkpoint, 100);
-    assert_eq!(handle.last_scanned(), 100);
+    assert_eq!(handle.last_scanned(), Some(100));
     assert!(matches!(
         public_data_plane
             .cached_public_scan_coverage(PublicScanRange::new(101, 150))
@@ -1517,12 +1529,23 @@ async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
     .expect("spawn wallet worker");
 
     let outcome = service
-        .apply_cached_public_scan_coverage(&cfg, 0, 100, 200, &handle, &backfill_tx, 0)
+        .apply_cached_public_scan_coverage(
+            &cfg,
+            0,
+            100,
+            200,
+            &handle,
+            &backfill_tx,
+            crate::types::WalletSchedulableProgress {
+                last_scanned: 100,
+                reset_generation: 0,
+            },
+        )
         .await;
 
     assert_eq!(outcome.checkpoint, 150);
     assert!(!outcome.finished);
-    assert_eq!(handle.last_scanned(), 150);
+    assert_eq!(handle.last_scanned(), Some(150));
     assert_eq!(handle.readiness(), WalletReadiness::Syncing);
     assert!(!*handle.ready_rx.borrow());
 
@@ -2042,7 +2065,10 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
                     .expect("normalize empty log payload"),
             ],
             Some(105),
-            7,
+            crate::types::WalletSchedulableProgress {
+                last_scanned: 100,
+                reset_generation: 0,
+            },
             &sender_clone,
             &handle,
         )
@@ -2059,7 +2085,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
         panic!("startup target should accept the token first");
     };
     assert_eq!(target_block, 105);
-    assert_eq!(token.reset_generation(), 7);
+    assert_eq!(token.reset_generation(), 0);
     response
         .send(WalletBackfillFinishResult::Accepted {
             committed_to: 100,
@@ -2171,7 +2197,10 @@ async fn wallet_startup_events_treat_leading_ready_as_success() {
                     .expect("normalize empty log payload"),
             ],
             Some(105),
-            0,
+            crate::types::WalletSchedulableProgress {
+                last_scanned: 0,
+                reset_generation: 0,
+            },
             &sender_clone,
             &handle,
         )
@@ -2262,7 +2291,10 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
                     .expect("normalize empty log payload"),
             ],
             Some(105),
-            0,
+            crate::types::WalletSchedulableProgress {
+                last_scanned: 0,
+                reset_generation: 0,
+            },
             &sender_clone,
             &handle,
         )
@@ -2372,7 +2404,10 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
                     .expect("normalize empty log payload"),
             ],
             None,
-            0,
+            crate::types::WalletSchedulableProgress {
+                last_scanned: 0,
+                reset_generation: 0,
+            },
             &sender_clone,
             &handle,
         )
