@@ -174,21 +174,163 @@ pub(super) enum WalletIndexedCatchUpCommand {
     },
 }
 
-/// Owned pure POI private delta for actor re-entry (jobs never write mirrors).
-///
-/// Protocol B: payloads are **intents**. Actor apply folds them against the current
-/// private UTXO snapshot (and matching context rules) — never blind-writes stale rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedPoiIdentity {
+    commitment_kind: UtxoCommitmentKind,
+    commitment: FixedBytes<32>,
+    npk: FixedBytes<32>,
+    blinded_commitment: FixedBytes<32>,
+}
+
+impl ExpectedPoiIdentity {
+    fn new(poi: &UtxoPoiMetadata) -> Self {
+        Self {
+            commitment_kind: poi.commitment_kind,
+            commitment: poi.commitment,
+            npk: poi.npk,
+            blinded_commitment: poi.blinded_commitment,
+        }
+    }
+
+    fn matches(&self, poi: &UtxoPoiMetadata) -> bool {
+        poi.commitment_kind == self.commitment_kind
+            && poi.commitment == self.commitment
+            && poi.npk == self.npk
+            && poi.blinded_commitment == self.blinded_commitment
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedWalletOutput {
+    stable_identity: Vec<u8>,
+    tree: u32,
+    position: u64,
+    source: UtxoSource,
+    poi_identity: ExpectedPoiIdentity,
+}
+
+impl ExpectedWalletOutput {
+    pub(crate) fn new(wallet_utxo: &WalletUtxo) -> Self {
+        Self {
+            stable_identity: wallet_utxo_stable_identity(wallet_utxo),
+            tree: wallet_utxo.utxo.tree,
+            position: wallet_utxo.utxo.position,
+            source: wallet_utxo.utxo.source.clone(),
+            poi_identity: ExpectedPoiIdentity::new(&wallet_utxo.utxo.poi),
+        }
+    }
+
+    pub(crate) fn matches(&self, wallet_utxo: &WalletUtxo) -> bool {
+        !wallet_utxo.is_spent()
+            && wallet_utxo_stable_identity(wallet_utxo) == self.stable_identity
+            && wallet_utxo.utxo.tree == self.tree
+            && wallet_utxo.utxo.position == self.position
+            && wallet_utxo.utxo.source == self.source
+            && self.poi_identity.matches(&wallet_utxo.utxo.poi)
+    }
+
+    pub(crate) const fn output_commitment(&self) -> FixedBytes<32> {
+        self.poi_identity.commitment
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedPoiListState {
+    statuses: BTreeMap<FixedBytes<32>, Option<PoiStatus>>,
+}
+
+impl ExpectedPoiListState {
+    pub(crate) fn new(poi: &UtxoPoiMetadata, list_keys: &[FixedBytes<32>]) -> Self {
+        Self {
+            statuses: list_keys
+                .iter()
+                .copied()
+                .map(|list_key| (list_key, poi.statuses.get(&list_key).copied()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn matches_recoverable_or_valid(
+        &self,
+        poi: &UtxoPoiMetadata,
+        list_keys: &[FixedBytes<32>],
+    ) -> bool {
+        self.statuses
+            .keys()
+            .all(|list_key| list_keys.contains(list_key))
+            && list_keys.iter().all(|list_key| {
+                self.statuses.get(list_key).is_some_and(|expected| {
+                    let current = poi.statuses.get(list_key).copied();
+                    expected
+                        .as_ref()
+                        .is_none_or(|status| status.is_recoverable() || *status == PoiStatus::Valid)
+                        && current.is_none_or(|status| {
+                            status.is_recoverable() || status == PoiStatus::Valid
+                        })
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpectedRecordState {
+    Absent,
+    Present(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpectedPoiStatus {
+    Recoverable,
+    Valid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingOutputPoiSubmissionPredicate {
+    Missing,
+    RetrySubmitted,
+    ForceMatching,
+}
+
+/// Owned semantic POI intent for actor re-entry (jobs never write mirrors or stale rows).
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
-    /// Proposed pending-context / recovery rows; apply keeps only those still matching
-    /// an unspent wallet UTXO under the permit snapshot.
-    Metadata {
-        pending_updates: Vec<PendingOutputPoiContextRecord>,
-        recovery_updates: Vec<OutputPoiRecoveryRecord>,
+    /// Fold a recovery action into the exact predecessor, optionally replacing a pending
+    /// context whose predecessor is also exact.
+    OutputRecovery {
+        expected_output: ExpectedWalletOutput,
+        active_list_keys: Vec<FixedBytes<32>>,
+        required_poi_status: ExpectedPoiStatus,
+        pending_update: Option<(ExpectedRecordState, PendingOutputPoiContextRecord)>,
+        expected_recovery: ExpectedRecordState,
+        action: OutputPoiRecoveryAction,
+        now: u64,
     },
-    /// Mark list keys Valid on the matching unspent UTXO (skipped if gone/spent).
+    /// Apply a completed submission to the current context/recovery records.
+    PendingSubmission {
+        expected_output: ExpectedWalletOutput,
+        expected_context_fingerprint: Vec<u8>,
+        expected_recovery: ExpectedRecordState,
+        active_list_keys: Vec<FixedBytes<32>>,
+        list_keys: Vec<FixedBytes<32>>,
+        predicate: PendingOutputPoiSubmissionPredicate,
+        merge_submitted_list_keys: bool,
+        action: OutputPoiRecoveryAction,
+        now: u64,
+    },
+    /// Mark a still-current context terminal after a structural submission failure.
+    PendingContextTerminal {
+        expected_output: ExpectedWalletOutput,
+        expected_context_fingerprint: Vec<u8>,
+        active_list_keys: Vec<FixedBytes<32>>,
+        error: String,
+    },
+    /// Mark list keys Valid only for the stable output and target-list state that were verified.
     VerifiedValid {
-        record: PendingOutputPoiContextRecord,
+        output_commitment: FixedBytes<32>,
+        expected_context_fingerprint: Vec<u8>,
+        expected_output: ExpectedWalletOutput,
+        expected_poi_list_state: ExpectedPoiListState,
+        active_list_keys: Vec<FixedBytes<32>>,
         valid_list_keys: Vec<FixedBytes<32>>,
         now: u64,
     },

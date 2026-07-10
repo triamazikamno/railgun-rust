@@ -42,7 +42,7 @@ use poi::poi::{
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
 };
 use railgun_wallet::scan::{CommitmentObservation, WalletLogDelta};
-use railgun_wallet::wallet_cache::WalletCacheError;
+use railgun_wallet::wallet_cache::{WalletCacheError, wallet_utxo_stable_identity};
 use railgun_wallet::{
     Note, PoiStatus, RailgunSpendSigner, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource,
     WalletUtxo,

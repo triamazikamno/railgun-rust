@@ -211,10 +211,10 @@ pub(super) async fn refresh_wallet_poi_statuses_remote_authorized(
             db,
             cache_store,
             cfg,
-            PoiPrivateDelta::PoiStatusRefresh {
-                active_list_keys,
-                expected_poi_by_blinded_commitment: &expected_poi_by_blinded_commitment,
-                statuses_by_blinded_commitment: &statuses_by_blinded_commitment,
+            OwnedPoiPrivateDelta::PoiStatusRefresh {
+                active_list_keys: active_list_keys.to_vec(),
+                expected_poi_by_blinded_commitment,
+                statuses_by_blinded_commitment,
                 refreshed_at: now_epoch_secs(),
             },
         )

@@ -587,6 +587,8 @@ pub enum OutputPoiRecoveryAction {
     CacheTxInput {
         tx_input: Vec<u8>,
     },
+    /// Add newly recoverable list material without changing submission/retry state.
+    ExtendContext,
     Detected {
         status: OutputPoiRecoveryStatus,
         retry_after: Option<Duration>,
@@ -677,6 +679,7 @@ impl OutputPoiRecoveryRecord {
                 self.updated_at = now;
                 self.last_detection_at = Some(now);
             }
+            OutputPoiRecoveryAction::ExtendContext => {}
             OutputPoiRecoveryAction::Detected {
                 status,
                 retry_after,
