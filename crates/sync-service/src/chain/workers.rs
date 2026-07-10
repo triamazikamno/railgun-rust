@@ -562,11 +562,14 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
                     txid_version: DEFAULT_TXID_VERSION,
                 };
                 let cache = TxidPublicCache::new(&db, key);
+                let maintenance = service.public_data_plane.indexed_artifact_maintenance();
                 if let Err(err) = cache
-                    .sync_to_indexed_tip(
+                    .sync_to_indexed_tip_maintained(
                         endpoint.as_ref(),
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
+                        &maintenance,
+                        Arc::clone(&db),
                     )
                     .await
                 {

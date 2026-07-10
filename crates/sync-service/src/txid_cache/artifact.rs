@@ -2,10 +2,10 @@ use super::*;
 
 use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactDescriptor, IndexedArtifactManifestClient,
-    IndexedArtifactRangeKind, IndexedArtifactStreamCatalog, IndexedArtifactStreamPartitionPolicy,
-    IndexedArtifactStreamPlan, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
-    VerifiedIndexedArtifactChunk, VerifiedIndexedArtifactChunkStager,
-    decode_indexed_artifact_chunk, verify_chunk_bytes,
+    IndexedArtifactPlannedChunk, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
+    IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
+    VerifiedIndexedArtifactChunkStager, decode_indexed_artifact_chunk, verify_chunk_bytes,
 };
 
 use broadcaster_core::transact::{
@@ -20,6 +20,102 @@ pub(crate) struct TxidPublicArtifactSource {
     client: IndexedArtifactManifestClient,
     scope: ChainScope,
     txid_version: String,
+}
+
+pub(super) struct TxidPublicArtifactChunkPlan {
+    pub(super) required: Vec<VerifiedIndexedArtifactChunk>,
+    pub(super) stable_current: Vec<VerifiedIndexedArtifactChunk>,
+}
+
+pub(super) struct TxidPublicArtifactMaintenance {
+    source: TxidPublicArtifactSource,
+    stable_current: Vec<VerifiedIndexedArtifactChunk>,
+    from_index: u64,
+    read_scope: TxidPublicCacheReadScope,
+}
+
+impl TxidPublicArtifactMaintenance {
+    pub(super) fn new(
+        source: TxidPublicArtifactSource,
+        stable_current: Vec<VerifiedIndexedArtifactChunk>,
+        from_index: u64,
+        read_scope: TxidPublicCacheReadScope,
+    ) -> Self {
+        Self {
+            source,
+            stable_current,
+            from_index,
+            read_scope,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn run(self, cache: &TxidPublicCache<'_>) {
+        for chunk in self.stable_current {
+            Self::retain_stable_chunk(cache, chunk, self.read_scope).await;
+        }
+        self.source
+            .retain_prior_tail_best_effort(cache, self.from_index, self.read_scope)
+            .await;
+    }
+
+    pub(super) fn take_stable_current(&mut self) -> Vec<VerifiedIndexedArtifactChunk> {
+        std::mem::take(&mut self.stable_current)
+    }
+
+    #[must_use]
+    pub(super) const fn read_scope(&self) -> TxidPublicCacheReadScope {
+        self.read_scope
+    }
+
+    #[must_use]
+    pub(super) const fn start_index(&self) -> u64 {
+        self.from_index
+    }
+
+    #[must_use]
+    pub(super) fn scope(&self) -> ChainScope {
+        self.source.scope.clone()
+    }
+
+    pub(super) async fn run_prior_tail(self, cache: &TxidPublicCache<'_>) {
+        self.source
+            .retain_prior_tail_best_effort(cache, self.from_index, self.read_scope)
+            .await;
+    }
+
+    pub(super) async fn retain_stable_chunk(
+        cache: &TxidPublicCache<'_>,
+        chunk: VerifiedIndexedArtifactChunk,
+        read_scope: TxidPublicCacheReadScope,
+    ) {
+        if cache.cached_artifact_chunk(&chunk.descriptor).is_some() {
+            return;
+        }
+        match cache
+            .begin_write_for_scope(read_scope)
+            .await
+            .and_then(|permit| {
+                if cache.cached_artifact_chunk(&chunk.descriptor).is_some() {
+                    Ok(0)
+                } else {
+                    permit.retain_artifact_chunks(std::slice::from_ref(&chunk))
+                }
+            }) {
+            Ok(retained) => debug!(
+                chain_id = cache.key.chain_id,
+                txid_version = cache.key.txid_version,
+                retained,
+                "retained planner-stable current public TXID artifact chunk"
+            ),
+            Err(err) => warn!(
+                ?err,
+                chain_id = cache.key.chain_id,
+                txid_version = cache.key.txid_version,
+                "failed planner-stable current public TXID artifact retention"
+            ),
+        }
+    }
 }
 
 impl TxidPublicArtifactSource {
@@ -44,7 +140,7 @@ impl TxidPublicArtifactSource {
         cache: &TxidPublicCache<'_>,
         from_index: u64,
         to_index: Option<u64>,
-    ) -> Result<Vec<VerifiedIndexedArtifactChunk>, TxidPublicCacheError> {
+    ) -> Result<TxidPublicArtifactChunkPlan, TxidPublicCacheError> {
         let manifest = self
             .client
             .fetch_manifest(&self.scope, None, SystemTime::now())
@@ -54,7 +150,10 @@ impl TxidPublicArtifactSource {
             .iter()
             .find(|entry| entry.scope == self.scope)
         else {
-            return Ok(Vec::new());
+            return Ok(TxidPublicArtifactChunkPlan {
+                required: Vec::new(),
+                stable_current: Vec::new(),
+            });
         };
         let range_end = to_index.unwrap_or(u64::MAX);
 
@@ -77,8 +176,9 @@ impl TxidPublicArtifactSource {
                 catalogs.push(self.fetch_stream_catalog(catalog_descriptor).await?);
             }
         }
-        let plan = IndexedArtifactStreamPlan::plan(
+        let plan = IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
             &catalogs,
+            &chain_entry.catalogs,
             &IndexedArtifactStreamPlanRequest::new(
                 IndexedDatasetKind::PublicTxid,
                 self.scope.clone(),
@@ -91,7 +191,8 @@ impl TxidPublicArtifactSource {
         .map_err(|err| TxidPublicCacheError::MetadataMismatch(err.to_string()))?;
         let mut chunks = Vec::with_capacity(plan.required_current_chunks.len());
         let mut missing = Vec::new();
-        for descriptor in &plan.required_current_chunks {
+        for entry in &plan.required_current_chunks {
+            let descriptor = &entry.descriptor;
             if let Some(chunk) = cache.cached_artifact_chunk(descriptor) {
                 chunks.push(chunk);
             } else {
@@ -106,7 +207,20 @@ impl TxidPublicArtifactSource {
                     .map_err(TxidPublicCacheError::from)?,
             );
         }
-        Ok(chunks)
+        let stable_current = chunks
+            .iter()
+            .filter(|chunk| {
+                plan.required_current_chunks
+                    .iter()
+                    .any(|entry| entry.is_stable_current() && entry.descriptor == chunk.descriptor)
+                    && cache.cached_artifact_chunk(&chunk.descriptor).is_none()
+            })
+            .cloned()
+            .collect();
+        Ok(TxidPublicArtifactChunkPlan {
+            required: chunks,
+            stable_current,
+        })
     }
 
     pub(crate) async fn retain_prior_tail_best_effort(
@@ -183,12 +297,10 @@ impl TxidPublicArtifactSource {
                 return;
             }
         };
-        self.retain_optional_prior_tail_chunks(
-            cache,
-            &plan.optional_prior_tail_retention,
-            read_scope,
-        )
-        .await;
+        let optional_prior_tail_retention = plan.optional_prior_tail_retention;
+        drop(catalogs);
+        self.retain_optional_prior_tail_chunks(cache, &optional_prior_tail_retention, read_scope)
+            .await;
     }
 
     fn catalog_may_contain_txid_partition(&self, descriptor: &IndexedArtifactDescriptor) -> bool {
@@ -247,54 +359,62 @@ impl TxidPublicArtifactSource {
     async fn retain_optional_prior_tail_chunks(
         &self,
         cache: &TxidPublicCache<'_>,
-        descriptors: &[crate::indexed_artifacts::IndexedArtifactDescriptor],
+        entries: &[IndexedArtifactPlannedChunk],
         read_scope: TxidPublicCacheReadScope,
     ) {
-        if descriptors.is_empty() {
-            return;
-        }
-        match self.client.fetch_chunks_bounded(descriptors).await {
-            Ok(chunks) => {
-                match cache
-                    .begin_write_for_scope(read_scope)
-                    .await
-                    .and_then(|permit| permit.retain_artifact_chunks(&chunks))
-                {
-                    Ok(retained) => {
-                        debug!(
+        for entry in entries {
+            let descriptor = &entry.descriptor;
+            if cache.cached_artifact_chunk(descriptor).is_some() {
+                continue;
+            }
+            match self
+                .client
+                .fetch_chunks_bounded(std::slice::from_ref(descriptor))
+                .await
+            {
+                Ok(chunks) => {
+                    let retained =
+                        cache
+                            .begin_write_for_scope(read_scope)
+                            .await
+                            .and_then(|permit| {
+                                if cache.cached_artifact_chunk(descriptor).is_some() {
+                                    Ok(0)
+                                } else {
+                                    permit.retain_artifact_chunks(&chunks)
+                                }
+                            });
+                    match retained {
+                        Ok(retained) => debug!(
                             chain_id = cache.key.chain_id,
                             txid_version = cache.key.txid_version,
                             retained,
-                            requested = descriptors.len(),
-                            "retained optional public TXID prior-tail artifact chunks"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
+                            cid = %descriptor.cid,
+                            "retained optional public TXID prior-tail artifact chunk"
+                        ),
+                        Err(err) => warn!(
                             ?err,
                             chain_id = cache.key.chain_id,
                             txid_version = cache.key.txid_version,
-                            requested = descriptors.len(),
+                            cid = %descriptor.cid,
                             "failed best-effort public TXID prior-tail retention"
-                        );
+                        ),
                     }
                 }
-            }
-            Err(err) => {
-                warn!(
+                Err(err) => warn!(
                     ?err,
                     chain_id = cache.key.chain_id,
                     txid_version = cache.key.txid_version,
-                    requested = descriptors.len(),
-                    "failed to fetch optional public TXID prior-tail artifact chunks"
-                );
+                    cid = %descriptor.cid,
+                    "failed to fetch optional public TXID prior-tail artifact chunk"
+                ),
             }
         }
     }
 }
 
 impl TxidPublicCache<'_> {
-    fn cached_artifact_chunk(
+    pub(super) fn cached_artifact_chunk(
         &self,
         descriptor: &IndexedArtifactDescriptor,
     ) -> Option<VerifiedIndexedArtifactChunk> {
@@ -346,25 +466,6 @@ impl TxidPublicCache<'_> {
 }
 
 impl TxidPublicCacheWritePermit<'_> {
-    pub(super) fn retain_current_artifact_chunks(
-        &self,
-        chunks: &[VerifiedIndexedArtifactChunk],
-        from_index: u64,
-        latest_txid_index: Option<u64>,
-    ) -> Result<usize, TxidPublicCacheError> {
-        let current_chunks = chunks
-            .iter()
-            .filter(|chunk| {
-                chunk.descriptor.range.end >= from_index
-                    && latest_txid_index.is_none_or(|latest_txid_index| {
-                        chunk.descriptor.range.end < latest_txid_index
-                    })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        self.retain_artifact_chunks(&current_chunks)
-    }
-
     pub(super) fn retain_artifact_chunks(
         &self,
         chunks: &[VerifiedIndexedArtifactChunk],

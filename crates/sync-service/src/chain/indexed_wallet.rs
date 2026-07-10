@@ -11,7 +11,8 @@ use broadcaster_core::contracts::railgun::{
 
 use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
-    IndexedArtifactManifest, IndexedArtifactManifestClient, IndexedArtifactManifestError,
+    IndexedArtifactMaintenanceAdmission, IndexedArtifactMaintenanceKey, IndexedArtifactManifest,
+    IndexedArtifactManifestClient, IndexedArtifactManifestError, IndexedArtifactPlannedChunk,
     IndexedArtifactRange, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
     IndexedArtifactStreamCoverage, IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
     IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
@@ -388,11 +389,14 @@ impl IndexedWalletArtifactSession {
         let descriptors =
             Self::fetch_descriptors(&client, chain_entry, &scope, from_block, target_block).await?;
         let IndexedWalletArtifactDescriptorFetchResult {
-            chunk_descriptors,
-            chunk_retention_descriptors,
+            required_current_chunks,
             optional_prior_tail_retention,
             coverage,
         } = descriptors;
+        let chunk_descriptors = required_current_chunks
+            .iter()
+            .map(|entry| entry.descriptor.clone())
+            .collect::<Vec<_>>();
         let descriptor_elapsed_ms = descriptor_started.elapsed().as_millis();
         debug!(
             from_block,
@@ -408,22 +412,16 @@ impl IndexedWalletArtifactSession {
         );
         let indexed_chunk_descriptors: Vec<_> =
             chunk_descriptors.iter().cloned().enumerate().collect();
-        let chunks = Self::fetch_chunks(
-            &client,
-            &indexed_chunk_descriptors,
-            &chunk_retention_descriptors,
-            public_data_plane,
+        let chunks =
+            Self::fetch_chunks(&client, &indexed_chunk_descriptors, public_data_plane).await?;
+        Self::schedule_chunk_maintenance(
+            client,
+            &required_current_chunks,
+            optional_prior_tail_retention,
+            &chunks.chunks,
+            public_data_plane.clone(),
             read_scope,
-        )
-        .await?;
-        Self::retain_optional_prior_tail_chunks(
-            &client,
-            &optional_prior_tail_retention,
-            &chunk_retention_descriptors,
-            public_data_plane,
-            read_scope,
-        )
-        .await;
+        );
         debug!(
             from_block,
             to_block,
@@ -594,14 +592,16 @@ impl IndexedWalletArtifactSession {
                 .map_err(wallet_artifact_error)?;
             candidate_catalogs.push(catalog.into_stream_catalog());
         }
-        let plan =
-            Self::select_current_stream_plan(&candidate_catalogs, scope, from_block, target_block)?;
+        let plan = Self::select_current_stream_plan(
+            &candidate_catalogs,
+            &chain_entry.catalogs,
+            scope,
+            from_block,
+            target_block,
+        )?;
         let coverage = WalletScanArtifactCoverage::from_coverage(&plan.required_current_coverage)?;
-        let mut chunk_retention_descriptors = plan.required_current_chunks.clone();
-        chunk_retention_descriptors.extend_from_slice(&plan.optional_prior_tail_retention);
         Ok(IndexedWalletArtifactDescriptorFetchResult {
-            chunk_descriptors: plan.required_current_chunks,
-            chunk_retention_descriptors,
+            required_current_chunks: plan.required_current_chunks,
             optional_prior_tail_retention: plan.optional_prior_tail_retention,
             coverage,
         })
@@ -609,12 +609,14 @@ impl IndexedWalletArtifactSession {
 
     fn select_current_stream_plan(
         catalogs: &[IndexedArtifactStreamCatalog],
+        catalog_descriptors: &[IndexedArtifactDescriptor],
         scope: &ChainScope,
         from_block: u64,
         target_block: u64,
     ) -> Result<IndexedArtifactStreamPlan, SyncError> {
-        IndexedArtifactStreamPlan::plan(
+        IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
             catalogs,
+            catalog_descriptors,
             &IndexedArtifactStreamPlanRequest::new(
                 IndexedDatasetKind::WalletScan,
                 scope.clone(),
@@ -630,9 +632,7 @@ impl IndexedWalletArtifactSession {
     async fn fetch_chunks(
         client: &IndexedArtifactManifestClient,
         chunk_descriptors: &[(usize, IndexedArtifactDescriptor)],
-        chunk_retention_descriptors: &[IndexedArtifactDescriptor],
         public_data_plane: &ChainPublicDataPlane,
-        read_scope: PublicScanReadScope,
     ) -> Result<IndexedWalletArtifactChunkFetchResult, SyncError> {
         let descriptors: Vec<_> = chunk_descriptors
             .iter()
@@ -663,22 +663,10 @@ impl IndexedWalletArtifactSession {
             }
         }
         let fetch_verify_elapsed_ms = fetch_started.elapsed().as_millis();
-        let all_chunks: Vec<_> = indexed_chunks
-            .iter()
-            .map(|(_, chunk)| chunk.clone())
-            .collect();
-        let retained_chunks = public_data_plane
-            .retain_wallet_scan_artifact_chunks(
-                &all_chunks,
-                chunk_retention_descriptors,
-                read_scope,
-            )
-            .await;
         debug!(
             requested_chunks = descriptors.len(),
             cache_hits = descriptors.len().saturating_sub(missing_descriptors.len()),
             fetched_chunks = missing_descriptors.len(),
-            retained_chunks,
             "wallet-scan artifact chunks resolved through public cache"
         );
         let mut indexed_chunks: Vec<_> = indexed_chunks
@@ -699,35 +687,118 @@ impl IndexedWalletArtifactSession {
         })
     }
 
-    async fn retain_optional_prior_tail_chunks(
-        client: &IndexedArtifactManifestClient,
-        optional_descriptors: &[IndexedArtifactDescriptor],
-        chunk_retention_descriptors: &[IndexedArtifactDescriptor],
-        public_data_plane: &ChainPublicDataPlane,
+    fn schedule_chunk_maintenance(
+        client: IndexedArtifactManifestClient,
+        required_entries: &[IndexedArtifactPlannedChunk],
+        optional_entries: Vec<IndexedArtifactPlannedChunk>,
+        current_chunks: &[IndexedWalletArtifactChunk],
+        public_data_plane: ChainPublicDataPlane,
         read_scope: PublicScanReadScope,
     ) {
-        if optional_descriptors.is_empty() {
-            return;
-        }
-        match client.fetch_chunks_bounded(optional_descriptors).await {
-            Ok(chunks) => {
-                let retained = public_data_plane
-                    .retain_wallet_scan_artifact_chunks(
-                        &chunks,
-                        chunk_retention_descriptors,
-                        read_scope,
-                    )
-                    .await;
+        let stable_current_chunks = current_chunks
+            .iter()
+            .filter(|chunk| {
+                required_entries.iter().any(|entry| {
+                    entry.is_stable_current() && entry.descriptor == chunk.chunk.descriptor
+                }) && public_data_plane
+                    .cached_wallet_scan_artifact_chunk(&chunk.chunk.descriptor)
+                    .is_none()
+            })
+            .map(|chunk| chunk.chunk.clone())
+            .collect::<Vec<_>>();
+        for chunk in stable_current_chunks {
+            let key = IndexedArtifactMaintenanceKey::wallet_chunk(
+                &chunk.descriptor,
+                read_scope.epoch().value,
+            );
+            let retained_payload_bytes = chunk.bytes.len() as u64;
+            let descriptor = chunk.descriptor.clone();
+            let cid = descriptor.cid.clone();
+            let maintenance_plane = public_data_plane.clone();
+            let admission = public_data_plane.schedule_indexed_artifact_maintenance(
+                key,
+                retained_payload_bytes,
+                async move {
+                    if maintenance_plane
+                        .cached_wallet_scan_artifact_chunk(&descriptor)
+                        .is_some()
+                    {
+                        return;
+                    }
+                    let retained = maintenance_plane
+                        .retain_wallet_scan_artifact_chunks(
+                            std::slice::from_ref(&chunk),
+                            read_scope,
+                        )
+                        .await;
+                    debug!(retained, "retained stable wallet-scan artifact chunk");
+                },
+            );
+            if admission != IndexedArtifactMaintenanceAdmission::Admitted {
                 debug!(
-                    requested = optional_descriptors.len(),
-                    retained, "retained optional wallet-scan prior-tail artifact chunks"
+                    ?admission,
+                    cid = %cid,
+                    "stable wallet-scan artifact maintenance was not admitted"
                 );
             }
-            Err(err) => warn!(
-                ?err,
-                requested = optional_descriptors.len(),
-                "failed best-effort wallet-scan prior-tail artifact retention"
-            ),
+        }
+
+        for entry in optional_entries {
+            let descriptor = entry.descriptor;
+            if public_data_plane
+                .cached_wallet_scan_artifact_chunk(&descriptor)
+                .is_some()
+            {
+                continue;
+            }
+            let key =
+                IndexedArtifactMaintenanceKey::wallet_chunk(&descriptor, read_scope.epoch().value);
+            let maintenance_client = client.clone();
+            let maintenance_plane = public_data_plane.clone();
+            let admission = public_data_plane.schedule_indexed_artifact_maintenance(key, 0, {
+                let descriptor = descriptor.clone();
+                async move {
+                    if maintenance_plane
+                        .cached_wallet_scan_artifact_chunk(&descriptor)
+                        .is_some()
+                    {
+                        return;
+                    }
+                    match maintenance_client
+                        .fetch_chunks_bounded(std::slice::from_ref(&descriptor))
+                        .await
+                    {
+                        Ok(chunks) => {
+                            if maintenance_plane
+                                .cached_wallet_scan_artifact_chunk(&descriptor)
+                                .is_some()
+                            {
+                                return;
+                            }
+                            let retained = maintenance_plane
+                                .retain_wallet_scan_artifact_chunks(&chunks, read_scope)
+                                .await;
+                            debug!(
+                                retained,
+                                cid = %descriptor.cid,
+                                "retained optional wallet-scan prior-tail artifact chunk"
+                            );
+                        }
+                        Err(err) => warn!(
+                            ?err,
+                            cid = %descriptor.cid,
+                            "failed best-effort wallet-scan prior-tail artifact retention"
+                        ),
+                    }
+                }
+            });
+            if admission != IndexedArtifactMaintenanceAdmission::Admitted {
+                debug!(
+                    ?admission,
+                    cid = %descriptor.cid,
+                    "optional wallet-scan artifact maintenance was not admitted"
+                );
+            }
         }
     }
 }
@@ -744,9 +815,8 @@ struct IndexedWalletArtifactChunkFetchResult {
 }
 
 struct IndexedWalletArtifactDescriptorFetchResult {
-    chunk_descriptors: Vec<IndexedArtifactDescriptor>,
-    chunk_retention_descriptors: Vec<IndexedArtifactDescriptor>,
-    optional_prior_tail_retention: Vec<IndexedArtifactDescriptor>,
+    required_current_chunks: Vec<IndexedArtifactPlannedChunk>,
+    optional_prior_tail_retention: Vec<IndexedArtifactPlannedChunk>,
     coverage: WalletScanArtifactCoverage,
 }
 
@@ -1956,9 +2026,18 @@ mod tests {
             empty_wallet_scan_catalog(scope.clone(), 2, 100, 110),
         ];
 
-        let plan =
-            IndexedWalletArtifactSession::select_current_stream_plan(&catalogs, &scope, 100, 110)
-                .expect("empty replacement catalog should plan");
+        let catalog_descriptors = catalogs
+            .iter()
+            .map(|catalog| catalog.descriptor.clone())
+            .collect::<Vec<_>>();
+        let plan = IndexedWalletArtifactSession::select_current_stream_plan(
+            &catalogs,
+            &catalog_descriptors,
+            &scope,
+            100,
+            110,
+        )
+        .expect("empty replacement catalog should plan");
         assert!(plan.required_current_chunks.is_empty());
 
         let session = IndexedWalletArtifactSession {
@@ -1966,7 +2045,11 @@ mod tests {
                 latest_indexed_block: 110,
                 catalog_count: catalogs.len(),
             },
-            chunk_descriptors: plan.required_current_chunks,
+            chunk_descriptors: plan
+                .required_current_chunks
+                .into_iter()
+                .map(|entry| entry.descriptor)
+                .collect(),
             chunks: Vec::new(),
             coverage: WalletScanArtifactCoverage::from_coverage(&plan.required_current_coverage)
                 .expect("planner coverage"),
@@ -1980,6 +2063,37 @@ mod tests {
         assert_eq!(page.checkpoint_block, 110);
         assert_eq!(page.nullifier_rows, 0);
         assert!(page.nullifiers.is_empty());
+    }
+
+    #[test]
+    fn indexed_wallet_planner_uses_non_intersecting_manifest_catalog_context() {
+        let scope = scope();
+        let current = with_catalog_generation(
+            wallet_scan_chunk(
+                scope.clone(),
+                100,
+                110,
+                vec![(
+                    WALLET_NULLIFIER_SECTION_ID,
+                    nullifier_section(105, 7, [0x11; 32]),
+                )],
+                1,
+            ),
+            1,
+        );
+        let current_catalog = wallet_scan_catalog(1, vec![current.descriptor]);
+        let successor_catalog = empty_wallet_scan_catalog(scope.clone(), 1, 200, 210).descriptor;
+
+        let plan = IndexedWalletArtifactSession::select_current_stream_plan(
+            std::slice::from_ref(&current_catalog),
+            &[current_catalog.descriptor.clone(), successor_catalog],
+            &scope,
+            100,
+            110,
+        )
+        .expect("manifest successor context should plan without fetching its catalog body");
+
+        assert!(plan.required_current_chunks[0].is_stable_current());
     }
 
     #[test]
@@ -2452,8 +2566,13 @@ mod tests {
             .scope
             .clone();
         let catalogs = stream_catalogs_for_chunks(chunks);
+        let catalog_descriptors = catalogs
+            .iter()
+            .map(|catalog| catalog.descriptor.clone())
+            .collect::<Vec<_>>();
         let selected = IndexedWalletArtifactSession::select_current_stream_plan(
             &catalogs,
+            &catalog_descriptors,
             &scope,
             from_block,
             target_block,
@@ -2461,10 +2580,10 @@ mod tests {
         .required_current_chunks;
         Ok(selected
             .into_iter()
-            .map(|descriptor| {
+            .map(|entry| {
                 chunks
                     .iter()
-                    .find(|chunk| chunk.descriptor == descriptor)
+                    .find(|chunk| chunk.descriptor == entry.descriptor)
                     .expect("selected descriptor has chunk bytes")
                     .clone()
             })

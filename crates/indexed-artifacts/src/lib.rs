@@ -518,14 +518,51 @@ impl IndexedArtifactStreamCoverage {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexedArtifactStreamPlan {
-    pub required_current_chunks: Vec<IndexedArtifactDescriptor>,
+    pub required_current_chunks: Vec<IndexedArtifactPlannedChunk>,
     pub required_current_coverage: Vec<IndexedArtifactStreamCoverage>,
-    pub optional_prior_tail_retention: Vec<IndexedArtifactDescriptor>,
+    pub optional_prior_tail_retention: Vec<IndexedArtifactPlannedChunk>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedArtifactPlannedChunkPlacement {
+    CurrentStable,
+    CurrentTransient,
+    OptionalPriorTail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedArtifactPlannedChunk {
+    pub descriptor: IndexedArtifactDescriptor,
+    pub stream: IndexedArtifactStreamIdentity,
+    pub placement: IndexedArtifactPlannedChunkPlacement,
+}
+
+impl IndexedArtifactPlannedChunk {
+    #[must_use]
+    pub const fn descriptor(&self) -> &IndexedArtifactDescriptor {
+        &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn is_stable_current(&self) -> bool {
+        matches!(
+            self.placement,
+            IndexedArtifactPlannedChunkPlacement::CurrentStable
+        )
+    }
 }
 
 impl IndexedArtifactStreamPlan {
     pub fn plan(
         catalogs: &[IndexedArtifactStreamCatalog],
+        request: &IndexedArtifactStreamPlanRequest,
+    ) -> Result<Self, IndexedArtifactStreamPlanError> {
+        Self::plan_with_catalog_descriptor_context(catalogs, &[], request)
+    }
+
+    pub fn plan_with_catalog_descriptor_context(
+        catalogs: &[IndexedArtifactStreamCatalog],
+        catalog_descriptors: &[IndexedArtifactDescriptor],
         request: &IndexedArtifactStreamPlanRequest,
     ) -> Result<Self, IndexedArtifactStreamPlanError> {
         if request.start > request.end {
@@ -590,6 +627,32 @@ impl IndexedArtifactStreamPlan {
                     ));
             }
         }
+        for descriptor in catalog_descriptors.iter().filter(|descriptor| {
+            descriptor.matches(request.dataset_kind, &request.scope, request.range_kind)
+                && request.partition_policy.matches_descriptor(descriptor)
+        }) {
+            if descriptor.range.start > descriptor.range.end {
+                return Err(IndexedArtifactStreamPlanError::InvalidDescriptorRange {
+                    cid: descriptor.cid.clone(),
+                    start: descriptor.range.start,
+                    end: descriptor.range.end,
+                });
+            }
+            let generation = descriptor.metadata.catalog_generation.ok_or_else(|| {
+                IndexedArtifactStreamPlanError::MissingCatalogGeneration {
+                    cid: descriptor.cid.clone(),
+                }
+            })?;
+            let stream_key = ArtifactStreamKey::from_descriptor(descriptor);
+            streams
+                .entry(stream_key)
+                .or_default()
+                .catalog_boundaries
+                .push(StreamCatalogBoundary {
+                    generation,
+                    start: descriptor.range.start,
+                });
+        }
 
         let mut required_current_chunks = Vec::new();
         let mut required_current_coverage = Vec::new();
@@ -601,9 +664,11 @@ impl IndexedArtifactStreamPlan {
             optional_prior_tail_retention.extend(stream_plan.optional_prior_tail_retention);
         }
 
-        required_current_chunks.sort_by(cmp_descriptor);
+        required_current_chunks
+            .sort_by(|left, right| cmp_descriptor(&left.descriptor, &right.descriptor));
         required_current_coverage.sort_by(cmp_stream_coverage);
-        optional_prior_tail_retention.sort_by(cmp_descriptor);
+        optional_prior_tail_retention
+            .sort_by(|left, right| cmp_descriptor(&left.descriptor, &right.descriptor));
         Ok(Self {
             required_current_chunks,
             required_current_coverage,
@@ -613,16 +678,16 @@ impl IndexedArtifactStreamPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtifactStreamKey {
-    dataset_kind: IndexedDatasetKind,
-    chain_type: ChainType,
-    chain_id: u64,
-    railgun_contract: Address,
-    range_kind: IndexedArtifactRangeKind,
-    partition: Option<String>,
+pub struct IndexedArtifactStreamIdentity {
+    pub dataset_kind: IndexedDatasetKind,
+    pub chain_type: ChainType,
+    pub chain_id: u64,
+    pub railgun_contract: Address,
+    pub range_kind: IndexedArtifactRangeKind,
+    pub partition: Option<String>,
 }
 
-impl ArtifactStreamKey {
+impl IndexedArtifactStreamIdentity {
     fn from_descriptor(descriptor: &IndexedArtifactDescriptor) -> Self {
         Self {
             dataset_kind: descriptor.dataset_kind,
@@ -681,7 +746,7 @@ impl ArtifactStreamKey {
     }
 }
 
-impl Ord for ArtifactStreamKey {
+impl Ord for IndexedArtifactStreamIdentity {
     fn cmp(&self, other: &Self) -> Ordering {
         dataset_kind_order(self.dataset_kind)
             .cmp(&dataset_kind_order(other.dataset_kind))
@@ -701,11 +766,13 @@ impl Ord for ArtifactStreamKey {
     }
 }
 
-impl PartialOrd for ArtifactStreamKey {
+impl PartialOrd for IndexedArtifactStreamIdentity {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
+type ArtifactStreamKey = IndexedArtifactStreamIdentity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StreamPlanEntry {
@@ -729,8 +796,12 @@ impl StreamPlanEntry {
         }
     }
 
-    fn mark_final(entries: &mut [Self]) {
-        if let Some(final_entry) = entries.last_mut() {
+    fn mark_final(entries: &mut [Self], catalog_boundaries: &[StreamCatalogBoundary]) {
+        if let Some(final_entry) = entries.last_mut()
+            && !catalog_boundaries
+                .iter()
+                .any(|boundary| boundary.start > final_entry.descriptor.range.end)
+        {
             final_entry.final_in_generation = true;
         }
     }
@@ -798,12 +869,30 @@ impl StreamPlanEntry {
                     && other.descriptor.range.start > self.descriptor.range.end
             })
     }
+
+    fn into_planned(
+        self,
+        placement: IndexedArtifactPlannedChunkPlacement,
+    ) -> IndexedArtifactPlannedChunk {
+        IndexedArtifactPlannedChunk {
+            descriptor: self.descriptor,
+            stream: self.stream_key,
+            placement,
+        }
+    }
 }
 
 #[derive(Default)]
 struct StreamPlanInput {
     entries: Vec<StreamPlanEntry>,
     coverage: Vec<StreamCoverageEntry>,
+    catalog_boundaries: Vec<StreamCatalogBoundary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamCatalogBoundary {
+    generation: u64,
+    start: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -934,6 +1023,14 @@ impl<'a> ArtifactStreamPlanner<'a> {
         for generation in coverage_by_generation.keys() {
             by_generation.entry(*generation).or_default();
         }
+        let mut boundaries_by_generation: BTreeMap<u64, Vec<StreamCatalogBoundary>> =
+            BTreeMap::new();
+        for boundary in input.catalog_boundaries {
+            boundaries_by_generation
+                .entry(boundary.generation)
+                .or_default()
+                .push(boundary);
+        }
 
         for (generation, mut generation_entries) in by_generation {
             let mut generation_coverage = coverage_by_generation
@@ -948,7 +1045,10 @@ impl<'a> ArtifactStreamPlanner<'a> {
             planner
                 .stream_key
                 .validate_generation_coverage_ranges(generation, &generation_coverage)?;
-            StreamPlanEntry::mark_final(&mut generation_entries);
+            let generation_boundaries = boundaries_by_generation
+                .get(&generation)
+                .map_or(&[][..], Vec::as_slice);
+            StreamPlanEntry::mark_final(&mut generation_entries, generation_boundaries);
 
             for entry in generation_entries {
                 planner.apply_entry(entry)?;
@@ -1174,14 +1274,23 @@ impl<'a> ArtifactStreamPlanner<'a> {
                 .range
                 .intersects(self.request.start, self.request.end)
             {
-                required_current_chunks.push(entry.descriptor.clone());
+                let placement = if entry.is_currently_stable(&self.current) {
+                    IndexedArtifactPlannedChunkPlacement::CurrentStable
+                } else {
+                    IndexedArtifactPlannedChunkPlacement::CurrentTransient
+                };
+                required_current_chunks.push(entry.clone().into_planned(placement));
                 required_current_coverage.push(IndexedArtifactStreamCoverage::from_descriptor(
                     &entry.descriptor,
                 ));
             } else if entry.descriptor.range.end < self.request.start
                 && entry.is_retainable_prior_tail(&self.current)
             {
-                optional_prior_tail_retention.push(entry.descriptor.clone());
+                optional_prior_tail_retention.push(
+                    entry
+                        .clone()
+                        .into_planned(IndexedArtifactPlannedChunkPlacement::OptionalPriorTail),
+                );
             }
         }
         required_current_coverage.extend(
@@ -3114,6 +3223,157 @@ mod tests {
 
         assert_eq!(required_cids(&plan), vec![current_tail.cid.clone()]);
         assert_eq!(optional_cids(&plan), vec![old_tail.cid.clone()]);
+        assert_eq!(
+            plan.optional_prior_tail_retention[0].placement,
+            IndexedArtifactPlannedChunkPlacement::OptionalPriorTail
+        );
+    }
+
+    #[test]
+    fn stream_planner_classifies_current_chunk_stability() {
+        let transient_tail = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            10,
+            19,
+            1,
+        );
+        let request = StreamFixture::request(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            0,
+            19,
+        );
+
+        let transient_plan = plan_from_descriptors(std::slice::from_ref(&transient_tail), &request)
+            .expect("plan transient final chunk");
+        assert_eq!(
+            transient_plan.required_current_chunks[0].placement,
+            IndexedArtifactPlannedChunkPlacement::CurrentTransient
+        );
+
+        for stable_tail in [
+            transient_tail.clone().sealed(),
+            transient_tail.clone().complete(),
+        ] {
+            let stable_plan = plan_from_descriptors(std::slice::from_ref(&stable_tail), &request)
+                .expect("plan explicitly stable final chunk");
+            assert_eq!(
+                stable_plan.required_current_chunks[0].placement,
+                IndexedArtifactPlannedChunkPlacement::CurrentStable
+            );
+        }
+
+        let first = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            0,
+            9,
+            1,
+        );
+        let non_final_plan = plan_from_descriptors(&[first.clone(), transient_tail], &request)
+            .expect("plan non-final current chunk");
+        assert_eq!(
+            non_final_plan.required_current_chunks[0].descriptor.cid,
+            first.cid
+        );
+        assert_eq!(
+            non_final_plan.required_current_chunks[0].placement,
+            IndexedArtifactPlannedChunkPlacement::CurrentStable
+        );
+    }
+
+    #[test]
+    fn stream_planner_uses_adjacent_catalog_descriptor_as_stability_context() {
+        let current = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            0,
+            9,
+            1,
+        )
+        .partition("list-a");
+        let current_catalog = catalog_with_range(1, 0, 9, vec![current]);
+        let successor_catalog = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            10,
+            19,
+            1,
+        )
+        .partition("list-a");
+        let request = StreamFixture::partitioned_request(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            0,
+            9,
+            "list-a",
+        );
+
+        let plan = IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
+            std::slice::from_ref(&current_catalog),
+            &[current_catalog.descriptor.clone(), successor_catalog],
+            &request,
+        )
+        .expect("same-generation successor catalog stabilizes the current tail");
+
+        assert_eq!(
+            plan.required_current_chunks[0].placement,
+            IndexedArtifactPlannedChunkPlacement::CurrentStable
+        );
+
+        let other_partition_successor = StreamFixture::descriptor(
+            IndexedDatasetKind::PublicTxid,
+            IndexedArtifactRangeKind::TxidIndex,
+            10,
+            19,
+            1,
+        )
+        .partition("list-b");
+        let exact_partition_plan = IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
+            std::slice::from_ref(&current_catalog),
+            &[
+                current_catalog.descriptor.clone(),
+                other_partition_successor,
+            ],
+            &request,
+        )
+        .expect("other-partition context remains independently plannable");
+        assert_eq!(
+            exact_partition_plan.required_current_chunks[0].placement,
+            IndexedArtifactPlannedChunkPlacement::CurrentTransient
+        );
+
+        let wallet_current = StreamFixture::descriptor(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            100,
+            110,
+            1,
+        );
+        let wallet_catalog = catalog_with_range(1, 100, 110, vec![wallet_current]);
+        let wallet_successor = StreamFixture::descriptor(
+            IndexedDatasetKind::WalletScan,
+            IndexedArtifactRangeKind::Block,
+            200,
+            210,
+            1,
+        );
+        let sparse_wallet_plan = IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
+            std::slice::from_ref(&wallet_catalog),
+            &[wallet_catalog.descriptor.clone(), wallet_successor],
+            &StreamFixture::request(
+                IndexedDatasetKind::WalletScan,
+                IndexedArtifactRangeKind::Block,
+                100,
+                110,
+            ),
+        )
+        .expect("sparse wallet successor context remains plannable");
+        assert_eq!(
+            sparse_wallet_plan.required_current_chunks[0].placement,
+            IndexedArtifactPlannedChunkPlacement::CurrentStable
+        );
     }
 
     #[test]
@@ -3605,6 +3865,10 @@ mod tests {
         .expect("partitioned TXID stream remains independently plannable");
 
         assert_eq!(required_cids(&plan), vec![txid_partition_a.cid.clone()]);
+        assert_eq!(
+            plan.required_current_chunks[0].stream.partition.as_deref(),
+            Some("list-a")
+        );
         assert_non_overlapping_by_partition(&plan.required_current_chunks);
 
         let plan = plan_from_descriptors(
@@ -3892,7 +4156,7 @@ mod tests {
     fn required_cids(plan: &IndexedArtifactStreamPlan) -> Vec<String> {
         plan.required_current_chunks
             .iter()
-            .map(|descriptor| descriptor.cid.clone())
+            .map(|entry| entry.descriptor.cid.clone())
             .collect()
     }
 
@@ -3906,32 +4170,38 @@ mod tests {
     fn optional_cids(plan: &IndexedArtifactStreamPlan) -> Vec<String> {
         plan.optional_prior_tail_retention
             .iter()
-            .map(|descriptor| descriptor.cid.clone())
+            .map(|entry| entry.descriptor.cid.clone())
             .collect()
     }
 
-    fn assert_non_overlapping(descriptors: &[IndexedArtifactDescriptor]) {
-        for window in descriptors.windows(2) {
+    fn assert_non_overlapping(entries: &[IndexedArtifactPlannedChunk]) {
+        for window in entries.windows(2) {
             assert!(
-                !window[0]
-                    .range
-                    .intersects(window[1].range.start, window[1].range.end),
+                !window[0].descriptor.range.intersects(
+                    window[1].descriptor.range.start,
+                    window[1].descriptor.range.end,
+                ),
                 "required current chunks overlap: {:?} and {:?}",
-                window[0].range,
-                window[1].range
+                window[0].descriptor.range,
+                window[1].descriptor.range
             );
         }
     }
 
-    fn assert_non_overlapping_by_partition(descriptors: &[IndexedArtifactDescriptor]) {
-        for (index, left) in descriptors.iter().enumerate() {
-            for right in descriptors.iter().skip(index + 1) {
-                if left.metadata.stream_partition == right.metadata.stream_partition {
+    fn assert_non_overlapping_by_partition(entries: &[IndexedArtifactPlannedChunk]) {
+        for (index, left) in entries.iter().enumerate() {
+            for right in entries.iter().skip(index + 1) {
+                if left.descriptor.metadata.stream_partition
+                    == right.descriptor.metadata.stream_partition
+                {
                     assert!(
-                        !left.range.intersects(right.range.start, right.range.end),
+                        !left
+                            .descriptor
+                            .range
+                            .intersects(right.descriptor.range.start, right.descriptor.range.end,),
                         "same partition required current chunks overlap: {:?} and {:?}",
-                        left.range,
-                        right.range
+                        left.descriptor.range,
+                        right.descriptor.range
                     );
                 }
             }

@@ -28,9 +28,9 @@ use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
@@ -201,6 +201,59 @@ async fn txid_public_cache_isolates_contracts_on_the_same_chain_and_db() {
         ),
         Err(super::TxidPublicCacheError::MissingTarget)
     ));
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_stable_maintenance_rechecks_cache_before_rewriting() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let row = indexed_transaction(0x31, 0x02, 0x01, 0x03);
+    let chunk = public_txid_artifact_chunk(
+        0,
+        std::slice::from_ref(&row),
+        Some(root_for_single_leaf(row.txid_leaf_hash())),
+    );
+    let read_scope = cache.begin_write().await.scope();
+
+    super::artifact::TxidPublicArtifactMaintenance::retain_stable_chunk(
+        &cache,
+        chunk.clone(),
+        read_scope,
+    )
+    .await;
+    let id = super::artifact_chunk_blob_id(key, &chunk.descriptor.cid);
+    let mut meta = db
+        .get_blob_meta(super::TXID_CACHE_BLOB_KIND, &id)
+        .expect("read retained artifact metadata")
+        .expect("stable artifact retained");
+    meta.updated_at = 1;
+    db.put_blob_meta(super::TXID_CACHE_BLOB_KIND, &id, &meta)
+        .expect("mark retained metadata");
+
+    super::artifact::TxidPublicArtifactMaintenance::retain_stable_chunk(&cache, chunk, read_scope)
+        .await;
+
+    assert_eq!(
+        db.get_blob_meta(super::TXID_CACHE_BLOB_KIND, &id)
+            .expect("reread retained artifact metadata")
+            .expect("stable artifact remains retained")
+            .updated_at,
+        1,
+        "overlapping maintenance must not rewrite existing file metadata"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -1760,6 +1813,67 @@ async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
 }
 
 #[tokio::test]
+async fn txid_public_planner_uses_non_intersecting_manifest_catalog_context() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let row = indexed_transaction(0x61, 0x02, 0x01, 0x03);
+    let root = root_for_single_leaf(row.txid_leaf_hash());
+    let current = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
+    let missing_catalog_bytes = b"authenticated successor catalog descriptor";
+    let successor_descriptor = IndexedArtifactDescriptor {
+        dataset_kind: IndexedDatasetKind::PublicTxid,
+        scope: artifact_scope(),
+        range: IndexedArtifactRange {
+            kind: IndexedArtifactRangeKind::TxidIndex,
+            start: 1,
+            end: 1,
+        },
+        row_count: 1,
+        cid: raw_cid(missing_catalog_bytes).to_string(),
+        sha256: prefixed_sha256(missing_catalog_bytes),
+        byte_size: missing_catalog_bytes.len() as u64,
+        encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+        compression: CompressionAlgorithm::None,
+        metadata: DatasetDescriptorMetadata {
+            catalog_generation: Some(1),
+            stream_partition: Some(TEST_TXID_VERSION.to_string()),
+            ..DatasetDescriptorMetadata::default()
+        },
+    };
+    let (config, _server) = public_txid_artifact_source_with_extra_catalogs(
+        vec![(1, vec![current])],
+        vec![successor_descriptor],
+    );
+    let source = super::artifact::TxidPublicArtifactSource::new(
+        &config,
+        None,
+        artifact_scope(),
+        TEST_TXID_VERSION,
+    );
+
+    let plan = source
+        .fetch_current_chunks(&cache, 0, Some(0))
+        .await
+        .expect("successor descriptor should not require its catalog body");
+
+    assert_eq!(plan.required.len(), 1);
+    assert_eq!(plan.stable_current.len(), 1);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -1955,7 +2069,209 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
 }
 
 #[tokio::test]
-async fn txid_public_validated_artifact_retains_non_final_current_chunk() {
+async fn txid_public_background_does_not_retain_unsealed_final_chunk() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let row = indexed_transaction(0x76, 0x02, 0x01, 0x03);
+    let root = root_for_single_leaf(row.txid_leaf_hash());
+    let chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
+    let cid = raw_cid(&chunk.bytes).to_string();
+    let (source, _server) = public_txid_artifact_source(vec![chunk]);
+
+    assert_eq!(
+        cache
+            .sync_to_indexed_tip(None, None, Some(&source))
+            .await
+            .expect("background artifact sync"),
+        1
+    );
+
+    assert!(
+        db.get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &cid),
+        )
+        .expect("read transient chunk metadata")
+        .is_none(),
+        "planner-classified transient final chunks must not be retained"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_validated_retains_explicitly_stable_final_at_exact_marker() {
+    for stream_complete in [false, true] {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let key = TxidPublicCacheKey {
+            chain_type: 0,
+            chain_id: 1,
+            railgun_contract: artifact_scope().railgun_contract,
+            txid_version: TEST_TXID_VERSION,
+        };
+        let cache = TxidPublicCache::new(&db, key);
+        let row = indexed_transaction(0x77 + u8::from(stream_complete), 0x02, 0x01, 0x03);
+        let root = root_for_single_leaf(row.txid_leaf_hash());
+        let mut chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
+        chunk.descriptor.metadata.stream_complete = stream_complete;
+        chunk.descriptor.metadata.chunk_sealed = !stream_complete;
+        let cid = raw_cid(&chunk.bytes).to_string();
+        let (source, _server) = public_txid_artifact_source(vec![chunk]);
+
+        cache
+            .sync_with_artifact_source(
+                None,
+                None,
+                TxidPublicLatestValidated {
+                    txid_index: 0,
+                    merkleroot: Some(root),
+                },
+                Some(&source),
+            )
+            .await
+            .expect("validated explicitly stable artifact sync");
+
+        assert!(
+            db.get_blob_meta(
+                super::TXID_CACHE_BLOB_KIND,
+                &super::artifact_chunk_blob_id(key, &cid),
+            )
+            .expect("read stable final chunk metadata")
+            .is_some(),
+            "sealed and complete final chunks are retained at the exact validated marker"
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn txid_public_second_unchanged_cycle_fetches_no_chunks() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x79, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x7a, 0x04, 0x05, 0x06);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let first_path = ipfs_car_path(&raw_cid(&first_chunk.bytes));
+    let second_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let second_path = ipfs_car_path(&raw_cid(&second_chunk.bytes));
+    let (source, server) = public_txid_artifact_source(vec![first_chunk, second_chunk]);
+
+    cache
+        .sync_to_indexed_tip(None, None, Some(&source))
+        .await
+        .expect("first background cycle");
+    let first_requests = server.request_count(&first_path);
+    let second_requests = server.request_count(&second_path);
+    let catalog_requests =
+        server.request_count_excluding(&["/manifest", first_path.as_str(), second_path.as_str()]);
+
+    assert_eq!(
+        cache
+            .sync_to_indexed_tip(None, None, Some(&source))
+            .await
+            .expect("second background cycle"),
+        0
+    );
+    assert_eq!(server.request_count(&first_path), first_requests);
+    assert_eq!(server.request_count(&second_path), second_requests);
+    assert!(
+        server.request_count_excluding(&["/manifest", first_path.as_str(), second_path.as_str(),])
+            > catalog_requests,
+        "the unchanged cycle still inspects catalogs"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_corrupt_retained_blob_is_refetched() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
+        txid_version: TEST_TXID_VERSION,
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let first = indexed_transaction(0x7b, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x7c, 0x04, 0x05, 0x06);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let first_bytes = first_chunk.bytes.clone();
+    let first_cid = raw_cid(&first_bytes).to_string();
+    let first_path = ipfs_car_path(&raw_cid(&first_bytes));
+    let second_chunk =
+        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
+    let (source, server) = public_txid_artifact_source(vec![first_chunk, second_chunk]);
+
+    cache
+        .sync_to_indexed_tip(None, None, Some(&source))
+        .await
+        .expect("seed retained stable chunk");
+    let meta = db
+        .get_blob_meta(
+            super::TXID_CACHE_BLOB_KIND,
+            &super::artifact_chunk_blob_id(key, &first_cid),
+        )
+        .expect("read retained chunk metadata")
+        .expect("stable first chunk retained");
+    let retained_path = db.resolve_path(&meta.relative_path);
+    fs::write(&retained_path, b"corrupt").expect("corrupt retained chunk");
+    let requests_before = server.request_count(&first_path);
+
+    cache
+        .sync_to_indexed_tip(None, None, Some(&source))
+        .await
+        .expect("corrupt optional chunk refetched");
+
+    assert_eq!(server.request_count(&first_path), requests_before + 1);
+    assert_eq!(
+        fs::read(retained_path).expect("read repaired retained chunk"),
+        first_bytes
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_validated_artifact_retains_planner_stable_non_final_bounded_chunk() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3865,6 +4181,7 @@ fn write_varint(mut value: usize, out: &mut Vec<u8>) {
 
 struct PathServer {
     url: Url,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl PathServer {
@@ -3877,22 +4194,51 @@ impl PathServer {
         .expect("mock server URL");
         let request_count = routes.len().saturating_mul(8);
         let routes = Arc::new(routes);
+        let requests = Arc::new(Mutex::new(Vec::new()));
         std::thread::spawn({
             let routes = Arc::clone(&routes);
+            let requests = Arc::clone(&requests);
             move || {
                 for _ in 0..request_count {
                     let (stream, _) = listener.accept().expect("accept request");
                     let routes = Arc::clone(&routes);
-                    std::thread::spawn(move || handle_path_request(stream, routes));
+                    let requests = Arc::clone(&requests);
+                    std::thread::spawn(move || handle_path_request(stream, routes, requests));
                 }
             }
         });
-        Self { url }
+        Self { url, requests }
+    }
+
+    fn request_count(&self, path: &str) -> usize {
+        self.requests
+            .lock()
+            .expect("path server request lock")
+            .iter()
+            .filter(|request| request.as_str() == path)
+            .count()
+    }
+
+    fn request_count_excluding(&self, excluded: &[&str]) -> usize {
+        self.requests
+            .lock()
+            .expect("path server request lock")
+            .iter()
+            .filter(|request| !excluded.contains(&request.as_str()))
+            .count()
     }
 }
 
-fn handle_path_request(mut stream: std::net::TcpStream, routes: Arc<HashMap<String, Vec<u8>>>) {
+fn handle_path_request(
+    mut stream: std::net::TcpStream,
+    routes: Arc<HashMap<String, Vec<u8>>>,
+    requests: Arc<Mutex<Vec<String>>>,
+) {
     let path = read_request_path(&mut stream);
+    requests
+        .lock()
+        .expect("path server request lock")
+        .push(path.clone());
     let (status, reason, body) = routes
         .get(&path)
         .map_or((404_u16, "NOT FOUND", Vec::new()), |body| {

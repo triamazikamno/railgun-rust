@@ -1912,7 +1912,7 @@ impl ChainService {
             let _ = handle.mark_stopping();
         }
         self.cancel.cancel();
-        self.public_data_plane.shutdown();
+        self.public_data_plane.shutdown().await;
         await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;
     }
 

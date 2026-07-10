@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::indexed_artifacts::{
-    ChainScope, ChainType, IndexedArtifactDescriptor, IndexedArtifactRangeKind, IndexedDatasetKind,
-    VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
+    ChainScope, ChainType, IndexedArtifactDescriptor, IndexedArtifactMaintenanceAdmission,
+    IndexedArtifactMaintenanceKey, IndexedArtifactMaintenanceScheduler, IndexedArtifactRangeKind,
+    IndexedDatasetKind, VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
 };
 use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
 use crate::poi_cache::PoiCacheService;
@@ -609,6 +610,7 @@ pub(crate) struct ChainPublicDataPlane {
     epoch: Arc<AtomicU64>,
     state: Arc<Mutex<ChainPublicDataPlaneState>>,
     commit_fence: Arc<Mutex<()>>,
+    indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler,
     poi_cache_service: Option<Arc<PoiCacheService>>,
     #[cfg(test)]
     indexed_wallet_page_test_block: Arc<Mutex<Option<IndexedWalletPageTestBlock>>>,
@@ -622,6 +624,7 @@ impl ChainPublicDataPlane {
             epoch,
             state: Arc::new(Mutex::new(ChainPublicDataPlaneState::default())),
             commit_fence: Arc::new(Mutex::new(())),
+            indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler::new(),
             poi_cache_service: None,
             #[cfg(test)]
             indexed_wallet_page_test_block: Arc::new(Mutex::new(None)),
@@ -634,10 +637,28 @@ impl ChainPublicDataPlane {
         self
     }
 
-    pub(crate) fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
+        self.indexed_artifact_maintenance.shutdown().await;
         if let Some(service) = self.poi_cache_service.as_ref() {
             service.shutdown();
         }
+    }
+
+    pub(crate) fn schedule_indexed_artifact_maintenance<F>(
+        &self,
+        key: IndexedArtifactMaintenanceKey,
+        retained_payload_bytes: u64,
+        job: F,
+    ) -> IndexedArtifactMaintenanceAdmission
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.indexed_artifact_maintenance
+            .try_schedule(key, retained_payload_bytes, job)
+    }
+
+    pub(crate) fn indexed_artifact_maintenance(&self) -> IndexedArtifactMaintenanceScheduler {
+        self.indexed_artifact_maintenance.clone()
     }
 
     #[must_use]
@@ -860,11 +881,13 @@ impl ChainPublicDataPlane {
     ) -> Result<(), TxidPublicCacheError> {
         let cache = TxidPublicCache::new(self.db.as_ref(), request.key.as_cache_key());
         cache
-            .sync_with_artifact_source(
+            .sync_with_artifact_source_maintained(
                 request.endpoint,
                 request.http_client,
                 request.latest.into(),
                 request.indexed_artifact_source,
+                &self.indexed_artifact_maintenance,
+                Arc::clone(&self.db),
             )
             .await
     }
@@ -969,7 +992,6 @@ impl ChainPublicDataPlane {
     pub(crate) async fn retain_wallet_scan_artifact_chunks(
         &self,
         chunks: &[VerifiedIndexedArtifactChunk],
-        retention_descriptors: &[IndexedArtifactDescriptor],
         read_scope: PublicScanReadScope,
     ) -> usize {
         let Ok(_permit) = self
@@ -983,7 +1005,12 @@ impl ChainPublicDataPlane {
         };
         let mut retained = 0_usize;
         for chunk in chunks {
-            if !wallet_scan_artifact_descriptor_is_stable(&chunk.descriptor, retention_descriptors)
+            if !wallet_scan_artifact_descriptor_matches_cache_kind(&chunk.descriptor) {
+                continue;
+            }
+            if self
+                .cached_wallet_scan_artifact_chunk(&chunk.descriptor)
+                .is_some()
             {
                 continue;
             }
@@ -1283,31 +1310,6 @@ fn wallet_scan_artifact_descriptor_matches_cache_kind(
         && descriptor.range.kind == IndexedArtifactRangeKind::Block
 }
 
-fn wallet_scan_artifact_descriptor_is_stable(
-    descriptor: &IndexedArtifactDescriptor,
-    selected_descriptors: &[IndexedArtifactDescriptor],
-) -> bool {
-    if !wallet_scan_artifact_descriptor_matches_cache_kind(descriptor) {
-        return false;
-    }
-    if descriptor.metadata.chunk_sealed || descriptor.metadata.stream_complete {
-        return true;
-    }
-    selected_descriptors.iter().any(|other| {
-        wallet_scan_artifact_same_stream(descriptor, other)
-            && other.range.start > descriptor.range.start
-    })
-}
-
-fn wallet_scan_artifact_same_stream(
-    left: &IndexedArtifactDescriptor,
-    right: &IndexedArtifactDescriptor,
-) -> bool {
-    left.dataset_kind == right.dataset_kind
-        && left.scope == right.scope
-        && left.range.kind == right.range.kind
-}
-
 fn wallet_scan_artifact_chunk_blob_id(descriptor: &IndexedArtifactDescriptor) -> String {
     format!(
         "{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
@@ -1526,7 +1528,7 @@ mod tests {
             "the registry fast path must not expose the old-generation corpus"
         );
 
-        data_plane.shutdown();
+        data_plane.shutdown().await;
         reset_service.shutdown();
         drop(data_plane);
         drop(reset_service);
@@ -1940,7 +1942,6 @@ mod tests {
             data_plane
                 .retain_wallet_scan_artifact_chunks(
                     std::slice::from_ref(&wallet_scan_chunk),
-                    std::slice::from_ref(&wallet_scan_chunk.descriptor),
                     data_plane.begin_public_scan_read(),
                 )
                 .await,
@@ -1996,19 +1997,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_scan_artifact_chunk_cache_reuses_only_stable_descriptor_matches() {
+    async fn wallet_scan_artifact_chunk_cache_retains_only_planner_selected_chunks() {
         let (db, data_plane, root_dir) = test_data_plane_with_db("wallet-scan-chunk-cache");
         let stable_chunk = test_wallet_scan_chunk(1, 10, &[1, 2, 3], |_| {});
         let transient_tail = test_wallet_scan_chunk(11, 20, &[4, 5, 6], |_| {});
-        let selected = vec![
-            stable_chunk.descriptor.clone(),
-            transient_tail.descriptor.clone(),
-        ];
-
         let retained = data_plane
             .retain_wallet_scan_artifact_chunks(
-                &[stable_chunk.clone(), transient_tail.clone()],
-                &selected,
+                std::slice::from_ref(&stable_chunk),
                 data_plane.begin_public_scan_read(),
             )
             .await;
@@ -2044,7 +2039,6 @@ mod tests {
             data_plane
                 .retain_wallet_scan_artifact_chunks(
                     std::slice::from_ref(&sealed_tail),
-                    std::slice::from_ref(&sealed_tail.descriptor),
                     data_plane.begin_public_scan_read(),
                 )
                 .await,
@@ -2057,21 +2051,16 @@ mod tests {
             "explicitly sealed final chunks are retained"
         );
 
-        let context_only_successor = test_wallet_scan_chunk(41, 50, &[10, 11, 12], |_| {});
         let predecessor = test_wallet_scan_chunk(31, 40, &[13, 14, 15], |_| {});
         assert_eq!(
             data_plane
                 .retain_wallet_scan_artifact_chunks(
                     std::slice::from_ref(&predecessor),
-                    &[
-                        predecessor.descriptor.clone(),
-                        context_only_successor.descriptor.clone(),
-                    ],
                     data_plane.begin_public_scan_read(),
                 )
                 .await,
             1,
-            "planner retention context may include chunks outside the request"
+            "planner-selected stable chunks may be retained outside the request"
         );
         let predecessor_id = wallet_scan_artifact_chunk_blob_id(&predecessor.descriptor);
         let mut predecessor_meta = db
@@ -2085,6 +2074,16 @@ mod tests {
             &predecessor_meta,
         )
         .expect("reset access time");
+        assert_eq!(
+            data_plane
+                .retain_wallet_scan_artifact_chunks(
+                    std::slice::from_ref(&predecessor),
+                    data_plane.begin_public_scan_read(),
+                )
+                .await,
+            0,
+            "overlapping maintenance must not rewrite a cached wallet chunk"
+        );
         assert!(
             data_plane
                 .cached_wallet_scan_artifact_chunk(&predecessor.descriptor)

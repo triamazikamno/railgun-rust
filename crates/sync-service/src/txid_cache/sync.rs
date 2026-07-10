@@ -58,6 +58,7 @@ impl TxidPublicCache<'_> {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn sync_with_artifact_source(
         &self,
         endpoint: Option<&Url>,
@@ -65,6 +66,40 @@ impl TxidPublicCache<'_> {
         latest: TxidPublicLatestValidated,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<(), TxidPublicCacheError> {
+        let maintenance = self
+            .sync_with_artifact_source_plan(endpoint, http_client, latest, indexed_artifact_source)
+            .await?;
+        if let Some(maintenance) = maintenance {
+            maintenance.run(self).await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn sync_with_artifact_source_maintained(
+        &self,
+        endpoint: Option<&Url>,
+        http_client: Option<&reqwest::Client>,
+        latest: TxidPublicLatestValidated,
+        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
+        maintenance_scheduler: &crate::indexed_artifacts::IndexedArtifactMaintenanceScheduler,
+        maintenance_db: std::sync::Arc<DbStore>,
+    ) -> Result<(), TxidPublicCacheError> {
+        let maintenance = self
+            .sync_with_artifact_source_plan(endpoint, http_client, latest, indexed_artifact_source)
+            .await?;
+        if let Some(maintenance) = maintenance {
+            self.schedule_artifact_maintenance(maintenance_scheduler, maintenance_db, maintenance);
+        }
+        Ok(())
+    }
+
+    async fn sync_with_artifact_source_plan(
+        &self,
+        endpoint: Option<&Url>,
+        http_client: Option<&reqwest::Client>,
+        latest: TxidPublicLatestValidated,
+        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
+    ) -> Result<Option<artifact::TxidPublicArtifactMaintenance>, TxidPublicCacheError> {
         let (artifact_from_index, force_validated_refresh, read_scope) = {
             let permit = self.begin_write().await;
             let read_scope = permit.scope();
@@ -83,7 +118,7 @@ impl TxidPublicCache<'_> {
                     latest_validated_txid_index = latest.txid_index,
                     "TXID public cache already covers latest validated range"
                 );
-                return Ok(());
+                return Ok(None);
             }
             (
                 manifest.artifact_fetch_start_index(latest, local_status),
@@ -97,8 +132,7 @@ impl TxidPublicCache<'_> {
                     .fetch_current_chunks(self, artifact_from_index, Some(latest.txid_index))
                     .await
                 {
-                    Ok(chunks) if !chunks.is_empty() => Some((source, chunks)),
-                    Ok(_) => None,
+                    Ok(plan) => Some((source, plan)),
                     Err(err) if endpoint.is_some() => {
                         warn!(
                             ?err,
@@ -125,7 +159,7 @@ impl TxidPublicCache<'_> {
         };
         let artifact_chunk_refs = artifact_fetch
             .as_ref()
-            .map(|(_source, chunks)| chunks.as_slice());
+            .map(|(_source, plan)| plan.required.as_slice());
 
         self.sync_inner(
             endpoint,
@@ -136,26 +170,14 @@ impl TxidPublicCache<'_> {
             read_scope,
         )
         .await?;
-        if let Some((source, chunks)) = artifact_fetch.as_ref() {
-            let permit = self.begin_write_for_scope(read_scope).await?;
-            let retained = permit.retain_current_artifact_chunks(
-                chunks,
+        Ok(artifact_fetch.map(|(source, plan)| {
+            artifact::TxidPublicArtifactMaintenance::new(
+                source,
+                plan.stable_current,
                 artifact_from_index,
-                Some(latest.txid_index),
-            )?;
-            debug!(
-                chain_id = self.key.chain_id,
-                txid_version = self.key.txid_version,
-                retained,
-                current_chunks = chunks.len(),
-                "retained current public TXID artifact chunks"
-            );
-            drop(permit);
-            source
-                .retain_prior_tail_best_effort(self, artifact_from_index, read_scope)
-                .await;
-        }
-        Ok(())
+                read_scope,
+            )
+        }))
     }
 
     #[cfg(test)]
@@ -393,13 +415,46 @@ impl TxidPublicCache<'_> {
         Ok(fetched_rows)
     }
 
+    #[cfg(test)]
     pub(crate) async fn sync_to_indexed_tip(
         &self,
         endpoint: Option<&Url>,
         http_client: Option<&reqwest::Client>,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<u64, TxidPublicCacheError> {
-        let mut retention_after_graphql = None;
+        let (fetched_rows, maintenance) = self
+            .sync_to_indexed_tip_plan(endpoint, http_client, indexed_artifact_source)
+            .await?;
+        if let Some(maintenance) = maintenance {
+            maintenance.run(self).await;
+        }
+        Ok(fetched_rows)
+    }
+
+    pub(crate) async fn sync_to_indexed_tip_maintained(
+        &self,
+        endpoint: Option<&Url>,
+        http_client: Option<&reqwest::Client>,
+        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
+        maintenance_scheduler: &crate::indexed_artifacts::IndexedArtifactMaintenanceScheduler,
+        maintenance_db: std::sync::Arc<DbStore>,
+    ) -> Result<u64, TxidPublicCacheError> {
+        let (fetched_rows, maintenance) = self
+            .sync_to_indexed_tip_plan(endpoint, http_client, indexed_artifact_source)
+            .await?;
+        if let Some(maintenance) = maintenance {
+            self.schedule_artifact_maintenance(maintenance_scheduler, maintenance_db, maintenance);
+        }
+        Ok(fetched_rows)
+    }
+
+    async fn sync_to_indexed_tip_plan(
+        &self,
+        endpoint: Option<&Url>,
+        http_client: Option<&reqwest::Client>,
+        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
+    ) -> Result<(u64, Option<artifact::TxidPublicArtifactMaintenance>), TxidPublicCacheError> {
+        let mut maintenance_after_graphql = None;
         if let Some(config) = indexed_artifact_source {
             let (read_scope, from_index) = {
                 let permit = self.begin_write().await;
@@ -426,48 +481,52 @@ impl TxidPublicCache<'_> {
             };
             if let Some(source) = source {
                 match source.fetch_current_chunks(self, from_index, None).await {
-                    Ok(chunks) if !chunks.is_empty() => {
-                        match self
-                            .apply_artifact_chunks_only(&chunks, endpoint.is_some(), read_scope)
-                            .await?
-                        {
+                    Ok(plan) if !plan.required.is_empty() => {
+                        let applied = self
+                            .apply_artifact_chunks_only(
+                                &plan.required,
+                                endpoint.is_some(),
+                                read_scope,
+                            )
+                            .await?;
+                        let maintenance = artifact::TxidPublicArtifactMaintenance::new(
+                            source,
+                            plan.stable_current,
+                            from_index,
+                            read_scope,
+                        );
+                        match applied {
                             Some(applied_rows) if applied_rows > 0 => {
-                                let permit = self.begin_write_for_scope(read_scope).await?;
-                                let retained = permit
-                                    .retain_current_artifact_chunks(&chunks, from_index, None)?;
-                                debug!(
-                                    chain_id = self.key.chain_id,
-                                    txid_version = self.key.txid_version,
-                                    retained,
-                                    current_chunks = chunks.len(),
-                                    "retained current public TXID artifact chunks"
-                                );
-                                drop(permit);
-                                source
-                                    .retain_prior_tail_best_effort(self, from_index, read_scope)
-                                    .await;
-                                return Ok(applied_rows);
+                                return Ok((applied_rows, Some(maintenance)));
                             }
                             Some(_) if endpoint.is_none() => {
-                                source
-                                    .retain_prior_tail_best_effort(self, from_index, read_scope)
-                                    .await;
-                                return Ok(0);
+                                return Ok((0, Some(maintenance)));
                             }
                             Some(_) => {
-                                retention_after_graphql = Some((source, from_index, read_scope));
+                                maintenance_after_graphql = Some(maintenance);
                             }
                             None => {}
                         }
                     }
-                    Ok(_) if endpoint.is_none() => {
-                        source
-                            .retain_prior_tail_best_effort(self, from_index, read_scope)
-                            .await;
-                        return Ok(0);
+                    Ok(plan) if endpoint.is_none() => {
+                        return Ok((
+                            0,
+                            Some(artifact::TxidPublicArtifactMaintenance::new(
+                                source,
+                                plan.stable_current,
+                                from_index,
+                                read_scope,
+                            )),
+                        ));
                     }
-                    Ok(_) => {
-                        retention_after_graphql = Some((source, from_index, read_scope));
+                    Ok(plan) => {
+                        maintenance_after_graphql =
+                            Some(artifact::TxidPublicArtifactMaintenance::new(
+                                source,
+                                plan.stable_current,
+                                from_index,
+                                read_scope,
+                            ));
                     }
                     Err(err) if endpoint.is_some() => {
                         warn!(
@@ -486,12 +545,7 @@ impl TxidPublicCache<'_> {
             Some(endpoint) => self.sync_to_graph_tip(endpoint, http_client).await?,
             None => 0,
         };
-        if let Some((source, from_index, read_scope)) = retention_after_graphql {
-            source
-                .retain_prior_tail_best_effort(self, from_index, read_scope)
-                .await;
-        }
-        Ok(fetched_rows)
+        Ok((fetched_rows, maintenance_after_graphql))
     }
 
     #[cfg(test)]
@@ -619,6 +673,80 @@ impl TxidPublicCache<'_> {
             scope,
             self.key.txid_version,
         ))
+    }
+
+    fn schedule_artifact_maintenance(
+        &self,
+        scheduler: &crate::indexed_artifacts::IndexedArtifactMaintenanceScheduler,
+        db: std::sync::Arc<DbStore>,
+        mut maintenance: artifact::TxidPublicArtifactMaintenance,
+    ) {
+        let chain_type = self.key.chain_type;
+        let chain_id = self.key.chain_id;
+        let railgun_contract = self.key.railgun_contract;
+        let txid_version = self.key.txid_version.to_string();
+        let read_scope = maintenance.read_scope();
+        for chunk in maintenance.take_stable_current() {
+            let scheduler_key = crate::indexed_artifacts::IndexedArtifactMaintenanceKey::txid_chunk(
+                &chunk.descriptor,
+                &txid_version,
+                read_scope.generation(),
+            );
+            let retained_payload_bytes = chunk.bytes.len() as u64;
+            let chunk_cid = chunk.descriptor.cid.clone();
+            let maintenance_db = std::sync::Arc::clone(&db);
+            let maintenance_txid_version = txid_version.clone();
+            let admission =
+                scheduler.try_schedule(scheduler_key, retained_payload_bytes, async move {
+                    let key = TxidPublicCacheKey {
+                        chain_type,
+                        chain_id,
+                        railgun_contract,
+                        txid_version: &maintenance_txid_version,
+                    };
+                    let cache = TxidPublicCache::new(maintenance_db.as_ref(), key);
+                    artifact::TxidPublicArtifactMaintenance::retain_stable_chunk(
+                        &cache, chunk, read_scope,
+                    )
+                    .await;
+                });
+            if admission != crate::indexed_artifacts::IndexedArtifactMaintenanceAdmission::Admitted
+            {
+                debug!(
+                    ?admission,
+                    chain_id,
+                    txid_version = self.key.txid_version,
+                    cid = %chunk_cid,
+                    "stable public TXID artifact maintenance was not admitted"
+                );
+            }
+        }
+
+        let scheduler_key =
+            crate::indexed_artifacts::IndexedArtifactMaintenanceKey::txid_prior_tail(
+                maintenance.scope(),
+                &txid_version,
+                maintenance.start_index(),
+                read_scope.generation(),
+            );
+        let admission = scheduler.try_schedule(scheduler_key, 0, async move {
+            let key = TxidPublicCacheKey {
+                chain_type,
+                chain_id,
+                railgun_contract,
+                txid_version: &txid_version,
+            };
+            let cache = TxidPublicCache::new(db.as_ref(), key);
+            maintenance.run_prior_tail(&cache).await;
+        });
+        if admission != crate::indexed_artifacts::IndexedArtifactMaintenanceAdmission::Admitted {
+            debug!(
+                ?admission,
+                chain_id,
+                txid_version = self.key.txid_version,
+                "optional public TXID prior-tail maintenance was not admitted"
+            );
+        }
     }
 
     async fn apply_artifact_chunks_only(

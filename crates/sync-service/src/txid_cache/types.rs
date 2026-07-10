@@ -111,6 +111,13 @@ pub(super) struct TxidPublicCacheReadScope {
     generation: u64,
 }
 
+impl TxidPublicCacheReadScope {
+    #[must_use]
+    pub(super) const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 pub(super) struct TxidPublicCacheWritePermit<'a> {
     cache: TxidPublicCache<'a>,
     scope: TxidPublicCacheReadScope,

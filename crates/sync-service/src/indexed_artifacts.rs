@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, future::Shared, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 pub use railgun_indexed_artifacts::{
@@ -19,8 +23,9 @@ pub use railgun_indexed_artifacts::{
     INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES, IndexedArtifactCatalog,
     IndexedArtifactChainEntry, IndexedArtifactChunkEnvelope, IndexedArtifactChunkEnvelopeHeader,
     IndexedArtifactChunkSection, IndexedArtifactDescriptor, IndexedArtifactError,
-    IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
-    IndexedArtifactStreamCatalog, IndexedArtifactStreamCoverage,
+    IndexedArtifactManifest, IndexedArtifactPlannedChunk, IndexedArtifactPlannedChunkPlacement,
+    IndexedArtifactRange, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
+    IndexedArtifactStreamCoverage, IndexedArtifactStreamIdentity,
     IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
     IndexedArtifactStreamPlanError, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
     LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm, format_scope,
@@ -28,6 +33,287 @@ pub use railgun_indexed_artifacts::{
 
 use crate::trustless_artifacts::{TrustlessArtifactError, TrustlessArtifactFetcher};
 use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
+
+const INDEXED_ARTIFACT_MAINTENANCE_CAPACITY: usize = 8;
+const INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES: u64 =
+    INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES;
+type IndexedArtifactMaintenanceJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type IndexedArtifactMaintenanceWorker = Shared<IndexedArtifactMaintenanceJob>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IndexedArtifactMaintenanceKey {
+    WalletChunk {
+        epoch: u64,
+        descriptor: Box<IndexedArtifactDescriptor>,
+    },
+    TxidChunk {
+        scope: ChainScope,
+        txid_version: String,
+        generation: u64,
+        cid: String,
+        sha256: alloy::primitives::FixedBytes<32>,
+    },
+    TxidPriorTail {
+        scope: ChainScope,
+        txid_version: String,
+        from_index: u64,
+        generation: u64,
+    },
+    #[cfg(test)]
+    Test(u64),
+}
+
+impl IndexedArtifactMaintenanceKey {
+    #[must_use]
+    pub(crate) fn wallet_chunk(descriptor: &IndexedArtifactDescriptor, epoch: u64) -> Self {
+        Self::WalletChunk {
+            epoch,
+            descriptor: Box::new(descriptor.clone()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn txid_chunk(
+        descriptor: &IndexedArtifactDescriptor,
+        txid_version: &str,
+        generation: u64,
+    ) -> Self {
+        Self::TxidChunk {
+            scope: descriptor.scope.clone(),
+            txid_version: txid_version.to_string(),
+            generation,
+            cid: descriptor.cid.clone(),
+            sha256: descriptor.sha256,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn txid_prior_tail(
+        scope: ChainScope,
+        txid_version: &str,
+        from_index: u64,
+        generation: u64,
+    ) -> Self {
+        Self::TxidPriorTail {
+            scope,
+            txid_version: txid_version.to_string(),
+            from_index,
+            generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexedArtifactMaintenanceAdmission {
+    Admitted,
+    Duplicate,
+    Full,
+    PayloadFull,
+    Shutdown,
+}
+
+#[derive(Clone)]
+pub(crate) struct IndexedArtifactMaintenanceScheduler {
+    inner: std::sync::Arc<IndexedArtifactMaintenanceSchedulerInner>,
+}
+
+struct IndexedArtifactMaintenanceSchedulerInner {
+    sender: mpsc::Sender<IndexedArtifactMaintenanceJob>,
+    worker: std::sync::Mutex<IndexedArtifactMaintenanceWorkerState>,
+    admission: std::sync::Mutex<IndexedArtifactMaintenanceAdmissionState>,
+    cancel: CancellationToken,
+}
+
+struct IndexedArtifactMaintenanceWorkerState {
+    receiver: Option<mpsc::Receiver<IndexedArtifactMaintenanceJob>>,
+    worker: Option<IndexedArtifactMaintenanceWorker>,
+}
+
+struct IndexedArtifactMaintenanceAdmissionState {
+    retained_payload_bytes: u64,
+    max_retained_payload_bytes: u64,
+    keys: Vec<IndexedArtifactMaintenanceKey>,
+}
+
+struct IndexedArtifactMaintenanceReservation {
+    inner: std::sync::Weak<IndexedArtifactMaintenanceSchedulerInner>,
+    key: Option<IndexedArtifactMaintenanceKey>,
+    retained_payload_bytes: u64,
+}
+
+impl Drop for IndexedArtifactMaintenanceReservation {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut admission = inner
+            .admission
+            .lock()
+            .expect("indexed artifact maintenance admission lock poisoned");
+        admission.retained_payload_bytes = admission
+            .retained_payload_bytes
+            .saturating_sub(self.retained_payload_bytes);
+        if let Some(key) = self.key.take()
+            && let Some(index) = admission.keys.iter().position(|reserved| *reserved == key)
+        {
+            admission.keys.swap_remove(index);
+        }
+    }
+}
+
+impl Drop for IndexedArtifactMaintenanceSchedulerInner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl IndexedArtifactMaintenanceScheduler {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::with_limits(
+            INDEXED_ARTIFACT_MAINTENANCE_CAPACITY,
+            INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(
+            capacity,
+            INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES,
+        )
+    }
+
+    fn with_limits(capacity: usize, max_retained_payload_bytes: u64) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        Self {
+            inner: std::sync::Arc::new(IndexedArtifactMaintenanceSchedulerInner {
+                sender,
+                worker: std::sync::Mutex::new(IndexedArtifactMaintenanceWorkerState {
+                    receiver: Some(receiver),
+                    worker: None,
+                }),
+                admission: std::sync::Mutex::new(IndexedArtifactMaintenanceAdmissionState {
+                    retained_payload_bytes: 0,
+                    max_retained_payload_bytes,
+                    keys: Vec::new(),
+                }),
+                cancel: CancellationToken::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn try_schedule<F>(
+        &self,
+        key: IndexedArtifactMaintenanceKey,
+        retained_payload_bytes: u64,
+        job: F,
+    ) -> IndexedArtifactMaintenanceAdmission
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if self.inner.cancel.is_cancelled() {
+            return IndexedArtifactMaintenanceAdmission::Shutdown;
+        }
+
+        let reservation = {
+            let mut admission = self
+                .inner
+                .admission
+                .lock()
+                .expect("indexed artifact maintenance admission lock poisoned");
+            if admission.keys.contains(&key) {
+                return IndexedArtifactMaintenanceAdmission::Duplicate;
+            }
+            if retained_payload_bytes
+                > admission
+                    .max_retained_payload_bytes
+                    .saturating_sub(admission.retained_payload_bytes)
+            {
+                return IndexedArtifactMaintenanceAdmission::PayloadFull;
+            }
+            admission.retained_payload_bytes = admission
+                .retained_payload_bytes
+                .saturating_add(retained_payload_bytes);
+            admission.keys.push(key.clone());
+            IndexedArtifactMaintenanceReservation {
+                inner: std::sync::Arc::downgrade(&self.inner),
+                key: Some(key),
+                retained_payload_bytes,
+            }
+        };
+
+        let mut worker = self
+            .inner
+            .worker
+            .lock()
+            .expect("indexed artifact maintenance worker lock poisoned");
+        if self.inner.cancel.is_cancelled() {
+            return IndexedArtifactMaintenanceAdmission::Shutdown;
+        }
+        Self::ensure_worker(&mut worker, &self.inner.cancel);
+        let reserved_job = async move {
+            let _reservation = reservation;
+            job.await;
+        };
+        match self.inner.sender.try_send(Box::pin(reserved_job)) {
+            Ok(()) => IndexedArtifactMaintenanceAdmission::Admitted,
+            Err(mpsc::error::TrySendError::Full(_)) => IndexedArtifactMaintenanceAdmission::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                IndexedArtifactMaintenanceAdmission::Shutdown
+            }
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        let worker = {
+            let worker = self
+                .inner
+                .worker
+                .lock()
+                .expect("indexed artifact maintenance worker lock poisoned");
+            self.inner.cancel.cancel();
+            worker.worker.clone()
+        };
+        if let Some(worker) = worker {
+            worker.await;
+        }
+    }
+
+    fn ensure_worker(
+        state: &mut IndexedArtifactMaintenanceWorkerState,
+        cancel: &CancellationToken,
+    ) {
+        let Some(mut receiver) = state.receiver.take() else {
+            return;
+        };
+        let worker_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let job = tokio::select! {
+                    biased;
+                    _ = worker_cancel.cancelled() => break,
+                    job = receiver.recv() => job,
+                };
+                let Some(job) = job else {
+                    break;
+                };
+                tokio::select! {
+                    biased;
+                    _ = worker_cancel.cancelled() => break,
+                    () = job => {}
+                }
+            }
+        });
+        state.worker = Some(
+            async move {
+                let _ = handle.await;
+            }
+            .boxed()
+            .shared(),
+        );
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedIndexedArtifactChunk {
@@ -217,6 +503,7 @@ impl VerifiedIndexedArtifactChunkStager {
     }
 }
 
+#[derive(Clone)]
 pub struct IndexedArtifactManifestClient {
     config: IndexedArtifactSourceConfig,
     client: reqwest::Client,
@@ -1366,6 +1653,129 @@ mod tests {
     const LIBP2P_KEY_CODEC: u64 = 0x72;
     const RAW_CODEC: u64 = 0x55;
 
+    #[tokio::test]
+    async fn maintenance_shutdown_cancels_running_work_and_rejects_admission() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let scheduler = IndexedArtifactMaintenanceScheduler::with_capacity(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(1), 1, async move {
+                let _drop_signal = DropSignal(Some(dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            },),
+            IndexedArtifactMaintenanceAdmission::Admitted
+        );
+        started_rx.await.expect("maintenance job started");
+        assert_eq!(
+            scheduler.try_schedule(
+                IndexedArtifactMaintenanceKey::Test(1),
+                1,
+                std::future::pending(),
+            ),
+            IndexedArtifactMaintenanceAdmission::Duplicate
+        );
+        assert_eq!(
+            scheduler.try_schedule(
+                IndexedArtifactMaintenanceKey::Test(2),
+                1,
+                std::future::pending(),
+            ),
+            IndexedArtifactMaintenanceAdmission::Admitted
+        );
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(3), 1, async {},),
+            IndexedArtifactMaintenanceAdmission::Full
+        );
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(3), 1, async {},),
+            IndexedArtifactMaintenanceAdmission::Full,
+            "a failed send must release its keyed reservation"
+        );
+
+        scheduler.shutdown().await;
+
+        dropped_rx
+            .try_recv()
+            .expect("shutdown awaited the worker's maintenance drop signal");
+        {
+            let admission = scheduler
+                .inner
+                .admission
+                .lock()
+                .expect("maintenance admission state after shutdown");
+            assert_eq!(admission.retained_payload_bytes, 0);
+            assert!(admission.keys.is_empty());
+        }
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(4), 1, async {},),
+            IndexedArtifactMaintenanceAdmission::Shutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_payload_cap_releases_after_job_completion() {
+        let scheduler = IndexedArtifactMaintenanceScheduler::with_limits(2, 10);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(1), 6, async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+            },),
+            IndexedArtifactMaintenanceAdmission::Admitted
+        );
+        started_rx.await.expect("payload-holding job started");
+
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(2), 5, async {},),
+            IndexedArtifactMaintenanceAdmission::PayloadFull,
+            "the count queue still has capacity, but the aggregate byte cap rejects"
+        );
+
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(3), 0, async move {
+                let _ = drained_tx.send(());
+            },),
+            IndexedArtifactMaintenanceAdmission::Admitted
+        );
+        release_tx.send(()).expect("release payload-holding job");
+        drained_rx.await.expect("payload reservation released");
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(2), 5, async move {
+                let _ = admitted_tx.send(());
+            },),
+            IndexedArtifactMaintenanceAdmission::Admitted
+        );
+        admitted_rx.await.expect("post-release job ran");
+        scheduler.shutdown().await;
+    }
+
+    #[test]
+    fn wallet_maintenance_key_includes_full_cache_identity() {
+        let mut first = chunk_descriptor(scope(), 0, 9);
+        first.metadata.catalog_generation = Some(1);
+        let mut second = first.clone();
+        second.metadata.catalog_generation = Some(2);
+
+        assert_ne!(
+            IndexedArtifactMaintenanceKey::wallet_chunk(&first, 0),
+            IndexedArtifactMaintenanceKey::wallet_chunk(&second, 0),
+        );
+    }
+
     #[test]
     fn manifest_validation_accepts_signature_sequence_freshness_and_scope() {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
@@ -1747,8 +2157,8 @@ mod tests {
         .expect("sparse catalog remains plannable");
 
         assert_eq!(plan.required_current_chunks.len(), 1);
-        assert_eq!(plan.required_current_chunks[0].range.start, 150);
-        assert_eq!(plan.required_current_chunks[0].range.end, 180);
+        assert_eq!(plan.required_current_chunks[0].descriptor.range.start, 150);
+        assert_eq!(plan.required_current_chunks[0].descriptor.range.end, 180);
         assert!(
             plan.required_current_coverage
                 .iter()
@@ -1882,7 +2292,7 @@ mod tests {
         assert_eq!(
             plan.required_current_chunks
                 .iter()
-                .map(|chunk| chunk.metadata.stream_partition.as_deref())
+                .map(|entry| entry.descriptor.metadata.stream_partition.as_deref())
                 .collect::<Vec<_>>(),
             vec![Some("list-a")]
         );
