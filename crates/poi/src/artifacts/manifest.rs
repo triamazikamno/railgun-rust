@@ -63,7 +63,7 @@ pub struct RetainedDeltaDescriptor {
 
 impl RetainedDeltaDescriptor {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         artifact: ArtifactDescriptor,
         start_index: u64,
         end_index: u64,

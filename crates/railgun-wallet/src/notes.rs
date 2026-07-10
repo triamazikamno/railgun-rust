@@ -39,10 +39,10 @@ impl NoteCiphertext {
         let shared_key = shared_symmetric_key(sender_viewing_private_key, &blinded_receiver)
             .map_err(|_| NoteError::InvalidViewingKey)?;
 
-        let encoded_mpk = if sender_random != MEMO_SENDER_RANDOM_NULL {
-            receiver.master_public_key
-        } else {
+        let encoded_mpk = if sender_random == MEMO_SENDER_RANDOM_NULL {
             receiver.master_public_key ^ sender.master_public_key
+        } else {
+            receiver.master_public_key
         };
 
         let (iv_tag, ct_blocks, memo) = Self::encrypt_v2_payload(
@@ -94,15 +94,16 @@ impl NoteCiphertext {
         blocks[2].copy_from_slice(&pt[64..96]);
         Ok((iv_tag, blocks, Vec::new()))
     }
+}
 
-    #[must_use]
-    pub fn into_commitment_ciphertext(self) -> CommitmentCiphertext {
-        CommitmentCiphertext {
-            ciphertext: self.ciphertext,
-            blindedSenderViewingKey: self.blinded_sender_viewing_key,
-            blindedReceiverViewingKey: self.blinded_receiver_viewing_key,
-            annotationData: self.annotation_data,
-            memo: self.memo,
+impl From<NoteCiphertext> for CommitmentCiphertext {
+    fn from(value: NoteCiphertext) -> Self {
+        Self {
+            ciphertext: value.ciphertext,
+            blindedSenderViewingKey: value.blinded_sender_viewing_key,
+            blindedReceiverViewingKey: value.blinded_receiver_viewing_key,
+            annotationData: value.annotation_data,
+            memo: value.memo,
         }
     }
 }

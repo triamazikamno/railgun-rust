@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    ChainError, ChainService, DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, Future, Mutex,
+    PublicDataPlaneEpoch, PublicScanReadScope, PublicScanSource, WalletScanApply,
+    WalletScanInputRows, WalletScanRows, WalletScanRowsPayload, debug, warn,
+};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -254,7 +258,7 @@ pub struct PublicDataPlaneHandle {
 
 impl PublicDataPlaneHandle {
     #[must_use]
-    pub(crate) fn new(service: Arc<ChainService>) -> Self {
+    pub(crate) const fn new(service: Arc<ChainService>) -> Self {
         Self { service }
     }
 
@@ -283,7 +287,7 @@ impl PublicDataPlaneHandle {
 
 impl PublicScanRows {
     #[must_use]
-    pub fn row_count(&self) -> usize {
+    pub const fn row_count(&self) -> usize {
         self.rows.row_count()
     }
 }
@@ -303,8 +307,8 @@ pub enum PublicScanRowsAnswer {
     },
 }
 
-impl PublicScanRowsAnswer {
-    pub(crate) fn from_wallet_scan_apply(apply: WalletScanApply) -> Self {
+impl From<WalletScanApply> for PublicScanRowsAnswer {
+    fn from(apply: WalletScanApply) -> Self {
         let WalletScanApply {
             from_block,
             to_block,
@@ -409,7 +413,7 @@ struct PublicCoverageStore {
 }
 
 impl PublicCoverageStore {
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.records.len()
     }
 
@@ -894,7 +898,7 @@ impl ChainPublicDataPlane {
 
     pub(crate) fn txid_public_proof(
         &self,
-        request: PublicTxidProofRequest,
+        request: &PublicTxidProofRequest,
     ) -> Result<PublicTxidProof, TxidPublicCacheError> {
         let key = request.key.as_cache_key();
         let cache = TxidPublicCache::new(self.db.as_ref(), key);
@@ -1017,7 +1021,7 @@ impl ChainPublicDataPlane {
             match self.retain_wallet_scan_artifact_chunk(chunk) {
                 Ok(()) => retained = retained.saturating_add(1),
                 Err(reason) => {
-                    warn!(cid = %chunk.descriptor.cid, %reason, "failed to retain wallet-scan artifact chunk")
+                    warn!(cid = %chunk.descriptor.cid, %reason, "failed to retain wallet-scan artifact chunk");
                 }
             }
         }
@@ -1541,9 +1545,8 @@ mod tests {
         let (data_plane, root_dir) = test_data_plane("poi-corpus-no-service");
         let key = PublicPoiCorpusKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION);
 
-        let error = match data_plane.ensure_poi_corpus(key).await {
-            Ok(_) => panic!("POI corpus should require a chain-owned service"),
-            Err(error) => error,
+        let Err(error) = data_plane.ensure_poi_corpus(key).await else {
+            panic!("POI corpus should require a chain-owned service");
         };
 
         assert_eq!(

@@ -560,7 +560,8 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
         true,
         100,
         test_backfill_driver(sender, 0, 1),
-        now - std::time::Duration::from_secs(20),
+        now.checked_sub(std::time::Duration::from_secs(20))
+            .expect("test instant supports 20 second subtraction"),
     );
 
     assert_eq!(
@@ -571,7 +572,7 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
         42161,
         now,
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 
     cursor.mark_indexed_tail_attempt(now);
@@ -579,28 +580,32 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
         42161,
         now + std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
     assert!(cursor.should_try_indexed_tail_fallback(
         42161,
-        now + std::time::Duration::from_secs(60),
+        now + std::time::Duration::from_mins(1),
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 
-    cursor.mark_progress(150, now + std::time::Duration::from_secs(60));
+    cursor.mark_progress(150, now + std::time::Duration::from_mins(1));
     assert!(!cursor.should_try_indexed_tail_fallback(
         42161,
         now + std::time::Duration::from_secs(70),
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 }
 
 #[test]
 fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
     let now = std::time::Instant::now();
-    let mut state = WalletTailFallbackState::new(100, now - std::time::Duration::from_secs(20));
+    let mut state = WalletTailFallbackState::new(
+        100,
+        now.checked_sub(std::time::Duration::from_secs(20))
+            .expect("test instant supports 20 second subtraction"),
+    );
 
     assert!(state.should_try_indexed_tail_fallback(
         42161,
@@ -608,7 +613,7 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
         160,
         now,
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 
     state.mark_indexed_tail_attempt(now);
@@ -618,7 +623,7 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
         160,
         now + std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 
     state.update_last_scanned(130, now + std::time::Duration::from_secs(30));
@@ -628,7 +633,7 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
         190,
         now + std::time::Duration::from_secs(40),
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 
     assert!(state.should_try_indexed_tail_fallback(
@@ -637,7 +642,7 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
         190,
         now + std::time::Duration::from_secs(90),
         std::time::Duration::from_secs(15),
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_mins(1),
     ));
 }
 
@@ -928,7 +933,7 @@ fn rpc_and_indexed_wallet_scan_applies_use_normalized_rows() {
         read_scope,
     });
 
-    let rpc_apply = WalletScanApply::rows_from_log_batch(10, 20, batch, PublicScanSource::Rpc)
+    let rpc_apply = WalletScanApply::rows_from_log_batch(10, 20, &batch, PublicScanSource::Rpc)
         .expect("normalize RPC rows");
     let indexed_apply = WalletScanApply::indexed_rows(
         10,
@@ -968,7 +973,7 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
         send_wallet_scan_apply(
             "test",
             &sender,
-            WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+            WalletScanApply::rows_from_log_batch(101, 105, &batch, PublicScanSource::Rpc)
                 .expect("normalize empty log payload"),
             token,
         )
@@ -1129,12 +1134,16 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     let wallet_a_lease =
         match send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token).await {
             WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
-            result => panic!("wallet A target rejected: {result:?}"),
+            result @ WalletBackfillStartResult::Rejected { .. } => {
+                panic!("wallet A target rejected: {result:?}")
+            }
         };
     let wallet_b_lease =
         match send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token).await {
             WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
-            result => panic!("wallet B target rejected: {result:?}"),
+            result @ WalletBackfillStartResult::Rejected { .. } => {
+                panic!("wallet B target rejected: {result:?}")
+            }
         };
     backfill_request_tx
         .send(BackfillRequest::Add {
@@ -1214,7 +1223,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         chain_id: 1,
         railgun_contract: Address::from([0xbb; 20]),
     };
-    let artifact_source = checkpointed_wallet_artifact_source(scope.clone(), 100, 200, 150);
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 100, 200, 150);
     let squid = GraphqlServer::spawn(vec![
         r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
         r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
@@ -1364,7 +1373,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         railgun_contract: Address::from([0xbb; 20]),
     };
     let (artifact_source, block) =
-        checkpointed_wallet_artifact_source_with_blocked_manifest(scope.clone(), 100, 150, 150);
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 100, 150, 150);
     let PathServerBlockControl {
         request_started,
         release,
@@ -1483,7 +1492,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         tokio::task::spawn_blocking(move || {
             request_started
                 .recv()
-                .expect("artifact manifest fetch started")
+                .expect("artifact manifest fetch started");
         }),
     )
     .await
@@ -1689,7 +1698,7 @@ async fn indexed_wallet_squid_transition_probe_keeps_pre_probe_read_scope() {
         chain_id: 1,
         railgun_contract: Address::from([0xbb; 20]),
     };
-    let artifact_source = checkpointed_wallet_artifact_source(scope.clone(), 100, 200, 150);
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 100, 200, 150);
     let (squid, block) = GraphqlServer::spawn_with_blocked_response(
         vec![
             r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
@@ -1886,7 +1895,7 @@ async fn public_scan_coverage_arbitrates_uncached_range_through_sources() {
         chain_id: 1,
         railgun_contract: Address::from([0xbb; 20]),
     };
-    let artifact_source = checkpointed_wallet_artifact_source(scope.clone(), 100, 150, 150);
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 100, 150, 150);
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
         Duration::from_secs(1),
@@ -2004,7 +2013,7 @@ async fn public_scan_rows_rejects_source_result_after_epoch_invalidation() {
         railgun_contract: Address::from([0xbb; 20]),
     };
     let (artifact_source, block) =
-        checkpointed_wallet_artifact_source_with_blocked_manifest(scope.clone(), 100, 150, 150);
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 100, 150, 150);
     let PathServerBlockControl {
         request_started,
         release,
@@ -2031,7 +2040,7 @@ async fn public_scan_rows_rejects_source_result_after_epoch_invalidation() {
         tokio::task::spawn_blocking(move || {
             request_started
                 .recv()
-                .expect("artifact manifest fetch started")
+                .expect("artifact manifest fetch started");
         }),
     )
     .await
@@ -2379,7 +2388,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
         send_wallet_startup_events(
             "test",
             vec![
-                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                WalletScanApply::rows_from_log_batch(101, 105, &batch, PublicScanSource::Rpc)
                     .expect("normalize empty log payload"),
             ],
             Some(105),
@@ -2509,7 +2518,7 @@ async fn wallet_startup_events_treat_leading_ready_as_success() {
         send_wallet_startup_events(
             "test",
             vec![
-                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                WalletScanApply::rows_from_log_batch(101, 105, &batch, PublicScanSource::Rpc)
                     .expect("normalize empty log payload"),
             ],
             Some(105),
@@ -2619,7 +2628,7 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
         send_wallet_startup_events(
             "test",
             vec![
-                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                WalletScanApply::rows_from_log_batch(101, 105, &batch, PublicScanSource::Rpc)
                     .expect("normalize empty log payload"),
             ],
             Some(105),
@@ -2727,7 +2736,7 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
         send_wallet_startup_events(
             "test",
             vec![
-                WalletScanApply::rows_from_log_batch(101, 105, batch, PublicScanSource::Rpc)
+                WalletScanApply::rows_from_log_batch(101, 105, &batch, PublicScanSource::Rpc)
                     .expect("normalize empty log payload"),
             ],
             None,
@@ -2954,7 +2963,9 @@ async fn indexed_status_guard_drop_retires_claim_and_clears_status() {
     let token = context.handle.mint_sync_token(0);
     let driver = match send_wallet_target("test", &context.wallet_backfill_tx, 100, token).await {
         WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
-        result => panic!("initial backfill start rejected: {result:?}"),
+        result @ WalletBackfillStartResult::Rejected { .. } => {
+            panic!("initial backfill start rejected: {result:?}")
+        }
     };
     assert_eq!(
         driver.finish("test", 100).await,
@@ -3107,7 +3118,9 @@ impl PathServer {
                     let (stream, _) = listener.accept().expect("accept path request");
                     let routes = Arc::clone(&routes);
                     let block = block.clone();
-                    std::thread::spawn(move || handle_path_request(stream, routes, block));
+                    std::thread::spawn(move || {
+                        handle_path_request(stream, &routes, block.as_deref());
+                    });
                 }
             }
         });
@@ -3191,7 +3204,7 @@ impl JsonRpcServer {
         std::thread::spawn(move || {
             for response in responses {
                 let (stream, _) = listener.accept().expect("accept json-rpc request");
-                handle_json_rpc_request(stream, response, &request_tx);
+                handle_json_rpc_request(stream, &response, &request_tx);
             }
         });
         Self { url, requests }
@@ -3200,8 +3213,8 @@ impl JsonRpcServer {
 
 fn handle_path_request(
     mut stream: std::net::TcpStream,
-    routes: Arc<HashMap<String, Vec<u8>>>,
-    block: Option<Arc<PathServerBlock>>,
+    routes: &HashMap<String, Vec<u8>>,
+    block: Option<&PathServerBlock>,
 ) {
     let path = read_request_path(&mut stream);
     if let Some(block) = block.as_ref()
@@ -3261,7 +3274,7 @@ fn handle_graphql_request(
 
 fn handle_json_rpc_request(
     mut stream: std::net::TcpStream,
-    response: serde_json::Value,
+    response: &serde_json::Value,
     requests: &std_mpsc::Sender<String>,
 ) {
     let request = read_http_request(&mut stream);
@@ -3331,7 +3344,7 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
 }
 
 fn checkpointed_wallet_artifact_source(
-    scope: ChainScope,
+    scope: &ChainScope,
     start: u64,
     end: u64,
     checkpoint_block: u64,
@@ -3474,7 +3487,7 @@ fn blocked_wallet_optional_maintenance_fixture(
 }
 
 fn checkpointed_wallet_artifact_source_with_blocked_manifest(
-    scope: ChainScope,
+    scope: &ChainScope,
     start: u64,
     end: u64,
     checkpoint_block: u64,
@@ -3485,14 +3498,14 @@ fn checkpointed_wallet_artifact_source_with_blocked_manifest(
 }
 
 fn checkpointed_wallet_artifact_source_controlled(
-    scope: ChainScope,
+    scope: &ChainScope,
     start: u64,
     end: u64,
     checkpoint_block: u64,
     block_manifest: bool,
 ) -> (TestArtifactSource, Option<PathServerBlockControl>) {
     let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
-    let chunk_bytes = empty_wallet_scan_chunk_bytes(&scope, start, end);
+    let chunk_bytes = empty_wallet_scan_chunk_bytes(scope, start, end);
     let chunk_cid = raw_cid(&chunk_bytes);
     let chunk_descriptor = wallet_artifact_descriptor(
         scope.clone(),
@@ -3554,7 +3567,7 @@ fn checkpointed_wallet_artifact_source_controlled(
             car_bytes(catalog_cid, &[(catalog_cid, catalog_bytes)]),
         ),
         (
-            chunk_path.clone(),
+            chunk_path,
             car_bytes(chunk_cid, &[(chunk_cid, chunk_bytes)]),
         ),
     ]);
@@ -3697,9 +3710,9 @@ fn write_cbor_bytes(value: &[u8], out: &mut Vec<u8>) {
 fn write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
     match len {
         0..=23 => out.push(major | u8::try_from(len).expect("small len")),
-        24..=0xff => out.extend_from_slice(&[major | 24, u8::try_from(len).expect("u8 len")]),
+        24..=0xff => out.extend_from_slice(&[major | 0x18, u8::try_from(len).expect("u8 len")]),
         0x100..=0xffff => {
-            out.push(major | 25);
+            out.push(major | 0x19);
             out.extend_from_slice(&u16::try_from(len).expect("u16 len").to_be_bytes());
         }
         _ => panic!("fixture length too large"),

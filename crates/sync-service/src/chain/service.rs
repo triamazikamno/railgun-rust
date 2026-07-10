@@ -1,5 +1,28 @@
-use super::*;
+use super::{
+    Arc, AtomicBool, AtomicU64, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig,
+    ChainError, ChainHandle, ChainPublicDataPlane, ChainService, DbStore, Duration,
+    GlobalPoiPolicy, HashMap, IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
+    IndexedWalletCatchUpSourceOrder, IndexedWalletPage, IndexedWalletPageKind, Instant, JoinHandle,
+    LogBatch, MerkleForestDbExt, Mutex, Ordering, Provider, ProviderHandle, PublicCoverageAnswer,
+    PublicDataPlaneDiagnosticKind, PublicDataPlaneEpoch, PublicDataPlaneError,
+    PublicDataPlaneHandle, PublicScanCoverageWrite, PublicScanRange, PublicScanReadScope,
+    PublicScanRowsAnswer, PublicScanSource, QueryRpcPool, QuickSyncClient, RwLock,
+    WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
+    WalletBackfillStartResult, WalletConfig, WalletHandle, WalletIndexedCatchUpSource,
+    WalletIndexedCatchUpStatusGuard, WalletPoiRuntime, WalletReadiness, WalletReadinessError,
+    WalletRegistration, WalletResetReplayPlan, WalletScanApply, WalletStartupSyncCandidate,
+    WalletStartupSyncError, WalletStartupSyncStrategy, WalletWorkerServices,
+    artifact_failure_can_fallback_to_squid, broadcast, build_provider_with_http_client, debug,
+    info, mpsc, oneshot, send_wallet_startup_events, should_hedge_wallet_startup, sort_logs,
+    spawn_backfill_loop, spawn_head_poller, spawn_live_log_loop, spawn_pending_tip_loop,
+    spawn_txid_public_cache_loop, spawn_wallet_lag_fallback_loop, squid_tail_target_after_artifact,
+    wait_or_cancel, wallet_backfill_from_block, wallet_cache_store,
+    wallet_finish_result_removes_cursor, wallet_finish_retry_request, wallet_sync_target, warn,
+    watch,
+};
 
+#[cfg(test)]
+use super::{WalletBackfillApplyResult, WalletBackfillDriver};
 #[cfg(test)]
 use crate::types::WalletSyncToken;
 
@@ -508,7 +531,7 @@ impl ChainService {
         }
     }
 
-    pub(super) fn rpc_scan_source_for_range(&self, from_block: u64) -> PublicScanSource {
+    pub(super) const fn rpc_scan_source_for_range(&self, from_block: u64) -> PublicScanSource {
         if self.chain.archive_until_block > 0 && from_block <= self.chain.archive_until_block {
             PublicScanSource::ArchiveRpc
         } else {
@@ -527,7 +550,7 @@ impl ChainService {
             .public_scan_commit_permit(range, source, read_scope)
             .await
             .map_err(ChainError::from)?;
-        Ok(PublicScanRowsAnswer::from_wallet_scan_apply(apply))
+        Ok(apply.into())
     }
 
     async fn record_public_scan_coverage_result(
@@ -861,11 +884,11 @@ impl ChainService {
         if reset_result.reset_generation().is_none() {
             warn!(?reset_result, cache_key = %cache_key, from_block = reset_from, "wallet reset rejected");
             return Err(ChainError::WalletResetRejected(reset_result));
-        };
-        if !reset_result.committed() {
-            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset accepted and pending actor-owned replay");
-        } else {
+        }
+        if reset_result.committed() {
             info!(cache_key = %cache_key, from_block = reset_from, "wallet reset rewind committed; actor owns replay admission");
+        } else {
+            info!(cache_key = %cache_key, from_block = reset_from, "wallet reset accepted and pending actor-owned replay");
         }
         Ok(())
     }
@@ -1029,7 +1052,7 @@ impl ChainService {
             wallets.insert(
                 cache_key.clone(),
                 WalletRegistration {
-                    handle: handle.clone(),
+                    handle,
                     cfg: cfg.clone(),
                     cancel: cancel.clone(),
                     backfill_sender: backfill_sender.clone(),
@@ -1712,7 +1735,7 @@ impl ChainService {
                 "RPC wallet backfill source selected",
             )
             .await;
-        let apply = WalletScanApply::rows_from_log_batch(from_block, to_block, batch, source)
+        let apply = WalletScanApply::rows_from_log_batch(from_block, to_block, &batch, source)
             .map_err(ChainError::from)?;
         self.record_public_scan_coverage(
             PublicScanRange::new(from_block, to_block),
@@ -1809,9 +1832,7 @@ impl ChainService {
         from_block: u64,
         safe_head: u64,
     ) -> Option<IndexedWalletArtifactSession> {
-        if self.chain.indexed_artifact_source.is_none() {
-            return None;
-        }
+        self.chain.indexed_artifact_source.as_ref()?;
         let read_scope = self.begin_public_scan_read();
         let range = PublicScanRange::new(from_block, safe_head);
         self.public_data_plane
@@ -2257,14 +2278,10 @@ impl ChainService {
                     .read_scope()
             };
             let page_result = if using_artifact {
-                match artifact_session
+                artifact_session
                     .as_ref()
                     .expect("artifact session is configured for artifact catch-up")
                     .page_for_block_range(from_block, to_block)
-                {
-                    Ok(outcome) => Ok(outcome),
-                    Err(err) => Err(err),
-                }
             } else {
                 IndexedWalletPage::fetch(
                     squid_session
@@ -2563,7 +2580,7 @@ pub(super) async fn wait_for_wallet_ready(
             WalletReadiness::Syncing => {}
         }
         tokio::select! {
-            _ = cancel.cancelled() => return false,
+            () = cancel.cancelled() => return false,
             changed = readiness_rx.changed() => {
                 if changed.is_err() {
                     return false;
@@ -2588,7 +2605,7 @@ pub(super) async fn wait_for_startup_sync_target(
             return Some(wallet_sync_target(safe_head, sync_to_block));
         }
         tokio::select! {
-            _ = cancel.cancelled() => return None,
+            () = cancel.cancelled() => return None,
             changed = safe_head_rx.changed() => {
                 if changed.is_err() {
                     return None;

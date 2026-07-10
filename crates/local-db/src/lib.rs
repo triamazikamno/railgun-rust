@@ -12,28 +12,27 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
-const BLOB_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_index");
-const MERKLE_FOREST_INDEX_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("merkle_forest_index");
-const ZKEY_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zkey_index");
-const WALLET_UTXO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_utxo");
-const WALLET_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_meta");
-const WALLET_SYNC_ACTOR_STATE_TABLE: TableDefinition<&str, &[u8]> =
+type ByteTableDefinition = TableDefinition<'static, &'static str, &'static [u8]>;
+
+const META_TABLE: ByteTableDefinition = TableDefinition::new("meta");
+const BLOB_INDEX_TABLE: ByteTableDefinition = TableDefinition::new("blob_index");
+const MERKLE_FOREST_INDEX_TABLE: ByteTableDefinition = TableDefinition::new("merkle_forest_index");
+const ZKEY_INDEX_TABLE: ByteTableDefinition = TableDefinition::new("zkey_index");
+const WALLET_UTXO_TABLE: ByteTableDefinition = TableDefinition::new("wallet_utxo");
+const WALLET_META_TABLE: ByteTableDefinition = TableDefinition::new("wallet_meta");
+const WALLET_SYNC_ACTOR_STATE_TABLE: ByteTableDefinition =
     TableDefinition::new("wallet_sync_actor_state_v1");
-const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
+const PENDING_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
     TableDefinition::new("fee_note_assurance_pending");
-const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
+const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
     TableDefinition::new("fee_note_assurance_terminal");
-const PENDING_OUTPUT_POI_CONTEXT_TABLE: TableDefinition<&str, &[u8]> =
+const PENDING_OUTPUT_POI_CONTEXT_TABLE: ByteTableDefinition =
     TableDefinition::new("pending_output_poi_context");
-const OUTPUT_POI_RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("output_poi_recovery");
-const POI_ARTIFACT_CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("poi_artifact_cache");
-const APP_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("app_settings_v1");
+const OUTPUT_POI_RECOVERY_TABLE: ByteTableDefinition = TableDefinition::new("output_poi_recovery");
+const POI_ARTIFACT_CACHE_TABLE: ByteTableDefinition = TableDefinition::new("poi_artifact_cache");
+const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
 const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
-const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
+const DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
     TableDefinition::new("desktop_wallet_vault_v1");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,7 +765,7 @@ impl DbStore {
                 }
                 Some(meta) if meta.schema_version < CURRENT_SCHEMA_VERSION => {
                     if let Err(err) =
-                        store.run_migrations(meta.schema_version, CURRENT_SCHEMA_VERSION)
+                        Self::run_migrations(meta.schema_version, CURRENT_SCHEMA_VERSION)
                     {
                         if matches!(err, DbError::UnsupportedSchemaVersion { .. }) {
                             drop(store);
@@ -1650,7 +1649,7 @@ impl DbStore {
         Ok(())
     }
 
-    const fn run_migrations(&self, from: u32, to: u32) -> Result<(), DbError> {
+    const fn run_migrations(from: u32, to: u32) -> Result<(), DbError> {
         if from < to {
             return Err(DbError::UnsupportedSchemaVersion { version: from });
         }

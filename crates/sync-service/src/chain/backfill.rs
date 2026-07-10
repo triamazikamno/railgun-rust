@@ -1,5 +1,16 @@
 use super::service::send_wallet_reset;
-use super::*;
+use super::{
+    BlockNumberOrTag, ChainConfig, ChainError, ChainService, DbStore, DynProvider, FixedBytes,
+    ForestReorgDecision, HashMap, HashSet, Instant, Log, MerkleForest, MerkleForestDbExt,
+    MerkleForestSnapshot, Ordering, Path, PersistError, Provider, SNAPSHOT_VERSION, SharedLogBatch,
+    WalletBackfillDriver, WalletResetReplayPlan, anchor_file_name, debug,
+    fetch_logs_for_range_with_provider, info, parse_anchor_block, wallet_reorg_backfill_from_block,
+    wallet_sync_target, warn,
+};
+use std::time::Duration;
+
+#[cfg(test)]
+use super::{Address, Arc, QueryRpcPool, build_provider_with_http_client};
 
 pub(super) struct WalletBackfill {
     pub(super) from_block: u64,
@@ -26,14 +37,14 @@ impl WalletTailFallbackState {
         }
     }
 
-    pub(super) fn update_last_scanned(&mut self, last_scanned: u64, now: Instant) {
+    pub(super) const fn update_last_scanned(&mut self, last_scanned: u64, now: Instant) {
         if last_scanned != self.last_scanned {
             self.last_scanned = last_scanned;
             self.last_advanced_at = now;
         }
     }
 
-    pub(super) fn mark_indexed_tail_attempt(&mut self, now: Instant) {
+    pub(super) const fn mark_indexed_tail_attempt(&mut self, now: Instant) {
         self.last_indexed_tail_attempt_at = Some(now);
     }
 
@@ -62,7 +73,7 @@ impl WalletTailFallbackState {
 }
 
 impl WalletBackfill {
-    pub(super) fn new(
+    pub(super) const fn new(
         from_block: u64,
         target_block: u64,
         follow_safe_head: bool,
@@ -92,7 +103,7 @@ impl WalletBackfill {
         }
     }
 
-    pub(super) fn mark_progress(&mut self, from_block: u64, now: Instant) {
+    pub(super) const fn mark_progress(&mut self, from_block: u64, now: Instant) {
         self.from_block = from_block;
         self.last_advanced_at = now;
     }
@@ -115,7 +126,7 @@ impl WalletBackfill {
         self.last_indexed_tail_attempt_at = None;
     }
 
-    pub(super) fn mark_indexed_tail_attempt(&mut self, now: Instant) {
+    pub(super) const fn mark_indexed_tail_attempt(&mut self, now: Instant) {
         self.last_indexed_tail_attempt_at = Some(now);
     }
 
@@ -151,7 +162,6 @@ pub(super) const fn wallet_backfill_lag_blocks(from_block: u64, target_block: u6
 
 pub(super) const fn wallet_tail_fallback_block_time_secs(chain_id: u64) -> u64 {
     match chain_id {
-        1 => 12,
         56 => 3,
         137 => 2,
         42161 => 1,
@@ -278,7 +288,7 @@ impl ChainService {
             if reset_result.reset_generation().is_none() {
                 debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
                 continue;
-            };
+            }
             debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted for actor-owned replay");
         }
     }

@@ -43,3 +43,6 @@ zstd = { workspace = true }
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 multihash-codetable = { workspace = true }
+
+[lints]
+workspace = true

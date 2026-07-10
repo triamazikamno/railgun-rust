@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    DbStore, DenseMerkleTree, FixedBytes, TREE_LEAF_COUNT, TxidPublicCache, TxidPublicCacheError,
+    TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCacheRow, TxidPublicProof, U256,
+    find_target_row, read_tree_leaves,
+};
+#[cfg(test)]
+use super::{
+    TxidPublicCacheIndexEntry, TxidPublicCachePage, TxidPublicCacheWritePermit,
+    TxidPublicCachedTransaction, index_entries_for_hash, rebuild_index_for_manifest,
+};
 
 pub(crate) fn txid_public_proof_for_recovered_output(
     db: &DbStore,
@@ -26,7 +35,7 @@ pub(crate) fn txid_public_proof_for_recovered_output(
     txid_public_proof_for_target_row(
         &manifest,
         db,
-        target,
+        &target,
         latest_validated_txid_index,
         latest_validated_merkleroot,
     )
@@ -69,7 +78,7 @@ pub(crate) fn txid_public_proof_for_recovered_output_at_index(
     txid_public_proof_for_target_row(
         &manifest,
         db,
-        target,
+        &target,
         latest_validated_txid_index,
         latest_validated_merkleroot,
     )
@@ -109,7 +118,7 @@ fn validate_proof_marker(
 pub(super) fn txid_public_proof_for_target_row(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,
-    target: TxidPublicCacheRow,
+    target: &TxidPublicCacheRow,
     latest_validated_txid_index: u64,
     latest_validated_merkleroot: Option<FixedBytes<32>>,
 ) -> Result<TxidPublicProof, TxidPublicCacheError> {
@@ -352,7 +361,7 @@ pub(super) fn row_for_txid_index(
     }
 }
 
-pub(super) fn txid_root_index_for_target(
+pub(super) const fn txid_root_index_for_target(
     target_txid_index: u64,
     latest_validated_txid_index: u64,
 ) -> u64 {

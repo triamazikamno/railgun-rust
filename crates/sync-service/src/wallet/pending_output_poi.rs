@@ -1,4 +1,20 @@
-use super::*;
+use super::{
+    BTreeMap, BlindedCommitmentData, CancellationToken, ChainPublicDataPlane,
+    CommitmentObservation, DbStore, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
+    ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant, LocalPoiStatusReader,
+    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
+    OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+    PendingOutputPoiContextRecord, PendingOutputPoiObservation,
+    PendingOutputPoiSubmissionPredicate, PoiError, PoiPrivateApplyOutcome, PoiStatus,
+    PoiStatusReader, PublicPoiCorpusKey, SingleCommitmentProofContext, UtxoPoiMetadata,
+    WalletCacheError, WalletCacheStore, WalletConfig, WalletHandle, WalletPoiRuntime,
+    WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, debug, hex,
+    new_output_poi_recovery_record, now_epoch_secs, warn,
+};
+
+#[cfg(test)]
+use super::{PendingOutputPoiSubmitter, PoiRpcClient};
 
 #[cfg(test)]
 pub(crate) async fn process_pending_output_poi_observations(
@@ -240,7 +256,6 @@ pub(super) enum PendingOutputPoiRemoteAttempt {
         submitted_list_keys: Vec<FixedBytes<32>>,
     },
     Failed {
-        submitted_list_keys: Vec<FixedBytes<32>>,
         error: PoiError,
     },
 }
@@ -262,7 +277,10 @@ pub(super) struct PendingOutputPoiSubmissionPlan {
 }
 
 impl PendingOutputPoiSubmissionPlan {
-    fn missing(list_keys: Vec<FixedBytes<32>>, expected_recovery: ExpectedRecordState) -> Self {
+    const fn missing(
+        list_keys: Vec<FixedBytes<32>>,
+        expected_recovery: ExpectedRecordState,
+    ) -> Self {
         Self {
             kind: PendingOutputPoiSubmissionKind::Missing,
             list_keys,
@@ -271,7 +289,7 @@ impl PendingOutputPoiSubmissionPlan {
         }
     }
 
-    fn retry_submitted(
+    const fn retry_submitted(
         list_keys: Vec<FixedBytes<32>>,
         expected_recovery: ExpectedRecordState,
         force_submission_retry: bool,
@@ -285,7 +303,7 @@ impl PendingOutputPoiSubmissionPlan {
     }
 
     /// Force-resubmit plan: active list keys already on the context (submitted or not).
-    pub(super) fn force_matching(
+    pub(super) const fn force_matching(
         list_keys: Vec<FixedBytes<32>>,
         expected_recovery: ExpectedRecordState,
     ) -> Self {
@@ -319,7 +337,7 @@ impl PendingOutputPoiSubmissionPlan {
         self.expected_recovery.clone()
     }
 
-    pub(super) fn predicate(&self) -> PendingOutputPoiSubmissionPredicate {
+    pub(super) const fn predicate(&self) -> PendingOutputPoiSubmissionPredicate {
         match self.kind {
             PendingOutputPoiSubmissionKind::Missing => PendingOutputPoiSubmissionPredicate::Missing,
             PendingOutputPoiSubmissionKind::RetrySubmitted => {
@@ -423,7 +441,7 @@ async fn submit_observed_pending_output_pois_impl(
         )
         .await?
         {
-            PendingOutputPoiRemoteAttempt::NotCurrent => continue,
+            PendingOutputPoiRemoteAttempt::NotCurrent => {}
             PendingOutputPoiRemoteAttempt::AuthorityStale => break,
             PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
                 if let Err(err) = apply_poi_private_delta(
@@ -486,10 +504,7 @@ async fn submit_observed_pending_output_pois_impl(
                     }
                 }
             }
-            PendingOutputPoiRemoteAttempt::Failed {
-                error: err,
-                submitted_list_keys: _,
-            } => {
+            PendingOutputPoiRemoteAttempt::Failed { error: err } => {
                 if !pending_output_poi_submission_side_effect_current(
                     authority,
                     db,
@@ -725,10 +740,7 @@ async fn submit_pending_output_poi_context_via_gateway(
                     }
                     Err(WalletPrivateRemoteError::Check(error)) => return Err(error),
                     Err(WalletPrivateRemoteError::Remote(error)) => {
-                        return Ok(PendingOutputPoiRemoteAttempt::Failed {
-                            submitted_list_keys: submitted_list_keys.to_vec(),
-                            error,
-                        });
+                        return Ok(PendingOutputPoiRemoteAttempt::Failed { error });
                     }
                 }
             }
@@ -773,10 +785,7 @@ async fn submit_pending_output_poi_context_via_gateway(
             }
             Err(WalletPrivateRemoteError::Check(error)) => Err(error),
             Err(WalletPrivateRemoteError::Remote(error)) => {
-                Ok(PendingOutputPoiRemoteAttempt::Failed {
-                    submitted_list_keys: submitted_list_keys.to_vec(),
-                    error,
-                })
+                Ok(PendingOutputPoiRemoteAttempt::Failed { error })
             }
         }
     }
@@ -936,7 +945,7 @@ fn prune_nonrecoverable_unsubmitted_poi_lists(
         .retain(|list_key, _| should_retain(list_key));
 }
 
-pub(super) fn output_poi_recovery_default_status(
+pub(super) const fn output_poi_recovery_default_status(
     action: &OutputPoiRecoveryAction,
 ) -> OutputPoiRecoveryStatus {
     match action {
@@ -1030,7 +1039,7 @@ async fn apply_poi_private_delta_inline(
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             }
 
-            let pending_update = if let Some((expected_pending, update)) = pending_update {
+            let pending_update = if let Some((expected_pending, update)) = *pending_update {
                 let current = db.get_pending_output_poi_context(
                     cfg.chain.chain_id,
                     &cfg.cache_key,
@@ -1402,8 +1411,7 @@ async fn apply_poi_private_delta_inline(
                         .unwrap_or_default();
                     let utxos = utxos_locked
                         .as_ref()
-                        .map(|locked| locked.as_slice())
-                        .unwrap_or(&[]);
+                        .map_or(&[] as &[WalletUtxo], |locked| locked.as_slice());
                     permit.apply_notify_changed(&token, utxos, &overlay);
                 }
                 Ok::<(), WalletCacheError>(())
@@ -1526,6 +1534,7 @@ pub(super) async fn submit_pending_output_poi_context(
     .await
 }
 
+#[cfg(test)]
 async fn submit_pending_output_poi_context_unchecked(
     submitter: &dyn PendingOutputPoiSubmitter,
     chain_id: u64,
@@ -2025,12 +2034,6 @@ enum AuthorizedPoiStatusSource<'a> {
     Remote(&'a WalletPrivatePoiClients),
 }
 
-#[derive(Debug)]
-enum PendingOutputPoiStatusReadError {
-    Remote(PoiError),
-    Check(local_db::DbError),
-}
-
 async fn read_pending_output_poi_statuses(
     source: &AuthorizedPoiStatusSource<'_>,
     authority: &WalletPrivateMutationAuthority<'_>,
@@ -2039,10 +2042,7 @@ async fn read_pending_output_poi_statuses(
     record: &PendingOutputPoiContextRecord,
     list_keys: &[FixedBytes<32>],
     identity: &PendingOutputPoiSubmitIdentity,
-) -> Result<
-    Option<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>>,
-    PendingOutputPoiStatusReadError,
-> {
+) -> Result<Option<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>>, String> {
     let request_data = [BlindedCommitmentData::transact(
         identity.derived_blinded_commitment,
     )];
@@ -2057,7 +2057,7 @@ async fn read_pending_output_poi_statuses(
             )
             .await
             .map(Some)
-            .map_err(PendingOutputPoiStatusReadError::Remote),
+            .map_err(|error| error.to_string()),
         AuthorizedPoiStatusSource::Remote(private_poi) => match private_poi
             .pois_per_list(
                 || async {
@@ -2084,12 +2084,8 @@ async fn read_pending_output_poi_statuses(
         {
             Ok(statuses) => Ok(Some(statuses)),
             Err(WalletPrivateRemoteError::Stale(_)) => Ok(None),
-            Err(WalletPrivateRemoteError::Check(error)) => {
-                Err(PendingOutputPoiStatusReadError::Check(error))
-            }
-            Err(WalletPrivateRemoteError::Remote(error)) => {
-                Err(PendingOutputPoiStatusReadError::Remote(error))
-            }
+            Err(WalletPrivateRemoteError::Check(error)) => Err(error.to_string()),
+            Err(WalletPrivateRemoteError::Remote(error)) => Err(error.to_string()),
         },
     }
 }
@@ -2170,29 +2166,10 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
     match poi_runtime {
         WalletPoiRuntime::IndexedArtifacts { .. } => {
             let key = PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id);
-            if !public_data_plane
+            if public_data_plane
                 .poi_corpus_ready_for_lists(key.clone(), active_list_keys)
                 .await
             {
-                if poi_runtime.wallet_read_fallback_enabled() {
-                    verify_submitted_pending_output_pois_inner(
-                        authority,
-                        AuthorizedPoiStatusSource::Remote(private_poi),
-                        db,
-                        cfg,
-                        cache_store,
-                        active_list_keys,
-                    )
-                    .await
-                } else {
-                    warn!(
-                        cache_key = %cfg.cache_key,
-                        chain_id = cfg.chain.chain_id,
-                        "artifact POI local cache unavailable; skipping submitted pending output POI verification"
-                    );
-                    PendingOutputPoiVerificationOutcome::default()
-                }
-            } else {
                 let corpus = match public_data_plane.ensure_poi_corpus(key).await {
                     Ok(corpus) => corpus,
                     Err(err) => {
@@ -2210,6 +2187,23 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
                     active_list_keys,
                 )
                 .await
+            } else if poi_runtime.wallet_read_fallback_enabled() {
+                verify_submitted_pending_output_pois_inner(
+                    authority,
+                    AuthorizedPoiStatusSource::Remote(private_poi),
+                    db,
+                    cfg,
+                    cache_store,
+                    active_list_keys,
+                )
+                .await
+            } else {
+                warn!(
+                    cache_key = %cfg.cache_key,
+                    chain_id = cfg.chain.chain_id,
+                    "artifact POI local cache unavailable; skipping submitted pending output POI verification"
+                );
+                PendingOutputPoiVerificationOutcome::default()
             }
         }
         WalletPoiRuntime::PoiProxy { .. } => {

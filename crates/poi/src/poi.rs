@@ -159,8 +159,7 @@ impl Poi {
                 .collect::<Vec<_>>(),
             "submit fee-note single-commitment poi"
         );
-        let single_commitment_context =
-            SingleCommitmentProofContext::from_fee_note_assurance(context);
+        let single_commitment_context = SingleCommitmentProofContext::from(context);
         self.rpc_client
             .submit_single_commitment_proofs(
                 &context.txid_version,
@@ -364,9 +363,8 @@ pub struct SingleCommitmentProofContext {
         BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
 }
 
-impl SingleCommitmentProofContext {
-    #[must_use]
-    pub fn from_fee_note_assurance(context: &FeeNoteAssuranceContext) -> Self {
+impl From<&FeeNoteAssuranceContext> for SingleCommitmentProofContext {
+    fn from(context: &FeeNoteAssuranceContext) -> Self {
         Self {
             txid_version: context.txid_version.clone(),
             railgun_txid: context.railgun_txid,
@@ -1430,8 +1428,7 @@ mod tests {
     #[test]
     fn single_commitment_submit_request_serializes_context() {
         let context = sample_context();
-        let single_commitment_context =
-            SingleCommitmentProofContext::from_fee_note_assurance(&context);
+        let single_commitment_context = SingleCommitmentProofContext::from(&context);
         let params = PoiRpcClient::submit_single_commitment_proofs_params(
             &context.txid_version,
             0,
@@ -1529,8 +1526,7 @@ mod tests {
     #[test]
     fn single_commitment_submit_request_uses_bare_hex_poi_keys() {
         let context = sample_context();
-        let single_commitment_context =
-            SingleCommitmentProofContext::from_fee_note_assurance(&context);
+        let single_commitment_context = SingleCommitmentProofContext::from(&context);
         let params = PoiRpcClient::submit_single_commitment_proofs_params(
             &context.txid_version,
             0,

@@ -1,4 +1,8 @@
-use super::*;
+use alloy::primitives::{FixedBytes, U256};
+use poi::error::PoiRpcError;
+use thiserror::Error;
+
+use crate::prover::ProverError;
 
 #[derive(Debug, Error)]
 pub enum BuildError {

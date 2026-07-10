@@ -1,12 +1,51 @@
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use super::*;
-use crate::artifacts::ArtifactSource;
+use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
+use alloy::sol_types::SolCall;
+use alloy::uint;
 use async_trait::async_trait;
-use broadcaster_core::transact::parse_transact_calldata;
-use broadcaster_core::utxo::{UtxoCommitmentKind, UtxoSource};
-use merkletree::tree::MerkleTreeUpdate;
+use poi::poi::PoiMerkleProof;
+
+use broadcaster_core::contracts::railgun::{
+    ActionData, BoundParams, TokenTransfer, relayCall, transactCall,
+};
+use broadcaster_core::crypto::poseidon::poseidon;
+use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::notes::Note;
+use broadcaster_core::transact::{
+    DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, parse_transact_calldata,
+};
+use broadcaster_core::tree::TREE_DEPTH;
+use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource};
+use merkletree::tree::{MerkleForest, MerkleProof, MerkleTreeUpdate};
+
+use crate::artifacts::ArtifactSource;
+use crate::keys::{RailgunSpendSigner, WalletKeys};
+use crate::prover::ProverService;
+use crate::tx::{
+    BroadcasterFeeOutput, BuildError, CompositePrivateOutputRoleKind, CompositeRelayAction,
+    CompositeRelayActionToken, CompositeRelayActions, CompositeUnshieldLeg,
+    CompositeUnshieldLegRole, CompositeUnshieldRecipient, CompositeUnshieldRequest, InputWitness,
+    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, PoiCircuitVariant, PoiMerkleProofSource,
+    PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
+    PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, SendRequest,
+    TransactionBuilder, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS,
+    compute_railgun_txid_from_public_inputs, generate_post_transaction_pois,
+    generate_pre_transaction_pois, insert_pre_transaction_poi, poi_circuit_variant,
+};
+
+use super::{
+    BoundParamsExt, TransactionPlanBuilder, build_fee_only_outputs, build_send_outputs,
+    build_unshield_outputs, select_utxos,
+};
+use super::{
+    max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
+    send_selection_info, send_selection_info_with_broadcaster_fee,
+    send_selection_info_with_broadcaster_fee_token,
+    send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
+};
 
 struct MockSpendSigner {
     signed_msg: Cell<Option<U256>>,
@@ -137,7 +176,7 @@ fn test_transaction_builder() -> TransactionBuilder {
 }
 
 fn test_prover() -> ProverService {
-    ProverService::with_capacity_db(ArtifactSource::default(), 1, None)
+    ProverService::with_capacity_db(&ArtifactSource::default(), 1, None)
 }
 
 fn selected_positions(selection: &[Utxo]) -> Vec<u64> {
@@ -285,7 +324,7 @@ fn sample_address_data(seed: u8) -> ViewingKeyData {
 async fn pre_transaction_poi_generation_uses_configured_proof_source() {
     let chunk = sample_chunk(11, 1, 1, false);
     let source = FailingLocalPoiProofSource::default();
-    let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
     let err = generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
         chunks: &[chunk],
         chain_type: 0,
@@ -307,7 +346,7 @@ async fn pre_transaction_poi_generation_uses_configured_proof_source() {
 async fn pre_transaction_poi_generation_batches_merkle_proof_source_by_list() {
     let chunks = [sample_chunk(11, 1, 1, false), sample_chunk(12, 1, 1, false)];
     let source = FailingLocalPoiProofSource::default();
-    let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
     let err = generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
         chunks: &chunks,
         chain_type: 0,
@@ -331,7 +370,7 @@ async fn post_transaction_poi_generation_uses_configured_proof_source() {
     let chunk = sample_chunk(12, 1, 1, false);
     let txid_data = sample_post_txid_data(&chunk, uint!(5_U256));
     let source = FailingLocalPoiProofSource::default();
-    let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
     let err = generate_post_transaction_pois(PostTransactionPoiGenerationRequest {
         chunk: &chunk,
         txid_data: &txid_data,
@@ -385,7 +424,7 @@ fn unproven_send_uses_proof_root_from_dirty_forest() {
     let signer = MockSpendSigner {
         signed_msg: Cell::new(None),
     };
-    let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
     let plan_builder = TransactionPlanBuilder::new(
         &builder,
         &sender,
@@ -399,7 +438,7 @@ fn unproven_send_uses_proof_root_from_dirty_forest() {
 
     let plan = plan_builder
         .build_unproven_send(
-            SendRequest {
+            &SendRequest {
                 token_address: token,
                 amount: uint!(4_U256),
                 recipient,
@@ -1058,13 +1097,21 @@ async fn composite_unshield_enforces_eight_transaction_batch_limit() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let utxos = (0..9)
-        .map(|index| wallet_test_utxo(&wallet, Address::from([index as u8 + 1; 20]), 1, 0, index))
+        .map(|index| {
+            wallet_test_utxo(
+                &wallet,
+                Address::from([u8::try_from(index).expect("test index") + 1; 20]),
+                1,
+                0,
+                index,
+            )
+        })
         .collect::<Vec<_>>();
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        legs: (0..9)
+        legs: (0_u8..9)
             .map(|index| CompositeUnshieldLeg {
-                token_address: Address::from([index as u8 + 1; 20]),
+                token_address: Address::from([index + 1; 20]),
                 amount: uint!(1_U256),
                 recipient: CompositeUnshieldRecipient::Public(Address::from([0x82; 20])),
                 role: CompositeUnshieldLegRole::Other,
@@ -1279,13 +1326,13 @@ async fn composite_same_size_alternate_tree_candidate_keeps_plan_under_batch_lim
         },
     ];
     for index in 0..6 {
-        let leg_token = Address::from([0x90 + index as u8; 20]);
+        let leg_token = Address::from([0x90 + u8::try_from(index).expect("test index"); 20]);
         utxos.push(wallet_test_utxo(
             &wallet,
             leg_token,
             1,
-            2 + index as u32,
-            index as u64,
+            2 + u32::try_from(index).expect("test index"),
+            u64::try_from(index).expect("test index"),
         ));
         legs.push(CompositeUnshieldLeg {
             token_address: leg_token,
@@ -1668,6 +1715,7 @@ fn unshield_outputs_put_broadcaster_fee_note_first() {
     .expect("unshield outputs");
 
     assert_eq!(outputs.outputs.len(), 3);
+    assert_eq!(outputs.unshield_output_index, 2);
     assert_eq!(outputs.commitment_ciphertext.len(), 2);
     let fee_note = outputs.broadcaster_fee_note.expect("fee note");
     assert_eq!(outputs.outputs[0].value, uint!(2_U256));

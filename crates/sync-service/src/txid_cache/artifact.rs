@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    BlobMeta, DbStore, Digest, ErrorKind, FixedBytes, IndexedArtifactSourceConfig, Sha256,
+    SystemTime, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_FORMAT_VERSION, TxidPublicCache,
+    TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCachePage,
+    TxidPublicCacheReadScope, TxidPublicCacheRow, TxidPublicCacheTransaction,
+    TxidPublicCacheWritePermit, U256, artifact_chunk_blob_id, artifact_chunk_file_name, fs,
+    now_epoch_secs, read_tree_leaves, warn, write_blob_file,
+};
 
 use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactDescriptor, IndexedArtifactManifestClient,
@@ -35,7 +42,7 @@ pub(super) struct TxidPublicArtifactMaintenance {
 }
 
 impl TxidPublicArtifactMaintenance {
-    pub(super) fn new(
+    pub(super) const fn new(
         source: TxidPublicArtifactSource,
         stable_current: Vec<VerifiedIndexedArtifactChunk>,
         from_index: u64,
@@ -345,14 +352,8 @@ impl TxidPublicArtifactSource {
         &self,
         descriptor: &IndexedArtifactDescriptor,
     ) -> Result<IndexedArtifactStreamCatalog, TxidPublicCacheError> {
-        let catalog = self
-            .client
-            .fetch_catalog(descriptor)
-            .await?
-            .into_stream_catalog();
-        Ok(IndexedArtifactStreamCatalog::new(
-            catalog.descriptor,
-            catalog.chunks,
+        Ok(IndexedArtifactStreamCatalog::from(
+            self.client.fetch_catalog(descriptor).await?,
         ))
     }
 
@@ -485,7 +486,7 @@ impl TxidPublicCacheWritePermit<'_> {
             }
             let pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
             verify_declared_merkle_root(
-                &chunk.descriptor.metadata.root,
+                chunk.descriptor.metadata.root.as_ref(),
                 &manifest,
                 db,
                 chunk.descriptor.range.start,
@@ -584,7 +585,7 @@ impl TxidPublicCacheManifest {
             }
             if applied_range_end == chunk.descriptor.range.end {
                 verify_declared_merkle_root(
-                    &chunk.descriptor.metadata.root,
+                    chunk.descriptor.metadata.root.as_ref(),
                     self,
                     db,
                     chunk.descriptor.range.start,
@@ -594,7 +595,7 @@ impl TxidPublicCacheManifest {
             } else {
                 let full_pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
                 verify_declared_merkle_root(
-                    &chunk.descriptor.metadata.root,
+                    chunk.descriptor.metadata.root.as_ref(),
                     self,
                     db,
                     chunk.descriptor.range.start,
@@ -604,7 +605,7 @@ impl TxidPublicCacheManifest {
             }
             if to_index == Some(applied_range_end) && latest_validated_merkleroot.is_some() {
                 verify_declared_merkle_root(
-                    &latest_validated_merkleroot,
+                    latest_validated_merkleroot.as_ref(),
                     self,
                     db,
                     chunk.descriptor.range.start,
@@ -688,7 +689,7 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for Vec<TxidPublicCachePage> {
 }
 
 fn verify_declared_merkle_root(
-    expected: &Option<FixedBytes<32>>,
+    expected: Option<&FixedBytes<32>>,
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,
     range_start: u64,

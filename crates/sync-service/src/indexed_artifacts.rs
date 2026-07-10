@@ -292,7 +292,7 @@ impl IndexedArtifactMaintenanceScheduler {
             loop {
                 let job = tokio::select! {
                     biased;
-                    _ = worker_cancel.cancelled() => break,
+                    () = worker_cancel.cancelled() => break,
                     job = receiver.recv() => job,
                 };
                 let Some(job) = job else {
@@ -300,7 +300,7 @@ impl IndexedArtifactMaintenanceScheduler {
                 };
                 tokio::select! {
                     biased;
-                    _ = worker_cancel.cancelled() => break,
+                    () = worker_cancel.cancelled() => break,
                     () = job => {}
                 }
             }
@@ -329,13 +329,14 @@ pub struct VerifiedIndexedArtifactCatalog {
 
 impl VerifiedIndexedArtifactCatalog {
     #[must_use]
-    pub fn into_stream_catalog(self) -> IndexedArtifactStreamCatalog {
-        IndexedArtifactStreamCatalog::new(self.descriptor, self.catalog.chunks)
-    }
-
-    #[must_use]
     pub fn into_catalog(self) -> IndexedArtifactCatalog {
         self.catalog
+    }
+}
+
+impl From<VerifiedIndexedArtifactCatalog> for IndexedArtifactStreamCatalog {
+    fn from(verified: VerifiedIndexedArtifactCatalog) -> Self {
+        Self::new(verified.descriptor, verified.catalog.chunks)
     }
 }
 
@@ -360,7 +361,7 @@ pub struct VerifiedIndexedArtifactChunkStager {
 
 impl VerifiedIndexedArtifactChunkStager {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         dataset_kind: IndexedDatasetKind,
         scope: ChainScope,
         range_kind: IndexedArtifactRangeKind,
@@ -419,10 +420,9 @@ impl VerifiedIndexedArtifactChunkStager {
                     end: chunk.descriptor.range.end,
                 },
             )?;
-            let chunk = self
-                .staged
-                .remove(&self.next_range_start)
-                .expect("chunk was present for next range start");
+            let Some(chunk) = self.staged.remove(&self.next_range_start) else {
+                break;
+            };
             self.next_range_start = next_range_start;
             ready.push(chunk);
         }
@@ -670,7 +670,7 @@ impl IndexedArtifactManifestClient {
             .map(|descriptor| descriptor.byte_size)
             .collect::<Vec<_>>();
         let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
-        let mut results = vec![None; descriptors.len()];
+        let mut results = Vec::with_capacity(descriptors.len());
         let mut next_index = 0;
         let mut completed_chunks = 0;
         let mut in_flight_bytes = 0_u64;
@@ -799,7 +799,7 @@ impl IndexedArtifactManifestClient {
                 elapsed_ms = fetched.elapsed_ms,
                 "indexed artifact chunk fetch verified"
             );
-            results[fetched.index] = Some(fetched.chunk);
+            results.push((fetched.index, fetched.chunk));
         }
 
         debug!(
@@ -813,10 +813,8 @@ impl IndexedArtifactManifestClient {
             "indexed artifact chunk fetch batch complete"
         );
 
-        Ok(results
-            .into_iter()
-            .map(|chunk| chunk.expect("all scheduled chunks completed"))
-            .collect())
+        results.sort_unstable_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, chunk)| chunk).collect())
     }
 
     async fn fetch_manifest_from_cid(
@@ -1170,7 +1168,7 @@ fn validate_catalog_descriptor_aggregate(
     Ok(())
 }
 
-fn validate_manifest_sequence(
+const fn validate_manifest_sequence(
     sequence: u64,
     last_accepted_sequence: Option<u64>,
 ) -> Result<(), IndexedArtifactManifestError> {
@@ -1784,7 +1782,7 @@ mod tests {
         manifest.sign_manifest(&signing_key).expect("sign manifest");
         let config = config(
             signing_key.verifying_key().to_bytes(),
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
         );
 
         validate_manifest(
@@ -1826,7 +1824,7 @@ mod tests {
         let scope = scope();
         let other_scope = ChainScope {
             chain_id: 56,
-            ..scope.clone()
+            ..scope
         };
         let mut manifest = manifest_for_scope(scope.clone(), now_ms());
         manifest.sign_manifest(&signing_key).expect("sign manifest");
@@ -2017,7 +2015,7 @@ mod tests {
 
         assert_eq!(verified.chunks.len(), 1);
 
-        let mut wrong_hash = descriptor.clone();
+        let mut wrong_hash = descriptor;
         wrong_hash.sha256 = FixedBytes::from([99_u8; 32]);
         assert!(matches!(
             verify_catalog_bytes(&wrong_hash, &bytes),
@@ -2142,7 +2140,7 @@ mod tests {
         let verified = verify_catalog_bytes(&descriptor, &bytes).expect("sparse catalog verifies");
         let plan = IndexedArtifactStreamPlan::plan(
             &[IndexedArtifactStreamCatalog::new(
-                descriptor.clone(),
+                descriptor,
                 verified.chunks,
             )],
             &IndexedArtifactStreamPlanRequest::new(
@@ -2394,7 +2392,7 @@ mod tests {
             b"second chunk".to_vec(),
             b"third chunk".to_vec(),
         ];
-        let descriptors = descriptors_for_bytes(scope, &chunk_bytes);
+        let descriptors = descriptors_for_bytes(&scope, &chunk_bytes);
         let server = ChunkServer::spawn(
             descriptors
                 .iter()
@@ -2434,7 +2432,7 @@ mod tests {
     async fn bounded_chunk_fetch_uses_configured_concurrency() {
         let scope = scope();
         let chunk_bytes = vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
-        let descriptors = descriptors_for_bytes(scope, &chunk_bytes);
+        let descriptors = descriptors_for_bytes(&scope, &chunk_bytes);
         let server = ChunkServer::spawn(responses_for_descriptors(
             &descriptors,
             &chunk_bytes,
@@ -2458,7 +2456,7 @@ mod tests {
     async fn bounded_chunk_fetch_enforces_in_flight_byte_budget() {
         let scope = scope();
         let chunk_bytes = vec![b"aaaaa".to_vec(), b"bbbbb".to_vec(), b"ccccc".to_vec()];
-        let descriptors = descriptors_for_bytes(scope, &chunk_bytes);
+        let descriptors = descriptors_for_bytes(&scope, &chunk_bytes);
         let server = ChunkServer::spawn(responses_for_descriptors(
             &descriptors,
             &chunk_bytes,
@@ -2851,7 +2849,7 @@ mod tests {
     }
 
     fn descriptors_for_bytes(
-        scope: ChainScope,
+        scope: &ChainScope,
         chunks: &[Vec<u8>],
     ) -> Vec<IndexedArtifactDescriptor> {
         chunks
@@ -2983,9 +2981,11 @@ mod tests {
     fn write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
         match len {
             0..=23 => out.push(major | u8::try_from(len).expect("small len")),
-            24..=0xff => out.extend_from_slice(&[major | 24, u8::try_from(len).expect("u8 len")]),
+            24..=0xff => {
+                out.extend_from_slice(&[major | 0x18, u8::try_from(len).expect("u8 len")]);
+            }
             0x100..=0xffff => {
-                out.push(major | 25);
+                out.push(major | 0x19);
                 out.extend_from_slice(&u16::try_from(len).expect("u16 len").to_be_bytes());
             }
             _ => panic!("fixture length too large"),
@@ -3047,7 +3047,13 @@ mod tests {
                         let max_active = Arc::clone(&max_active);
                         let requests = Arc::clone(&requests);
                         std::thread::spawn(move || {
-                            handle_chunk_request(stream, responses, active, max_active, requests);
+                            handle_chunk_request(
+                                stream,
+                                &responses,
+                                &active,
+                                &max_active,
+                                &requests,
+                            );
                         });
                     }
                 }
@@ -3080,7 +3086,7 @@ mod tests {
                     for _ in 0..request_count {
                         let (stream, _) = listener.accept().expect("accept request");
                         let routes = Arc::clone(&routes);
-                        std::thread::spawn(move || handle_path_request(stream, routes));
+                        std::thread::spawn(move || handle_path_request(stream, &routes));
                     }
                 }
             });
@@ -3091,10 +3097,10 @@ mod tests {
 
     fn handle_chunk_request(
         mut stream: std::net::TcpStream,
-        responses: Arc<HashMap<String, ChunkResponse>>,
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-        requests: Arc<Mutex<Vec<String>>>,
+        responses: &HashMap<String, ChunkResponse>,
+        active: &AtomicUsize,
+        max_active: &AtomicUsize,
+        requests: &Mutex<Vec<String>>,
     ) {
         let mut request = Vec::new();
         let mut buf = [0_u8; 1024];
@@ -3131,7 +3137,7 @@ mod tests {
         active.fetch_sub(1, AtomicOrdering::SeqCst);
     }
 
-    fn handle_path_request(mut stream: std::net::TcpStream, routes: Arc<HashMap<String, Vec<u8>>>) {
+    fn handle_path_request(mut stream: std::net::TcpStream, routes: &HashMap<String, Vec<u8>>) {
         let path = read_request_path(&mut stream);
         let (status, reason, body) = routes
             .get(&path)

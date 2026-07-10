@@ -1,4 +1,16 @@
-use super::*;
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+
+use broadcaster_core::contracts::railgun::{ActionData, TokenTransfer, Transaction};
+use broadcaster_core::crypto::poseidon::poseidon;
+use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::notes::Note;
+use broadcaster_core::tree::TREE_DEPTH;
+use broadcaster_core::utxo::Utxo;
+use merkletree::tree::MerkleProof;
+
+use crate::keys::RailgunSpendSigner;
+
+use super::{BuildError, PreTransactionPoiError, compute_railgun_txid_from_public_inputs};
 
 pub const UNRELAYED_ADAPT_PARAMS: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -42,7 +54,7 @@ impl TransactionPlanChunk {
     }
 
     #[must_use]
-    pub fn private_output_count(&self) -> Option<usize> {
+    pub const fn private_output_count(&self) -> Option<usize> {
         if self.has_unshield {
             self.outputs.len().checked_sub(1)
         } else {
@@ -138,22 +150,22 @@ pub struct TransactPlan {
 
 impl UnshieldPlan {
     #[must_use]
-    pub fn transaction_count(&self) -> usize {
+    pub const fn transaction_count(&self) -> usize {
         self.chunks.len()
     }
 
     #[must_use]
-    pub fn input_count(&self) -> usize {
+    pub const fn input_count(&self) -> usize {
         self.inputs.len()
     }
 
     #[must_use]
-    pub fn private_output_count(&self) -> usize {
+    pub const fn private_output_count(&self) -> usize {
         self.outputs.len()
     }
 
     #[must_use]
-    pub fn public_output_count(&self) -> usize {
+    pub const fn public_output_count(&self) -> usize {
         self.unshield_notes.len()
     }
 
@@ -167,17 +179,17 @@ impl UnshieldPlan {
 
 impl SendPlan {
     #[must_use]
-    pub fn transaction_count(&self) -> usize {
+    pub const fn transaction_count(&self) -> usize {
         self.chunks.len()
     }
 
     #[must_use]
-    pub fn input_count(&self) -> usize {
+    pub const fn input_count(&self) -> usize {
         self.inputs.len()
     }
 
     #[must_use]
-    pub fn private_output_count(&self) -> usize {
+    pub const fn private_output_count(&self) -> usize {
         self.outputs.len()
     }
 
@@ -467,7 +479,7 @@ impl UnshieldRequest {
 }
 
 impl CompositeUnshieldRecipient {
-    pub(super) fn unshield_to(self, relay_adapt_contract: Address) -> Address {
+    pub(super) const fn unshield_to(self, relay_adapt_contract: Address) -> Address {
         match self {
             Self::Public(recipient) => recipient,
             Self::RelayAdapt => relay_adapt_contract,
@@ -490,7 +502,7 @@ impl CompositeRelayActionToken {
     }
 
     #[must_use]
-    pub(super) fn transfer(self, recipient: Address, amount: U256) -> TokenTransfer {
+    pub(super) const fn transfer(self, recipient: Address, amount: U256) -> TokenTransfer {
         match self {
             Self::Erc20(token_address) => TokenTransfer::erc20(token_address, recipient, amount),
             Self::BaseNative => TokenTransfer::base_native(recipient, amount),

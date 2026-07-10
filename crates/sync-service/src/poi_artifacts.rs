@@ -468,12 +468,11 @@ impl PoiArtifactIngestor {
         let last_sequence = persisted
             .as_ref()
             .map(|persisted| persisted.record.last_accepted_manifest_sequence);
-        let cache_generation = match persisted.as_ref() {
-            Some(persisted) => persisted.cache_generation,
-            None => {
-                let generation = poi_artifact_cache_generation_cell(db)?;
-                with_poi_artifact_cache_generation(&generation, |generation| generation)
-            }
+        let cache_generation = if let Some(persisted) = persisted.as_ref() {
+            persisted.cache_generation
+        } else {
+            let generation = poi_artifact_cache_generation_cell(db)?;
+            with_poi_artifact_cache_generation(&generation, |generation| generation)
         };
         let refresh_started = Instant::now();
         let refresh = self
@@ -523,7 +522,7 @@ impl PoiArtifactIngestor {
                 &entry,
                 persisted,
                 cache_generation,
-            )?
+            )
         {
             return Ok(refresh);
         }
@@ -923,7 +922,7 @@ pub(crate) struct PoiArtifactRefresh {
 }
 
 impl PoiArtifactRefresh {
-    fn identity(&self) -> &PoiCacheIdentity {
+    const fn identity(&self) -> &PoiCacheIdentity {
         self.cache.identity()
     }
 }
@@ -1082,7 +1081,7 @@ pub(crate) fn persist_refresh(
     Ok(())
 }
 
-fn validate_manifest_sequence(
+const fn validate_manifest_sequence(
     manifest: &Manifest,
     last_accepted_sequence: Option<u64>,
 ) -> Result<(), PoiArtifactError> {
@@ -1229,7 +1228,7 @@ fn validate_blocked_shields_artifact(
         .blocked_shields
         .iter()
         .cloned()
-        .map(|record| record.into_signed_blocked_shield())
+        .map(poi::artifacts::BlockedShieldArtifactRecord::into_signed_blocked_shield)
         .collect())
 }
 
@@ -1259,7 +1258,7 @@ fn try_reuse_matching_tip(
     entry: &ManifestEntry,
     persisted: &PersistedPoiArtifactCache,
     cache_generation: u64,
-) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
+) -> Option<PoiArtifactRefresh> {
     let entry_tip_root = entry.current_tip_merkleroot;
     if persisted.record.current_tip_index == entry.current_tip_index
         && persisted.record.current_tip_root == entry_tip_root
@@ -1275,14 +1274,14 @@ fn try_reuse_matching_tip(
             tip_index = entry.current_tip_index,
             "reusing persisted POI artifact cache with matching manifest tip root"
         );
-        return Ok(Some(PoiArtifactRefresh {
+        return Some(PoiArtifactRefresh {
             manifest_sequence,
             cache: persisted.cache.clone(),
             entry: entry.clone(),
             cache_generation,
-        }));
+        });
     }
-    Ok(None)
+    None
 }
 
 fn require_scope_bytes(
@@ -1568,7 +1567,7 @@ mod tests {
         entry.deltas = Vec::new();
         let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
 
-        let refresh = ingestor
+        let mut refresh = ingestor
             .try_artifact_suffix_merge(
                 &identity,
                 5,
@@ -1584,7 +1583,7 @@ mod tests {
         assert_eq!(refresh.manifest_sequence, 5);
         assert_eq!(refresh.entry.current_tip_index, 2);
         assert_eq!(refresh.cache.progress().next_event_index, 3);
-        assert_eq!(root_for_tip(&mut refresh.cache.clone(), 2), root_2);
+        assert_eq!(root_for_tip(&mut refresh.cache, 2), root_2);
         assert_eq!(
             artifact_server.request_path(),
             format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
@@ -1648,7 +1647,7 @@ mod tests {
         entry.deltas = vec![delta_descriptor];
         let persisted = persisted_cache(&identity, cache, 1, root_1, &entry);
 
-        let refresh = ingestor
+        let mut refresh = ingestor
             .try_artifact_suffix_merge(
                 &identity,
                 5,
@@ -1662,7 +1661,7 @@ mod tests {
             .expect("merge result");
 
         assert_eq!(refresh.cache.progress().next_event_index, 4);
-        assert_eq!(root_for_tip(&mut refresh.cache.clone(), 3), root_3);
+        assert_eq!(root_for_tip(&mut refresh.cache, 3), root_3);
         assert_eq!(
             artifact_server.request_path(),
             format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
@@ -1863,7 +1862,7 @@ mod tests {
         entry.deltas = Vec::new();
         let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
 
-        let error = match ingestor
+        let Err(error) = ingestor
             .try_artifact_suffix_merge(
                 &identity,
                 5,
@@ -1873,9 +1872,8 @@ mod tests {
                 persisted.cache_generation,
             )
             .await
-        {
-            Ok(_) => panic!("root validation should fail"),
-            Err(error) => error,
+        else {
+            panic!("root validation should fail");
         };
 
         assert!(matches!(
@@ -1923,7 +1921,7 @@ mod tests {
         entry.deltas = Vec::new();
         let persisted = persisted_cache(&identity, cache, 0, root_0, &entry);
 
-        let error = match ingestor
+        let Err(error) = ingestor
             .try_artifact_suffix_merge(
                 &identity,
                 5,
@@ -1933,9 +1931,8 @@ mod tests {
                 persisted.cache_generation,
             )
             .await
-        {
-            Ok(_) => panic!("proxy request failure"),
-            Err(error) => error,
+        else {
+            panic!("proxy request failure");
         };
 
         assert!(matches!(
@@ -2012,7 +2009,7 @@ mod tests {
         let refresh = PoiArtifactRefresh {
             manifest_sequence: 5,
             cache: loaded.cache.clone(),
-            entry: entry.clone(),
+            entry,
             cache_generation: loaded.cache_generation,
         };
 
@@ -2425,9 +2422,11 @@ mod tests {
     fn write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
         match len {
             0..=23 => out.push(major | u8::try_from(len).expect("small len")),
-            24..=0xff => out.extend_from_slice(&[major | 24, u8::try_from(len).expect("u8 len")]),
+            24..=0xff => {
+                out.extend_from_slice(&[major | 0x18, u8::try_from(len).expect("u8 len")]);
+            }
             0x100..=0xffff => {
-                out.push(major | 25);
+                out.push(major | 0x19);
                 out.extend_from_slice(&u16::try_from(len).expect("u16 len").to_be_bytes());
             }
             _ => panic!("fixture length too large"),

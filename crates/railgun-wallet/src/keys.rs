@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use std::sync::LazyLock;
 
 use alloy::primitives::U256;
@@ -73,11 +72,11 @@ struct BabyJubPoint {
 }
 
 impl BabyJubPoint {
-    fn new(x: Fq, y: Fq) -> Self {
+    const fn new(x: Fq, y: Fq) -> Self {
         Self { x, y }
     }
 
-    fn base8() -> Self {
+    const fn base8() -> Self {
         Self::new(BABYJUB_BASE8_X, BABYJUB_BASE8_Y)
     }
 
@@ -187,9 +186,9 @@ impl EddsaSignature {
         compose[32..].copy_from_slice(&msg.to_le_bytes::<32>());
 
         let r_buff = blake512_bytes(&compose);
-        let suborder = BABYJUB_SUBORDER.deref();
+        let suborder = &BABYJUB_SUBORDER;
         let mut r = BigUint::from_bytes_le(&r_buff);
-        r %= suborder;
+        r %= &**suborder;
 
         let r8 = base8.mul(r.clone());
 
@@ -200,8 +199,8 @@ impl EddsaSignature {
             prime_field_to_u256(a.y),
             msg,
         ]);
-        let s_term = (BigUint::from(hm) * &s) % suborder;
-        let s_value = (r + s_term) % suborder;
+        let s_term = (BigUint::from(hm) * &s) % &**suborder;
+        let s_value = (r + s_term) % &**suborder;
 
         Self {
             r8: [prime_field_to_u256(r8.x), prime_field_to_u256(r8.y)],
@@ -295,7 +294,7 @@ struct WalletNode {
 }
 
 impl WalletNode {
-    fn new(chain_key: [u8; 32], chain_code: [u8; 32]) -> Self {
+    const fn new(chain_key: [u8; 32], chain_code: [u8; 32]) -> Self {
         Self {
             chain_key,
             chain_code,

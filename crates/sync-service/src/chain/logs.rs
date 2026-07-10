@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Address, ChainError, CommitmentBatch, DynProvider, Filter, FixedBytes,
+    GeneratedCommitmentBatch, Log, Nullified, Nullifiers, Provider, RailgunLegacyShieldEvents,
+    Shield, SolEvent, Transact,
+};
 
 pub(super) async fn fetch_logs_for_range_with_provider(
     provider: &DynProvider,

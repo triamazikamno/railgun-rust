@@ -64,15 +64,15 @@ impl Default for WalletActorLifecycleCell {
 }
 
 impl WalletActorLifecycleCell {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self::with_state(WalletActorLifecycle::Active)
     }
 
-    pub(crate) fn new_prepared() -> Self {
+    pub(crate) const fn new_prepared() -> Self {
         Self::with_state(WalletActorLifecycle::Prepared)
     }
 
-    fn with_state(state: WalletActorLifecycle) -> Self {
+    const fn with_state(state: WalletActorLifecycle) -> Self {
         Self {
             fence: Mutex::new(LifecycleInner {
                 state,
@@ -85,7 +85,7 @@ impl WalletActorLifecycleCell {
         let mut guard = self
             .fence
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut guard)
     }
 
@@ -180,33 +180,6 @@ pub(crate) struct WalletActorApplyToken<'a> {
 
 /// Alias used by durable commit constructors (same capability as apply token).
 pub(crate) type WalletActorCommitToken<'a> = WalletActorApplyToken<'a>;
-
-/// Logical private-state transitions. Each transition must run under **exactly one**
-/// [`WalletActorLifecycleCell::with_active_apply`] (or terminal shutdown fence).
-/// Effects take a token only — they must not open a second lifecycle fence.
-///
-/// Known transitions implemented in the worker / POI modules:
-/// - `AcceptReset` — durable pending-reset accept + generation + readiness
-/// - `CommitResetRewind` — durable rewind + mirrors
-/// - `ScanCommit` — durable scan progress + mirrors + progress/rev/readiness
-/// - `PoiStatusRefresh` — durable UTXO POI status + mirrors
-/// - `PendingOutputVerify` — durable verified context + mirrors
-/// - Single-effect publishes (indexed catch-up, overlay notify, poi_refreshing flag)
-///
-/// New private mutations should add a named transition and apply it in one fence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // catalog of transitions; used as documentation + future routing
-pub(crate) enum WalletPrivateTransitionKind {
-    AcceptReset,
-    CommitResetRewind,
-    ScanCommit,
-    PoiStatusRefresh,
-    PendingOutputVerify,
-    IndexedCatchUpPublish,
-    OverlayPublish,
-    PoiRefreshingFlag,
-    ReadinessPublish,
-}
 
 /// Credential for remote POI jobs re-entering the actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

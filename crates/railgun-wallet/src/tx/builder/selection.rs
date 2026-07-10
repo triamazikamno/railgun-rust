@@ -1220,7 +1220,7 @@ impl<'a> SelectionSearch<'a> {
         }
     }
 
-    fn exact_only(&self) -> bool {
+    const fn exact_only(&self) -> bool {
         2 + self.target_count + self.base_output_count + 1 > MAX_SIGNATURE_INPUTS
     }
 

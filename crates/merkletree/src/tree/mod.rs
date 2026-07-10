@@ -424,6 +424,7 @@ pub fn bench_hash_layer_alloc(layer: &mut Vec<U256>) {
 }
 
 #[cfg(feature = "bench")]
+#[must_use]
 pub fn bench_compute_root_alloc(tree: &MerkleTree) -> U256 {
     let mut layer = vec![ZERO_HASHES[0]; TREE_LEAF_COUNT as usize];
     for (index, leaf) in &tree.leaves {

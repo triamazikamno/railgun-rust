@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BTreeMap, BlindedCommitmentData, DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, FixedBytes, Instant,
+    PoiError, PoiMerkleProof, PoiMerkleProofSource, PoiRpcClient, PoiStatus,
+    PreTransactionPoiError, SingleCommitmentProofContext, WalletLocalPoiCaches, async_trait, debug,
+    hex,
+};
 
 #[async_trait]
 pub(crate) trait PoiStatusReader: Send + Sync {
@@ -22,7 +27,7 @@ impl PoiStatusReader for PoiRpcClient {
         list_keys: &[FixedBytes<32>],
         blinded_commitment_datas: &[BlindedCommitmentData],
     ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError> {
-        PoiRpcClient::pois_per_list(
+        Self::pois_per_list(
             self,
             txid_version,
             chain_type,
@@ -40,7 +45,7 @@ pub(crate) struct LocalPoiStatusReader {
 }
 
 impl LocalPoiStatusReader {
-    pub(crate) fn new(caches: WalletLocalPoiCaches) -> Self {
+    pub(crate) const fn new(caches: WalletLocalPoiCaches) -> Self {
         Self { caches }
     }
 }
@@ -255,7 +260,7 @@ impl PendingOutputPoiSubmitter for PoiRpcClient {
         utxo_tree_out: u64,
         utxo_position_out: u64,
     ) -> Result<(), PoiError> {
-        PoiRpcClient::submit_single_commitment_proofs(
+        Self::submit_single_commitment_proofs(
             self,
             txid_version,
             chain_type,
@@ -277,7 +282,7 @@ impl PendingOutputPoiSubmitter for PoiRpcClient {
         txid_merkleroot_index: u64,
         poi: &broadcaster_core::transact::PreTxPoi,
     ) -> Result<(), PoiError> {
-        PoiRpcClient::submit_transact_proof(
+        Self::submit_transact_proof(
             self,
             txid_version,
             chain_type,

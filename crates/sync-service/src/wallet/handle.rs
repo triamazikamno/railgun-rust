@@ -1,17 +1,15 @@
-pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
-pub const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_secs(60);
+pub(super) const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
+pub(super) const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_mins(1);
 pub(super) const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
-pub(super) const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+pub(super) const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_mins(1);
 #[cfg(test)]
 pub(super) const WALLET_METADATA_LIVE_FLUSH_BLOCKS: u64 = 25;
-pub(super) const LOCAL_PENDING_SPENT_TTL: Duration = Duration::from_secs(10 * 60);
-pub(super) const OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
-pub(super) const OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER: Duration =
-    Duration::from_secs(24 * 60 * 60);
-pub(super) const OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER: Duration =
-    Duration::from_secs(24 * 60 * 60);
-pub(super) const PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+pub(super) const LOCAL_PENDING_SPENT_TTL: Duration = Duration::from_mins(10);
+pub(super) const OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER: Duration = Duration::from_mins(10);
+pub(super) const OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER: Duration = Duration::from_hours(24);
+pub(super) const OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER: Duration = Duration::from_hours(24);
+pub(super) const PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER: Duration = Duration::from_mins(5);
 pub(super) const OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES: u64 = 128;
 pub(super) const OUTPUT_POI_RECOVERY_VERIFY_PROOF: bool = true;
 pub(super) const OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER: Duration = Duration::from_secs(5);
@@ -77,9 +75,21 @@ impl WalletPoiRefreshSelection {
     }
 }
 
-use super::*;
+use super::{
+    Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, HashSet,
+    Mutex, Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextRecord,
+    PoiStatus, RwLock, SyncProgressUpdate, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource,
+    WalletActorApplyToken, WalletActorCommitToken, WalletActorLifecycle, WalletActorLifecycleCell,
+    WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCurrentSnapshot,
+    WalletIndexedCatchUpStatus, WalletReadiness, WalletResetToken, WalletScanRows, WalletSyncToken,
+    WalletUtxo, WalletViewState, chain_pending_overlay_matches, debug, mpsc, now_epoch_secs,
+    oneshot, wallet_utxo_stable_identity, warn, watch,
+};
 
 use crate::types::SyncProgressSender;
+
+#[cfg(test)]
+use super::Utxo;
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
@@ -99,7 +109,7 @@ pub struct WalletHandle {
     pub ready_rx: watch::Receiver<bool>,
     pub readiness_rx: watch::Receiver<WalletReadiness>,
     pub rev_rx: watch::Receiver<u64>,
-    /// Single-source public private-view (Current vs ResetPending).
+    /// Single-source public private-view (Current vs `ResetPending`).
     pub view_rx: watch::Receiver<WalletViewState>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
     pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
@@ -119,12 +129,12 @@ pub(crate) struct WalletActorTokenAuthority<'a> {
 
 impl WalletActorTokenAuthority<'_> {
     #[must_use]
-    pub(crate) const fn chain_id(&self) -> u64 {
+    pub(crate) const fn chain_id(self) -> u64 {
         self.handle.chain_id
     }
 
     #[must_use]
-    pub(crate) const fn actor_id(&self) -> u64 {
+    pub(crate) const fn actor_id(self) -> u64 {
         self.handle.actor_id
     }
 }
@@ -137,7 +147,7 @@ pub(crate) struct WalletIndexedCatchUpLease {
 
 impl WalletIndexedCatchUpLease {
     #[must_use]
-    pub(super) fn for_actor_accepted_job(
+    pub(super) const fn for_actor_accepted_job(
         token: WalletSyncToken,
         liveness: oneshot::Sender<()>,
     ) -> Self {
@@ -187,7 +197,7 @@ struct ExpectedPoiIdentity {
 }
 
 impl ExpectedPoiIdentity {
-    fn new(poi: &UtxoPoiMetadata) -> Self {
+    const fn new(poi: &UtxoPoiMetadata) -> Self {
         Self {
             commitment_kind: poi.commitment_kind,
             commitment: poi.commitment,
@@ -304,7 +314,7 @@ pub(crate) enum OwnedPoiPrivateDelta {
         expected_output: ExpectedWalletOutput,
         active_list_keys: Vec<FixedBytes<32>>,
         required_poi_status: ExpectedPoiStatus,
-        pending_update: Option<(ExpectedRecordState, PendingOutputPoiContextRecord)>,
+        pending_update: Box<Option<(ExpectedRecordState, PendingOutputPoiContextRecord)>>,
         expected_recovery: ExpectedRecordState,
         action: OutputPoiRecoveryAction,
         now: u64,
@@ -368,7 +378,7 @@ pub(crate) struct WalletPrivateApplyClient {
 }
 
 impl WalletPrivateApplyClient {
-    pub(crate) fn new(tx: mpsc::Sender<WalletPrivateApplyRequest>) -> Self {
+    pub(crate) const fn new(tx: mpsc::Sender<WalletPrivateApplyRequest>) -> Self {
         Self { tx }
     }
 
@@ -602,7 +612,6 @@ impl WalletPrivateMutationPermit<'_> {
     }
 
     pub(super) fn apply_publish_progress(
-        &self,
         _token: &WalletActorApplyToken<'_>,
         progress_tx: Option<&SyncProgressSender>,
         update: SyncProgressUpdate,
@@ -613,11 +622,10 @@ impl WalletPrivateMutationPermit<'_> {
     }
 
     pub(super) fn apply_publish_readiness(
-        &self,
         _token: &WalletActorApplyToken<'_>,
         ready_tx: &watch::Sender<bool>,
         readiness_tx: &watch::Sender<WalletReadiness>,
-        readiness: WalletReadiness,
+        readiness: &WalletReadiness,
     ) {
         if let Err(err) = readiness_tx.send(readiness.clone()) {
             debug!(?err, "failed to send wallet readiness state");
@@ -660,11 +668,11 @@ impl WalletPrivateMutationPermit<'_> {
         self.handle.reset_generation_tx.send_replace(generation);
     }
 
-    pub(super) fn pending_overlay(&self) -> &Arc<RwLock<WalletPendingOverlay>> {
+    pub(super) const fn pending_overlay(&self) -> &Arc<RwLock<WalletPendingOverlay>> {
         &self.handle.pending_overlay
     }
 
-    pub(super) fn handle_utxos(&self) -> &Arc<RwLock<Vec<WalletUtxo>>> {
+    pub(super) const fn handle_utxos(&self) -> &Arc<RwLock<Vec<WalletUtxo>>> {
         &self.handle.utxos
     }
 
@@ -678,46 +686,6 @@ impl WalletPrivateMutationPermit<'_> {
         let snapshot = self.handle.utxos.read().await.clone();
         self.revalidate()?;
         Ok(snapshot)
-    }
-
-    pub(super) async fn replace_wallet_utxos(
-        &self,
-        next: Vec<WalletUtxo>,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        let mut locked = self.handle.utxos.write().await;
-        self.with_active_apply(|_token| {
-            *locked = next;
-        })
-    }
-
-    pub(super) async fn set_last_scanned(
-        &self,
-        block: u64,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        let utxos = self.handle.utxos.read().await.clone();
-        let overlay = self.handle.pending_overlay.read().await.clone();
-        self.with_active_apply(|token| {
-            self.apply_set_last_scanned(&token, block, &utxos, &overlay);
-        })
-    }
-
-    pub(super) fn set_reset_generation(
-        &self,
-        generation: u64,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        self.with_active_apply(|token| {
-            self.apply_set_reset_generation(&token, generation);
-        })
-    }
-
-    pub(super) fn publish_progress(
-        &self,
-        progress_tx: Option<&SyncProgressSender>,
-        update: SyncProgressUpdate,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        self.with_active_apply(|token| {
-            self.apply_publish_progress(&token, progress_tx, update);
-        })
     }
 
     pub(super) async fn notify_changed(&self) -> Result<(), WalletBackfillRejectReason> {
@@ -757,18 +725,6 @@ impl WalletPrivateMutationPermit<'_> {
         })
     }
 
-    /// Publish readiness/ready under the lifecycle fence while apply-authorized.
-    pub(super) fn publish_readiness(
-        &self,
-        ready_tx: &watch::Sender<bool>,
-        readiness_tx: &watch::Sender<WalletReadiness>,
-        readiness: WalletReadiness,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        self.with_active_apply(|token| {
-            self.apply_publish_readiness(&token, ready_tx, readiness_tx, readiness);
-        })
-    }
-
     pub(super) async fn replace_chain_pending_overlay(
         &self,
         next: WalletPendingOverlay,
@@ -779,7 +735,7 @@ impl WalletPrivateMutationPermit<'_> {
     }
 }
 
-pub use crate::types::{WalletPendingOverlay, WalletPendingSpent};
+pub(super) use crate::types::{WalletPendingOverlay, WalletPendingSpent};
 
 impl WalletHandle {
     #[must_use]
@@ -914,9 +870,7 @@ impl WalletHandle {
             return WalletBackfillStartResult::Rejected {
                 committed_to: self.last_scanned_raw(),
                 reason: WalletBackfillRejectReason::StaleGeneration {
-                    expected: current
-                        .map(|p| p.reset_generation)
-                        .unwrap_or(progress.reset_generation),
+                    expected: current.map_or(progress.reset_generation, |p| p.reset_generation),
                     actual: progress.reset_generation,
                 },
             };
@@ -959,7 +913,7 @@ impl WalletHandle {
         progress.revalidate(self.schedulable_progress())
     }
 
-    pub(crate) fn mint_reset_token(&self, intent_id: u64) -> WalletResetToken {
+    pub(crate) const fn mint_reset_token(&self, intent_id: u64) -> WalletResetToken {
         WalletResetToken::mint(WalletActorTokenAuthority { handle: self }, intent_id)
     }
 
@@ -992,7 +946,7 @@ impl WalletHandle {
     /// view-stamped `(last_scanned, reset_generation)` for scheduling.
     ///
     /// Generation comes from the view snapshot only — never from authority generation —
-    /// so AcceptReset cannot pair an old cursor with a newly advanced atomic generation.
+    /// so `AcceptReset` cannot pair an old cursor with a newly advanced atomic generation.
     pub(crate) async fn wait_schedulable_progress(
         &self,
         cancel: &CancellationToken,
@@ -1007,7 +961,7 @@ impl WalletHandle {
                 return Some(progress);
             }
             tokio::select! {
-                _ = cancel.cancelled() => return None,
+                () = cancel.cancelled() => return None,
                 changed = view_rx.changed() => {
                     if changed.is_err() {
                         return None;
@@ -1129,6 +1083,7 @@ impl WalletHandle {
 
     /// Pending tip overlay only when view is [`WalletViewState::Current`].
     /// Sole public source is the published projection (not the live lock).
+    #[must_use]
     pub fn pending_overlay(&self) -> Option<Arc<WalletPendingOverlay>> {
         self.current_snapshot()
             .map(|snapshot| Arc::clone(&snapshot.pending_overlay))
@@ -1181,6 +1136,7 @@ impl WalletHandle {
 
     /// UTXO snapshot only when view is [`WalletViewState::Current`].
     /// Returns `None` while reset is pending.
+    #[must_use]
     pub fn utxos_snapshot(&self) -> Option<Arc<[WalletUtxo]>> {
         self.current_snapshot()
             .map(|snapshot| Arc::clone(&snapshot.utxos))
@@ -1189,6 +1145,7 @@ impl WalletHandle {
     /// Coherent current private snapshot from the published view, or `None` while reset-pending.
     ///
     /// This is the sole public private-projection choke point (UTXOs + pending overlay + stamps).
+    #[must_use]
     pub fn current_snapshot(&self) -> Option<Arc<WalletCurrentSnapshot>> {
         self.view_state().current_snapshot()
     }

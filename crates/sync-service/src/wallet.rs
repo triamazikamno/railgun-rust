@@ -15,7 +15,7 @@ use broadcaster_core::crypto::shared_key::shared_symmetric_key;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{DEFAULT_TXID_VERSION, railgun_txid_leaf_hash_with_output_start};
 use broadcaster_core::tree::TREE_LEAF_COUNT;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
 use merkletree::tree::{DenseMerkleTree, MerkleForest};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
@@ -48,7 +48,6 @@ use railgun_wallet::{
     Note, PoiStatus, RailgunSpendSigner, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource,
     WalletUtxo,
 };
-use url::Url;
 
 use crate::chain::{
     ChainError, ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey,
@@ -58,15 +57,15 @@ use crate::chain::{
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::txid_cache::TxidPublicCacheError;
 use crate::types::{
-    BackfillEvent, BackfillRequest, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback,
-    SharedLogBatch, SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult,
-    WalletBackfillFinishResult, WalletBackfillGrant, WalletBackfillOwnerDisposition,
-    WalletBackfillOwnerSignal, WalletBackfillRejectReason, WalletBackfillResetResult,
-    WalletBackfillStartResult, WalletCacheStore, WalletConfig, WalletCurrentSnapshot,
-    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness,
-    WalletReadinessError, WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken,
-    WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit,
-    WalletSyncToken, WalletViewState,
+    BackfillEvent, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback, SharedLogBatch,
+    SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult,
+    WalletBackfillGrant, WalletBackfillOwnerDisposition, WalletBackfillOwnerSignal,
+    WalletBackfillRejectReason, WalletBackfillResetResult, WalletBackfillStartResult,
+    WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletIndexedCatchUpStatus,
+    WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness, WalletReadinessError,
+    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
+    WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
+    WalletViewState,
 };
 
 mod actor;
@@ -86,22 +85,53 @@ pub(crate) use actor::{
     PoiRemoteJobKey, WalletActorApplyToken, WalletActorCommitToken, WalletActorCredential,
     WalletActorLifecycle, WalletActorLifecycleCell, WalletRemoteDone,
 };
-use delta::*;
-use handle::*;
+use delta::{
+    apply_wallet_delta_to_vec_with_outcome, chain_pending_overlay_matches, rewind_wallet_utxos,
+};
+use handle::{
+    EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus, ExpectedRecordState,
+    ExpectedWalletOutput, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES, OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER,
+    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_VERIFY_PROOF, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+    PendingOutputPoiSubmissionPredicate, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
+    WalletIndexedCatchUpCommand, WalletPendingOverlayUpdate, WalletPoiRefreshSelection,
+    WalletPrivateRemoteAuthority,
+};
 pub(crate) use handle::{
     OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,
     WalletIndexedCatchUpLease, WalletPrivateApplyClient, WalletPrivateApplyRequest,
     WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
 };
-use local_poi_cache::*;
-use output_poi_recovery::*;
-use pending_output_poi::*;
+use local_poi_cache::log_local_poi_cache_unavailable;
+use output_poi_recovery::{
+    OutputPoiRecoveryRequest, force_resubmit_matching_pending_output_pois_authorized,
+    mark_valid_output_poi_recoveries, mark_valid_output_poi_recoveries_authorized,
+    new_output_poi_recovery_record, output_poi_recovery_candidates, recover_missing_output_pois,
+};
+use pending_output_poi::{
+    PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
+    apply_owned_poi_private_delta_on_actor, apply_poi_private_delta,
+    expected_pending_context_state, expected_recovery_state,
+    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
+    pending_output_poi_observation_updates, pending_output_poi_submission_plan_current,
+    pending_output_poi_submit_identity, preflight_and_remote_submit_pending_output_poi,
+    process_pending_output_poi_observations_authorized, submit_observed_pending_output_pois_inner,
+    verify_submitted_pending_output_pois_with_config_authorized,
+};
 pub(crate) use persist::WalletPoiRuntime;
-use persist::*;
-use poi_maintenance::*;
-use poi_refresh::*;
-use poi_sources::*;
-use private_remote::*;
+use persist::{
+    OutputPoiRecoveryRun, WalletLiveMetadataFlush, WalletPersistState, WalletProgressPersist,
+    WalletProgressPrivateEffects, blinded_commitment_type, now_epoch_secs,
+    wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
+};
+use poi_maintenance::PoiMaintenanceController;
+use poi_refresh::{
+    refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
+};
+use poi_sources::PendingOutputPoiSubmitter;
+pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
+use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
 
 pub use crate::types::{WalletPendingOverlay, WalletPendingSpent};
 #[cfg(test)]
@@ -115,8 +145,6 @@ pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
 pub(crate) use poi_refresh::LivePoiTailError;
 pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
-#[cfg(test)]
-pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
 #[cfg(test)]
 pub(crate) use worker::spawn_wallet_worker;
 pub(crate) use worker::{PreparedWalletWorker, prepare_wallet_worker, wallet_cache_store};

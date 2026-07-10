@@ -1,4 +1,18 @@
-use super::*;
+#[cfg(test)]
+use super::handle::{WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL};
+use super::{
+    Arc, BackfillEvent, BlindedCommitmentType, ChainPublicDataPlane, DbStore, FixedBytes,
+    GlobalPoiPolicy, IndexedArtifactSourceConfig, Instant, MerkleForest, OutputPoiRecoveryRecord,
+    OutputPoiRecoveryRequest, PendingOutputPoiContextRecord, PoiProxyFallback, PoiRpcClient,
+    PublicPoiCorpusKey, QueryRpcPool, RwLock, SystemTime, UNIX_EPOCH, UtxoCommitmentKind,
+    WalletActorCommitToken, WalletCacheError, WalletCacheStore, WalletConfig, WalletHandle,
+    WalletPoiRefreshSelection, WalletPrivateCommit, WalletPrivateMutationAuthority,
+    WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletReadiness, WalletUtxo, debug,
+    log_local_poi_cache_unavailable, mark_valid_output_poi_recoveries,
+    output_poi_recovery_candidates, recover_missing_output_pois,
+};
+use tokio::sync::mpsc;
+use url::Url;
 
 pub(crate) fn wallet_poi_status_refresh_needed(
     wallet_utxos: &[WalletUtxo],
@@ -22,7 +36,7 @@ pub(super) fn wallet_poi_status_refresh_needed_for_selection(
         })
 }
 
-pub(super) fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommitmentType {
+pub(super) const fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommitmentType {
     match kind {
         UtxoCommitmentKind::Shield => BlindedCommitmentType::Shield,
         UtxoCommitmentKind::Transact => BlindedCommitmentType::Transact,
@@ -32,13 +46,13 @@ pub(super) fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommit
 pub(crate) fn wallet_poi_status_client(
     poi_rpc_url: &Url,
     http_client: Option<&reqwest::Client>,
-) -> Option<PoiRpcClient> {
-    Some(match http_client {
+) -> PoiRpcClient {
+    match http_client {
         Some(http_client) => {
             PoiRpcClient::with_http_client(poi_rpc_url.clone(), http_client.clone())
         }
         None => PoiRpcClient::new(poi_rpc_url.clone()),
-    })
+    }
 }
 
 pub(crate) enum WalletPoiRuntime {
@@ -56,8 +70,7 @@ impl WalletPoiRuntime {
         policy: &GlobalPoiPolicy,
         http_client: Option<&reqwest::Client>,
     ) -> Self {
-        let client = wallet_poi_status_client(policy.rpc_url(), http_client)
-            .expect("POI RPC client construction is infallible");
+        let client = wallet_poi_status_client(policy.rpc_url(), http_client);
         match policy {
             GlobalPoiPolicy::IndexedArtifacts {
                 wallet_read_fallback,
@@ -245,7 +258,7 @@ pub(super) struct WalletLiveMetadataFlush {
 }
 
 impl WalletLiveMetadataFlush {
-    pub(super) fn new(last_persisted_block: u64, now: Instant) -> Self {
+    pub(super) const fn new(last_persisted_block: u64, now: Instant) -> Self {
         Self {
             last_persisted_block,
             last_persisted_at: now,
@@ -258,12 +271,13 @@ impl WalletLiveMetadataFlush {
             || now.duration_since(self.last_persisted_at) >= WALLET_METADATA_LIVE_FLUSH_INTERVAL
     }
 
-    pub(super) fn mark_persisted(&mut self, last_persisted_block: u64, now: Instant) {
+    pub(super) const fn mark_persisted(&mut self, last_persisted_block: u64, now: Instant) {
         self.last_persisted_block = last_persisted_block;
         self.last_persisted_at = now;
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct WalletProgressPersist<'a> {
     pub(super) cache_key: &'a str,
     pub(super) snapshot: &'a [WalletUtxo],
@@ -272,7 +286,7 @@ pub(super) struct WalletProgressPersist<'a> {
     pub(super) changed: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct WalletProgressPrivateEffects<'a> {
     pub(super) pending_output_context_chain_id: u64,
     pub(super) pending_output_context_updates: &'a [PendingOutputPoiContextRecord],

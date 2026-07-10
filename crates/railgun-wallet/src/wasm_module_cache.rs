@@ -14,7 +14,7 @@ const WASM_MODULE_CACHE_FORMAT_VERSION: u32 = 2;
 const WASM_MODULE_CACHE_ENGINE_VERSION: &str = "wasmer-6.1.0";
 
 #[derive(Debug, Error)]
-pub enum WasmModuleCacheError {
+pub(crate) enum WasmModuleCacheError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("db error: {0}")]
@@ -31,12 +31,12 @@ pub enum WasmModuleCacheError {
     Deserialize(String),
 }
 
-pub struct CachedWasmModule {
-    pub module: Module,
-    pub cache_hit: bool,
+pub(crate) struct CachedWasmModule {
+    pub(crate) module: Module,
+    pub(crate) cache_hit: bool,
 }
 
-pub fn load_or_compile_wasm_module(
+pub(crate) fn load_or_compile_wasm_module(
     db: Option<&DbStore>,
     store: &Store,
     variant: &str,
@@ -82,7 +82,7 @@ pub fn load_or_compile_wasm_module(
     })
 }
 
-pub fn wasm_module_cache_exists(
+pub(crate) fn wasm_module_cache_exists(
     db: &DbStore,
     variant: &str,
     compiler: &str,

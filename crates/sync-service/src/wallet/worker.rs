@@ -1,4 +1,35 @@
-use super::*;
+use super::{
+    Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, ChainError, ChainPublicDataPlane,
+    DbStore, Duration, FixedBytes, FuturesUnordered, HashSet, IndexedArtifactSourceConfig, Instant,
+    Instrument, LocalPoiStatusReader, MerkleForest, Mutex, OutputPoiRecoveryRun,
+    PoiMaintenanceController, PoiProxyFallback, PoiRemoteJobKey, PoiRpcClient, PoiStatusReader,
+    PublicPoiCorpusKey, QueryRpcPool, RwLock, SharedLogBatch, SyncProgressStage,
+    SyncProgressUpdate, WALLET_POI_REFRESH_INTERVAL, WalletActorApplyToken, WalletActorCommitToken,
+    WalletActorCredential, WalletActorLifecycleCell, WalletBackfillApplyResult,
+    WalletBackfillFinishResult, WalletBackfillGrant, WalletBackfillOwnerDisposition,
+    WalletBackfillOwnerSignal, WalletBackfillRejectReason, WalletBackfillResetResult,
+    WalletBackfillStartResult, WalletCacheError, WalletCacheStore, WalletConfig,
+    WalletCurrentSnapshot, WalletHandle, WalletIndexedCatchUpCommand, WalletIndexedCatchUpLease,
+    WalletIndexedCatchUpStatus, WalletLiveMetadataFlush, WalletLogDelta, WalletPendingOverlay,
+    WalletPendingOverlayUpdate, WalletPendingResetRecord, WalletPersistState,
+    WalletPoiRefreshSelection, WalletPoiRuntime, WalletPrivateApplyClient,
+    WalletPrivateApplyRequest, WalletPrivateCommit, WalletPrivateMutationAuthority,
+    WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletProgressPersist,
+    WalletProgressPrivateEffects, WalletReadiness, WalletReadinessError, WalletRemoteDone,
+    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
+    WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncActorStateRecord, WalletSyncToken,
+    WalletUtxo, WalletViewState, WalletWorkerServices, apply_owned_poi_private_delta_on_actor,
+    apply_wallet_delta_to_vec_with_outcome, broadcast, chain_pending_overlay_matches, debug,
+    default_active_poi_list_keys, force_resubmit_matching_pending_output_pois_authorized, info,
+    mark_valid_output_poi_recoveries_authorized, mpsc, now_epoch_secs, oneshot,
+    pending_output_poi_observation_updates, pending_overlay_from_delta,
+    process_pending_output_poi_observations_authorized,
+    refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
+    rewind_wallet_utxos, verify_submitted_pending_output_pois_with_config_authorized,
+    wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection, warn, watch,
+};
+use crate::types::BackfillRequest;
+use futures::StreamExt;
 
 async fn publish_poi_refreshing(
     sender: &watch::Sender<bool>,
@@ -64,8 +95,8 @@ async fn request_poi_maintenance(
     cfg: &WalletConfig,
     public_data_plane: &ChainPublicDataPlane,
     rpcs: &Arc<QueryRpcPool>,
-    http_client: &Option<reqwest::Client>,
-    indexed_artifact_source: &Option<IndexedArtifactSourceConfig>,
+    http_client: Option<&reqwest::Client>,
+    indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     poi_runtime: &WalletPoiRuntime,
     forest: &Arc<RwLock<MerkleForest>>,
     utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
@@ -103,8 +134,8 @@ async fn request_poi_maintenance(
         cfg: cfg.clone(),
         public_data_plane: public_data_plane.clone(),
         rpcs: Arc::clone(rpcs),
-        http_client: http_client.clone(),
-        indexed_artifact_source: indexed_artifact_source.clone(),
+        http_client: http_client.cloned(),
+        indexed_artifact_source: indexed_artifact_source.cloned(),
         poi_client: client,
         poi_is_indexed: poi_runtime.is_indexed_artifacts(),
         poi_wallet_read_fallback: poi_runtime.wallet_read_fallback_enabled(),
@@ -137,8 +168,8 @@ async fn on_poi_maintenance_done(
     cfg: &WalletConfig,
     public_data_plane: &ChainPublicDataPlane,
     rpcs: &Arc<QueryRpcPool>,
-    http_client: &Option<reqwest::Client>,
-    indexed_artifact_source: &Option<IndexedArtifactSourceConfig>,
+    http_client: Option<&reqwest::Client>,
+    indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     poi_runtime: &WalletPoiRuntime,
     forest: &Arc<RwLock<MerkleForest>>,
     utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
@@ -365,7 +396,6 @@ struct WalletScanCommitRequest<'a> {
     live_metadata_flush: &'a mut WalletLiveMetadataFlush,
     ready_tx: &'a watch::Sender<bool>,
     readiness_tx: &'a watch::Sender<WalletReadiness>,
-    active_poi_list_keys: &'a [FixedBytes<32>],
     mark_syncing_on_commit: bool,
     public_data_plane: &'a ChainPublicDataPlane,
 }
@@ -426,9 +456,9 @@ struct WalletResetCommitRequest<'a> {
     live_metadata_flush: &'a mut WalletLiveMetadataFlush,
 }
 
-/// Outcome of CommitResetRewind only (pending reset already accepted).
+/// Outcome of `CommitResetRewind` only (pending reset already accepted).
 /// Never means "reset rejected" — use [`WalletBackfillResetResult::Rejected`] only
-/// before durable AcceptReset.
+/// before durable `AcceptReset`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WalletResetRewindOutcome {
     Committed {
@@ -444,14 +474,18 @@ impl WalletResetRewindOutcome {
     const fn committed(&self) -> bool {
         matches!(self, Self::Committed { .. })
     }
+}
 
-    fn into_rewind_status(self) -> WalletResetRewindStatus {
-        match self {
-            Self::Committed { committed_to } => WalletResetRewindStatus::Committed { committed_to },
-            Self::Deferred {
+impl From<WalletResetRewindOutcome> for WalletResetRewindStatus {
+    fn from(outcome: WalletResetRewindOutcome) -> Self {
+        match outcome {
+            WalletResetRewindOutcome::Committed { committed_to } => {
+                Self::Committed { committed_to }
+            }
+            WalletResetRewindOutcome::Deferred {
                 committed_to,
                 reason,
-            } => WalletResetRewindStatus::Pending {
+            } => Self::Pending {
                 committed_to,
                 last_attempt: Some(reason),
             },
@@ -467,13 +501,13 @@ impl WalletResetCommitOutcome {
     fn into_accept_result(self, reset_generation: u64) -> WalletBackfillResetResult {
         WalletBackfillResetResult::Accepted {
             reset_generation,
-            rewind: self.rewind.into_rewind_status(),
+            rewind: self.rewind.into(),
         }
     }
 }
 
 /// Fold a post-accept rewind attempt into a public reset result.
-/// After AcceptReset succeeds, the public result is never Rejected.
+/// After `AcceptReset` succeeds, the public result is never Rejected.
 fn reset_result_after_accept(
     reset_generation: u64,
     outcome: WalletResetCommitOutcome,
@@ -645,7 +679,7 @@ impl WalletActorState {
         }
     }
 
-    fn update_cursor(&mut self, last_scanned: u64) {
+    const fn update_cursor(&mut self, last_scanned: u64) {
         self.last_scanned = last_scanned;
     }
 
@@ -687,13 +721,12 @@ impl WalletActorState {
     fn apply_fact_and_publish_with_token(
         &mut self,
         fact: WalletReadinessFact,
-        permit: &WalletPrivateMutationPermit<'_>,
         token: &WalletActorApplyToken<'_>,
         ready_tx: &watch::Sender<bool>,
         readiness_tx: &watch::Sender<WalletReadiness>,
     ) {
         self.apply_fact(fact);
-        self.reduce_and_publish_readiness_with_token(permit, token, ready_tx, readiness_tx);
+        self.reduce_and_publish_readiness_with_token(token, ready_tx, readiness_tx);
     }
 
     fn apply_fact_and_publish_active(
@@ -908,7 +941,7 @@ impl WalletActorState {
         self.retire_all_jobs_for_reset()
     }
 
-    fn clear_pending_reset(&mut self) {
+    const fn clear_pending_reset(&mut self) {
         self.pending_reset = None;
         self.pending_reset_rewind_committed = false;
         self.pending_reset_replay_admitted = None;
@@ -1035,20 +1068,24 @@ impl WalletActorState {
         readiness_tx: &watch::Sender<WalletReadiness>,
     ) -> Result<(), WalletBackfillRejectReason> {
         permit.with_active_apply(|token| {
-            self.reduce_and_publish_readiness_with_token(permit, &token, ready_tx, readiness_tx);
+            self.reduce_and_publish_readiness_with_token(&token, ready_tx, readiness_tx);
         })
     }
 
     /// Sole readiness publication path under an Active apply token.
     fn reduce_and_publish_readiness_with_token(
         &mut self,
-        permit: &WalletPrivateMutationPermit<'_>,
         token: &WalletActorApplyToken<'_>,
         ready_tx: &watch::Sender<bool>,
         readiness_tx: &watch::Sender<WalletReadiness>,
     ) {
         let readiness = self.derived_readiness();
-        permit.apply_publish_readiness(token, ready_tx, readiness_tx, readiness.clone());
+        WalletPrivateMutationPermit::apply_publish_readiness(
+            token,
+            ready_tx,
+            readiness_tx,
+            &readiness,
+        );
         self.readiness = readiness;
     }
 }
@@ -1124,38 +1161,6 @@ impl WalletPoiRuntime {
             }
         }
     }
-
-    pub(super) async fn read_available_for_lists(
-        &self,
-        public_data_plane: &ChainPublicDataPlane,
-        cfg: &WalletConfig,
-        active_list_keys: &[FixedBytes<32>],
-    ) -> bool {
-        match self {
-            Self::IndexedArtifacts { .. } => {
-                public_data_plane
-                    .poi_corpus_ready_for_lists(
-                        PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id),
-                        active_list_keys,
-                    )
-                    .await
-                    || self.wallet_read_fallback_enabled()
-            }
-            Self::PoiProxy { .. } => true,
-        }
-    }
-
-    /// True when a local corpus reader is available (actor may refresh statuses without remote I/O).
-    pub(super) async fn local_status_available(
-        &self,
-        public_data_plane: &ChainPublicDataPlane,
-        cfg: &WalletConfig,
-        active_list_keys: &[FixedBytes<32>],
-    ) -> bool {
-        self.local_status_reader(public_data_plane, cfg, active_list_keys)
-            .await
-            .is_some()
-    }
 }
 
 impl WalletResetCommitRequest<'_> {
@@ -1209,7 +1214,7 @@ impl WalletResetCommitRequest<'_> {
         let mut utxos_locked = request.utxos.write().await;
         let mut overlay_locked = permit.pending_overlay().write().await;
         let apply_result = permit.with_active_apply(|token| {
-            if let Err(err) = request.cache_store.commit_wallet_private_state(
+            request.cache_store.commit_wallet_private_state(
                 WalletPrivateCommit::new(
                     &token,
                     &permit,
@@ -1223,9 +1228,7 @@ impl WalletResetCommitRequest<'_> {
                     &[],
                 )
                 .with_sync_actor_state(&sync_actor_state),
-            ) {
-                return Err(err);
-            }
+            )?;
             *utxos_locked = candidate;
             permit.apply_set_last_scanned(
                 &token,
@@ -1243,7 +1246,7 @@ impl WalletResetCommitRequest<'_> {
             }
             // Exit ResetPending: public view is now rewound current.
             permit.apply_publish_view_current(&token, &utxos_locked, &overlay_locked);
-            Ok(())
+            Ok::<(), WalletCacheError>(())
         });
         drop(overlay_locked);
         drop(utxos_locked);
@@ -1364,7 +1367,6 @@ impl WalletPoiStatusRefreshCommitRequest<'_> {
             *utxos_locked = candidate;
             request.actor_state.apply_fact_and_publish_with_token(
                 WalletReadinessFact::DurablePrivateCommitOk { last_scanned: None },
-                &permit,
                 &token,
                 request.ready_tx,
                 request.readiness_tx,
@@ -1665,7 +1667,7 @@ impl WalletScanCommitRequest<'_> {
                 .map(|guard| guard.clone())
                 .unwrap_or_default();
             permit.apply_set_last_scanned(&token, to_block, &utxos_locked, &overlay);
-            permit.apply_publish_progress(
+            WalletPrivateMutationPermit::apply_publish_progress(
                 &token,
                 request.cfg.progress_tx.as_ref(),
                 SyncProgressUpdate::new(
@@ -1686,7 +1688,6 @@ impl WalletScanCommitRequest<'_> {
             if request.mark_syncing_on_commit {
                 request.actor_state.apply_fact_and_publish_with_token(
                     fact,
-                    &permit,
                     &token,
                     request.ready_tx,
                     request.readiness_tx,
@@ -1772,7 +1773,7 @@ pub(crate) struct PreparedWalletWorker {
 }
 
 impl PreparedWalletWorker {
-    pub(crate) fn handle(&self) -> &WalletHandle {
+    pub(crate) const fn handle(&self) -> &WalletHandle {
         self.handle
             .as_ref()
             .expect("prepared wallet worker must own its handle")
@@ -2278,11 +2279,11 @@ pub(crate) async fn prepare_wallet_worker(
                             WalletPoiRefreshSelection::RequiredOrRecoverable,
                         )
                     };
-                    if refresh_needed {
-                        if let Some(status_reader) = poi_runtime
+                    if refresh_needed
+                        && let Some(status_reader) = poi_runtime
                             .local_status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
                             .await
-                        {
+                    {
                             match (WalletPoiStatusRefreshCommitRequest {
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
@@ -2313,7 +2314,6 @@ pub(crate) async fn prepare_wallet_worker(
                                     warn!(?reason, cache_key = %cfg.cache_key, "post-ready wallet POI status refresh rejected");
                                 }
                             }
-                        }
                     }
                     let _ = request_poi_maintenance(
                         &mut poi_maintenance,
@@ -2327,8 +2327,8 @@ pub(crate) async fn prepare_wallet_worker(
                         &cfg,
                         &public_data_plane,
                         &rpcs,
-                        &http_client,
-                        &indexed_artifact_source,
+                        http_client.as_ref(),
+                        indexed_artifact_source.as_ref(),
                         &poi_runtime,
                         &forest,
                         &utxos,
@@ -2342,10 +2342,8 @@ pub(crate) async fn prepare_wallet_worker(
                 }
             }};
         }
-        if actor_state.pending_reset.is_some() {
-            if try_drive_pending_reset!().is_some() {
-                signal_restored_reset_attempt(&mut startup_replay_tx);
-            }
+        if actor_state.pending_reset.is_some() && try_drive_pending_reset!().is_some() {
+            signal_restored_reset_attempt(&mut startup_replay_tx);
         }
 
         // Prepared-worker cancellation drops the sender, so this cannot hang. Once activation is
@@ -2356,7 +2354,7 @@ pub(crate) async fn prepare_wallet_worker(
         }
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => break,
+                () = cancel.cancelled() => break,
                 Some((token, signal)) = accepted_backfill_liveness.next(), if !accepted_backfill_liveness.is_empty() => {
                     let WalletBackfillOwnerSignal {
                         disposition,
@@ -2435,8 +2433,8 @@ pub(crate) async fn prepare_wallet_worker(
                                 &cfg,
                                 &public_data_plane,
                                 &rpcs,
-                                &http_client,
-                                &indexed_artifact_source,
+                                http_client.as_ref(),
+                                indexed_artifact_source.as_ref(),
                                 &poi_runtime,
                                 &forest,
                                 &utxos,
@@ -2558,8 +2556,8 @@ pub(crate) async fn prepare_wallet_worker(
                         &cfg,
                         &public_data_plane,
                         &rpcs,
-                        &http_client,
-                        &indexed_artifact_source,
+                                http_client.as_ref(),
+                                indexed_artifact_source.as_ref(),
                         &poi_runtime,
                         &forest,
                         &utxos,
@@ -2712,7 +2710,7 @@ pub(crate) async fn prepare_wallet_worker(
                     actor_state.retire_job(request.token);
                     drop(permit);
                 }
-                _ = tokio::time::sleep(WALLET_POI_REFRESH_INTERVAL), if poi_status_client.is_some() && backfill_complete_block.is_some() && actor_state.pending_reset.is_none() => {
+                () = tokio::time::sleep(WALLET_POI_REFRESH_INTERVAL), if poi_status_client.is_some() && backfill_complete_block.is_some() && actor_state.pending_reset.is_none() => {
                     let Some(_client) = poi_status_client.as_ref() else {
                         continue;
                     };
@@ -2727,12 +2725,12 @@ pub(crate) async fn prepare_wallet_worker(
                             selection,
                         )
                     };
-                    if refresh_needed {
-                        if let Some(status_reader) = poi_runtime
+                    if refresh_needed
+                        && let Some(status_reader) = poi_runtime
                             .local_status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
                             .await
-                        {
-                            match (WalletPoiStatusRefreshCommitRequest {
+                    {
+                        match (WalletPoiStatusRefreshCommitRequest {
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
                                 utxos: &utxos,
@@ -2761,7 +2759,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 Err(reason) => {
                                     warn!(?reason, cache_key = %cfg.cache_key, "periodic wallet POI status refresh rejected");
                                 }
-                            }
                         }
                     }
                     let _ = request_poi_maintenance(
@@ -2776,8 +2773,8 @@ pub(crate) async fn prepare_wallet_worker(
                         &cfg,
                         &public_data_plane,
                         &rpcs,
-                        &http_client,
-                        &indexed_artifact_source,
+                                    http_client.as_ref(),
+                                    indexed_artifact_source.as_ref(),
                         &poi_runtime,
                         &forest,
                         &utxos,
@@ -2906,7 +2903,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 live_metadata_flush: &mut live_metadata_flush,
                                 ready_tx: &ready_tx,
                                 readiness_tx: &readiness_tx,
-                                active_poi_list_keys: &active_poi_list_keys,
                                 mark_syncing_on_commit: true,
                                 public_data_plane: &public_data_plane,
                             }
@@ -2926,8 +2922,8 @@ pub(crate) async fn prepare_wallet_worker(
                                      &cfg,
                                      &public_data_plane,
                                      &rpcs,
-                                     &http_client,
-                                     &indexed_artifact_source,
+                                     http_client.as_ref(),
+                                     indexed_artifact_source.as_ref(),
                                      &poi_runtime,
                                      &forest,
                                      &utxos,
@@ -3121,28 +3117,26 @@ pub(crate) async fn prepare_wallet_worker(
                             // AcceptReset transition: durable accept + generation + actor_state +
                             // publications under one active-apply fence (no split after durable write).
                             let accept_result = acceptance_permit.with_active_apply(|token| {
-                                if let Err(err) = persist_wallet_reset_acceptance_with_token(
+                                persist_wallet_reset_acceptance_with_token(
                                     &token,
                                     &acceptance_permit,
                                     cache_store.as_ref(),
                                     &cfg,
                                     intent_id,
                                     accepted_pending_reset,
-                                ) {
-                                    return Err(err);
-                                }
+                                )?;
                                 acceptance_permit
                                     .apply_set_reset_generation(&token, next_reset_generation);
                                 let reset_intent_id = accepted_pending_reset.intent_id;
                                 let reset_from = accepted_pending_reset.from_block;
-                                 let clear_indexed_catch_up =
-                                     actor_state.accept_reset(accepted_pending_reset);
-                                 // Force intent is generation-scoped; do not carry across rewind.
-                                 poi_maintenance.clear_force_on_reset();
-                                 if clear_indexed_catch_up {
-                                     acceptance_permit
-                                         .apply_publish_indexed_catch_up(&token, None);
-                                 }
+                                let clear_indexed_catch_up =
+                                    actor_state.accept_reset(accepted_pending_reset);
+                                // Force intent is generation-scoped; do not carry across rewind.
+                                poi_maintenance.clear_force_on_reset();
+                                if clear_indexed_catch_up {
+                                    acceptance_permit
+                                        .apply_publish_indexed_catch_up(&token, None);
+                                }
                                 acceptance_permit.apply_publish_view_reset_pending(
                                     &token,
                                     reset_intent_id,
@@ -3150,12 +3144,11 @@ pub(crate) async fn prepare_wallet_worker(
                                     next_reset_generation,
                                 );
                                 actor_state.reduce_and_publish_readiness_with_token(
-                                    &acceptance_permit,
                                     &token,
                                     &ready_tx,
                                     &readiness_tx,
                                 );
-                                Ok(())
+                                Ok::<(), WalletCacheError>(())
                             });
                             match accept_result {
                                 Ok(Ok(())) => {
@@ -3265,7 +3258,7 @@ pub(crate) async fn prepare_wallet_worker(
                             let apply = match WalletScanApply::rows_from_log_batch(
                                 expected_from_block,
                                 batch.to_block,
-                                batch.clone(),
+                                &batch,
                                 crate::types::PublicScanSource::Rpc,
                             ) {
                                 Ok(apply) => apply,
@@ -3299,7 +3292,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 live_metadata_flush: &mut live_metadata_flush,
                                 ready_tx: &ready_tx,
                                 readiness_tx: &readiness_tx,
-                                active_poi_list_keys: &active_poi_list_keys,
                                 mark_syncing_on_commit: false,
                                 public_data_plane: &public_data_plane,
                             }
@@ -3324,8 +3316,8 @@ pub(crate) async fn prepare_wallet_worker(
                                             &cfg,
                                             &public_data_plane,
                                             &rpcs,
-                                            &http_client,
-                                            &indexed_artifact_source,
+                                            http_client.as_ref(),
+                                            indexed_artifact_source.as_ref(),
                                             &poi_runtime,
                                             &forest,
                                             &utxos,
@@ -3374,6 +3366,7 @@ pub(crate) async fn prepare_wallet_worker(
     Ok(prepared)
 }
 
+#[cfg(test)]
 pub(crate) async fn spawn_wallet_worker(
     services: WalletWorkerServices,
     cfg: WalletConfig,
@@ -3427,23 +3420,31 @@ mod tests {
     use std::time::Duration;
 
     use alloy::primitives::{Address, FixedBytes, U256};
+    use async_trait::async_trait;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
     use broadcaster_core::notes::Note;
     use broadcaster_core::query_rpc_pool::QueryRpcPool;
-    use local_db::{DbConfig, DbStore, WalletMeta};
+    use broadcaster_core::transact::DEFAULT_TXID_VERSION;
+    use local_db::{
+        DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta,
+    };
     use merkletree::tree::MerkleForest;
+    use poi::error::PoiError;
+    use poi::poi::BlindedCommitmentData;
     use tokio::sync::{RwLock, broadcast, mpsc, oneshot, watch};
     use url::Url;
 
     use railgun_wallet::scan::{SpentNullifier, WalletLogDelta};
-    use railgun_wallet::{Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
+    use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 
     use crate::chain::ChainPublicDataPlane;
     use crate::types::{
         BackfillRequest, ChainKey, GlobalPoiPolicy, LogBatch, PublicDataPlaneEpoch,
         PublicScanReadScope, WalletBackfillDriver, WalletConfig, WalletIndexedCatchUpSource,
-        WalletIndexedCatchUpStatus,
+        WalletIndexedCatchUpStatus, WalletPendingSpent, WalletScanRows,
     };
+    use crate::wallet::WalletActorLifecycle;
+    use crate::wallet::handle::WalletPendingOverlayRequest;
 
     fn test_public_data_plane(db: &Arc<DbStore>) -> ChainPublicDataPlane {
         ChainPublicDataPlane::new(
@@ -3771,7 +3772,9 @@ mod tests {
                 assert_eq!(grant.token(), token);
                 grant.activate()
             }
-            other => panic!("expected accepted target, got {other:?}"),
+            other @ WalletBackfillStartResult::Rejected { .. } => {
+                panic!("expected accepted target, got {other:?}")
+            }
         }
     }
 
@@ -4021,7 +4024,7 @@ mod tests {
         WalletScanApply::rows_from_log_batch(
             from_block,
             to_block,
-            logs_payload(from_block, to_block),
+            &logs_payload(from_block, to_block),
             crate::types::PublicScanSource::Rpc,
         )
         .expect("normalize empty log payload")
@@ -6792,7 +6795,7 @@ mod tests {
             .expect("open db"),
         );
         let (_live_tx, live_rx) = broadcast::channel(8);
-        let (_backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_worker(
@@ -6807,7 +6810,7 @@ mod tests {
                 poi_runtime: test_wallet_poi_runtime(),
                 forest: Arc::new(RwLock::new(MerkleForest::new())),
                 backfill_tx: backfill_request_tx,
-                backfill_sender: _backfill_tx,
+                backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
             },
             wallet_config(),
@@ -7127,7 +7130,6 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        let active_poi_list_keys = default_active_poi_list_keys();
         let wallet_utxo = test_wallet_utxo(105, 7);
         let (started_tx, _started_rx) = oneshot::channel();
         let (_release, release_rx) = oneshot::channel();
@@ -7195,7 +7197,6 @@ mod tests {
                 live_metadata_flush: &mut live_metadata_flush,
                 ready_tx: &ready_tx,
                 readiness_tx: &readiness_tx,
-                active_poi_list_keys: &active_poi_list_keys,
                 mark_syncing_on_commit: true,
                 public_data_plane: &public_data_plane,
             }
@@ -7262,7 +7263,6 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        let active_poi_list_keys = default_active_poi_list_keys();
         let wallet_utxo = test_wallet_utxo(105, 7);
         let (_live_tx, live_rx) = broadcast::channel(8);
         let (backfill_tx, backfill_rx) = mpsc::channel(8);
@@ -7331,7 +7331,6 @@ mod tests {
             live_metadata_flush: &mut live_metadata_flush,
             ready_tx: &ready_tx,
             readiness_tx: &readiness_tx,
-            active_poi_list_keys: &active_poi_list_keys,
             mark_syncing_on_commit: true,
             public_data_plane: &public_data_plane,
         }
@@ -7534,7 +7533,7 @@ mod tests {
                 WalletScanApply::rows_from_log_batch(
                     120,
                     130,
-                    logs_payload(100, 199),
+                    &logs_payload(100, 199),
                     crate::types::PublicScanSource::Rpc,
                 )
                 .expect("normalize shared log payload"),
@@ -7551,7 +7550,7 @@ mod tests {
                 WalletScanApply::rows_from_log_batch(
                     131,
                     199,
-                    logs_payload(100, 199),
+                    &logs_payload(100, 199),
                     crate::types::PublicScanSource::Rpc,
                 )
                 .expect("normalize shared log payload"),

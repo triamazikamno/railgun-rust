@@ -62,18 +62,45 @@ mod service;
 mod types;
 mod workers;
 
-use backfill::*;
+use backfill::{WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks};
 use data_plane::PublicScanCoverageWrite;
 pub(crate) use data_plane::{
     ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated,
     PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest,
 };
-use forest_db::*;
-use indexed_wallet::*;
-use logs::*;
-use merkle_artifacts::*;
-use types::*;
-use workers::*;
+use forest_db::MerkleForestDbExt;
+use indexed_wallet::{
+    IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession, IndexedWalletPage,
+    artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
+    should_hedge_wallet_startup, squid_tail_target_after_artifact, wait_or_cancel,
+    wallet_backfill_from_block, wallet_reorg_backfill_from_block, wallet_sync_target,
+};
+use logs::{anchor_file_name, fetch_logs_for_range_with_provider, parse_anchor_block, sort_logs};
+use merkle_artifacts::run_merkle_artifact_catch_up_into;
+use types::{
+    EVM_CHAIN_TYPE, ForestReorgDecision, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind,
+    PendingTipWalletRegistration, TXID_PUBLIC_CACHE_SYNC_INTERVAL, WalletIndexedCatchUpStatusGuard,
+    WalletRegistration, WalletStartupSyncCandidate, WalletStartupSyncError,
+    WalletStartupSyncStrategy, send_sync_progress,
+};
+use workers::{
+    spawn_backfill_loop, spawn_head_poller, spawn_live_log_loop, spawn_pending_tip_loop,
+    spawn_txid_public_cache_loop, spawn_wallet_lag_fallback_loop,
+    wallet_finish_result_removes_cursor, wallet_finish_retry_request,
+};
+
+#[cfg(test)]
+use backfill::wallet_tail_fallback_lag_threshold_blocks;
+#[cfg(test)]
+use indexed_wallet::{
+    IndexedWalletArtifactProbe, complete_stream_checkpoint, wallet_startup_hedge_block_count,
+};
+#[cfg(test)]
+use logs::combined_log_event_signatures_for_range;
+#[cfg(test)]
+use workers::{
+    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
+};
 
 pub use data_plane::{
     PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,

@@ -1,4 +1,10 @@
-use super::*;
+#[cfg(test)]
+use super::async_trait;
+use super::{
+    Arc, BTreeMap, BlindedCommitmentData, FixedBytes, PendingOutputPoiSubmitter, PoiError,
+    PoiMerkleProof, PoiMerkleProofSource, PoiRpcClient, PoiStatus, PoiStatusReader,
+    PreTransactionPoiError, SingleCommitmentProofContext, WalletPrivateRemoteAuthority,
+};
 use std::convert::Infallible;
 
 /// Why a wallet-private remote effect was rejected before transport dispatch.

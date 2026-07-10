@@ -1,7 +1,16 @@
-use super::*;
+use super::{
+    Arc, ChainConfig, ChainError, DEFAULT_PAGE_SIZE, DbStore, DynProvider, FixedBytes, Instant,
+    MerkleForest, MerkleForestSnapshot, Path, PathBuf, PersistError, QuickSyncClient,
+    QuickSyncConfig, RwLock, SNAPSHOT_VERSION, SyncProgressStage, SyncProgressUpdate, async_trait,
+    debug, info, parse_anchor_block, run_merkle_artifact_catch_up_into,
+    run_quick_sync_into_with_progress, send_sync_progress, warn,
+};
+
+#[cfg(test)]
+use super::{Address, Duration, QueryRpcPool};
 
 #[async_trait]
-pub trait MerkleForestDbExt {
+pub(super) trait MerkleForestDbExt {
     async fn load_or_initialize_forest(
         &self,
         chain: &ChainConfig,
@@ -27,7 +36,7 @@ impl MerkleForestDbExt for DbStore {
         let mut last_processed = chain.deployment_block.saturating_sub(1);
         let file_name = format!("forest-{}-{}.msgpack", chain.chain_id, chain.contract);
         self.ensure_blob_dir("merkle_forest")?;
-        let relative = DbStore::relative_blob_path("merkle_forest", &file_name);
+        let relative = Self::relative_blob_path("merkle_forest", &file_name);
         let mut snapshot_path = self.resolve_path(&relative);
         let mut last_anchor = 0;
 
@@ -404,7 +413,7 @@ fn persist_indexed_artifact_forest_snapshot(
     Ok(true)
 }
 
-fn commitment_sync_progress_update(
+const fn commitment_sync_progress_update(
     is_tail: bool,
     start_block: u64,
     current_block: u64,

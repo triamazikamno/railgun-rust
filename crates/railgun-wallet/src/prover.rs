@@ -72,7 +72,7 @@ struct PoiWitnessInputs {
 }
 
 impl CircuitWitnessInputs {
-    fn new(values: BTreeMap<String, Vec<BigInt>>) -> Self {
+    const fn new(values: BTreeMap<String, Vec<BigInt>>) -> Self {
         Self { values }
     }
 
@@ -183,7 +183,7 @@ impl From<RailgunWitnessInputs> for BTreeMap<String, Vec<BigInt>> {
 
 impl PoiWitnessInputs {
     #[must_use]
-    pub fn new(inputs: &PoiProofInputs, max_inputs: usize, max_outputs: usize) -> Self {
+    fn new(inputs: &PoiProofInputs, max_inputs: usize, max_outputs: usize) -> Self {
         let mut values = BTreeMap::new();
         values.insert(
             "anyRailgunTxidMerklerootAfterTransaction".to_string(),
@@ -471,34 +471,38 @@ struct ProverBlockingContext<'a> {
 
 impl ProverService {
     #[must_use]
-    pub fn new(source: ArtifactSource) -> Self {
-        Self::with_capacity_db(source, DEFAULT_PROVER_QUEUE, open_db(DbConfig::default()))
-    }
-
-    #[must_use]
-    pub fn new_with_db_dir(source: ArtifactSource, db_dir: PathBuf) -> Self {
+    pub fn new(source: &ArtifactSource) -> Self {
         Self::with_capacity_db(
             source,
             DEFAULT_PROVER_QUEUE,
-            open_db(DbConfig { root_dir: db_dir }),
+            open_db(DbConfig::default()).as_ref(),
         )
     }
 
     #[must_use]
-    pub fn new_with_db(source: ArtifactSource, db: Arc<DbStore>) -> Self {
+    pub fn new_with_db_dir(source: &ArtifactSource, db_dir: PathBuf) -> Self {
+        Self::with_capacity_db(
+            source,
+            DEFAULT_PROVER_QUEUE,
+            open_db(DbConfig { root_dir: db_dir }).as_ref(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_db(source: &ArtifactSource, db: &Arc<DbStore>) -> Self {
         Self::with_capacity_db(source, DEFAULT_PROVER_QUEUE, Some(db))
     }
 
     #[must_use]
-    pub fn with_capacity(source: ArtifactSource, queue_size: usize) -> Self {
-        Self::with_capacity_db(source, queue_size, open_db(DbConfig::default()))
+    pub fn with_capacity(source: &ArtifactSource, queue_size: usize) -> Self {
+        Self::with_capacity_db(source, queue_size, open_db(DbConfig::default()).as_ref())
     }
 
     #[must_use]
     pub fn with_capacity_db(
-        source: ArtifactSource,
+        source: &ArtifactSource,
         queue_size: usize,
-        db_store: Option<Arc<DbStore>>,
+        db_store: Option<&Arc<DbStore>>,
     ) -> Self {
         let worker_count = default_prover_worker_count();
         let cache_lock = Arc::new(Mutex::new(()));
@@ -509,7 +513,7 @@ impl ProverService {
             spawn_prover_worker(
                 worker_index,
                 source.clone(),
-                db_store.clone(),
+                db_store.cloned(),
                 receiver,
                 Arc::clone(&cache_lock),
             );
@@ -619,7 +623,7 @@ fn spawn_prover_worker(
                             &private_inputs,
                             &signature,
                             verify_proof,
-                            ProverBlockingContext {
+                            &ProverBlockingContext {
                                 db_store: db_store.as_deref(),
                                 cache_lock: &cache_lock,
                                 queue_wait_elapsed_ms,
@@ -663,7 +667,7 @@ fn spawn_prover_worker(
                             &source,
                             &inputs,
                             verify_proof,
-                            ProverBlockingContext {
+                            &ProverBlockingContext {
                                 db_store: db_store.as_deref(),
                                 cache_lock: &cache_lock,
                                 queue_wait_elapsed_ms,
@@ -900,7 +904,7 @@ fn prove_unshield_blocking(
     private_inputs: &PrivateInputs,
     signature: &[U256; 3],
     verify_proof: bool,
-    context: ProverBlockingContext<'_>,
+    context: &ProverBlockingContext<'_>,
 ) -> Result<SnarkProof, ProverError> {
     let total_started = Instant::now();
     debug!(
@@ -1014,14 +1018,14 @@ fn prove_unshield_blocking(
         "generated railgun proof"
     );
 
-    Ok(ark_proof_to_sol(proof))
+    Ok(ark_proof_to_sol(&proof))
 }
 
 fn prove_poi_blocking(
     source: &ArtifactSource,
     inputs: &PoiProofInputs,
     verify_proof: bool,
-    context: ProverBlockingContext<'_>,
+    context: &ProverBlockingContext<'_>,
 ) -> Result<PoiProofResult, ProverError> {
     let total_started = Instant::now();
     let (max_inputs, max_outputs) = poi_circuit_size(inputs);
@@ -1137,12 +1141,12 @@ fn prove_poi_blocking(
     );
 
     Ok(PoiProofResult {
-        snark_proof: ark_proof_to_snarkjs(proof),
+        snark_proof: ark_proof_to_snarkjs(&proof),
         public_signals: public_inputs.into_iter().map(prime_field_to_u256).collect(),
     })
 }
 
-fn poi_circuit_size(inputs: &PoiProofInputs) -> (usize, usize) {
+const fn poi_circuit_size(inputs: &PoiProofInputs) -> (usize, usize) {
     if inputs.nullifiers.len() <= 3 && inputs.commitments_out.len() <= 3 {
         (3, 3)
     } else {
@@ -1171,7 +1175,7 @@ const fn use_singlepass_poi_witness(max_inputs: usize, max_outputs: usize) -> bo
     max_inputs == 13 && max_outputs == 13
 }
 
-fn ark_proof_to_sol(proof: Proof<Bn254>) -> SnarkProof {
+fn ark_proof_to_sol(proof: &Proof<Bn254>) -> SnarkProof {
     let a = G1Point {
         x: prime_field_to_u256(proof.a.x),
         y: prime_field_to_u256(proof.a.y),
@@ -1193,7 +1197,7 @@ fn ark_proof_to_sol(proof: Proof<Bn254>) -> SnarkProof {
     SnarkProof { a, b, c }
 }
 
-fn ark_proof_to_snarkjs(proof: Proof<Bn254>) -> SnarkJsProof {
+fn ark_proof_to_snarkjs(proof: &Proof<Bn254>) -> SnarkJsProof {
     SnarkJsProof {
         pi_a: [
             prime_field_to_u256(proof.a.x),
@@ -1288,7 +1292,7 @@ mod tests {
             c: G1Affine::new_unchecked(fq(7), fq(8)),
         };
 
-        let snarkjs = ark_proof_to_snarkjs(proof);
+        let snarkjs = ark_proof_to_snarkjs(&proof);
 
         assert_eq!(
             snarkjs.pi_b,

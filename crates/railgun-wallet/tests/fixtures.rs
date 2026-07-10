@@ -183,7 +183,7 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
                 broadcaster_fee: None,
                 min_gas_price: 0,
             };
-            let prover = ProverService::new(ArtifactSource::default());
+            let prover = ProverService::new(&ArtifactSource::default());
             builder
                 .build_unshield_plan(&wallet, &forest, &[utxo], request, &prover)
                 .await
@@ -274,16 +274,15 @@ fn proof_verification_fails_for_invalid_signature() {
     let mut signature = plan.signature;
     signature[0] += U256::ONE;
 
-    let prover = ProverService::new(ArtifactSource::default());
+    let prover = ProverService::new(&ArtifactSource::default());
     let result = with_runtime(prover.prove_unshield(
         &plan.public_inputs,
         &plan.private_inputs,
         &signature,
         true,
     ));
-    let err = match result {
-        Ok(_) => panic!("invalid proof should fail verification"),
-        Err(err) => err,
+    let Err(err) = result else {
+        panic!("invalid proof should fail verification");
     };
     match err {
         ProverError::InvalidProof | ProverError::Verify(_) => {}

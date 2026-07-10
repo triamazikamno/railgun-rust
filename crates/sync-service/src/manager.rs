@@ -27,6 +27,7 @@ pub struct SyncManager {
 }
 
 impl SyncManager {
+    #[must_use]
     pub fn new(db: Arc<DbStore>, poi_policy: GlobalPoiPolicy) -> Self {
         Self {
             db,
@@ -124,7 +125,7 @@ impl SyncManager {
         for service in chains.values() {
             match service.reset_wallet(cache_key, from_block).await {
                 Ok(()) => return Ok(()),
-                Err(ChainError::WalletNotFound) => continue,
+                Err(ChainError::WalletNotFound) => {}
                 Err(err) => return Err(SyncManagerError::Chain(err)),
             }
         }

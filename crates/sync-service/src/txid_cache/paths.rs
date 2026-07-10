@@ -1,4 +1,4 @@
-use super::*;
+use super::{Ordering, SystemTime, TXID_CACHE_TEMP_COUNTER, TxidPublicCacheKey, UNIX_EPOCH};
 
 pub(super) fn cache_id(key: TxidPublicCacheKey<'_>) -> String {
     format!(

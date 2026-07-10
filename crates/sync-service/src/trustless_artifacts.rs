@@ -148,22 +148,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         for (gateway_index, gateway) in self.gateways.iter().enumerate() {
             let gateway_host = gateway_host(gateway);
             let attempt_started = Instant::now();
-            let url = match ipns_record_gateway_url(gateway, name) {
-                Ok(url) => url,
-                Err(err) => {
-                    debug!(
-                        ?err,
-                        gateway_host,
-                        gateway_index,
-                        gateway_count,
-                        ipns_name = name,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
-                        "POI artifact IPNS gateway URL build failed"
-                    );
-                    last_error = Some(err);
-                    continue;
-                }
-            };
+            let url = ipns_record_gateway_url(gateway, name);
             match self.fetch_ipns_record_candidate(&url, peer_id, now).await {
                 Ok(candidate) => {
                     debug!(
@@ -217,23 +202,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         for (gateway_index, gateway) in self.gateways.iter().enumerate() {
             let gateway_host = gateway_host(gateway);
             let attempt_started = Instant::now();
-            let url = match car_gateway_url(gateway, &cid) {
-                Ok(url) => url,
-                Err(err) => {
-                    debug!(
-                        ?err,
-                        gateway_host,
-                        gateway_index,
-                        gateway_count,
-                        resource,
-                        cid = %cid,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
-                        "POI artifact CID gateway URL build failed"
-                    );
-                    last_error = Some(err);
-                    continue;
-                }
-            };
+            let url = car_gateway_url(gateway, &cid);
             match self.fetch_cid_bytes_from_url(cid, &url, limits).await {
                 Ok(bytes) => {
                     if gateway_index > 0 {
@@ -789,11 +758,14 @@ fn ipns_record_public_key(bytes: &[u8]) -> Result<Option<&[u8]>, TrustlessArtifa
     let mut reader = BytesReader::from_bytes(bytes);
     let mut public_key = None;
     while !reader.is_eof() {
-        match reader.next_tag(bytes).map_err(invalid_ipns_record_error)? {
+        match reader
+            .next_tag(bytes)
+            .map_err(|source| invalid_ipns_record_error(&source))?
+        {
             58 => {
                 let value = reader
                     .read_bytes(bytes)
-                    .map_err(invalid_ipns_record_error)?;
+                    .map_err(|source| invalid_ipns_record_error(&source))?;
                 if value.is_empty() {
                     public_key = None;
                 } else {
@@ -802,13 +774,13 @@ fn ipns_record_public_key(bytes: &[u8]) -> Result<Option<&[u8]>, TrustlessArtifa
             }
             tag => reader
                 .read_unknown(bytes, tag)
-                .map_err(invalid_ipns_record_error)?,
+                .map_err(|source| invalid_ipns_record_error(&source))?,
         }
     }
     Ok(public_key)
 }
 
-fn invalid_ipns_record_error(source: quick_protobuf::Error) -> TrustlessArtifactError {
+fn invalid_ipns_record_error(source: &quick_protobuf::Error) -> TrustlessArtifactError {
     TrustlessArtifactError::InvalidIpnsRecord {
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, source.to_string()),
     }
@@ -821,27 +793,23 @@ fn parse_cid(value: &str) -> Result<Cid, TrustlessArtifactError> {
     })
 }
 
-fn car_gateway_url(gateway: &Url, cid: &Cid) -> Result<Url, TrustlessArtifactError> {
-    let mut url = gateway_resource_url(gateway, "ipfs", &cid.to_string())?;
+fn car_gateway_url(gateway: &Url, cid: &Cid) -> Url {
+    let mut url = gateway_resource_url(gateway, "ipfs", &cid.to_string());
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("format", "car");
         query.append_pair("dag-scope", "entity");
     }
-    Ok(url)
+    url
 }
 
-fn ipns_record_gateway_url(gateway: &Url, name: &str) -> Result<Url, TrustlessArtifactError> {
-    let mut url = gateway_resource_url(gateway, "ipns", name)?;
+fn ipns_record_gateway_url(gateway: &Url, name: &str) -> Url {
+    let mut url = gateway_resource_url(gateway, "ipns", name);
     url.query_pairs_mut().append_pair("format", "ipns-record");
-    Ok(url)
+    url
 }
 
-fn gateway_resource_url(
-    gateway: &Url,
-    namespace: &'static str,
-    value: &str,
-) -> Result<Url, TrustlessArtifactError> {
+fn gateway_resource_url(gateway: &Url, namespace: &'static str, value: &str) -> Url {
     let mut url = gateway.clone();
     let path = gateway.path().trim_end_matches('/');
     let namespace_suffix = format!("/{namespace}");
@@ -853,7 +821,7 @@ fn gateway_resource_url(
         format!("{path}/{namespace}/{value}")
     };
     url.set_path(&new_path);
-    Ok(url)
+    url
 }
 
 fn gateway_host(gateway: &Url) -> &str {
@@ -1022,7 +990,7 @@ mod tests {
         let gateway = Url::parse("https://gateway.example/base/ipfs?existing=1").expect("URL");
         let cid = raw_cid(b"hello");
 
-        let url = car_gateway_url(&gateway, &cid).expect("CAR URL");
+        let url = car_gateway_url(&gateway, &cid);
 
         assert_eq!(url.path(), format!("/base/ipfs/{cid}"));
         assert_eq!(url.query(), Some("existing=1&format=car&dag-scope=entity"));
@@ -1032,7 +1000,7 @@ mod tests {
     fn ipns_gateway_url_adds_record_query_parameter() {
         let gateway = Url::parse("https://gateway.example/root").expect("URL");
 
-        let url = ipns_record_gateway_url(&gateway, "k51name").expect("IPNS URL");
+        let url = ipns_record_gateway_url(&gateway, "k51name");
 
         assert_eq!(url.path(), "/root/ipns/k51name");
         assert_eq!(url.query(), Some("format=ipns-record"));
@@ -1551,7 +1519,7 @@ mod tests {
         ];
         cid_bytes.extend_from_slice(&[0_u8; 32]);
         v2_header[0] = u8::try_from(cid_bytes.len() + 3).expect("block length byte");
-        v2_header[1..1 + cid_bytes.len()].copy_from_slice(&cid_bytes);
+        v2_header[1..=cid_bytes.len()].copy_from_slice(&cid_bytes);
         car.extend_from_slice(&v2_header);
         car
     }
@@ -1583,9 +1551,11 @@ mod tests {
     fn write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
         match len {
             0..=23 => out.push(major | u8::try_from(len).expect("small len")),
-            24..=0xff => out.extend_from_slice(&[major | 24, u8::try_from(len).expect("u8 len")]),
+            24..=0xff => {
+                out.extend_from_slice(&[major | 0x18, u8::try_from(len).expect("u8 len")]);
+            }
             0x100..=0xffff => {
-                out.push(major | 25);
+                out.push(major | 0x19);
                 out.extend_from_slice(&u16::try_from(len).expect("u16 len").to_be_bytes());
             }
             _ => panic!("fixture length too large"),

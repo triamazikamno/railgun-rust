@@ -35,18 +35,13 @@ impl PoiMaintenanceController {
     }
 
     #[must_use]
-    pub(super) fn is_running(&self) -> bool {
+    pub(super) const fn is_running(&self) -> bool {
         matches!(self.phase, PoiMaintenancePhase::Running { .. })
     }
 
     #[must_use]
-    pub(super) fn force_pending(&self) -> bool {
+    pub(super) const fn force_pending(&self) -> bool {
         self.force_pending
-    }
-
-    #[must_use]
-    pub(super) fn phase(&self) -> PoiMaintenancePhase {
-        self.phase
     }
 
     /// Record a maintenance request. Requests while busy/unavailable latch one rerun;
@@ -114,11 +109,11 @@ impl PoiMaintenanceController {
         }
     }
 
-    /// Drop durable force across AcceptReset / generation advance.
+    /// Drop durable force across `AcceptReset` / generation advance.
     ///
     /// Does not clear `Running`: the in-flight job still owns the phase until
     /// `on_job_done` so a second concurrent job cannot start.
-    pub(super) fn clear_force_on_reset(&mut self) {
+    pub(super) const fn clear_force_on_reset(&mut self) {
         self.force_pending = false;
         self.rerun_pending = false;
     }

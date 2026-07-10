@@ -446,7 +446,7 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
     let stale = indexed_transaction(0x11, 0x02, 0x01, 0x03);
     let corrected = indexed_transaction(0x22, 0x04, 0x05, 0x06);
     let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(vec![stale.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&stale)));
 
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
@@ -467,7 +467,7 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
     let corrected_leaf = corrected.txid_leaf_hash();
     let corrected_root = root_for_single_leaf(corrected_leaf);
     let (validated_endpoint, _validated_requests) =
-        spawn_graphql_response(public_txid_response(vec![corrected.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&corrected)));
     cache
         .sync(
             &validated_endpoint,
@@ -531,14 +531,14 @@ async fn txid_public_cache_lookup_prefers_validated_duplicate_over_unvalidated_s
     let stale_duplicate = indexed_transaction(0x44, 0x02, 0x03, 0x04);
     let canonical = indexed_transaction(0x44, 0x02, 0x05, 0x06);
     let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(vec![filler, stale_duplicate.clone()]));
+        spawn_graphql_response(public_txid_response(&[filler, stale_duplicate.clone()]));
 
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
         .await
         .expect("prefetch stale duplicate row");
     let (validated_endpoint, _validated_requests) =
-        spawn_graphql_response(public_txid_response(vec![canonical.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&canonical)));
     cache
         .sync(
             &validated_endpoint,
@@ -597,7 +597,8 @@ async fn txid_public_cache_recovery_catchup_stops_after_target_page() {
     };
     let cache = TxidPublicCache::new(&db, key);
     let target = indexed_transaction(0x77, 0x02, 0x03, 0x04);
-    let (endpoint, requests) = spawn_graphql_response(public_txid_response(vec![target.clone()]));
+    let (endpoint, requests) =
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&target)));
 
     let cached = cache
         .sync_until_recovered_output_with_page_size(
@@ -643,7 +644,7 @@ async fn txid_public_cache_recovery_refreshes_rewritten_rows_below_high_water_ma
     let stale_tail = indexed_transaction(0x12, 0x04, 0x05, 0x06);
     let canonical = indexed_transaction(0x77, 0x09, 0x0a, 0x0b);
     let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(vec![stale.clone(), stale_tail]));
+        spawn_graphql_response(public_txid_response(&[stale.clone(), stale_tail]));
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
         .await
@@ -656,7 +657,7 @@ async fn txid_public_cache_recovery_refreshes_rewritten_rows_below_high_water_ma
     assert_eq!(manifest.validated_cached_txid_index, None);
 
     let (recovery_endpoint, requests) =
-        spawn_graphql_response(public_txid_response(vec![canonical.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&canonical)));
     let cached = cache
         .sync_until_recovered_output_with_page_size(
             &recovery_endpoint,
@@ -722,13 +723,13 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
     let corrected_leaf = corrected.txid_leaf_hash();
     let corrected_root = root_for_single_leaf(corrected_leaf);
     let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(vec![stale]));
+        spawn_graphql_response(public_txid_response(&[stale]));
 
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
         .await
         .expect("prefetch stale graph-tip row");
-    let (empty_endpoint, _empty_requests) = spawn_graphql_response(public_txid_response(vec![]));
+    let (empty_endpoint, _empty_requests) = spawn_graphql_response(public_txid_response(&[]));
     let error = cache
         .sync(
             &empty_endpoint,
@@ -779,7 +780,7 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
     ));
 
     let (corrected_endpoint, _corrected_requests) =
-        spawn_graphql_response(public_txid_response(vec![corrected.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&corrected)));
     cache
         .sync(
             &corrected_endpoint,
@@ -826,7 +827,7 @@ async fn txid_public_latest_validated_waits_for_graph_tip_sync_manifest_write() 
     };
     let graph_row = indexed_transaction(0x33, 0x07, 0x08, 0x09);
     let (endpoint, requests, release_response) =
-        spawn_delayed_graphql_response(public_txid_response(vec![graph_row]));
+        spawn_delayed_graphql_response(public_txid_response(&[graph_row]));
     let sync_turn = super::TXID_CACHE_SYNC_LOCK.lock().await;
     let sync_db = Arc::clone(&db);
     let sync_endpoint = endpoint.clone();
@@ -837,7 +838,7 @@ async fn txid_public_latest_validated_waits_for_graph_tip_sync_manifest_write() 
     });
     tokio::task::yield_now().await;
     drop(sync_turn);
-    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(120)))
+    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_mins(2)))
         .await
         .expect("join request receiver")
         .expect("graph-tip request received");
@@ -912,7 +913,7 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
 
     let second = indexed_transaction(0x52, 0x04, 0x05, 0x06);
     let (endpoint, requests, release_response) =
-        spawn_delayed_graphql_response(public_txid_response(vec![second.clone()]));
+        spawn_delayed_graphql_response(public_txid_response(std::slice::from_ref(&second)));
     let sync_turn = super::TXID_CACHE_SYNC_LOCK.lock().await;
     let sync_db = Arc::clone(&db);
     let sync_endpoint = endpoint.clone();
@@ -923,7 +924,7 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
     });
     tokio::task::yield_now().await;
     drop(sync_turn);
-    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(120)))
+    tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_mins(2)))
         .await
         .expect("join request receiver")
         .expect("graph-tip request received");
@@ -1231,7 +1232,7 @@ async fn txid_public_artifact_failure_before_progress_falls_back_to_graphql() {
     let bad_artifact_row = indexed_transaction(0x11, 0x02, 0x01, 0x03);
     let bad_chunk = public_txid_artifact_chunk(0, &[bad_artifact_row], None);
     let (endpoint, requests) =
-        spawn_graphql_response(public_txid_response(vec![graph_row.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&graph_row)));
 
     cache
         .sync_with_artifact_chunks(
@@ -1573,7 +1574,7 @@ async fn txid_public_full_range_artifact_root_mismatch_falls_back_to_graphql() {
     let artifact_chunk =
         public_txid_artifact_chunk(0, std::slice::from_ref(&artifact_row), Some(artifact_root));
     let (endpoint, requests) =
-        spawn_graphql_response(public_txid_response(vec![graph_row.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&graph_row)));
 
     cache
         .sync_with_artifact_chunks(
@@ -1623,11 +1624,10 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
     let cache = TxidPublicCache::new(&db, key);
     let old_first = indexed_transaction(0x31, 0x02, 0x01, 0x03);
     let old_second = indexed_transaction(0x32, 0x04, 0x05, 0x06);
-    let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(vec![
-            old_first.clone(),
-            old_second.clone(),
-        ]));
+    let (prefetch_endpoint, _prefetch_requests) = spawn_graphql_response(public_txid_response(&[
+        old_first.clone(),
+        old_second.clone(),
+    ]));
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
         .await
@@ -1652,7 +1652,7 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
     let graph_first = indexed_transaction(0x51, 0x0d, 0x0e, 0x0f);
     let graph_second = indexed_transaction(0x52, 0x10, 0x11, 0x12);
     let graph_root = txid_root_for_transactions(&[graph_first.clone(), graph_second.clone()]);
-    let (endpoint, requests) = spawn_graphql_response(public_txid_response(vec![
+    let (endpoint, requests) = spawn_graphql_response(public_txid_response(&[
         graph_first.clone(),
         graph_second.clone(),
     ]));
@@ -1717,7 +1717,7 @@ async fn txid_public_cache_prefers_configured_artifact_source_before_graphql() {
         public_txid_artifact_chunk(0, std::slice::from_ref(&artifact_row), Some(artifact_root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
     let (graph_endpoint, graph_requests) =
-        spawn_graphql_response(public_txid_response(vec![graph_row]));
+        spawn_graphql_response(public_txid_response(&[graph_row]));
 
     cache
         .sync_with_artifact_source(
@@ -1887,9 +1887,8 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
         txid_version: TEST_TXID_VERSION,
     };
     let cache = TxidPublicCache::new(&db, key);
-    let original_rows = (0..10)
+    let original_rows = (0_u8..10)
         .map(|offset| {
-            let offset = offset as u8;
             indexed_transaction(0x70 + offset, 0x20 + offset, 0x30 + offset, 0x40 + offset)
         })
         .collect::<Vec<_>>();
@@ -1919,9 +1918,8 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
         .expect("read row 9 before invalid repack")
         .expect("row 9 present before invalid repack");
 
-    let next_rows = (0..10)
+    let next_rows = (0_u8..10)
         .map(|offset| {
-            let offset = offset as u8;
             indexed_transaction(0x90 + offset, 0x50 + offset, 0x60 + offset, 0x70 + offset)
         })
         .collect::<Vec<_>>();
@@ -1932,9 +1930,8 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
         .collect::<Vec<_>>();
     let next_root = txid_root_for_transactions(&all_rows);
     let current_tail = public_txid_artifact_chunk(10, &next_rows, Some(next_root));
-    let repacked_rows = (0..10)
+    let repacked_rows = (0_u8..10)
         .map(|offset| {
-            let offset = offset as u8;
             indexed_transaction(0xb0 + offset, 0x80 + offset, 0x90 + offset, 0xa0 + offset)
         })
         .collect::<Vec<_>>();
@@ -2515,7 +2512,7 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
         (1, vec![prior_tail.clone()]),
         (2, vec![prior_tail, current_tail]),
     ]);
-    let (graph_endpoint, graph_requests) = spawn_graphql_response(public_txid_response(vec![]));
+    let (graph_endpoint, graph_requests) = spawn_graphql_response(public_txid_response(&[]));
 
     let fetched = cache
         .sync_to_indexed_tip(Some(&graph_endpoint), None, Some(&retention_source))
@@ -2622,7 +2619,7 @@ async fn txid_public_optional_prior_tail_failure_does_not_block_current_chunk() 
         .expect("seed first validated row");
 
     let mut malformed_prior_tail =
-        public_txid_artifact_chunk_from_payload(0, 0, 1, Vec::new(), Some(first_root));
+        public_txid_artifact_chunk_from_payload(0, 0, 1, &[], Some(first_root));
     malformed_prior_tail.descriptor.metadata.stream_partition = Some(TEST_TXID_VERSION.to_string());
     let malformed_cid = raw_cid(&malformed_prior_tail.bytes).to_string();
     let second = indexed_transaction(0x67, 0x04, 0x05, 0x06);
@@ -3169,7 +3166,7 @@ async fn txid_public_cache_background_falls_back_to_graphql_after_zero_artifact_
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![later_chunk]);
     let graph_row = indexed_transaction(0x52, 0x04, 0x05, 0x06);
     let (graph_endpoint, graph_requests) =
-        spawn_graphql_response(public_txid_response(vec![graph_row.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&graph_row)));
 
     let fetched = cache
         .sync_to_indexed_tip(Some(&graph_endpoint), None, Some(&artifact_source))
@@ -3447,7 +3444,7 @@ async fn txid_public_cache_falls_back_to_graphql_when_artifact_descriptors_are_u
     let graph_root = root_for_single_leaf(graph_row.txid_leaf_hash());
     let (artifact_source, _artifact_server) = public_txid_empty_artifact_source();
     let (graph_endpoint, graph_requests) =
-        spawn_graphql_response(public_txid_response(vec![graph_row.clone()]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&graph_row)));
 
     cache
         .sync_with_artifact_source(
@@ -3694,7 +3691,7 @@ async fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
 
 #[test]
 fn txid_public_artifact_rejects_extreme_row_count_without_allocation() {
-    let chunk = public_txid_artifact_chunk_from_payload(0, 0, u64::MAX, Vec::new(), None);
+    let chunk = public_txid_artifact_chunk_from_payload(0, 0, u64::MAX, &[], None);
 
     let error = Vec::<super::TxidPublicCachePage>::try_from(&chunk)
         .expect_err("extreme row count should be rejected as format error");
@@ -3719,7 +3716,7 @@ fn txid_public_artifact_rejects_extreme_vector_count_without_allocation() {
     write_u64(&mut payload, 1);
     payload.extend_from_slice(&[0x55; 32]);
     write_u32(&mut payload, u32::MAX);
-    let chunk = public_txid_artifact_chunk_from_payload(0, 0, 1, payload, None);
+    let chunk = public_txid_artifact_chunk_from_payload(0, 0, 1, &payload, None);
 
     let error = Vec::<super::TxidPublicCachePage>::try_from(&chunk)
         .expect_err("extreme vector count should be rejected as format error");
@@ -3764,7 +3761,7 @@ fn indexed_transaction(
     }
 }
 
-fn public_txid_response(transactions: Vec<IndexedRailgunTransaction>) -> String {
+fn public_txid_response(transactions: &[IndexedRailgunTransaction]) -> String {
     serde_json::json!({ "data": { "transactions": transactions } }).to_string()
 }
 
@@ -3842,11 +3839,11 @@ fn public_txid_artifact_chunk_from_payload(
     start_index: u64,
     end_index: u64,
     row_count: u64,
-    payload: Vec<u8>,
+    payload: &[u8],
     root: Option<FixedBytes<32>>,
 ) -> VerifiedIndexedArtifactChunk {
     let uncompressed =
-        public_txid_artifact_envelope_with_end(start_index, end_index, row_count, &payload);
+        public_txid_artifact_envelope_with_end(start_index, end_index, row_count, payload);
     let bytes = zstd::stream::encode_all(Cursor::new(uncompressed), 3).expect("compress chunk");
     VerifiedIndexedArtifactChunk {
         descriptor: IndexedArtifactDescriptor {
@@ -4019,7 +4016,7 @@ fn public_txid_artifact_source_with_extra_catalogs(
         all_chunks.extend(chunks);
     }
     catalog_descriptors.extend(extra_catalog_descriptors);
-    signed_artifact_source(scope, catalog_descriptors, catalog_blocks, all_chunks)
+    signed_artifact_source(&scope, catalog_descriptors, catalog_blocks, all_chunks)
 }
 
 fn shared_stream_partition(chunks: &[VerifiedIndexedArtifactChunk]) -> Option<String> {
@@ -4033,7 +4030,7 @@ fn shared_stream_partition(chunks: &[VerifiedIndexedArtifactChunk]) -> Option<St
 }
 
 fn public_txid_empty_artifact_source() -> (IndexedArtifactSourceConfig, PathServer) {
-    signed_artifact_source(artifact_scope(), Vec::new(), Vec::new(), Vec::new())
+    signed_artifact_source(&artifact_scope(), Vec::new(), Vec::new(), Vec::new())
 }
 
 fn unavailable_artifact_source() -> IndexedArtifactSourceConfig {
@@ -4050,7 +4047,7 @@ fn unavailable_artifact_source() -> IndexedArtifactSourceConfig {
 }
 
 fn signed_artifact_source(
-    scope: ChainScope,
+    scope: &ChainScope,
     catalogs: Vec<IndexedArtifactDescriptor>,
     catalog_blocks: Vec<(Cid, Vec<u8>)>,
     chunks: Vec<VerifiedIndexedArtifactChunk>,
@@ -4162,9 +4159,9 @@ fn write_cbor_bytes(value: &[u8], out: &mut Vec<u8>) {
 fn write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
     match len {
         0..=23 => out.push(major | u8::try_from(len).expect("small len")),
-        24..=0xff => out.extend_from_slice(&[major | 24, u8::try_from(len).expect("u8 len")]),
+        24..=0xff => out.extend_from_slice(&[major | 0x18, u8::try_from(len).expect("u8 len")]),
         0x100..=0xffff => {
-            out.push(major | 25);
+            out.push(major | 0x19);
             out.extend_from_slice(&u16::try_from(len).expect("u16 len").to_be_bytes());
         }
         _ => panic!("fixture length too large"),
@@ -4203,7 +4200,7 @@ impl PathServer {
                     let (stream, _) = listener.accept().expect("accept request");
                     let routes = Arc::clone(&routes);
                     let requests = Arc::clone(&requests);
-                    std::thread::spawn(move || handle_path_request(stream, routes, requests));
+                    std::thread::spawn(move || handle_path_request(stream, &routes, &requests));
                 }
             }
         });
@@ -4231,8 +4228,8 @@ impl PathServer {
 
 fn handle_path_request(
     mut stream: std::net::TcpStream,
-    routes: Arc<HashMap<String, Vec<u8>>>,
-    requests: Arc<Mutex<Vec<String>>>,
+    routes: &Arc<HashMap<String, Vec<u8>>>,
+    requests: &Arc<Mutex<Vec<String>>>,
 ) {
     let path = read_request_path(&mut stream);
     requests

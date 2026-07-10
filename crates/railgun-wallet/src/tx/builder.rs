@@ -1,4 +1,32 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::time::Instant;
+
+use alloy::primitives::{Address, FixedBytes, U256, Uint};
+use alloy::sol_types::SolCall;
+use rand::Rng;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
+use broadcaster_core::contracts::railgun::{
+    ActionData, BoundParams, CommitmentCiphertext, CommitmentPreimage, SnarkProof, Transaction,
+    relayCall, transactCall,
+};
+use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
+use broadcaster_core::utxo::Utxo;
+use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleProof};
+
+use crate::keys::{RailgunSpendSigner, WalletKeys};
+use crate::notes::{Note, NoteCiphertext};
+use crate::prover::{ProverError, ProverService};
+
+use super::{
+    BroadcasterFeeOutput, BuildError, CompositePlanShape, CompositePrivateOutputRole,
+    CompositePrivateOutputRoleKind, CompositeUnshieldLeg, CompositeUnshieldLegMetadata,
+    CompositeUnshieldPlan, CompositeUnshieldPlannedOutput, CompositeUnshieldRequest, InputWitness,
+    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, PrivateInputs, PublicInputs,
+    SendPlan, SendRequest, TransactPlan, TransactionBuilder, TransactionCall, TransactionPlanChunk,
+    UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan, UnshieldRequest,
+};
 
 use selection::{
     BatchUtxoSelection, UtxoSelection, remove_selected_utxos,
@@ -18,8 +46,6 @@ pub use selection::{
     unshield_selection_info_with_separate_broadcaster_fee_seed,
 };
 
-#[cfg(test)]
-use alloy::uint;
 #[cfg(test)]
 use selection::select_utxos;
 
@@ -247,6 +273,7 @@ impl TransactionBuilder {
                     commitment_ciphertext,
                     broadcaster_fee_note: chunk_fee_note,
                     unshield_note,
+                    unshield_output_index: output_index,
                     change_note,
                 } = build_unshield_outputs(
                     leg.token_address,
@@ -277,10 +304,6 @@ impl TransactionBuilder {
                     });
                 }
 
-                let output_index = outputs
-                    .len()
-                    .checked_sub(1)
-                    .expect("unshield outputs always include public output");
                 unshield_outputs.push(CompositeUnshieldPlannedOutput {
                     leg_index,
                     transaction_index,
@@ -440,7 +463,7 @@ impl TransactionBuilder {
                     forest,
                     fee_selection,
                     action_selection,
-                    request,
+                    &request,
                     fee,
                     prover,
                 )
@@ -456,7 +479,7 @@ impl TransactionBuilder {
             1,
         )?;
 
-        self.build_send_batch_with_signer(viewing, signer, forest, selection, request, prover)
+        self.build_send_batch_with_signer(viewing, signer, forest, selection, &request, prover)
             .await
     }
 
@@ -528,6 +551,7 @@ impl TransactionBuilder {
                 commitment_ciphertext,
                 broadcaster_fee_note: _,
                 unshield_note,
+                unshield_output_index: _,
                 change_note: chunk_change_note,
             } = build_unshield_outputs(
                 request.token_address,
@@ -539,7 +563,7 @@ impl TransactionBuilder {
                 &viewing.viewing_private_key,
             )?;
             if chunk_change_note.is_some() {
-                change_note = chunk_change_note.clone();
+                change_note.clone_from(&chunk_change_note);
             }
             unshield_notes.push(unshield_note);
             unproven_plans.push(plan_builder.build_unproven_unshield(
@@ -644,7 +668,7 @@ impl TransactionBuilder {
         forest: &MerkleForest,
         fee_selection: UtxoSelection,
         action_selection: BatchUtxoSelection,
-        request: SendRequest,
+        request: &SendRequest,
         fee: BroadcasterFeeOutput,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
@@ -724,7 +748,7 @@ impl TransactionBuilder {
             )?;
             action_outputs_elapsed_ms += action_outputs_started.elapsed().as_millis();
             if chunk_change_note.is_some() {
-                change_note = chunk_change_note.clone();
+                change_note.clone_from(&chunk_change_note);
             }
             recipient_notes.push(recipient_note);
             let action_unproven_started = Instant::now();
@@ -850,6 +874,7 @@ impl TransactionBuilder {
                 commitment_ciphertext,
                 broadcaster_fee_note: chunk_fee_note,
                 unshield_note,
+                unshield_output_index: _,
                 change_note: chunk_change_note,
             } = build_unshield_outputs(
                 request.token_address,
@@ -864,7 +889,7 @@ impl TransactionBuilder {
                 broadcaster_fee_note = chunk_fee_note;
             }
             if chunk_change_note.is_some() {
-                change_note = chunk_change_note.clone();
+                change_note.clone_from(&chunk_change_note);
             }
             unshield_notes.push(unshield_note);
             unproven_plans.push(plan_builder.build_unproven_unshield(
@@ -970,7 +995,7 @@ impl TransactionBuilder {
         signer: &impl RailgunSpendSigner,
         forest: &MerkleForest,
         selection: BatchUtxoSelection,
-        request: SendRequest,
+        request: &SendRequest,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
         let total_started = Instant::now();
@@ -1023,7 +1048,7 @@ impl TransactionBuilder {
                 broadcaster_fee_note = chunk_fee_note;
             }
             if chunk_change_note.is_some() {
-                change_note = chunk_change_note.clone();
+                change_note.clone_from(&chunk_change_note);
             }
             recipient_notes.push(recipient_note);
             let unproven_started = Instant::now();
@@ -1340,7 +1365,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     }
 
     /// Validate that the total signature inputs don't exceed the limit.
-    fn validate_signature_limit(&self, num_outputs: usize) -> Result<(), BuildError> {
+    const fn validate_signature_limit(&self, num_outputs: usize) -> Result<(), BuildError> {
         let signature_input_len = 2 + self.inputs.len() + num_outputs;
         if signature_input_len > MAX_SIGNATURE_INPUTS {
             return Err(BuildError::SignatureInputLimit {
@@ -1375,7 +1400,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
             .into_iter()
-            .map(NoteCiphertext::into_commitment_ciphertext)
+            .map(CommitmentCiphertext::from)
             .collect();
         let bound_params = BoundParams::new_unshield(
             tree_number,
@@ -1419,7 +1444,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
 
     fn build_unproven_send(
         self,
-        request: SendRequest,
+        request: &SendRequest,
         outputs: Vec<Note>,
         commitment_ciphertext: Vec<NoteCiphertext>,
         proof_cache: Option<&mut InputWitnessProofCache<'_>>,
@@ -1432,7 +1457,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
             .into_iter()
-            .map(NoteCiphertext::into_commitment_ciphertext)
+            .map(CommitmentCiphertext::from)
             .collect();
         let bound_params = BoundParams::new_transact(
             tree_number,
@@ -1487,7 +1512,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
             .into_iter()
-            .map(NoteCiphertext::into_commitment_ciphertext)
+            .map(CommitmentCiphertext::from)
             .collect();
         let bound_params = BoundParams::new_transact(
             tree_number,
@@ -1545,7 +1570,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         )?;
 
         let outputs = vec![output];
-        let commitment_ciphertext = vec![ciphertext.into_commitment_ciphertext()];
+        let commitment_ciphertext = vec![CommitmentCiphertext::from(ciphertext)];
 
         self.validate_signature_limit(outputs.len())?;
 
@@ -1627,6 +1652,7 @@ struct UnshieldOutputs {
     commitment_ciphertext: Vec<NoteCiphertext>,
     broadcaster_fee_note: Option<Note>,
     unshield_note: Note,
+    unshield_output_index: usize,
     change_note: Option<Note>,
 }
 
@@ -1890,7 +1916,9 @@ async fn prove_transaction_plans(
         .take(plan_count)
         .collect::<Vec<_>>();
     for handle in handles {
-        let (index, proven) = handle.await.map_err(join_error_to_prover_error)??;
+        let (index, proven) = handle
+            .await
+            .map_err(|error| join_error_to_prover_error(&error))??;
         proven_plans[index] = Some(proven);
     }
 
@@ -1946,7 +1974,8 @@ async fn prove_prepared_transaction_plan(
     })
 }
 
-pub fn join_error_to_prover_error(error: tokio::task::JoinError) -> ProverError {
+#[must_use]
+pub fn join_error_to_prover_error(error: &tokio::task::JoinError) -> ProverError {
     ProverError::WorkerPanic(error.to_string())
 }
 
@@ -1990,8 +2019,9 @@ fn build_fee_only_outputs(
     )?
     .expect("broadcaster fee is provided");
 
-    let mut change_note = None;
-    if !change.is_zero() {
+    let change_note = if change.is_zero() {
+        None
+    } else {
         let note = Note::new_change(
             sender.master_public_key,
             broadcaster_fee.token_address,
@@ -2002,8 +2032,8 @@ fn build_fee_only_outputs(
             NoteCiphertext::try_from_note(&note, sender, sender, sender_viewing_private_key)?;
         outputs.push(note.clone());
         commitment_ciphertext.push(ciphertext);
-        change_note = Some(note);
-    }
+        Some(note)
+    };
 
     Ok(FeeOnlyOutputs {
         outputs,
@@ -2032,8 +2062,9 @@ fn build_unshield_outputs(
         sender_viewing_private_key,
     )?;
 
-    let mut change_note = None;
-    if !change.is_zero() {
+    let change_note = if change.is_zero() {
+        None
+    } else {
         let note = Note::new_change(
             receiver.master_public_key,
             token_address,
@@ -2044,9 +2075,10 @@ fn build_unshield_outputs(
             NoteCiphertext::try_from_note(&note, receiver, receiver, sender_viewing_private_key)?;
         outputs.push(note.clone());
         commitment_ciphertext.push(ciphertext);
-        change_note = Some(note);
-    }
+        Some(note)
+    };
 
+    let unshield_output_index = outputs.len();
     let unshield_note = Note::new_unshield(unshield_to, token_address, unshield_amount);
     outputs.push(unshield_note.clone());
 
@@ -2055,6 +2087,7 @@ fn build_unshield_outputs(
         commitment_ciphertext,
         broadcaster_fee_note,
         unshield_note,
+        unshield_output_index,
         change_note,
     })
 }
@@ -2093,8 +2126,9 @@ fn build_send_outputs(
     outputs.push(recipient_note.clone());
     commitment_ciphertext.push(recipient_ciphertext);
 
-    let mut change_note = None;
-    if !change.is_zero() {
+    let change_note = if change.is_zero() {
+        None
+    } else {
         let note = Note::new_change(
             sender.master_public_key,
             token_address,
@@ -2105,8 +2139,8 @@ fn build_send_outputs(
             NoteCiphertext::try_from_note(&note, sender, sender, sender_viewing_private_key)?;
         outputs.push(note.clone());
         commitment_ciphertext.push(ciphertext);
-        change_note = Some(note);
-    }
+        Some(note)
+    };
 
     Ok(SendOutputs {
         outputs,

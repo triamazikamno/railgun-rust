@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    FixedBytes, HashMap, HashSet, U256, Utxo, UtxoSource, WalletConfig, WalletLogDelta,
+    WalletPendingOverlay, WalletPendingSpent, WalletUtxo,
+};
+
+#[cfg(test)]
+use super::DbStore;
 
 #[cfg(test)]
 pub(crate) fn apply_wallet_delta_to_vec(
@@ -33,7 +39,7 @@ pub(crate) fn pending_overlay_from_delta(
                 cfg.scan_keys.nullifying_key,
                 &nullifier_sources,
             )
-            .map(|source| WalletPendingSpent::from_source(&entry.utxo, source))
+            .map(|source| WalletPendingSpent::from_source(&entry.utxo, &source))
         })
         .collect::<Vec<_>>();
     pending_spent.sort_by_key(WalletPendingSpent::key);

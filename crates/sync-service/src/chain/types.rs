@@ -1,9 +1,17 @@
-use super::*;
+use super::{
+    Arc, AtomicBool, AtomicU64, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig,
+    ChainPublicDataPlane, CommitmentUpdateError, DbStore, DynProvider, GlobalPoiPolicy, HashMap,
+    JoinHandle, MerkleForest, Mutex, PersistError, PublicDataPlaneError, RwLock, SharedLogBatch,
+    SyncError, SyncProgressSender, SyncProgressUpdate, TransportError, WalletBackfillResetResult,
+    WalletCacheError, WalletConfig, WalletHandle, WalletIndexedCatchUpSource,
+    WalletIndexedCatchUpStatus, WalletScanApply, WalletScanError, broadcast, debug, mpsc, watch,
+};
+use std::time::Duration;
 
 use crate::wallet::WalletIndexedCatchUpLease;
 
 pub(super) const EVM_CHAIN_TYPE: u8 = 0;
-pub(super) const TXID_PUBLIC_CACHE_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub(super) const TXID_PUBLIC_CACHE_SYNC_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForestReorgDecision {

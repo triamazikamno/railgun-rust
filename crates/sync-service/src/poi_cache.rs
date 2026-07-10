@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime};
@@ -28,8 +28,8 @@ use crate::wallet::{
 };
 
 const EVM_CHAIN_TYPE: u8 = 0;
-const POI_ARTIFACT_CACHE_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const POI_ARTIFACT_CACHE_LIVE_TAIL_INTERVAL: Duration = Duration::from_secs(60);
+const POI_ARTIFACT_CACHE_SYNC_INTERVAL: Duration = Duration::from_mins(5);
+const POI_ARTIFACT_CACHE_LIVE_TAIL_INTERVAL: Duration = Duration::from_mins(1);
 
 struct ChainPoiCacheLoop {
     db: Arc<DbStore>,
@@ -56,7 +56,6 @@ pub struct PoiCacheService {
 }
 
 impl PoiCacheService {
-    #[must_use]
     pub fn new(
         db: Arc<DbStore>,
         artifact_config: PoiArtifactSourceConfig,
@@ -99,20 +98,18 @@ impl PoiCacheService {
         }
 
         let local_caches = LocalPoiCaches::new(Arc::clone(&self.cache_generation));
-        let chain_already_started = {
+        let concurrent_existing = {
             let mut chains = self.chains.write().await;
-            if chains.contains_key(&chain_id) {
-                true
-            } else {
-                chains.insert(chain_id, local_caches.clone());
-                false
+            match chains.entry(chain_id) {
+                Entry::Occupied(entry) => Some(entry.get().clone()),
+                Entry::Vacant(entry) => {
+                    entry.insert(local_caches.clone());
+                    None
+                }
             }
         };
-        if chain_already_started {
-            return self
-                .local_caches(chain_id)
-                .await
-                .expect("chain cache state exists after concurrent start");
+        if let Some(existing) = concurrent_existing {
+            return existing;
         }
 
         let active_list_keys = default_active_poi_list_keys();
@@ -267,7 +264,7 @@ fn default_poi_rpc_url() -> Url {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn new_poi_artifact_cache_progress(
+const fn new_poi_artifact_cache_progress(
     chain_id: u64,
     phase: PoiArtifactCachePhase,
     completed_lists: usize,
@@ -494,7 +491,9 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
         "starting chain-scoped artifact POI cache service"
     );
     let live_tail_client = wallet_poi_status_client(&task.poi_rpc_url, task.http_client.as_ref());
-    let mut last_artifact_sync = Instant::now() - POI_ARTIFACT_CACHE_SYNC_INTERVAL;
+    let mut last_artifact_sync = Instant::now()
+        .checked_sub(POI_ARTIFACT_CACHE_SYNC_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         let caches_available = chain_poi_caches_available_for_lists(
             chain_id,
@@ -516,9 +515,9 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
             )
             .await;
             last_artifact_sync = Instant::now();
-        } else if let Some(client) = live_tail_client.as_ref() {
+        } else {
             sync_chain_poi_live_tails(
-                client,
+                &live_tail_client,
                 chain_id,
                 &task.local_caches,
                 &task.active_list_keys,
@@ -528,8 +527,8 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
         }
 
         tokio::select! {
-            _ = task.cancel.cancelled() => break,
-            _ = tokio::time::sleep(POI_ARTIFACT_CACHE_LIVE_TAIL_INTERVAL) => {}
+            () = task.cancel.cancelled() => break,
+            () = tokio::time::sleep(POI_ARTIFACT_CACHE_LIVE_TAIL_INTERVAL) => {}
         }
     }
     info!(chain_id, "chain-scoped artifact POI cache service stopped");
@@ -606,7 +605,7 @@ async fn sync_chain_poi_artifact_caches(
                 identity.clone(),
                 preloaded_caches.remove(list_key),
                 SystemTime::now(),
-                live_tail_client.as_ref(),
+                Some(&live_tail_client),
             )
             .await;
         let artifact_refresh_elapsed_ms = artifact_refresh_started.elapsed().as_millis();
@@ -617,72 +616,67 @@ async fn sync_chain_poi_artifact_caches(
                 let candidate_generation = refresh.cache_generation;
                 let mut cache = refresh.cache;
                 let live_tail_started = Instant::now();
-                let live_tail = if let Some(client) = live_tail_client.as_ref() {
-                    let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
-                    let baseline_list_progress =
-                        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys)
-                            .await;
-                    let list_progress = list_progress_with_active_event(
-                        active_list_keys,
-                        &baseline_list_progress,
-                        *list_key,
+                let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
+                let baseline_list_progress =
+                    chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
+                let list_progress = list_progress_with_active_event(
+                    active_list_keys,
+                    &baseline_list_progress,
+                    *list_key,
+                    Some(local_tip_index),
+                    None,
+                );
+                send_poi_artifact_cache_progress(
+                    progress_tx,
+                    new_poi_artifact_cache_progress(
+                        chain_id,
+                        PoiArtifactCachePhase::LiveTailing,
+                        list_index,
+                        total_lists,
+                        Some(*list_key),
                         Some(local_tip_index),
                         None,
-                    );
-                    send_poi_artifact_cache_progress(
-                        progress_tx,
-                        new_poi_artifact_cache_progress(
-                            chain_id,
-                            PoiArtifactCachePhase::LiveTailing,
-                            list_index,
-                            total_lists,
-                            Some(*list_key),
-                            Some(local_tip_index),
-                            None,
-                            list_progress,
-                            initially_ready,
-                            None,
-                        ),
-                    );
-                    match live_tail_candidate_cache(client, &cache).await {
-                        Ok((tailed_cache, outcome)) => {
-                            cache = tailed_cache;
-                            let list_progress = list_progress_with_active_event(
-                                active_list_keys,
-                                &baseline_list_progress,
-                                *list_key,
-                                Some(outcome.next_event_index.saturating_sub(1)),
-                                Some(outcome.next_event_index.saturating_sub(1)),
-                            );
-                            send_poi_artifact_cache_progress(
-                                progress_tx,
-                                new_poi_artifact_cache_progress(
-                                    chain_id,
-                                    PoiArtifactCachePhase::LiveTailing,
-                                    list_index,
-                                    total_lists,
-                                    Some(*list_key),
-                                    Some(outcome.next_event_index.saturating_sub(1)),
-                                    Some(outcome.next_event_index.saturating_sub(1)),
-                                    list_progress,
-                                    initially_ready,
-                                    None,
-                                ),
-                            );
-                            Some(outcome)
-                        }
-                        Err(err) => {
-                            warn!(
-                                ?err,
+                        list_progress,
+                        initially_ready,
+                        None,
+                    ),
+                );
+                let live_tail = match live_tail_candidate_cache(&live_tail_client, &cache).await {
+                    Ok((tailed_cache, outcome)) => {
+                        cache = tailed_cache;
+                        let list_progress = list_progress_with_active_event(
+                            active_list_keys,
+                            &baseline_list_progress,
+                            *list_key,
+                            Some(outcome.next_event_index.saturating_sub(1)),
+                            Some(outcome.next_event_index.saturating_sub(1)),
+                        );
+                        send_poi_artifact_cache_progress(
+                            progress_tx,
+                            new_poi_artifact_cache_progress(
                                 chain_id,
-                                list_key = %hex::encode(list_key),
-                                "live POI event tail failed; using artifact checkpoint"
-                            );
-                            None
-                        }
+                                PoiArtifactCachePhase::LiveTailing,
+                                list_index,
+                                total_lists,
+                                Some(*list_key),
+                                Some(outcome.next_event_index.saturating_sub(1)),
+                                Some(outcome.next_event_index.saturating_sub(1)),
+                                list_progress,
+                                initially_ready,
+                                None,
+                            ),
+                        );
+                        Some(outcome)
                     }
-                } else {
-                    None
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            chain_id,
+                            list_key = %hex::encode(list_key),
+                            "live POI event tail failed; using artifact checkpoint"
+                        );
+                        None
+                    }
                 };
                 let live_tail_elapsed_ms = live_tail_started.elapsed().as_millis();
                 let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
@@ -712,8 +706,14 @@ async fn sync_chain_poi_artifact_caches(
                     local_tip_index,
                     live_tail_events = live_tail.as_ref().map_or(0, |outcome| outcome.events),
                     live_tail_pages = live_tail.as_ref().map_or(0, |outcome| outcome.pages),
-                    live_tail_start_index = live_tail.as_ref().map_or(local_tip_index.saturating_add(1), |outcome| outcome.start_index),
-                    live_tail_next_event_index = live_tail.as_ref().map_or(local_tip_index.saturating_add(1), |outcome| outcome.next_event_index),
+                    live_tail_start_index = live_tail.as_ref().map_or_else(
+                        || local_tip_index.saturating_add(1),
+                        |outcome| outcome.start_index,
+                    ),
+                    live_tail_next_event_index = live_tail.as_ref().map_or_else(
+                        || local_tip_index.saturating_add(1),
+                        |outcome| outcome.next_event_index,
+                    ),
                     base_cid = %refresh.entry.base.cid,
                     delta_count = refresh.entry.deltas.len(),
                     blocked_shields_cid = %refresh.entry.blocked_shields.cid,
@@ -739,18 +739,16 @@ async fn sync_chain_poi_artifact_caches(
                     Ok(Some(persisted)) => {
                         let candidate_generation = persisted.cache_generation;
                         let mut cache = persisted.cache;
-                        if let Some(client) = live_tail_client.as_ref() {
-                            match live_tail_candidate_cache(client, &cache).await {
-                                Ok((tailed_cache, _outcome)) => {
-                                    cache = tailed_cache;
-                                }
-                                Err(err) => warn!(
-                                    ?err,
-                                    chain_id,
-                                    list_key = %hex::encode(list_key),
-                                    "live POI event tail failed after artifact refresh error"
-                                ),
+                        match live_tail_candidate_cache(&live_tail_client, &cache).await {
+                            Ok((tailed_cache, _outcome)) => {
+                                cache = tailed_cache;
                             }
+                            Err(err) => warn!(
+                                ?err,
+                                chain_id,
+                                list_key = %hex::encode(list_key),
+                                "live POI event tail failed after artifact refresh error"
+                            ),
                         }
                         let installed = install_generated_cache_if_current(
                             local_caches,
@@ -1533,7 +1531,8 @@ mod tests {
             starter.start_chain(1).await;
         });
 
-        let progress = wait_for_progress(&mut progress_rx, 1, |progress| progress.is_error()).await;
+        let progress =
+            wait_for_progress(&mut progress_rx, 1, PoiArtifactCacheProgress::is_error).await;
 
         assert_eq!(progress.phase, PoiArtifactCachePhase::Error);
         assert!(progress.ready_for_wallet_checks);
@@ -1570,7 +1569,8 @@ mod tests {
             starter.start_chain(1).await;
         });
 
-        let progress = wait_for_progress(&mut progress_rx, 1, |progress| progress.is_error()).await;
+        let progress =
+            wait_for_progress(&mut progress_rx, 1, PoiArtifactCacheProgress::is_error).await;
 
         assert_eq!(progress.phase, PoiArtifactCachePhase::Error);
         assert!(!progress.ready_for_wallet_checks);

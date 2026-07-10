@@ -1,4 +1,24 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::time::Instant;
+
+use alloy::hex;
+use alloy::primitives::{Bytes, FixedBytes, U256};
+use async_trait::async_trait;
+use poi::poi::{PoiMerkleProof, PoiRpcClient};
+
+use broadcaster_core::crypto::poseidon::poseidon;
+use broadcaster_core::transact::{
+    DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, compute_railgun_txid_parts,
+    dummy_txid_root, pre_transaction_output_global_position, railgun_txid_leaf_hash,
+    railgun_txid_leaf_hash_with_output_start,
+};
+use broadcaster_core::tree::TREE_DEPTH;
+
+use crate::prover::{ProverError, ProverService};
+
+use super::{
+    PreTransactionPoiError, PublicInputs, TransactionPlanChunk, join_error_to_prover_error,
+};
 
 #[async_trait]
 pub trait PoiMerkleProofSource: Send + Sync {
@@ -22,7 +42,7 @@ impl PoiMerkleProofSource for PoiRpcClient {
         list_key: &FixedBytes<32>,
         blinded_commitments: &[FixedBytes<32>],
     ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
-        Ok(PoiRpcClient::poi_merkle_proofs(
+        Ok(Self::poi_merkle_proofs(
             self,
             txid_version,
             chain_type,
@@ -329,7 +349,9 @@ impl TransactionPlanChunk {
     }
 }
 
-fn validate_poi_input_count(chunk: &TransactionPlanChunk) -> Result<(), PreTransactionPoiError> {
+const fn validate_poi_input_count(
+    chunk: &TransactionPlanChunk,
+) -> Result<(), PreTransactionPoiError> {
     if chunk.inputs.len() != chunk.public_inputs.nullifiers.len() {
         return Err(PreTransactionPoiError::InputCountMismatch {
             expected: chunk.public_inputs.nullifiers.len(),
@@ -347,7 +369,10 @@ fn railgun_txid_if_has_unshield_bytes(chunk: &TransactionPlanChunk, railgun_txid
     }
 }
 
-fn railgun_txid_if_has_unshield_value(chunk: &TransactionPlanChunk, railgun_txid: U256) -> U256 {
+const fn railgun_txid_if_has_unshield_value(
+    chunk: &TransactionPlanChunk,
+    railgun_txid: U256,
+) -> U256 {
     if chunk.has_unshield {
         railgun_txid
     } else {
@@ -658,12 +683,14 @@ pub async fn generate_pre_transaction_pois(
                 .take(handles.len())
                 .collect();
         for handle in handles {
-            let (index, list_key, txid_leaf_hash, pre_tx_poi) =
-                handle.await.map_err(join_error_to_prover_error)??;
+            let (index, list_key, txid_leaf_hash, pre_tx_poi) = handle
+                .await
+                .map_err(|error| join_error_to_prover_error(&error))??;
             proof_results[index] = Some((list_key, txid_leaf_hash, pre_tx_poi));
         }
         for result in proof_results {
-            let (list_key, txid_leaf_hash, pre_tx_poi) = result.expect("all POI proofs generated");
+            let (list_key, txid_leaf_hash, pre_tx_poi) =
+                result.ok_or(ProverError::WorkerDropped)?;
             insert_pre_transaction_poi(&mut map, list_key, txid_leaf_hash, pre_tx_poi);
         }
     }
@@ -752,6 +779,7 @@ pub fn insert_pre_transaction_poi(
         .insert(txid_leaf_hash, pre_tx_poi);
 }
 
+#[must_use]
 pub fn compute_railgun_txid_from_public_inputs(public_inputs: &PublicInputs) -> U256 {
     compute_railgun_txid_parts(
         &public_inputs.nullifiers,

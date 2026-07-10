@@ -17,7 +17,7 @@ const ZKEY_CACHE_VERSION: u32 = 1;
 const ZKEY_CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
-pub enum ZkeyCacheError {
+pub(crate) enum ZkeyCacheError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
@@ -33,7 +33,7 @@ pub enum ZkeyCacheError {
 type ZkeyCachePayload = (ProvingKey<Bn254>, NPIndex<Fr>);
 type ZkeyCacheLoadResult = Result<Option<ZkeyCachePayload>, ZkeyCacheError>;
 
-pub trait ZkeyCacheDbExt {
+pub(crate) trait ZkeyCacheDbExt {
     fn load_zkey_cache(&self, variant: &str, expected_hash: [u8; 32]) -> ZkeyCacheLoadResult;
     fn write_zkey_cache(
         &self,
@@ -98,7 +98,7 @@ impl ZkeyCacheDbExt for DbStore {
     ) -> Result<(), ZkeyCacheError> {
         self.ensure_blob_dir("zkey")?;
         let file_name = format!("{variant}.ark");
-        let relative = DbStore::relative_blob_path("zkey", &file_name);
+        let relative = Self::relative_blob_path("zkey", &file_name);
         let path = self.resolve_path(&relative);
         let tmp_path = path.with_extension("tmp");
 
@@ -125,7 +125,7 @@ impl ZkeyCacheDbExt for DbStore {
     }
 }
 
-pub fn load_or_parse_zkey(
+pub(crate) fn load_or_parse_zkey(
     db: Option<&DbStore>,
     variant: &str,
     expected_hash: [u8; 32],
@@ -154,7 +154,7 @@ pub fn load_or_parse_zkey(
     Ok((proving_key, matrices))
 }
 
-pub fn zkey_cache_exists(
+pub(crate) fn zkey_cache_exists(
     db: &DbStore,
     variant: &str,
     expected_hash: [u8; 32],
@@ -178,7 +178,7 @@ pub fn zkey_cache_exists(
 
 fn reader_sha256<R: Read>(reader: &mut R) -> Result<[u8; 32], ZkeyCacheError> {
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {

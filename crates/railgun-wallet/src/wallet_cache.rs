@@ -127,6 +127,7 @@ pub fn wallet_utxo_stable_identity(utxo: &WalletUtxo) -> Vec<u8> {
     out
 }
 
+#[must_use]
 pub fn wallet_cache_key(
     wallet_id: &str,
     chain_id: u64,

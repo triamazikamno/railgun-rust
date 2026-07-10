@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ChainConfig, MerkleForest, SyncError, SyncProgressSender, SyncProgressStage,
+    SyncProgressUpdate, artifact_chunk_progress, send_sync_progress,
+};
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -107,6 +110,12 @@ struct MerkleCheckpointArtifactPage {
     leaves: Vec<U256>,
 }
 
+impl MerkleCheckpointArtifactPage {
+    const fn covers_position(&self, tree_number: u32, tree_position: u64) -> bool {
+        self.tree_number == tree_number && tree_position < self.leaf_count
+    }
+}
+
 pub(super) async fn run_merkle_artifact_catch_up_into(
     forest: &mut MerkleForest,
     chain: &ChainConfig,
@@ -158,7 +167,7 @@ impl MerkleArtifactSession {
         let manifest = client
             .fetch_manifest(&scope, None, SystemTime::now())
             .await
-            .map_err(merkle_artifact_error)?;
+            .map_err(|err| merkle_artifact_error(&err))?;
         send_merkle_artifact_preparation_progress(
             progress_tx,
             MERKLE_ARTIFACT_MANIFEST_DONE_PROGRESS,
@@ -281,7 +290,7 @@ impl MerkleArtifactSession {
                 },
             )
             .await
-            .map_err(merkle_artifact_error)?;
+            .map_err(|err| merkle_artifact_error(&err))?;
         let mut commitment_pages = Vec::with_capacity(commitment_chunks.len());
         for chunk in commitment_chunks {
             commitment_pages.push(CommitmentArtifactPage::try_from(&chunk)?);
@@ -323,7 +332,7 @@ impl MerkleArtifactSession {
             let catalog = client
                 .fetch_catalog(catalog_descriptor)
                 .await
-                .map_err(merkle_artifact_error)?
+                .map_err(|err| merkle_artifact_error(&err))?
                 .into_catalog();
             for chunk in catalog.chunks.into_iter().filter(|chunk| {
                 chunk.matches(
@@ -384,7 +393,7 @@ impl MerkleArtifactSession {
             let catalog = client
                 .fetch_catalog(catalog_descriptor)
                 .await
-                .map_err(merkle_artifact_error)?
+                .map_err(|err| merkle_artifact_error(&err))?
                 .into_catalog();
             for chunk in catalog.chunks.into_iter().filter(|chunk| {
                 chunk.matches(
@@ -541,9 +550,7 @@ impl MerkleArtifactSession {
         update: &MerkleTreeUpdate,
     ) -> Result<Option<U256>, SyncError> {
         for checkpoint in &self.checkpoint_pages {
-            if checkpoint.tree_number != update.tree_number
-                || update.tree_position >= checkpoint.leaf_count
-            {
+            if !checkpoint.covers_position(update.tree_number, update.tree_position) {
                 continue;
             }
             let position = usize::try_from(update.tree_position).map_err(|_| {
@@ -602,7 +609,8 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for CommitmentArtifactPage {
     type Error = SyncError;
 
     fn try_from(chunk: &VerifiedIndexedArtifactChunk) -> Result<Self, Self::Error> {
-        let envelope = decode_indexed_artifact_chunk(chunk).map_err(merkle_artifact_error)?;
+        let envelope =
+            decode_indexed_artifact_chunk(chunk).map_err(|err| merkle_artifact_error(&err))?;
         if envelope.header.dataset_kind != IndexedDatasetKind::Commitments {
             return Err(merkle_artifact_format(
                 "chunk is not a commitments artifact",
@@ -619,7 +627,7 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for CommitmentArtifactPage {
         let payload = envelope
             .section_payload(COMMITMENT_RECORD_SECTION_ID)
             .map_err(IndexedArtifactManifestError::from)
-            .map_err(merkle_artifact_error)?;
+            .map_err(|err| merkle_artifact_error(&err))?;
         let mut cursor = MerkleArtifactCursor::new(payload);
         let count = cursor.read_count("commitment count")?;
         let mut previous_global = None;
@@ -716,7 +724,8 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for MerkleCheckpointArtifactPage {
     type Error = SyncError;
 
     fn try_from(chunk: &VerifiedIndexedArtifactChunk) -> Result<Self, Self::Error> {
-        let envelope = decode_indexed_artifact_chunk(chunk).map_err(merkle_artifact_error)?;
+        let envelope =
+            decode_indexed_artifact_chunk(chunk).map_err(|err| merkle_artifact_error(&err))?;
         if envelope.header.dataset_kind != IndexedDatasetKind::MerkleCheckpoint {
             return Err(merkle_artifact_format(
                 "chunk is not a merkle_checkpoint artifact",
@@ -733,7 +742,7 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for MerkleCheckpointArtifactPage {
         let payload = envelope
             .section_payload(MERKLE_CHECKPOINT_SECTION_ID)
             .map_err(IndexedArtifactManifestError::from)
-            .map_err(merkle_artifact_error)?;
+            .map_err(|err| merkle_artifact_error(&err))?;
         let mut cursor = MerkleArtifactCursor::new(payload);
         let tree_number = cursor.read_u32("checkpoint tree_number")?;
         let leaf_count = cursor.read_u64("checkpoint leaf_count")?;
@@ -890,7 +899,7 @@ impl<'a> MerkleArtifactCursor<'a> {
     }
 }
 
-fn merkle_artifact_error(err: IndexedArtifactManifestError) -> SyncError {
+fn merkle_artifact_error(err: &IndexedArtifactManifestError) -> SyncError {
     merkle_artifact_format(err.to_string())
 }
 
@@ -953,9 +962,8 @@ mod tests {
         chunk.descriptor.metadata.start_block = Some(100);
         chunk.descriptor.metadata.end_block = Some(101);
 
-        let error = match CommitmentArtifactPage::try_from(&chunk) {
-            Ok(_) => panic!("commitment block coverage mismatch"),
-            Err(error) => error,
+        let Err(error) = CommitmentArtifactPage::try_from(&chunk) else {
+            panic!("commitment block coverage mismatch");
         };
 
         assert!(
@@ -999,9 +1007,8 @@ mod tests {
             },
         );
 
-        let error = match CommitmentArtifactPage::try_from(&chunk) {
-            Ok(_) => panic!("extreme commitment count should fail as a format error"),
-            Err(error) => error,
+        let Err(error) = CommitmentArtifactPage::try_from(&chunk) else {
+            panic!("extreme commitment count should fail as a format error");
         };
 
         assert!(
@@ -1035,7 +1042,7 @@ mod tests {
     fn merkle_checkpoint_artifact_page_verifies_root_and_metadata() {
         let leaves = vec![U256::from(1), U256::from(2)];
         let root = DenseMerkleTree::from_ordered_leaves(leaves.iter().copied(), 2).root();
-        let chunk = checkpoint_chunk(scope(), 2, 2, root, 123, leaves.clone());
+        let chunk = checkpoint_chunk(scope(), 2, 2, root, 123, &leaves);
 
         let page = MerkleCheckpointArtifactPage::try_from(&chunk).expect("checkpoint page");
 
@@ -1049,12 +1056,11 @@ mod tests {
     fn merkle_checkpoint_artifact_page_rejects_root_metadata_mismatch() {
         let leaves = vec![U256::from(1), U256::from(2)];
         let root = DenseMerkleTree::from_ordered_leaves(leaves.iter().copied(), 2).root();
-        let mut chunk = checkpoint_chunk(scope(), 2, 2, root, 123, leaves);
+        let mut chunk = checkpoint_chunk(scope(), 2, 2, root, 123, &leaves);
         chunk.descriptor.metadata.root = Some(FixedBytes::from([0xee; 32]));
 
-        let error = match MerkleCheckpointArtifactPage::try_from(&chunk) {
-            Ok(_) => panic!("checkpoint root metadata mismatch"),
-            Err(error) => error,
+        let Err(error) = MerkleCheckpointArtifactPage::try_from(&chunk) else {
+            panic!("checkpoint root metadata mismatch");
         };
 
         assert!(
@@ -1068,11 +1074,10 @@ mod tests {
     fn merkle_checkpoint_artifact_page_rejects_computed_root_mismatch() {
         let leaves = vec![U256::from(1), U256::from(2)];
         let wrong_root = U256::from(3);
-        let chunk = checkpoint_chunk(scope(), 2, 2, wrong_root, 123, leaves);
+        let chunk = checkpoint_chunk(scope(), 2, 2, wrong_root, 123, &leaves);
 
-        let error = match MerkleCheckpointArtifactPage::try_from(&chunk) {
-            Ok(_) => panic!("checkpoint computed root mismatch"),
-            Err(error) => error,
+        let Err(error) = MerkleCheckpointArtifactPage::try_from(&chunk) else {
+            panic!("checkpoint computed root mismatch");
         };
 
         assert!(error.to_string().contains("checkpoint root mismatch"));
@@ -1245,7 +1250,7 @@ mod tests {
             2,
             U256::from(99),
             100,
-            vec![U256::from(1), U256::from(2)],
+            &[U256::from(1), U256::from(2)],
         );
         let checkpoint_pages = MerkleArtifactSession::decode_checkpoint_pages_best_effort(
             1,
@@ -1375,14 +1380,14 @@ mod tests {
         leaf_count: u64,
         root: U256,
         last_indexed_block: u64,
-        leaves: Vec<U256>,
+        leaves: &[U256],
     ) -> VerifiedIndexedArtifactChunk {
         let mut payload = Vec::new();
         write_u32(&mut payload, tree_number);
         write_u64(&mut payload, leaf_count);
         payload.extend_from_slice(&root.to_be_bytes::<32>());
         write_u64(&mut payload, last_indexed_block);
-        for leaf in &leaves {
+        for leaf in leaves {
             payload.extend_from_slice(&leaf.to_be_bytes::<32>());
         }
         let start = u64::from(tree_number) * TREE_LEAF_COUNT;
@@ -1431,7 +1436,7 @@ mod tests {
             IndexedDatasetKind::WalletScan | IndexedDatasetKind::PublicTxid => 1,
         };
         let bytes = chunk_bytes(
-            scope.clone(),
+            &scope,
             dataset_kind,
             start,
             end,
@@ -1462,7 +1467,7 @@ mod tests {
     }
 
     fn chunk_bytes(
-        scope: ChainScope,
+        scope: &ChainScope,
         dataset_kind: IndexedDatasetKind,
         start: u64,
         end: u64,

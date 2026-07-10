@@ -1,37 +1,45 @@
-use super::{
-    CalldataRecoveryBuildRequest, DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, ExpectedPoiListState,
-    ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, LOCAL_PENDING_SPENT_TTL,
-    LocalPoiMerkleProofSource, LocalPoiStatusReader, MatchingPendingOutputPoiContextDisposition,
-    OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OutputPoiRecoveryRequest, OutputRecoveryRemoteProofSource, OwnedPoiPrivateDelta,
-    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubmissionPredicate,
-    PendingOutputPoiSubmitter, PoiPrivateApplyOutcome, PoiStatusReader,
-    PublicCacheTxidRecoveryRequest, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
+use super::delta::{discard_pending_output_poi_contexts_for_spent_outputs, spent_source_for_utxo};
+use super::handle::{
+    LOCAL_PENDING_SPENT_TTL, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
     WALLET_METADATA_LIVE_FLUSH_INTERVAL, WALLET_POI_RECOVERABLE_REFRESH_AFTER,
-    WALLET_POI_STATUS_BATCH_SIZE, WalletActorLifecycleCell, WalletHandle, WalletLiveMetadataFlush,
-    WalletNullifierIndex, WalletPendingOverlay, WalletPendingSpent, WalletPersistState,
-    WalletPoiRefreshRequest, WalletPoiRefreshSelection, WalletPoiRuntime,
-    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletProgressPersist,
-    WalletViewState, apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec,
-    apply_wallet_delta_to_vec_with_outcome, build_output_poi_recovery_chunk,
-    build_output_poi_recovery_chunk_from_calldata, decode_railgun_transactions,
-    discard_pending_output_poi_contexts_for_spent_outputs, extend_pending_output_poi_context,
-    force_resubmit_matching_pending_output_pois,
-    force_resubmit_matching_pending_output_pois_authorized, install_tailed_poi_cache_if_current,
-    matching_pending_output_poi_context_disposition, newly_recoverable_output_poi_list_keys,
-    now_epoch_secs, output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
+    WalletPoiRefreshRequest,
+};
+use super::local_poi_cache::install_tailed_poi_cache_if_current;
+use super::output_poi_recovery::{
+    CalldataRecoveryBuildRequest, MatchingPendingOutputPoiContextDisposition,
+    OutputRecoveryRemoteProofSource, PublicCacheTxidRecoveryRequest, WalletNullifierIndex,
+    build_output_poi_recovery_chunk, build_output_poi_recovery_chunk_from_calldata,
+    decode_railgun_transactions, extend_pending_output_poi_context,
+    force_resubmit_matching_pending_output_pois, matching_pending_output_poi_context_disposition,
+    newly_recoverable_output_poi_list_keys, output_poi_recovery_proof_retry_after,
     output_poi_recovery_retry_allowed_for_lists, output_start_global_position,
-    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
-    pending_output_poi_submit_identity, pending_overlay_from_delta,
-    preflight_and_remote_submit_pending_output_poi, preflight_local_output_poi_input_proofs,
-    process_pending_output_poi_observations, process_pending_output_poi_observations_authorized,
-    process_pending_output_poi_observations_inner, recoverable_output_poi_list_keys,
+    preflight_local_output_poi_input_proofs, recoverable_output_poi_list_keys,
     recovered_output_txid_data_from_public_cache, recovery_input_merkle_tree_for_root,
-    refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
-    rewind_wallet_utxos, spent_source_for_utxo, sync_live_poi_event_tail,
-    verify_submitted_pending_output_pois, verify_submitted_pending_output_pois_authorized,
+};
+use super::pending_output_poi::{
+    process_pending_output_poi_observations_inner, verify_submitted_pending_output_pois,
+    verify_submitted_pending_output_pois_authorized,
     verify_submitted_pending_output_pois_authorized_with_projection,
     verify_submitted_pending_output_pois_with_config,
+};
+use super::{
+    DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
+    ExpectedRecordState, ExpectedWalletOutput, LocalPoiMerkleProofSource, LocalPoiStatusReader,
+    OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    OutputPoiRecoveryRequest, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+    PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter, PoiPrivateApplyOutcome,
+    PoiStatusReader, WALLET_POI_STATUS_BATCH_SIZE, WalletActorLifecycleCell, WalletHandle,
+    WalletLiveMetadataFlush, WalletPendingOverlay, WalletPendingSpent, WalletPersistState,
+    WalletPoiRefreshSelection, WalletPoiRuntime, WalletPrivateMutationAuthority,
+    WalletPrivatePoiClients, WalletProgressPersist, WalletViewState,
+    apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec,
+    apply_wallet_delta_to_vec_with_outcome, force_resubmit_matching_pending_output_pois_authorized,
+    now_epoch_secs, output_poi_recovery_candidates, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submit_identity,
+    pending_overlay_from_delta, preflight_and_remote_submit_pending_output_poi,
+    process_pending_output_poi_observations, process_pending_output_poi_observations_authorized,
+    refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
+    rewind_wallet_utxos, sync_live_poi_event_tail,
     verify_submitted_pending_output_pois_with_config_authorized, wallet_poi_status_client,
     wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
 };
@@ -52,8 +60,8 @@ use alloy::sol_types::SolCall;
 use alloy::uint;
 use async_trait::async_trait;
 use broadcaster_core::contracts::railgun::{
-    BoundParams, Call, CommitmentPreimage, RelayAdapt7702ActionData, SnarkProof, Transaction,
-    executeCall,
+    BoundParams, Call, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702ActionData,
+    SnarkProof, Transaction, executeCall,
 };
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::notes::Note;
@@ -1014,7 +1022,7 @@ fn output_poi_recovery_action_records_submit_success() {
 
     record.apply_action(
         OutputPoiRecoveryAction::Submitted {
-            retry_after: Duration::from_secs(60),
+            retry_after: Duration::from_mins(1),
         },
         10,
     );
@@ -1040,7 +1048,7 @@ fn output_poi_recovery_action_records_submit_failure() {
     record.apply_action(
         OutputPoiRecoveryAction::SubmitFailed {
             error: "submit failed".to_string(),
-            retry_after: Duration::from_secs(60),
+            retry_after: Duration::from_mins(1),
         },
         10,
     );
@@ -1357,25 +1365,27 @@ fn output_poi_recovery_chunk_decrypts_missing_unshield_fee_output_from_calldata(
         change_note.clone(),
         input.utxo.tree,
         9,
-        source.clone(),
+        source,
         UtxoCommitmentKind::Transact,
     ));
-    let fee_ciphertext = NoteCiphertext::try_from_note(
-        &fee_note,
-        &sender,
-        &broadcaster,
-        &scan_keys.viewing_private_key,
-    )
-    .expect("encrypt fee note")
-    .into_commitment_ciphertext();
-    let change_ciphertext = NoteCiphertext::try_from_note(
-        &change_note,
-        &sender,
-        &sender,
-        &scan_keys.viewing_private_key,
-    )
-    .expect("encrypt change note")
-    .into_commitment_ciphertext();
+    let fee_ciphertext = CommitmentCiphertext::from(
+        NoteCiphertext::try_from_note(
+            &fee_note,
+            &sender,
+            &broadcaster,
+            &scan_keys.viewing_private_key,
+        )
+        .expect("encrypt fee note"),
+    );
+    let change_ciphertext = CommitmentCiphertext::from(
+        NoteCiphertext::try_from_note(
+            &change_note,
+            &sender,
+            &sender,
+            &scan_keys.viewing_private_key,
+        )
+        .expect("encrypt change note"),
+    );
     let unshield_note = Note::new_unshield(Address::from([0x56; 20]), token, U256::from(7_u8));
 
     let mut forest = MerkleForest::new();
@@ -1659,7 +1669,7 @@ async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() 
         U256::from(recovery_chunk.output_start_global),
     );
     let direct_error = public_data_plane
-        .txid_public_proof(PublicTxidProofRequest {
+        .txid_public_proof(&PublicTxidProofRequest {
             key: DataPlanePublicTxidCacheKey::new(txid_scope, DEFAULT_TXID_VERSION),
             target: PublicTxidProofTarget::UnknownIndex {
                 expected_leaf_hash: expected_leaf,
@@ -2164,7 +2174,7 @@ async fn indexed_artifacts_proxy_fallback_does_not_probe_remote_for_ready_local_
 async fn wallet_poi_status_client_uses_configured_rpc_url() {
     let list_key = FixedBytes::from([0x11; 32]);
     let mock = spawn_poi_rpc(serde_json::json!({})).await;
-    let client = wallet_poi_status_client(&mock.url, None).expect("POI client");
+    let client = wallet_poi_status_client(&mock.url, None);
 
     client
         .pois_per_list(DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, 1, &[list_key], &[])
@@ -4848,7 +4858,7 @@ async fn output_recovery_mixed_statuses_request_and_persist_only_recoverable_lis
                 expected_output: ExpectedWalletOutput::new(&candidate),
                 active_list_keys: recoverable_list_keys.clone(),
                 required_poi_status: ExpectedPoiStatus::Recoverable,
-                pending_update: Some((ExpectedRecordState::Absent, pending.clone())),
+                pending_update: Box::new(Some((ExpectedRecordState::Absent, pending.clone()))),
                 expected_recovery: ExpectedRecordState::Absent,
                 action: OutputPoiRecoveryAction::Detected {
                     status: OutputPoiRecoveryStatus::Recoverable,
@@ -4981,7 +4991,7 @@ async fn assert_valid_output_recovery_recovers_new_active_list(force_retry: bool
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: recoverable_list_keys,
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Some((ExpectedRecordState::Absent, pending.clone())),
+            pending_update: Box::new(Some((ExpectedRecordState::Absent, pending.clone()))),
             expected_recovery,
             action: OutputPoiRecoveryAction::Detected {
                 status: OutputPoiRecoveryStatus::Recoverable,
@@ -5135,10 +5145,10 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
             expected_output: ExpectedWalletOutput::new(&current_output),
             active_list_keys: new_list_keys.clone(),
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Some((
+            pending_update: Box::new(Some((
                 ExpectedRecordState::Present(expected_context_fingerprint),
                 extended,
-            )),
+            ))),
             expected_recovery,
             action: OutputPoiRecoveryAction::ExtendContext,
             now: 10,
@@ -5299,10 +5309,10 @@ async fn output_recovery_extension_skips_concurrent_context_change() {
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: vec![list_b],
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Some((
+            pending_update: Box::new(Some((
                 ExpectedRecordState::Present(expected_context_fingerprint),
                 extended,
-            )),
+            ))),
             expected_recovery,
             action: OutputPoiRecoveryAction::ExtendContext,
             now: 10,
@@ -5417,10 +5427,10 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: vec![list_key],
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Some((
+            pending_update: Box::new(Some((
                 ExpectedRecordState::Present(expected_context_fingerprint),
                 regenerated.clone(),
-            )),
+            ))),
             expected_recovery,
             action: OutputPoiRecoveryAction::Detected {
                 status: OutputPoiRecoveryStatus::Recoverable,
@@ -5538,10 +5548,10 @@ async fn force_terminal_regeneration_skips_concurrent_context_replacement() {
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: vec![list_key],
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Some((
+            pending_update: Box::new(Some((
                 ExpectedRecordState::Present(expected_context_fingerprint),
                 regenerated,
-            )),
+            ))),
             expected_recovery,
             action: OutputPoiRecoveryAction::Detected {
                 status: OutputPoiRecoveryStatus::Recoverable,
@@ -5656,7 +5666,6 @@ async fn remote_proof_gateway_revalidates_after_source_resolution_wait() {
         "stale fallback must not call remote poi_merkle_proofs"
     );
 
-    drop(source);
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -5744,7 +5753,6 @@ async fn remote_proof_gateway_rejects_mixed_candidate_with_no_recoverable_lists(
     }
     assert_eq!(transport.calls(), 0);
 
-    drop(source);
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -5891,7 +5899,7 @@ async fn recovery_actor_skips_when_output_becomes_valid_before_apply() {
             expected_output,
             active_list_keys: vec![list_key],
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Some((ExpectedRecordState::Absent, pending.clone())),
+            pending_update: Box::new(Some((ExpectedRecordState::Absent, pending.clone()))),
             expected_recovery: ExpectedRecordState::Absent,
             action: OutputPoiRecoveryAction::Detected {
                 status: OutputPoiRecoveryStatus::Recoverable,

@@ -1,4 +1,38 @@
-use super::*;
+#[cfg(test)]
+use super::pending_output_poi::{
+    pending_output_poi_context_still_current_unchecked, pending_output_poi_recovery_update,
+    submit_pending_output_poi_context,
+};
+use super::{
+    Arc, Bytes, ChainPublicDataPlane, ChainScope, ChainType, CommitmentCiphertext,
+    DEFAULT_TXID_VERSION, DbStore, DenseMerkleTree, Deserialize, Duration, EVM_CHAIN_TYPE,
+    ExpectedPoiStatus, ExpectedWalletOutput, FixedBytes, HashMap, IndexedArtifactSourceConfig,
+    InputWitness, Instant, LocalPoiMerkleProofSource, MerkleForest, Note,
+    OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES,
+    OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
+    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiContextRecord,
+    PendingOutputPoiObservation, PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt,
+    PendingOutputPoiRole, PendingOutputPoiSubmissionPlan, PoiMerkleProof, PoiMerkleProofSource,
+    PoiPrivateApplyOutcome, PoiRpcClient, PoiStatus, PostTransactionPoiData,
+    PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
+    PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusKey, PublicTxidCacheKey,
+    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
+    PublicTxidSyncRequest, QueryRpcPool, RailgunSpendSigner, RwLock, SolCall, TREE_LEAF_COUNT,
+    Transaction, TransactionPlanChunk, TxidPublicCacheError, U256, Utxo, UtxoCommitmentKind,
+    UtxoPoiMetadata, ValidatedRailgunTxidStatus, WalletCacheStore, WalletConfig, WalletPoiRuntime,
+    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletPrivateRemoteError, WalletUtxo,
+    apply_poi_private_delta, async_trait, debug, decrypt_in_place_16b_iv, executeCall,
+    expected_pending_context_state, expected_recovery_state, generate_post_transaction_pois, hex,
+    json, log_local_poi_cache_unavailable, now_epoch_secs, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submission_plan_current,
+    pending_output_poi_submit_identity, preflight_and_remote_submit_pending_output_poi,
+    railgun_txid_leaf_hash_with_output_start, relayCall, shared_symmetric_key, split_iv_tag,
+    submit_observed_pending_output_pois_inner, transactCall, warn,
+};
+#[cfg(test)]
+use super::{PendingOutputPoiSubmitter, SingleCommitmentProofContext};
 mod public_cache;
 
 #[cfg(not(test))]
@@ -792,7 +826,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                         expected_output: ExpectedWalletOutput::new(candidate),
                         active_list_keys: recoverable_list_keys.clone(),
                         required_poi_status: ExpectedPoiStatus::Recoverable,
-                        pending_update: Some((expected_pending_context, record)),
+                        pending_update: Box::new(Some((expected_pending_context, record))),
                         expected_recovery,
                         action: if pending_context_extension.is_some() && !reset_valid_recovery {
                             OutputPoiRecoveryAction::ExtendContext
@@ -1087,7 +1121,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
             | PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {}
         }
         match attempt {
-            PendingOutputPoiRemoteAttempt::NotCurrent => continue,
+            PendingOutputPoiRemoteAttempt::NotCurrent => {}
             PendingOutputPoiRemoteAttempt::AuthorityStale => break,
             PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
                 if let Err(err) = apply_poi_private_delta(
@@ -1390,7 +1424,9 @@ pub(super) struct CalldataRecoveryBuildRequest<'a> {
     pub(super) candidate_started: Instant,
 }
 
-pub(super) fn output_poi_recovery_proof_retry_after(err: &PreTransactionPoiError) -> Duration {
+pub(super) const fn output_poi_recovery_proof_retry_after(
+    err: &PreTransactionPoiError,
+) -> Duration {
     match err {
         PreTransactionPoiError::Prover(
             ProverError::WorkerPanic(_) | ProverError::WorkerDropped | ProverError::QueueClosed,
@@ -1508,7 +1544,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
                     expected_output: ExpectedWalletOutput::new(candidate),
                     active_list_keys: required_poi_list_keys.to_vec(),
                     required_poi_status: ExpectedPoiStatus::Recoverable,
-                    pending_update: None,
+                    pending_update: Box::new(None),
                     expected_recovery,
                     action: OutputPoiRecoveryAction::CacheTxInput {
                         tx_input: tx_input.to_vec(),
@@ -1878,16 +1914,16 @@ pub(super) fn build_output_poi_recovery_chunk(
         let output_start_tree = (output_start_global / u128::from(TREE_LEAF_COUNT)) as u32;
         let output_start_position = (output_start_global % u128::from(TREE_LEAF_COUNT)) as u64;
         let input_tree = u32::from(transaction.boundParams.treeNumber);
-        let max_leaf_count = if input_tree == output_start_tree {
-            output_start_position
-        } else if input_tree < output_start_tree {
-            TREE_LEAF_COUNT
-        } else {
-            return Err(RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::MissingMerkleProof,
-                "transaction input tree is after output tree",
-                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-            ));
+        let max_leaf_count = match input_tree.cmp(&output_start_tree) {
+            std::cmp::Ordering::Equal => output_start_position,
+            std::cmp::Ordering::Less => TREE_LEAF_COUNT,
+            std::cmp::Ordering::Greater => {
+                return Err(RecoveryFailure::retryable(
+                    OutputPoiRecoveryStatus::MissingMerkleProof,
+                    "transaction input tree is after output tree",
+                    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+                ));
+            }
         };
 
         let mut output_notes = output_notes_for_transaction(
@@ -2430,7 +2466,7 @@ pub(super) async fn record_output_poi_recovery_failure(
             expected_output: ExpectedWalletOutput::new(candidate),
             active_list_keys: active_list_keys.to_vec(),
             required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: None,
+            pending_update: Box::new(None),
             expected_recovery,
             action: OutputPoiRecoveryAction::Detected {
                 status,
@@ -2499,7 +2535,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
                 expected_output: ExpectedWalletOutput::new(wallet_utxo),
                 active_list_keys: active_list_keys.to_vec(),
                 required_poi_status: ExpectedPoiStatus::Valid,
-                pending_update: None,
+                pending_update: Box::new(None),
                 expected_recovery,
                 action: OutputPoiRecoveryAction::Valid,
                 now,

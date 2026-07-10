@@ -525,7 +525,7 @@ impl ChainConfig {
         }
     }
 
-    pub(crate) fn should_skip_merkle_artifact_catch_up(
+    pub(crate) const fn should_skip_merkle_artifact_catch_up(
         &self,
         from_block: u64,
         safe_head: u64,
@@ -556,6 +556,7 @@ pub struct ChainConfigDefaults {
 }
 
 impl ChainConfigDefaults {
+    #[must_use]
     pub fn for_chain(chain_id: u64) -> Option<Self> {
         match chain_id {
             1 => Some(Self {
@@ -572,10 +573,10 @@ impl ChainConfigDefaults {
                     "https://eth.api.pocket.network",
                     "https://mainnet.rpc.sentio.xyz",
                     "https://eth.drpc.org",
-                ]),
+                ])?,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql")
-                        .expect("valid ethereum quick sync endpoint"),
+                        .ok()?,
                 ),
                 indexed_wallet_block_range: 300_000,
                 deployment_block: 14_737_691,
@@ -598,10 +599,10 @@ impl ChainConfigDefaults {
                     "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
                     "https://bsc.rpc.blxrbdn.com",
                     "https://bsc.drpc.org",
-                ]),
+                ])?,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql")
-                        .expect("valid bsc quick sync endpoint"),
+                        .ok()?,
                 ),
                 indexed_wallet_block_range: 1_000_000,
                 deployment_block: 17_633_701,
@@ -624,10 +625,10 @@ impl ChainConfigDefaults {
                     "https://polygon-bor-rpc.publicnode.com",
                     "https://poly.api.pocket.network",
                     "https://polygon.drpc.org",
-                ]),
+                ])?,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql")
-                        .expect("valid polygon quick sync endpoint"),
+                        .ok()?,
                 ),
                 indexed_wallet_block_range: 1_000_000,
                 deployment_block: 28_083_766,
@@ -653,10 +654,10 @@ impl ChainConfigDefaults {
                     "https://arbitrum.rpc.subquery.network/public",
                     "https://arb1.lava.build",
                     "https://arbitrum.gateway.tenderly.co",
-                ]),
+                ])?,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql")
-                        .expect("valid arbitrum quick sync endpoint"),
+                        .ok()?,
                 ),
                 indexed_wallet_block_range: 5_000_000,
                 deployment_block: 56_109_834,
@@ -672,10 +673,8 @@ impl ChainConfigDefaults {
     }
 }
 
-fn default_rpc_urls(urls: &[&str]) -> Vec<Url> {
-    urls.iter()
-        .map(|url| Url::parse(url).expect("valid default rpc url"))
-        .collect()
+fn default_rpc_urls(urls: &[&str]) -> Option<Vec<Url>> {
+    urls.iter().map(|url| Url::parse(url).ok()).collect()
 }
 
 pub struct WalletPrivateCommit<'a> {
@@ -855,7 +854,7 @@ impl WalletCacheStore for DbStore {
     }
 
     fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
-        Ok(DbStore::get_wallet_meta(self, wallet_id)?)
+        Ok(Self::get_wallet_meta(self, wallet_id)?)
     }
 
     fn get_wallet_sync_actor_state(
@@ -863,7 +862,7 @@ impl WalletCacheStore for DbStore {
         chain_id: u64,
         wallet_id: &str,
     ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError> {
-        Ok(DbStore::get_wallet_sync_actor_state(
+        Ok(Self::get_wallet_sync_actor_state(
             self, chain_id, wallet_id,
         )?)
     }
@@ -872,7 +871,7 @@ impl WalletCacheStore for DbStore {
         &self,
         commit: WalletSyncActorStateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
-        Ok(DbStore::put_wallet_sync_actor_state(self, commit.state())?)
+        Ok(Self::put_wallet_sync_actor_state(self, commit.state())?)
     }
 }
 
@@ -1128,7 +1127,7 @@ impl WalletScanRows {
     }
 
     #[must_use]
-    pub(crate) fn covers(&self, from_block: u64, to_block: u64) -> bool {
+    pub(crate) const fn covers(&self, from_block: u64, to_block: u64) -> bool {
         self.from_block == from_block
             && self.to_block == to_block
             && match &self.payload {
@@ -1199,7 +1198,7 @@ impl WalletScanApply {
     pub(crate) fn rows_from_log_batch(
         from_block: u64,
         to_block: u64,
-        batch: SharedLogBatch,
+        batch: &SharedLogBatch,
         source: PublicScanSource,
     ) -> Result<Self, WalletScanError> {
         let read_scope = batch.read_scope;
@@ -1245,7 +1244,7 @@ impl WalletScanApply {
     }
 
     #[must_use]
-    pub(crate) fn empty_coverage(
+    pub(crate) const fn empty_coverage(
         from_block: u64,
         to_block: u64,
         read_scope: PublicScanReadScope,
@@ -1423,7 +1422,11 @@ impl WalletPendingSpent {
         (self.tree, self.position)
     }
 
-    pub fn from_source(utxo: &railgun_wallet::Utxo, source: railgun_wallet::UtxoSource) -> Self {
+    #[must_use]
+    pub const fn from_source(
+        utxo: &railgun_wallet::Utxo,
+        source: &railgun_wallet::UtxoSource,
+    ) -> Self {
         Self {
             tree: utxo.tree,
             position: utxo.position,
@@ -1434,7 +1437,8 @@ impl WalletPendingSpent {
     }
 
     #[cfg(test)]
-    pub fn submitted(
+    #[must_use]
+    pub const fn submitted(
         utxo: &railgun_wallet::Utxo,
         tx_hash: Option<FixedBytes<32>>,
         now: u64,
@@ -1564,7 +1568,7 @@ impl Eq for WalletViewState {}
 
 impl WalletViewState {
     #[must_use]
-    pub fn is_current(&self) -> bool {
+    pub const fn is_current(&self) -> bool {
         matches!(self, Self::Current(_))
     }
 
@@ -1607,7 +1611,7 @@ impl WalletViewState {
     }
 }
 
-/// Status of the CommitResetRewind transition after AcceptReset has already succeeded
+/// Status of the `CommitResetRewind` transition after `AcceptReset` has already succeeded
 /// (or for restored/retry rewinds of an already-accepted pending reset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletResetRewindStatus {
@@ -1637,7 +1641,7 @@ impl WalletResetRewindStatus {
 
 /// Public result of a wallet reset request.
 ///
-/// **Invariant:** once AcceptReset has durably succeeded, the result is always
+/// **Invariant:** once `AcceptReset` has durably succeeded, the result is always
 /// [`Accepted`](Self::Accepted) with a rewind status. [`Rejected`](Self::Rejected)
 /// means the reset was never accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1757,7 +1761,7 @@ pub(crate) struct WalletSyncToken {
 
 impl WalletSyncToken {
     #[must_use]
-    pub(crate) fn mint(
+    pub(crate) const fn mint(
         authority: WalletActorTokenAuthority<'_>,
         reset_generation: u64,
         job_id: u64,
@@ -1816,7 +1820,7 @@ pub(crate) struct WalletResetToken {
 
 impl WalletResetToken {
     #[must_use]
-    pub(crate) fn mint(authority: WalletActorTokenAuthority<'_>, intent_id: u64) -> Self {
+    pub(crate) const fn mint(authority: WalletActorTokenAuthority<'_>, intent_id: u64) -> Self {
         Self {
             chain_id: authority.chain_id(),
             actor_id: authority.actor_id(),
@@ -1898,7 +1902,7 @@ impl PartialEq for WalletBackfillGrant {
 impl Eq for WalletBackfillGrant {}
 
 impl WalletBackfillGrant {
-    pub(crate) fn for_actor_accepted_job(
+    pub(crate) const fn for_actor_accepted_job(
         token: WalletSyncToken,
         sender: mpsc::Sender<BackfillEvent>,
         liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
@@ -1912,7 +1916,7 @@ impl WalletBackfillGrant {
         }
     }
 
-    pub(crate) fn token(&self) -> WalletSyncToken {
+    pub(crate) const fn token(&self) -> WalletSyncToken {
         self.inner
             .as_ref()
             .expect("backfill grant is present")
@@ -1980,11 +1984,11 @@ impl WalletBackfillDriver {
         WalletBackfillGrant::from_token(token, sender).activate()
     }
 
-    fn inner(&self) -> &WalletBackfillOwner {
+    const fn inner(&self) -> &WalletBackfillOwner {
         self.inner.as_ref().expect("backfill driver is present")
     }
 
-    pub(crate) fn token(&self) -> WalletSyncToken {
+    pub(crate) const fn token(&self) -> WalletSyncToken {
         self.inner().token
     }
 
@@ -2004,7 +2008,7 @@ impl WalletBackfillDriver {
         )
     }
 
-    pub(crate) fn sender(&self) -> &mpsc::Sender<BackfillEvent> {
+    pub(crate) const fn sender(&self) -> &mpsc::Sender<BackfillEvent> {
         &self.inner().sender
     }
 

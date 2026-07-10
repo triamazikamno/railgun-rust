@@ -1,4 +1,7 @@
-use super::*;
+use super::{WalletConfig, warn};
+
+#[cfg(test)]
+use super::{FixedBytes, PoiCache, WalletLocalPoiCaches};
 
 #[cfg(test)]
 pub(super) async fn install_tailed_poi_cache_if_current(

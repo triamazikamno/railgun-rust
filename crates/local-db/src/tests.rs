@@ -20,8 +20,7 @@ fn temp_db_root() -> PathBuf {
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     dir.join(format!("db-{pid}-{nanos}-{counter}"))
 }

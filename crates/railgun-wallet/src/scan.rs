@@ -176,7 +176,7 @@ impl std::fmt::Debug for WalletScanInputRows {
 
 impl WalletScanInputRows {
     #[must_use]
-    pub fn row_count(&self) -> usize {
+    pub const fn row_count(&self) -> usize {
         self.transact_commitments
             .len()
             .saturating_add(self.shield_commitments.len())

@@ -1,4 +1,17 @@
-use super::*;
+use super::{
+    DbStore, DenseMerkleTree, ErrorKind, FixedBytes, IndexedArtifactSourceConfig, NonZeroUsize,
+    Path, QuickSyncClient, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_PAGE_SIZE,
+    TXID_CACHE_SYNC_LOCK, TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey,
+    TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCacheReadScope, TxidPublicCacheRefresh,
+    TxidPublicCacheReset, TxidPublicCacheSyncState, TxidPublicCacheWritePermit,
+    TxidPublicLatestValidated, Url, artifact, debug, fs, info, read_tree_leaves,
+    rebuild_index_for_manifest, update_index_for_page, warn,
+};
+#[cfg(test)]
+use super::{
+    TxidPublicCachedTransaction, find_public_recovery_transaction_in_manifest,
+    find_target_row_in_page,
+};
 
 pub(crate) async fn reset_txid_public_cache(
     db: &DbStore,
@@ -271,23 +284,22 @@ impl TxidPublicCache<'_> {
             "TXID public cache sync started"
         );
         let client = if graph_needed {
-            match endpoint {
-                Some(endpoint) => Some(match http_client.cloned() {
+            if let Some(endpoint) = endpoint {
+                Some(match http_client.cloned() {
                     Some(http_client) => {
                         QuickSyncClient::with_http_client(endpoint.clone(), http_client)
                     }
                     None => QuickSyncClient::new(endpoint.clone()),
-                }),
-                None => {
-                    debug!(
-                        chain_id = self.key.chain_id,
-                        txid_version = self.key.txid_version,
-                        refresh_start,
-                        latest_validated_txid_index = latest.txid_index,
-                        "TXID public cache needs more rows but GraphQL fallback is unavailable"
-                    );
-                    None
-                }
+                })
+            } else {
+                debug!(
+                    chain_id = self.key.chain_id,
+                    txid_version = self.key.txid_version,
+                    refresh_start,
+                    latest_validated_txid_index = latest.txid_index,
+                    "TXID public cache needs more rows but GraphQL fallback is unavailable"
+                );
+                None
             }
         } else {
             None
@@ -793,7 +805,7 @@ impl TxidPublicCacheManifest {
         Ok(status)
     }
 
-    fn set_latest_validated(&mut self, latest: TxidPublicLatestValidated) {
+    const fn set_latest_validated(&mut self, latest: TxidPublicLatestValidated) {
         self.latest_validated_txid_index = Some(latest.txid_index);
         self.latest_validated_merkleroot = latest.merkleroot;
     }
@@ -865,11 +877,11 @@ impl TxidPublicCacheManifest {
         }
         match self.validate_contiguous_rows_through(db, latest.txid_index) {
             Ok(()) => {}
-            Err(TxidPublicCacheError::MissingLeaf { .. }) => {
-                return Ok(TxidPublicLocalLatestStatus::NeedsValidatedRefresh);
-            }
-            Err(TxidPublicCacheError::MetadataMismatch(_))
-            | Err(TxidPublicCacheError::Decode(_)) => {
+            Err(
+                TxidPublicCacheError::MissingLeaf { .. }
+                | TxidPublicCacheError::MetadataMismatch(_)
+                | TxidPublicCacheError::Decode(_),
+            ) => {
                 return Ok(TxidPublicLocalLatestStatus::NeedsValidatedRefresh);
             }
             Err(TxidPublicCacheError::Io(err)) if err.kind() == ErrorKind::NotFound => {

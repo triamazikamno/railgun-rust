@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    BTreeMap, BlindedCommitmentData, DbStore, EVM_CHAIN_TYPE, Error, FixedBytes, Instant,
+    OwnedPoiPrivateDelta, POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError,
+    PoiPrivateApplyOutcome, PoiRpcClient, PoiRpcError, PoiStatusReader, SnapshotEvent, U256,
+    WALLET_POI_STATUS_BATCH_SIZE, WalletBackfillRejectReason, WalletCacheStore, WalletConfig,
+    WalletPoiRefreshSelection, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, apply_poi_private_delta,
+    blinded_commitment_type, debug, now_epoch_secs, warn,
+};
+use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 
 pub(super) async fn refresh_wallet_poi_statuses_selected(
@@ -111,7 +120,7 @@ pub(super) async fn refresh_wallet_poi_statuses_selected(
     changed
 }
 
-/// Remote general-status refresh for PoiProxy / artifact fallback jobs.
+/// Remote general-status refresh for `PoiProxy` / artifact fallback jobs.
 ///
 /// Every batch is a separately authorized private disclosure. Results re-enter the
 /// actor as a pure intent and are folded against the current UTXO set before commit.
@@ -190,7 +199,7 @@ pub(super) async fn refresh_wallet_poi_statuses_remote_authorized(
             .await;
         match response {
             Ok(statuses) => statuses_by_blinded_commitment.extend(statuses),
-            Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Subject)) => continue,
+            Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Subject)) => {}
             Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Authority)) => break,
             Err(WalletPrivateRemoteError::Check(reason)) => {
                 debug!(?reason, cache_key = %cfg.cache_key, "remote wallet POI status check rejected");
