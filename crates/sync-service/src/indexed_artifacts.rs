@@ -373,14 +373,15 @@ impl IndexedArtifactManifestClient {
         }
         let batch_started = Instant::now();
         let max_in_flight_bytes = self.config.max_in_flight_bytes;
+        for descriptor in descriptors {
+            descriptor.decoded_envelope_byte_size_charge()?;
+        }
+        // Retrieval and decoded-resident memory are separate resources. This budget limits
+        // compressed gateway bytes; decode_chunk_bytes enforces the dataset output limit.
         let in_flight_byte_charges = descriptors
             .iter()
-            .map(|descriptor| {
-                descriptor
-                    .decoded_envelope_byte_size_charge()
-                    .map(|decoded_byte_size| descriptor.byte_size.max(decoded_byte_size))
-            })
-            .collect::<Result<Vec<_>, IndexedArtifactChunkError>>()?;
+            .map(|descriptor| descriptor.byte_size)
+            .collect::<Vec<_>>();
         let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
         let mut results = vec![None; descriptors.len()];
         let mut next_index = 0;
@@ -2126,26 +2127,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_chunk_fetch_charges_legacy_descriptor_at_dataset_cap() {
+    async fn bounded_chunk_fetch_charges_legacy_descriptor_by_compressed_size() {
         let bytes = b"legacy descriptor".to_vec();
         let mut descriptor = chunk_descriptor_for_bytes(scope(), 0, 1, raw_cid(&bytes), &bytes);
         descriptor.metadata.decoded_envelope_byte_size = None;
         let mut source_config = config([7_u8; 32], None);
-        source_config.max_in_flight_bytes =
-            INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES - 1;
+        source_config.max_in_flight_bytes = descriptor.byte_size;
         let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
 
         let error = client
             .fetch_chunks_bounded(&[descriptor])
             .await
-            .expect_err("legacy descriptor charged at dataset cap");
+            .expect_err("missing gateway rejects after byte-budget admission");
 
-        assert!(matches!(
+        assert!(!matches!(
             error,
-            IndexedArtifactManifestError::ChunkExceedsInFlightBudget {
-                byte_size: INDEXED_ARTIFACT_WALLET_SCAN_MAX_DECODED_ENVELOPE_BYTES,
-                ..
-            }
+            IndexedArtifactManifestError::ChunkExceedsInFlightBudget { .. }
         ));
     }
 
