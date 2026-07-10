@@ -6,7 +6,7 @@ pub(super) struct WalletBackfill {
     pub(super) target_block: u64,
     pub(super) follow_safe_head: bool,
     pub(super) progress_start_block: u64,
-    pub(super) lease: WalletBackfillLease,
+    pub(super) driver: WalletBackfillDriver,
     pub(super) last_advanced_at: Instant,
     pub(super) last_indexed_tail_attempt_at: Option<Instant>,
 }
@@ -67,7 +67,7 @@ impl WalletBackfill {
         target_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
-        lease: WalletBackfillLease,
+        driver: WalletBackfillDriver,
         now: Instant,
     ) -> Self {
         Self {
@@ -75,7 +75,7 @@ impl WalletBackfill {
             target_block,
             follow_safe_head,
             progress_start_block,
-            lease,
+            driver,
             last_advanced_at: now,
             last_indexed_tail_attempt_at: None,
         }

@@ -95,7 +95,7 @@ pub(super) enum IndexedWalletCatchUpSourceOrder {
 pub(super) struct WalletIndexedCatchUpStatusGuard<'a> {
     handle: &'a WalletHandle,
     expose_status: bool,
-    lease: Option<WalletIndexedCatchUpLease>,
+    lease: WalletIndexedCatchUpLease,
 }
 
 impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
@@ -104,7 +104,7 @@ impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
         Some(Self {
             handle,
             expose_status,
-            lease: Some(lease),
+            lease,
         })
     }
 
@@ -114,25 +114,15 @@ impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
         from_block: u64,
         target_block: u64,
     ) {
-        if self.expose_status
-            && let Some(lease) = self.lease
-        {
+        if self.expose_status {
             self.handle.set_indexed_catch_up(
-                lease,
+                &self.lease,
                 WalletIndexedCatchUpStatus {
                     source,
                     from_block,
                     target_block,
                 },
             );
-        }
-    }
-}
-
-impl Drop for WalletIndexedCatchUpStatusGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(lease) = self.lease.take() {
-            self.handle.clear_indexed_catch_up(lease);
         }
     }
 }

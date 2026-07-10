@@ -2,10 +2,11 @@ use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, GlobalPoiPolicy, LogBatch, PublicDataPlaneEpoch,
     PublicScanReadScope, PublicScanSource, SharedLogBatch, SyncProgressSender, SyncProgressStage,
-    SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillLease,
-    WalletBackfillRejectReason, WalletBackfillResetResult, WalletConfig,
-    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletReadiness, WalletReadinessError,
-    WalletResetReplayPlan, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
+    SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillDriver,
+    WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
+    WalletBackfillStartResult, WalletConfig, WalletIndexedCatchUpSource,
+    WalletIndexedCatchUpStatus, WalletReadiness, WalletReadinessError, WalletResetReplayPlan,
+    WalletScanApply, WalletScanRows, WalletScanRowsPayload,
 };
 use crate::wallet::{WalletHandle, WalletPoiRuntime, WalletWorkerServices, wallet_cache_store};
 use alloy::eips::BlockNumberOrTag;

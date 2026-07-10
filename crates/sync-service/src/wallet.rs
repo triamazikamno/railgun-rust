@@ -15,6 +15,7 @@ use broadcaster_core::crypto::shared_key::shared_symmetric_key;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{DEFAULT_TXID_VERSION, railgun_txid_leaf_hash_with_output_start};
 use broadcaster_core::tree::TREE_LEAF_COUNT;
+use futures::stream::{FuturesUnordered, StreamExt};
 use merkletree::tree::{DenseMerkleTree, MerkleForest};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
@@ -59,8 +60,9 @@ use crate::txid_cache::TxidPublicCacheError;
 use crate::types::{
     BackfillEvent, BackfillRequest, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback,
     SharedLogBatch, SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult,
-    WalletBackfillFinishResult, WalletBackfillLease, WalletBackfillRejectReason,
-    WalletBackfillResetResult, WalletCacheStore, WalletConfig, WalletCurrentSnapshot,
+    WalletBackfillFinishResult, WalletBackfillGrant, WalletBackfillOwnerDisposition,
+    WalletBackfillOwnerSignal, WalletBackfillRejectReason, WalletBackfillResetResult,
+    WalletBackfillStartResult, WalletCacheStore, WalletConfig, WalletCurrentSnapshot,
     WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness,
     WalletReadinessError, WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken,
     WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit,

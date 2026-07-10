@@ -1510,36 +1510,33 @@ pub(super) async fn send_wallet_startup_events(
 ) -> bool {
     let target_block =
         done_block.unwrap_or_else(|| applies.last().map_or(0, |apply| apply.to_block));
-    let lease = if target_block > 0 {
+    let mut driver = if target_block > 0 {
         match handle
             .start_backfill(cache_key, sender, progress, target_block)
             .await
         {
-            WalletBackfillFinishResult::Ready { .. } => return true,
-            WalletBackfillFinishResult::Accepted { lease, .. } => Some(lease),
-            WalletBackfillFinishResult::Rejected { .. } => return false,
+            WalletBackfillStartResult::Accepted { grant, .. } => Some(grant.activate()),
+            WalletBackfillStartResult::Rejected { .. } => return false,
         }
     } else {
         None
     };
     for apply in applies {
-        let result = if let Some(lease) = lease.as_ref() {
-            lease.apply(cache_key, apply).await
+        let result = if let Some(driver) = driver.as_ref() {
+            driver.apply(cache_key, apply).await
         } else {
             let target_block = apply.to_block;
             match handle
                 .start_backfill(cache_key, sender, progress, target_block)
                 .await
             {
-                WalletBackfillFinishResult::Ready { committed_to } => {
-                    WalletBackfillApplyResult::AlreadyCovered { committed_to }
-                }
-                WalletBackfillFinishResult::Accepted { lease, .. } => {
-                    let result = lease.apply(cache_key, apply).await;
-                    lease.retire(cache_key).await;
+                WalletBackfillStartResult::Accepted { grant, .. } => {
+                    let driver = grant.activate();
+                    let result = driver.apply(cache_key, apply).await;
+                    driver.retire(cache_key).await;
                     result
                 }
-                WalletBackfillFinishResult::Rejected {
+                WalletBackfillStartResult::Rejected {
                     committed_to,
                     reason,
                 } => WalletBackfillApplyResult::Rejected {
@@ -1553,8 +1550,8 @@ pub(super) async fn send_wallet_startup_events(
             | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
             WalletBackfillApplyResult::Rejected { reason, .. } => {
                 debug!(?reason, cache_key, "wallet startup scan batch rejected");
-                if let Some(lease) = lease.as_ref() {
-                    lease.retire(cache_key).await;
+                if let Some(driver) = driver.take() {
+                    driver.retire(cache_key).await;
                 }
                 return false;
             }
@@ -1562,24 +1559,25 @@ pub(super) async fn send_wallet_startup_events(
     }
     if let Some(last_block) = done_block
         && !matches!(
-            lease
+            driver
                 .as_ref()
-                .expect("startup done block has an accepted lease")
+                .expect("startup done block has an active driver")
                 .finish(cache_key, last_block)
                 .await,
             WalletBackfillFinishResult::Ready { .. }
         )
     {
         debug!(cache_key, last_block, "wallet startup finish rejected");
-        if let Some(lease) = lease.as_ref() {
-            lease.retire(cache_key).await;
+        if let Some(driver) = driver.take() {
+            driver.retire(cache_key).await;
         }
         return false;
     }
-    if done_block.is_none() && target_block > 0 {
-        if let Some(lease) = lease.as_ref() {
-            lease.retire(cache_key).await;
-        }
+    if done_block.is_none()
+        && target_block > 0
+        && let Some(driver) = driver.take()
+    {
+        driver.retire(cache_key).await;
     }
     true
 }

@@ -1356,13 +1356,32 @@ impl WalletBackfillApplyResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WalletBackfillFinishResult {
+#[derive(Debug, PartialEq, Eq)]
+pub enum WalletBackfillStartResult {
     Accepted {
         committed_to: u64,
         target_block: u64,
-        lease: WalletBackfillLease,
+        grant: WalletBackfillGrant,
     },
+    Rejected {
+        committed_to: u64,
+        reason: WalletBackfillRejectReason,
+    },
+}
+
+impl WalletBackfillStartResult {
+    #[must_use]
+    pub const fn committed_to(&self) -> u64 {
+        match self {
+            Self::Accepted { committed_to, .. } | Self::Rejected { committed_to, .. } => {
+                *committed_to
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletBackfillFinishResult {
     Ready {
         committed_to: u64,
     },
@@ -1376,17 +1395,7 @@ impl WalletBackfillFinishResult {
     #[must_use]
     pub const fn committed_to(&self) -> u64 {
         match self {
-            Self::Accepted { committed_to, .. }
-            | Self::Ready { committed_to }
-            | Self::Rejected { committed_to, .. } => *committed_to,
-        }
-    }
-
-    #[must_use]
-    pub fn accepted_lease(&self) -> Option<WalletBackfillLease> {
-        match self {
-            Self::Accepted { lease, .. } => Some(lease.clone()),
-            Self::Ready { .. } | Self::Rejected { .. } => None,
+            Self::Ready { committed_to } | Self::Rejected { committed_to, .. } => *committed_to,
         }
     }
 }
@@ -1841,19 +1850,111 @@ impl WalletResetToken {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WalletBackfillLease {
-    token: WalletSyncToken,
-    sender: mpsc::Sender<BackfillEvent>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalletBackfillOwnerDisposition {
+    BenignRetirement,
+    DriverLost,
 }
 
-impl PartialEq for WalletBackfillLease {
-    fn eq(&self, other: &Self) -> bool {
-        self.token == other.token
+#[derive(Debug)]
+pub(crate) struct WalletBackfillOwnerSignal {
+    pub(crate) disposition: WalletBackfillOwnerDisposition,
+    pub(crate) acknowledgement: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct WalletBackfillOwner {
+    token: WalletSyncToken,
+    sender: mpsc::Sender<BackfillEvent>,
+    liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
+}
+
+impl WalletBackfillOwner {
+    fn signal(
+        self,
+        disposition: WalletBackfillOwnerDisposition,
+        acknowledgement: Option<oneshot::Sender<()>>,
+    ) {
+        let _ = self.liveness.send(WalletBackfillOwnerSignal {
+            disposition,
+            acknowledgement,
+        });
     }
 }
 
-impl Eq for WalletBackfillLease {}
+/// An actor-accepted backfill job that has not yet been activated by a driver.
+/// Dropping a grant is benign cancellation.
+#[derive(Debug)]
+pub struct WalletBackfillGrant {
+    inner: Option<WalletBackfillOwner>,
+}
+
+impl PartialEq for WalletBackfillGrant {
+    fn eq(&self, other: &Self) -> bool {
+        self.token() == other.token()
+    }
+}
+
+impl Eq for WalletBackfillGrant {}
+
+impl WalletBackfillGrant {
+    pub(crate) fn for_actor_accepted_job(
+        token: WalletSyncToken,
+        sender: mpsc::Sender<BackfillEvent>,
+        liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
+    ) -> Self {
+        Self {
+            inner: Some(WalletBackfillOwner {
+                token,
+                sender,
+                liveness,
+            }),
+        }
+    }
+
+    pub(crate) fn token(&self) -> WalletSyncToken {
+        self.inner
+            .as_ref()
+            .expect("backfill grant is present")
+            .token
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
+        let (liveness, _receiver) = oneshot::channel();
+        Self::for_actor_accepted_job(token, sender, liveness)
+    }
+
+    #[must_use]
+    pub(crate) fn activate(mut self) -> WalletBackfillDriver {
+        WalletBackfillDriver {
+            inner: self.inner.take(),
+        }
+    }
+}
+
+impl Drop for WalletBackfillGrant {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            inner.signal(WalletBackfillOwnerDisposition::BenignRetirement, None);
+        }
+    }
+}
+
+/// Unique owner of an activated actor backfill job.
+/// Dropping it without actor completion or explicit retirement reports driver loss.
+#[derive(Debug)]
+pub struct WalletBackfillDriver {
+    inner: Option<WalletBackfillOwner>,
+}
+
+impl PartialEq for WalletBackfillDriver {
+    fn eq(&self, other: &Self) -> bool {
+        self.token() == other.token()
+    }
+}
+
+impl Eq for WalletBackfillDriver {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WalletResetReplayPlan {
@@ -1873,13 +1974,18 @@ impl WalletResetReplayPlan {
     }
 }
 
-impl WalletBackfillLease {
+impl WalletBackfillDriver {
+    #[cfg(test)]
     pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
-        Self { token, sender }
+        WalletBackfillGrant::from_token(token, sender).activate()
     }
 
-    pub(crate) const fn token(&self) -> WalletSyncToken {
-        self.token
+    fn inner(&self) -> &WalletBackfillOwner {
+        self.inner.as_ref().expect("backfill driver is present")
+    }
+
+    pub(crate) fn token(&self) -> WalletSyncToken {
+        self.inner().token
     }
 
     pub(crate) fn supersedes(&self, active: &Self) -> bool {
@@ -1899,7 +2005,7 @@ impl WalletBackfillLease {
     }
 
     pub(crate) fn sender(&self) -> &mpsc::Sender<BackfillEvent> {
-        &self.sender
+        &self.inner().sender
     }
 
     pub(crate) async fn apply(
@@ -1910,10 +2016,10 @@ impl WalletBackfillLease {
         let requested_to = apply.to_block;
         let (response, result_rx) = oneshot::channel();
         if let Err(err) = self
-            .sender
+            .sender()
             .send(BackfillEvent::Apply {
                 apply,
-                token: self.token,
+                token: self.token(),
                 response,
             })
             .await
@@ -1943,11 +2049,10 @@ impl WalletBackfillLease {
     ) -> WalletBackfillFinishResult {
         let (response, result_rx) = oneshot::channel();
         if let Err(err) = self
-            .sender
-            .send(BackfillEvent::Target {
+            .sender()
+            .send(BackfillEvent::Finish {
                 target_block,
-                token: self.token,
-                sender: self.sender.clone(),
+                token: self.token(),
                 response,
             })
             .await
@@ -1976,49 +2081,66 @@ impl WalletBackfillLease {
         }
     }
 
-    pub(crate) async fn retire(&self, cache_key: &str) {
-        if let Err(err) = self
-            .sender
-            .send(BackfillEvent::JobRetired { token: self.token })
-            .await
-        {
-            warn!(?err, cache_key, "failed to send wallet job retirement");
+    pub(crate) async fn retire(mut self, _cache_key: &str) {
+        if let Some(inner) = self.inner.take() {
+            let (acknowledgement, acknowledged) = oneshot::channel();
+            inner.signal(
+                WalletBackfillOwnerDisposition::BenignRetirement,
+                Some(acknowledgement),
+            );
+            let _ = acknowledged.await;
         }
     }
 
-    pub(crate) async fn fail(&self, cache_key: &str, reason: WalletReadinessError) {
+    pub(crate) async fn fail(self, cache_key: &str, reason: WalletReadinessError) {
+        let (response, result_rx) = oneshot::channel();
         if let Err(err) = self
-            .sender
+            .sender()
             .send(BackfillEvent::JobFailed {
-                token: self.token,
+                token: self.token(),
                 reason,
+                response,
             })
             .await
         {
             warn!(?err, cache_key, "failed to send wallet job failure");
+            return;
+        }
+        if let Err(err) = result_rx.await {
+            warn!(?err, cache_key, "wallet job failure response dropped");
+        }
+    }
+}
+
+impl Drop for WalletBackfillDriver {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            inner.signal(WalletBackfillOwnerDisposition::DriverLost, None);
         }
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum BackfillEvent {
+    Start {
+        target_block: u64,
+        token: WalletSyncToken,
+        response: oneshot::Sender<WalletBackfillStartResult>,
+    },
     Apply {
         apply: WalletScanApply,
         token: WalletSyncToken,
         response: oneshot::Sender<WalletBackfillApplyResult>,
     },
-    Target {
+    Finish {
         target_block: u64,
         token: WalletSyncToken,
-        sender: mpsc::Sender<BackfillEvent>,
         response: oneshot::Sender<WalletBackfillFinishResult>,
     },
     JobFailed {
         token: WalletSyncToken,
         reason: WalletReadinessError,
-    },
-    JobRetired {
-        token: WalletSyncToken,
+        response: oneshot::Sender<()>,
     },
     Reset {
         token: WalletResetToken,
@@ -2036,7 +2158,7 @@ pub(crate) enum BackfillRequest {
         to_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
-        lease: WalletBackfillLease,
+        driver: WalletBackfillDriver,
     },
     Remove {
         cache_key: String,
@@ -2050,7 +2172,7 @@ impl BackfillRequest {
         to_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
-        lease: WalletBackfillLease,
+        driver: WalletBackfillDriver,
     ) -> Self {
         Self::Add {
             cache_key: cache_key.into(),
@@ -2058,7 +2180,7 @@ impl BackfillRequest {
             to_block,
             follow_safe_head,
             progress_start_block,
-            lease,
+            driver,
         }
     }
 }

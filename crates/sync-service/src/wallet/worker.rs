@@ -550,10 +550,12 @@ enum WalletActorJobKind {
     IndexedCatchUp,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WalletActorJob {
     reset_generation: u64,
     kind: WalletActorJobKind,
+    target_block: Option<u64>,
+    indexed_status: Option<WalletIndexedCatchUpStatus>,
 }
 
 /// Readiness-affecting fact transitions. Call sites mutate only through these;
@@ -578,7 +580,8 @@ struct WalletActorState {
     actor_id: u64,
     reset_generation: u64,
     last_scanned: u64,
-    target_block: Option<u64>,
+    /// Highest target that completed its final durable finish in this reset generation.
+    completed_target_block: Option<u64>,
     /// Last published readiness (updated only by reduce paths).
     readiness: WalletReadiness,
     /// Readiness fault input to [`Self::derived_readiness`].
@@ -593,7 +596,25 @@ struct WalletActorState {
     active_jobs: BTreeMap<u64, WalletActorJob>,
     highest_accepted_backfill_job_id: u64,
     latest_pending_overlay_job: Option<u64>,
-    active_indexed_catch_up_job: Option<u64>,
+}
+
+async fn accepted_backfill_owner_dropped(
+    token: WalletSyncToken,
+    receiver: oneshot::Receiver<WalletBackfillOwnerSignal>,
+) -> (WalletSyncToken, WalletBackfillOwnerSignal) {
+    let signal = receiver.await.unwrap_or(WalletBackfillOwnerSignal {
+        disposition: WalletBackfillOwnerDisposition::DriverLost,
+        acknowledgement: None,
+    });
+    (token, signal)
+}
+
+async fn accepted_indexed_job_owner_dropped(
+    token: WalletSyncToken,
+    receiver: oneshot::Receiver<()>,
+) -> WalletSyncToken {
+    let _ = receiver.await;
+    token
 }
 
 impl WalletActorState {
@@ -610,7 +631,7 @@ impl WalletActorState {
             actor_id,
             reset_generation,
             last_scanned,
-            target_block: None,
+            completed_target_block: None,
             readiness: WalletReadiness::Syncing,
             readiness_fault: None,
             shutdown: false,
@@ -621,7 +642,6 @@ impl WalletActorState {
             active_jobs: BTreeMap::new(),
             highest_accepted_backfill_job_id: 0,
             latest_pending_overlay_job: None,
-            active_indexed_catch_up_job: None,
         }
     }
 
@@ -762,13 +782,12 @@ impl WalletActorState {
             WalletActorJob {
                 reset_generation: token.reset_generation(),
                 kind,
+                target_block: None,
+                indexed_status: None,
             },
         );
         if kind == WalletActorJobKind::PendingOverlay {
             self.latest_pending_overlay_job = Some(token.job_id());
-        }
-        if kind == WalletActorJobKind::IndexedCatchUp {
-            self.active_indexed_catch_up_job = Some(token.job_id());
         }
         true
     }
@@ -792,6 +811,20 @@ impl WalletActorState {
                 .is_some_and(|job| job.reset_generation == token.reset_generation())
     }
 
+    fn has_active_backfill_job(&self) -> bool {
+        self.active_jobs
+            .values()
+            .any(|job| job.kind == WalletActorJobKind::Backfill)
+    }
+
+    fn active_backfill_target(&self) -> Option<u64> {
+        self.active_jobs
+            .values()
+            .filter(|job| job.kind == WalletActorJobKind::Backfill)
+            .filter_map(|job| job.target_block)
+            .max()
+    }
+
     fn retire_job(&mut self, token: WalletSyncToken) -> bool {
         if !self.has_active_job(token) {
             return false;
@@ -799,9 +832,6 @@ impl WalletActorState {
         let retired = self.active_jobs.remove(&token.job_id()).is_some();
         if retired && self.pending_reset_replay_admitted == Some(token) {
             self.pending_reset_replay_admitted = None;
-        }
-        if retired && self.active_indexed_catch_up_job == Some(token.job_id()) {
-            self.active_indexed_catch_up_job = None;
         }
         retired
     }
@@ -814,49 +844,58 @@ impl WalletActorState {
         retired
     }
 
-    fn has_active_backfill_jobs_except(&self, token: WalletSyncToken) -> bool {
-        self.active_jobs.iter().any(|(job_id, job)| {
-            *job_id != token.job_id() && job.kind == WalletActorJobKind::Backfill
-        })
-    }
-
-    fn readiness_blocking_target(&self, token: WalletSyncToken, last_scanned: u64) -> Option<u64> {
-        let target_block = self.target_block?;
-        if self.pending_reset.is_some()
-            || last_scanned < target_block
-            || self.has_active_backfill_jobs_except(token)
-        {
-            Some(target_block)
-        } else {
-            None
+    fn apply_backfill_owner_disposition(
+        &mut self,
+        token: WalletSyncToken,
+        disposition: WalletBackfillOwnerDisposition,
+    ) -> bool {
+        match disposition {
+            WalletBackfillOwnerDisposition::BenignRetirement => self.retire_job(token),
+            WalletBackfillOwnerDisposition::DriverLost => {
+                self.fail_job(token, WalletReadinessError::BackfillUnavailable)
+            }
         }
     }
 
     fn retire_all_jobs_for_reset(&mut self) -> bool {
-        let indexed_catch_up_was_active = self.active_indexed_catch_up_job.take().is_some();
+        let indexed_catch_up_was_active = self
+            .active_jobs
+            .values()
+            .any(|job| job.kind == WalletActorJobKind::IndexedCatchUp);
         self.active_jobs.clear();
         self.latest_pending_overlay_job = None;
-        self.target_block = None;
+        self.completed_target_block = None;
         indexed_catch_up_was_active
     }
 
     fn accept_indexed_catch_up(&mut self, token: WalletSyncToken) -> bool {
-        if self.active_indexed_catch_up_job.is_some() {
+        if self
+            .active_jobs
+            .values()
+            .any(|job| job.kind == WalletActorJobKind::IndexedCatchUp)
+        {
             return false;
         }
         self.accept_job(token, WalletActorJobKind::IndexedCatchUp)
     }
 
-    fn is_active_indexed_catch_up(&self, lease: WalletIndexedCatchUpLease) -> bool {
-        self.active_indexed_catch_up_job == Some(lease.token().job_id())
-            && self.is_active_job(lease.token(), WalletActorJobKind::IndexedCatchUp)
+    fn is_active_indexed_catch_up(&self, token: WalletSyncToken) -> bool {
+        self.is_active_job(token, WalletActorJobKind::IndexedCatchUp)
     }
 
-    fn retire_indexed_catch_up(&mut self, lease: WalletIndexedCatchUpLease) -> bool {
-        if !self.is_active_indexed_catch_up(lease) {
+    fn publish_indexed_catch_up(
+        &mut self,
+        token: WalletSyncToken,
+        status: WalletIndexedCatchUpStatus,
+    ) -> bool {
+        if !self.is_active_indexed_catch_up(token) {
             return false;
         }
-        self.retire_job(lease.token())
+        self.active_jobs
+            .get_mut(&token.job_id())
+            .expect("validated indexed catch-up job exists")
+            .indexed_status = Some(status);
+        true
     }
 
     fn accept_reset(&mut self, pending: PendingWalletReset) -> bool {
@@ -878,18 +917,53 @@ impl WalletActorState {
     fn mark_shutdown(&mut self) {
         self.shutdown = true;
         self.active_jobs.clear();
-        self.active_indexed_catch_up_job = None;
+        self.latest_pending_overlay_job = None;
+        self.pending_reset_replay_admitted = None;
     }
 
     fn accept_target(&mut self, token: WalletSyncToken, target_block: u64) -> bool {
+        if self.has_active_job(token) {
+            return false;
+        }
         if !self.accept_job(token, WalletActorJobKind::Backfill) {
             return false;
         }
-        self.target_block = Some(
-            self.target_block
-                .map_or(target_block, |current| current.max(target_block)),
-        );
+        self.active_jobs
+            .get_mut(&token.job_id())
+            .expect("accepted backfill job exists")
+            .target_block = Some(target_block);
         true
+    }
+
+    fn update_target(&mut self, token: WalletSyncToken, target_block: u64) -> Option<u64> {
+        if !self.is_active_job(token, WalletActorJobKind::Backfill) {
+            return None;
+        }
+        let job = self
+            .active_jobs
+            .get_mut(&token.job_id())
+            .expect("validated backfill job exists");
+        let target_block = job
+            .target_block
+            .map_or(target_block, |current| current.max(target_block));
+        job.target_block = Some(target_block);
+        Some(target_block)
+    }
+
+    fn complete_backfill_job(&mut self, token: WalletSyncToken) -> bool {
+        let Some(target_block) = self
+            .active_jobs
+            .get(&token.job_id())
+            .filter(|job| job.kind == WalletActorJobKind::Backfill)
+            .and_then(|job| job.target_block)
+        else {
+            return false;
+        };
+        self.completed_target_block = Some(
+            self.completed_target_block
+                .map_or(target_block, |completed| completed.max(target_block)),
+        );
+        self.retire_job(token)
     }
 
     fn accept_pending_overlay(&mut self, token: WalletSyncToken, last_scanned: u64) -> bool {
@@ -929,7 +1003,7 @@ impl WalletActorState {
         }) {
             return WalletReadiness::Syncing;
         }
-        match self.target_block {
+        match self.completed_target_block {
             Some(target_block) if target_block > 0 && self.last_scanned >= target_block => {
                 WalletReadiness::Ready
             }
@@ -1560,7 +1634,7 @@ impl WalletScanCommitRequest<'_> {
 
         let target_block = request
             .actor_state
-            .target_block
+            .active_backfill_target()
             .unwrap_or(to_block)
             .max(to_block);
         let mut utxos_locked = request.utxos.write().await;
@@ -1905,6 +1979,8 @@ pub(crate) async fn prepare_wallet_worker(
             restored_highest_reset_intent,
             restored_pending_reset,
         );
+        let mut accepted_backfill_liveness = FuturesUnordered::new();
+        let mut accepted_indexed_job_liveness = FuturesUnordered::new();
         macro_rules! publish_readiness {
             () => {{
                 if let Err(reason) = worker_handle.with_active_apply(
@@ -1966,9 +2042,10 @@ pub(crate) async fn prepare_wallet_worker(
                             );
                             let token =
                                 worker_handle.mint_sync_token(actor_state.reset_generation);
-                            let admitted = if !actor_state
-                                .accept_target(token, pending.replay_plan.target_block)
-                            {
+                            let admitted = if !actor_state.accept_target(
+                                token,
+                                pending.replay_plan.target_block,
+                            ) {
                                 actor_state.apply_fact(WalletReadinessFact::SetFault(
                                     WalletReadinessError::BackfillUnavailable,
                                 ));
@@ -1976,19 +2053,26 @@ pub(crate) async fn prepare_wallet_worker(
                             } else if pending.replay_plan.target_block > 0
                                 && replay_from > pending.replay_plan.target_block
                             {
-                                actor_state.retire_job(token);
+                                actor_state.complete_backfill_job(token);
+                                backfill_complete_block = actor_state.completed_target_block;
                                 true
                             } else {
+                                let (liveness, receiver) = oneshot::channel();
+                                accepted_backfill_liveness
+                                    .push(accepted_backfill_owner_dropped(token, receiver));
+                                let driver = WalletBackfillGrant::for_actor_accepted_job(
+                                    token,
+                                    backfill_sender.clone(),
+                                    liveness,
+                                )
+                                .activate();
                                 let request = BackfillRequest::add(
                                     cfg.cache_key.clone(),
                                     replay_from,
                                     pending.replay_plan.target_block,
                                     pending.replay_plan.follow_safe_head,
                                     replay_from,
-                                    WalletBackfillLease::from_token(
-                                        token,
-                                        backfill_sender.clone(),
-                                    ),
+                                    driver,
                                 );
                                 match backfill_tx.try_send(request) {
                                     Ok(()) => true,
@@ -2273,6 +2357,41 @@ pub(crate) async fn prepare_wallet_worker(
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                Some((token, signal)) = accepted_backfill_liveness.next(), if !accepted_backfill_liveness.is_empty() => {
+                    let WalletBackfillOwnerSignal {
+                        disposition,
+                        acknowledgement,
+                    } = signal;
+                    let changed = actor_state.apply_backfill_owner_disposition(token, disposition);
+                    if changed {
+                        if disposition == WalletBackfillOwnerDisposition::BenignRetirement
+                            && !actor_state.has_active_backfill_job()
+                        {
+                            backfill_complete_block = actor_state.completed_target_block;
+                        } else if disposition == WalletBackfillOwnerDisposition::DriverLost {
+                            backfill_complete_block = None;
+                        }
+                        publish_readiness!();
+                    }
+                    if let Some(acknowledgement) = acknowledgement {
+                        let _ = acknowledgement.send(());
+                    }
+                }
+                Some(token) = accepted_indexed_job_liveness.next(), if !accepted_indexed_job_liveness.is_empty() => {
+                    if actor_state.retire_job(token) {
+                        let authority = WalletPrivateMutationAuthority::new(
+                            &worker_handle,
+                            actor_state.reset_generation,
+                            &cancel,
+                        );
+                        if let Ok(permit) = authority.acquire().await
+                            && let Err(reason) = permit.publish_indexed_catch_up(None)
+                        {
+                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up abandonment status clear rejected");
+                        }
+                        publish_readiness!();
+                    }
+                }
                 Some(apply_req) = private_apply_rx.recv() => {
                     let WalletPrivateApplyRequest {
                         reset_generation,
@@ -2462,6 +2581,9 @@ pub(crate) async fn prepare_wallet_worker(
                                     let token =
                                         worker_handle.mint_sync_token(actor_state.reset_generation);
                                     let lease = if actor_state.accept_indexed_catch_up(token) {
+                                        let (liveness, receiver) = oneshot::channel();
+                                        accepted_indexed_job_liveness
+                                            .push(accepted_indexed_job_owner_dropped(token, receiver));
                                         let _ = actor_state.reduce_and_publish_readiness_active(
                                             &permit,
                                             &ready_tx,
@@ -2469,43 +2591,37 @@ pub(crate) async fn prepare_wallet_worker(
                                         );
                                         Some(WalletIndexedCatchUpLease::for_actor_accepted_job(
                                             token,
+                                            liveness,
                                         ))
                                     } else {
                                         None
                                     };
-                                    if let Err(Some(lease)) = response.send(lease) {
-                                        if actor_state.retire_indexed_catch_up(lease) {
+                                    if let Err(lease) = response.send(lease) {
+                                        drop(lease);
+                                        if actor_state.retire_job(token) {
+                                            if let Err(reason) =
+                                                permit.publish_indexed_catch_up(None)
+                                            {
+                                                debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up dropped-claim status clear rejected");
+                                            }
                                             let _ = actor_state.reduce_and_publish_readiness_active(
                                                 &permit,
                                                 &ready_tx,
                                                 &readiness_tx,
                                             );
                                         }
-                                        debug!(cache_key = %cfg.cache_key, token = ?lease.token(), "indexed wallet catch-up claim receiver dropped");
+                                        debug!(cache_key = %cfg.cache_key, ?token, "indexed wallet catch-up claim receiver dropped");
                                     }
                                 }
-                                WalletIndexedCatchUpCommand::Publish { lease, status } => {
-                                    if actor_state.is_active_indexed_catch_up(lease)
-                                        && let Err(reason) =
+                                WalletIndexedCatchUpCommand::Publish { token, status } => {
+                                    if actor_state.publish_indexed_catch_up(token, status) {
+                                        if let Err(reason) =
                                             permit.publish_indexed_catch_up(Some(status))
-                                    {
-                                        debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status publication rejected");
-                                    } else if !actor_state.is_active_indexed_catch_up(lease) {
-                                        debug!(cache_key = %cfg.cache_key, token = ?lease.token(), "stale indexed wallet catch-up status publication ignored");
-                                    }
-                                }
-                                WalletIndexedCatchUpCommand::Clear { lease } => {
-                                    if actor_state.retire_indexed_catch_up(lease) {
-                                        if let Err(reason) = permit.publish_indexed_catch_up(None) {
-                                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status clear rejected");
+                                        {
+                                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status publication rejected");
                                         }
-                                        let _ = actor_state.reduce_and_publish_readiness_active(
-                                            &permit,
-                                            &ready_tx,
-                                            &readiness_tx,
-                                        );
                                     } else {
-                                        debug!(cache_key = %cfg.cache_key, token = ?lease.token(), "stale indexed wallet catch-up status clear ignored");
+                                        debug!(cache_key = %cfg.cache_key, ?token, "stale indexed wallet catch-up status publication ignored");
                                     }
                                 }
                             }
@@ -2672,6 +2788,63 @@ pub(crate) async fn prepare_wallet_worker(
                 }
                 Some(event) = backfill_rx.recv() => {
                     match event {
+                        BackfillEvent::Start { target_block, token, response } => {
+                            if let Err(reason) = actor_state.validate_sync_token_current(
+                                token,
+                                &worker_handle,
+                                &cancel,
+                            ) {
+                                let _ = response.send(WalletBackfillStartResult::Rejected {
+                                    committed_to: last_scanned,
+                                    reason,
+                                });
+                                continue;
+                            }
+                            if try_drive_pending_reset!().is_some()
+                                && actor_state.pending_reset.is_some()
+                            {
+                                let reason = if actor_state.readiness_fault
+                                    == Some(WalletReadinessError::PersistenceFailed)
+                                {
+                                    WalletBackfillRejectReason::PersistenceFailed
+                                } else {
+                                    WalletBackfillRejectReason::Shutdown
+                                };
+                                let _ = response.send(WalletBackfillStartResult::Rejected {
+                                    committed_to: last_scanned,
+                                    reason,
+                                });
+                                continue;
+                            }
+                            if !actor_state.accept_target(token, target_block) {
+                                let _ = response.send(WalletBackfillStartResult::Rejected {
+                                    committed_to: last_scanned,
+                                    reason: WalletBackfillRejectReason::Shutdown,
+                                });
+                                continue;
+                            }
+                            let (liveness, receiver) = oneshot::channel();
+                            accepted_backfill_liveness
+                                .push(accepted_backfill_owner_dropped(token, receiver));
+                            backfill_complete_block = None;
+                            publish_readiness!();
+                            let result = WalletBackfillStartResult::Accepted {
+                                committed_to: last_scanned,
+                                target_block,
+                                grant: WalletBackfillGrant::for_actor_accepted_job(
+                                    token,
+                                    backfill_sender.clone(),
+                                    liveness,
+                                ),
+                            };
+                            if let Err(result) = response.send(result) {
+                                drop(result);
+                                if actor_state.retire_job(token) {
+                                    publish_readiness!();
+                                }
+                                debug!(cache_key = %cfg.cache_key, ?token, "wallet backfill start receiver dropped");
+                            }
+                        }
                         BackfillEvent::Apply { apply, token, response } => {
                             if let Some(outcome) = try_drive_pending_reset!()
                                 && actor_state.pending_reset.is_some()
@@ -2767,11 +2940,12 @@ pub(crate) async fn prepare_wallet_worker(
                                  debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet scan apply result");
                              }
                          }
-                         BackfillEvent::Target { target_block, token, sender, response } => {
+                         BackfillEvent::Finish { target_block, token, response } => {
                             let current_reset_generation = actor_state.reset_generation;
-                            if let Err(reason) = actor_state.validate_sync_token_current(
+                            if let Err(reason) = actor_state.validate_active_sync_token(
                                 token,
                                 &worker_handle,
+                                WalletActorJobKind::Backfill,
                                 &cancel,
                             ) {
                                 let result = WalletBackfillFinishResult::Rejected {
@@ -2810,18 +2984,15 @@ pub(crate) async fn prepare_wallet_worker(
                                 }
                                 continue;
                             }
-                            if !actor_state.accept_target(token, target_block) {
-                                let result = WalletBackfillFinishResult::Rejected {
+                            let Some(required_target) = actor_state.update_target(token, target_block)
+                            else {
+                                let _ = response.send(WalletBackfillFinishResult::Rejected {
                                     committed_to: last_scanned,
                                     reason: WalletBackfillRejectReason::Shutdown,
-                                };
-                                if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send inactive wallet target result");
-                                }
+                                });
                                 continue;
-                            }
-                            if target_block == 0 || target_block > last_scanned {
-                                let required_target = actor_state.target_block.unwrap_or(target_block);
+                            };
+                            if required_target == 0 || required_target > last_scanned {
                                 debug!(
                                     cache_key = %cfg.cache_key,
                                     target_block = required_target,
@@ -2831,48 +3002,26 @@ pub(crate) async fn prepare_wallet_worker(
                                 );
                                 backfill_complete_block = None;
                                 publish_readiness!();
-                                let result = WalletBackfillFinishResult::Accepted {
+                                let result = WalletBackfillFinishResult::Rejected {
                                     committed_to: last_scanned,
-                                    target_block: required_target,
-                                    lease: WalletBackfillLease::from_token(token, sender),
+                                    reason: WalletBackfillRejectReason::TargetNotReached {
+                                        target_block: required_target,
+                                    },
                                 };
                                 if let Err(err) = response.send(result) {
                                     debug!(?err, cache_key = %cfg.cache_key, "failed to send pending wallet target result");
-                                    if actor_state.retire_job(token) {
-                                        publish_readiness!();
-                                    }
                                 }
                                 continue;
                             }
-                            if let Some(required_target) =
-                                actor_state.readiness_blocking_target(token, last_scanned)
-                            {
-                                actor_state.retire_job(token);
-                                publish_readiness!();
-                                let result = WalletBackfillFinishResult::Rejected {
-                                    committed_to: last_scanned,
-                                    reason: WalletBackfillRejectReason::TargetNotReached { target_block: required_target },
-                                };
-                                if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send blocked wallet target result");
-                                }
-                                continue;
-                            }
-                            let finish_outcome = apply_backfill_done!(target_block);
+                            let finish_outcome = apply_backfill_done!(required_target);
                             let result = match finish_outcome {
                                 WalletBackfillDoneOutcome::Finished => {
-                                    actor_state.retire_job(token);
-                                    publish_readiness!();
-                                    if matches!(actor_state.readiness, WalletReadiness::Ready) {
-                                        WalletBackfillFinishResult::Ready { committed_to: last_scanned }
-                                    } else {
-                                        WalletBackfillFinishResult::Rejected {
-                                            committed_to: last_scanned,
-                                            reason: WalletBackfillRejectReason::TargetNotReached {
-                                                target_block: actor_state.target_block.unwrap_or(target_block),
-                                            },
-                                        }
+                                    actor_state.complete_backfill_job(token);
+                                    if actor_state.has_active_backfill_job() {
+                                        backfill_complete_block = None;
                                     }
+                                    publish_readiness!();
+                                    WalletBackfillFinishResult::Ready { committed_to: last_scanned }
                                 }
                                 WalletBackfillDoneOutcome::Rejected(reason) => {
                                     if reason == WalletBackfillRejectReason::PersistenceFailed {
@@ -2893,7 +3042,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet target result");
                             }
                         }
-                        BackfillEvent::JobFailed { token, reason } => {
+                        BackfillEvent::JobFailed { token, reason, response } => {
                             if actor_state.validate_active_sync_token(
                                 token,
                                 &worker_handle,
@@ -2905,20 +3054,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 actor_state.fail_job(token, reason);
                                 publish_readiness!();
                             }
-                        }
-                        BackfillEvent::JobRetired { token } => {
-                            if actor_state.validate_active_sync_token(
-                                token,
-                                &worker_handle,
-                                WalletActorJobKind::Backfill,
-                                &cancel,
-                            )
-                            .is_ok()
-                            {
-                                if actor_state.retire_job(token) {
-                                    publish_readiness!();
-                                }
-                            }
+                            let _ = response.send(());
                         }
                         BackfillEvent::Reset { token, from_block, replay_plan, response } => {
                             if let Err(reason) = actor_state.validate_reset_token_current(
@@ -3022,7 +3158,10 @@ pub(crate) async fn prepare_wallet_worker(
                                 Ok(())
                             });
                             match accept_result {
-                                Ok(Ok(())) => {}
+                                Ok(Ok(())) => {
+                                    accepted_backfill_liveness.clear();
+                                    accepted_indexed_job_liveness.clear();
+                                }
                                 Ok(Err(err)) => {
                                     warn!(?err, cache_key = %cfg.cache_key, intent_id, from_block, "failed to persist wallet reset acceptance");
                                     let result = WalletBackfillResetResult::Rejected {
@@ -3081,20 +3220,29 @@ pub(crate) async fn prepare_wallet_worker(
                                 );
                                 let current_reset_generation = actor_state.reset_generation;
                                 let token = worker_handle.mint_sync_token(current_reset_generation);
-                                if !actor_state.accept_job(token, WalletActorJobKind::Backfill) {
+                                if !actor_state.accept_target(token, batch.to_block) {
                                     actor_state.apply_fact(WalletReadinessFact::SetFault(
                                         WalletReadinessError::BackfillUnavailable,
                                     ));
                                     publish_readiness!();
                                     continue;
                                 }
+                                let (liveness, receiver) = oneshot::channel();
+                                accepted_backfill_liveness
+                                    .push(accepted_backfill_owner_dropped(token, receiver));
+                                let driver = WalletBackfillGrant::for_actor_accepted_job(
+                                    token,
+                                    backfill_sender.clone(),
+                                    liveness,
+                                )
+                                .activate();
                                 match backfill_tx.try_send(BackfillRequest::add(
                                     cfg.cache_key.clone(),
                                     expected_from_block,
                                     batch.to_block,
                                     true,
                                     expected_from_block,
-                                    WalletBackfillLease::from_token(token, backfill_sender.clone()),
+                                    driver,
                                 )) {
                                     Ok(()) => {
                                         backfill_complete_block = None;
@@ -3128,7 +3276,7 @@ pub(crate) async fn prepare_wallet_worker(
                             };
                             let current_reset_generation = actor_state.reset_generation;
                             let live_token = worker_handle.mint_sync_token(current_reset_generation);
-                            if !actor_state.accept_job(live_token, WalletActorJobKind::Backfill) {
+                            if !actor_state.accept_target(live_token, batch.to_block) {
                                 actor_state.apply_fact(WalletReadinessFact::SetFault(
                                     WalletReadinessError::BackfillUnavailable,
                                 ));
@@ -3206,6 +3354,9 @@ pub(crate) async fn prepare_wallet_worker(
         let _ = worker_handle.mark_stopping();
         let _ = worker_handle.publish_terminal_shutdown_if_allowed(|| {
             actor_state.mark_shutdown();
+            if let Err(err) = worker_handle.indexed_catch_up_tx.send(None) {
+                debug!(?err, cache_key = %cfg.cache_key, "failed to clear indexed wallet catch-up status on shutdown");
+            }
             actor_state.reduce_and_publish_readiness(&ready_tx, &readiness_tx);
         });
     }.instrument(tracing::info_span!("wallet", chain_id)));
@@ -3290,7 +3441,8 @@ mod tests {
     use crate::chain::ChainPublicDataPlane;
     use crate::types::{
         BackfillRequest, ChainKey, GlobalPoiPolicy, LogBatch, PublicDataPlaneEpoch,
-        PublicScanReadScope, WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+        PublicScanReadScope, WalletBackfillDriver, WalletConfig, WalletIndexedCatchUpSource,
+        WalletIndexedCatchUpStatus,
     };
 
     fn test_public_data_plane(db: &Arc<DbStore>) -> ChainPublicDataPlane {
@@ -3530,25 +3682,21 @@ mod tests {
         apply: WalletScanApply,
         token: WalletSyncToken,
     ) -> WalletBackfillApplyResult {
-        let _ = send_target_token(sender, apply.to_block, token).await;
-        let (response, result_rx) = oneshot::channel();
-        sender
-            .send(BackfillEvent::Apply {
-                apply,
-                token,
-                response,
-            })
-            .await
-            .expect("send apply");
-        let result = result_rx.await.expect("apply response");
-        if matches!(result, WalletBackfillApplyResult::Rejected { .. }) {
-            sender
-                .send(BackfillEvent::JobRetired { token })
-                .await
-                .expect("retire rejected apply job");
-            tokio::task::yield_now().await;
+        match send_start_token(sender, apply.to_block, token).await {
+            WalletBackfillStartResult::Accepted { grant, .. } => {
+                let driver = grant.activate();
+                let result = driver.apply("test", apply).await;
+                driver.retire("test").await;
+                result
+            }
+            WalletBackfillStartResult::Rejected {
+                committed_to,
+                reason,
+            } => WalletBackfillApplyResult::Rejected {
+                committed_to,
+                reason,
+            },
         }
-        result
     }
 
     async fn send_target(
@@ -3570,12 +3718,35 @@ mod tests {
         target_block: u64,
         token: WalletSyncToken,
     ) -> WalletBackfillFinishResult {
+        match send_start_token(sender, target_block, token).await {
+            WalletBackfillStartResult::Accepted { grant, .. } => {
+                let driver = grant.activate();
+                let result = driver.finish("test", target_block).await;
+                if !matches!(result, WalletBackfillFinishResult::Ready { .. }) {
+                    driver.retire("test").await;
+                }
+                result
+            }
+            WalletBackfillStartResult::Rejected {
+                committed_to,
+                reason,
+            } => WalletBackfillFinishResult::Rejected {
+                committed_to,
+                reason,
+            },
+        }
+    }
+
+    async fn send_start_token(
+        sender: &mpsc::Sender<BackfillEvent>,
+        target_block: u64,
+        token: WalletSyncToken,
+    ) -> WalletBackfillStartResult {
         let (response, result_rx) = oneshot::channel();
         sender
-            .send(BackfillEvent::Target {
+            .send(BackfillEvent::Start {
                 target_block,
                 token,
-                sender: sender.clone(),
                 response,
             })
             .await
@@ -3583,24 +3754,245 @@ mod tests {
         result_rx.await.expect("target response")
     }
 
-    fn assert_target_accepted(
-        result: WalletBackfillFinishResult,
+    fn assert_start_accepted(
+        result: WalletBackfillStartResult,
         token: WalletSyncToken,
         committed_to: u64,
         target_block: u64,
-    ) {
+    ) -> WalletBackfillDriver {
         match result {
-            WalletBackfillFinishResult::Accepted {
+            WalletBackfillStartResult::Accepted {
                 committed_to: actual_committed_to,
                 target_block: actual_target_block,
-                lease,
+                grant,
             } => {
                 assert_eq!(actual_committed_to, committed_to);
                 assert_eq!(actual_target_block, target_block);
-                assert_eq!(lease.token(), token);
+                assert_eq!(grant.token(), token);
+                grant.activate()
             }
             other => panic!("expected accepted target, got {other:?}"),
         }
+    }
+
+    fn accepted_test_backfill_owner(
+        state: &mut WalletActorState,
+        token: WalletSyncToken,
+        target_block: u64,
+    ) -> (
+        WalletBackfillGrant,
+        oneshot::Receiver<WalletBackfillOwnerSignal>,
+    ) {
+        assert!(state.accept_target(token, target_block));
+        let (sender, _receiver) = mpsc::channel(1);
+        let (liveness, receiver) = oneshot::channel();
+        (
+            WalletBackfillGrant::for_actor_accepted_job(token, sender, liveness),
+            receiver,
+        )
+    }
+
+    async fn unacknowledged_test_backfill_disposition(
+        token: WalletSyncToken,
+        liveness: oneshot::Receiver<WalletBackfillOwnerSignal>,
+    ) -> WalletBackfillOwnerDisposition {
+        let (actual_token, signal) = accepted_backfill_owner_dropped(token, liveness).await;
+        assert_eq!(actual_token, token);
+        assert!(signal.acknowledgement.is_none());
+        signal.disposition
+    }
+
+    #[tokio::test]
+    async fn dropped_start_response_receiver_retires_accepted_owner() {
+        let mut state = WalletActorState::new(1, 1, 0, 100, 0, None);
+        let token = WalletSyncToken::for_test(1, 1, 0, 1);
+        let (grant, liveness) = accepted_test_backfill_owner(&mut state, token, 200);
+        let (response, result_rx) = oneshot::channel();
+        drop(result_rx);
+
+        let result = WalletBackfillStartResult::Accepted {
+            committed_to: 100,
+            target_block: 200,
+            grant,
+        };
+        drop(
+            response
+                .send(result)
+                .expect_err("start receiver was dropped"),
+        );
+
+        assert_eq!(
+            unacknowledged_test_backfill_disposition(token, liveness).await,
+            WalletBackfillOwnerDisposition::BenignRetirement
+        );
+        assert!(state.apply_backfill_owner_disposition(
+            token,
+            WalletBackfillOwnerDisposition::BenignRetirement,
+        ));
+        assert!(state.active_jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_delivered_start_result_retires_accepted_owner() {
+        let mut state = WalletActorState::new(1, 1, 0, 100, 0, None);
+        let token = WalletSyncToken::for_test(1, 1, 0, 1);
+        let (grant, liveness) = accepted_test_backfill_owner(&mut state, token, 200);
+        let (response, result_rx) = oneshot::channel();
+        response
+            .send(WalletBackfillStartResult::Accepted {
+                committed_to: 100,
+                target_block: 200,
+                grant,
+            })
+            .expect("deliver accepted start result");
+
+        drop(result_rx.await.expect("receive accepted start result"));
+
+        assert_eq!(
+            unacknowledged_test_backfill_disposition(token, liveness).await,
+            WalletBackfillOwnerDisposition::BenignRetirement
+        );
+        assert!(state.apply_backfill_owner_disposition(
+            token,
+            WalletBackfillOwnerDisposition::BenignRetirement,
+        ));
+        assert!(state.active_jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_unactivated_backfill_grant_restores_completed_readiness_without_fault() {
+        let mut state = WalletActorState::new(1, 1, 0, 100, 0, None);
+        let completed = WalletSyncToken::for_test(1, 1, 0, 1);
+        assert!(state.accept_target(completed, 100));
+        assert!(state.complete_backfill_job(completed));
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
+
+        let newer = WalletSyncToken::for_test(1, 1, 0, 2);
+        let (grant, liveness) = accepted_test_backfill_owner(&mut state, newer, 200);
+        assert_eq!(state.derived_readiness(), WalletReadiness::Syncing);
+        drop(grant);
+
+        assert_eq!(
+            unacknowledged_test_backfill_disposition(newer, liveness).await,
+            WalletBackfillOwnerDisposition::BenignRetirement
+        );
+        assert!(state.apply_backfill_owner_disposition(
+            newer,
+            WalletBackfillOwnerDisposition::BenignRetirement,
+        ));
+        assert_eq!(state.completed_target_block, Some(100));
+        assert_eq!(state.readiness_fault, None);
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
+    }
+
+    #[test]
+    fn multiple_backfill_targets_recompute_from_job_records() {
+        let mut state = WalletActorState::new(1, 1, 0, 200, 0, None);
+        let first = WalletSyncToken::for_test(1, 1, 0, 1);
+        let second = WalletSyncToken::for_test(1, 1, 0, 2);
+        assert!(state.accept_target(first, 150));
+        assert!(state.accept_target(second, 200));
+
+        assert!(state.complete_backfill_job(first));
+        assert_eq!(state.completed_target_block, Some(150));
+        assert_eq!(state.derived_readiness(), WalletReadiness::Syncing);
+        assert!(state.retire_job(second));
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn dropped_backfill_request_reports_active_driver_loss() {
+        let mut state = WalletActorState::new(1, 1, 0, 100, 0, None);
+        let completed = WalletSyncToken::for_test(1, 1, 0, 1);
+        assert!(state.accept_target(completed, 100));
+        assert!(state.complete_backfill_job(completed));
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
+
+        let token = WalletSyncToken::for_test(1, 1, 0, 2);
+        let (grant, liveness) = accepted_test_backfill_owner(&mut state, token, 200);
+        assert_eq!(state.derived_readiness(), WalletReadiness::Syncing);
+        drop(BackfillRequest::add(
+            "test",
+            101,
+            200,
+            false,
+            101,
+            grant.activate(),
+        ));
+
+        assert_eq!(
+            unacknowledged_test_backfill_disposition(token, liveness).await,
+            WalletBackfillOwnerDisposition::DriverLost
+        );
+        assert!(
+            state.apply_backfill_owner_disposition(
+                token,
+                WalletBackfillOwnerDisposition::DriverLost,
+            )
+        );
+        assert!(state.active_jobs.is_empty());
+        assert_eq!(
+            state.derived_readiness(),
+            WalletReadiness::Failed(WalletReadinessError::BackfillUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_retry_completion_ignores_subsequent_driver_drop() {
+        let mut state = WalletActorState::new(1, 1, 0, 100, 0, None);
+        let token = WalletSyncToken::for_test(1, 1, 0, 1);
+        let (grant, liveness) = accepted_test_backfill_owner(&mut state, token, 100);
+        let driver = grant.activate();
+
+        state.apply_fact(WalletReadinessFact::DurablePersistFailed);
+
+        assert!(state.is_active_job(token, WalletActorJobKind::Backfill));
+        assert_eq!(state.active_jobs[&token.job_id()].target_block, Some(100));
+        state.apply_fact(WalletReadinessFact::DurablePrivateCommitOk { last_scanned: None });
+        assert!(state.complete_backfill_job(token));
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
+        drop(driver);
+        assert_eq!(
+            unacknowledged_test_backfill_disposition(token, liveness).await,
+            WalletBackfillOwnerDisposition::DriverLost
+        );
+        assert!(
+            !state.apply_backfill_owner_disposition(
+                token,
+                WalletBackfillOwnerDisposition::DriverLost,
+            )
+        );
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn dropped_indexed_owner_clears_exact_job_status_and_readiness() {
+        let mut state = WalletActorState::new(1, 1, 0, 100, 0, None);
+        let completed = WalletSyncToken::for_test(1, 1, 0, 1);
+        assert!(state.accept_target(completed, 100));
+        assert!(state.complete_backfill_job(completed));
+        let token = WalletSyncToken::for_test(1, 1, 0, 2);
+        assert!(state.accept_indexed_catch_up(token));
+        let status = WalletIndexedCatchUpStatus {
+            source: WalletIndexedCatchUpSource::IndexedArtifacts,
+            from_block: 101,
+            target_block: 200,
+        };
+        assert!(state.publish_indexed_catch_up(token, status));
+        assert_eq!(
+            state.active_jobs[&token.job_id()].indexed_status.as_ref(),
+            Some(&status)
+        );
+        let (liveness, receiver) = oneshot::channel();
+        let lease = WalletIndexedCatchUpLease::for_actor_accepted_job(token, liveness);
+        drop(lease);
+
+        assert_eq!(
+            accepted_indexed_job_owner_dropped(token, receiver).await,
+            token
+        );
+        assert!(state.retire_job(token));
+        assert_eq!(state.derived_readiness(), WalletReadiness::Ready);
     }
 
     const fn test_reset_token(intent_id: u64) -> WalletResetToken {
@@ -3871,14 +4263,17 @@ mod tests {
             WalletBackfillFinishResult::Ready { committed_to: 900 }
         );
         assert_eq!(handle.readiness(), WalletReadiness::Ready);
+        let tail_token = handle.mint_sync_token(0);
+        let tail_lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 1000, tail_token).await,
+            tail_token,
+            900,
+            1000,
+        );
         assert_eq!(
-            send_apply(
-                &handle,
-                &backfill_tx,
-                indexed_delta_batch(901, 950, empty_delta()),
-                0
-            )
-            .await,
+            tail_lease
+                .apply("test", indexed_delta_batch(901, 950, empty_delta()))
+                .await,
             WalletBackfillApplyResult::Committed { committed_to: 950 }
         );
 
@@ -3891,14 +4286,6 @@ mod tests {
         .expect("partial indexed tail applied");
         assert_eq!(handle.readiness(), WalletReadiness::Syncing);
         assert!(!*handle.ready_rx.borrow());
-        assert!(matches!(
-            send_target(&handle, &backfill_tx, 1000, 0).await,
-            WalletBackfillFinishResult::Accepted {
-                committed_to: 950,
-                target_block: 1000,
-                ..
-            }
-        ));
         assert_eq!(handle.readiness(), WalletReadiness::Syncing);
 
         cancel.cancel();
@@ -4535,17 +4922,13 @@ mod tests {
         .expect("spawn wallet worker");
         let token = handle.mint_sync_token(0);
 
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 150, token).await,
+        let lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 150, token).await,
             token,
             100,
             150,
         );
-        backfill_tx
-            .send(BackfillEvent::JobRetired { token })
-            .await
-            .expect("retire job");
-        tokio::task::yield_now().await;
+        lease.retire("test").await;
 
         let (response, result_rx) = oneshot::channel();
         backfill_tx
@@ -4681,24 +5064,24 @@ mod tests {
         .expect("spawn wallet worker");
 
         let token = handle.mint_sync_token(0);
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 200, token).await,
+        let lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 200, token).await,
             token,
             100,
             200,
         );
-        backfill_tx
-            .send(BackfillEvent::JobRetired { token })
-            .await
-            .expect("retire job");
+        lease.retire("test").await;
         tokio::time::sleep(Duration::from_millis(25)).await;
+        let (response, result_rx) = oneshot::channel();
         backfill_tx
             .send(BackfillEvent::JobFailed {
                 token,
                 reason: WalletReadinessError::BackfillUnavailable,
+                response,
             })
             .await
             .expect("late job failure");
+        result_rx.await.expect("job failure response");
         tokio::time::sleep(Duration::from_millis(25)).await;
 
         assert!(!matches!(handle.readiness(), WalletReadiness::Failed(_)));
@@ -4811,14 +5194,8 @@ mod tests {
         .expect("spawn wallet worker");
         let token = handle.mint_sync_token(0);
 
-        backfill_tx
-            .send(BackfillEvent::JobRetired { token })
-            .await
-            .expect("send never-accepted retire");
-        tokio::task::yield_now().await;
-
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 150, token).await,
+        let _lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 150, token).await,
             token,
             100,
             150,
@@ -4835,7 +5212,7 @@ mod tests {
 
         for job_id in 1..=10_000 {
             let token = WalletSyncToken::for_test(1, 1, 0, job_id);
-            assert!(actor_state.accept_job(token, WalletActorJobKind::Backfill));
+            assert!(actor_state.accept_target(token, 0));
             assert!(actor_state.retire_job(token));
         }
 
@@ -4845,10 +5222,7 @@ mod tests {
             WalletSyncToken::for_test(1, 1, 0, 10_000),
             WalletActorJobKind::Backfill,
         ));
-        assert!(actor_state.accept_job(
-            WalletSyncToken::for_test(1, 1, 0, 10_001),
-            WalletActorJobKind::Backfill,
-        ));
+        assert!(actor_state.accept_target(WalletSyncToken::for_test(1, 1, 0, 10_001), 0));
     }
 
     #[tokio::test]
@@ -4891,17 +5265,13 @@ mod tests {
         .expect("spawn wallet worker");
         let token = handle.mint_sync_token(0);
 
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 150, token).await,
+        let lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 150, token).await,
             token,
             100,
             150,
         );
-        backfill_tx
-            .send(BackfillEvent::JobRetired { token })
-            .await
-            .expect("retire job");
-        tokio::task::yield_now().await;
+        lease.retire("test").await;
 
         assert_eq!(
             send_target_token(&backfill_tx, 150, token).await,
@@ -4969,27 +5339,20 @@ mod tests {
         assert_eq!(handle.authority_reset_generation(), 0);
 
         let token = handle.mint_sync_token(handle.authority_reset_generation());
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 110, token).await,
+        let lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 110, token).await,
             token,
             100,
             110,
         );
-        let (response, result_rx) = oneshot::channel();
-        backfill_tx
-            .send(BackfillEvent::Apply {
-                apply: indexed_delta_batch(101, 110, empty_delta()),
-                token,
-                response,
-            })
-            .await
-            .expect("send post-reset-failure apply");
         assert_eq!(
-            result_rx.await.expect("apply result"),
+            lease
+                .apply("test", indexed_delta_batch(101, 110, empty_delta()))
+                .await,
             WalletBackfillApplyResult::Committed { committed_to: 110 }
         );
         assert_eq!(
-            send_target_token(&backfill_tx, 110, token).await,
+            lease.finish("test", 110).await,
             WalletBackfillFinishResult::Ready { committed_to: 110 }
         );
 
@@ -5010,7 +5373,7 @@ mod tests {
         let BackfillRequest::Add {
             from_block,
             to_block,
-            lease,
+            driver,
             ..
         } = request
         else {
@@ -5018,7 +5381,7 @@ mod tests {
         };
         assert_eq!(from_block, 111);
         assert_eq!(to_block, 120);
-        assert_eq!(lease.token().reset_generation(), 0);
+        assert_eq!(driver.token().reset_generation(), 0);
 
         cancel.cancel();
         drop(db);
@@ -5085,7 +5448,7 @@ mod tests {
             from_block,
             to_block,
             follow_safe_head,
-            lease,
+            driver,
             ..
         } = request
         else {
@@ -5094,7 +5457,7 @@ mod tests {
         assert_eq!(from_block, 100);
         assert_eq!(to_block, 150);
         assert!(!follow_safe_head);
-        assert_eq!(lease.token().reset_generation(), 1);
+        assert_eq!(driver.token().reset_generation(), 1);
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -5175,20 +5538,18 @@ mod tests {
             result_rx.await.expect("reset response"),
             WalletBackfillResetResult::accepted_committed(1, 99)
         );
-        let first_token =
+        let first_lease =
             match tokio::time::timeout(Duration::from_secs(1), backfill_request_rx.recv())
                 .await
                 .expect("first reset replay admitted")
                 .expect("first reset replay request")
             {
-                BackfillRequest::Add { lease, .. } => lease.token(),
+                BackfillRequest::Add { driver, .. } => driver,
                 BackfillRequest::Remove { .. } => panic!("expected reset replay add request"),
             };
+        let first_token = first_lease.token();
 
-        backfill_tx
-            .send(BackfillEvent::JobRetired { token: first_token })
-            .await
-            .expect("retire first reset replay");
+        first_lease.retire("test").await;
         let (response, result_rx) = oneshot::channel();
         backfill_tx
             .send(BackfillEvent::Apply {
@@ -5206,15 +5567,16 @@ mod tests {
             }
         );
 
-        let second_token =
+        let second_lease =
             match tokio::time::timeout(Duration::from_secs(1), backfill_request_rx.recv())
                 .await
                 .expect("reset replay readmitted")
                 .expect("readmitted reset replay request")
             {
-                BackfillRequest::Add { lease, .. } => lease.token(),
+                BackfillRequest::Add { driver, .. } => driver,
                 BackfillRequest::Remove { .. } => panic!("expected reset replay add request"),
             };
+        let second_token = second_lease.token();
         assert_ne!(second_token, first_token);
 
         cancel.cancel();
@@ -5267,8 +5629,8 @@ mod tests {
         );
 
         let covering_token = handle.mint_sync_token(0);
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 200, covering_token).await,
+        let covering_lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 200, covering_token).await,
             covering_token,
             100,
             200,
@@ -5277,10 +5639,9 @@ mod tests {
         let (response, result_rx) = oneshot::channel();
         drop(result_rx);
         backfill_tx
-            .send(BackfillEvent::Target {
+            .send(BackfillEvent::Start {
                 target_block: 150,
                 token: dropped_token,
-                sender: backfill_tx.clone(),
                 response,
             })
             .await
@@ -5305,16 +5666,13 @@ mod tests {
         assert_eq!(handle.readiness(), WalletReadiness::Syncing);
 
         assert_eq!(
-            send_apply_token(
-                &backfill_tx,
-                indexed_delta_batch(101, 200, empty_delta()),
-                covering_token,
-            )
-            .await,
+            covering_lease
+                .apply("test", indexed_delta_batch(101, 200, empty_delta()))
+                .await,
             WalletBackfillApplyResult::Committed { committed_to: 200 }
         );
         assert_eq!(
-            send_target_token(&backfill_tx, 200, covering_token).await,
+            covering_lease.finish("test", 200).await,
             WalletBackfillFinishResult::Ready { committed_to: 200 }
         );
 
@@ -5376,13 +5734,14 @@ mod tests {
         );
         let token = handle.mint_sync_token(1);
         cache_store.fail_next_store();
-        assert_eq!(
-            send_target_token(&backfill_tx, 130, token).await,
-            WalletBackfillFinishResult::Rejected {
-                committed_to: 120,
-                reason: WalletBackfillRejectReason::PersistenceFailed,
+        assert!(matches!(
+            send_start_token(&backfill_tx, 130, token).await,
+            WalletBackfillStartResult::Rejected {
+                reason: WalletBackfillRejectReason::PersistenceFailed
+                    | WalletBackfillRejectReason::Shutdown,
+                ..
             }
-        );
+        ));
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -5406,35 +5765,22 @@ mod tests {
             }
         );
 
-        let replay_token = match backfill_request_rx
+        let replay_lease = match backfill_request_rx
             .recv()
             .await
             .expect("actor-owned reset replay request")
         {
-            BackfillRequest::Add { lease, .. } => lease.token(),
+            BackfillRequest::Add { driver, .. } => driver,
             BackfillRequest::Remove { .. } => panic!("expected reset replay add request"),
         };
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 130, replay_token).await,
-            replay_token,
-            99,
-            130,
-        );
-        let (response, result_rx) = oneshot::channel();
-        backfill_tx
-            .send(BackfillEvent::Apply {
-                apply: indexed_delta_batch(100, 130, empty_delta()),
-                token: replay_token,
-                response,
-            })
-            .await
-            .expect("send replay apply");
         assert_eq!(
-            result_rx.await.expect("replay apply result"),
+            replay_lease
+                .apply("test", indexed_delta_batch(100, 130, empty_delta()))
+                .await,
             WalletBackfillApplyResult::Committed { committed_to: 130 }
         );
         assert_eq!(
-            send_target_token(&backfill_tx, 130, replay_token).await,
+            replay_lease.finish("test", 130).await,
             WalletBackfillFinishResult::Ready { committed_to: 130 }
         );
 
@@ -5494,6 +5840,75 @@ mod tests {
                 .last_scanned_block,
             50
         );
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_reset_covered_positive_replay_target_completes_without_queued_job() {
+        let root_dir = temp_db_root("wallet-reset-covered-replay-target");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, mut backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+                public_data_plane: test_public_data_plane(&db),
+            },
+            wallet_config(),
+            1,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            120,
+        )
+        .await
+        .expect("spawn wallet worker");
+
+        let (response, result_rx) = oneshot::channel();
+        backfill_tx
+            .send(BackfillEvent::Reset {
+                token: test_reset_token(1),
+                from_block: 121,
+                replay_plan: WalletResetReplayPlan::new(0, 100, false),
+                response,
+            })
+            .await
+            .expect("send covered-target reset");
+        assert_eq!(
+            result_rx.await.expect("reset response"),
+            WalletBackfillResetResult::accepted_committed(1, 120)
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.readiness() != WalletReadiness::Ready {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("covered replay target becomes ready");
+
+        assert_eq!(handle.last_scanned(), Some(120));
+        assert!(backfill_request_rx.try_recv().is_err());
 
         cancel.cancel();
         drop(db);
@@ -5797,19 +6212,22 @@ mod tests {
             WalletBackfillFinishResult::Ready { committed_to: 100 }
         );
         let gap_token = handle.mint_sync_token(0);
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 150, gap_token).await,
+        let _gap_lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 150, gap_token).await,
             gap_token,
             100,
             150,
         );
         let covered_token = handle.mint_sync_token(0);
+        let covered_lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 100, covered_token).await,
+            covered_token,
+            100,
+            100,
+        );
         assert_eq!(
-            send_target_token(&backfill_tx, 100, covered_token).await,
-            WalletBackfillFinishResult::Rejected {
-                committed_to: 100,
-                reason: WalletBackfillRejectReason::TargetNotReached { target_block: 150 },
-            }
+            covered_lease.finish("test", 100).await,
+            WalletBackfillFinishResult::Ready { committed_to: 100 }
         );
         assert_eq!(handle.readiness(), WalletReadiness::Syncing);
         assert!(!*handle.ready_rx.borrow());
@@ -6982,17 +7400,20 @@ mod tests {
         .expect("spawn wallet worker");
 
         let token = handle.mint_sync_token(0);
+        let lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 200, token).await,
+            token,
+            100,
+            200,
+        );
         assert_eq!(
-            send_apply_token(
-                &backfill_tx,
-                indexed_delta_batch(101, 200, empty_delta()),
-                token,
-            )
-            .await,
+            lease
+                .apply("test", indexed_delta_batch(101, 200, empty_delta()))
+                .await,
             WalletBackfillApplyResult::Committed { committed_to: 200 }
         );
         assert_eq!(
-            send_target_token(&backfill_tx, 200, token).await,
+            lease.finish("test", 200).await,
             WalletBackfillFinishResult::Ready { committed_to: 200 }
         );
 
@@ -7207,7 +7628,7 @@ mod tests {
                 .await
                 .expect("second indexed claim completed")
                 .expect("dropped first claim must be retired");
-        handle.clear_indexed_catch_up(lease);
+        drop(lease);
         tokio::time::timeout(Duration::from_secs(1), async {
             while handle.readiness() != WalletReadiness::Ready {
                 tokio::task::yield_now().await;
@@ -7216,7 +7637,36 @@ mod tests {
         .await
         .expect("indexed claim retirement republished readiness");
 
+        let shutdown_lease = handle
+            .try_claim_indexed_catch_up()
+            .await
+            .expect("indexed claim before shutdown");
+        handle.set_indexed_catch_up(
+            &shutdown_lease,
+            WalletIndexedCatchUpStatus {
+                source: WalletIndexedCatchUpSource::Squid,
+                from_block: 101,
+                target_block: 200,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.indexed_catch_up_rx.borrow().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("indexed status published before shutdown");
         cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.readiness() != WalletReadiness::Shutdown
+                || handle.indexed_catch_up_rx.borrow().is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown cleared indexed status and active job");
+        drop(shutdown_lease);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
@@ -7277,7 +7727,7 @@ mod tests {
             from_block: 101,
             target_block: 200,
         };
-        handle.set_indexed_catch_up(first_lease, first_status.clone());
+        handle.set_indexed_catch_up(&first_lease, first_status);
         tokio::time::timeout(Duration::from_secs(1), async {
             while handle.indexed_catch_up_rx.borrow().is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7289,7 +7739,7 @@ mod tests {
             handle.indexed_catch_up_rx.borrow().as_ref(),
             Some(&first_status)
         );
-        handle.clear_indexed_catch_up(first_lease);
+        drop(first_lease);
         tokio::time::timeout(Duration::from_secs(1), async {
             while handle.indexed_catch_up_rx.borrow().is_some() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7313,7 +7763,7 @@ mod tests {
             from_block: 201,
             target_block: 300,
         };
-        handle.set_indexed_catch_up(second_lease, second_status.clone());
+        handle.set_indexed_catch_up(&second_lease, second_status);
         tokio::time::timeout(Duration::from_secs(1), async {
             while handle.indexed_catch_up_rx.borrow().as_ref() != Some(&second_status) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7322,13 +7772,6 @@ mod tests {
         .await
         .expect("second indexed catch-up status published");
 
-        handle.set_indexed_catch_up(first_lease, first_status);
-        handle.clear_indexed_catch_up(first_lease);
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert_eq!(
-            handle.indexed_catch_up_rx.borrow().as_ref(),
-            Some(&second_status)
-        );
         assert!(send_reset(&backfill_tx, 1, 50).await.committed());
         tokio::time::timeout(Duration::from_secs(1), async {
             while handle.indexed_catch_up_rx.borrow().is_some() {
@@ -7337,7 +7780,7 @@ mod tests {
         })
         .await
         .expect("reset cleared indexed catch-up status");
-        handle.clear_indexed_catch_up(second_lease);
+        drop(second_lease);
 
         cancel.cancel();
         drop(db);
@@ -7399,14 +7842,13 @@ mod tests {
                 },
             }
         );
-        assert!(matches!(
-            send_target(&handle, &backfill_tx, 200, 0).await,
-            WalletBackfillFinishResult::Accepted {
-                committed_to: 150,
-                target_block: 200,
-                ..
-            }
-        ));
+        let done_token = handle.mint_sync_token(0);
+        let _done_lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 200, done_token).await,
+            done_token,
+            150,
+            200,
+        );
         assert_eq!(handle.last_scanned(), Some(150));
         assert_eq!(
             send_apply(
@@ -7538,19 +7980,13 @@ mod tests {
             }
         ));
         let current_target_token = handle.mint_sync_token(1);
-        assert_target_accepted(
-            send_target_token(&backfill_tx, 150, current_target_token).await,
+        let current_target_lease = assert_start_accepted(
+            send_start_token(&backfill_tx, 150, current_target_token).await,
             current_target_token,
             79,
             150,
         );
-        backfill_tx
-            .send(BackfillEvent::JobRetired {
-                token: current_target_token,
-            })
-            .await
-            .expect("retire unattached current target");
-        tokio::task::yield_now().await;
+        current_target_lease.retire("test").await;
         assert_eq!(
             send_apply(
                 &handle,
@@ -7640,7 +8076,7 @@ mod tests {
             from_block,
             to_block,
             follow_safe_head,
-            lease,
+            driver,
             ..
         } = request
         else {
@@ -7650,22 +8086,17 @@ mod tests {
         assert_eq!(from_block, 101);
         assert!(to_block > from_block);
         assert!(follow_safe_head);
-        assert_eq!(lease.token().reset_generation(), 0);
+        assert_eq!(driver.token().reset_generation(), 0);
         assert_eq!(handle.last_scanned(), Some(100));
 
         assert_eq!(
-            send_apply_token(
-                &backfill_tx,
-                logs_apply(from_block, to_block),
-                lease.token()
-            )
-            .await,
+            driver.apply("test", logs_apply(from_block, to_block)).await,
             WalletBackfillApplyResult::Committed {
                 committed_to: to_block
             }
         );
         assert_eq!(
-            send_target_token(&backfill_tx, to_block, lease.token()).await,
+            driver.finish("test", to_block).await,
             WalletBackfillFinishResult::Ready {
                 committed_to: to_block
             }

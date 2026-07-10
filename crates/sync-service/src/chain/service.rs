@@ -10,21 +10,39 @@ pub(super) async fn send_wallet_scan_apply(
     apply: WalletScanApply,
     token: WalletSyncToken,
 ) -> WalletBackfillApplyResult {
-    WalletBackfillLease::from_token(token, sender.clone())
+    WalletBackfillDriver::from_token(token, sender.clone())
         .apply(cache_key, apply)
         .await
 }
 
 #[cfg(test)]
 pub(super) async fn send_wallet_target(
-    cache_key: &str,
+    _cache_key: &str,
     sender: &mpsc::Sender<BackfillEvent>,
     target_block: u64,
     token: WalletSyncToken,
-) -> WalletBackfillFinishResult {
-    WalletBackfillLease::from_token(token, sender.clone())
-        .finish(cache_key, target_block)
+) -> WalletBackfillStartResult {
+    let (response, result_rx) = oneshot::channel();
+    if sender
+        .send(BackfillEvent::Start {
+            target_block,
+            token,
+            response,
+        })
         .await
+        .is_err()
+    {
+        return WalletBackfillStartResult::Rejected {
+            committed_to: target_block.saturating_sub(1),
+            reason: WalletBackfillRejectReason::Shutdown,
+        };
+    }
+    result_rx
+        .await
+        .unwrap_or(WalletBackfillStartResult::Rejected {
+            committed_to: target_block.saturating_sub(1),
+            reason: WalletBackfillRejectReason::Shutdown,
+        })
 }
 
 pub(in crate::chain) async fn send_wallet_reset(
@@ -581,15 +599,9 @@ impl ChainService {
         let target_result = handle
             .start_backfill(&cfg.cache_key, sender, progress, target_block)
             .await;
-        let lease = match target_result {
-            WalletBackfillFinishResult::Ready { committed_to } => {
-                return CachedPublicScanApplyOutcome {
-                    checkpoint: committed_to,
-                    finished: true,
-                };
-            }
-            WalletBackfillFinishResult::Accepted { lease, .. } => lease,
-            WalletBackfillFinishResult::Rejected { .. } => {
+        let driver = match target_result {
+            WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
+            WalletBackfillStartResult::Rejected { .. } => {
                 return CachedPublicScanApplyOutcome {
                     checkpoint,
                     finished: false,
@@ -599,10 +611,10 @@ impl ChainService {
         loop {
             let from_block = wallet_backfill_from_block(checkpoint, start_block);
             if from_block > target_block {
-                let result = lease.finish(&cfg.cache_key, target_block).await;
+                let result = driver.finish(&cfg.cache_key, target_block).await;
                 let finished = matches!(result, WalletBackfillFinishResult::Ready { .. });
                 if !finished {
-                    lease.retire(&cfg.cache_key).await;
+                    driver.retire(&cfg.cache_key).await;
                 }
                 return CachedPublicScanApplyOutcome {
                     checkpoint,
@@ -614,7 +626,7 @@ impl ChainService {
                 .cached_empty_wallet_scan_apply(from_block, target_block)
                 .await
             else {
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return CachedPublicScanApplyOutcome {
                     checkpoint,
                     finished: false,
@@ -631,7 +643,7 @@ impl ChainService {
                     "cached empty public coverage selected",
                 )
                 .await;
-            let apply_result = lease.apply(&cfg.cache_key, apply).await;
+            let apply_result = driver.apply(&cfg.cache_key, apply).await;
             let Some(committed_to) = apply_result.accepted_committed_to() else {
                 debug!(
                     ?apply_result,
@@ -640,7 +652,7 @@ impl ChainService {
                     apply_to,
                     "cached public coverage was not committed"
                 );
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return CachedPublicScanApplyOutcome {
                     checkpoint,
                     finished: false,
@@ -648,7 +660,7 @@ impl ChainService {
             };
             checkpoint = committed_to;
             if committed_to < apply_to {
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return CachedPublicScanApplyOutcome {
                     checkpoint,
                     finished: false,
@@ -884,9 +896,7 @@ impl ChainService {
             )
         };
         // Ticket must still match current view generation before using the range.
-        let Some(progress) = handle.revalidate_schedulable_progress(progress) else {
-            return None;
-        };
+        let progress = handle.revalidate_schedulable_progress(progress)?;
         let last_scanned = from_block.saturating_sub(1);
         let started = Instant::now();
         let checkpoint = self
@@ -1181,32 +1191,68 @@ impl ChainService {
                 .start_backfill(&cfg.cache_key, &backfill_sender, progress, sync_target)
                 .await;
             debug!(?target_result, cache_key = %cfg.cache_key, "wallet target update result");
-            let lease = match target_result {
-                WalletBackfillFinishResult::Ready { .. } => return,
-                WalletBackfillFinishResult::Accepted { lease, .. } => lease,
-                WalletBackfillFinishResult::Rejected { .. } => return,
+            let driver = match target_result {
+                WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
+                WalletBackfillStartResult::Rejected { .. } => return,
             };
-            if let Err(err) = self.backfill_tx.try_send(BackfillRequest::add(
+            let request = BackfillRequest::add(
                 cfg.cache_key.clone(),
                 from_block,
                 sync_target,
                 follow_safe_head,
                 from_block,
-                lease.clone(),
-            )) {
+                driver,
+            );
+            if let Err(err) = self.backfill_tx.try_send(request) {
                 warn!(
                     ?err,
                     cache_key = %cfg.cache_key,
                     "backfill loop unavailable after target update"
                 );
-                lease
-                    .fail(&cfg.cache_key, WalletReadinessError::BackfillUnavailable)
-                    .await;
+                if let BackfillRequest::Add { driver, .. } = err.into_inner() {
+                    driver
+                        .fail(&cfg.cache_key, WalletReadinessError::BackfillUnavailable)
+                        .await;
+                }
             }
         } else {
-            let result = handle
+            let start_result = handle
                 .start_backfill(&cfg.cache_key, &backfill_sender, progress, sync_target)
                 .await;
+            let result = match start_result {
+                WalletBackfillStartResult::Accepted { grant, .. } => {
+                    let driver = grant.activate();
+                    let result = driver.finish(&cfg.cache_key, sync_target).await;
+                    if wallet_finish_result_removes_cursor(&result) {
+                        driver.retire(&cfg.cache_key).await;
+                    } else {
+                        let request = wallet_finish_retry_request(
+                            cfg.cache_key.clone(),
+                            sync_target,
+                            false,
+                            from_block,
+                            &result,
+                            driver,
+                        );
+                        if let Err(err) = self.backfill_tx.try_send(request) {
+                            warn!(?err, cache_key = %cfg.cache_key, sync_target, "failed to enqueue fixed-target finish retry");
+                            if let BackfillRequest::Add { driver, .. } = err.into_inner() {
+                                driver
+                                    .fail(&cfg.cache_key, WalletReadinessError::BackfillUnavailable)
+                                    .await;
+                            }
+                        }
+                    }
+                    result
+                }
+                WalletBackfillStartResult::Rejected {
+                    committed_to,
+                    reason,
+                } => WalletBackfillFinishResult::Rejected {
+                    committed_to,
+                    reason,
+                },
+            };
             debug!(?result, cache_key = %cfg.cache_key, "wallet finish result");
         }
     }
@@ -2139,10 +2185,9 @@ impl ChainService {
         let target_result = handle
             .start_backfill(&cfg.cache_key, sender, progress, target)
             .await;
-        let lease = match target_result {
-            WalletBackfillFinishResult::Ready { committed_to } => return committed_to,
-            WalletBackfillFinishResult::Accepted { lease, .. } => lease,
-            WalletBackfillFinishResult::Rejected { .. } => return checkpoint,
+        let driver = match target_result {
+            WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
+            WalletBackfillStartResult::Rejected { .. } => return checkpoint,
         };
         loop {
             if from_block > target {
@@ -2187,7 +2232,7 @@ impl ChainService {
                 continue;
             }
             if cancel.is_cancelled() {
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return checkpoint;
             }
             let page_started = Instant::now();
@@ -2263,7 +2308,7 @@ impl ChainService {
                         );
                         let Some(session) = self.probe_squid_indexed_wallet_source(cfg).await
                         else {
-                            lease.retire(&cfg.cache_key).await;
+                            driver.retire(&cfg.cache_key).await;
                             return checkpoint;
                         };
                         indexed_height = session.indexed_height();
@@ -2302,7 +2347,7 @@ impl ChainService {
                                 elapsed_ms = catch_up_started.elapsed().as_millis(),
                                 "indexed wallet fallback skipped; cache already at target"
                             );
-                            lease.retire(&cfg.cache_key).await;
+                            driver.retire(&cfg.cache_key).await;
                             return checkpoint;
                         }
                         continue;
@@ -2326,7 +2371,7 @@ impl ChainService {
                             .prepare_indexed_wallet_artifact_session(cfg, from_block, safe_head)
                             .await;
                         let Some(session) = artifact_session.as_ref() else {
-                            lease.retire(&cfg.cache_key).await;
+                            driver.retire(&cfg.cache_key).await;
                             return checkpoint;
                         };
                         squid_session = None;
@@ -2366,7 +2411,7 @@ impl ChainService {
                                 elapsed_ms = catch_up_started.elapsed().as_millis(),
                                 "indexed wallet fallback skipped; cache already at target"
                             );
-                            lease.retire(&cfg.cache_key).await;
+                            driver.retire(&cfg.cache_key).await;
                             return checkpoint;
                         }
                         continue;
@@ -2385,13 +2430,13 @@ impl ChainService {
                         "indexed wallet catch-up page failed; falling back to RPC",
                     )
                     .await;
-                    lease.retire(&cfg.cache_key).await;
+                    driver.retire(&cfg.cache_key).await;
                     return checkpoint;
                 }
             };
             let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
             if cancel.is_cancelled() {
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return checkpoint;
             }
             let parse_started = Instant::now();
@@ -2423,10 +2468,10 @@ impl ChainService {
                     to_block = page_checkpoint,
                     "indexed wallet page rejected before wallet apply"
                 );
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return checkpoint;
             }
-            let apply_result = lease
+            let apply_result = driver
                 .apply(
                     &cfg.cache_key,
                     WalletScanApply::indexed_rows(
@@ -2446,7 +2491,7 @@ impl ChainService {
                     to_block = page_checkpoint,
                     "indexed wallet delta was not committed; using RPC backfill from committed cursor"
                 );
-                lease.retire(&cfg.cache_key).await;
+                driver.retire(&cfg.cache_key).await;
                 return checkpoint;
             };
             checkpoint = committed_checkpoint;
@@ -2485,7 +2530,11 @@ impl ChainService {
             elapsed_ms = catch_up_started.elapsed().as_millis(),
             "indexed wallet catch-up complete"
         );
-        lease.retire(&cfg.cache_key).await;
+        let finish_result = driver.finish(&cfg.cache_key, target).await;
+        if !matches!(finish_result, WalletBackfillFinishResult::Ready { .. }) {
+            debug!(?finish_result, cache_key = %cfg.cache_key, "indexed wallet catch-up finish rejected");
+            driver.retire(&cfg.cache_key).await;
+        }
         checkpoint
     }
 }

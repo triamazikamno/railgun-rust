@@ -6759,7 +6759,7 @@ async fn start_backfill_rejects_stale_progress_ticket() {
     assert!(
         matches!(
             result,
-            crate::types::WalletBackfillFinishResult::Rejected {
+            crate::types::WalletBackfillStartResult::Rejected {
                 reason: crate::types::WalletBackfillRejectReason::StaleGeneration { .. },
                 ..
             }

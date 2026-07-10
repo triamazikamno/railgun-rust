@@ -17,7 +17,7 @@ use merkletree::tree::MerkleForest;
 use multihash_codetable::{Code, MultihashDigest};
 use railgun_wallet::scan::WalletScanInputRows;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -32,12 +32,12 @@ use super::{
     Nullified, Nullifiers, PublicCoverageAnswer, PublicDataPlaneDiagnosticKind,
     PublicDataPlaneError, PublicPoiCorpusKey, PublicScanCoverageWrite, PublicScanRange,
     PublicScanRowsAnswer, PublicScanSource, RailgunLegacyShieldEvents, Shield, Transact,
-    WalletBackfill, WalletTailFallbackState, WalletWorkerServices,
+    WalletBackfill, WalletIndexedCatchUpStatusGuard, WalletTailFallbackState, WalletWorkerServices,
     artifact_failure_can_fallback_to_squid, combined_log_event_signatures_for_range,
     complete_stream_checkpoint, drain_pending_backfill_requests, pending_tip_from_block,
     pending_tip_provider_covers_target, send_wallet_startup_events, should_hedge_wallet_startup,
     spawn_backfill_loop, squid_tail_target_after_artifact, wallet_backfill_from_block,
-    wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
+    wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor, wallet_finish_retry_request,
     wallet_reorg_backfill_from_block, wallet_startup_hedge_block_count, wallet_sync_target,
     wallet_tail_fallback_lag_threshold_blocks,
 };
@@ -53,8 +53,9 @@ use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, ChainKey, GlobalPoiPolicy,
     IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LogBatch,
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
-    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillLease,
-    WalletBackfillRejectReason, WalletConfig, WalletIndexedCatchUpSource, WalletReadiness,
+    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    WalletBackfillGrant, WalletBackfillOwnerDisposition, WalletBackfillRejectReason,
+    WalletBackfillStartResult, WalletConfig, WalletIndexedCatchUpSource, WalletReadiness,
     WalletReadinessError, WalletScanApply, WalletScanRowsPayload, WalletSyncToken,
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
@@ -67,7 +68,7 @@ fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBack
         target_block,
         follow_safe_head,
         100,
-        test_backfill_lease(sender, 0, 1),
+        test_backfill_driver(sender, 0, 1),
         std::time::Instant::now(),
     )
 }
@@ -105,12 +106,12 @@ fn test_sync_token(reset_generation: u64, job_id: u64) -> WalletSyncToken {
     WalletSyncToken::for_test(1, 1, reset_generation, job_id)
 }
 
-fn test_backfill_lease(
+fn test_backfill_driver(
     sender: mpsc::Sender<BackfillEvent>,
     reset_generation: u64,
     job_id: u64,
-) -> WalletBackfillLease {
-    WalletBackfillLease::from_token(test_sync_token(reset_generation, job_id), sender)
+) -> WalletBackfillDriver {
+    WalletBackfillDriver::from_token(test_sync_token(reset_generation, job_id), sender)
 }
 
 fn test_scope() -> ChainScope {
@@ -178,7 +179,7 @@ fn wallet_backfill_persistence_retry_keeps_replay_start() {
         120,
         false,
         100,
-        test_backfill_lease(mpsc::channel(1).0, 1, 1),
+        test_backfill_driver(mpsc::channel(1).0, 1, 1),
         now,
     );
 
@@ -195,7 +196,7 @@ fn wallet_backfill_retryable_finish_rewinds_cursor_instead_of_removing() {
         120,
         false,
         100,
-        test_backfill_lease(mpsc::channel(1).0, 1, 1),
+        test_backfill_driver(mpsc::channel(1).0, 1, 1),
         now,
     );
     let result = WalletBackfillFinishResult::Rejected {
@@ -207,6 +208,58 @@ fn wallet_backfill_retryable_finish_rewinds_cursor_instead_of_removing() {
     cursor.retry_after_rejected_finish(result.committed_to(), now);
 
     assert_eq!(cursor.from_block, 100);
+}
+
+#[tokio::test]
+async fn ready_tail_persistence_failure_queues_active_driver_for_retry() {
+    let result = WalletBackfillFinishResult::Rejected {
+        committed_to: 120,
+        reason: WalletBackfillRejectReason::PersistenceFailed,
+    };
+    let token = test_sync_token(1, 1);
+    let (event_sender, _event_receiver) = mpsc::channel(1);
+    let (liveness, mut disposition) = oneshot::channel();
+    let driver =
+        WalletBackfillGrant::for_actor_accepted_job(token, event_sender, liveness).activate();
+
+    let request = wallet_finish_retry_request("test".to_string(), 120, false, 100, &result, driver);
+    assert!(matches!(
+        disposition.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    let BackfillRequest::Add {
+        from_block,
+        to_block,
+        progress_start_block,
+        driver,
+        ..
+    } = request
+    else {
+        panic!("ready-tail finish retry must retain an active driver");
+    };
+    assert_eq!(from_block, 121);
+    assert_eq!(to_block, 120);
+    assert_eq!(progress_start_block, 100);
+    assert_eq!(driver.token(), token);
+
+    tokio::join!(
+        async {
+            driver.retire("test").await;
+        },
+        async {
+            let signal = disposition.await.expect("driver retirement disposition");
+            assert_eq!(
+                signal.disposition,
+                WalletBackfillOwnerDisposition::BenignRetirement
+            );
+            signal
+                .acknowledgement
+                .expect("explicit retirement requests acknowledgement")
+                .send(())
+                .expect("driver waits for retirement acknowledgement");
+        }
+    );
 }
 
 #[test]
@@ -412,7 +465,7 @@ async fn artifact_poi_corpus_survives_wallet_unregister_reregister() {
 #[tokio::test]
 async fn active_backfill_drains_reset_replacement_request() {
     let (request_tx, mut request_rx) = mpsc::channel(4);
-    let (old_sender, mut old_receiver) = mpsc::channel(1);
+    let (old_sender, old_receiver) = mpsc::channel(1);
     let (new_sender, _new_receiver) = mpsc::channel(1);
     let mut cursors = HashMap::new();
     cursors.insert(
@@ -422,7 +475,7 @@ async fn active_backfill_drains_reset_replacement_request() {
             1_000,
             true,
             100,
-            test_backfill_lease(old_sender, 0, 1),
+            test_backfill_driver(old_sender, 0, 1),
             std::time::Instant::now(),
         ),
     );
@@ -434,7 +487,7 @@ async fn active_backfill_drains_reset_replacement_request() {
             to_block: 150,
             follow_safe_head: true,
             progress_start_block: 80,
-            lease: test_backfill_lease(new_sender, 1, 2),
+            driver: test_backfill_driver(new_sender, 1, 2),
         })
         .expect("queue reset replacement backfill");
 
@@ -445,21 +498,15 @@ async fn active_backfill_drains_reset_replacement_request() {
     assert_eq!(cursor.target_block, 150);
     assert!(cursor.follow_safe_head);
     assert_eq!(cursor.progress_start_block, 80);
-    assert_eq!(cursor.lease.token().reset_generation(), 1);
-    match old_receiver.recv().await.expect("old job retired") {
-        BackfillEvent::JobRetired { token } => {
-            assert_eq!(token.job_id(), 1);
-            assert_eq!(token.reset_generation(), 0);
-        }
-        event => panic!("unexpected retirement event: {event:?}"),
-    }
+    assert_eq!(cursor.driver.token().reset_generation(), 1);
+    assert!(old_receiver.is_empty());
 }
 
 #[tokio::test]
 async fn active_backfill_ignores_stale_replacement_request() {
     let (request_tx, mut request_rx) = mpsc::channel(4);
-    let (active_sender, mut active_receiver) = mpsc::channel(1);
-    let (stale_sender, mut stale_receiver) = mpsc::channel(1);
+    let (active_sender, active_receiver) = mpsc::channel(1);
+    let (stale_sender, stale_receiver) = mpsc::channel(1);
     let mut cursors = HashMap::new();
     cursors.insert(
         "test".to_string(),
@@ -468,7 +515,7 @@ async fn active_backfill_ignores_stale_replacement_request() {
             1_000,
             true,
             100,
-            test_backfill_lease(active_sender, 1, 2),
+            test_backfill_driver(active_sender, 1, 2),
             std::time::Instant::now(),
         ),
     );
@@ -480,7 +527,7 @@ async fn active_backfill_ignores_stale_replacement_request() {
             to_block: 150,
             follow_safe_head: true,
             progress_start_block: 80,
-            lease: test_backfill_lease(stale_sender, 0, 1),
+            driver: test_backfill_driver(stale_sender, 0, 1),
         })
         .expect("queue stale replacement backfill");
 
@@ -489,16 +536,10 @@ async fn active_backfill_ignores_stale_replacement_request() {
     let cursor = cursors.get("test").expect("active cursor retained");
     assert_eq!(cursor.from_block, 100);
     assert_eq!(cursor.target_block, 1_000);
-    assert_eq!(cursor.lease.token().reset_generation(), 1);
-    assert_eq!(cursor.lease.token().job_id(), 2);
-    match stale_receiver.recv().await.expect("stale job retired") {
-        BackfillEvent::JobRetired { token } => {
-            assert_eq!(token.job_id(), 1);
-            assert_eq!(token.reset_generation(), 0);
-        }
-        event => panic!("unexpected retirement event: {event:?}"),
-    }
-    assert!(active_receiver.try_recv().is_err());
+    assert_eq!(cursor.driver.token().reset_generation(), 1);
+    assert_eq!(cursor.driver.token().job_id(), 2);
+    assert!(stale_receiver.is_empty());
+    assert!(active_receiver.is_empty());
 }
 
 #[test]
@@ -518,7 +559,7 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
         160,
         true,
         100,
-        test_backfill_lease(sender, 0, 1),
+        test_backfill_driver(sender, 0, 1),
         now - std::time::Duration::from_secs(20),
     );
 
@@ -939,7 +980,7 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
     );
     assert_eq!(
         send_wallet_target("test", &sender, 105, token).await,
-        WalletBackfillFinishResult::Rejected {
+        WalletBackfillStartResult::Rejected {
             committed_to: 104,
             reason: WalletBackfillRejectReason::Shutdown,
         }
@@ -1085,14 +1126,16 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     );
     let wallet_a_token = wallet_a.mint_sync_token(0);
     let wallet_b_token = wallet_b.mint_sync_token(0);
-    let wallet_a_lease = send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token)
-        .await
-        .accepted_lease()
-        .expect("wallet A target accepted");
-    let wallet_b_lease = send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token)
-        .await
-        .accepted_lease()
-        .expect("wallet B target accepted");
+    let wallet_a_lease =
+        match send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token).await {
+            WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
+            result => panic!("wallet A target rejected: {result:?}"),
+        };
+    let wallet_b_lease =
+        match send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token).await {
+            WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
+            result => panic!("wallet B target rejected: {result:?}"),
+        };
     backfill_request_tx
         .send(BackfillRequest::Add {
             cache_key: "wallet-a".to_string(),
@@ -1100,7 +1143,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             to_block: 199,
             follow_safe_head: false,
             progress_start_block: 100,
-            lease: wallet_a_lease,
+            driver: wallet_a_lease,
         })
         .await
         .expect("send wallet A backfill request");
@@ -1111,7 +1154,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
             to_block: 130,
             follow_safe_head: false,
             progress_start_block: 120,
-            lease: wallet_b_lease,
+            driver: wallet_b_lease,
         })
         .await
         .expect("send wallet B backfill request");
@@ -2350,10 +2393,9 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
         .await
     });
 
-    let Some(BackfillEvent::Target {
+    let Some(BackfillEvent::Start {
         target_block,
         token,
-        sender,
         response,
     }) = receiver.recv().await
     else {
@@ -2362,10 +2404,10 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     assert_eq!(target_block, 105);
     assert_eq!(token.reset_generation(), 0);
     response
-        .send(WalletBackfillFinishResult::Accepted {
+        .send(WalletBackfillStartResult::Accepted {
             committed_to: 100,
             target_block,
-            lease: WalletBackfillLease::from_token(token, sender),
+            grant: WalletBackfillGrant::from_token(token, sender.clone()),
         })
         .expect("send initial target result");
 
@@ -2387,10 +2429,9 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     response
         .send(WalletBackfillApplyResult::Committed { committed_to: 105 })
         .expect("send apply result");
-    let Some(BackfillEvent::Target {
+    let Some(BackfillEvent::Finish {
         target_block,
         token: finish_token,
-        sender: _,
         response,
     }) = receiver.recv().await
     else {
@@ -2482,18 +2523,34 @@ async fn wallet_startup_events_treat_leading_ready_as_success() {
         .await
     });
 
-    let Some(BackfillEvent::Target {
+    let Some(BackfillEvent::Start {
         target_block,
+        token,
         response,
-        ..
     }) = receiver.recv().await
     else {
         panic!("startup target should be sent");
     };
     assert_eq!(target_block, 105);
     response
+        .send(WalletBackfillStartResult::Accepted {
+            committed_to: 105,
+            target_block,
+            grant: WalletBackfillGrant::from_token(token, sender.clone()),
+        })
+        .expect("send accepted start result");
+    let Some(BackfillEvent::Apply { response, .. }) = receiver.recv().await else {
+        panic!("startup apply should be sent");
+    };
+    response
+        .send(WalletBackfillApplyResult::AlreadyCovered { committed_to: 105 })
+        .expect("send covered apply result");
+    let Some(BackfillEvent::Finish { response, .. }) = receiver.recv().await else {
+        panic!("startup finish should be sent");
+    };
+    response
         .send(WalletBackfillFinishResult::Ready { committed_to: 105 })
-        .expect("send ready target result");
+        .expect("send ready finish result");
     assert!(send_task.await.expect("send task completed"));
     assert!(receiver.try_recv().is_err());
 
@@ -2576,20 +2633,19 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
         .await
     });
 
-    let Some(BackfillEvent::Target {
+    let Some(BackfillEvent::Start {
         target_block,
         token,
-        sender,
         response,
     }) = receiver.recv().await
     else {
         panic!("startup target should be sent");
     };
     response
-        .send(WalletBackfillFinishResult::Accepted {
+        .send(WalletBackfillStartResult::Accepted {
             committed_to: 100,
             target_block,
-            lease: WalletBackfillLease::from_token(token, sender),
+            grant: WalletBackfillGrant::from_token(token, sender.clone()),
         })
         .expect("send target result");
 
@@ -2603,10 +2659,6 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
         })
         .expect("send apply failure");
 
-    let Some(BackfillEvent::JobRetired { token: retired }) = receiver.recv().await else {
-        panic!("startup token should be retired");
-    };
-    assert_eq!(retired, token);
     assert!(!send_task.await.expect("send task completed"));
     assert!(receiver.try_recv().is_err());
 
@@ -2689,20 +2741,19 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
         .await
     });
 
-    let Some(BackfillEvent::Target {
+    let Some(BackfillEvent::Start {
         target_block,
         token,
-        sender,
         response,
     }) = receiver.recv().await
     else {
         panic!("startup target should be sent");
     };
     response
-        .send(WalletBackfillFinishResult::Accepted {
+        .send(WalletBackfillStartResult::Accepted {
             committed_to: 100,
             target_block,
-            lease: WalletBackfillLease::from_token(token, sender),
+            grant: WalletBackfillGrant::from_token(token, sender.clone()),
         })
         .expect("send target result");
 
@@ -2713,10 +2764,6 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
         .send(WalletBackfillApplyResult::Committed { committed_to: 105 })
         .expect("send apply success");
 
-    let Some(BackfillEvent::JobRetired { token: retired }) = receiver.recv().await else {
-        panic!("partial startup token should be retired");
-    };
-    assert_eq!(retired, token);
     assert!(send_task.await.expect("send task completed"));
     assert!(receiver.try_recv().is_err());
 
@@ -2891,6 +2938,52 @@ impl IndexedCatchUpTestContext {
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
+}
+
+#[tokio::test]
+async fn indexed_status_guard_drop_retires_claim_and_clears_status() {
+    let scope = test_scope();
+    let context = IndexedCatchUpTestContext::new(
+        &scope,
+        Url::parse("http://127.0.0.1:1").expect("quick sync URL"),
+        None,
+        100,
+        10,
+    )
+    .await;
+    let token = context.handle.mint_sync_token(0);
+    let driver = match send_wallet_target("test", &context.wallet_backfill_tx, 100, token).await {
+        WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
+        result => panic!("initial backfill start rejected: {result:?}"),
+    };
+    assert_eq!(
+        driver.finish("test", 100).await,
+        WalletBackfillFinishResult::Ready { committed_to: 100 }
+    );
+    let guard = WalletIndexedCatchUpStatusGuard::claim(&context.handle, true)
+        .await
+        .expect("indexed status guard claim");
+    guard.set(WalletIndexedCatchUpSource::Squid, 101, 200);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while context.handle.indexed_catch_up_rx.borrow().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("guard status published");
+
+    drop(guard);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while context.handle.indexed_catch_up_rx.borrow().is_some()
+            || context.handle.readiness() != WalletReadiness::Ready
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("guard drop cleared status and restored readiness");
+    context.cleanup();
 }
 
 fn test_chain_service(

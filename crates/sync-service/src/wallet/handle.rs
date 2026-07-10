@@ -129,19 +129,26 @@ impl WalletActorTokenAuthority<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub(crate) struct WalletIndexedCatchUpLease {
     token: WalletSyncToken,
+    _liveness: oneshot::Sender<()>,
 }
 
 impl WalletIndexedCatchUpLease {
     #[must_use]
-    pub(super) const fn for_actor_accepted_job(token: WalletSyncToken) -> Self {
-        Self { token }
+    pub(super) fn for_actor_accepted_job(
+        token: WalletSyncToken,
+        liveness: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            token,
+            _liveness: liveness,
+        }
     }
 
     #[must_use]
-    pub(crate) const fn token(self) -> WalletSyncToken {
+    pub(crate) const fn token(&self) -> WalletSyncToken {
         self.token
     }
 }
@@ -166,11 +173,8 @@ pub(super) enum WalletIndexedCatchUpCommand {
         response: oneshot::Sender<Option<WalletIndexedCatchUpLease>>,
     },
     Publish {
-        lease: WalletIndexedCatchUpLease,
+        token: WalletSyncToken,
         status: WalletIndexedCatchUpStatus,
-    },
-    Clear {
-        lease: WalletIndexedCatchUpLease,
     },
 }
 
@@ -896,18 +900,18 @@ impl WalletHandle {
 
     /// Start generation-scoped backfill from a public progress ticket.
     ///
-    /// Revalidates `progress` against the current view before minting a lease. Rejects if
-    /// the view is reset-pending or the generation advanced (stale ticket).
+    /// Revalidates `progress` before requesting acceptance. Only the actor constructs the
+    /// returned lease after recording the job and its liveness monitor.
     pub(crate) async fn start_backfill(
         &self,
         cache_key: &str,
         sender: &mpsc::Sender<BackfillEvent>,
         progress: crate::types::WalletSchedulableProgress,
         target_block: u64,
-    ) -> WalletBackfillFinishResult {
+    ) -> WalletBackfillStartResult {
         let Some(progress) = self.revalidate_schedulable_progress(progress) else {
             let current = self.schedulable_progress();
-            return WalletBackfillFinishResult::Rejected {
+            return WalletBackfillStartResult::Rejected {
                 committed_to: self.last_scanned_raw(),
                 reason: WalletBackfillRejectReason::StaleGeneration {
                     expected: current
@@ -917,11 +921,30 @@ impl WalletHandle {
                 },
             };
         };
-        let lease = WalletBackfillLease::from_token(
-            self.mint_sync_token(progress.reset_generation),
-            sender.clone(),
-        );
-        lease.finish(cache_key, target_block).await
+        let (response, result_rx) = oneshot::channel();
+        if let Err(err) = sender
+            .send(BackfillEvent::Start {
+                target_block,
+                token: self.mint_sync_token(progress.reset_generation),
+                response,
+            })
+            .await
+        {
+            warn!(
+                ?err,
+                cache_key, target_block, "failed to send wallet backfill start"
+            );
+            return WalletBackfillStartResult::Rejected {
+                committed_to: self.last_scanned_raw(),
+                reason: WalletBackfillRejectReason::Shutdown,
+            };
+        }
+        result_rx
+            .await
+            .unwrap_or(WalletBackfillStartResult::Rejected {
+                committed_to: self.last_scanned_raw(),
+                reason: WalletBackfillRejectReason::Shutdown,
+            })
     }
 
     /// Revalidate a stored progress ticket against the current public view.
@@ -1029,12 +1052,15 @@ impl WalletHandle {
 
     pub(crate) fn set_indexed_catch_up(
         &self,
-        lease: WalletIndexedCatchUpLease,
+        lease: &WalletIndexedCatchUpLease,
         status: WalletIndexedCatchUpStatus,
     ) {
-        if let Err(err) = self
-            .indexed_catch_up_status_tx
-            .send(WalletIndexedCatchUpCommand::Publish { lease, status })
+        if let Err(err) =
+            self.indexed_catch_up_status_tx
+                .send(WalletIndexedCatchUpCommand::Publish {
+                    token: lease.token(),
+                    status,
+                })
         {
             debug!(?err, cache_key = %self.cache_key, "failed to request indexed wallet catch-up status publication");
         }
@@ -1050,15 +1076,6 @@ impl WalletHandle {
             return None;
         }
         result.await.unwrap_or(None)
-    }
-
-    pub(crate) fn clear_indexed_catch_up(&self, lease: WalletIndexedCatchUpLease) {
-        if let Err(err) = self
-            .indexed_catch_up_status_tx
-            .send(WalletIndexedCatchUpCommand::Clear { lease })
-        {
-            debug!(?err, cache_key = %self.cache_key, "failed to request indexed wallet catch-up status clear");
-        }
     }
 
     fn notify_changed_with_projection(&self, utxos: &[WalletUtxo], overlay: &WalletPendingOverlay) {
