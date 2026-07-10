@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -56,8 +57,7 @@ use crate::types::{
     WalletReadinessError, WalletScanApply, WalletScanRowsPayload, WalletSyncToken,
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
-use crate::wallet::WalletPoiRuntime;
-use crate::wallet::spawn_wallet_worker;
+use crate::wallet::{WalletHandle, WalletPoiRuntime, spawn_wallet_worker};
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
@@ -362,6 +362,7 @@ async fn artifact_poi_corpus_survives_wallet_unregister_reregister() {
         )
         .with_poi_cache_service(Arc::new(
             crate::poi_cache::PoiCacheService::new(Arc::clone(&db), artifact_source.clone(), None)
+                .expect("initialize POI cache generation")
                 .with_poi_rpc_url(rpc_url.clone()),
         ))
     } else {
@@ -400,7 +401,7 @@ async fn artifact_poi_corpus_survives_wallet_unregister_reregister() {
         .local_caches();
 
     assert_ne!(first.actor_id(), second.actor_id());
-    assert!(Arc::ptr_eq(&first_corpus, &second_corpus));
+    assert!(first_corpus.ptr_eq(&second_corpus));
     service.unregister_wallet(&cfg.cache_key).await;
     service.shutdown().await;
     drop(db);
@@ -1472,6 +1473,157 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_wallet_initial_squid_probe_keeps_pre_probe_read_scope() {
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let (squid, block) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"150"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+            r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
+        ],
+        0,
+    );
+    let context = IndexedCatchUpTestContext::new(&scope, squid.url.clone(), None, 100, 100).await;
+    let catch_up = context.spawn_catch_up(150, IndexedWalletCatchUpSourceOrder::SquidFirst);
+
+    wait_for_std_signal(block.request_started, "initial Squid probe started").await;
+    context
+        .public_data_plane
+        .invalidate_public_scan_coverage_from(101)
+        .await;
+    block.release.send(()).expect("release initial Squid probe");
+    let checkpoint = catch_up.await.expect("indexed catch-up task");
+
+    assert_eq!(checkpoint, 100);
+    assert_eq!(context.handle.last_scanned(), Some(100));
+    assert!(matches!(
+        context
+            .public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(101, 150))
+            .await,
+        PublicCoverageAnswer::Missing { .. }
+    ));
+    let diagnostics = context.public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::CoverageRejected
+            && event.source == Some(PublicScanSource::Squid)
+            && event.range == Some(PublicScanRange::new(101, 150))
+    }));
+
+    context.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_wallet_squid_transition_probe_keeps_pre_probe_read_scope() {
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let artifact_source = checkpointed_wallet_artifact_source(scope.clone(), 100, 200, 150);
+    let (squid, block) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+            r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
+        ],
+        0,
+    );
+    let context = IndexedCatchUpTestContext::new(
+        &scope,
+        squid.url.clone(),
+        Some(artifact_source.config.clone()),
+        100,
+        100,
+    )
+    .await;
+    let catch_up = context.spawn_catch_up(200, IndexedWalletCatchUpSourceOrder::ArtifactsFirst);
+
+    wait_for_std_signal(block.request_started, "Squid transition probe started").await;
+    assert_eq!(context.handle.last_scanned(), Some(150));
+    context
+        .public_data_plane
+        .invalidate_public_scan_coverage_from(151)
+        .await;
+    block
+        .release
+        .send(())
+        .expect("release Squid transition probe");
+    let checkpoint = catch_up.await.expect("indexed catch-up task");
+
+    assert_eq!(checkpoint, 150);
+    assert_eq!(context.handle.last_scanned(), Some(150));
+    assert!(matches!(
+        context
+            .public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(151, 200))
+            .await,
+        PublicCoverageAnswer::Missing { .. }
+    ));
+    let diagnostics = context.public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::CoverageRejected
+            && event.source == Some(PublicScanSource::Squid)
+            && event.range == Some(PublicScanRange::new(151, 200))
+    }));
+
+    context.cleanup();
+    drop(artifact_source.server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_wallet_squid_session_is_not_restamped_between_pages() {
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+        r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
+        r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
+    ]);
+    let context = IndexedCatchUpTestContext::new(&scope, squid.url.clone(), None, 100, 50).await;
+    let (page_committed, release_page) = context
+        .public_data_plane
+        .block_after_indexed_wallet_page_for_test(150)
+        .await;
+    let catch_up = context.spawn_catch_up(200, IndexedWalletCatchUpSourceOrder::SquidFirst);
+
+    tokio::time::timeout(Duration::from_secs(2), page_committed)
+        .await
+        .expect("first Squid page committed")
+        .expect("page commit hook open");
+    assert_eq!(context.handle.last_scanned(), Some(150));
+    context
+        .public_data_plane
+        .invalidate_public_scan_coverage_from(151)
+        .await;
+    release_page.send(()).expect("release page boundary");
+    let checkpoint = catch_up.await.expect("indexed catch-up task");
+
+    assert_eq!(checkpoint, 150);
+    assert_eq!(context.handle.last_scanned(), Some(150));
+    assert!(matches!(
+        context
+            .public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(151, 200))
+            .await,
+        PublicCoverageAnswer::Missing { .. }
+    ));
+    let diagnostics = context.public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::CoverageRejected
+            && event.source == Some(PublicScanSource::Squid)
+            && event.range == Some(PublicScanRange::new(151, 200))
+    }));
+
+    context.cleanup();
+}
+
 #[tokio::test]
 async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
     let root_dir = temp_db_root("cached-coverage-no-intermediate-ready");
@@ -2478,6 +2630,147 @@ fn test_chain_config(
     }
 }
 
+struct IndexedCatchUpTestContext {
+    root_dir: PathBuf,
+    db: Arc<DbStore>,
+    service: Arc<ChainService>,
+    public_data_plane: ChainPublicDataPlane,
+    wallet_cfg: WalletConfig,
+    handle: WalletHandle,
+    wallet_backfill_tx: mpsc::Sender<BackfillEvent>,
+    cancel: CancellationToken,
+    last_scanned: u64,
+}
+
+async fn wait_for_std_signal(receiver: std_mpsc::Receiver<()>, message: &'static str) {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || receiver.recv().expect(message)),
+    )
+    .await
+    .expect(message)
+    .expect("signal wait task completed");
+}
+
+impl IndexedCatchUpTestContext {
+    async fn new(
+        scope: &ChainScope,
+        quick_sync_endpoint: Url,
+        indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
+        last_scanned: u64,
+        indexed_wallet_block_range: u64,
+    ) -> Self {
+        let root_dir = temp_db_root("indexed-wallet-read-session");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let rpcs = Arc::new(QueryRpcPool::new(
+            vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+            Duration::from_secs(1),
+        ));
+        let mut chain = test_chain_config(scope, Arc::clone(&rpcs), indexed_artifact_source);
+        chain.quick_sync_endpoint = Some(quick_sync_endpoint.clone());
+        chain.indexed_wallet_block_range = indexed_wallet_block_range;
+        let public_data_plane = ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+        let (wallet_backfill_tx, wallet_backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let wallet_cfg = test_wallet_config(scope, quick_sync_endpoint);
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs,
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: wallet_backfill_tx.clone(),
+                public_data_plane: public_data_plane.clone(),
+            },
+            wallet_cfg.clone(),
+            1,
+            service.live_log_tx.subscribe(),
+            wallet_backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            last_scanned,
+        )
+        .await
+        .expect("spawn wallet worker");
+        Self {
+            root_dir,
+            db,
+            service,
+            public_data_plane,
+            wallet_cfg,
+            handle,
+            wallet_backfill_tx,
+            cancel,
+            last_scanned,
+        }
+    }
+
+    fn spawn_catch_up(
+        &self,
+        safe_head: u64,
+        source_order: IndexedWalletCatchUpSourceOrder,
+    ) -> tokio::task::JoinHandle<u64> {
+        let service = Arc::clone(&self.service);
+        let cfg = self.wallet_cfg.clone();
+        let handle = self.handle.clone();
+        let cancel = self.cancel.clone();
+        let sender = self.wallet_backfill_tx.clone();
+        let last_scanned = self.last_scanned;
+        tokio::spawn(async move {
+            service
+                .indexed_wallet_catch_up(
+                    &cfg,
+                    0,
+                    last_scanned,
+                    safe_head,
+                    &handle,
+                    &cancel,
+                    source_order,
+                    true,
+                    (
+                        &sender,
+                        crate::types::WalletSchedulableProgress {
+                            last_scanned,
+                            reset_generation: 0,
+                        },
+                    ),
+                )
+                .await
+        })
+    }
+
+    fn cleanup(self) {
+        let Self {
+            root_dir,
+            db,
+            service,
+            public_data_plane,
+            handle,
+            cancel,
+            ..
+        } = self;
+        cancel.cancel();
+        drop(handle);
+        drop(service);
+        drop(public_data_plane);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
 fn test_chain_service(
     db: Arc<DbStore>,
     chain: ChainConfig,
@@ -2602,6 +2895,11 @@ struct GraphqlServer {
     requests: std_mpsc::Receiver<String>,
 }
 
+struct GraphqlServerBlock {
+    request_started: std_mpsc::Sender<()>,
+    release: std::sync::Mutex<std_mpsc::Receiver<()>>,
+}
+
 struct JsonRpcServer {
     url: Url,
     requests: std_mpsc::Receiver<String>,
@@ -2609,6 +2907,33 @@ struct JsonRpcServer {
 
 impl GraphqlServer {
     fn spawn(responses: Vec<&'static str>) -> Self {
+        Self::spawn_controlled(responses, None)
+    }
+
+    fn spawn_with_blocked_response(
+        responses: Vec<&'static str>,
+        blocked_response: usize,
+    ) -> (Self, PathServerBlockControl) {
+        let (request_started_tx, request_started) = std_mpsc::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let block = Arc::new(GraphqlServerBlock {
+            request_started: request_started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let server = Self::spawn_controlled(responses, Some((blocked_response, block)));
+        (
+            server,
+            PathServerBlockControl {
+                request_started,
+                release,
+            },
+        )
+    }
+
+    fn spawn_controlled(
+        responses: Vec<&'static str>,
+        blocked_response: Option<(usize, Arc<GraphqlServerBlock>)>,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind graphql server");
         let url = Url::parse(&format!(
             "http://{}",
@@ -2617,9 +2942,12 @@ impl GraphqlServer {
         .expect("graphql server url");
         let (request_tx, requests) = std_mpsc::channel();
         std::thread::spawn(move || {
-            for response in responses {
+            for (response_index, response) in responses.into_iter().enumerate() {
                 let (stream, _) = listener.accept().expect("accept graphql request");
-                handle_graphql_request(stream, response, &request_tx);
+                let block = blocked_response.as_ref().and_then(|(index, block)| {
+                    (*index == response_index).then(|| Arc::clone(block))
+                });
+                handle_graphql_request(stream, response, &request_tx, block);
             }
         });
         Self { url, requests }
@@ -2682,9 +3010,22 @@ fn handle_graphql_request(
     mut stream: std::net::TcpStream,
     response: &'static str,
     requests: &std_mpsc::Sender<String>,
+    block: Option<Arc<GraphqlServerBlock>>,
 ) {
     let request = read_http_request(&mut stream);
     requests.send(request).expect("record graphql request");
+    if let Some(block) = block {
+        block
+            .request_started
+            .send(())
+            .expect("signal blocked GraphQL response");
+        block
+            .release
+            .lock()
+            .expect("blocked GraphQL release lock")
+            .recv()
+            .expect("release blocked GraphQL response");
+    }
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.len()
@@ -3027,10 +3368,13 @@ fn write_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temp_db_root(name: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_nanos();
-    std::env::temp_dir().join(format!("sync-service-{name}-{unique}"))
+    let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("sync-service-{name}-{unique}-{counter}"))
 }

@@ -114,6 +114,8 @@ pub(crate) use poi_refresh::LivePoiTailError;
 pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
 #[cfg(test)]
+pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
+#[cfg(test)]
 pub(crate) use worker::spawn_wallet_worker;
 pub(crate) use worker::{PreparedWalletWorker, prepare_wallet_worker, wallet_cache_store};
 

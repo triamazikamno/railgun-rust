@@ -43,8 +43,8 @@ use crate::chain::{
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::types::{
     ChainKey, GlobalPoiPolicy, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-    PoiProxyFallback, WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletPrivateCommit,
-    WalletReadiness, WalletSchedulableProgress, WalletSyncActorStateCommit,
+    PoiProxyFallback, WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletLocalPoiCaches,
+    WalletPrivateCommit, WalletReadiness, WalletSchedulableProgress, WalletSyncActorStateCommit,
 };
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
@@ -179,6 +179,7 @@ fn test_public_data_plane_with_poi_service(db: &Arc<DbStore>) -> ChainPublicData
                 test_poi_artifact_source_config(),
                 None,
             )
+            .expect("initialize POI cache generation")
             .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("POI RPC URL")),
         ),
     )
@@ -1898,7 +1899,7 @@ async fn local_poi_status_refresh_reads_cache_without_remote_pois_per_list() {
     cache
         .apply_poi_leaves(0, &[U256::from_be_bytes(valid_blinded_commitment.0)])
         .expect("apply local poi leaf");
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+    let local_caches = WalletLocalPoiCaches::new_for_test(BTreeMap::from([(list_key, cache)]));
     let local_reader = LocalPoiStatusReader::new(local_caches);
     let unused_remote = RecordingPoiStatusClient::default();
 
@@ -2229,7 +2230,7 @@ async fn local_poi_merkle_proof_source_reads_cache_without_remote_merkle_proofs(
         }])
         .expect("apply artifact event");
     cache.accept_current_roots();
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+    let local_caches = WalletLocalPoiCaches::new_for_test(BTreeMap::from([(list_key, cache)]));
     let source = LocalPoiMerkleProofSource::new(local_caches);
 
     let proofs = source
@@ -2265,7 +2266,7 @@ async fn local_output_poi_proof_preflight_fails_before_expensive_recovery_when_c
         list_key,
     ));
     cache.accept_current_roots();
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+    let local_caches = WalletLocalPoiCaches::new_for_test(BTreeMap::from([(list_key, cache)]));
     let source = LocalPoiMerkleProofSource::new(local_caches);
 
     let failure = preflight_local_output_poi_input_proofs(
@@ -2316,7 +2317,7 @@ async fn local_output_poi_proof_preflight_checks_transaction_inputs() {
             event_type: PoiEventType::Transact,
         }])
         .expect("apply input POI event");
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+    let local_caches = WalletLocalPoiCaches::new_for_test(BTreeMap::from([(list_key, cache)]));
     let source = LocalPoiMerkleProofSource::new(local_caches);
 
     preflight_local_output_poi_input_proofs(
@@ -2659,10 +2660,8 @@ async fn tailed_cache_install_skips_when_current_cache_advanced() {
     initial_cache.accept_current_roots();
     let original_next_event_index = initial_cache.progress().next_event_index;
 
-    let local_caches = Arc::new(RwLock::new(BTreeMap::from([(
-        list_key,
-        initial_cache.clone(),
-    )])));
+    let local_caches =
+        WalletLocalPoiCaches::new_for_test(BTreeMap::from([(list_key, initial_cache.clone())]));
     let mut stale_tail_cache = initial_cache;
     stale_tail_cache
         .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {

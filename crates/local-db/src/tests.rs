@@ -488,11 +488,18 @@ fn clear_poi_artifact_cache_removes_only_poi_artifact_records() {
         .put_desktop_wallet_vault_record("vault|meta", b"encrypted metadata")
         .expect("store vault metadata");
 
-    let removed = store
-        .clear_poi_artifact_cache()
+    let (removed, generation) = store
+        .clear_poi_artifact_cache_with_generation()
         .expect("clear POI artifact cache");
 
     assert_eq!(removed, 2);
+    assert_eq!(generation, 1);
+    assert_eq!(
+        store
+            .poi_artifact_cache_generation()
+            .expect("load POI artifact cache generation"),
+        generation
+    );
     assert!(
         store
             .get_poi_artifact_cache(

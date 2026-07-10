@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,31 +31,53 @@ static POI_ARTIFACT_CACHE_SYNC_STATE: LazyLock<Mutex<PoiArtifactCacheSyncState>>
 
 #[derive(Default)]
 struct PoiArtifactCacheSyncState {
-    generations: BTreeMap<PathBuf, u64>,
+    generations: BTreeMap<PathBuf, Arc<AtomicU64>>,
 }
 
 impl PoiArtifactCacheSyncState {
     fn lock() -> MutexGuard<'static, Self> {
         POI_ARTIFACT_CACHE_SYNC_STATE
             .lock()
-            .expect("POI artifact cache sync lock poisoned")
+            .expect("POI artifact cache sync state lock poisoned")
     }
 
-    fn generation(&mut self, db: &DbStore) -> u64 {
-        *self
-            .generations
-            .entry(db.root_dir().to_path_buf())
-            .or_insert(0)
+    fn generation_cell(&mut self, db: &DbStore) -> Result<Arc<AtomicU64>, local_db::DbError> {
+        if let Some(generation) = self.generations.get(db.root_dir()) {
+            return Ok(Arc::clone(generation));
+        }
+        let generation = Arc::new(AtomicU64::new(db.poi_artifact_cache_generation()?));
+        self.generations
+            .insert(db.root_dir().to_path_buf(), Arc::clone(&generation));
+        Ok(generation)
     }
 
-    fn bump_generation(&mut self, db: &DbStore) -> u64 {
-        let generation = self
+    fn publish_generation(&mut self, db: &DbStore, generation: u64) {
+        let cell = self
             .generations
             .entry(db.root_dir().to_path_buf())
-            .or_insert(0);
-        *generation = generation.saturating_add(1);
-        *generation
+            .or_insert_with(|| Arc::new(AtomicU64::new(generation)));
+        cell.store(generation, Ordering::Release);
     }
+}
+
+pub(crate) fn with_poi_artifact_cache_generation<R>(
+    generation: &AtomicU64,
+    operation: impl FnOnce(u64) -> R,
+) -> R {
+    let _sync_guard = PoiArtifactCacheSyncState::lock();
+    operation(generation.load(Ordering::Acquire))
+}
+
+pub(crate) fn poi_artifact_cache_generation_cell(
+    db: &DbStore,
+) -> Result<Arc<AtomicU64>, local_db::DbError> {
+    PoiArtifactCacheSyncState::lock().generation_cell(db)
+}
+
+fn lock_poi_artifact_cache_sync() -> MutexGuard<'static, PoiArtifactCacheSyncState> {
+    POI_ARTIFACT_CACHE_SYNC_STATE
+        .lock()
+        .expect("POI artifact cache sync state lock poisoned")
 }
 
 #[derive(Clone, Copy)]
@@ -445,13 +468,13 @@ impl PoiArtifactIngestor {
         let last_sequence = persisted
             .as_ref()
             .map(|persisted| persisted.record.last_accepted_manifest_sequence);
-        let cache_generation = persisted.as_ref().map_or_else(
-            || {
-                let mut state = PoiArtifactCacheSyncState::lock();
-                state.generation(db)
-            },
-            |persisted| persisted.cache_generation,
-        );
+        let cache_generation = match persisted.as_ref() {
+            Some(persisted) => persisted.cache_generation,
+            None => {
+                let generation = poi_artifact_cache_generation_cell(db)?;
+                with_poi_artifact_cache_generation(&generation, |generation| generation)
+            }
+        };
         let refresh_started = Instant::now();
         let refresh = self
             .refresh_verified_cache(
@@ -911,6 +934,12 @@ pub(crate) struct PersistedPoiArtifactCache {
     pub(crate) cache_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoiArtifactCacheReset {
+    pub(crate) removed: u64,
+    pub(crate) generation: u64,
+}
+
 #[derive(Debug, Default)]
 struct ArtifactSuffixMergeOutcome {
     base_events: usize,
@@ -1002,8 +1031,8 @@ pub(crate) fn load_persisted_cache(
     db: &DbStore,
     identity: &PoiCacheIdentity,
 ) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
-    let mut state = PoiArtifactCacheSyncState::lock();
-    let cache_generation = state.generation(db);
+    let mut sync_state = lock_poi_artifact_cache_sync();
+    let cache_generation = sync_state.generation_cell(db)?.load(Ordering::Acquire);
     let Some(record) = db.get_poi_artifact_cache(
         identity.chain_type,
         identity.chain_id,
@@ -1041,8 +1070,8 @@ pub(crate) fn persist_refresh(
         cache_payload,
         updated_at: 0,
     };
-    let mut state = PoiArtifactCacheSyncState::lock();
-    let current_generation = state.generation(db);
+    let mut sync_state = lock_poi_artifact_cache_sync();
+    let current_generation = sync_state.generation_cell(db)?.load(Ordering::Acquire);
     if refresh.cache_generation != current_generation {
         return Err(PoiArtifactError::StalePublicCacheGeneration {
             expected: current_generation,
@@ -1337,10 +1366,16 @@ fn common_delta_prefix_len(
         .count()
 }
 
-pub(crate) fn clear_poi_artifact_cache_for_reset(db: &DbStore) -> Result<u64, local_db::DbError> {
-    let mut state = PoiArtifactCacheSyncState::lock();
-    state.bump_generation(db);
-    db.clear_poi_artifact_cache()
+pub(crate) fn clear_poi_artifact_cache_for_reset(
+    db: &DbStore,
+) -> Result<PoiArtifactCacheReset, local_db::DbError> {
+    let mut sync_state = lock_poi_artifact_cache_sync();
+    let (removed, generation) = db.clear_poi_artifact_cache_with_generation()?;
+    sync_state.publish_generation(db, generation);
+    Ok(PoiArtifactCacheReset {
+        removed,
+        generation,
+    })
 }
 
 #[cfg(test)]
@@ -1349,6 +1384,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::sync::mpsc::{self, Receiver};
 
     use cid::Cid;
@@ -1980,11 +2016,18 @@ mod tests {
             cache_generation: loaded.cache_generation,
         };
 
-        let removed = clear_poi_artifact_cache_for_reset(&db).expect("reset POI artifact cache");
+        let reset = clear_poi_artifact_cache_for_reset(&db).expect("reset POI artifact cache");
         let error = persist_refresh(&db, &identity, &refresh)
             .expect_err("stale refresh must not repopulate after reset");
 
-        assert_eq!(removed, 1);
+        assert_eq!(reset.removed, 1);
+        assert_eq!(reset.generation, 1);
+        assert_eq!(
+            poi_artifact_cache_generation_cell(&db)
+                .expect("load reset generation")
+                .load(Ordering::Acquire),
+            reset.generation
+        );
         assert!(matches!(
             error,
             PoiArtifactError::StalePublicCacheGeneration { .. }
@@ -2001,6 +2044,17 @@ mod tests {
         );
 
         drop(db);
+        let reopened = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("reopen db");
+        assert_eq!(
+            poi_artifact_cache_generation_cell(&reopened)
+                .expect("load persisted reset generation")
+                .load(Ordering::Acquire),
+            reset.generation
+        );
+        drop(reopened);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 

@@ -32,6 +32,7 @@ const OUTPUT_POI_RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
 const POI_ARTIFACT_CACHE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("poi_artifact_cache");
 const APP_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("app_settings_v1");
+const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
 const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("desktop_wallet_vault_v1");
 
@@ -1226,8 +1227,35 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn poi_artifact_cache_generation(&self) -> Result<u64, DbError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
+            Some(value) => decode(value.value()),
+            None => Ok(0),
+        }
+    }
+
     pub fn clear_poi_artifact_cache(&self) -> Result<u64, DbError> {
+        self.clear_poi_artifact_cache_with_generation()
+            .map(|(removed, _)| removed)
+    }
+
+    pub fn clear_poi_artifact_cache_with_generation(&self) -> Result<(u64, u64), DbError> {
         let txn = self.db.begin_write()?;
+        let generation = {
+            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            let current = match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
+                Some(value) => decode(value.value())?,
+                None => 0_u64,
+            };
+            let generation = current
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("POI artifact cache generation overflow"))?;
+            let encoded = encode(&generation)?;
+            table.insert(POI_ARTIFACT_CACHE_GENERATION_KEY, encoded.as_slice())?;
+            generation
+        };
         let removed = {
             let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
             let removed = table.len()?;
@@ -1235,7 +1263,7 @@ impl DbStore {
             removed
         };
         txn.commit()?;
-        Ok(removed)
+        Ok((removed, generation))
     }
 
     pub fn get_pending_fee_note_assurance(

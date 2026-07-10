@@ -557,6 +557,13 @@ struct ChainPublicDataPlaneState {
     poi_corpora: BTreeMap<PublicPoiCorpusKey, LocalPoiCaches>,
 }
 
+#[cfg(test)]
+struct IndexedWalletPageTestBlock {
+    checkpoint: u64,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalletScanArtifactChunkCacheReset {
     blob_entries_removed: u64,
@@ -603,6 +610,8 @@ pub(crate) struct ChainPublicDataPlane {
     state: Arc<Mutex<ChainPublicDataPlaneState>>,
     commit_fence: Arc<Mutex<()>>,
     poi_cache_service: Option<Arc<PoiCacheService>>,
+    #[cfg(test)]
+    indexed_wallet_page_test_block: Arc<Mutex<Option<IndexedWalletPageTestBlock>>>,
 }
 
 impl ChainPublicDataPlane {
@@ -614,6 +623,8 @@ impl ChainPublicDataPlane {
             state: Arc::new(Mutex::new(ChainPublicDataPlaneState::default())),
             commit_fence: Arc::new(Mutex::new(())),
             poi_cache_service: None,
+            #[cfg(test)]
+            indexed_wallet_page_test_block: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -637,6 +648,43 @@ impl ChainPublicDataPlane {
     #[must_use]
     pub(crate) fn begin_public_scan_read(&self) -> PublicScanReadScope {
         PublicScanReadScope::new(self.current_epoch())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn block_after_indexed_wallet_page_for_test(
+        &self,
+        checkpoint: u64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *self.indexed_wallet_page_test_block.lock().await = Some(IndexedWalletPageTestBlock {
+            checkpoint,
+            reached,
+            release: release_rx,
+        });
+        (reached_rx, release)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_after_indexed_wallet_page_for_test(&self, checkpoint: u64) {
+        let block = {
+            let mut block = self.indexed_wallet_page_test_block.lock().await;
+            if block
+                .as_ref()
+                .is_some_and(|block| block.checkpoint == checkpoint)
+            {
+                block.take()
+            } else {
+                None
+            }
+        };
+        if let Some(block) = block {
+            let _ = block.reached.send(());
+            let _ = block.release.await;
+        }
     }
 
     pub(crate) async fn cached_public_scan_coverage(
@@ -716,12 +764,13 @@ impl ChainPublicDataPlane {
                 }
             })?
         } else {
-            self.clear_in_memory_poi_corpora().await;
-            clear_poi_artifact_cache_for_reset(&self.db).map_err(|err| {
+            let reset = clear_poi_artifact_cache_for_reset(&self.db).map_err(|err| {
                 PublicDataPlaneError::PublicCacheReset {
                     reason: err.to_string(),
                 }
-            })?
+            })?;
+            self.clear_in_memory_poi_corpora().await;
+            reset.removed
         };
         Ok(PublicSyncCacheReset {
             previous_epoch,
@@ -741,11 +790,6 @@ impl ChainPublicDataPlane {
         &self,
         key: PublicPoiCorpusKey,
     ) -> Result<PublicPoiCorpusHandle, PublicDataPlaneError> {
-        if let Some(existing) = self.state.lock().await.poi_corpora.get(&key).cloned() {
-            return Ok(PublicPoiCorpusHandle {
-                local_caches: existing,
-            });
-        }
         let Some(service) = self.poi_cache_service.as_ref() else {
             return Err(PublicDataPlaneError::PoiCorpusUnavailable {
                 chain_id: key.chain_id,
@@ -1390,7 +1434,7 @@ mod tests {
             .ensure_poi_corpus(key.clone())
             .await
             .expect("second POI corpus");
-        assert!(Arc::ptr_eq(&first.local_caches(), &second.local_caches()));
+        assert!(first.local_caches().ptr_eq(&second.local_caches()));
         assert_eq!(data_plane.state.lock().await.poi_corpora.len(), 1);
         let list_key = FixedBytes::from([0x11; 32]);
         let mut cache = PoiCache::new(PoiCacheIdentity::new(
@@ -1423,6 +1467,70 @@ mod tests {
                 .await
         );
         drop(data_plane);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn poi_corpus_fast_path_synchronizes_reset_from_another_service() {
+        let (db, root_dir) = test_db("poi-corpus-cross-service-generation");
+        let artifact_config = || PoiArtifactSourceConfig {
+            trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+            manifest_source: PoiArtifactManifestSource::Url(
+                Url::parse("http://127.0.0.1:1/poi-manifest.json").expect("POI manifest URL"),
+            ),
+            gateway_urls: Vec::new(),
+            max_manifest_age: None,
+        };
+        let reset_service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+            .expect("initialize reset service");
+        let serving_service = Arc::new(
+            PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+                .expect("initialize serving service"),
+        );
+        let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)))
+            .with_poi_cache_service(serving_service);
+        let key = PublicPoiCorpusKey::wallet_default(1);
+        let list_key = FixedBytes::from([0x31; 32]);
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            key.chain_type,
+            key.chain_id,
+            &key.txid_version,
+            list_key,
+        ));
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x32; 32],
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply old-generation POI event");
+        let first = data_plane
+            .ensure_poi_corpus(key.clone())
+            .await
+            .expect("initial POI corpus");
+        first.local_caches().write().await.insert(list_key, cache);
+
+        reset_service
+            .reset_poi_artifact_cache()
+            .await
+            .expect("cross-service reset");
+        let second = data_plane
+            .ensure_poi_corpus(key)
+            .await
+            .expect("generation-synchronized POI corpus");
+
+        assert!(first.local_caches().ptr_eq(&second.local_caches()));
+        assert!(
+            second.local_caches().read().await.is_empty(),
+            "the registry fast path must not expose the old-generation corpus"
+        );
+
+        data_plane.shutdown();
+        reset_service.shutdown();
+        drop(data_plane);
+        drop(reset_service);
+        drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
@@ -1860,6 +1968,11 @@ mod tests {
         assert_eq!(reset.wallet_scan_artifact_chunk_entries_removed, 1);
         assert!(reset.wallet_scan_artifact_chunk_files_removed >= 1);
         assert_eq!(reset.poi_cache_entries_removed, 1);
+        assert_eq!(
+            db.poi_artifact_cache_generation()
+                .expect("load POI cache generation after reset"),
+            1
+        );
         assert!(
             db.get_blob_meta(txid_kind, txid_id)
                 .expect("get txid blob meta after reset")
@@ -2122,6 +2235,7 @@ mod tests {
             },
             None,
         )
+        .expect("initialize POI cache generation")
         .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("POI RPC URL"));
         let data_plane = ChainPublicDataPlane::new(db, Arc::new(AtomicU64::new(0)))
             .with_poi_cache_service(Arc::new(poi_cache_service));

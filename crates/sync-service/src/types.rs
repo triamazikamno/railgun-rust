@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, FixedBytes, U256, address};
@@ -15,7 +16,7 @@ use railgun_wallet::scan::WalletLogDelta;
 use railgun_wallet::scan::{WalletScanError, WalletScanInputRows, WalletScanKeys};
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError, serialize_wallet_utxo};
 use railgun_wallet::{ProverService, WalletUtxo};
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, mpsc, oneshot, watch};
 use tracing::warn;
 use url::Url;
 
@@ -308,7 +309,110 @@ impl PoiArtifactCacheProgress {
     }
 }
 
-pub type LocalPoiCaches = Arc<RwLock<BTreeMap<FixedBytes<32>, PoiCache>>>;
+type LocalPoiCacheMap = BTreeMap<FixedBytes<32>, PoiCache>;
+
+#[derive(Debug)]
+struct LocalPoiCachesInner {
+    caches: RwLock<LocalPoiCacheMap>,
+    shared_generation: Arc<AtomicU64>,
+    installed_generation: AtomicU64,
+}
+
+/// A generation-fenced handle to chain-local POI caches.
+///
+/// Clones share both the cache map and its installed generation. Every guard
+/// acquisition clears the map before exposing it if the database generation
+/// has advanced.
+#[derive(Debug, Clone)]
+pub struct LocalPoiCaches {
+    inner: Arc<LocalPoiCachesInner>,
+}
+
+impl LocalPoiCaches {
+    #[must_use]
+    pub fn new(shared_generation: Arc<AtomicU64>) -> Self {
+        let installed_generation = shared_generation.load(Ordering::Acquire);
+        Self {
+            inner: Arc::new(LocalPoiCachesInner {
+                caches: RwLock::new(BTreeMap::new()),
+                shared_generation,
+                installed_generation: AtomicU64::new(installed_generation),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_for_test(caches: BTreeMap<FixedBytes<32>, PoiCache>) -> Self {
+        Self {
+            inner: Arc::new(LocalPoiCachesInner {
+                caches: RwLock::new(caches),
+                shared_generation: Arc::new(AtomicU64::new(0)),
+                installed_generation: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub async fn read(&self) -> RwLockReadGuard<'_, BTreeMap<FixedBytes<32>, PoiCache>> {
+        let guard = self.inner.caches.read().await;
+        if self.installed_generation() == self.current_generation() {
+            return guard;
+        }
+        drop(guard);
+
+        let mut guard = self.inner.caches.write().await;
+        self.synchronize_locked(&mut guard);
+        RwLockWriteGuard::downgrade(guard)
+    }
+
+    pub async fn write(&self) -> RwLockWriteGuard<'_, BTreeMap<FixedBytes<32>, PoiCache>> {
+        let mut guard = self.inner.caches.write().await;
+        self.synchronize_locked(&mut guard);
+        guard
+    }
+
+    pub(crate) async fn synchronize_generation(&self) -> bool {
+        if self.installed_generation() == self.current_generation() {
+            return false;
+        }
+        let mut guard = self.inner.caches.write().await;
+        self.synchronize_locked(&mut guard)
+    }
+
+    pub(crate) fn shared_generation(&self) -> &AtomicU64 {
+        self.inner.shared_generation.as_ref()
+    }
+
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.inner.shared_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn installed_generation(&self) -> u64 {
+        self.inner.installed_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_installed_generation(&self, generation: u64) {
+        self.inner
+            .installed_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn synchronize_locked(&self, caches: &mut LocalPoiCacheMap) -> bool {
+        let current_generation = self.current_generation();
+        if self.installed_generation() == current_generation {
+            return false;
+        }
+        caches.clear();
+        self.mark_installed_generation(current_generation);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 pub type WalletLocalPoiCaches = LocalPoiCaches;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

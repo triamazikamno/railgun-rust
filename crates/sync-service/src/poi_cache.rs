@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime};
 
 use alloy::hex;
@@ -16,7 +16,8 @@ use url::Url;
 
 use crate::poi_artifacts::{
     PersistedPoiArtifactCache, PoiArtifactIngestor, PoiArtifactProgressEvent,
-    clear_poi_artifact_cache_for_reset, load_persisted_cache,
+    clear_poi_artifact_cache_for_reset, load_persisted_cache, poi_artifact_cache_generation_cell,
+    with_poi_artifact_cache_generation,
 };
 use crate::types::{
     LocalPoiCaches, PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
@@ -30,10 +31,6 @@ const EVM_CHAIN_TYPE: u8 = 0;
 const POI_ARTIFACT_CACHE_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const POI_ARTIFACT_CACHE_LIVE_TAIL_INTERVAL: Duration = Duration::from_secs(60);
 
-struct ChainPoiCacheState {
-    local_caches: LocalPoiCaches,
-}
-
 struct ChainPoiCacheLoop {
     db: Arc<DbStore>,
     http_client: Option<reqwest::Client>,
@@ -45,7 +42,6 @@ struct ChainPoiCacheLoop {
     preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
     cancel: CancellationToken,
-    install_epoch: Arc<AtomicU64>,
 }
 
 pub struct PoiCacheService {
@@ -53,11 +49,10 @@ pub struct PoiCacheService {
     artifact_config: PoiArtifactSourceConfig,
     http_client: Option<reqwest::Client>,
     poi_rpc_url: Url,
-    chains: RwLock<HashMap<u64, ChainPoiCacheState>>,
+    chains: RwLock<HashMap<u64, LocalPoiCaches>>,
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
     cancel: CancellationToken,
-    /// Protocol C2: bumped on public POI cache reset; in-flight sync installs must match.
-    install_epoch: Arc<AtomicU64>,
+    cache_generation: Arc<AtomicU64>,
 }
 
 impl PoiCacheService {
@@ -66,9 +61,10 @@ impl PoiCacheService {
         db: Arc<DbStore>,
         artifact_config: PoiArtifactSourceConfig,
         http_client: Option<reqwest::Client>,
-    ) -> Self {
+    ) -> Result<Self, local_db::DbError> {
         let (progress_tx, _) = watch::channel(BTreeMap::new());
-        Self {
+        let cache_generation = poi_artifact_cache_generation_cell(&db)?;
+        Ok(Self {
             db,
             artifact_config,
             http_client,
@@ -76,8 +72,8 @@ impl PoiCacheService {
             chains: RwLock::new(HashMap::new()),
             progress_tx,
             cancel: CancellationToken::new(),
-            install_epoch: Arc::new(AtomicU64::new(0)),
-        }
+            cache_generation,
+        })
     }
 
     #[must_use]
@@ -102,18 +98,21 @@ impl PoiCacheService {
             return existing;
         }
 
-        let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
-        {
+        let local_caches = LocalPoiCaches::new(Arc::clone(&self.cache_generation));
+        let chain_already_started = {
             let mut chains = self.chains.write().await;
-            if let Some(existing) = chains.get(&chain_id) {
-                return Arc::clone(&existing.local_caches);
+            if chains.contains_key(&chain_id) {
+                true
+            } else {
+                chains.insert(chain_id, local_caches.clone());
+                false
             }
-            chains.insert(
-                chain_id,
-                ChainPoiCacheState {
-                    local_caches: Arc::clone(&local_caches),
-                },
-            );
+        };
+        if chain_already_started {
+            return self
+                .local_caches(chain_id)
+                .await
+                .expect("chain cache state exists after concurrent start");
         }
 
         let active_list_keys = default_active_poi_list_keys();
@@ -132,13 +131,15 @@ impl PoiCacheService {
                 None,
             ),
         );
-        let preloaded_caches = install_persisted_chain_poi_caches(
+        let mut preloaded_caches = install_persisted_chain_poi_caches(
             self.db.as_ref(),
             chain_id,
             &local_caches,
             &active_list_keys,
         )
         .await;
+        synchronize_chain_cache_generation(chain_id, &local_caches, Some(&mut preloaded_caches))
+            .await;
         emit_chain_poi_cache_ready_progress(
             &self.progress_tx,
             chain_id,
@@ -152,28 +153,37 @@ impl PoiCacheService {
             poi_rpc_url: self.poi_rpc_url.clone(),
             artifact_config: self.artifact_config.clone(),
             chain_id,
-            local_caches: Arc::clone(&local_caches),
+            local_caches: local_caches.clone(),
             active_list_keys,
             preloaded_caches,
             progress_tx: self.progress_tx.clone(),
             cancel: self.cancel.child_token(),
-            install_epoch: Arc::clone(&self.install_epoch),
         });
         local_caches
     }
 
     pub async fn local_caches(&self, chain_id: u64) -> Option<LocalPoiCaches> {
-        self.chains
-            .read()
-            .await
-            .get(&chain_id)
-            .map(|state| Arc::clone(&state.local_caches))
+        let local_caches = self.chains.read().await.get(&chain_id).cloned()?;
+        if synchronize_chain_cache_generation(chain_id, &local_caches, None).await {
+            send_stale_chain_poi_cache_progress(&self.progress_tx, chain_id);
+            spawn_chain_poi_cache_resync(
+                Arc::clone(&self.db),
+                self.http_client.clone(),
+                self.poi_rpc_url.clone(),
+                self.artifact_config.clone(),
+                chain_id,
+                local_caches.clone(),
+                self.progress_tx.clone(),
+            );
+        }
+        Some(local_caches)
     }
 
     pub async fn retry_poi_artifact_cache_refresh(&self, chain_id: u64) -> bool {
-        let Some(local_caches) = self.local_caches(chain_id).await else {
+        let Some(local_caches) = self.chains.read().await.get(&chain_id).cloned() else {
             return false;
         };
+        synchronize_chain_cache_generation(chain_id, &local_caches, None).await;
         spawn_chain_poi_cache_resync(
             Arc::clone(&self.db),
             self.http_client.clone(),
@@ -182,19 +192,22 @@ impl PoiCacheService {
             chain_id,
             local_caches,
             self.progress_tx.clone(),
-            Arc::clone(&self.install_epoch),
         );
         true
     }
 
     pub async fn reset_poi_artifact_cache(&self) -> Result<u64, local_db::DbError> {
-        let removed = clear_poi_artifact_cache_for_reset(&self.db)?;
+        let reset = clear_poi_artifact_cache_for_reset(&self.db)?;
+        debug!(
+            generation = reset.generation,
+            "POI artifact cache generation published after durable reset"
+        );
         let chains: Vec<_> = self
             .chains
             .read()
             .await
             .iter()
-            .map(|(chain_id, state)| (*chain_id, Arc::clone(&state.local_caches)))
+            .map(|(chain_id, local_caches)| (*chain_id, local_caches.clone()))
             .collect();
         let chain_count = chains.len();
 
@@ -215,21 +228,13 @@ impl PoiCacheService {
                     None,
                 ),
             );
-            let mut caches = local_caches.write().await;
-            let in_memory_caches = caches.len();
-            caches.clear();
+            local_caches.synchronize_generation().await;
+            let installed_generation = local_caches.installed_generation();
             info!(
                 chain_id,
-                in_memory_caches, "cleared in-memory artifact POI cache"
+                installed_generation, "fenced in-memory artifact POI cache"
             );
         }
-
-        // Invalidate any in-flight install that started before this reset.
-        let epoch = self.install_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        debug!(
-            epoch,
-            "POI artifact cache install epoch advanced after reset"
-        );
 
         for (chain_id, local_caches) in chains {
             spawn_chain_poi_cache_resync(
@@ -240,15 +245,16 @@ impl PoiCacheService {
                 chain_id,
                 local_caches,
                 self.progress_tx.clone(),
-                Arc::clone(&self.install_epoch),
             );
         }
 
         info!(
-            persisted_records = removed,
-            chain_count, "reset local artifact POI cache"
+            persisted_records = reset.removed,
+            generation = reset.generation,
+            chain_count,
+            "reset local artifact POI cache"
         );
-        Ok(removed)
+        Ok(reset.removed)
     }
 
     pub fn shutdown(&self) {
@@ -294,6 +300,28 @@ fn send_poi_artifact_cache_progress(
     progress_tx.send_modify(|chains| {
         chains.insert(progress.chain_id, progress);
     });
+}
+
+fn send_stale_chain_poi_cache_progress(
+    progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
+    chain_id: u64,
+) {
+    let active_list_keys = default_active_poi_list_keys();
+    send_poi_artifact_cache_progress(
+        progress_tx,
+        new_poi_artifact_cache_progress(
+            chain_id,
+            PoiArtifactCachePhase::LoadingPersisted,
+            0,
+            active_list_keys.len(),
+            None,
+            None,
+            None,
+            poi_cache_list_progress_for_keys(&active_list_keys),
+            false,
+            None,
+        ),
+    );
 }
 
 fn poi_cache_list_progress_for_keys(
@@ -437,7 +465,6 @@ fn spawn_chain_poi_cache_resync(
     chain_id: u64,
     local_caches: LocalPoiCaches,
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
-    install_epoch: Arc<AtomicU64>,
 ) {
     tokio::spawn(
         async move {
@@ -452,7 +479,6 @@ fn spawn_chain_poi_cache_resync(
                 &active_list_keys,
                 BTreeMap::new(),
                 &progress_tx,
-                &install_epoch,
             )
             .await;
         }
@@ -487,7 +513,6 @@ async fn run_chain_poi_cache_loop(mut task: ChainPoiCacheLoop) {
                 &task.active_list_keys,
                 std::mem::take(&mut task.preloaded_caches),
                 &task.progress_tx,
-                &task.install_epoch,
             )
             .await;
             last_artifact_sync = Instant::now();
@@ -521,9 +546,7 @@ async fn sync_chain_poi_artifact_caches(
     active_list_keys: &[FixedBytes<32>],
     mut preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
     progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
-    install_epoch: &AtomicU64,
 ) {
-    let expected_install_epoch = install_epoch.load(Ordering::Acquire);
     let total_lists = active_list_keys.len();
     if total_lists == 0 {
         send_poi_artifact_cache_progress(
@@ -544,6 +567,7 @@ async fn sync_chain_poi_artifact_caches(
         return;
     }
 
+    synchronize_chain_cache_generation(chain_id, local_caches, Some(&mut preloaded_caches)).await;
     let initially_ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let client = http_client.cloned().unwrap_or_else(reqwest::Client::new);
@@ -590,6 +614,7 @@ async fn sync_chain_poi_artifact_caches(
             Ok(refresh) => {
                 let manifest_sequence = refresh.manifest_sequence;
                 let artifact_tip_index = refresh.entry.current_tip_index;
+                let candidate_generation = refresh.cache_generation;
                 let mut cache = refresh.cache;
                 let live_tail_started = Instant::now();
                 let live_tail = if let Some(client) = live_tail_client.as_ref() {
@@ -663,28 +688,21 @@ async fn sync_chain_poi_artifact_caches(
                 let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
                 let install_started = Instant::now();
                 let install_lock_started = Instant::now();
-                let installed = if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
+                let installed = install_generated_cache_if_current(
+                    local_caches,
+                    *list_key,
+                    cache,
+                    candidate_generation,
+                )
+                .await;
+                if !installed && local_caches.current_generation() != candidate_generation {
                     debug!(
                         chain_id,
                         list_key = %hex::encode(list_key),
-                        expected_install_epoch,
-                        "artifact POI cache install skipped; install epoch advanced (public cache reset)"
+                        candidate_generation,
+                        "artifact POI cache install skipped; cache generation advanced"
                     );
-                    false
-                } else {
-                    let mut caches = local_caches.write().await;
-                    if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
-                        debug!(
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            expected_install_epoch,
-                            "artifact POI cache install skipped under lock; install epoch advanced"
-                        );
-                        false
-                    } else {
-                        install_cache_if_not_behind(&mut caches, *list_key, cache)
-                    }
-                };
+                }
                 let install_lock_wait_elapsed_ms = install_lock_started.elapsed().as_millis();
                 debug!(
                     chain_id,
@@ -719,6 +737,7 @@ async fn sync_chain_poi_artifact_caches(
                 );
                 match load_persisted_cache(db, &identity) {
                     Ok(Some(persisted)) => {
+                        let candidate_generation = persisted.cache_generation;
                         let mut cache = persisted.cache;
                         if let Some(client) = live_tail_client.as_ref() {
                             match live_tail_candidate_cache(client, &cache).await {
@@ -733,33 +752,20 @@ async fn sync_chain_poi_artifact_caches(
                                 ),
                             }
                         }
-                        if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
+                        let installed = install_generated_cache_if_current(
+                            local_caches,
+                            *list_key,
+                            cache,
+                            candidate_generation,
+                        )
+                        .await;
+                        if !installed {
                             debug!(
                                 chain_id,
                                 list_key = %hex::encode(list_key),
-                                expected_install_epoch,
-                                "persisted artifact POI cache install skipped; install epoch advanced"
+                                candidate_generation,
+                                "persisted artifact POI cache install skipped; stale generation or current cache is newer"
                             );
-                        } else {
-                            let mut caches = local_caches.write().await;
-                            if install_epoch.load(Ordering::Acquire) != expected_install_epoch {
-                                debug!(
-                                    chain_id,
-                                    list_key = %hex::encode(list_key),
-                                    expected_install_epoch,
-                                    "persisted artifact POI cache install skipped under lock; install epoch advanced"
-                                );
-                            } else {
-                                let installed =
-                                    install_cache_if_not_behind(&mut caches, *list_key, cache);
-                                if !installed {
-                                    debug!(
-                                        chain_id,
-                                        list_key = %hex::encode(list_key),
-                                        "persisted artifact POI cache install skipped; current cache is newer"
-                                    );
-                                }
-                            }
                         }
                     }
                     Ok(None) => {}
@@ -770,6 +776,7 @@ async fn sync_chain_poi_artifact_caches(
                         "failed to load persisted artifact POI cache after refresh error"
                     ),
                 }
+                synchronize_chain_cache_generation(chain_id, local_caches, None).await;
                 let ready =
                     chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys)
                         .await;
@@ -797,6 +804,7 @@ async fn sync_chain_poi_artifact_caches(
             }
         }
     }
+    synchronize_chain_cache_generation(chain_id, local_caches, None).await;
     let ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
@@ -839,6 +847,70 @@ fn install_cache_if_not_behind(
     true
 }
 
+async fn synchronize_chain_cache_generation(
+    chain_id: u64,
+    local_caches: &LocalPoiCaches,
+    preloaded_caches: Option<&mut BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>>,
+) -> bool {
+    let (installed_is_stale, preloaded_is_stale) = with_poi_artifact_cache_generation(
+        local_caches.shared_generation(),
+        |current_generation| {
+            let installed_is_stale = local_caches.installed_generation() != current_generation;
+            let preloaded_is_stale = preloaded_caches.as_ref().is_some_and(|preloaded| {
+                preloaded
+                    .values()
+                    .any(|persisted| persisted.cache_generation != current_generation)
+            });
+            (installed_is_stale, preloaded_is_stale)
+        },
+    );
+    if !installed_is_stale && !preloaded_is_stale {
+        return false;
+    }
+
+    let generation_changed = local_caches.synchronize_generation().await;
+    let mut preloaded_caches = preloaded_caches;
+    let (removed_preloaded, current_generation) = with_poi_artifact_cache_generation(
+        local_caches.shared_generation(),
+        |current_generation| {
+            let removed_preloaded = preloaded_caches.as_mut().map_or(0, |preloaded| {
+                let previous_len = preloaded.len();
+                preloaded.retain(|_, persisted| persisted.cache_generation == current_generation);
+                previous_len.saturating_sub(preloaded.len())
+            });
+            (removed_preloaded, current_generation)
+        },
+    );
+    if generation_changed || removed_preloaded > 0 {
+        debug!(
+            chain_id,
+            current_generation,
+            removed_preloaded,
+            "synchronized chain-scoped POI caches to shared generation"
+        );
+    }
+    generation_changed || removed_preloaded > 0
+}
+
+async fn install_generated_cache_if_current(
+    local_caches: &LocalPoiCaches,
+    list_key: FixedBytes<32>,
+    cache: PoiCache,
+    candidate_generation: u64,
+) -> bool {
+    let mut caches = local_caches.write().await;
+    with_poi_artifact_cache_generation(local_caches.shared_generation(), |current_generation| {
+        if current_generation != candidate_generation {
+            return false;
+        }
+        if local_caches.installed_generation() != candidate_generation {
+            caches.clear();
+            local_caches.mark_installed_generation(candidate_generation);
+        }
+        install_cache_if_not_behind(&mut caches, list_key, cache)
+    })
+}
+
 async fn install_persisted_chain_poi_caches(
     db: &DbStore,
     chain_id: u64,
@@ -864,17 +936,49 @@ async fn install_persisted_chain_poi_caches(
         }
     }
 
+    install_loaded_persisted_chain_poi_caches(chain_id, local_caches, loaded, started).await
+}
+
+async fn install_loaded_persisted_chain_poi_caches(
+    chain_id: u64,
+    local_caches: &LocalPoiCaches,
+    mut loaded: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
+    started: Instant,
+) -> BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache> {
     let loaded_count = loaded.len();
     if loaded_count > 0 {
         let lock_started = Instant::now();
         let mut caches = local_caches.write().await;
         let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
-        for (list_key, persisted) in &loaded {
-            caches.insert(*list_key, persisted.cache.clone());
+        with_poi_artifact_cache_generation(
+            local_caches.shared_generation(),
+            |current_generation| {
+                if local_caches.installed_generation() != current_generation {
+                    caches.clear();
+                    local_caches.mark_installed_generation(current_generation);
+                }
+                loaded.retain(|list_key, persisted| {
+                    if current_generation != persisted.cache_generation {
+                        return false;
+                    }
+                    caches.insert(*list_key, persisted.cache.clone());
+                    true
+                });
+            },
+        );
+        let installed_count = loaded.len();
+        if installed_count != loaded_count {
+            debug!(
+                chain_id,
+                loaded_count,
+                installed_count,
+                "discarded stale persisted chain-scoped artifact POI caches"
+            );
         }
         info!(
             chain_id,
             loaded_count,
+            installed_count,
             lock_wait_elapsed_ms,
             elapsed_ms = started.elapsed().as_millis(),
             "installed persisted chain-scoped artifact POI cache"
@@ -893,13 +997,16 @@ async fn chain_poi_caches_available_for_lists(
         return true;
     }
     let caches = local_caches.read().await;
-    active_list_keys.iter().all(|list_key| {
-        caches.get(list_key).is_some_and(|cache| {
-            cache.identity().chain_type == EVM_CHAIN_TYPE
-                && cache.identity().chain_id == chain_id
-                && cache.identity().txid_version == DEFAULT_TXID_VERSION
-                && cache.progress().next_event_index > 0
-        })
+    with_poi_artifact_cache_generation(local_caches.shared_generation(), |current_generation| {
+        local_caches.installed_generation() == current_generation
+            && active_list_keys.iter().all(|list_key| {
+                caches.get(list_key).is_some_and(|cache| {
+                    cache.identity().chain_type == EVM_CHAIN_TYPE
+                        && cache.identity().chain_id == chain_id
+                        && cache.identity().txid_version == DEFAULT_TXID_VERSION
+                        && cache.progress().next_event_index > 0
+                })
+            })
     })
 }
 
@@ -959,12 +1066,17 @@ async fn sync_chain_poi_live_tails(
     progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
 ) {
     let total_lists = active_list_keys.len();
+    synchronize_chain_cache_generation(chain_id, local_caches, None).await;
     let initially_ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let mut last_error = None;
     for (list_index, list_key) in active_list_keys.iter().enumerate() {
-        let Some(mut cache) = local_caches.read().await.get(list_key).cloned() else {
-            continue;
+        let (mut cache, candidate_generation) = {
+            let caches = local_caches.read().await;
+            let Some(cache) = caches.get(list_key).cloned() else {
+                continue;
+            };
+            (cache, local_caches.installed_generation())
         };
         let original_next_event_index = cache.progress().next_event_index;
         if original_next_event_index == 0 {
@@ -1003,6 +1115,7 @@ async fn sync_chain_poi_live_tails(
                         *list_key,
                         cache,
                         original_next_event_index,
+                        candidate_generation,
                     )
                     .await
                     {
@@ -1047,6 +1160,7 @@ async fn sync_chain_poi_live_tails(
             }
         }
     }
+    synchronize_chain_cache_generation(chain_id, local_caches, None).await;
     let ready =
         chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
     let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
@@ -1080,35 +1194,56 @@ async fn install_tailed_poi_cache_if_current(
     list_key: FixedBytes<32>,
     cache: PoiCache,
     expected_next_event_index: u64,
+    candidate_generation: u64,
 ) -> bool {
     let mut caches = local_caches.write().await;
-    let Some(current) = caches.get(&list_key) else {
-        return false;
-    };
-    if current.progress().next_event_index != expected_next_event_index {
-        return false;
-    }
-    caches.insert(list_key, cache);
-    true
+    with_poi_artifact_cache_generation(local_caches.shared_generation(), |current_generation| {
+        if current_generation != candidate_generation
+            || local_caches.installed_generation() != candidate_generation
+        {
+            return false;
+        }
+        let Some(current) = caches.get(&list_key) else {
+            return false;
+        };
+        if current.progress().next_event_index != expected_next_event_index {
+            return false;
+        }
+        caches.insert(list_key, cache);
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         EVM_CHAIN_TYPE, PoiCacheService, chain_poi_cache_list_progress,
-        install_cache_if_not_behind, live_tail_candidate_cache, single_list_event_index,
+        chain_poi_caches_available_for_lists, emit_chain_poi_cache_ready_progress,
+        install_cache_if_not_behind, install_generated_cache_if_current,
+        install_loaded_persisted_chain_poi_caches, install_tailed_poi_cache_if_current,
+        live_tail_candidate_cache, single_list_event_index,
+    };
+    use crate::poi_artifacts::{
+        clear_poi_artifact_cache_for_reset, load_persisted_cache,
+        poi_artifact_cache_generation_cell,
     };
     use crate::types::{
-        PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
+        LocalPoiCaches, PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
         PoiArtifactSourceConfig,
     };
-    use crate::wallet::LivePoiTailError;
+    use crate::wallet::{
+        LivePoiTailError, LocalPoiMerkleProofSource, LocalPoiStatusReader, PoiStatusReader,
+    };
     use alloy::primitives::{FixedBytes, U256};
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
     use local_db::{DbConfig, DbStore, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord};
     use poi::artifacts::SnapshotEvent;
     use poi::cache::{PoiCache, PoiCacheIdentity};
-    use poi::poi::{PoiEventType, PoiRpcClient, default_active_poi_list_key};
+    use poi::poi::{
+        BlindedCommitmentData, PoiEventType, PoiRpcClient, default_active_poi_list_key,
+    };
+    use railgun_wallet::PoiStatus;
+    use railgun_wallet::tx::PoiMerkleProofSource;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
@@ -1117,7 +1252,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use url::Url;
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1186,10 +1321,10 @@ mod tests {
                 snapshot_event(1, FixedBytes::from([3_u8; 32])),
             ],
         );
-        let local_caches = Arc::new(tokio::sync::RwLock::new(BTreeMap::from([
+        let local_caches = LocalPoiCaches::new_for_test(BTreeMap::from([
             (first_key, first_cache),
             (second_key, second_cache),
-        ])));
+        ]));
         let active_list_keys = vec![first_key, second_key];
 
         let list_progress =
@@ -1322,14 +1457,15 @@ mod tests {
             })
             .expect("open temp db"),
         );
-        let service = PoiCacheService::new(db, artifact_config(), None);
+        let service = PoiCacheService::new(db, artifact_config(), None)
+            .expect("initialize POI cache generation");
 
         let first = service.start_chain(1).await;
         let second = service.start_chain(1).await;
         let other_chain = service.start_chain(137).await;
 
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!Arc::ptr_eq(&first, &other_chain));
+        assert!(first.ptr_eq(&second));
+        assert!(!first.ptr_eq(&other_chain));
         service.shutdown();
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
@@ -1348,7 +1484,8 @@ mod tests {
         let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
         let cache = cache_with_events(identity, &[snapshot_event(0, FixedBytes::from([9_u8; 32]))]);
         persist_cache(db.as_ref(), &cache);
-        let service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None);
+        let service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+            .expect("initialize POI cache generation");
 
         service.start_chain(1).await;
 
@@ -1387,6 +1524,7 @@ mod tests {
         persist_cache(db.as_ref(), &cache);
         let service = Arc::new(
             PoiCacheService::new(db, artifact_config(), None)
+                .expect("initialize POI cache generation")
                 .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("test POI RPC URL")),
         );
         let mut progress_rx = service.progress_rx();
@@ -1423,6 +1561,7 @@ mod tests {
         );
         let service = Arc::new(
             PoiCacheService::new(db, artifact_config(), None)
+                .expect("initialize POI cache generation")
                 .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("test POI RPC URL")),
         );
         let mut progress_rx = service.progress_rx();
@@ -1465,6 +1604,343 @@ mod tests {
         assert!(!installed);
         assert_eq!(current.progress().next_event_index, 2);
         assert!(current.position(&live_tail_commitment).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn old_refresh_waiting_for_local_lock_is_rejected_after_generation_bump() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let candidate = cache_with_events(
+            identity,
+            &[snapshot_event(0, FixedBytes::from([0x31_u8; 32]))],
+        );
+        let cache_generation =
+            poi_artifact_cache_generation_cell(&db).expect("shared cache generation");
+        let local_caches = LocalPoiCaches::new(Arc::clone(&cache_generation));
+        let local_guard = local_caches.write().await;
+        let install = tokio::spawn({
+            let local_caches = local_caches.clone();
+            async move {
+                install_generated_cache_if_current(&local_caches, list_key, candidate, 0).await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !install.is_finished(),
+            "old refresh must wait for cache lock"
+        );
+
+        let reset = clear_poi_artifact_cache_for_reset(&db).expect("bump cache generation");
+        drop(local_guard);
+
+        assert!(!install.await.expect("refresh install task"));
+        assert!(local_caches.read().await.is_empty());
+        let service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+            .expect("initialize service from persistent generation");
+        assert_eq!(
+            service.cache_generation.load(Ordering::Acquire),
+            reset.generation
+        );
+        service.shutdown();
+        drop(service);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persisted_preload_waiting_for_local_lock_is_fenced_by_reset() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let persisted = cache_with_events(
+            identity.clone(),
+            &[snapshot_event(0, FixedBytes::from([0x41_u8; 32]))],
+        );
+        persist_cache(&db, &persisted);
+        let persisted = load_persisted_cache(&db, &identity)
+            .expect("load persisted cache candidate")
+            .expect("persisted cache candidate");
+        let preloaded = BTreeMap::from([(list_key, persisted)]);
+        let cache_generation =
+            poi_artifact_cache_generation_cell(&db).expect("shared cache generation");
+        let local_caches = LocalPoiCaches::new(Arc::clone(&cache_generation));
+        let local_guard = local_caches.write().await;
+        let preload = tokio::spawn({
+            let local_caches = local_caches.clone();
+            async move {
+                install_loaded_persisted_chain_poi_caches(
+                    1,
+                    &local_caches,
+                    preloaded,
+                    Instant::now(),
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!preload.is_finished(), "preload must wait for cache lock");
+
+        clear_poi_artifact_cache_for_reset(&db).expect("reset persisted cache");
+        drop(local_guard);
+
+        assert!(preload.await.expect("preload task").is_empty());
+        assert!(local_caches.read().await.is_empty());
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn services_for_one_db_share_generation_and_resynchronize_stale_caches() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let old_commitment = FixedBytes::from([0x51_u8; 32]);
+        let old_cache = cache_with_events(identity.clone(), &[snapshot_event(0, old_commitment)]);
+        persist_cache(&db, &old_cache);
+
+        let reset_service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+            .expect("initialize reset service");
+        let serving_service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+            .expect("initialize serving service");
+        assert!(Arc::ptr_eq(
+            &reset_service.cache_generation,
+            &serving_service.cache_generation
+        ));
+
+        let local_caches = serving_service.start_chain(1).await;
+        assert!(local_caches.read().await.contains_key(&list_key));
+        let status_reader = LocalPoiStatusReader::new(local_caches.clone());
+        let proof_source = LocalPoiMerkleProofSource::new(local_caches.clone());
+        let old_statuses = status_reader
+            .pois_per_list(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &[list_key],
+                &[BlindedCommitmentData::transact(old_commitment)],
+            )
+            .await
+            .expect("read old-generation status before reset");
+        assert_eq!(
+            old_statuses
+                .get(&old_commitment)
+                .and_then(|per_list| per_list.get(&list_key)),
+            Some(&PoiStatus::Valid)
+        );
+        proof_source
+            .poi_merkle_proofs(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &list_key,
+                &[old_commitment],
+            )
+            .await
+            .expect("read old-generation proof before reset");
+        let old_generation = serving_service.cache_generation.load(Ordering::Acquire);
+        let old_refresh = cache_with_events(
+            identity.clone(),
+            &[
+                snapshot_event(0, FixedBytes::from([0x51_u8; 32])),
+                snapshot_event(1, FixedBytes::from([0x52_u8; 32])),
+            ],
+        );
+
+        reset_service
+            .reset_poi_artifact_cache()
+            .await
+            .expect("reset shared POI cache");
+        let current_generation = reset_service.cache_generation.load(Ordering::Acquire);
+        assert_eq!(current_generation, old_generation + 1);
+        assert_eq!(
+            serving_service.cache_generation.load(Ordering::Acquire),
+            current_generation
+        );
+
+        let stale_statuses = status_reader
+            .pois_per_list(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &[list_key],
+                &[BlindedCommitmentData::transact(old_commitment)],
+            )
+            .await
+            .expect("old reader fences status after cross-service reset");
+        assert_eq!(
+            stale_statuses
+                .get(&old_commitment)
+                .and_then(|per_list| per_list.get(&list_key)),
+            Some(&PoiStatus::Unknown)
+        );
+        proof_source
+            .poi_merkle_proofs(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &list_key,
+                &[old_commitment],
+            )
+            .await
+            .expect_err("old reader must not return a stale proof after cross-service reset");
+        assert!(
+            local_caches.read().await.is_empty(),
+            "direct readers must fence the old-generation corpus without service re-entry"
+        );
+        assert_eq!(local_caches.installed_generation(), current_generation);
+
+        let exposed = serving_service.start_chain(1).await;
+        assert!(local_caches.ptr_eq(&exposed));
+        assert!(
+            exposed.read().await.is_empty(),
+            "the second service must clear its old-generation corpus before exposing it"
+        );
+        assert!(
+            !install_generated_cache_if_current(
+                &local_caches,
+                list_key,
+                old_refresh,
+                old_generation,
+            )
+            .await,
+            "an old-generation refresh must be rejected by the shared fence"
+        );
+
+        let preloaded_cache = cache_with_events(
+            identity.clone(),
+            &[snapshot_event(0, FixedBytes::from([0x61_u8; 32]))],
+        );
+        persist_cache(&db, &preloaded_cache);
+        let persisted = load_persisted_cache(&db, &identity)
+            .expect("load current-generation persisted cache")
+            .expect("current-generation persisted cache");
+        assert_eq!(persisted.cache_generation, current_generation);
+        let active_list_keys = vec![list_key];
+        let installed_preloads = install_loaded_persisted_chain_poi_caches(
+            1,
+            &local_caches,
+            BTreeMap::from([(list_key, persisted)]),
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(installed_preloads.len(), 1);
+        let current_commitment = FixedBytes::from([0x61_u8; 32]);
+        let current_statuses = status_reader
+            .pois_per_list(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &[list_key],
+                &[BlindedCommitmentData::transact(current_commitment)],
+            )
+            .await
+            .expect("old reader sees current-generation status after install");
+        assert_eq!(
+            current_statuses
+                .get(&current_commitment)
+                .and_then(|per_list| per_list.get(&list_key)),
+            Some(&PoiStatus::Valid)
+        );
+        proof_source
+            .poi_merkle_proofs(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &list_key,
+                &[current_commitment],
+            )
+            .await
+            .expect("old reader sees current-generation proof after install");
+        assert!(
+            chain_poi_caches_available_for_lists(1, &local_caches, &active_list_keys).await,
+            "a current-generation install must restore cache readiness"
+        );
+
+        let refreshed_cache = cache_with_events(
+            identity.clone(),
+            &[
+                snapshot_event(0, FixedBytes::from([0x61_u8; 32])),
+                snapshot_event(1, FixedBytes::from([0x62_u8; 32])),
+            ],
+        );
+        assert!(
+            install_generated_cache_if_current(
+                &local_caches,
+                list_key,
+                refreshed_cache,
+                current_generation,
+            )
+            .await
+        );
+
+        let live_tailed_cache = cache_with_events(
+            identity,
+            &[
+                snapshot_event(0, FixedBytes::from([0x61_u8; 32])),
+                snapshot_event(1, FixedBytes::from([0x62_u8; 32])),
+                snapshot_event(2, FixedBytes::from([0x63_u8; 32])),
+            ],
+        );
+        assert!(
+            install_tailed_poi_cache_if_current(
+                &local_caches,
+                list_key,
+                live_tailed_cache,
+                2,
+                current_generation,
+            )
+            .await
+        );
+        assert_eq!(
+            local_caches
+                .read()
+                .await
+                .get(&list_key)
+                .expect("live-tailed cache")
+                .progress()
+                .next_event_index,
+            3
+        );
+        assert!(chain_poi_caches_available_for_lists(1, &local_caches, &active_list_keys).await);
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(BTreeMap::new());
+        emit_chain_poi_cache_ready_progress(&progress_tx, 1, &local_caches, &active_list_keys)
+            .await;
+        assert!(
+            progress_rx
+                .borrow()
+                .get(&1)
+                .expect("serving progress")
+                .ready_for_wallet_checks
+        );
+
+        serving_service.shutdown();
+        reset_service.shutdown();
+        drop(serving_service);
+        drop(reset_service);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     #[tokio::test]
