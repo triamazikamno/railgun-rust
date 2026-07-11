@@ -53,12 +53,6 @@ pub(crate) enum IndexedArtifactMaintenanceKey {
         cid: String,
         sha256: alloy::primitives::FixedBytes<32>,
     },
-    TxidPriorTail {
-        scope: ChainScope,
-        txid_version: String,
-        from_index: u64,
-        generation: u64,
-    },
     #[cfg(test)]
     Test(u64),
 }
@@ -84,21 +78,6 @@ impl IndexedArtifactMaintenanceKey {
             generation,
             cid: descriptor.cid.clone(),
             sha256: descriptor.sha256,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn txid_prior_tail(
-        scope: ChainScope,
-        txid_version: &str,
-        from_index: u64,
-        generation: u64,
-    ) -> Self {
-        Self::TxidPriorTail {
-            scope,
-            txid_version: txid_version.to_string(),
-            from_index,
-            generation,
         }
     }
 }
@@ -336,7 +315,24 @@ impl VerifiedIndexedArtifactCatalog {
 
 impl From<VerifiedIndexedArtifactCatalog> for IndexedArtifactStreamCatalog {
     fn from(verified: VerifiedIndexedArtifactCatalog) -> Self {
-        Self::new(verified.descriptor, verified.catalog.chunks)
+        let mut descriptor = verified.descriptor;
+        descriptor.metadata.catalog_generation = None;
+        descriptor.metadata.stream_partition = None;
+        descriptor.metadata.stream_complete = false;
+        descriptor.metadata.chunk_sealed = false;
+        let chunks = verified
+            .catalog
+            .chunks
+            .into_iter()
+            .map(|mut chunk| {
+                chunk.metadata.catalog_generation = None;
+                chunk.metadata.stream_partition = None;
+                chunk.metadata.stream_complete = false;
+                chunk.metadata.chunk_sealed = false;
+                chunk
+            })
+            .collect();
+        Self::new(descriptor, chunks)
     }
 }
 
@@ -995,7 +991,7 @@ pub fn verify_catalog_bytes(
         });
     }
 
-    let mut catalog: IndexedArtifactCatalog = serde_json::from_slice(bytes)?;
+    let catalog: IndexedArtifactCatalog = serde_json::from_slice(bytes)?;
     if catalog.format_version != INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION {
         return Err(IndexedArtifactManifestError::UnsupportedCatalogVersion {
             version: catalog.format_version,
@@ -1017,11 +1013,6 @@ pub fn verify_catalog_bytes(
         validate_chunk_descriptor_scope(descriptor, chunk)?;
     }
     validate_catalog_descriptor_aggregate(descriptor, &catalog.chunks)?;
-    catalog.chunks = catalog
-        .chunks
-        .into_iter()
-        .map(|chunk| chunk.with_inherited_catalog_generation(descriptor))
-        .collect();
     Ok(catalog)
 }
 
@@ -1090,11 +1081,6 @@ fn validate_chunk_descriptor_scope(
 fn validate_catalog_descriptor_for_expansion(
     descriptor: &IndexedArtifactDescriptor,
 ) -> Result<(), IndexedArtifactManifestError> {
-    if descriptor.metadata.catalog_generation.is_none() {
-        return Err(IndexedArtifactManifestError::CatalogMissingGeneration {
-            cid: descriptor.cid.clone(),
-        });
-    }
     if descriptor.range.start > descriptor.range.end {
         return Err(
             IndexedArtifactManifestError::CatalogDescriptorInvalidRange {
@@ -1293,8 +1279,6 @@ pub enum IndexedArtifactManifestError {
         chunk_start: u64,
         chunk_end: u64,
     },
-    #[error("indexed artifact catalog {cid} missing catalog generation metadata")]
-    CatalogMissingGeneration { cid: String },
     #[error("indexed artifact catalog {cid} range start {start} exceeds end {end}")]
     CatalogDescriptorInvalidRange { cid: String, start: u64, end: u64 },
     #[error("indexed artifact catalog chunk {cid} range start {start} exceeds end {end}")]
@@ -2034,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_verification_rejects_missing_generation() {
+    fn catalog_verification_accepts_format_v1_without_generation() {
         let scope = scope();
         let catalog = IndexedArtifactCatalog {
             format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
@@ -2046,16 +2030,14 @@ mod tests {
         let mut descriptor = catalog_descriptor(scope, 0, 50, &bytes);
         descriptor.metadata.catalog_generation = None;
 
-        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("generation required");
+        let verified = verify_catalog_bytes(&descriptor, &bytes).expect("v1 catalog verifies");
 
-        assert!(matches!(
-            err,
-            IndexedArtifactManifestError::CatalogMissingGeneration { .. }
-        ));
+        assert_eq!(verified.chunks.len(), 1);
+        assert_eq!(verified.chunks[0].metadata.catalog_generation, None);
     }
 
     #[test]
-    fn catalog_verification_rejects_missing_generation_on_empty_matching_catalog() {
+    fn catalog_verification_accepts_empty_format_v1_catalog_without_generation() {
         let scope = scope();
         let catalog = IndexedArtifactCatalog {
             format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
@@ -2074,12 +2056,10 @@ mod tests {
         );
         descriptor.metadata.catalog_generation = None;
 
-        let err = verify_catalog_bytes(&descriptor, &bytes).expect_err("generation required");
+        let verified =
+            verify_catalog_bytes(&descriptor, &bytes).expect("empty v1 catalog verifies");
 
-        assert!(matches!(
-            err,
-            IndexedArtifactManifestError::CatalogMissingGeneration { .. }
-        ));
+        assert!(verified.chunks.is_empty());
     }
 
     #[test]
@@ -2207,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_verification_inherits_generation_and_preserves_chunk_stream_metadata() {
+    fn catalog_verification_omits_internal_only_stream_metadata_from_v1() {
         let scope = scope();
         let catalog_metadata = DatasetDescriptorMetadata {
             catalog_generation: Some(42),
@@ -2249,7 +2229,7 @@ mod tests {
         let descriptor = catalog_descriptor_for_dataset_with_metadata(
             IndexedDatasetKind::PublicTxid,
             IndexedArtifactRangeKind::TxidIndex,
-            scope.clone(),
+            scope,
             0,
             9,
             catalog_row_count,
@@ -2260,44 +2240,21 @@ mod tests {
         let verified = verify_catalog_bytes(&descriptor, &bytes).expect("catalog verifies");
 
         let list_a_metadata = &verified.chunks[0].metadata;
-        assert_eq!(list_a_metadata.catalog_generation, Some(42));
-        assert_eq!(list_a_metadata.stream_partition.as_deref(), Some("list-a"));
+        assert_eq!(list_a_metadata.catalog_generation, None);
+        assert_eq!(list_a_metadata.stream_partition, None);
         assert!(!list_a_metadata.stream_complete);
         assert!(!list_a_metadata.chunk_sealed);
         let list_b_metadata = &verified.chunks[1].metadata;
-        assert_eq!(list_b_metadata.catalog_generation, Some(42));
-        assert_eq!(list_b_metadata.stream_partition.as_deref(), Some("list-b"));
+        assert_eq!(list_b_metadata.catalog_generation, None);
+        assert_eq!(list_b_metadata.stream_partition, None);
         assert!(!list_b_metadata.stream_complete);
         assert!(!list_b_metadata.chunk_sealed);
 
-        let plan = IndexedArtifactStreamPlan::plan(
-            &[IndexedArtifactStreamCatalog::new(
-                descriptor,
-                verified.chunks,
-            )],
-            &IndexedArtifactStreamPlanRequest::new(
-                IndexedDatasetKind::PublicTxid,
-                scope,
-                IndexedArtifactRangeKind::TxidIndex,
-                0,
-                9,
-                IndexedArtifactStreamPartitionPolicy::Exact("list-a".to_string()),
-            ),
-        )
-        .expect("verified catalog partitions remain independently plannable");
-
-        assert_eq!(plan.required_current_chunks.len(), 1);
-        assert_eq!(
-            plan.required_current_chunks
-                .iter()
-                .map(|entry| entry.descriptor.metadata.stream_partition.as_deref())
-                .collect::<Vec<_>>(),
-            vec![Some("list-a")]
-        );
+        assert_eq!(descriptor.metadata.catalog_generation, Some(42));
     }
 
     #[test]
-    fn catalog_verification_replaces_chunk_generation_with_authenticated_catalog_generation() {
+    fn catalog_verification_does_not_restore_omitted_generation_metadata() {
         let scope = scope();
         let mut chunk = chunk_descriptor(scope.clone(), 0, 50);
         chunk.metadata.catalog_generation = Some(7);
@@ -2314,11 +2271,65 @@ mod tests {
         let verified = verify_catalog_bytes(&descriptor, &bytes).expect("catalog verifies");
 
         let metadata = &verified.chunks[0].metadata;
-        assert_eq!(metadata.catalog_generation, Some(42));
+        assert_eq!(metadata.catalog_generation, None);
+    }
+
+    #[test]
+    fn authoritative_snapshots_replace_ranges_without_historical_merging() {
+        let scope = scope();
+        let mut old_chunk = chunk_descriptor(scope.clone(), 0, 50);
+        old_chunk.cid = "bafy-old-current-chunk".to_string();
+        let mut new_chunk = old_chunk.clone();
+        new_chunk.cid = "bafy-new-current-chunk".to_string();
+        new_chunk.sha256 = FixedBytes::from([0x99; 32]);
+
+        let snapshot = |generation: u64, chunk: IndexedArtifactDescriptor| {
+            let mut descriptor = chunk.clone();
+            descriptor.cid = format!("bafy-catalog-{generation}");
+            descriptor.metadata.catalog_generation = Some(generation);
+            IndexedArtifactStreamCatalog::from(VerifiedIndexedArtifactCatalog {
+                descriptor,
+                catalog: IndexedArtifactCatalog {
+                    format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+                    dataset_kind: IndexedDatasetKind::WalletScan,
+                    scope: scope.clone(),
+                    chunks: vec![chunk],
+                },
+            })
+        };
+        let old_snapshot = snapshot(1, old_chunk);
+        let new_snapshot = snapshot(2, new_chunk);
+        let request = IndexedArtifactStreamPlanRequest::new(
+            IndexedDatasetKind::WalletScan,
+            scope,
+            IndexedArtifactRangeKind::Block,
+            0,
+            50,
+            IndexedArtifactStreamPartitionPolicy::Ignore,
+        );
+
+        let old_plan =
+            IndexedArtifactStreamPlan::plan(std::slice::from_ref(&old_snapshot), &request)
+                .expect("old snapshot plans independently");
+        let new_plan =
+            IndexedArtifactStreamPlan::plan(std::slice::from_ref(&new_snapshot), &request)
+                .expect("new snapshot plans independently");
+        assert_eq!(
+            old_plan.required_current_chunks[0].descriptor.cid,
+            "bafy-old-current-chunk"
+        );
+        assert_eq!(
+            new_plan.required_current_chunks[0].descriptor.cid,
+            "bafy-new-current-chunk"
+        );
+        assert!(matches!(
+            IndexedArtifactStreamPlan::plan(&[old_snapshot, new_snapshot], &request),
+            Err(IndexedArtifactStreamPlanError::SameGenerationOverlap { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn fetch_catalog_rejects_missing_generation_before_gateway_request() {
+    async fn fetch_catalog_accepts_format_v1_without_generation() {
         let scope = scope();
         let catalog = IndexedArtifactCatalog {
             format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
@@ -2346,17 +2357,14 @@ mod tests {
         source_config.gateway_urls = vec![server.url.clone()];
         let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
 
-        let err = client
+        let verified = client
             .fetch_catalog(&descriptor)
             .await
-            .expect_err("missing generation rejected before fetch");
+            .expect("missing generation is valid for v1");
 
-        assert!(matches!(
-            err,
-            IndexedArtifactManifestError::CatalogMissingGeneration { .. }
-        ));
+        assert!(verified.catalog.chunks.is_empty());
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(server.max_active(), 0, "gateway should not be touched");
+        assert_eq!(server.max_active(), 1, "catalog should be fetched once");
     }
 
     #[test]

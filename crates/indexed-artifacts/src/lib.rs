@@ -361,15 +361,15 @@ pub struct DatasetDescriptorMetadata {
     pub start_block: Option<u64>,
     pub end_block: Option<u64>,
     pub last_indexed_block: Option<u64>,
-    #[serde(default)]
+    #[serde(skip)]
     pub catalog_generation: Option<u64>,
-    #[serde(default)]
+    #[serde(skip)]
     pub stream_partition: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub stream_complete: bool,
-    #[serde(default)]
+    #[serde(skip)]
     pub chunk_sealed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub decoded_envelope_byte_size: Option<u64>,
 }
 
@@ -592,11 +592,7 @@ impl IndexedArtifactStreamPlan {
                     end: descriptor.range.end,
                 });
             }
-            let generation = descriptor.metadata.catalog_generation.ok_or_else(|| {
-                IndexedArtifactStreamPlanError::MissingCatalogGeneration {
-                    cid: descriptor.cid.clone(),
-                }
-            })?;
+            let generation = descriptor.metadata.catalog_generation.unwrap_or_default();
             if request.partition_policy.matches_descriptor(descriptor) {
                 let catalog_stream_key = ArtifactStreamKey::from(descriptor);
                 streams
@@ -644,11 +640,7 @@ impl IndexedArtifactStreamPlan {
                     end: descriptor.range.end,
                 });
             }
-            let generation = descriptor.metadata.catalog_generation.ok_or_else(|| {
-                IndexedArtifactStreamPlanError::MissingCatalogGeneration {
-                    cid: descriptor.cid.clone(),
-                }
-            })?;
+            let generation = descriptor.metadata.catalog_generation.unwrap_or_default();
             let stream_key = ArtifactStreamKey::from(descriptor);
             streams
                 .entry(stream_key)
@@ -1926,8 +1918,6 @@ pub enum IndexedArtifactStreamPlanError {
     InvalidRequestRange { start: u64, end: u64 },
     #[error("artifact stream descriptor {cid} range start {start} exceeds end {end}")]
     InvalidDescriptorRange { cid: String, start: u64, end: u64 },
-    #[error("artifact stream descriptor {cid} is missing catalog generation")]
-    MissingCatalogGeneration { cid: String },
     #[error(
         "artifact stream generation {generation} has overlapping chunks for partition {partition:?}: {left_start}-{left_end} overlaps {right_start}-{right_end}"
     )]
@@ -2393,6 +2383,176 @@ mod tests {
     }
 
     #[test]
+    fn format_v1_manifest_signature_verifies_after_legacy_deserialization() {
+        #[derive(Serialize)]
+        struct FormatV1Metadata {
+            root: Option<FixedBytes<32>>,
+            checkpoint_block: Option<u64>,
+            tree_number: Option<u16>,
+            leaf_count: Option<u64>,
+            start_block: Option<u64>,
+            end_block: Option<u64>,
+            last_indexed_block: Option<u64>,
+        }
+
+        #[derive(Serialize)]
+        struct FormatV1Descriptor {
+            dataset_kind: IndexedDatasetKind,
+            scope: ChainScope,
+            range: IndexedArtifactRange,
+            row_count: u64,
+            cid: String,
+            sha256: FixedBytes<32>,
+            byte_size: u64,
+            encoding_version: u16,
+            compression: CompressionAlgorithm,
+            metadata: FormatV1Metadata,
+        }
+
+        #[derive(Serialize)]
+        struct FormatV1ChainEntry {
+            scope: ChainScope,
+            latest_indexed: Vec<LatestIndexedHeight>,
+            catalogs: Vec<FormatV1Descriptor>,
+        }
+
+        #[derive(Serialize)]
+        struct FormatV1ManifestBody {
+            format_version: u16,
+            issued_at_ms: u64,
+            sequence: u64,
+            publisher: PublisherIdentity,
+            chains: Vec<FormatV1ChainEntry>,
+        }
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let publisher =
+            PublisherIdentity::ed25519(FixedBytes::from(signing_key.verifying_key().to_bytes()));
+        let descriptor = IndexedArtifactDescriptor {
+            dataset_kind: IndexedDatasetKind::PublicTxid,
+            scope: scope(),
+            range: IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::TxidIndex,
+                start: 0,
+                end: 9,
+            },
+            row_count: 10,
+            cid: "bafy-format-v1-catalog".to_string(),
+            sha256: FixedBytes::from([0x33; 32]),
+            byte_size: 123,
+            encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            compression: CompressionAlgorithm::None,
+            metadata: DatasetDescriptorMetadata {
+                root: Some(FixedBytes::from([0x55; 32])),
+                checkpoint_block: Some(100),
+                last_indexed_block: Some(100),
+                ..Default::default()
+            },
+        };
+        let legacy_body = FormatV1ManifestBody {
+            format_version: INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
+            issued_at_ms: 42,
+            sequence: 7,
+            publisher: publisher.clone(),
+            chains: vec![FormatV1ChainEntry {
+                scope: scope(),
+                latest_indexed: vec![LatestIndexedHeight {
+                    dataset_kind: IndexedDatasetKind::PublicTxid,
+                    block_number: 100,
+                    block_hash: FixedBytes::from([0x77; 32]),
+                }],
+                catalogs: vec![FormatV1Descriptor {
+                    dataset_kind: descriptor.dataset_kind,
+                    scope: descriptor.scope.clone(),
+                    range: descriptor.range.clone(),
+                    row_count: descriptor.row_count,
+                    cid: descriptor.cid.clone(),
+                    sha256: descriptor.sha256,
+                    byte_size: descriptor.byte_size,
+                    encoding_version: descriptor.encoding_version,
+                    compression: descriptor.compression,
+                    metadata: FormatV1Metadata {
+                        root: descriptor.metadata.root,
+                        checkpoint_block: descriptor.metadata.checkpoint_block,
+                        tree_number: descriptor.metadata.tree_number,
+                        leaf_count: descriptor.metadata.leaf_count,
+                        start_block: descriptor.metadata.start_block,
+                        end_block: descriptor.metadata.end_block,
+                        last_indexed_block: descriptor.metadata.last_indexed_block,
+                    },
+                }],
+            }],
+        };
+        let legacy_body_bytes = serde_json::to_vec(&legacy_body).expect("serialize v1 body");
+        let mut manifest = IndexedArtifactManifest {
+            format_version: INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
+            issued_at_ms: 42,
+            sequence: 7,
+            publisher,
+            chains: vec![IndexedArtifactChainEntry {
+                scope: scope(),
+                latest_indexed: vec![LatestIndexedHeight {
+                    dataset_kind: IndexedDatasetKind::PublicTxid,
+                    block_number: 100,
+                    block_hash: FixedBytes::from([0x77; 32]),
+                }],
+                catalogs: vec![descriptor],
+            }],
+            publisher_signature: None,
+        };
+        manifest.publisher_signature = Some(FixedBytes::from(
+            signing_key.sign(&legacy_body_bytes).to_bytes(),
+        ));
+
+        assert_eq!(
+            manifest
+                .deterministic_body_bytes()
+                .expect("serialize current v1 body"),
+            legacy_body_bytes
+        );
+        let wire = serde_json::to_vec(&manifest).expect("serialize signed v1 manifest");
+        let wire_text = std::str::from_utf8(&wire).expect("v1 JSON");
+        assert!(!wire_text.contains("catalog_generation"));
+        assert!(!wire_text.contains("stream_partition"));
+        assert!(!wire_text.contains("stream_complete"));
+        assert!(!wire_text.contains("chunk_sealed"));
+        let decoded: IndexedArtifactManifest =
+            serde_json::from_slice(&wire).expect("deserialize old producer manifest");
+        decoded
+            .verify_trusted_signature(&signing_key.verifying_key().to_bytes())
+            .expect("old producer signature verifies");
+
+        let mut injected: serde_json::Value =
+            serde_json::from_slice(&wire).expect("parse signed v1 manifest");
+        let metadata = injected
+            .pointer_mut("/chains/0/catalogs/0/metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("catalog metadata object");
+        metadata.insert("catalog_generation".to_string(), serde_json::json!(99));
+        metadata.insert(
+            "stream_partition".to_string(),
+            serde_json::json!("attacker-controlled"),
+        );
+        metadata.insert("stream_complete".to_string(), serde_json::json!(true));
+        metadata.insert("chunk_sealed".to_string(), serde_json::json!(true));
+        metadata.insert(
+            "decoded_envelope_byte_size".to_string(),
+            serde_json::json!(999),
+        );
+        let injected: IndexedArtifactManifest = serde_json::from_value(injected)
+            .expect("deserialize v1 manifest with injected metadata");
+        let injected_metadata = &injected.chains[0].catalogs[0].metadata;
+        assert_eq!(injected_metadata.catalog_generation, None);
+        assert_eq!(injected_metadata.stream_partition, None);
+        assert!(!injected_metadata.stream_complete);
+        assert!(!injected_metadata.chunk_sealed);
+        assert_eq!(injected_metadata.decoded_envelope_byte_size, None);
+        injected
+            .verify_trusted_signature(&signing_key.verifying_key().to_bytes())
+            .expect("unsigned injected metadata cannot affect v1 verification");
+    }
+
+    #[test]
     fn typed_fields_serialize_as_lowercase_prefixed_hex() {
         let descriptor = IndexedArtifactDescriptor {
             dataset_kind: IndexedDatasetKind::PublicTxid,
@@ -2430,11 +2590,11 @@ mod tests {
         assert!(json.contains(
             "\"root\":\"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\""
         ));
-        assert!(json.contains("\"catalog_generation\":9"));
-        assert!(json.contains("\"stream_partition\":\"txid-v3:list-a\""));
-        assert!(json.contains("\"stream_complete\":true"));
-        assert!(json.contains("\"chunk_sealed\":true"));
-        assert!(json.contains("\"decoded_envelope_byte_size\":123"));
+        assert!(!json.contains("catalog_generation"));
+        assert!(!json.contains("stream_partition"));
+        assert!(!json.contains("stream_complete"));
+        assert!(!json.contains("chunk_sealed"));
+        assert!(!json.contains("decoded_envelope_byte_size"));
     }
 
     #[test]
@@ -3433,7 +3593,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_planner_rejects_missing_generation_and_superseded_requested_range_gaps() {
+    fn stream_planner_accepts_snapshot_without_generation_and_rejects_requested_range_gaps() {
         let missing_generation = descriptor(
             IndexedDatasetKind::PublicTxid,
             scope(),
@@ -3448,10 +3608,9 @@ mod tests {
             9,
         );
 
-        assert!(matches!(
-            plan_from_descriptors(&[missing_generation], &request),
-            Err(IndexedArtifactStreamPlanError::MissingCatalogGeneration { .. })
-        ));
+        let plan = plan_from_descriptors(&[missing_generation], &request)
+            .expect("format-v1 snapshot does not require generation metadata");
+        assert_eq!(plan.required_current_chunks.len(), 1);
 
         let old_tail = StreamFixture::descriptor(
             IndexedDatasetKind::PublicTxid,

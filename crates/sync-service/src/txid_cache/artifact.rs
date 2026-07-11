@@ -9,14 +9,14 @@ use super::{
 
 use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactDescriptor, IndexedArtifactManifestClient,
-    IndexedArtifactPlannedChunk, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
-    IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
-    IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
-    VerifiedIndexedArtifactChunkStager, decode_indexed_artifact_chunk, verify_chunk_bytes,
+    IndexedArtifactRangeKind, IndexedArtifactStreamCatalog, IndexedArtifactStreamPartitionPolicy,
+    IndexedArtifactStreamPlan, IndexedArtifactStreamPlanRequest, IndexedDatasetKind,
+    VerifiedIndexedArtifactChunk, VerifiedIndexedArtifactChunkStager,
+    decode_indexed_artifact_chunk, verify_chunk_bytes,
 };
 
 use broadcaster_core::transact::{
-    compute_railgun_txid_parts, railgun_txid_leaf_hash_with_output_start,
+    DEFAULT_TXID_VERSION, compute_railgun_txid_parts, railgun_txid_leaf_hash_with_output_start,
 };
 use merkletree::tree::DenseMerkleTree;
 use tracing::debug;
@@ -35,23 +35,17 @@ pub(super) struct TxidPublicArtifactChunkPlan {
 }
 
 pub(super) struct TxidPublicArtifactMaintenance {
-    source: TxidPublicArtifactSource,
     stable_current: Vec<VerifiedIndexedArtifactChunk>,
-    from_index: u64,
     read_scope: TxidPublicCacheReadScope,
 }
 
 impl TxidPublicArtifactMaintenance {
     pub(super) const fn new(
-        source: TxidPublicArtifactSource,
         stable_current: Vec<VerifiedIndexedArtifactChunk>,
-        from_index: u64,
         read_scope: TxidPublicCacheReadScope,
     ) -> Self {
         Self {
-            source,
             stable_current,
-            from_index,
             read_scope,
         }
     }
@@ -61,9 +55,6 @@ impl TxidPublicArtifactMaintenance {
         for chunk in self.stable_current {
             Self::retain_stable_chunk(cache, chunk, self.read_scope).await;
         }
-        self.source
-            .retain_prior_tail_best_effort(cache, self.from_index, self.read_scope)
-            .await;
     }
 
     pub(super) fn take_stable_current(&mut self) -> Vec<VerifiedIndexedArtifactChunk> {
@@ -73,22 +64,6 @@ impl TxidPublicArtifactMaintenance {
     #[must_use]
     pub(super) const fn read_scope(&self) -> TxidPublicCacheReadScope {
         self.read_scope
-    }
-
-    #[must_use]
-    pub(super) const fn start_index(&self) -> u64 {
-        self.from_index
-    }
-
-    #[must_use]
-    pub(super) fn scope(&self) -> ChainScope {
-        self.source.scope.clone()
-    }
-
-    pub(super) async fn run_prior_tail(self, cache: &TxidPublicCache<'_>) {
-        self.source
-            .retain_prior_tail_best_effort(cache, self.from_index, self.read_scope)
-            .await;
     }
 
     pub(super) async fn retain_stable_chunk(
@@ -148,6 +123,12 @@ impl TxidPublicArtifactSource {
         from_index: u64,
         to_index: Option<u64>,
     ) -> Result<TxidPublicArtifactChunkPlan, TxidPublicCacheError> {
+        if self.txid_version != DEFAULT_TXID_VERSION {
+            return Ok(TxidPublicArtifactChunkPlan {
+                required: Vec::new(),
+                stable_current: Vec::new(),
+            });
+        }
         let manifest = self
             .client
             .fetch_manifest(&self.scope, None, SystemTime::now())
@@ -183,16 +164,15 @@ impl TxidPublicArtifactSource {
                 catalogs.push(self.fetch_stream_catalog(catalog_descriptor).await?);
             }
         }
-        let plan = IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
+        let plan = IndexedArtifactStreamPlan::plan(
             &catalogs,
-            &chain_entry.catalogs,
             &IndexedArtifactStreamPlanRequest::new(
                 IndexedDatasetKind::PublicTxid,
                 self.scope.clone(),
                 IndexedArtifactRangeKind::TxidIndex,
                 from_index,
                 range_end,
-                IndexedArtifactStreamPartitionPolicy::Exact(self.txid_version.clone()),
+                IndexedArtifactStreamPartitionPolicy::Unpartitioned,
             ),
         )
         .map_err(|err| TxidPublicCacheError::MetadataMismatch(err.to_string()))?;
@@ -230,96 +210,12 @@ impl TxidPublicArtifactSource {
         })
     }
 
-    pub(crate) async fn retain_prior_tail_best_effort(
-        &self,
-        cache: &TxidPublicCache<'_>,
-        from_index: u64,
-        read_scope: TxidPublicCacheReadScope,
-    ) {
-        let manifest = match self
-            .client
-            .fetch_manifest(&self.scope, None, SystemTime::now())
-            .await
-        {
-            Ok(manifest) => manifest,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    chain_id = cache.key.chain_id,
-                    txid_version = cache.key.txid_version,
-                    "failed to fetch public TXID artifact manifest for optional prior-tail retention"
-                );
-                return;
-            }
-        };
-        let Some(chain_entry) = manifest
-            .chains
-            .iter()
-            .find(|entry| entry.scope == self.scope)
-        else {
-            return;
-        };
-
-        let mut catalogs = Vec::new();
-        for catalog_descriptor in chain_entry
-            .catalogs
-            .iter()
-            .filter(|catalog| self.catalog_may_contain_txid_partition(catalog))
-        {
-            match self.fetch_stream_catalog(catalog_descriptor).await {
-                Ok(catalog) => catalogs.push(catalog),
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        cid = %catalog_descriptor.cid,
-                        chain_id = cache.key.chain_id,
-                        txid_version = cache.key.txid_version,
-                        "failed to fetch optional public TXID prior-tail catalog"
-                    );
-                }
-            }
-        }
-        if catalogs.is_empty() {
-            return;
-        }
-        let plan = match IndexedArtifactStreamPlan::plan(
-            &catalogs,
-            &IndexedArtifactStreamPlanRequest::new(
-                IndexedDatasetKind::PublicTxid,
-                self.scope.clone(),
-                IndexedArtifactRangeKind::TxidIndex,
-                from_index,
-                u64::MAX,
-                IndexedArtifactStreamPartitionPolicy::Exact(self.txid_version.clone()),
-            ),
-        ) {
-            Ok(plan) => plan,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    chain_id = cache.key.chain_id,
-                    txid_version = cache.key.txid_version,
-                    "failed to plan optional public TXID prior-tail retention"
-                );
-                return;
-            }
-        };
-        let optional_prior_tail_retention = plan.optional_prior_tail_retention;
-        drop(catalogs);
-        self.retain_optional_prior_tail_chunks(cache, &optional_prior_tail_retention, read_scope)
-            .await;
-    }
-
     fn catalog_may_contain_txid_partition(&self, descriptor: &IndexedArtifactDescriptor) -> bool {
         descriptor.matches(
             IndexedDatasetKind::PublicTxid,
             &self.scope,
             IndexedArtifactRangeKind::TxidIndex,
-        ) && descriptor
-            .metadata
-            .stream_partition
-            .as_deref()
-            .is_none_or(|partition| partition == self.txid_version.as_str())
+        ) && descriptor.metadata.stream_partition.is_none()
     }
 
     fn txid_chunk_matches_partition(&self, descriptor: &IndexedArtifactDescriptor) -> bool {
@@ -327,7 +223,7 @@ impl TxidPublicArtifactSource {
             IndexedDatasetKind::PublicTxid,
             &self.scope,
             IndexedArtifactRangeKind::TxidIndex,
-        ) && descriptor.metadata.stream_partition.as_deref() == Some(self.txid_version.as_str())
+        ) && descriptor.metadata.stream_partition.is_none()
     }
 
     fn required_prior_context_start(
@@ -356,62 +252,6 @@ impl TxidPublicArtifactSource {
             self.client.fetch_catalog(descriptor).await?,
         ))
     }
-
-    async fn retain_optional_prior_tail_chunks(
-        &self,
-        cache: &TxidPublicCache<'_>,
-        entries: &[IndexedArtifactPlannedChunk],
-        read_scope: TxidPublicCacheReadScope,
-    ) {
-        for entry in entries {
-            let descriptor = &entry.descriptor;
-            if cache.cached_artifact_chunk(descriptor).is_some() {
-                continue;
-            }
-            match self
-                .client
-                .fetch_chunks_bounded(std::slice::from_ref(descriptor))
-                .await
-            {
-                Ok(chunks) => {
-                    let retained =
-                        cache
-                            .begin_write_for_scope(read_scope)
-                            .await
-                            .and_then(|permit| {
-                                if cache.cached_artifact_chunk(descriptor).is_some() {
-                                    Ok(0)
-                                } else {
-                                    permit.retain_artifact_chunks(&chunks)
-                                }
-                            });
-                    match retained {
-                        Ok(retained) => debug!(
-                            chain_id = cache.key.chain_id,
-                            txid_version = cache.key.txid_version,
-                            retained,
-                            cid = %descriptor.cid,
-                            "retained optional public TXID prior-tail artifact chunk"
-                        ),
-                        Err(err) => warn!(
-                            ?err,
-                            chain_id = cache.key.chain_id,
-                            txid_version = cache.key.txid_version,
-                            cid = %descriptor.cid,
-                            "failed best-effort public TXID prior-tail retention"
-                        ),
-                    }
-                }
-                Err(err) => warn!(
-                    ?err,
-                    chain_id = cache.key.chain_id,
-                    txid_version = cache.key.txid_version,
-                    cid = %descriptor.cid,
-                    "failed to fetch optional public TXID prior-tail artifact chunk"
-                ),
-            }
-        }
-    }
 }
 
 impl TxidPublicCache<'_> {
@@ -423,7 +263,8 @@ impl TxidPublicCache<'_> {
         if descriptor.dataset_kind != IndexedDatasetKind::PublicTxid
             || descriptor.range.kind != IndexedArtifactRangeKind::TxidIndex
             || descriptor.scope != scope
-            || descriptor.metadata.stream_partition.as_deref() != Some(self.key.txid_version)
+            || self.key.txid_version != DEFAULT_TXID_VERSION
+            || descriptor.metadata.stream_partition.is_some()
         {
             return None;
         }
@@ -478,7 +319,8 @@ impl TxidPublicCacheWritePermit<'_> {
         let key = self.key();
         for chunk in chunks {
             if chunk.descriptor.scope != key.artifact_scope()?
-                || chunk.descriptor.metadata.stream_partition.as_deref() != Some(key.txid_version)
+                || key.txid_version != DEFAULT_TXID_VERSION
+                || chunk.descriptor.metadata.stream_partition.is_some()
             {
                 return Err(TxidPublicCacheError::MetadataMismatch(
                     "retained public_txid artifact cache identity mismatch".to_string(),
@@ -668,21 +510,17 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for Vec<TxidPublicCachePage> {
             envelope.header.range.end,
             envelope.header.row_count,
         )?;
-        let txid_version = chunk
-            .descriptor
-            .metadata
-            .stream_partition
-            .as_deref()
-            .ok_or_else(|| {
-                TxidPublicCacheError::MetadataMismatch(
-                    "public_txid artifact missing stream partition".to_string(),
-                )
-            })?;
+        if chunk.descriptor.metadata.stream_partition.is_some() {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "format-v1 public_txid artifact has unsupported stream partition metadata"
+                    .to_string(),
+            ));
+        }
         let key = TxidPublicCacheKey {
             chain_type: 0,
             chain_id: chunk.descriptor.scope.chain_id,
             railgun_contract: chunk.descriptor.scope.railgun_contract,
-            txid_version,
+            txid_version: DEFAULT_TXID_VERSION,
         };
         TxidPublicCachePage::pages_from_rows(key, rows)
     }

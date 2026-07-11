@@ -52,9 +52,8 @@ use crate::indexed_artifacts::{
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
     INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION, INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
     INDEXED_ARTIFACT_CHUNK_MAGIC, IndexedArtifactCatalog, IndexedArtifactChainEntry,
-    IndexedArtifactDescriptor, IndexedArtifactMaintenanceAdmission, IndexedArtifactMaintenanceKey,
-    IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind, IndexedDatasetKind,
-    LatestIndexedHeight, PublisherIdentity,
+    IndexedArtifactDescriptor, IndexedArtifactManifest, IndexedArtifactRange,
+    IndexedArtifactRangeKind, IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity,
 };
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, ChainKey, GlobalPoiPolicy,
@@ -1581,7 +1580,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
 }
 
 #[tokio::test]
-async fn blocked_wallet_optional_endpoint_does_not_delay_required_rows() {
+async fn wallet_snapshot_does_not_fetch_optional_prior_endpoint() {
     let BlockedWalletOptionalMaintenanceFixture {
         root_dir,
         db,
@@ -1593,7 +1592,7 @@ async fn blocked_wallet_optional_endpoint_does_not_delay_required_rows() {
     } = blocked_wallet_optional_maintenance_fixture("wallet-optional-nonblocking");
     let PathServerBlockControl {
         request_started,
-        release,
+        release: _,
     } = optional_block;
     let read_scope = public_data_plane.begin_public_scan_read();
 
@@ -1616,23 +1615,12 @@ async fn blocked_wallet_optional_endpoint_does_not_delay_required_rows() {
     };
     assert_eq!(page.checkpoint_block, 120);
 
-    wait_for_std_signal(request_started, "optional wallet chunk request started").await;
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
-    assert_eq!(
-        public_data_plane.schedule_indexed_artifact_maintenance(
-            IndexedArtifactMaintenanceKey::Test(1),
-            0,
-            async move {
-                let _ = drained_tx.send(());
-            },
-        ),
-        IndexedArtifactMaintenanceAdmission::Admitted
+    assert!(
+        request_started
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "current snapshot reads must not fetch optional prior-tail chunks"
     );
-    release.send(()).expect("release optional wallet chunk");
-    tokio::time::timeout(Duration::from_secs(2), drained_rx)
-        .await
-        .expect("wallet maintenance drained")
-        .expect("maintenance drain signal");
 
     public_data_plane.shutdown().await;
     drop(public_data_plane);
@@ -1643,7 +1631,7 @@ async fn blocked_wallet_optional_endpoint_does_not_delay_required_rows() {
 }
 
 #[tokio::test]
-async fn stale_detached_wallet_retention_cannot_write_after_invalidation() {
+async fn superseded_wallet_descriptor_stays_uncached_after_invalidation() {
     let BlockedWalletOptionalMaintenanceFixture {
         root_dir,
         db,
@@ -1655,42 +1643,29 @@ async fn stale_detached_wallet_retention_cannot_write_after_invalidation() {
     } = blocked_wallet_optional_maintenance_fixture("wallet-optional-stale");
     let PathServerBlockControl {
         request_started,
-        release,
+        release: _,
     } = optional_block;
     let read_scope = public_data_plane.begin_public_scan_read();
     IndexedWalletArtifactSession::prepare(&chain, 110, 120, read_scope, &public_data_plane)
         .await
         .expect("prepare wallet artifacts")
         .expect("wallet artifact session");
-    wait_for_std_signal(request_started, "optional wallet chunk request started").await;
+    assert!(
+        request_started
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "superseded optional descriptor must not be fetched"
+    );
 
     public_data_plane
         .invalidate_public_scan_coverage_from(110)
         .await;
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
-    assert_eq!(
-        public_data_plane.schedule_indexed_artifact_maintenance(
-            IndexedArtifactMaintenanceKey::Test(2),
-            0,
-            async move {
-                let _ = drained_tx.send(());
-            },
-        ),
-        IndexedArtifactMaintenanceAdmission::Admitted
-    );
-    release
-        .send(())
-        .expect("release stale optional wallet chunk");
-    tokio::time::timeout(Duration::from_secs(2), drained_rx)
-        .await
-        .expect("stale wallet maintenance drained")
-        .expect("maintenance drain signal");
 
     assert!(
         public_data_plane
             .cached_wallet_scan_artifact_chunk(&optional_descriptor)
             .is_none(),
-        "maintenance carrying a stale read scope must not write after invalidation"
+        "superseded descriptors must remain uncached"
     );
 
     public_data_plane.shutdown().await;

@@ -1315,18 +1315,63 @@ async fn txid_public_artifact_only_failure_before_progress_returns_error() {
 }
 
 #[tokio::test]
-async fn txid_public_artifact_only_rejects_missing_stream_partition() {
-    txid_public_artifact_only_rejects_unsupported_stream_partition(None).await;
+async fn txid_public_artifact_only_accepts_format_v1_without_stream_partition() {
+    txid_public_artifact_only_handles_format_v1_stream_partition(None).await;
 }
 
 #[tokio::test]
-async fn txid_public_artifact_only_rejects_different_stream_partition() {
-    txid_public_artifact_only_rejects_unsupported_stream_partition(Some("other-txid-version"))
-        .await;
+async fn txid_public_format_v1_serialization_omits_stream_partition() {
+    txid_public_artifact_only_handles_format_v1_stream_partition(Some("other-txid-version")).await;
 }
 
 #[tokio::test]
-async fn txid_public_ignores_malformed_catalog_for_different_stream_partition() {
+async fn txid_public_format_v1_rejects_non_v2_cache_identity() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: 1,
+        railgun_contract: artifact_scope().railgun_contract,
+        txid_version: "future-txid-version",
+    };
+    let cache = TxidPublicCache::new(&db, key);
+    let artifact_row = indexed_transaction(0x45, 0x04, 0x05, 0x06);
+    let artifact_root = root_for_single_leaf(artifact_row.txid_leaf_hash());
+    let chunk =
+        public_txid_artifact_chunk(0, std::slice::from_ref(&artifact_row), Some(artifact_root));
+    let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![chunk]);
+
+    let error = cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(artifact_root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect_err("format-v1 artifacts must not satisfy another TXID identity");
+
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        }
+    ));
+    assert!(cache.load_manifest().expect("load manifest").is_none());
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_rejects_malformed_current_catalog_even_with_internal_partition() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1367,7 +1412,7 @@ async fn txid_public_ignores_malformed_catalog_for_different_stream_partition() 
         vec![malformed_other_partition],
     );
 
-    cache
+    let error = cache
         .sync_with_artifact_source(
             None,
             None,
@@ -1378,20 +1423,17 @@ async fn txid_public_ignores_malformed_catalog_for_different_stream_partition() 
             Some(&artifact_source),
         )
         .await
-        .expect("different partition catalog must not affect TXID sync");
+        .expect_err("all format-v1 current catalogs must be valid");
 
-    let manifest = cache
-        .load_manifest()
-        .expect("load manifest")
-        .expect("manifest present");
-    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert!(matches!(error, super::TxidPublicCacheError::Artifact(_)));
+    assert!(cache.load_manifest().expect("load manifest").is_none());
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
-async fn txid_public_accepts_matching_chunk_from_multi_partition_catalog() {
+async fn txid_public_rejects_overlapping_internal_partitions_in_format_v1() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1419,7 +1461,7 @@ async fn txid_public_accepts_matching_chunk_from_multi_partition_catalog() {
     let (artifact_source, _artifact_server) =
         public_txid_artifact_source(vec![requested_chunk, other_chunk]);
 
-    cache
+    let error = cache
         .sync_with_artifact_source(
             None,
             None,
@@ -1430,26 +1472,20 @@ async fn txid_public_accepts_matching_chunk_from_multi_partition_catalog() {
             Some(&artifact_source),
         )
         .await
-        .expect("multi-partition catalog should expose requested TXID chunk");
+        .expect_err("format-v1 has one implicit TXID identity");
 
-    let manifest = cache
-        .load_manifest()
-        .expect("load manifest")
-        .expect("manifest present");
-    assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let row = super::row_for_txid_index(&manifest, &db, 0)
-        .expect("read requested row")
-        .expect("requested row present");
-    assert_eq!(
-        row.transaction.transaction_hash,
-        requested_row.transaction_hash
-    );
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::MetadataMismatch(message)
+            if message.contains("overlapping chunks")
+    ));
+    assert!(cache.load_manifest().expect("load manifest").is_none());
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
+async fn txid_public_artifact_only_handles_format_v1_stream_partition(
     stream_partition: Option<&str>,
 ) {
     let root_dir = temp_db_root();
@@ -1471,7 +1507,7 @@ async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
     chunk.descriptor.metadata.stream_partition = stream_partition.map(str::to_string);
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![chunk]);
 
-    let error = cache
+    let result = cache
         .sync_with_artifact_source(
             None,
             None,
@@ -1481,19 +1517,16 @@ async fn txid_public_artifact_only_rejects_unsupported_stream_partition(
             },
             Some(&artifact_source),
         )
-        .await
-        .expect_err("unsupported partition must not satisfy artifact-only latest sync");
+        .await;
 
-    assert!(matches!(
-        error,
-        super::TxidPublicCacheError::CacheNotReady {
-            next_index: 0,
-            required_index: 0,
-        }
-    ));
-    assert!(
-        cache.load_manifest().expect("load manifest").is_none(),
-        "unsupported partition must not write public TXID progress or latest metadata"
+    result.expect("format-v1 serialization omits internal partition metadata");
+    assert_eq!(
+        cache
+            .load_manifest()
+            .expect("load manifest")
+            .expect("manifest present")
+            .validated_cached_txid_index,
+        Some(0)
     );
 
     drop(db);
@@ -1756,7 +1789,7 @@ async fn txid_public_cache_prefers_configured_artifact_source_before_graphql() {
 }
 
 #[tokio::test]
-async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
+async fn txid_public_rejects_overlapping_catalogs_in_current_snapshot() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1781,7 +1814,7 @@ async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
         (2, vec![replacement]),
     ]);
 
-    cache
+    let error = cache
         .sync_with_artifact_source(
             None,
             None,
@@ -1792,28 +1825,21 @@ async fn txid_public_artifact_uses_planner_for_replaced_final_tail() {
             Some(&artifact_source),
         )
         .await
-        .expect("planner should select only replacement current TXID chunk");
+        .expect_err("one current snapshot must not contain overlapping TXID catalogs");
 
-    let manifest = cache
-        .load_manifest()
-        .expect("load manifest")
-        .expect("manifest present");
-    assert_eq!(manifest.next_txid_index, 2);
-    assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let first_row = super::row_for_txid_index(&manifest, &db, 0)
-        .expect("read first row")
-        .expect("first row present");
-    assert_eq!(
-        first_row.transaction.transaction_hash,
-        new_first.transaction_hash
-    );
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::MetadataMismatch(message)
+            if message.contains("overlapping chunks")
+    ));
+    assert!(cache.load_manifest().expect("load manifest").is_none());
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
-async fn txid_public_planner_uses_non_intersecting_manifest_catalog_context() {
+async fn txid_public_format_v1_ignores_partitioned_catalog_context() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1867,14 +1893,14 @@ async fn txid_public_planner_uses_non_intersecting_manifest_catalog_context() {
         .expect("successor descriptor should not require its catalog body");
 
     assert_eq!(plan.required.len(), 1);
-    assert_eq!(plan.stable_current.len(), 1);
+    assert!(plan.stable_current.is_empty());
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
-async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
+async fn txid_public_rejects_overlapping_current_snapshot_repack() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1952,12 +1978,12 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
     let error = cache
         .sync_to_indexed_tip(None, None, Some(&artifact_source))
         .await
-        .expect_err("stable prior-tail conflict must reject the invalid current repack");
+        .expect_err("overlapping current catalogs must reject the invalid repack");
 
     assert!(matches!(
         error,
         super::TxidPublicCacheError::MetadataMismatch(message)
-            if message.contains("stable chunk")
+            if message.contains("overlapping chunks")
     ));
     let after_manifest = cache
         .load_manifest()
@@ -1991,7 +2017,7 @@ async fn txid_public_rejects_current_repack_over_stable_prior_tail() {
 }
 
 #[tokio::test]
-async fn txid_public_background_retains_prior_tail_when_current_chunk_advances() {
+async fn txid_public_background_does_not_retain_superseded_prior_tail() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2023,7 +2049,6 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
 
     let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let retained_cid = raw_cid(&prior_tail.bytes).to_string();
-    let retained_bytes = prior_tail.bytes.clone();
     let second = indexed_transaction(0x71, 0x04, 0x05, 0x06);
     let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
     let current_chunk =
@@ -2036,7 +2061,7 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
     let fetched = cache
         .sync_to_indexed_tip(None, None, Some(&source))
         .await
-        .expect("current chunk should apply and prior tail should be retained");
+        .expect("current chunk should apply without prior-tail maintenance");
 
     assert_eq!(fetched, 1);
     let manifest = cache
@@ -2051,15 +2076,15 @@ async fn txid_public_background_retains_prior_tail_when_current_chunk_advances()
         second_row.transaction.transaction_hash,
         second.transaction_hash
     );
-    let meta = db
-        .get_blob_meta(
+    assert!(
+        db.get_blob_meta(
             super::TXID_CACHE_BLOB_KIND,
             &super::artifact_chunk_blob_id(key, &retained_cid),
         )
-        .expect("read retained chunk metadata")
-        .expect("prior tail chunk metadata present");
-    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
-    assert_eq!(retained, retained_bytes);
+        .expect("read prior-tail chunk metadata")
+        .is_none(),
+        "superseded prior tails must not be fetched solely for retention"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -2108,7 +2133,7 @@ async fn txid_public_background_does_not_retain_unsealed_final_chunk() {
 }
 
 #[tokio::test]
-async fn txid_public_validated_retains_explicitly_stable_final_at_exact_marker() {
+async fn txid_public_ignores_speculative_lifecycle_flags_on_final_chunk() {
     for stream_complete in [false, true] {
         let root_dir = temp_db_root();
         let db = DbStore::open(DbConfig {
@@ -2141,16 +2166,16 @@ async fn txid_public_validated_retains_explicitly_stable_final_at_exact_marker()
                 Some(&source),
             )
             .await
-            .expect("validated explicitly stable artifact sync");
+            .expect("validated format-v1 artifact sync");
 
         assert!(
             db.get_blob_meta(
                 super::TXID_CACHE_BLOB_KIND,
                 &super::artifact_chunk_blob_id(key, &cid),
             )
-            .expect("read stable final chunk metadata")
-            .is_some(),
-            "sealed and complete final chunks are retained at the exact validated marker"
+            .expect("read final chunk metadata")
+            .is_none(),
+            "format-v1 sealing and completion flags must not change retention"
         );
 
         drop(db);
@@ -2201,10 +2226,10 @@ async fn txid_public_second_unchanged_cycle_fetches_no_chunks() {
     );
     assert_eq!(server.request_count(&first_path), first_requests);
     assert_eq!(server.request_count(&second_path), second_requests);
-    assert!(
-        server.request_count_excluding(&["/manifest", first_path.as_str(), second_path.as_str(),])
-            > catalog_requests,
-        "the unchanged cycle still inspects catalogs"
+    assert_eq!(
+        server.request_count_excluding(&["/manifest", first_path.as_str(), second_path.as_str(),]),
+        catalog_requests,
+        "a locally sufficient unchanged cycle need not inspect catalogs"
     );
 
     drop(db);
@@ -2252,10 +2277,22 @@ async fn txid_public_corrupt_retained_blob_is_refetched() {
     fs::write(&retained_path, b"corrupt").expect("corrupt retained chunk");
     let requests_before = server.request_count(&first_path);
 
-    cache
-        .sync_to_indexed_tip(None, None, Some(&source))
+    let artifact_source = super::artifact::TxidPublicArtifactSource::new(
+        &source,
+        None,
+        artifact_scope(),
+        TEST_TXID_VERSION,
+    );
+    let plan = artifact_source
+        .fetch_current_chunks(&cache, 0, Some(0))
         .await
-        .expect("corrupt optional chunk refetched");
+        .expect("corrupt demanded chunk refetched");
+    let permit = cache.begin_write().await;
+    let read_scope = permit.scope();
+    drop(permit);
+    super::artifact::TxidPublicArtifactMaintenance::new(plan.stable_current, read_scope)
+        .run(&cache)
+        .await;
 
     assert_eq!(server.request_count(&first_path), requests_before + 1);
     assert_eq!(
@@ -2331,7 +2368,7 @@ async fn txid_public_validated_artifact_retains_planner_stable_non_final_bounded
 }
 
 #[tokio::test]
-async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catalog() {
+async fn txid_public_background_does_not_fetch_prior_only_catalog() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2363,7 +2400,6 @@ async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catal
 
     let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let retained_cid = raw_cid(&prior_tail.bytes).to_string();
-    let retained_bytes = prior_tail.bytes.clone();
     let second = indexed_transaction(0x73, 0x04, 0x05, 0x06);
     let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
     let current_chunk =
@@ -2376,7 +2412,7 @@ async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catal
     let fetched = cache
         .sync_to_indexed_tip(None, None, Some(&source))
         .await
-        .expect("current chunk should apply and non-repeated prior tail should be retained");
+        .expect("current chunk should apply without prior-only catalog maintenance");
 
     assert_eq!(fetched, 1);
     let manifest = cache
@@ -2391,22 +2427,22 @@ async fn txid_public_background_retains_prior_tail_not_repeated_by_current_catal
         second_row.transaction.transaction_hash,
         second.transaction_hash
     );
-    let meta = db
-        .get_blob_meta(
+    assert!(
+        db.get_blob_meta(
             super::TXID_CACHE_BLOB_KIND,
             &super::artifact_chunk_blob_id(key, &retained_cid),
         )
-        .expect("read retained chunk metadata")
-        .expect("prior tail chunk metadata present");
-    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
-    assert_eq!(retained, retained_bytes);
+        .expect("read prior-tail chunk metadata")
+        .is_none(),
+        "a non-current prior catalog must not be fetched for retention"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
-async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
+async fn txid_public_background_skips_prior_tail_after_progress() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2441,7 +2477,6 @@ async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let retained_cid = raw_cid(&prior_tail.bytes).to_string();
-    let retained_bytes = prior_tail.bytes.clone();
     let current_tail =
         public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
     let (retention_source, _retention_server) = public_txid_artifact_source_with_catalogs(vec![
@@ -2452,25 +2487,25 @@ async fn txid_public_background_artifact_retains_prior_tail_after_progress() {
     let fetched = cache
         .sync_to_indexed_tip(None, None, Some(&retention_source))
         .await
-        .expect("background retention pass should not need current rows");
+        .expect("background pass should not need current rows");
 
     assert_eq!(fetched, 0);
-    let meta = db
-        .get_blob_meta(
+    assert!(
+        db.get_blob_meta(
             super::TXID_CACHE_BLOB_KIND,
             &super::artifact_chunk_blob_id(key, &retained_cid),
         )
-        .expect("read retained chunk metadata")
-        .expect("prior tail chunk metadata present");
-    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
-    assert_eq!(retained, retained_bytes);
+        .expect("read prior-tail chunk metadata")
+        .is_none(),
+        "no-progress background sync must not fetch prior tails"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
-async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configured() {
+async fn txid_public_background_skips_prior_tail_with_graphql_fallback_configured() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2505,7 +2540,6 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let retained_cid = raw_cid(&prior_tail.bytes).to_string();
-    let retained_bytes = prior_tail.bytes.clone();
     let current_tail =
         public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
     let (retention_source, _retention_server) = public_txid_artifact_source_with_catalogs(vec![
@@ -2517,22 +2551,22 @@ async fn txid_public_background_retains_prior_tail_with_graphql_fallback_configu
     let fetched = cache
         .sync_to_indexed_tip(Some(&graph_endpoint), None, Some(&retention_source))
         .await
-        .expect("retention should run after no-progress GraphQL fallback");
+        .expect("no-progress GraphQL fallback should complete");
 
     assert_eq!(fetched, 0);
     let request = graph_requests
         .recv_timeout(Duration::from_secs(5))
         .expect("GraphQL fallback request received");
     assert!(request.contains("PublicTxidPage"));
-    let meta = db
-        .get_blob_meta(
+    assert!(
+        db.get_blob_meta(
             super::TXID_CACHE_BLOB_KIND,
             &super::artifact_chunk_blob_id(key, &retained_cid),
         )
-        .expect("read retained chunk metadata")
-        .expect("prior tail chunk metadata present");
-    let retained = fs::read(db.resolve_path(&meta.relative_path)).expect("read retained chunk");
-    assert_eq!(retained, retained_bytes);
+        .expect("read prior-tail chunk metadata")
+        .is_none(),
+        "GraphQL fallback must not trigger prior-tail retention"
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -3827,7 +3861,6 @@ fn public_txid_artifact_chunk(
                 leaf_count: None,
                 start_block: None,
                 end_block: None,
-                stream_partition: Some(TEST_TXID_VERSION.to_string()),
                 ..DatasetDescriptorMetadata::default()
             },
         },
@@ -3966,7 +3999,7 @@ fn public_txid_artifact_source_with_extra_catalogs(
     let mut catalog_descriptors = Vec::new();
     let mut catalog_blocks = Vec::new();
     let mut all_chunks = Vec::new();
-    for (generation, chunks) in catalogs {
+    for (_generation, chunks) in catalogs {
         let chunks = chunks
             .into_iter()
             .map(with_real_chunk_cid)
@@ -3982,7 +4015,6 @@ fn public_txid_artifact_source_with_extra_catalogs(
         };
         let catalog_bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
         let catalog_cid = raw_cid(&catalog_bytes);
-        let catalog_stream_partition = shared_stream_partition(&chunks);
         let catalog_descriptor = IndexedArtifactDescriptor {
             dataset_kind: IndexedDatasetKind::PublicTxid,
             scope: scope.clone(),
@@ -4005,11 +4037,7 @@ fn public_txid_artifact_source_with_extra_catalogs(
             byte_size: catalog_bytes.len() as u64,
             encoding_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
             compression: CompressionAlgorithm::None,
-            metadata: DatasetDescriptorMetadata {
-                catalog_generation: Some(generation),
-                stream_partition: catalog_stream_partition,
-                ..DatasetDescriptorMetadata::default()
-            },
+            metadata: DatasetDescriptorMetadata::default(),
         };
         catalog_descriptors.push(catalog_descriptor);
         catalog_blocks.push((catalog_cid, catalog_bytes));
@@ -4017,16 +4045,6 @@ fn public_txid_artifact_source_with_extra_catalogs(
     }
     catalog_descriptors.extend(extra_catalog_descriptors);
     signed_artifact_source(&scope, catalog_descriptors, catalog_blocks, all_chunks)
-}
-
-fn shared_stream_partition(chunks: &[VerifiedIndexedArtifactChunk]) -> Option<String> {
-    let mut partitions = chunks
-        .iter()
-        .map(|chunk| chunk.descriptor.metadata.stream_partition.as_deref());
-    let first = partitions.next()??;
-    partitions
-        .all(|partition| partition == Some(first))
-        .then(|| first.to_string())
 }
 
 fn public_txid_empty_artifact_source() -> (IndexedArtifactSourceConfig, PathServer) {

@@ -101,7 +101,7 @@ impl TxidPublicCache<'_> {
             .sync_with_artifact_source_plan(endpoint, http_client, latest, indexed_artifact_source)
             .await?;
         if let Some(maintenance) = maintenance {
-            self.schedule_artifact_maintenance(maintenance_scheduler, maintenance_db, maintenance);
+            self.schedule_artifact_maintenance(maintenance_scheduler, &maintenance_db, maintenance);
         }
         Ok(())
     }
@@ -183,13 +183,8 @@ impl TxidPublicCache<'_> {
             read_scope,
         )
         .await?;
-        Ok(artifact_fetch.map(|(source, plan)| {
-            artifact::TxidPublicArtifactMaintenance::new(
-                source,
-                plan.stable_current,
-                artifact_from_index,
-                read_scope,
-            )
+        Ok(artifact_fetch.map(|(_source, plan)| {
+            artifact::TxidPublicArtifactMaintenance::new(plan.stable_current, read_scope)
         }))
     }
 
@@ -455,7 +450,7 @@ impl TxidPublicCache<'_> {
             .sync_to_indexed_tip_plan(endpoint, http_client, indexed_artifact_source)
             .await?;
         if let Some(maintenance) = maintenance {
-            self.schedule_artifact_maintenance(maintenance_scheduler, maintenance_db, maintenance);
+            self.schedule_artifact_maintenance(maintenance_scheduler, &maintenance_db, maintenance);
         }
         Ok(fetched_rows)
     }
@@ -502,9 +497,7 @@ impl TxidPublicCache<'_> {
                             )
                             .await?;
                         let maintenance = artifact::TxidPublicArtifactMaintenance::new(
-                            source,
                             plan.stable_current,
-                            from_index,
                             read_scope,
                         );
                         match applied {
@@ -524,9 +517,7 @@ impl TxidPublicCache<'_> {
                         return Ok((
                             0,
                             Some(artifact::TxidPublicArtifactMaintenance::new(
-                                source,
                                 plan.stable_current,
-                                from_index,
                                 read_scope,
                             )),
                         ));
@@ -534,9 +525,7 @@ impl TxidPublicCache<'_> {
                     Ok(plan) => {
                         maintenance_after_graphql =
                             Some(artifact::TxidPublicArtifactMaintenance::new(
-                                source,
                                 plan.stable_current,
-                                from_index,
                                 read_scope,
                             ));
                     }
@@ -690,7 +679,7 @@ impl TxidPublicCache<'_> {
     fn schedule_artifact_maintenance(
         &self,
         scheduler: &crate::indexed_artifacts::IndexedArtifactMaintenanceScheduler,
-        db: std::sync::Arc<DbStore>,
+        db: &std::sync::Arc<DbStore>,
         mut maintenance: artifact::TxidPublicArtifactMaintenance,
     ) {
         let chain_type = self.key.chain_type;
@@ -706,7 +695,7 @@ impl TxidPublicCache<'_> {
             );
             let retained_payload_bytes = chunk.bytes.len() as u64;
             let chunk_cid = chunk.descriptor.cid.clone();
-            let maintenance_db = std::sync::Arc::clone(&db);
+            let maintenance_db = std::sync::Arc::clone(db);
             let maintenance_txid_version = txid_version.clone();
             let admission =
                 scheduler.try_schedule(scheduler_key, retained_payload_bytes, async move {
@@ -732,32 +721,6 @@ impl TxidPublicCache<'_> {
                     "stable public TXID artifact maintenance was not admitted"
                 );
             }
-        }
-
-        let scheduler_key =
-            crate::indexed_artifacts::IndexedArtifactMaintenanceKey::txid_prior_tail(
-                maintenance.scope(),
-                &txid_version,
-                maintenance.start_index(),
-                read_scope.generation(),
-            );
-        let admission = scheduler.try_schedule(scheduler_key, 0, async move {
-            let key = TxidPublicCacheKey {
-                chain_type,
-                chain_id,
-                railgun_contract,
-                txid_version: &txid_version,
-            };
-            let cache = TxidPublicCache::new(db.as_ref(), key);
-            maintenance.run_prior_tail(&cache).await;
-        });
-        if admission != crate::indexed_artifacts::IndexedArtifactMaintenanceAdmission::Admitted {
-            debug!(
-                ?admission,
-                chain_id,
-                txid_version = self.key.txid_version,
-                "optional public TXID prior-tail maintenance was not admitted"
-            );
         }
     }
 

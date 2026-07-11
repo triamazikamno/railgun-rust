@@ -4,7 +4,7 @@ use super::{
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
     IndexedWalletPageKind, Instant, PublicScanReadScope, QuickSyncClient, SyncError, UtxoSource,
     WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillStartResult, WalletHandle,
-    WalletScanApply, WalletScanInputRows, WalletStartupSyncError, debug, mpsc, warn,
+    WalletScanApply, WalletScanInputRows, WalletStartupSyncError, debug, mpsc,
 };
 
 use std::time::SystemTime;
@@ -400,7 +400,6 @@ impl IndexedWalletArtifactSession {
             Self::fetch_descriptors(&client, chain_entry, &scope, from_block, target_block).await?;
         let IndexedWalletArtifactDescriptorFetchResult {
             required_current_chunks,
-            optional_prior_tail_retention,
             coverage,
         } = descriptors;
         let chunk_descriptors = required_current_chunks
@@ -425,9 +424,7 @@ impl IndexedWalletArtifactSession {
         let chunks =
             Self::fetch_chunks(&client, &indexed_chunk_descriptors, public_data_plane).await?;
         Self::schedule_chunk_maintenance(
-            &client,
             &required_current_chunks,
-            optional_prior_tail_retention,
             &chunks.chunks,
             public_data_plane,
             read_scope,
@@ -602,31 +599,23 @@ impl IndexedWalletArtifactSession {
                 .map_err(|err| wallet_artifact_error(&err))?;
             candidate_catalogs.push(IndexedArtifactStreamCatalog::from(catalog));
         }
-        let plan = Self::select_current_stream_plan(
-            &candidate_catalogs,
-            &chain_entry.catalogs,
-            scope,
-            from_block,
-            target_block,
-        )?;
+        let plan =
+            Self::select_current_stream_plan(&candidate_catalogs, scope, from_block, target_block)?;
         let coverage = WalletScanArtifactCoverage::from_coverage(&plan.required_current_coverage)?;
         Ok(IndexedWalletArtifactDescriptorFetchResult {
             required_current_chunks: plan.required_current_chunks,
-            optional_prior_tail_retention: plan.optional_prior_tail_retention,
             coverage,
         })
     }
 
     fn select_current_stream_plan(
         catalogs: &[IndexedArtifactStreamCatalog],
-        catalog_descriptors: &[IndexedArtifactDescriptor],
         scope: &ChainScope,
         from_block: u64,
         target_block: u64,
     ) -> Result<IndexedArtifactStreamPlan, SyncError> {
-        IndexedArtifactStreamPlan::plan_with_catalog_descriptor_context(
+        IndexedArtifactStreamPlan::plan(
             catalogs,
-            catalog_descriptors,
             &IndexedArtifactStreamPlanRequest::new(
                 IndexedDatasetKind::WalletScan,
                 scope.clone(),
@@ -698,9 +687,7 @@ impl IndexedWalletArtifactSession {
     }
 
     fn schedule_chunk_maintenance(
-        client: &IndexedArtifactManifestClient,
         required_entries: &[IndexedArtifactPlannedChunk],
-        optional_entries: Vec<IndexedArtifactPlannedChunk>,
         current_chunks: &[IndexedWalletArtifactChunk],
         public_data_plane: &ChainPublicDataPlane,
         read_scope: PublicScanReadScope,
@@ -752,64 +739,6 @@ impl IndexedWalletArtifactSession {
                 );
             }
         }
-
-        for entry in optional_entries {
-            let descriptor = entry.descriptor;
-            if public_data_plane
-                .cached_wallet_scan_artifact_chunk(&descriptor)
-                .is_some()
-            {
-                continue;
-            }
-            let key =
-                IndexedArtifactMaintenanceKey::wallet_chunk(&descriptor, read_scope.epoch().value);
-            let maintenance_client = client.clone();
-            let maintenance_plane = (*public_data_plane).clone();
-            let admission = public_data_plane.schedule_indexed_artifact_maintenance(key, 0, {
-                let descriptor = descriptor.clone();
-                async move {
-                    if maintenance_plane
-                        .cached_wallet_scan_artifact_chunk(&descriptor)
-                        .is_some()
-                    {
-                        return;
-                    }
-                    match maintenance_client
-                        .fetch_chunks_bounded(std::slice::from_ref(&descriptor))
-                        .await
-                    {
-                        Ok(chunks) => {
-                            if maintenance_plane
-                                .cached_wallet_scan_artifact_chunk(&descriptor)
-                                .is_some()
-                            {
-                                return;
-                            }
-                            let retained = maintenance_plane
-                                .retain_wallet_scan_artifact_chunks(&chunks, read_scope)
-                                .await;
-                            debug!(
-                                retained,
-                                cid = %descriptor.cid,
-                                "retained optional wallet-scan prior-tail artifact chunk"
-                            );
-                        }
-                        Err(err) => warn!(
-                            ?err,
-                            cid = %descriptor.cid,
-                            "failed best-effort wallet-scan prior-tail artifact retention"
-                        ),
-                    }
-                }
-            });
-            if admission != IndexedArtifactMaintenanceAdmission::Admitted {
-                debug!(
-                    ?admission,
-                    cid = %descriptor.cid,
-                    "optional wallet-scan artifact maintenance was not admitted"
-                );
-            }
-        }
     }
 }
 
@@ -826,7 +755,6 @@ struct IndexedWalletArtifactChunkFetchResult {
 
 struct IndexedWalletArtifactDescriptorFetchResult {
     required_current_chunks: Vec<IndexedArtifactPlannedChunk>,
-    optional_prior_tail_retention: Vec<IndexedArtifactPlannedChunk>,
     coverage: WalletScanArtifactCoverage,
 }
 
@@ -1964,37 +1892,39 @@ mod tests {
     }
 
     #[test]
-    fn indexed_wallet_artifact_selection_uses_current_replacement_tail() {
+    fn indexed_wallet_uses_new_authoritative_snapshot_without_merging() {
         let scope = scope();
-        let old_tail = with_catalog_generation(
-            wallet_scan_chunk(
-                scope.clone(),
-                100,
-                110,
-                vec![(
-                    WALLET_NULLIFIER_SECTION_ID,
-                    nullifier_section(105, 7, [0x11; 32]),
-                )],
-                1,
-            ),
+        let old_tail = wallet_scan_chunk(
+            scope.clone(),
+            100,
+            110,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(105, 7, [0x11; 32]),
+            )],
             1,
         );
-        let current_tail = with_catalog_generation(
-            wallet_scan_chunk(
-                scope,
-                100,
-                120,
-                vec![(
-                    WALLET_NULLIFIER_SECTION_ID,
-                    nullifier_section(115, 7, [0x22; 32]),
-                )],
-                1,
-            ),
-            2,
+        let current_tail = wallet_scan_chunk(
+            scope,
+            100,
+            120,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(115, 7, [0x22; 32]),
+            )],
+            1,
         );
 
-        let selected = selected_wallet_scan_chunks(&[old_tail, current_tail], 100, 120)
-            .expect("select required current chunks");
+        let old_selected = selected_wallet_scan_chunks(std::slice::from_ref(&old_tail), 100, 110)
+            .expect("select old snapshot");
+        let old_page = artifact_session(110, old_selected)
+            .page_for_block_range(100, 110)
+            .expect("old snapshot page should decode")
+            .expect("old snapshot covers range");
+        assert_eq!(old_page.nullifiers[0].source.block_number, 105);
+
+        let selected =
+            selected_wallet_scan_chunks(&[current_tail], 100, 120).expect("select new snapshot");
         let session = artifact_session(120, selected);
         let page = session
             .page_for_block_range(100, 120)
@@ -2010,67 +1940,31 @@ mod tests {
     }
 
     #[test]
-    fn indexed_wallet_artifact_empty_catalog_suppresses_stale_replacement_tail() {
+    fn indexed_wallet_rejects_overlapping_current_snapshot_catalogs() {
         let scope = scope();
-        let old_tail = with_catalog_generation(
-            wallet_scan_chunk(
-                scope.clone(),
-                100,
-                110,
-                vec![(
-                    WALLET_NULLIFIER_SECTION_ID,
-                    nullifier_section(105, 7, [0x11; 32]),
-                )],
-                1,
-            ),
+        let old_tail = wallet_scan_chunk(
+            scope.clone(),
+            100,
+            110,
+            vec![(
+                WALLET_NULLIFIER_SECTION_ID,
+                nullifier_section(105, 7, [0x11; 32]),
+            )],
             1,
         );
         let catalogs = vec![
-            wallet_scan_catalog(1, vec![old_tail.descriptor]),
-            empty_wallet_scan_catalog(scope.clone(), 2, 100, 110),
+            wallet_scan_catalog(0, vec![old_tail.descriptor]),
+            empty_wallet_scan_catalog(scope.clone(), 0, 100, 110),
         ];
 
-        let catalog_descriptors = catalogs
-            .iter()
-            .map(|catalog| catalog.descriptor.clone())
-            .collect::<Vec<_>>();
-        let plan = IndexedWalletArtifactSession::select_current_stream_plan(
-            &catalogs,
-            &catalog_descriptors,
-            &scope,
-            100,
-            110,
-        )
-        .expect("empty replacement catalog should plan");
-        assert!(plan.required_current_chunks.is_empty());
-
-        let session = IndexedWalletArtifactSession {
-            probe: IndexedWalletArtifactProbe {
-                latest_indexed_block: 110,
-                catalog_count: catalogs.len(),
-            },
-            chunk_descriptors: plan
-                .required_current_chunks
-                .into_iter()
-                .map(|entry| entry.descriptor)
-                .collect(),
-            chunks: Vec::new(),
-            coverage: WalletScanArtifactCoverage::from_coverage(&plan.required_current_coverage)
-                .expect("planner coverage"),
-            read_scope: test_public_scan_read_scope(),
-        };
-        let page = session
-            .page_for_block_range(100, 110)
-            .expect("empty current page should decode")
-            .expect("latest indexed block covers range");
-
-        assert_eq!(page.checkpoint_block, 110);
-        assert_eq!(page.nullifier_rows, 0);
-        assert!(page.nullifiers.is_empty());
+        let error =
+            IndexedWalletArtifactSession::select_current_stream_plan(&catalogs, &scope, 100, 110)
+                .expect_err("overlapping current snapshot catalogs must fail");
+        assert!(error.to_string().contains("overlap"));
     }
 
     #[test]
-    fn indexed_wallet_planner_uses_non_intersecting_manifest_catalog_context() {
+    fn indexed_wallet_snapshot_does_not_use_nonintersecting_catalog_context() {
         let scope = scope();
         let current = with_catalog_generation(
             wallet_scan_chunk(
@@ -2090,14 +1984,14 @@ mod tests {
 
         let plan = IndexedWalletArtifactSession::select_current_stream_plan(
             std::slice::from_ref(&current_catalog),
-            &[current_catalog.descriptor.clone(), successor_catalog],
             &scope,
             100,
             110,
         )
-        .expect("manifest successor context should plan without fetching its catalog body");
+        .expect("current catalog should plan without external catalog context");
 
-        assert!(plan.required_current_chunks[0].is_stable_current());
+        assert!(!plan.required_current_chunks[0].is_stable_current());
+        assert_eq!(successor_catalog.range.start, 200);
     }
 
     #[test]
@@ -2568,13 +2462,8 @@ mod tests {
             .scope
             .clone();
         let catalogs = stream_catalogs_for_chunks(chunks);
-        let catalog_descriptors = catalogs
-            .iter()
-            .map(|catalog| catalog.descriptor.clone())
-            .collect::<Vec<_>>();
         let selected = IndexedWalletArtifactSession::select_current_stream_plan(
             &catalogs,
-            &catalog_descriptors,
             &scope,
             from_block,
             target_block,

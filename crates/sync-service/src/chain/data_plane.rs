@@ -1333,7 +1333,7 @@ fn wallet_scan_artifact_descriptor_matches_cache_kind(
 
 fn wallet_scan_artifact_chunk_blob_id(descriptor: &IndexedArtifactDescriptor) -> String {
     format!(
-        "{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
+        "{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{}",
         descriptor.dataset_kind,
         format_scope(&descriptor.scope),
         descriptor.range.kind,
@@ -1344,17 +1344,6 @@ fn wallet_scan_artifact_chunk_blob_id(descriptor: &IndexedArtifactDescriptor) ->
         descriptor.byte_size,
         descriptor.encoding_version,
         descriptor.compression,
-        descriptor
-            .metadata
-            .catalog_generation
-            .map_or_else(|| "none".to_string(), |generation| generation.to_string()),
-        descriptor
-            .metadata
-            .stream_partition
-            .as_deref()
-            .unwrap_or("none"),
-        descriptor.metadata.stream_complete,
-        descriptor.metadata.chunk_sealed,
         descriptor
             .metadata
             .checkpoint_block
@@ -2017,7 +2006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_scan_artifact_chunk_cache_retains_only_planner_selected_chunks() {
+    async fn wallet_scan_artifact_chunk_cache_reuses_exact_content_identity() {
         let (db, data_plane, root_dir) = test_data_plane_with_db("wallet-scan-chunk-cache");
         let stable_chunk = test_wallet_scan_chunk(1, 10, &[1, 2, 3], |_| {});
         let transient_tail = test_wallet_scan_chunk(11, 20, &[4, 5, 6], |_| {});
@@ -2040,7 +2029,7 @@ mod tests {
             data_plane
                 .cached_wallet_scan_artifact_chunk(&transient_tail.descriptor)
                 .is_none(),
-            "unsealed final wallet-scan tails stay transient"
+            "chunks not selected for retention stay uncached"
         );
 
         let mut mismatched_descriptor = stable_chunk.descriptor.clone();
@@ -2048,8 +2037,15 @@ mod tests {
         assert!(
             data_plane
                 .cached_wallet_scan_artifact_chunk(&mismatched_descriptor)
+                .is_some(),
+            "speculative sealing metadata must not prevent exact-content reuse"
+        );
+        mismatched_descriptor.sha256 = FixedBytes::from([0xff; 32]);
+        assert!(
+            data_plane
+                .cached_wallet_scan_artifact_chunk(&mismatched_descriptor)
                 .is_none(),
-            "descriptor identity must match before cached bytes are reused"
+            "content identity must match before cached bytes are reused"
         );
 
         let sealed_tail = test_wallet_scan_chunk(21, 30, &[7, 8, 9], |metadata| {
@@ -2068,7 +2064,7 @@ mod tests {
             data_plane
                 .cached_wallet_scan_artifact_chunk(&sealed_tail.descriptor)
                 .is_some(),
-            "explicitly sealed final chunks are retained"
+            "explicitly demanded verified chunks are retained"
         );
 
         let predecessor = test_wallet_scan_chunk(31, 40, &[13, 14, 15], |_| {});
@@ -2080,7 +2076,7 @@ mod tests {
                 )
                 .await,
             1,
-            "planner-selected stable chunks may be retained outside the request"
+            "demanded verified chunks may be retained"
         );
         let predecessor_id = wallet_scan_artifact_chunk_blob_id(&predecessor.descriptor);
         let mut predecessor_meta = db
