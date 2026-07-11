@@ -1,16 +1,23 @@
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::fmt::{self, Display};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
-use alloy::primitives::{FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, railgun_txid_leaf_hash};
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table, TableDefinition,
+    TableHandle, WriteTransaction,
 };
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+
+mod migrations;
 
 type ByteTableDefinition = TableDefinition<'static, &'static str, &'static [u8]>;
 
@@ -34,6 +41,8 @@ const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settin
 const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
 const DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
     TableDefinition::new("desktop_wallet_vault_v1");
+const LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
+const WALLET_CACHE_KEY_DOMAIN: &[u8] = b"railgun-wallet-cache-key-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalDbTable {
@@ -189,6 +198,115 @@ const BLOBS_DIR: &str = "blobs";
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WalletCacheKey(String);
+
+impl WalletCacheKey {
+    #[must_use]
+    pub fn new(wallet_id: &str, chain_id: u64, contract: Address) -> Self {
+        let wallet_id = wallet_id.as_bytes();
+        let mut bytes = Vec::with_capacity(
+            WALLET_CACHE_KEY_DOMAIN.len() + 8 + wallet_id.len() + 8 + contract.len(),
+        );
+        bytes.extend_from_slice(WALLET_CACHE_KEY_DOMAIN);
+        bytes.extend_from_slice(&(wallet_id.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(wallet_id);
+        bytes.extend_from_slice(&chain_id.to_be_bytes());
+        bytes.extend_from_slice(contract.as_slice());
+        Self(hex::encode(bytes))
+    }
+
+    #[must_use]
+    pub fn from_opaque_id(id: [u8; 16]) -> Self {
+        Self(hex::encode(id))
+    }
+
+    pub fn from_opaque_bytes(value: &[u8]) -> Result<Self, WalletCacheKeyError> {
+        if value.is_empty() {
+            return Err(WalletCacheKeyError);
+        }
+        Ok(Self(hex::encode(value)))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for WalletCacheKey {
+    type Err = WalletCacheKeyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || !value.len().is_multiple_of(2)
+            || value
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || hex::decode(value).is_err()
+        {
+            return Err(WalletCacheKeyError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl AsRef<str> for WalletCacheKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for WalletCacheKey {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl From<WalletCacheKey> for String {
+    fn from(value: WalletCacheKey) -> Self {
+        value.0
+    }
+}
+
+impl Borrow<str> for WalletCacheKey {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Display for WalletCacheKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for WalletCacheKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WalletCacheKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[error("wallet cache key must be non-empty canonical lowercase hex")]
+pub struct WalletCacheKeyError;
+
 #[derive(Debug, Clone)]
 pub struct DbConfig {
     pub root_dir: PathBuf,
@@ -210,6 +328,8 @@ pub struct DbStore {
 
 #[derive(Debug, Error)]
 pub enum DbError {
+    #[error(transparent)]
+    InvalidWalletCacheKey(#[from] WalletCacheKeyError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("db error: {0}")]
@@ -237,6 +357,12 @@ pub enum DbError {
         actual_chain_id: u64,
         actual_wallet_id: String,
     },
+    #[error("invalid legacy desktop wallet cache row key {key}")]
+    InvalidLegacyDesktopWalletCacheRowKey { key: String },
+    #[error("invalid schema-7 pending-output POI context row {key}")]
+    InvalidSchemaSevenPendingOutputPoiContext { key: String },
+    #[error("schema migration destination already exists in {table}: {key}")]
+    SchemaMigrationDestinationConflict { table: &'static str, key: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,7 +413,7 @@ pub struct ZkeyMeta {
     pub format_version: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletUtxoRecord {
     pub utxo_id: String,
     pub payload: Vec<u8>,
@@ -299,6 +425,31 @@ pub struct WalletMeta {
     pub updated_at: u64,
     #[serde(default)]
     pub last_scanned_block_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletPrivateNamespaceId {
+    pub chain_id: u64,
+    pub wallet_id: WalletCacheKey,
+}
+
+impl WalletPrivateNamespaceId {
+    #[must_use]
+    pub const fn new(chain_id: u64, wallet_id: WalletCacheKey) -> Self {
+        Self {
+            chain_id,
+            wallet_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletPrivateNamespaceDeletionReport {
+    pub wallet_utxo_rows: u64,
+    pub wallet_meta_rows: u64,
+    pub wallet_sync_actor_state_rows: u64,
+    pub pending_output_poi_context_rows: u64,
+    pub output_poi_recovery_rows: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -721,6 +872,28 @@ impl OutputPoiRecoveryRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum WalletUtxoRowMutation<'a> {
+    Preserve,
+    Replace(&'a [(String, Vec<u8>)]),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WalletMetaMutation<'a> {
+    Preserve,
+    Set(&'a WalletMeta),
+}
+
+pub struct WalletPrivateStateBatch<'a> {
+    pub namespace: &'a WalletPrivateNamespaceId,
+    pub utxos: WalletUtxoRowMutation<'a>,
+    pub metadata: WalletMetaMutation<'a>,
+    pub sync_actor_state: Option<&'a WalletSyncActorStateRecord>,
+    pub pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
+    pub pending_output_context_deletes: &'a [FixedBytes<32>],
+    pub output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopWalletVaultRecord {
     pub key: String,
@@ -751,10 +924,17 @@ impl DbStore {
                 root_dir: root_dir.clone(),
                 db,
             };
-            store.initialize_schema()?;
+
+            if !store.has_meta_table()? {
+                store.initialize_schema()?;
+                let meta = Meta::new()?;
+                store.write_meta(&meta)?;
+                return Ok(store);
+            }
 
             match store.read_meta()? {
                 None => {
+                    store.initialize_schema()?;
                     let meta = Meta::new()?;
                     store.write_meta(&meta)?;
                     return Ok(store);
@@ -764,9 +944,7 @@ impl DbStore {
                     backup_db(&db_path)?;
                 }
                 Some(meta) if meta.schema_version < CURRENT_SCHEMA_VERSION => {
-                    if let Err(err) =
-                        Self::run_migrations(meta.schema_version, CURRENT_SCHEMA_VERSION)
-                    {
+                    if let Err(err) = store.run_migrations(&meta, CURRENT_SCHEMA_VERSION) {
                         if matches!(err, DbError::UnsupportedSchemaVersion { .. }) {
                             drop(store);
                             backup_db(&db_path)?;
@@ -774,16 +952,12 @@ impl DbStore {
                         }
                         return Err(err);
                     }
-
-                    let meta = Meta {
-                        schema_version: CURRENT_SCHEMA_VERSION,
-                        app_version: env!("CARGO_PKG_VERSION").to_string(),
-                        created_at: meta.created_at,
-                    };
-                    store.write_meta(&meta)?;
                     return Ok(store);
                 }
-                Some(_) => return Ok(store),
+                Some(_) => {
+                    store.initialize_schema()?;
+                    return Ok(store);
+                }
             }
         }
     }
@@ -855,7 +1029,11 @@ impl DbStore {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(table_def)?;
         let mut out = Vec::new();
-        for entry in table.range(prefix..range_end.as_str())? {
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix..range_end)?,
+            None => table.range(prefix..)?,
+        };
+        for entry in entries {
             let (_, value) = entry?;
             out.push(decode(value.value())?);
         }
@@ -891,10 +1069,18 @@ impl DbStore {
         let removed = {
             let mut table = txn.open_table(BLOB_INDEX_TABLE)?;
             let mut removed = 0_u64;
-            table.retain_in(prefix.as_str()..range_end.as_str(), |_, _| {
+            let mut retain = |_: &str, _: &[u8]| {
                 removed = removed.saturating_add(1);
                 false
-            })?;
+            };
+            match range_end.as_deref() {
+                Some(range_end) => {
+                    table.retain_in(prefix.as_str()..range_end, &mut retain)?;
+                }
+                None => {
+                    table.retain_in(prefix.as_str().., &mut retain)?;
+                }
+            }
             removed
         };
         txn.commit()?;
@@ -954,7 +1140,7 @@ impl DbStore {
 
     pub fn put_wallet_utxo(
         &self,
-        wallet_id: &str,
+        wallet_id: &WalletCacheKey,
         utxo_id: &str,
         payload: &[u8],
     ) -> Result<(), DbError> {
@@ -968,7 +1154,11 @@ impl DbStore {
         Ok(())
     }
 
-    pub fn delete_wallet_utxo(&self, wallet_id: &str, utxo_id: &str) -> Result<(), DbError> {
+    pub fn delete_wallet_utxo(
+        &self,
+        wallet_id: &WalletCacheKey,
+        utxo_id: &str,
+    ) -> Result<(), DbError> {
         let key = wallet_utxo_key(wallet_id, utxo_id);
         let txn = self.db.begin_write()?;
         {
@@ -979,7 +1169,7 @@ impl DbStore {
         Ok(())
     }
 
-    pub fn clear_wallet_utxos(&self, wallet_id: &str) -> Result<(), DbError> {
+    pub fn clear_wallet_utxos(&self, wallet_id: &WalletCacheKey) -> Result<(), DbError> {
         let prefix = wallet_utxo_prefix(wallet_id);
         let txn = self.db.begin_write()?;
         {
@@ -995,7 +1185,7 @@ impl DbStore {
     /// process is interrupted mid-write.
     pub fn batch_store_wallet_utxos(
         &self,
-        wallet_id: &str,
+        wallet_id: &WalletCacheKey,
         utxos: &[(String, Vec<u8>)],
         meta: Option<&WalletMeta>,
     ) -> Result<(), DbError> {
@@ -1011,7 +1201,7 @@ impl DbStore {
             if let Some(meta) = meta {
                 let data = encode(meta)?;
                 let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
-                meta_table.insert(wallet_id, data.as_slice())?;
+                meta_table.insert(wallet_id.as_str(), data.as_slice())?;
             }
         }
         txn.commit()?;
@@ -1020,44 +1210,34 @@ impl DbStore {
 
     pub fn batch_commit_wallet_private_state(
         &self,
-        wallet_id: &str,
-        utxos: Option<&[(String, Vec<u8>)]>,
-        meta: Option<&WalletMeta>,
-        sync_actor_state: Option<&WalletSyncActorStateRecord>,
-        pending_output_context_updates: &[PendingOutputPoiContextRecord],
-        pending_output_context_delete_chain_id: u64,
-        pending_output_context_deletes: &[FixedBytes<32>],
-        output_poi_recovery_updates: &[OutputPoiRecoveryRecord],
+        batch: &WalletPrivateStateBatch<'_>,
     ) -> Result<(), DbError> {
-        if let Some(state) = sync_actor_state
-            && (state.chain_id != pending_output_context_delete_chain_id
-                || state.wallet_id != wallet_id)
+        let wallet_id = &batch.namespace.wallet_id;
+        let chain_id = batch.namespace.chain_id;
+        if let Some(state) = batch.sync_actor_state
+            && (state.chain_id != chain_id || state.wallet_id != wallet_id.as_str())
         {
             return Err(DbError::InvalidWalletPrivateCommitNamespace {
-                expected_chain_id: pending_output_context_delete_chain_id,
+                expected_chain_id: chain_id,
                 expected_wallet_id: wallet_id.to_string(),
                 actual_chain_id: state.chain_id,
                 actual_wallet_id: state.wallet_id.clone(),
             });
         }
-        for record in pending_output_context_updates {
-            if record.chain_id != pending_output_context_delete_chain_id
-                || record.wallet_id != wallet_id
-            {
+        for record in batch.pending_output_context_updates {
+            if record.chain_id != chain_id || record.wallet_id != wallet_id.as_str() {
                 return Err(DbError::InvalidWalletPrivateCommitNamespace {
-                    expected_chain_id: pending_output_context_delete_chain_id,
+                    expected_chain_id: chain_id,
                     expected_wallet_id: wallet_id.to_string(),
                     actual_chain_id: record.chain_id,
                     actual_wallet_id: record.wallet_id.clone(),
                 });
             }
         }
-        for record in output_poi_recovery_updates {
-            if record.chain_id != pending_output_context_delete_chain_id
-                || record.wallet_id != wallet_id
-            {
+        for record in batch.output_poi_recovery_updates {
+            if record.chain_id != chain_id || record.wallet_id != wallet_id.as_str() {
                 return Err(DbError::InvalidWalletPrivateCommitNamespace {
-                    expected_chain_id: pending_output_context_delete_chain_id,
+                    expected_chain_id: chain_id,
                     expected_wallet_id: wallet_id.to_string(),
                     actual_chain_id: record.chain_id,
                     actual_wallet_id: record.wallet_id.clone(),
@@ -1067,7 +1247,7 @@ impl DbStore {
         let prefix = wallet_utxo_prefix(wallet_id);
         let txn = self.db.begin_write()?;
         {
-            if let Some(utxos) = utxos {
+            if let WalletUtxoRowMutation::Replace(utxos) = batch.utxos {
                 let mut utxo_table = txn.open_table(WALLET_UTXO_TABLE)?;
                 remove_table_prefix(&mut utxo_table, &prefix)?;
                 for (utxo_id, payload) in utxos {
@@ -1076,41 +1256,41 @@ impl DbStore {
                 }
             }
 
-            if let Some(meta) = meta {
+            if let WalletMetaMutation::Set(meta) = batch.metadata {
                 let data = encode(meta)?;
                 let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
-                meta_table.insert(wallet_id, data.as_slice())?;
+                meta_table.insert(wallet_id.as_str(), data.as_slice())?;
             }
 
-            if let Some(state) = sync_actor_state {
+            if let Some(state) = batch.sync_actor_state {
                 let key = state.key();
                 let data = encode(state)?;
                 let mut state_table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
                 state_table.insert(key.as_str(), data.as_slice())?;
             }
 
-            if !pending_output_context_updates.is_empty()
-                || !pending_output_context_deletes.is_empty()
+            if !batch.pending_output_context_updates.is_empty()
+                || !batch.pending_output_context_deletes.is_empty()
             {
                 let mut pending_table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-                for record in pending_output_context_updates {
+                for record in batch.pending_output_context_updates {
                     let key = record.key();
                     let data = encode(record)?;
                     pending_table.insert(key.as_str(), data.as_slice())?;
                 }
-                for output_commitment in pending_output_context_deletes {
+                for output_commitment in batch.pending_output_context_deletes {
                     let key = PendingOutputPoiContextRecord::key_for(
-                        pending_output_context_delete_chain_id,
-                        wallet_id,
+                        chain_id,
+                        wallet_id.as_str(),
                         output_commitment,
                     );
                     pending_table.remove(key.as_str())?;
                 }
             }
 
-            if !output_poi_recovery_updates.is_empty() {
+            if !batch.output_poi_recovery_updates.is_empty() {
                 let mut recovery_table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
-                for record in output_poi_recovery_updates {
+                for record in batch.output_poi_recovery_updates {
                     let key = record.key();
                     let data = encode(record)?;
                     recovery_table.insert(key.as_str(), data.as_slice())?;
@@ -1121,13 +1301,94 @@ impl DbStore {
         Ok(())
     }
 
-    pub fn list_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxoRecord>, DbError> {
+    pub fn delete_wallet_private_namespace(
+        &self,
+        identity: &WalletPrivateNamespaceId,
+    ) -> Result<WalletPrivateNamespaceDeletionReport, DbError> {
+        self.delete_wallet_private_namespace_transaction(identity, || Ok(()))
+    }
+
+    fn delete_wallet_private_namespace_transaction(
+        &self,
+        identity: &WalletPrivateNamespaceId,
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<WalletPrivateNamespaceDeletionReport, DbError> {
+        let wallet_utxo_prefix = wallet_utxo_prefix(&identity.wallet_id);
+        let wallet_sync_actor_state_key =
+            WalletSyncActorStateRecord::key_for(identity.chain_id, identity.wallet_id.as_str());
+        let pending_output_poi_context_prefix = PendingOutputPoiContextRecord::prefix_for_wallet(
+            identity.chain_id,
+            identity.wallet_id.as_str(),
+        );
+        let chain_wallet_namespace = format!("{}|{}", identity.chain_id, identity.wallet_id);
+        let output_poi_recovery_prefix = OutputPoiRecoveryRecord::prefix_for_wallet(
+            identity.chain_id,
+            identity.wallet_id.as_str(),
+        );
+        let txn = self.db.begin_write()?;
+        let report = {
+            let wallet_utxo_rows = {
+                let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
+                remove_table_prefix(&mut table, &wallet_utxo_prefix)?
+            };
+            let wallet_meta_rows = {
+                let mut table = txn.open_table(WALLET_META_TABLE)?;
+                u64::from(table.remove(identity.wallet_id.as_str())?.is_some())
+            };
+            let wallet_sync_actor_state_rows = {
+                let mut table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
+                u64::from(
+                    table
+                        .remove(wallet_sync_actor_state_key.as_str())?
+                        .is_some(),
+                )
+            };
+            let pending_output_poi_context_rows = {
+                let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+                remove_table_prefix_matching(
+                    &mut table,
+                    &pending_output_poi_context_prefix,
+                    |key| {
+                        key.rsplit_once('|').is_some_and(|(namespace, _)| {
+                            namespace == chain_wallet_namespace.as_str()
+                        })
+                    },
+                )?
+            };
+            let output_poi_recovery_rows = {
+                let mut table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+                remove_table_prefix_matching(&mut table, &output_poi_recovery_prefix, |key| {
+                    key.rsplit_once('|')
+                        .is_some_and(|(namespace, _)| namespace == chain_wallet_namespace.as_str())
+                })?
+            };
+            WalletPrivateNamespaceDeletionReport {
+                wallet_utxo_rows,
+                wallet_meta_rows,
+                wallet_sync_actor_state_rows,
+                pending_output_poi_context_rows,
+                output_poi_recovery_rows,
+            }
+        };
+        before_commit()?;
+        txn.commit()?;
+        Ok(report)
+    }
+
+    pub fn list_wallet_utxos(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<WalletUtxoRecord>, DbError> {
         let prefix = wallet_utxo_prefix(wallet_id);
         let range_end = prefix_range_end(&prefix);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(WALLET_UTXO_TABLE)?;
         let mut out = Vec::new();
-        for entry in table.range(prefix.as_str()..range_end.as_str())? {
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix.as_str()..range_end)?,
+            None => table.range(prefix.as_str()..)?,
+        };
+        for entry in entries {
             let (key, value) = entry?;
             let key = key.value();
             let utxo_id = key.strip_prefix(&prefix).unwrap_or(key).to_string();
@@ -1139,24 +1400,51 @@ impl DbStore {
         Ok(out)
     }
 
-    pub fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, DbError> {
+    pub fn get_wallet_meta(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Option<WalletMeta>, DbError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(WALLET_META_TABLE)?;
-        match table.get(wallet_id)? {
+        match table.get(wallet_id.as_str())? {
             Some(value) => Ok(Some(decode(value.value())?)),
             None => Ok(None),
         }
     }
 
-    pub fn put_wallet_meta(&self, wallet_id: &str, meta: &WalletMeta) -> Result<(), DbError> {
+    pub fn put_wallet_meta(
+        &self,
+        wallet_id: &WalletCacheKey,
+        meta: &WalletMeta,
+    ) -> Result<(), DbError> {
         let data = encode(meta)?;
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(WALLET_META_TABLE)?;
-            table.insert(wallet_id, data.as_slice())?;
+            table.insert(wallet_id.as_str(), data.as_slice())?;
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub fn put_wallet_meta_if_absent(
+        &self,
+        wallet_id: &WalletCacheKey,
+        meta: &WalletMeta,
+    ) -> Result<bool, DbError> {
+        let data = encode(meta)?;
+        let txn = self.db.begin_write()?;
+        let inserted = {
+            let mut table = txn.open_table(WALLET_META_TABLE)?;
+            if table.get(wallet_id.as_str())?.is_some() {
+                false
+            } else {
+                table.insert(wallet_id.as_str(), data.as_slice())?;
+                true
+            }
+        };
+        txn.commit()?;
+        Ok(inserted)
     }
 
     pub fn get_wallet_sync_actor_state(
@@ -1177,6 +1465,7 @@ impl DbStore {
         &self,
         record: &WalletSyncActorStateRecord,
     ) -> Result<(), DbError> {
+        record.wallet_id.parse::<WalletCacheKey>()?;
         let key = record.key();
         let data = encode(record)?;
         let txn = self.db.begin_write()?;
@@ -1383,6 +1672,7 @@ impl DbStore {
         &self,
         record: &PendingOutputPoiContextRecord,
     ) -> Result<(), DbError> {
+        record.wallet_id.parse::<WalletCacheKey>()?;
         let key = record.key();
         let data = encode(record)?;
         let txn = self.db.begin_write()?;
@@ -1440,6 +1730,7 @@ impl DbStore {
     }
 
     pub fn put_output_poi_recovery(&self, record: &OutputPoiRecoveryRecord) -> Result<(), DbError> {
+        record.wallet_id.parse::<WalletCacheKey>()?;
         let key = record.key();
         let data = encode(record)?;
         let txn = self.db.begin_write()?;
@@ -1451,13 +1742,34 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn delete_output_poi_recovery(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<(), DbError> {
+        let key = OutputPoiRecoveryRecord::key_for(chain_id, wallet_id, output_commitment);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn list_output_poi_recoveries(
         &self,
         chain_id: u64,
         wallet_id: &str,
     ) -> Result<Vec<OutputPoiRecoveryRecord>, DbError> {
         let prefix = OutputPoiRecoveryRecord::prefix_for_wallet(chain_id, wallet_id);
-        self.list_decoded_by_prefix(OUTPUT_POI_RECOVERY_TABLE, &prefix)
+        let records: Vec<OutputPoiRecoveryRecord> =
+            self.list_decoded_by_prefix(OUTPUT_POI_RECOVERY_TABLE, &prefix)?;
+        Ok(records
+            .into_iter()
+            .filter(|record| record.chain_id == chain_id && record.wallet_id == wallet_id)
+            .collect())
     }
 
     pub fn get_app_settings_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
@@ -1497,7 +1809,11 @@ impl DbStore {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(APP_SETTINGS_TABLE)?;
         let mut out = Vec::new();
-        for entry in table.range(prefix..range_end.as_str())? {
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix..range_end)?,
+            None => table.range(prefix..)?,
+        };
+        for entry in entries {
             let (key, value) = entry?;
             out.push(AppSettingsRecord {
                 key: key.value().to_string(),
@@ -1564,6 +1880,35 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn update_desktop_wallet_vault_records(
+        &self,
+        delete_keys: &[String],
+        put_records: &[(String, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        self.update_desktop_wallet_vault_records_transaction(delete_keys, put_records, || Ok(()))
+    }
+
+    fn update_desktop_wallet_vault_records_transaction(
+        &self,
+        delete_keys: &[String],
+        put_records: &[(String, Vec<u8>)],
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            for key in delete_keys {
+                table.remove(key.as_str())?;
+            }
+            for (key, payload) in put_records {
+                table.insert(key.as_str(), payload.as_slice())?;
+            }
+        }
+        before_commit()?;
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn delete_desktop_wallet_vault_record(&self, key: &str) -> Result<(), DbError> {
         let txn = self.db.begin_write()?;
         {
@@ -1599,7 +1944,11 @@ impl DbStore {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         let mut out = Vec::new();
-        for entry in table.range(prefix..range_end.as_str())? {
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix..range_end)?,
+            None => table.range(prefix..)?,
+        };
+        for entry in entries {
             let (key, value) = entry?;
             out.push(DesktopWalletVaultRecord {
                 key: key.value().to_string(),
@@ -1611,6 +1960,12 @@ impl DbStore {
 
     fn initialize_schema(&self) -> Result<(), DbError> {
         let txn = self.db.begin_write()?;
+        Self::initialize_schema_tables(&txn)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn initialize_schema_tables(txn: &WriteTransaction) -> Result<(), DbError> {
         txn.open_table(META_TABLE)?;
         txn.open_table(BLOB_INDEX_TABLE)?;
         txn.open_table(MERKLE_FOREST_INDEX_TABLE)?;
@@ -1625,8 +1980,14 @@ impl DbStore {
         txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
         txn.open_table(APP_SETTINGS_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-        txn.commit()?;
         Ok(())
+    }
+
+    fn has_meta_table(&self) -> Result<bool, DbError> {
+        let txn = self.db.begin_read()?;
+        Ok(txn
+            .list_tables()?
+            .any(|table| table.name() == META_TABLE.name()))
     }
 
     fn read_meta(&self) -> Result<Option<Meta>, DbError> {
@@ -1649,10 +2010,37 @@ impl DbStore {
         Ok(())
     }
 
-    const fn run_migrations(from: u32, to: u32) -> Result<(), DbError> {
-        if from < to {
-            return Err(DbError::UnsupportedSchemaVersion { version: from });
+    fn run_migrations(&self, meta: &Meta, to: u32) -> Result<(), DbError> {
+        self.run_migrations_transaction(meta, to, || Ok(()))
+    }
+
+    fn run_migrations_transaction(
+        &self,
+        meta: &Meta,
+        to: u32,
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        if meta.schema_version != 7 || to != 8 {
+            return Err(DbError::UnsupportedSchemaVersion {
+                version: meta.schema_version,
+            });
         }
+
+        let migrated_meta = Meta {
+            schema_version: to,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at: meta.created_at,
+        };
+        let migrated_meta = encode(&migrated_meta)?;
+        let txn = self.db.begin_write()?;
+        migrations::migrate_schema_7_to_8(&txn)?;
+        Self::initialize_schema_tables(&txn)?;
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert(META_KEY, migrated_meta.as_slice())?;
+        }
+        before_commit()?;
+        txn.commit()?;
         Ok(())
     }
 
@@ -1713,14 +2101,48 @@ fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T, DbError> {
     Ok(rmp_serde::from_slice(data)?)
 }
 
-fn remove_table_prefix(table: &mut Table<'_, &str, &[u8]>, prefix: &str) -> Result<(), DbError> {
-    let range_end = prefix_range_end(prefix);
-    table.retain_in(prefix..range_end.as_str(), |_, _| false)?;
-    Ok(())
+fn remove_table_prefix(table: &mut Table<'_, &str, &[u8]>, prefix: &str) -> Result<u64, DbError> {
+    remove_table_prefix_matching(table, prefix, |_| true)
 }
 
-fn prefix_range_end(prefix: &str) -> String {
-    format!("{prefix}~")
+fn remove_table_prefix_matching(
+    table: &mut Table<'_, &str, &[u8]>,
+    prefix: &str,
+    mut matches: impl FnMut(&str) -> bool,
+) -> Result<u64, DbError> {
+    let range_end = prefix_range_end(prefix);
+    let mut removed = 0_u64;
+    let mut retain = |key: &str, _: &[u8]| {
+        let remove = matches(key);
+        if remove {
+            removed = removed.saturating_add(1);
+        }
+        !remove
+    };
+    match range_end.as_deref() {
+        Some(range_end) => {
+            table.retain_in(prefix..range_end, &mut retain)?;
+        }
+        None => {
+            table.retain_in(prefix.., &mut retain)?;
+        }
+    }
+    Ok(removed)
+}
+
+fn prefix_range_end(prefix: &str) -> Option<String> {
+    let mut end = prefix.to_string();
+    while let Some(last) = end.pop() {
+        let mut next = u32::from(last).saturating_add(1);
+        while next <= u32::from(char::MAX) {
+            if let Some(next) = char::from_u32(next) {
+                end.push(next);
+                return Some(end);
+            }
+            next = next.saturating_add(1);
+        }
+    }
+    None
 }
 
 fn blob_index_key(kind: &str, id: &str) -> String {
@@ -1731,11 +2153,11 @@ fn merkle_forest_key(chain_id: u64, contract: &str) -> String {
     format!("{chain_id}|{contract}")
 }
 
-fn wallet_utxo_key(wallet_id: &str, utxo_id: &str) -> String {
+fn wallet_utxo_key(wallet_id: &WalletCacheKey, utxo_id: &str) -> String {
     format!("{wallet_id}|{utxo_id}")
 }
 
-fn wallet_utxo_prefix(wallet_id: &str) -> String {
+fn wallet_utxo_prefix(wallet_id: &WalletCacheKey) -> String {
     format!("{wallet_id}|")
 }
 

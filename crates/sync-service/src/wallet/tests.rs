@@ -50,9 +50,11 @@ use crate::chain::{
 };
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::types::{
-    ChainKey, GlobalPoiPolicy, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-    PoiProxyFallback, WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletLocalPoiCaches,
-    WalletPrivateCommit, WalletReadiness, WalletSchedulableProgress, WalletSyncActorStateCommit,
+    ChainKey, GlobalPoiPolicy, PendingOutputPoiContextIntent, PoiArtifactManifestSource,
+    PoiArtifactSourceConfig, PoiProxyFallback, WalletCacheStore, WalletCheckpointMutation,
+    WalletConfig, WalletCurrentSnapshot, WalletInactiveReason, WalletLocalPoiCaches,
+    WalletPrivateCommit, WalletPrivateRequestError, WalletReadiness, WalletSchedulableProgress,
+    WalletSyncActorStateCommit, WalletUtxoMutation,
 };
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
@@ -73,7 +75,8 @@ use broadcaster_core::transact::{
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use local_db::{
     DbConfig, DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta, WalletSyncActorStateRecord,
+    PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey, WalletMeta,
+    WalletSyncActorStateRecord,
 };
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleTreeUpdate};
 use poi::cache::{PoiCache, PoiCacheIdentity};
@@ -122,13 +125,17 @@ fn source(byte: u8) -> UtxoSource {
     }
 }
 
+fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
+    WalletCacheKey::from_opaque_bytes(value.as_ref()).expect("non-empty test wallet cache key")
+}
+
 fn wallet_config(nullifying_key: U256) -> WalletConfig {
     WalletConfig {
         chain: ChainKey {
             chain_id: 1,
             contract: Address::ZERO,
         },
-        cache_key: "test".to_string(),
+        cache_key: test_cache_key("test"),
         start_block: Some(0),
         sync_to_block: None,
         quick_sync_endpoint: None,
@@ -224,12 +231,13 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         Arc::new(WalletPendingOverlay::default()),
     )));
     let (pending_overlay_tx, _pending_overlay_rx) = mpsc::channel(1);
+    let (private_request_tx, _private_request_rx) = mpsc::channel(1);
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     WalletHandle {
-        cache_key: "cache-key".to_string(),
+        cache_key: test_cache_key("cache-key"),
         chain_id: 1,
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
@@ -248,6 +256,7 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         poi_refreshing_rx,
         indexed_catch_up_rx,
         pending_overlay_tx,
+        private_request_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,
         rev_tx,
@@ -853,7 +862,7 @@ fn pending_output_record(
     let txid_leaf = FixedBytes::from([0x55; 32]);
     PendingOutputPoiContextRecord {
         chain_id,
-        wallet_id: "wallet-1".to_string(),
+        wallet_id: test_cache_key("wallet-1").to_string(),
         txid_version: DEFAULT_TXID_VERSION.to_string(),
         output_commitment,
         output_npk: FixedBytes::from([0x66; 32]),
@@ -874,6 +883,24 @@ fn pending_output_record(
     }
 }
 
+fn pending_output_intent(
+    output_commitment: FixedBytes<32>,
+    list_key: FixedBytes<32>,
+) -> PendingOutputPoiContextIntent {
+    let record = pending_output_record(1, output_commitment, list_key);
+    PendingOutputPoiContextIntent {
+        txid_version: record.txid_version,
+        output_commitment: record.output_commitment,
+        output_npk: record.output_npk,
+        utxo_tree_in: record.utxo_tree_in,
+        railgun_txid: record.railgun_txid,
+        pre_transaction_pois_per_txid_leaf_per_list: record
+            .pre_transaction_pois_per_txid_leaf_per_list,
+        required_poi_list_keys: record.required_poi_list_keys,
+        output_role: record.output_role,
+    }
+}
+
 fn matching_pending_output_record(
     cfg: &WalletConfig,
     wallet_utxo: &WalletUtxo,
@@ -884,7 +911,7 @@ fn matching_pending_output_record(
         wallet_utxo.utxo.poi.commitment,
         list_key,
     );
-    record.wallet_id = cfg.cache_key.clone();
+    record.wallet_id = cfg.cache_key.to_string();
     record.output_npk = wallet_utxo.utxo.poi.npk;
     record.observation = Some(local_db::PendingOutputPoiObservation {
         output_tree: u64::from(wallet_utxo.utxo.tree),
@@ -1204,7 +1231,7 @@ impl WalletCacheStore for RecordingCacheStore {
         &self,
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
-        if commit.replace_wallet_utxos() {
+        if matches!(commit.utxo_mutation(), WalletUtxoMutation::Replace(_)) {
             let mut state = self.state.lock().expect("cache state");
             state.store_calls += 1;
             if state.fail_next_store {
@@ -1219,7 +1246,7 @@ impl WalletCacheStore for RecordingCacheStore {
         }
         for output_commitment in commit.pending_output_context_deletes() {
             self.db.delete_pending_output_poi_context(
-                commit.pending_output_context_chain_id(),
+                commit.chain_id(),
                 commit.wallet_id(),
                 output_commitment,
             )?;
@@ -1233,18 +1260,24 @@ impl WalletCacheStore for RecordingCacheStore {
         Ok(())
     }
 
-    fn load_wallet_utxos(&self, _wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
+    fn load_wallet_utxos(
+        &self,
+        _wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<WalletUtxo>, WalletCacheError> {
         Ok(Vec::new())
     }
 
-    fn get_wallet_meta(&self, _wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
+    fn get_wallet_meta(
+        &self,
+        _wallet_id: &WalletCacheKey,
+    ) -> Result<Option<WalletMeta>, WalletCacheError> {
         Ok(None)
     }
 
     fn get_wallet_sync_actor_state(
         &self,
         _chain_id: u64,
-        _wallet_id: &str,
+        _wallet_id: &WalletCacheKey,
     ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError> {
         Ok(None)
     }
@@ -1795,7 +1828,7 @@ async fn remote_poi_status_refresh_uses_gateway_and_actor_intent_apply() {
     .expect("open db");
     let list_key = FixedBytes::from([0x31; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-remote-status".to_string();
+    cfg.cache_key = test_cache_key("wallet-remote-status");
     let wallet_utxo = test_wallet_utxo(31);
     let mut handle = test_wallet_handle(vec![wallet_utxo.clone()]);
     handle.cache_key = cfg.cache_key.clone();
@@ -1842,7 +1875,7 @@ async fn delayed_remote_status_intent_does_not_overwrite_newer_local_status() {
     .expect("open db");
     let list_key = FixedBytes::from([0x32; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-status-cas".to_string();
+    cfg.cache_key = test_cache_key("wallet-status-cas");
     let wallet_utxo = test_wallet_utxo(32);
     let blinded_commitment = wallet_utxo.utxo.poi.blinded_commitment;
     let expected_poi = wallet_utxo.utxo.poi.clone();
@@ -2353,11 +2386,11 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
     );
     let nullifying_key = uint!(9_U256);
     let mut cfg = wallet_config(nullifying_key);
-    cfg.cache_key = if cached_input {
-        "wallet-stale-cached-recovery".to_string()
+    cfg.cache_key = test_cache_key(if cached_input {
+        "wallet-stale-cached-recovery"
     } else {
-        "wallet-stale-uncached-recovery".to_string()
-    };
+        "wallet-stale-uncached-recovery"
+    });
     let list_key = FixedBytes::from([0x21; 32]);
     let required_poi_list_keys = [list_key];
     let mut input = test_wallet_utxo(0);
@@ -3011,14 +3044,18 @@ async fn pending_output_poi_matches_undecryptable_observation_and_marks_submitte
     process_pending_output_poi_observations(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &[observation],
         Some(&submitter),
     )
     .await;
 
     let loaded = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load pending context")
         .expect("pending context present");
     let observed = loaded.observation.expect("observation recorded");
@@ -3066,14 +3103,18 @@ async fn recovered_pending_output_poi_uses_transact_proof_submission() {
     process_pending_output_poi_observations(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &[observation],
         Some(&submitter),
     )
     .await;
 
     let loaded = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load pending context")
         .expect("pending context present");
     assert_eq!(loaded.submitted_poi_list_keys, vec![list_key]);
@@ -3120,7 +3161,7 @@ async fn pending_output_poi_matches_wallet_owned_observation_and_keeps_utxo() {
     process_pending_output_poi_observations(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &delta.commitment_observations,
         Some(&submitter),
     )
@@ -3132,7 +3173,11 @@ async fn pending_output_poi_matches_wallet_owned_observation_and_keeps_utxo() {
     assert_eq!(wallet_utxos.len(), 1);
     assert_eq!(wallet_utxos[0].utxo.position, 36);
     let loaded = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load pending context")
         .expect("pending context present");
     assert!(loaded.observation.is_some());
@@ -3173,15 +3218,24 @@ async fn submitted_pending_output_poi_verification_deletes_valid_context() {
         .expect("store pending context");
     let client = RecordingPoiStatusClient::default();
 
-    let outcome =
-        verify_submitted_pending_output_pois(&client, &store, chain_id, "wallet-1", &[list_key])
-            .await;
+    let outcome = verify_submitted_pending_output_pois(
+        &client,
+        &store,
+        chain_id,
+        test_cache_key("wallet-1").as_str(),
+        &[list_key],
+    )
+    .await;
 
     assert_eq!(outcome.completed, 1);
     assert_eq!(outcome.pending, 0);
     assert!(
         store
-            .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+            .get_pending_output_poi_context(
+                chain_id,
+                test_cache_key("wallet-1").as_str(),
+                &output_commitment,
+            )
             .expect("load pending")
             .is_none()
     );
@@ -3206,7 +3260,7 @@ async fn proxy_maintenance_refresh_before_verification_reconciles_valid_context(
     let chain_id = 1;
     let list_key = FixedBytes::from([0x94; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-1".to_string();
+    cfg.cache_key = test_cache_key("wallet-1");
     let mut wallet_utxo = test_wallet_utxo(14);
     wallet_utxo
         .utxo
@@ -3333,7 +3387,7 @@ async fn omitted_active_list_becoming_missing_keeps_recovery_recoverable() {
     let omitted_list_key = FixedBytes::from([0x98; 32]);
     let active_list_keys = [verified_list_key, omitted_list_key];
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-omitted-list-became-missing".to_string();
+    cfg.cache_key = test_cache_key("wallet-omitted-list-became-missing");
     let mut wallet_utxo = test_wallet_utxo(18);
     wallet_utxo
         .utxo
@@ -3440,7 +3494,7 @@ async fn verified_valid_reinitializes_mismatched_recovery_source() {
     .expect("open db");
     let list_key = FixedBytes::from([0x99; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-verified-source-replacement".to_string();
+    cfg.cache_key = test_cache_key("wallet-verified-source-replacement");
     let mut wallet_utxo = test_wallet_utxo(19);
     wallet_utxo
         .utxo
@@ -3513,7 +3567,7 @@ async fn authorized_pending_output_poi_retry_resubmits_submitted_lists() {
     let list_key = FixedBytes::from([0x95; 32]);
     let valid_unsubmitted_list_key = FixedBytes::from([0x96; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-1".to_string();
+    cfg.cache_key = test_cache_key("wallet-1");
     let mut wallet_utxo = test_wallet_utxo(15);
     wallet_utxo
         .utxo
@@ -3610,7 +3664,7 @@ async fn existing_context_submits_missing_subset_and_prunes_nonrecoverable_unsub
         let nonrecoverable_list_key = FixedBytes::from([0xa2; 32]);
         let active_list_keys = [recoverable_list_key, nonrecoverable_list_key];
         let mut cfg = wallet_config(U256::ZERO);
-        cfg.cache_key = format!("wallet-existing-context-subset-{case}");
+        cfg.cache_key = test_cache_key(format!("wallet-existing-context-subset-{case}"));
         let mut wallet_utxo = test_wallet_utxo(90 + case as u64);
         wallet_utxo
             .utxo
@@ -3689,7 +3743,7 @@ async fn pending_submission_preflight_repeatedly_rejects_recovery_source_mismatc
     .expect("open db");
     let list_key = FixedBytes::from([0x97; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-recovery-source-mismatch".to_string();
+    cfg.cache_key = test_cache_key("wallet-recovery-source-mismatch");
     let mut wallet_utxo = test_wallet_utxo(17);
     wallet_utxo
         .utxo
@@ -3756,7 +3810,7 @@ async fn authorized_pending_output_poi_skips_output_that_no_longer_needs_poi() {
     .expect("open db");
     let list_key = FixedBytes::from([0x96; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-1".to_string();
+    cfg.cache_key = test_cache_key("wallet-1");
     let mut wallet_utxo = test_wallet_utxo(16);
     wallet_utxo
         .utxo
@@ -3804,8 +3858,10 @@ async fn pending_output_poi_maintenance_is_scoped_to_wallet_id() {
     let list_key = FixedBytes::from([0xa1; 32]);
     let wallet_a_commitment = FixedBytes::from([0xa2; 32]);
     let wallet_b_commitment = FixedBytes::from([0xa3; 32]);
+    let wallet_a_id = test_cache_key("wallet-a");
+    let wallet_b_id = test_cache_key("wallet-b");
     let mut wallet_a = pending_output_record(chain_id, wallet_a_commitment, list_key);
-    wallet_a.wallet_id = "wallet-a".to_string();
+    wallet_a.wallet_id = wallet_a_id.to_string();
     wallet_a.observation = Some(local_db::PendingOutputPoiObservation {
         output_tree: 3,
         output_position: 12,
@@ -3814,7 +3870,7 @@ async fn pending_output_poi_maintenance_is_scoped_to_wallet_id() {
         block_timestamp: 1_700_000_012,
     });
     let mut wallet_b = pending_output_record(chain_id, wallet_b_commitment, list_key);
-    wallet_b.wallet_id = "wallet-b".to_string();
+    wallet_b.wallet_id = wallet_b_id.to_string();
     wallet_b.observation = Some(local_db::PendingOutputPoiObservation {
         output_tree: 4,
         output_position: 13,
@@ -3830,17 +3886,23 @@ async fn pending_output_poi_maintenance_is_scoped_to_wallet_id() {
         .expect("store wallet B pending context");
     let submitter = RecordingPendingOutputPoiSubmitter::default();
 
-    process_pending_output_poi_observations(&store, chain_id, "wallet-a", &[], Some(&submitter))
-        .await;
+    process_pending_output_poi_observations(
+        &store,
+        chain_id,
+        wallet_a_id.as_str(),
+        &[],
+        Some(&submitter),
+    )
+    .await;
 
     assert_eq!(submitter.calls(), vec![(wallet_a_commitment, 3, 12)]);
     let wallet_a = store
-        .get_pending_output_poi_context(chain_id, "wallet-a", &wallet_a_commitment)
+        .get_pending_output_poi_context(chain_id, wallet_a_id.as_str(), &wallet_a_commitment)
         .expect("load wallet A pending context")
         .expect("wallet A pending context present");
     assert_eq!(wallet_a.submitted_poi_list_keys, vec![list_key]);
     let mut wallet_b = store
-        .get_pending_output_poi_context(chain_id, "wallet-b", &wallet_b_commitment)
+        .get_pending_output_poi_context(chain_id, wallet_b_id.as_str(), &wallet_b_commitment)
         .expect("load wallet B pending context")
         .expect("wallet B pending context present");
     assert!(wallet_b.submitted_poi_list_keys.is_empty());
@@ -3865,21 +3927,26 @@ async fn pending_output_poi_maintenance_is_scoped_to_wallet_id() {
     );
     let client = RecordingPoiStatusClient::default();
 
-    let outcome =
-        verify_submitted_pending_output_pois(&client, &store, chain_id, "wallet-a", &[list_key])
-            .await;
+    let outcome = verify_submitted_pending_output_pois(
+        &client,
+        &store,
+        chain_id,
+        wallet_a_id.as_str(),
+        &[list_key],
+    )
+    .await;
 
     assert_eq!(outcome.completed, 1);
     assert_eq!(outcome.pending, 0);
     assert!(
         store
-            .get_pending_output_poi_context(chain_id, "wallet-a", &wallet_a_commitment)
+            .get_pending_output_poi_context(chain_id, wallet_a_id.as_str(), &wallet_a_commitment)
             .expect("load wallet A pending context")
             .is_none()
     );
     assert!(
         store
-            .get_pending_output_poi_context(chain_id, "wallet-b", &wallet_b_commitment)
+            .get_pending_output_poi_context(chain_id, wallet_b_id.as_str(), &wallet_b_commitment)
             .expect("load wallet B pending context")
             .is_some()
     );
@@ -3920,9 +3987,14 @@ async fn submitted_pending_output_poi_verification_allows_retry_after_missing_de
     let client = RecordingPoiStatusClient::default();
     client.set_default_status(PoiStatus::Missing);
 
-    let outcome =
-        verify_submitted_pending_output_pois(&client, &store, chain_id, "wallet-1", &[list_key])
-            .await;
+    let outcome = verify_submitted_pending_output_pois(
+        &client,
+        &store,
+        chain_id,
+        test_cache_key("wallet-1").as_str(),
+        &[list_key],
+    )
+    .await;
 
     assert_eq!(outcome.completed, 0);
     assert_eq!(outcome.pending, 1);
@@ -3941,7 +4013,7 @@ async fn submitted_pending_output_poi_verification_allows_retry_after_missing_de
     process_pending_output_poi_observations_inner(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &[],
         Some(&submitter),
         false,
@@ -3973,7 +4045,8 @@ async fn indexed_artifacts_pending_verification_uses_local_cache_without_remote_
     let output_commitment = FixedBytes::from([0x94; 32]);
     let list_key = FixedBytes::from([0x95; 32]);
     let mut pending = pending_output_record(chain_id, output_commitment, list_key);
-    pending.wallet_id = "test".to_string();
+    let cache_key = test_cache_key("test");
+    pending.wallet_id = cache_key.to_string();
     pending.observation = Some(local_db::PendingOutputPoiObservation {
         output_tree: 3,
         output_position: 14,
@@ -4019,7 +4092,7 @@ async fn indexed_artifacts_pending_verification_uses_local_cache_without_remote_
     assert_eq!(outcome.completed, 1);
     assert!(
         store
-            .get_pending_output_poi_context(chain_id, "test", &output_commitment)
+            .get_pending_output_poi_context(chain_id, cache_key.as_str(), &output_commitment)
             .expect("load pending")
             .is_none()
     );
@@ -4063,24 +4136,38 @@ async fn pending_output_poi_submission_failure_remains_retryable() {
     process_pending_output_poi_observations(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &[observation],
         Some(&submitter),
     )
     .await;
     let failed = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load pending context")
         .expect("pending context present");
     assert!(failed.observation.is_some());
     assert!(failed.submitted_poi_list_keys.is_empty());
     assert!(failed.terminal_error.is_none());
 
-    process_pending_output_poi_observations(&store, chain_id, "wallet-1", &[], Some(&submitter))
-        .await;
+    process_pending_output_poi_observations(
+        &store,
+        chain_id,
+        test_cache_key("wallet-1").as_str(),
+        &[],
+        Some(&submitter),
+    )
+    .await;
 
     let retried = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load retried pending context")
         .expect("pending context present");
     assert_eq!(retried.submitted_poi_list_keys, vec![list_key]);
@@ -4102,7 +4189,7 @@ async fn authorized_pending_output_submission_cancels_without_mutating_context()
     let chain_id = 1;
     let list_key = FixedBytes::from([0xb2; 32]);
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-1".to_string();
+    cfg.cache_key = test_cache_key("wallet-1");
     let wallet_utxo = test_wallet_utxo(8);
     let output_commitment = wallet_utxo.utxo.poi.commitment;
     let pending = matching_pending_output_record(&cfg, &wallet_utxo, list_key);
@@ -4147,13 +4234,21 @@ async fn authorized_pending_output_submission_cancels_without_mutating_context()
     assert_eq!(task.await.expect("submission task"), 0);
     assert!(submitter.calls().is_empty());
     let loaded = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load pending context")
         .expect("pending context present");
     assert!(loaded.submitted_poi_list_keys.is_empty());
     assert!(
         store
-            .get_output_poi_recovery(chain_id, "wallet-1", &output_commitment)
+            .get_output_poi_recovery(
+                chain_id,
+                test_cache_key("wallet-1").as_str(),
+                &output_commitment,
+            )
             .expect("load recovery")
             .is_none()
     );
@@ -4202,7 +4297,7 @@ async fn authorized_pending_output_verification_skips_changed_context_after_awai
             task_reader.as_ref(),
             task_store.as_ref(),
             chain_id,
-            "wallet-1",
+            test_cache_key("wallet-1").as_str(),
             &[list_key],
         )
         .await
@@ -4224,7 +4319,11 @@ async fn authorized_pending_output_verification_skips_changed_context_after_awai
     assert_eq!(outcome.pending, 0);
     assert_eq!(outcome.errors, 0);
     let loaded = store
-        .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+        .get_pending_output_poi_context(
+            chain_id,
+            test_cache_key("wallet-1").as_str(),
+            &output_commitment,
+        )
         .expect("load pending context")
         .expect("pending context still present");
     assert_eq!(loaded.terminal_error, changed.terminal_error);
@@ -4266,8 +4365,14 @@ async fn recovered_output_poi_context_resubmits_after_retry_time() {
         .expect("store recovery state");
     let submitter = RecordingPendingOutputPoiSubmitter::default();
 
-    process_pending_output_poi_observations(&store, chain_id, "wallet-1", &[], Some(&submitter))
-        .await;
+    process_pending_output_poi_observations(
+        &store,
+        chain_id,
+        test_cache_key("wallet-1").as_str(),
+        &[],
+        Some(&submitter),
+    )
+    .await;
 
     let loaded = store
         .get_output_poi_recovery(chain_id, &pending.wallet_id, &output_commitment)
@@ -4315,14 +4420,20 @@ async fn recovered_output_poi_context_resubmits_when_forced_before_retry_time() 
         .expect("store recovery state");
     let submitter = RecordingPendingOutputPoiSubmitter::default();
 
-    process_pending_output_poi_observations(&store, chain_id, "wallet-1", &[], Some(&submitter))
-        .await;
+    process_pending_output_poi_observations(
+        &store,
+        chain_id,
+        test_cache_key("wallet-1").as_str(),
+        &[],
+        Some(&submitter),
+    )
+    .await;
     assert!(submitter.calls().is_empty());
 
     process_pending_output_poi_observations_inner(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &[],
         Some(&submitter),
         true,
@@ -4342,7 +4453,7 @@ fn pending_output_poi_context_matches_wallet_output_identity() {
     let wallet_utxo = test_wallet_utxo(38);
     let record = matching_pending_output_record(&cfg, &wallet_utxo, list_key);
 
-    assert_eq!(record.wallet_id, cfg.cache_key);
+    assert_eq!(record.wallet_id, cfg.cache_key.as_str());
 
     assert!(pending_output_poi_context_matches_wallet_utxo(
         &cfg,
@@ -4460,7 +4571,7 @@ async fn force_resubmitted_recovered_pending_output_uses_pending_retry_delay() {
         .statuses
         .insert(list_key, PoiStatus::Missing);
     let mut pending = matching_pending_output_record(&cfg, &wallet_utxo, list_key);
-    pending.wallet_id.clone_from(&cfg.cache_key);
+    pending.wallet_id = cfg.cache_key.to_string();
     pending.submitted_poi_list_keys = vec![list_key];
     store
         .put_pending_output_poi_context(&pending)
@@ -4515,7 +4626,7 @@ async fn authorized_force_submits_only_recoverable_subset() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-force-mixed-statuses".to_string();
+    cfg.cache_key = test_cache_key("wallet-force-mixed-statuses");
     let list_a = FixedBytes::from([0x4d; 32]);
     let list_b = FixedBytes::from([0x4e; 32]);
     let mut wallet_utxo = test_wallet_utxo(42);
@@ -4588,7 +4699,7 @@ async fn force_resubmit_preflight_skips_spent_output_before_remote_submit() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-force-spent".to_string();
+    cfg.cache_key = test_cache_key("wallet-force-spent");
     let list_key = FixedBytes::from([0x51; 32]);
     let mut wallet_utxo = test_wallet_utxo(51);
     wallet_utxo
@@ -4640,7 +4751,7 @@ async fn force_resubmit_preflight_aborts_on_stale_generation() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-force-stale".to_string();
+    cfg.cache_key = test_cache_key("wallet-force-stale");
     let list_key = FixedBytes::from([0x52; 32]);
     let mut wallet_utxo = test_wallet_utxo(52);
     wallet_utxo
@@ -4694,7 +4805,7 @@ async fn multi_proof_submit_revalidates_between_remote_calls() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-multi-proof".to_string();
+    cfg.cache_key = test_cache_key("wallet-multi-proof");
     let list_a = FixedBytes::from([0x61; 32]);
     let list_b = FixedBytes::from([0x62; 32]);
     let mut wallet_utxo = test_wallet_utxo(61);
@@ -4778,7 +4889,7 @@ async fn output_recovery_mixed_statuses_request_and_persist_only_recoverable_lis
         })
         .expect("open db");
         let mut cfg = wallet_config(U256::ZERO);
-        cfg.cache_key = format!("wallet-mixed-recovery-{case}");
+        cfg.cache_key = test_cache_key(format!("wallet-mixed-recovery-{case}"));
         let recoverable_list_key = FixedBytes::from([0x61; 32]);
         let unrelated_list_key = FixedBytes::from([0x62; 32]);
         let active_list_keys = [recoverable_list_key, unrelated_list_key];
@@ -4919,7 +5030,7 @@ async fn assert_valid_output_recovery_recovers_new_active_list(force_retry: bool
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = format!("wallet-valid-new-list-{force_retry}");
+    cfg.cache_key = test_cache_key(format!("wallet-valid-new-list-{force_retry}"));
     let list_a = FixedBytes::from([0x85; 32]);
     let list_b = FixedBytes::from([0x86; 32]);
     let active_list_keys = [list_a, list_b];
@@ -5060,7 +5171,7 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-incremental-recovery".to_string();
+    cfg.cache_key = test_cache_key("wallet-incremental-recovery");
     let list_a = FixedBytes::from([0x81; 32]);
     let list_b = FixedBytes::from([0x82; 32]);
     let active_list_keys = [list_a, list_b];
@@ -5245,7 +5356,7 @@ async fn output_recovery_extension_skips_concurrent_context_change() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-incremental-recovery-race".to_string();
+    cfg.cache_key = test_cache_key("wallet-incremental-recovery-race");
     let list_a = FixedBytes::from([0x83; 32]);
     let list_b = FixedBytes::from([0x84; 32]);
     let mut wallet_utxo = test_wallet_utxo(83);
@@ -5352,7 +5463,7 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-terminal-force-regeneration".to_string();
+    cfg.cache_key = test_cache_key("wallet-terminal-force-regeneration");
     let list_key = FixedBytes::from([0x87; 32]);
     let mut wallet_utxo = test_wallet_utxo(87);
     wallet_utxo
@@ -5493,7 +5604,7 @@ async fn force_terminal_regeneration_skips_concurrent_context_replacement() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-terminal-force-race".to_string();
+    cfg.cache_key = test_cache_key("wallet-terminal-force-race");
     let list_key = FixedBytes::from([0x88; 32]);
     let mut wallet_utxo = test_wallet_utxo(88);
     wallet_utxo
@@ -5599,7 +5710,7 @@ async fn remote_proof_gateway_revalidates_after_source_resolution_wait() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-proof-resolution-race".to_string();
+    cfg.cache_key = test_cache_key("wallet-proof-resolution-race");
     let list_key = FixedBytes::from([0x63; 32]);
     let active_list_keys = [list_key];
     let mut candidate = test_wallet_utxo(63);
@@ -5678,7 +5789,7 @@ async fn remote_proof_gateway_rejects_mixed_candidate_with_no_recoverable_lists(
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-proof-became-valid".to_string();
+    cfg.cache_key = test_cache_key("wallet-proof-became-valid");
     let list_key = FixedBytes::from([0x67; 32]);
     let unrelated_list_key = FixedBytes::from([0x68; 32]);
     let active_list_keys = [list_key, unrelated_list_key];
@@ -5870,7 +5981,7 @@ async fn recovery_actor_skips_when_output_becomes_valid_before_apply() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-recovery-became-valid".to_string();
+    cfg.cache_key = test_cache_key("wallet-recovery-became-valid");
     let list_key = FixedBytes::from([0x71; 32]);
     let mut wallet_utxo = test_wallet_utxo(71);
     wallet_utxo
@@ -5948,7 +6059,7 @@ async fn successful_submission_intent_survives_timestamp_only_poi_refresh() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-submission-timestamp-refresh".to_string();
+    cfg.cache_key = test_cache_key("wallet-submission-timestamp-refresh");
     let list_key = FixedBytes::from([0x74; 32]);
     let mut wallet_utxo = test_wallet_utxo(74);
     wallet_utxo
@@ -6027,7 +6138,7 @@ async fn successful_submission_intent_preserves_newer_unrelated_list_status() {
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-submission-unrelated-list-refresh".to_string();
+    cfg.cache_key = test_cache_key("wallet-submission-unrelated-list-refresh");
     let list_key = FixedBytes::from([0x75; 32]);
     let unrelated_list_key = FixedBytes::from([0x76; 32]);
     let mut wallet_utxo = test_wallet_utxo(75);
@@ -6105,7 +6216,7 @@ async fn stale_submission_behind_verified_valid_cannot_resurrect_or_downgrade() 
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-verified-before-submission".to_string();
+    cfg.cache_key = test_cache_key("wallet-verified-before-submission");
     let list_key = FixedBytes::from([0x72; 32]);
     let mut wallet_utxo = test_wallet_utxo(72);
     wallet_utxo
@@ -6227,7 +6338,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
     })
     .expect("open db");
     let mut cfg = wallet_config(U256::ZERO);
-    cfg.cache_key = "wallet-stale-verified".to_string();
+    cfg.cache_key = test_cache_key("wallet-stale-verified");
     let list_key = FixedBytes::from([0x73; 32]);
     let mut wallet_utxo = test_wallet_utxo(73);
     wallet_utxo
@@ -6518,7 +6629,10 @@ async fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
                     cache_key: "wallet",
                     snapshot: &snapshot,
                     last_scanned: 10,
-                    last_scanned_block_hash: None,
+                    checkpoint: WalletCheckpointMutation::Set {
+                        last_scanned_block: 10,
+                        last_scanned_block_hash: None,
+                    },
                     changed: true,
                 },
             )
@@ -6536,7 +6650,10 @@ async fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
                 cache_key: "wallet",
                 snapshot: &snapshot,
                 last_scanned: 11,
-                last_scanned_block_hash: None,
+                checkpoint: WalletCheckpointMutation::Set {
+                    last_scanned_block: 11,
+                    last_scanned_block_hash: None,
+                },
                 changed: false,
             },
         )
@@ -6554,7 +6671,10 @@ async fn failed_full_persist_forces_next_no_change_batch_to_store_snapshot() {
                 cache_key: "wallet",
                 snapshot: &snapshot,
                 last_scanned: 12,
-                last_scanned_block_hash: None,
+                checkpoint: WalletCheckpointMutation::Set {
+                    last_scanned_block: 12,
+                    last_scanned_block_hash: None,
+                },
                 changed: false,
             },
         )
@@ -6597,7 +6717,10 @@ async fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds()
                     cache_key: "wallet",
                     snapshot: &snapshot,
                     last_scanned: 10,
-                    last_scanned_block_hash: None,
+                    checkpoint: WalletCheckpointMutation::Set {
+                        last_scanned_block: 10,
+                        last_scanned_block_hash: None,
+                    },
                     changed: false,
                 },
             )
@@ -6616,7 +6739,10 @@ async fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds()
                 cache_key: "wallet",
                 snapshot: &snapshot,
                 last_scanned: 10,
-                last_scanned_block_hash: None,
+                checkpoint: WalletCheckpointMutation::Set {
+                    last_scanned_block: 10,
+                    last_scanned_block_hash: None,
+                },
                 changed: false,
             },
         )
@@ -6647,12 +6773,13 @@ async fn notify_changed_increments_revision() {
         Arc::new(WalletPendingOverlay::default()),
     )));
     let (pending_overlay_tx, _pending_overlay_rx) = mpsc::channel(1);
+    let (private_request_tx, _private_request_rx) = mpsc::channel(1);
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
-        cache_key: "cache-key".to_string(),
+        cache_key: test_cache_key("cache-key"),
         chain_id: 1,
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
@@ -6671,6 +6798,7 @@ async fn notify_changed_increments_revision() {
         poi_refreshing_rx,
         indexed_catch_up_rx,
         pending_overlay_tx,
+        private_request_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,
         rev_tx,
@@ -6791,12 +6919,13 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         Arc::new(WalletPendingOverlay::default()),
     )));
     let (pending_overlay_tx, _pending_overlay_rx) = mpsc::channel(1);
+    let (private_request_tx, _private_request_rx) = mpsc::channel(1);
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel::<WalletPoiRefreshRequest>(1);
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
-        cache_key: "cache-key".to_string(),
+        cache_key: test_cache_key("cache-key"),
         chain_id: 1,
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
@@ -6815,6 +6944,7 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         poi_refreshing_rx,
         indexed_catch_up_rx,
         pending_overlay_tx,
+        private_request_tx,
         poi_refresh_tx,
         indexed_catch_up_status_tx,
         rev_tx,
@@ -7023,10 +7153,13 @@ async fn local_pending_spent_updates_existing_submitted_tx_hash() {
     let replacement_hash = FixedBytes::from([0x22; 32]);
 
     handle
-        .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), Some(first_hash))
+        .mark_pending_spent_utxos_for_test(
+            std::slice::from_ref(&wallet_utxo.utxo),
+            Some(first_hash),
+        )
         .await;
     handle
-        .mark_pending_spent_utxos(
+        .mark_pending_spent_utxos_for_test(
             std::slice::from_ref(&wallet_utxo.utxo),
             Some(replacement_hash),
         )
@@ -7098,7 +7231,7 @@ async fn clear_local_pending_spent_removes_manual_locks() {
             .push(local_pending_spent_for(&wallet_utxo, now_epoch_secs()));
     }
 
-    assert!(handle.clear_local_pending_spent().await);
+    assert!(handle.clear_local_pending_spent_for_test().await);
     assert!(
         handle
             .pending_overlay()
@@ -7106,7 +7239,78 @@ async fn clear_local_pending_spent_removes_manual_locks() {
             .local_pending_spent
             .is_empty()
     );
-    assert!(!handle.clear_local_pending_spent().await);
+    assert!(!handle.clear_local_pending_spent_for_test().await);
+}
+
+#[tokio::test]
+async fn terminal_wallet_views_override_retained_reset_pending_state() {
+    let wallet_utxo = test_wallet_utxo(7);
+    let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+    let revision = *handle.rev_rx.borrow();
+    handle.view_tx.send_replace(WalletViewState::ResetPending {
+        intent_id: 1,
+        from_block: 10,
+        reset_generation: 1,
+    });
+    handle.retire_actor();
+
+    assert_eq!(
+        handle.view_state(),
+        WalletViewState::Inactive {
+            reason: WalletInactiveReason::Retired,
+            reset_generation: 0,
+        }
+    );
+
+    assert_eq!(
+        handle
+            .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
+            .await,
+        Err(WalletPrivateRequestError::Inactive)
+    );
+    assert_eq!(
+        handle.clear_all_local_pending_spent().await,
+        Err(WalletPrivateRequestError::Inactive)
+    );
+    assert_eq!(
+        handle
+            .create_pending_output_poi_contexts(vec![pending_output_intent(
+                FixedBytes::from([0x83; 32]),
+                FixedBytes::from([0x84; 32]),
+            )])
+            .await,
+        Err(WalletPrivateRequestError::Inactive)
+    );
+    assert_eq!(*handle.rev_rx.borrow(), revision);
+    assert!(
+        handle
+            .pending_overlay
+            .read()
+            .await
+            .local_pending_spent
+            .is_empty()
+    );
+
+    let stopping = test_wallet_handle(vec![wallet_utxo]);
+    stopping
+        .view_tx
+        .send_replace(WalletViewState::ResetPending {
+            intent_id: 2,
+            from_block: 20,
+            reset_generation: 2,
+        });
+    assert!(stopping.mark_stopping());
+    assert_eq!(
+        stopping.view_state(),
+        WalletViewState::Inactive {
+            reason: WalletInactiveReason::Shutdown,
+            reset_generation: 0,
+        }
+    );
+    assert_eq!(
+        stopping.clear_all_local_pending_spent().await,
+        Err(WalletPrivateRequestError::Inactive)
+    );
 }
 
 #[test]
@@ -7129,14 +7333,18 @@ fn spent_output_discards_pending_output_poi_context() {
     discard_pending_output_poi_contexts_for_spent_outputs(
         &store,
         chain_id,
-        "wallet-1",
+        test_cache_key("wallet-1").as_str(),
         &[output_commitment],
     )
     .expect("discard spent pending output context");
 
     assert!(
         store
-            .get_pending_output_poi_context(chain_id, "wallet-1", &output_commitment)
+            .get_pending_output_poi_context(
+                chain_id,
+                test_cache_key("wallet-1").as_str(),
+                &output_commitment,
+            )
             .expect("load pending context")
             .is_none()
     );

@@ -29,7 +29,7 @@ pub(crate) enum WalletActorLifecycle {
     Active = 1,
     /// Cancel observed while still current; exactly one terminal Shutdown publish; no durable commits.
     Stopping = 2,
-    /// Unregistered or replaced; publish nothing, apply nothing.
+    /// Unregistered or replaced; publish only the terminal Retired view, apply nothing.
     Retired = 3,
 }
 
@@ -94,13 +94,20 @@ impl WalletActorLifecycleCell {
     }
 
     /// Prepared/Active → Stopping. Returns true if this call performed the transition.
+    #[cfg(test)]
     pub(crate) fn mark_stopping(&self) -> bool {
+        self.mark_stopping_with(|| {})
+    }
+
+    /// Prepared/Active → Stopping, publishing terminal session state under the fence.
+    pub(crate) fn mark_stopping_with(&self, publish: impl FnOnce()) -> bool {
         self.with_fence(|inner| {
             if matches!(
                 inner.state,
                 WalletActorLifecycle::Prepared | WalletActorLifecycle::Active
             ) {
                 inner.state = WalletActorLifecycle::Stopping;
+                publish();
                 true
             } else {
                 false
@@ -167,6 +174,20 @@ impl WalletActorLifecycleCell {
             Ok(apply(WalletActorApplyToken {
                 _fence: PhantomData,
             }))
+        })
+    }
+
+    /// Runs request admission only while the mailbox actor is Active and current.
+    pub(crate) fn with_active_request<R>(
+        &self,
+        is_current: bool,
+        request: impl FnOnce() -> R,
+    ) -> Result<R, ()> {
+        self.with_fence(|inner| {
+            if inner.state != WalletActorLifecycle::Active || !is_current {
+                return Err(());
+            }
+            Ok(request())
         })
     }
 }
@@ -238,7 +259,12 @@ pub(crate) enum WalletRemoteDone {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn retire_poisons_terminal_shutdown_publish() {
@@ -286,6 +312,43 @@ mod tests {
         );
         cell.mark_retired(|| {});
         assert!(cell.with_active_apply(true, |_token| 2_u32).is_err());
+    }
+
+    #[test]
+    fn retire_waits_for_in_flight_durable_apply_and_fences_later_applies() {
+        let cell = Arc::new(WalletActorLifecycleCell::new());
+        let (apply_started_tx, apply_started_rx) = mpsc::channel();
+        let (release_apply_tx, release_apply_rx) = mpsc::channel();
+        let apply_cell = Arc::clone(&cell);
+        let apply = std::thread::spawn(move || {
+            apply_cell
+                .with_active_apply(true, |_token| {
+                    apply_started_tx.send(()).expect("signal active apply");
+                    release_apply_rx.recv().expect("release active apply");
+                })
+                .expect("active apply accepted");
+        });
+        apply_started_rx.recv().expect("active apply started");
+
+        let (retire_started_tx, retire_started_rx) = mpsc::channel();
+        let (retired_tx, retired_rx) = mpsc::channel();
+        let retire_cell = Arc::clone(&cell);
+        let retire = std::thread::spawn(move || {
+            retire_started_tx.send(()).expect("signal retire attempt");
+            retire_cell.mark_retired(|| {});
+            retired_tx.send(()).expect("signal retirement");
+        });
+        retire_started_rx.recv().expect("retire attempt started");
+        assert!(retired_rx.recv_timeout(Duration::from_millis(25)).is_err());
+
+        release_apply_tx.send(()).expect("release durable apply");
+        apply.join().expect("join active apply");
+        retired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retirement completed");
+        retire.join().expect("join retirement");
+        assert_eq!(cell.get(), WalletActorLifecycle::Retired);
+        assert!(cell.with_active_apply(true, |_token| ()).is_err());
     }
 
     #[test]

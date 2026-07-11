@@ -1,7 +1,7 @@
-use alloy::primitives::Address as ContractAddress;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::notes::Note;
 use broadcaster_core::utxo::{Utxo, UtxoPoiMetadata, UtxoSource, WalletUtxo};
+pub use local_db::WalletCacheKey;
 use local_db::{DbError, DbStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -127,21 +127,18 @@ pub fn wallet_utxo_stable_identity(utxo: &WalletUtxo) -> Vec<u8> {
     out
 }
 
-#[must_use]
-pub fn wallet_cache_key(
-    wallet_id: &str,
-    chain_id: u64,
-    contract_address: ContractAddress,
-) -> String {
-    format!("{wallet_id}|{chain_id}|{contract_address}")
-}
-
 pub trait WalletCacheDbExt {
-    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
+    fn load_wallet_utxos(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<WalletUtxo>, WalletCacheError>;
 }
 
 impl WalletCacheDbExt for DbStore {
-    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
+    fn load_wallet_utxos(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<WalletUtxo>, WalletCacheError> {
         let entries = self.list_wallet_utxos(wallet_id)?;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {

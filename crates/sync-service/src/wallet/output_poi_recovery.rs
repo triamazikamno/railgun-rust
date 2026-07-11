@@ -1355,7 +1355,7 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                     }
                 };
                 let mut recovery_updates = vec![pending_recovery];
-                if record.wallet_id != cfg.cache_key {
+                if record.wallet_id != cfg.cache_key.as_str() {
                     recovery_updates.push(output_poi_recovery_record_update(
                         db,
                         cfg,
@@ -2287,7 +2287,7 @@ pub(super) fn pending_output_poi_context_from_recovery(
 ) -> PendingOutputPoiContextRecord {
     PendingOutputPoiContextRecord {
         chain_id: cfg.chain.chain_id,
-        wallet_id: cfg.cache_key.clone(),
+        wallet_id: cfg.cache_key.to_string(),
         txid_version: DEFAULT_TXID_VERSION.to_string(),
         output_commitment: recovery_chunk.output.poi.commitment,
         output_npk: recovery_chunk.output.poi.npk,
@@ -2385,7 +2385,7 @@ pub(super) fn new_output_poi_recovery_record(
 ) -> OutputPoiRecoveryRecord {
     OutputPoiRecoveryRecord {
         chain_id: cfg.chain.chain_id,
-        wallet_id: cfg.cache_key.clone(),
+        wallet_id: cfg.cache_key.to_string(),
         output_commitment: candidate.utxo.poi.commitment,
         source_tx_hash: candidate.utxo.source.tx_hash,
         tx_input: None,

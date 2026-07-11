@@ -6,20 +6,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::sol_types::SolEvent;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
-use local_db::{DbConfig, DbStore};
+use local_db::{DbConfig, DbStore, WalletCacheKey};
 use merkletree::tree::MerkleForest;
 use multihash_codetable::{Code, MultihashDigest};
+use poi::cache::{PoiCache, PoiCacheIdentity};
+use poi::poi::PoiEventType;
 use railgun_wallet::scan::WalletScanInputRows;
+use railgun_wallet::tx::PoiMerkleProofSource;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
+    WalletCacheKey::from_opaque_bytes(value.as_ref()).expect("non-empty test wallet cache key")
+}
 
 use super::service::{
     await_live_log_task_shutdown, send_wallet_scan_apply, send_wallet_target,
@@ -428,6 +435,52 @@ async fn artifact_poi_corpus_survives_wallet_unregister_reregister() {
         public_data_plane.clone(),
         poi_policy,
     );
+    let list_key = FixedBytes::from([0x31; 32]);
+    let blinded_commitment = FixedBytes::from([0x32; 32]);
+    let mut cache = PoiCache::new(PoiCacheIdentity::new(
+        0,
+        scope.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: *blinded_commitment,
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("seed public POI corpus event");
+    cache.accept_current_roots();
+    public_data_plane
+        .ensure_poi_corpus(PublicPoiCorpusKey::new(
+            0,
+            scope.chain_id,
+            DEFAULT_TXID_VERSION,
+        ))
+        .await
+        .expect("public POI corpus")
+        .local_caches()
+        .write()
+        .await
+        .insert(list_key, cache);
+    let proof_source = service
+        .public_data_plane()
+        .local_poi_merkle_proof_source(DEFAULT_TXID_VERSION)
+        .await
+        .expect("chain-owned local POI proof source");
+    let proofs = proof_source
+        .poi_merkle_proofs(
+            DEFAULT_TXID_VERSION,
+            0,
+            scope.chain_id,
+            &list_key,
+            &[blinded_commitment],
+        )
+        .await
+        .expect("proof from chain-owned local corpus");
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(proofs[0].leaf, U256::from_be_bytes(blinded_commitment.0));
     let mut cfg = test_wallet_config(&scope, rpc_url);
     cfg.sync_to_block = Some(0);
     cfg.use_indexed_wallet_catch_up = false;
@@ -1067,12 +1120,13 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     let (wallet_a_tx, wallet_a_rx) = mpsc::channel(8);
     let (wallet_b_tx, wallet_b_rx) = mpsc::channel(8);
     let mut wallet_a_cfg = test_wallet_config(&scope, rpc.url.clone());
-    wallet_a_cfg.cache_key = "wallet-a".to_string();
+    wallet_a_cfg.cache_key = test_cache_key("wallet-a");
     wallet_a_cfg.sync_to_block = Some(199);
     wallet_a_cfg.quick_sync_endpoint = None;
     wallet_a_cfg.use_indexed_wallet_catch_up = false;
     let mut wallet_b_cfg = test_wallet_config(&scope, rpc.url.clone());
-    wallet_b_cfg.cache_key = "wallet-b".to_string();
+    let wallet_b_cache_key = test_cache_key("wallet-b");
+    wallet_b_cfg.cache_key = wallet_b_cache_key.clone();
     wallet_b_cfg.sync_to_block = Some(130);
     wallet_b_cfg.quick_sync_endpoint = None;
     wallet_b_cfg.use_indexed_wallet_catch_up = false;
@@ -1183,7 +1237,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     assert_eq!(wallet_a.last_scanned(), Some(199));
     assert_eq!(wallet_b.last_scanned(), Some(130));
     assert_eq!(
-        db.get_wallet_meta("wallet-b")
+        db.get_wallet_meta(&wallet_b_cache_key)
             .expect("wallet B meta read")
             .expect("wallet B meta")
             .last_scanned_block,
@@ -3647,7 +3701,7 @@ fn test_wallet_config(scope: &ChainScope, quick_sync_endpoint: Url) -> WalletCon
             chain_id: scope.chain_id,
             contract: scope.railgun_contract,
         },
-        cache_key: "test".to_string(),
+        cache_key: test_cache_key("test"),
         start_block: Some(0),
         sync_to_block: None,
         quick_sync_endpoint: Some(quick_sync_endpoint),

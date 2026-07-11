@@ -6,9 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, FixedBytes, U256, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::transact::PreTxPoi;
 use local_db::{
-    DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, WalletMeta,
-    WalletSyncActorStateRecord,
+    DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, PendingOutputPoiRole,
+    WalletCacheKey, WalletMeta, WalletMetaMutation, WalletPrivateNamespaceId,
+    WalletPrivateStateBatch, WalletSyncActorStateRecord, WalletUtxoRowMutation,
 };
 use poi::cache::PoiCache;
 #[cfg(test)]
@@ -324,13 +326,13 @@ struct LocalPoiCachesInner {
 /// acquisition clears the map before exposing it if the database generation
 /// has advanced.
 #[derive(Debug, Clone)]
-pub struct LocalPoiCaches {
+pub(crate) struct LocalPoiCaches {
     inner: Arc<LocalPoiCachesInner>,
 }
 
 impl LocalPoiCaches {
     #[must_use]
-    pub fn new(shared_generation: Arc<AtomicU64>) -> Self {
+    pub(crate) fn new(shared_generation: Arc<AtomicU64>) -> Self {
         let installed_generation = shared_generation.load(Ordering::Acquire);
         Self {
             inner: Arc::new(LocalPoiCachesInner {
@@ -353,7 +355,7 @@ impl LocalPoiCaches {
         }
     }
 
-    pub async fn read(&self) -> RwLockReadGuard<'_, BTreeMap<FixedBytes<32>, PoiCache>> {
+    pub(crate) async fn read(&self) -> RwLockReadGuard<'_, BTreeMap<FixedBytes<32>, PoiCache>> {
         let guard = self.inner.caches.read().await;
         if self.installed_generation() == self.current_generation() {
             return guard;
@@ -365,7 +367,7 @@ impl LocalPoiCaches {
         RwLockWriteGuard::downgrade(guard)
     }
 
-    pub async fn write(&self) -> RwLockWriteGuard<'_, BTreeMap<FixedBytes<32>, PoiCache>> {
+    pub(crate) async fn write(&self) -> RwLockWriteGuard<'_, BTreeMap<FixedBytes<32>, PoiCache>> {
         let mut guard = self.inner.caches.write().await;
         self.synchronize_locked(&mut guard);
         guard
@@ -413,7 +415,7 @@ impl LocalPoiCaches {
     }
 }
 
-pub type WalletLocalPoiCaches = LocalPoiCaches;
+pub(crate) type WalletLocalPoiCaches = LocalPoiCaches;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoiArtifactSourceConfig {
@@ -677,14 +679,27 @@ fn default_rpc_urls(urls: &[&str]) -> Option<Vec<Url>> {
     urls.iter().map(|url| Url::parse(url).ok()).collect()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum WalletUtxoMutation<'a> {
+    Preserve,
+    Replace(&'a [WalletUtxo]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletCheckpointMutation {
+    Preserve,
+    Set {
+        last_scanned_block: u64,
+        last_scanned_block_hash: Option<[u8; 32]>,
+    },
+}
+
 pub struct WalletPrivateCommit<'a> {
-    wallet_id: &'a str,
-    utxos: &'a [WalletUtxo],
-    replace_wallet_utxos: bool,
-    last_scanned_block: u64,
-    last_scanned_block_hash: Option<[u8; 32]>,
+    wallet_id: &'a WalletCacheKey,
+    chain_id: u64,
+    utxos: WalletUtxoMutation<'a>,
+    checkpoint: WalletCheckpointMutation,
     sync_actor_state: Option<&'a WalletSyncActorStateRecord>,
-    pending_output_context_chain_id: u64,
     pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
     pending_output_context_deletes: &'a [FixedBytes<32>],
     output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
@@ -701,7 +716,7 @@ impl<'a> WalletSyncActorStateCommit<'a> {
         permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
         state: &'a WalletSyncActorStateRecord,
     ) -> Self {
-        debug_assert_eq!(permit.wallet_id(), state.wallet_id.as_str());
+        debug_assert_eq!(permit.wallet_id().as_str(), state.wallet_id.as_str());
         Self { state }
     }
 
@@ -712,56 +727,70 @@ impl<'a> WalletSyncActorStateCommit<'a> {
 }
 
 impl<'a> WalletPrivateCommit<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(crate) const fn new(
         _token: &crate::wallet::WalletActorCommitToken<'_>,
         permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
         chain_id: u64,
-        utxos: &'a [WalletUtxo],
-        replace_wallet_utxos: bool,
-        last_scanned_block: u64,
-        last_scanned_block_hash: Option<[u8; 32]>,
-        pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
-        pending_output_context_deletes: &'a [FixedBytes<32>],
-        output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+        utxos: WalletUtxoMutation<'a>,
+        checkpoint: WalletCheckpointMutation,
     ) -> Self {
         Self {
             wallet_id: permit.wallet_id(),
+            chain_id,
             utxos,
-            replace_wallet_utxos,
-            last_scanned_block,
-            last_scanned_block_hash,
+            checkpoint,
             sync_actor_state: None,
-            pending_output_context_chain_id: chain_id,
-            pending_output_context_updates,
-            pending_output_context_deletes,
-            output_poi_recovery_updates,
+            pending_output_context_updates: &[],
+            pending_output_context_deletes: &[],
+            output_poi_recovery_updates: &[],
         }
     }
 
     #[must_use]
-    pub const fn wallet_id(&self) -> &str {
+    pub const fn wallet_id(&self) -> &WalletCacheKey {
         self.wallet_id
     }
 
     #[must_use]
-    pub const fn utxos(&self) -> &[WalletUtxo] {
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub const fn utxo_mutation(&self) -> WalletUtxoMutation<'a> {
         self.utxos
     }
 
     #[must_use]
-    pub const fn replace_wallet_utxos(&self) -> bool {
-        self.replace_wallet_utxos
+    pub const fn checkpoint_mutation(&self) -> WalletCheckpointMutation {
+        self.checkpoint
     }
 
     #[must_use]
-    pub const fn last_scanned_block(&self) -> u64 {
-        self.last_scanned_block
+    pub const fn with_pending_output_context_updates(
+        mut self,
+        updates: &'a [PendingOutputPoiContextRecord],
+    ) -> Self {
+        self.pending_output_context_updates = updates;
+        self
     }
 
     #[must_use]
-    pub const fn last_scanned_block_hash(&self) -> Option<[u8; 32]> {
-        self.last_scanned_block_hash
+    pub const fn with_pending_output_context_deletes(
+        mut self,
+        deletes: &'a [FixedBytes<32>],
+    ) -> Self {
+        self.pending_output_context_deletes = deletes;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_output_poi_recovery_updates(
+        mut self,
+        updates: &'a [OutputPoiRecoveryRecord],
+    ) -> Self {
+        self.output_poi_recovery_updates = updates;
+        self
     }
 
     #[must_use]
@@ -776,11 +805,6 @@ impl<'a> WalletPrivateCommit<'a> {
     #[must_use]
     pub const fn sync_actor_state(&self) -> Option<&WalletSyncActorStateRecord> {
         self.sync_actor_state
-    }
-
-    #[must_use]
-    pub const fn pending_output_context_chain_id(&self) -> u64 {
-        self.pending_output_context_chain_id
     }
 
     #[must_use]
@@ -805,14 +829,20 @@ pub trait WalletCacheStore: Send + Sync {
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError>;
 
-    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
+    fn load_wallet_utxos(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<WalletUtxo>, WalletCacheError>;
 
-    fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError>;
+    fn get_wallet_meta(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Option<WalletMeta>, WalletCacheError>;
 
     fn get_wallet_sync_actor_state(
         &self,
         chain_id: u64,
-        wallet_id: &str,
+        wallet_id: &WalletCacheKey,
     ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError>;
 
     fn put_wallet_sync_actor_state(
@@ -826,44 +856,63 @@ impl WalletCacheStore for DbStore {
         &self,
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
-        let utxo_entries = if commit.replace_wallet_utxos() {
-            Some(wallet_utxo_entries(commit.utxos())?)
-        } else {
-            None
+        let utxo_entries = match commit.utxo_mutation() {
+            WalletUtxoMutation::Preserve => None,
+            WalletUtxoMutation::Replace(utxos) => Some(wallet_utxo_entries(utxos)?),
         };
-        let meta = WalletMeta {
-            last_scanned_block: commit.last_scanned_block(),
-            updated_at: wallet_cache_now_epoch_secs()?,
-            last_scanned_block_hash: commit.last_scanned_block_hash(),
+        let meta = match commit.checkpoint_mutation() {
+            WalletCheckpointMutation::Preserve => None,
+            WalletCheckpointMutation::Set {
+                last_scanned_block,
+                last_scanned_block_hash,
+            } => Some(WalletMeta {
+                last_scanned_block,
+                updated_at: wallet_cache_now_epoch_secs()?,
+                last_scanned_block_hash,
+            }),
         };
-        self.batch_commit_wallet_private_state(
-            commit.wallet_id(),
-            utxo_entries.as_deref(),
-            Some(&meta),
-            commit.sync_actor_state(),
-            commit.pending_output_context_updates(),
-            commit.pending_output_context_chain_id(),
-            commit.pending_output_context_deletes(),
-            commit.output_poi_recovery_updates(),
-        )?;
+        let namespace =
+            WalletPrivateNamespaceId::new(commit.chain_id(), commit.wallet_id().clone());
+        self.batch_commit_wallet_private_state(&WalletPrivateStateBatch {
+            namespace: &namespace,
+            utxos: utxo_entries.as_deref().map_or(
+                WalletUtxoRowMutation::Preserve,
+                WalletUtxoRowMutation::Replace,
+            ),
+            metadata: meta
+                .as_ref()
+                .map_or(WalletMetaMutation::Preserve, WalletMetaMutation::Set),
+            sync_actor_state: commit.sync_actor_state(),
+            pending_output_context_updates: commit.pending_output_context_updates(),
+            pending_output_context_deletes: commit.pending_output_context_deletes(),
+            output_poi_recovery_updates: commit.output_poi_recovery_updates(),
+        })?;
         Ok(())
     }
 
-    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
+    fn load_wallet_utxos(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<WalletUtxo>, WalletCacheError> {
         WalletCacheDbExt::load_wallet_utxos(self, wallet_id)
     }
 
-    fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
+    fn get_wallet_meta(
+        &self,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Option<WalletMeta>, WalletCacheError> {
         Ok(Self::get_wallet_meta(self, wallet_id)?)
     }
 
     fn get_wallet_sync_actor_state(
         &self,
         chain_id: u64,
-        wallet_id: &str,
+        wallet_id: &WalletCacheKey,
     ) -> Result<Option<WalletSyncActorStateRecord>, WalletCacheError> {
         Ok(Self::get_wallet_sync_actor_state(
-            self, chain_id, wallet_id,
+            self,
+            chain_id,
+            wallet_id.as_str(),
         )?)
     }
 
@@ -897,7 +946,7 @@ fn wallet_cache_now_epoch_secs() -> Result<u64, std::io::Error> {
 #[derive(Clone)]
 pub struct WalletConfig {
     pub chain: ChainKey,
-    pub cache_key: String,
+    pub cache_key: WalletCacheKey,
     pub start_block: Option<u64>,
     pub sync_to_block: Option<u64>,
     pub quick_sync_endpoint: Option<Url>,
@@ -907,6 +956,60 @@ pub struct WalletConfig {
     pub cache_store: Option<Arc<dyn WalletCacheStore>>,
     pub poi_recovery_prover: Option<ProverService>,
     pub use_indexed_wallet_catch_up: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOutputPoiContextIntent {
+    pub txid_version: String,
+    pub output_commitment: FixedBytes<32>,
+    pub output_npk: FixedBytes<32>,
+    pub utxo_tree_in: u64,
+    pub railgun_txid: U256,
+    pub pre_transaction_pois_per_txid_leaf_per_list:
+        BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
+    pub required_poi_list_keys: Vec<FixedBytes<32>>,
+    pub output_role: PendingOutputPoiRole,
+}
+
+impl PendingOutputPoiContextIntent {
+    pub(crate) fn into_record(
+        self,
+        chain_id: u64,
+        wallet_id: String,
+        created_at: u64,
+    ) -> PendingOutputPoiContextRecord {
+        PendingOutputPoiContextRecord {
+            chain_id,
+            wallet_id,
+            txid_version: self.txid_version,
+            output_commitment: self.output_commitment,
+            output_npk: self.output_npk,
+            utxo_tree_in: self.utxo_tree_in,
+            railgun_txid: self.railgun_txid,
+            txid_merkleroot_index: None,
+            pre_transaction_pois_per_txid_leaf_per_list: self
+                .pre_transaction_pois_per_txid_leaf_per_list,
+            required_poi_list_keys: self.required_poi_list_keys,
+            output_role: self.output_role,
+            created_at,
+            source_operation_id: None,
+            observation: None,
+            submitted_poi_list_keys: Vec::new(),
+            terminal_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WalletPrivateRequestError {
+    #[error("wallet actor is inactive")]
+    Inactive,
+    #[error("wallet reset is pending")]
+    ResetPending,
+    #[error("wallet private request is stale")]
+    StaleView,
+    #[error("wallet private request persistence failed")]
+    PersistenceFailed,
 }
 
 #[cfg(test)]
@@ -1436,9 +1539,8 @@ impl WalletPendingSpent {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
-    pub const fn submitted(
+    pub(crate) const fn submitted(
         utxo: &railgun_wallet::Utxo,
         tx_hash: Option<FixedBytes<32>>,
         now: u64,
@@ -1518,7 +1620,13 @@ impl WalletSchedulableProgress {
     }
 }
 
-/// Single-source public private-view state for a wallet actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletInactiveReason {
+    Shutdown,
+    Retired,
+}
+
+/// Single-source public private-view and terminal session state for a wallet actor.
 ///
 /// While [`ResetPending`](Self::ResetPending), public readers must not treat
 /// pre-reset private projection (cursor, UTXOs, pending overlay) as current.
@@ -1533,6 +1641,10 @@ pub enum WalletViewState {
     ResetPending {
         intent_id: u64,
         from_block: u64,
+        reset_generation: u64,
+    },
+    Inactive {
+        reason: WalletInactiveReason,
         reset_generation: u64,
     },
 }
@@ -1559,6 +1671,16 @@ impl PartialEq for WalletViewState {
                     reset_generation: rg,
                 },
             ) => li == ri && lf == rf && lg == rg,
+            (
+                Self::Inactive {
+                    reason: left_reason,
+                    reset_generation: left_generation,
+                },
+                Self::Inactive {
+                    reason: right_reason,
+                    reset_generation: right_generation,
+                },
+            ) => left_reason == right_reason && left_generation == right_generation,
             _ => false,
         }
     }
@@ -1573,10 +1695,18 @@ impl WalletViewState {
     }
 
     #[must_use]
+    pub const fn inactive_reason(&self) -> Option<WalletInactiveReason> {
+        match self {
+            Self::Inactive { reason, .. } => Some(*reason),
+            Self::Current(_) | Self::ResetPending { .. } => None,
+        }
+    }
+
+    #[must_use]
     pub fn current_snapshot(&self) -> Option<Arc<WalletCurrentSnapshot>> {
         match self {
             Self::Current(snapshot) => Some(Arc::clone(snapshot)),
-            Self::ResetPending { .. } => None,
+            Self::ResetPending { .. } | Self::Inactive { .. } => None,
         }
     }
 
@@ -1584,7 +1714,7 @@ impl WalletViewState {
     pub fn last_scanned_current(&self) -> Option<u64> {
         match self {
             Self::Current(snapshot) => Some(snapshot.last_scanned),
-            Self::ResetPending { .. } => None,
+            Self::ResetPending { .. } | Self::Inactive { .. } => None,
         }
     }
 
@@ -1596,7 +1726,7 @@ impl WalletViewState {
                 last_scanned: snapshot.last_scanned,
                 reset_generation: snapshot.reset_generation,
             }),
-            Self::ResetPending { .. } => None,
+            Self::ResetPending { .. } | Self::Inactive { .. } => None,
         }
     }
 
@@ -1605,6 +1735,9 @@ impl WalletViewState {
         match self {
             Self::Current(snapshot) => snapshot.reset_generation,
             Self::ResetPending {
+                reset_generation, ..
+            }
+            | Self::Inactive {
                 reset_generation, ..
             } => *reset_generation,
         }

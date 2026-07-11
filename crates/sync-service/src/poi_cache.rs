@@ -44,7 +44,7 @@ struct ChainPoiCacheLoop {
     cancel: CancellationToken,
 }
 
-pub struct PoiCacheService {
+pub(crate) struct PoiCacheService {
     db: Arc<DbStore>,
     artifact_config: PoiArtifactSourceConfig,
     http_client: Option<reqwest::Client>,
@@ -56,7 +56,7 @@ pub struct PoiCacheService {
 }
 
 impl PoiCacheService {
-    pub fn new(
+    pub(crate) fn new(
         db: Arc<DbStore>,
         artifact_config: PoiArtifactSourceConfig,
         http_client: Option<reqwest::Client>,
@@ -76,23 +76,18 @@ impl PoiCacheService {
     }
 
     #[must_use]
-    pub fn with_poi_rpc_url(mut self, poi_rpc_url: Url) -> Self {
+    pub(crate) fn with_poi_rpc_url(mut self, poi_rpc_url: Url) -> Self {
         self.poi_rpc_url = poi_rpc_url;
         self
     }
 
-    pub async fn start_chains(&self, chain_ids: impl IntoIterator<Item = u64>) {
-        for chain_id in chain_ids {
-            self.start_chain(chain_id).await;
-        }
-    }
-
+    #[cfg(test)]
     #[must_use]
-    pub fn progress_rx(&self) -> watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>> {
+    pub(crate) fn progress_rx(&self) -> watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>> {
         self.progress_tx.subscribe()
     }
 
-    pub async fn start_chain(&self, chain_id: u64) -> LocalPoiCaches {
+    pub(crate) async fn start_chain(&self, chain_id: u64) -> LocalPoiCaches {
         if let Some(existing) = self.local_caches(chain_id).await {
             return existing;
         }
@@ -159,7 +154,7 @@ impl PoiCacheService {
         local_caches
     }
 
-    pub async fn local_caches(&self, chain_id: u64) -> Option<LocalPoiCaches> {
+    pub(crate) async fn local_caches(&self, chain_id: u64) -> Option<LocalPoiCaches> {
         let local_caches = self.chains.read().await.get(&chain_id).cloned()?;
         if synchronize_chain_cache_generation(chain_id, &local_caches, None).await {
             send_stale_chain_poi_cache_progress(&self.progress_tx, chain_id);
@@ -176,24 +171,7 @@ impl PoiCacheService {
         Some(local_caches)
     }
 
-    pub async fn retry_poi_artifact_cache_refresh(&self, chain_id: u64) -> bool {
-        let Some(local_caches) = self.chains.read().await.get(&chain_id).cloned() else {
-            return false;
-        };
-        synchronize_chain_cache_generation(chain_id, &local_caches, None).await;
-        spawn_chain_poi_cache_resync(
-            Arc::clone(&self.db),
-            self.http_client.clone(),
-            self.poi_rpc_url.clone(),
-            self.artifact_config.clone(),
-            chain_id,
-            local_caches,
-            self.progress_tx.clone(),
-        );
-        true
-    }
-
-    pub async fn reset_poi_artifact_cache(&self) -> Result<u64, local_db::DbError> {
+    pub(crate) async fn reset_poi_artifact_cache(&self) -> Result<u64, local_db::DbError> {
         let reset = clear_poi_artifact_cache_for_reset(&self.db)?;
         debug!(
             generation = reset.generation,
@@ -254,7 +232,7 @@ impl PoiCacheService {
         Ok(reset.removed)
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.cancel.cancel();
     }
 }

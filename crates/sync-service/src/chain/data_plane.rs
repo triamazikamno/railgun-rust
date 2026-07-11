@@ -31,6 +31,7 @@ use crate::txid_cache::{
     txid_public_proof_for_recovered_output_at_index,
 };
 use crate::types::{IndexedArtifactSourceConfig, LocalPoiCaches};
+use crate::wallet::LocalPoiMerkleProofSource;
 
 const PUBLIC_DATA_PLANE_DIAGNOSTIC_LIMIT: usize = 128;
 const WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND: &str = "wallet_scan_artifact_chunks";
@@ -278,6 +279,22 @@ impl PublicDataPlaneHandle {
 
     pub async fn diagnostics(&self) -> PublicDataPlaneDiagnostics {
         self.service.public_data_plane.diagnostics().await
+    }
+
+    pub async fn local_poi_merkle_proof_source(
+        &self,
+        txid_version: impl Into<String>,
+    ) -> Result<LocalPoiMerkleProofSource, PublicDataPlaneError> {
+        let corpus = self
+            .service
+            .public_data_plane
+            .ensure_poi_corpus(PublicPoiCorpusKey::new(
+                EVM_CHAIN_TYPE,
+                self.service.chain_id(),
+                txid_version,
+            ))
+            .await?;
+        Ok(LocalPoiMerkleProofSource::new(corpus.local_caches()))
     }
 
     pub async fn reset_public_cache(&self) -> Result<PublicSyncCacheReset, PublicDataPlaneError> {

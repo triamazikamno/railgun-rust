@@ -164,6 +164,10 @@ impl PublicScanPagePlan {
 }
 
 impl ChainService {
+    pub(super) const fn chain_id(&self) -> u64 {
+        self.chain.chain_id
+    }
+
     async fn wallet_registration_gate(&self, cache_key: &str) -> Arc<Mutex<()>> {
         let mut gates = self.wallet_registration_gates.lock().await;
         Arc::clone(
@@ -964,7 +968,7 @@ impl ChainService {
         let cache_key = cfg.cache_key.clone();
         let registration_gate = self.wallet_registration_gate(&cache_key).await;
         let _registration_guard = registration_gate.lock().await;
-        if let Some(existing) = self.wallets.read().await.get(&cache_key) {
+        if let Some(existing) = self.wallets.read().await.get(cache_key.as_str()) {
             if existing.handle.readiness().is_ready() {
                 self.spawn_txid_public_cache_loop_once();
             }
@@ -1050,7 +1054,7 @@ impl ChainService {
             let mut wallets = self.wallets.write().await;
             let handle = prepared.handle().clone();
             wallets.insert(
-                cache_key.clone(),
+                cache_key.to_string(),
                 WalletRegistration {
                     handle,
                     cfg: cfg.clone(),
@@ -1063,7 +1067,7 @@ impl ChainService {
             match prepared.activate() {
                 Ok(handle) => handle,
                 Err(err) => {
-                    wallets.remove(&cache_key);
+                    wallets.remove(cache_key.as_str());
                     return Err(err);
                 }
             }
@@ -1250,7 +1254,7 @@ impl ChainService {
                         driver.retire(&cfg.cache_key).await;
                     } else {
                         let request = wallet_finish_retry_request(
-                            cfg.cache_key.clone(),
+                            cfg.cache_key.to_string(),
                             sync_target,
                             false,
                             from_block,

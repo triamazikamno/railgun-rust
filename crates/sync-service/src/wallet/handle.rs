@@ -77,23 +77,22 @@ impl WalletPoiRefreshSelection {
 
 use super::{
     Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, HashSet,
-    Mutex, Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextRecord,
-    PoiStatus, RwLock, SyncProgressUpdate, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource,
-    WalletActorApplyToken, WalletActorCommitToken, WalletActorLifecycle, WalletActorLifecycleCell,
-    WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCurrentSnapshot,
-    WalletIndexedCatchUpStatus, WalletReadiness, WalletResetToken, WalletScanRows, WalletSyncToken,
-    WalletUtxo, WalletViewState, chain_pending_overlay_matches, debug, mpsc, now_epoch_secs,
-    oneshot, wallet_utxo_stable_identity, warn, watch,
+    Mutex, Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextIntent,
+    PendingOutputPoiContextRecord, PoiStatus, RwLock, SyncProgressUpdate, Utxo, UtxoCommitmentKind,
+    UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
+    WalletActorLifecycle, WalletActorLifecycleCell, WalletBackfillRejectReason,
+    WalletBackfillStartResult, WalletCacheError, WalletCacheKey, WalletCurrentSnapshot,
+    WalletInactiveReason, WalletIndexedCatchUpStatus, WalletPrivateRequestError, WalletReadiness,
+    WalletResetToken, WalletScanRows, WalletSyncToken, WalletUtxo, WalletViewState,
+    chain_pending_overlay_matches, debug, mpsc, now_epoch_secs, oneshot,
+    wallet_utxo_stable_identity, warn, watch,
 };
 
 use crate::types::SyncProgressSender;
 
-#[cfg(test)]
-use super::Utxo;
-
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
-    pub cache_key: String,
+    pub cache_key: WalletCacheKey,
     pub(super) chain_id: u64,
     pub(super) actor_id: u64,
     pub(super) active_actor_id: Arc<AtomicU64>,
@@ -110,10 +109,11 @@ pub struct WalletHandle {
     pub readiness_rx: watch::Receiver<WalletReadiness>,
     pub rev_rx: watch::Receiver<u64>,
     /// Single-source public private-view (Current vs `ResetPending`).
-    pub view_rx: watch::Receiver<WalletViewState>,
+    pub(super) view_rx: watch::Receiver<WalletViewState>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
     pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
     pub(super) pending_overlay_tx: mpsc::Sender<WalletPendingOverlayRequest>,
+    pub(super) private_request_tx: mpsc::Sender<WalletPrivateRequest>,
     pub(super) poi_refresh_tx: mpsc::Sender<WalletPoiRefreshRequest>,
     pub(super) indexed_catch_up_status_tx: mpsc::UnboundedSender<WalletIndexedCatchUpCommand>,
     pub(super) rev_tx: watch::Sender<u64>,
@@ -175,6 +175,51 @@ pub(super) struct WalletPendingOverlayRequest {
 pub(super) enum WalletPendingOverlayUpdate {
     PublicRows(WalletScanRows),
     Clear,
+}
+
+#[derive(Debug)]
+pub(super) enum WalletLocalPendingSpentUpdate {
+    Mark {
+        utxos: Vec<Utxo>,
+        tx_hash: Option<FixedBytes<32>>,
+    },
+    ClearAll,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum WalletPrivateViewTicket {
+    Current {
+        reset_generation: u64,
+        last_scanned: u64,
+    },
+    ResetPending {
+        reset_generation: u64,
+    },
+}
+
+impl WalletPrivateViewTicket {
+    pub(super) const fn reset_generation(self) -> u64 {
+        match self {
+            Self::Current {
+                reset_generation, ..
+            }
+            | Self::ResetPending { reset_generation } => reset_generation,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum WalletPrivateRequest {
+    LocalPendingSpent {
+        ticket: WalletPrivateViewTicket,
+        update: WalletLocalPendingSpentUpdate,
+        reply: oneshot::Sender<Result<bool, WalletPrivateRequestError>>,
+    },
+    CreatePendingOutputContexts {
+        ticket: WalletPrivateViewTicket,
+        contexts: Vec<PendingOutputPoiContextIntent>,
+        reply: oneshot::Sender<Result<usize, WalletPrivateRequestError>>,
+    },
 }
 
 #[derive(Debug)]
@@ -539,7 +584,7 @@ impl WalletPrivateRemoteAuthority {
 }
 
 impl WalletPrivateMutationPermit<'_> {
-    pub(crate) fn wallet_id(&self) -> &str {
+    pub(crate) const fn wallet_id(&self) -> &WalletCacheKey {
         &self.handle.cache_key
     }
 
@@ -676,11 +721,6 @@ impl WalletPrivateMutationPermit<'_> {
         &self.handle.utxos
     }
 
-    pub(super) fn last_scanned(&self) -> Result<u64, WalletBackfillRejectReason> {
-        self.revalidate()?;
-        Ok(self.handle.last_scanned_raw())
-    }
-
     pub(super) async fn wallet_utxos(&self) -> Result<Vec<WalletUtxo>, WalletBackfillRejectReason> {
         self.revalidate()?;
         let snapshot = self.handle.utxos.read().await.clone();
@@ -760,7 +800,12 @@ impl WalletHandle {
 
     /// Prepared/Active → Stopping. Used when cancel is observed for a still-current actor.
     pub(crate) fn mark_stopping(&self) -> bool {
-        self.lifecycle.mark_stopping()
+        self.lifecycle.mark_stopping_with(|| {
+            self.view_tx.send_replace(WalletViewState::Inactive {
+                reason: WalletInactiveReason::Shutdown,
+                reset_generation: self.authority_reset_generation(),
+            });
+        })
     }
 
     /// Exactly one terminal Shutdown publish while Stopping and still current.
@@ -814,6 +859,10 @@ impl WalletHandle {
         self.lifecycle.mark_retired(|| {
             self.active_actor_id
                 .store(RETIRED_WALLET_ACTOR_ID, Ordering::Release);
+            self.view_tx.send_replace(WalletViewState::Inactive {
+                reason: WalletInactiveReason::Retired,
+                reset_generation: self.authority_reset_generation(),
+            });
         });
     }
 
@@ -844,6 +893,22 @@ impl WalletHandle {
             Ok(Err(reason)) => Err(reason),
             Err(()) => Err(WalletBackfillRejectReason::Shutdown),
         }
+    }
+
+    pub(super) fn with_active_private_request<R>(
+        &self,
+        cancel: &CancellationToken,
+        request: impl FnOnce() -> Result<R, WalletPrivateRequestError>,
+    ) -> Result<R, WalletPrivateRequestError> {
+        self.lifecycle
+            .with_active_request(self.is_current_actor(), || {
+                if cancel.is_cancelled() {
+                    Err(WalletPrivateRequestError::Inactive)
+                } else {
+                    request()
+                }
+            })
+            .unwrap_or(Err(WalletPrivateRequestError::Inactive))
     }
 
     pub(crate) fn mint_sync_token(&self, reset_generation: u64) -> WalletSyncToken {
@@ -974,6 +1039,11 @@ impl WalletHandle {
     #[must_use]
     pub fn view_state(&self) -> WalletViewState {
         self.view_rx.borrow().clone()
+    }
+
+    #[must_use]
+    pub fn subscribe_view(&self) -> watch::Receiver<WalletViewState> {
+        self.view_rx.clone()
     }
 
     #[must_use]
@@ -1150,8 +1220,80 @@ impl WalletHandle {
         self.view_state().current_snapshot()
     }
 
+    fn private_request_ticket(&self) -> Result<WalletPrivateViewTicket, WalletPrivateRequestError> {
+        match self.view_state() {
+            WalletViewState::Current(snapshot) => Ok(WalletPrivateViewTicket::Current {
+                reset_generation: snapshot.reset_generation,
+                last_scanned: snapshot.last_scanned,
+            }),
+            WalletViewState::ResetPending {
+                reset_generation, ..
+            } => Ok(WalletPrivateViewTicket::ResetPending { reset_generation }),
+            WalletViewState::Inactive { .. } => Err(WalletPrivateRequestError::Inactive),
+        }
+    }
+
+    pub async fn mark_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: Option<FixedBytes<32>>,
+    ) -> Result<bool, WalletPrivateRequestError> {
+        let ticket = self.private_request_ticket()?;
+        let (reply, result) = oneshot::channel();
+        self.private_request_tx
+            .send(WalletPrivateRequest::LocalPendingSpent {
+                ticket,
+                update: WalletLocalPendingSpentUpdate::Mark {
+                    utxos: utxos.to_vec(),
+                    tx_hash,
+                },
+                reply,
+            })
+            .await
+            .map_err(|_| WalletPrivateRequestError::Inactive)?;
+        result
+            .await
+            .unwrap_or(Err(WalletPrivateRequestError::Inactive))
+    }
+
+    /// Clears every local submitted-transaction lock for this wallet as one explicit action.
+    pub async fn clear_all_local_pending_spent(&self) -> Result<bool, WalletPrivateRequestError> {
+        let ticket = self.private_request_ticket()?;
+        let (reply, result) = oneshot::channel();
+        self.private_request_tx
+            .send(WalletPrivateRequest::LocalPendingSpent {
+                ticket,
+                update: WalletLocalPendingSpentUpdate::ClearAll,
+                reply,
+            })
+            .await
+            .map_err(|_| WalletPrivateRequestError::Inactive)?;
+        result
+            .await
+            .unwrap_or(Err(WalletPrivateRequestError::Inactive))
+    }
+
+    pub async fn create_pending_output_poi_contexts(
+        &self,
+        contexts: Vec<PendingOutputPoiContextIntent>,
+    ) -> Result<usize, WalletPrivateRequestError> {
+        let ticket = self.private_request_ticket()?;
+        let (reply, result) = oneshot::channel();
+        self.private_request_tx
+            .send(WalletPrivateRequest::CreatePendingOutputContexts {
+                ticket,
+                contexts,
+                reply,
+            })
+            .await
+            .map_err(|_| WalletPrivateRequestError::Inactive)?;
+        result
+            .await
+            .unwrap_or(Err(WalletPrivateRequestError::Inactive))
+    }
+
     #[cfg(test)]
-    pub(crate) async fn clear_local_pending_spent(&self) -> bool {
+    pub(crate) async fn clear_local_pending_spent_for_test(&self) -> bool {
         let changed = {
             let mut overlay = self.pending_overlay.write().await;
             let changed = !overlay.local_pending_spent.is_empty();
@@ -1165,7 +1307,7 @@ impl WalletHandle {
     }
 
     #[cfg(test)]
-    pub(crate) async fn mark_pending_spent_utxos(
+    pub(crate) async fn mark_pending_spent_utxos_for_test(
         &self,
         utxos: &[Utxo],
         tx_hash: Option<FixedBytes<32>>,

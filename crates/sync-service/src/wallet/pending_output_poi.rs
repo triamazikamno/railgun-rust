@@ -7,9 +7,9 @@ use super::{
     PendingOutputPoiContextRecord, PendingOutputPoiObservation,
     PendingOutputPoiSubmissionPredicate, PoiError, PoiPrivateApplyOutcome, PoiStatus,
     PoiStatusReader, PublicPoiCorpusKey, SingleCommitmentProofContext, UtxoPoiMetadata,
-    WalletCacheError, WalletCacheStore, WalletConfig, WalletHandle, WalletPoiRuntime,
-    WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
-    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, debug, hex,
+    WalletCacheError, WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletHandle,
+    WalletPoiRuntime, WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug, hex,
     new_output_poi_recovery_record, now_epoch_secs, warn,
 };
 
@@ -1007,10 +1007,6 @@ async fn apply_poi_private_delta_inline(
         .wallet_utxos()
         .await
         .map_err(|_| WalletCacheError::Crypto)?;
-    let last_scanned = permit
-        .last_scanned()
-        .map_err(|_| WalletCacheError::Crypto)?;
-
     match delta {
         OwnedPoiPrivateDelta::OutputRecovery {
             expected_output,
@@ -1089,18 +1085,17 @@ async fn apply_poi_private_delta_inline(
             let pending_updates: Vec<_> = pending_update.into_iter().collect();
             let recovery_updates = [recovery];
             let result = permit.with_durable_apply(|token| {
-                cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-                    &token,
-                    &permit,
-                    cfg.chain.chain_id,
-                    &snapshot,
-                    false,
-                    last_scanned,
-                    None,
-                    &pending_updates,
-                    &[],
-                    &recovery_updates,
-                ))
+                cache_store.commit_wallet_private_state(
+                    WalletPrivateCommit::new(
+                        &token,
+                        &permit,
+                        cfg.chain.chain_id,
+                        WalletUtxoMutation::Preserve,
+                        WalletCheckpointMutation::Preserve,
+                    )
+                    .with_pending_output_context_updates(&pending_updates)
+                    .with_output_poi_recovery_updates(&recovery_updates),
+                )
             });
             drop(permit);
             match result {
@@ -1208,18 +1203,17 @@ async fn apply_poi_private_delta_inline(
                 .collect();
             let recovery_updates = [recovery];
             let result = permit.with_durable_apply(|token| {
-                cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-                    &token,
-                    &permit,
-                    cfg.chain.chain_id,
-                    &snapshot,
-                    false,
-                    last_scanned,
-                    None,
-                    &pending_updates,
-                    &[],
-                    &recovery_updates,
-                ))
+                cache_store.commit_wallet_private_state(
+                    WalletPrivateCommit::new(
+                        &token,
+                        &permit,
+                        cfg.chain.chain_id,
+                        WalletUtxoMutation::Preserve,
+                        WalletCheckpointMutation::Preserve,
+                    )
+                    .with_pending_output_context_updates(&pending_updates)
+                    .with_output_poi_recovery_updates(&recovery_updates),
+                )
             });
             drop(permit);
             match result {
@@ -1267,18 +1261,16 @@ async fn apply_poi_private_delta_inline(
             current_context.terminal_error = Some(error);
             let pending_updates = [current_context];
             let result = permit.with_durable_apply(|token| {
-                cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-                    &token,
-                    &permit,
-                    cfg.chain.chain_id,
-                    &snapshot,
-                    false,
-                    last_scanned,
-                    None,
-                    &pending_updates,
-                    &[],
-                    &[],
-                ))
+                cache_store.commit_wallet_private_state(
+                    WalletPrivateCommit::new(
+                        &token,
+                        &permit,
+                        cfg.chain.chain_id,
+                        WalletUtxoMutation::Preserve,
+                        WalletCheckpointMutation::Preserve,
+                    )
+                    .with_pending_output_context_updates(&pending_updates),
+                )
             });
             drop(permit);
             match result {
@@ -1388,18 +1380,21 @@ async fn apply_poi_private_delta_inline(
                 None
             };
             let result = permit.with_active_apply(|token| {
-                cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-                    &token,
-                    &permit,
-                    cfg.chain.chain_id,
-                    &snapshot,
-                    changed,
-                    last_scanned,
-                    None,
-                    &[],
-                    &pending_deletes_owned,
-                    &recovery_updates_owned,
-                ))?;
+                cache_store.commit_wallet_private_state(
+                    WalletPrivateCommit::new(
+                        &token,
+                        &permit,
+                        cfg.chain.chain_id,
+                        if changed {
+                            WalletUtxoMutation::Replace(&snapshot)
+                        } else {
+                            WalletUtxoMutation::Preserve
+                        },
+                        WalletCheckpointMutation::Preserve,
+                    )
+                    .with_pending_output_context_deletes(&pending_deletes_owned)
+                    .with_output_poi_recovery_updates(&recovery_updates_owned),
+                )?;
                 if let Some(locked) = utxos_locked.as_mut() {
                     **locked = std::mem::take(&mut snapshot);
                 }
@@ -1460,13 +1455,8 @@ async fn apply_poi_private_delta_inline(
                     &token,
                     &permit,
                     cfg.chain.chain_id,
-                    &snapshot,
-                    true,
-                    last_scanned,
-                    None,
-                    &[],
-                    &[],
-                    &[],
+                    WalletUtxoMutation::Replace(&snapshot),
+                    WalletCheckpointMutation::Preserve,
                 ))?;
                 *utxos_locked = snapshot;
                 let overlay = permit
@@ -1607,7 +1597,7 @@ pub(super) fn pending_output_poi_context_matches_wallet_utxo(
     record: &PendingOutputPoiContextRecord,
 ) -> bool {
     if record.chain_id != cfg.chain.chain_id
-        || record.wallet_id != cfg.cache_key
+        || record.wallet_id != cfg.cache_key.as_str()
         || record.output_commitment != wallet_utxo.utxo.poi.commitment
     {
         return false;

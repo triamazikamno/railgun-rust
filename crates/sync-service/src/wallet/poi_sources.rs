@@ -105,7 +105,7 @@ pub struct LocalPoiMerkleProofSource {
 
 impl LocalPoiMerkleProofSource {
     #[must_use]
-    pub const fn new(caches: WalletLocalPoiCaches) -> Self {
+    pub(crate) const fn new(caches: WalletLocalPoiCaches) -> Self {
         Self { caches }
     }
 

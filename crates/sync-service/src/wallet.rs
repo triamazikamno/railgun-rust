@@ -33,7 +33,7 @@ use tracing::{Instrument, debug, info, warn};
 use local_db::{
     DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
-    WalletPendingResetRecord, WalletSyncActorStateRecord,
+    WalletCacheKey, WalletPendingResetRecord, WalletSyncActorStateRecord,
 };
 use poi::artifacts::SnapshotEvent;
 use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError};
@@ -57,14 +57,16 @@ use crate::chain::{
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::txid_cache::TxidPublicCacheError;
 use crate::types::{
-    BackfillEvent, GlobalPoiPolicy, IndexedArtifactSourceConfig, PoiProxyFallback, SharedLogBatch,
-    SyncProgressStage, SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillFinishResult,
-    WalletBackfillGrant, WalletBackfillOwnerDisposition, WalletBackfillOwnerSignal,
-    WalletBackfillRejectReason, WalletBackfillResetResult, WalletBackfillStartResult,
-    WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletIndexedCatchUpStatus,
-    WalletLocalPoiCaches, WalletPrivateCommit, WalletReadiness, WalletReadinessError,
-    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
-    WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
+    BackfillEvent, GlobalPoiPolicy, IndexedArtifactSourceConfig, PendingOutputPoiContextIntent,
+    PoiProxyFallback, SharedLogBatch, SyncProgressStage, SyncProgressUpdate,
+    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillGrant,
+    WalletBackfillOwnerDisposition, WalletBackfillOwnerSignal, WalletBackfillRejectReason,
+    WalletBackfillResetResult, WalletBackfillStartResult, WalletCacheStore,
+    WalletCheckpointMutation, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
+    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit,
+    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletResetReplayPlan,
+    WalletResetRewindStatus, WalletResetToken, WalletScanApply, WalletScanRows,
+    WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken, WalletUtxoMutation,
     WalletViewState,
 };
 
@@ -95,8 +97,9 @@ use handle::{
     OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_VERIFY_PROOF, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiSubmissionPredicate, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
-    WalletIndexedCatchUpCommand, WalletPendingOverlayUpdate, WalletPoiRefreshSelection,
-    WalletPrivateRemoteAuthority,
+    WalletIndexedCatchUpCommand, WalletLocalPendingSpentUpdate, WalletPendingOverlayUpdate,
+    WalletPoiRefreshSelection, WalletPrivateRemoteAuthority, WalletPrivateRequest,
+    WalletPrivateViewTicket,
 };
 pub(crate) use handle::{
     OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,

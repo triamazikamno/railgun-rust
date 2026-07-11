@@ -5,11 +5,11 @@ use super::{
     GlobalPoiPolicy, IndexedArtifactSourceConfig, Instant, MerkleForest, OutputPoiRecoveryRecord,
     OutputPoiRecoveryRequest, PendingOutputPoiContextRecord, PoiProxyFallback, PoiRpcClient,
     PublicPoiCorpusKey, QueryRpcPool, RwLock, SystemTime, UNIX_EPOCH, UtxoCommitmentKind,
-    WalletActorCommitToken, WalletCacheError, WalletCacheStore, WalletConfig, WalletHandle,
-    WalletPoiRefreshSelection, WalletPrivateCommit, WalletPrivateMutationAuthority,
-    WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletReadiness, WalletUtxo, debug,
-    log_local_poi_cache_unavailable, mark_valid_output_poi_recoveries,
-    output_poi_recovery_candidates, recover_missing_output_pois,
+    WalletActorCommitToken, WalletCacheError, WalletCacheStore, WalletCheckpointMutation,
+    WalletConfig, WalletHandle, WalletPoiRefreshSelection, WalletPrivateCommit,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
+    WalletReadiness, WalletUtxo, WalletUtxoMutation, debug, log_local_poi_cache_unavailable,
+    mark_valid_output_poi_recoveries, output_poi_recovery_candidates, recover_missing_output_pois,
 };
 use tokio::sync::mpsc;
 use url::Url;
@@ -188,18 +188,18 @@ impl WalletPersistState {
             request.changed || self.needs_full_persist || self.pending_cache_reset.is_some();
         if full_persist {
             let persist_started = Instant::now();
-            return match cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-                token,
-                permit,
-                effects.pending_output_context_chain_id,
-                request.snapshot,
-                true,
-                request.last_scanned,
-                request.last_scanned_block_hash,
-                effects.pending_output_context_updates,
-                effects.pending_output_context_deletes,
-                effects.output_poi_recovery_updates,
-            )) {
+            return match cache_store.commit_wallet_private_state(
+                WalletPrivateCommit::new(
+                    token,
+                    permit,
+                    effects.pending_output_context_chain_id,
+                    WalletUtxoMutation::Replace(request.snapshot),
+                    request.checkpoint,
+                )
+                .with_pending_output_context_updates(effects.pending_output_context_updates)
+                .with_pending_output_context_deletes(effects.pending_output_context_deletes)
+                .with_output_poi_recovery_updates(effects.output_poi_recovery_updates),
+            ) {
                 Ok(()) => {
                     self.needs_full_persist = false;
                     self.pending_cache_reset = None;
@@ -230,18 +230,18 @@ impl WalletPersistState {
         }
 
         let meta_started = Instant::now();
-        cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-            token,
-            permit,
-            effects.pending_output_context_chain_id,
-            request.snapshot,
-            false,
-            request.last_scanned,
-            request.last_scanned_block_hash,
-            effects.pending_output_context_updates,
-            effects.pending_output_context_deletes,
-            effects.output_poi_recovery_updates,
-        ))?;
+        cache_store.commit_wallet_private_state(
+            WalletPrivateCommit::new(
+                token,
+                permit,
+                effects.pending_output_context_chain_id,
+                WalletUtxoMutation::Preserve,
+                request.checkpoint,
+            )
+            .with_pending_output_context_updates(effects.pending_output_context_updates)
+            .with_pending_output_context_deletes(effects.pending_output_context_deletes)
+            .with_output_poi_recovery_updates(effects.output_poi_recovery_updates),
+        )?;
         debug!(
             cache_key = %request.cache_key,
             last_scanned = request.last_scanned,
@@ -282,7 +282,7 @@ pub(super) struct WalletProgressPersist<'a> {
     pub(super) cache_key: &'a str,
     pub(super) snapshot: &'a [WalletUtxo],
     pub(super) last_scanned: u64,
-    pub(super) last_scanned_block_hash: Option<[u8; 32]>,
+    pub(super) checkpoint: WalletCheckpointMutation,
     pub(super) changed: bool,
 }
 
