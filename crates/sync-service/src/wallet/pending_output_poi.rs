@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BlindedCommitmentData, CancellationToken, ChainPublicDataPlane,
     CommitmentObservation, DbStore, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
-    ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant, LocalPoiStatusReader,
+    ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant,
     OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
     OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation,
@@ -2103,7 +2103,7 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config(
                     )
                     .await
             {
-                let reader = LocalPoiStatusReader::new(corpus.local_caches());
+                let reader = corpus.status_reader();
                 verify_submitted_pending_output_pois(
                     &reader,
                     db,
@@ -2167,7 +2167,7 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
                         return PendingOutputPoiVerificationOutcome::default();
                     }
                 };
-                let reader = LocalPoiStatusReader::new(corpus.local_caches());
+                let reader = corpus.status_reader();
                 verify_submitted_pending_output_pois_inner(
                     authority,
                     AuthorizedPoiStatusSource::Local(&reader),

@@ -155,7 +155,7 @@ impl OutputPoiRecoveryRequest<'_> {
                     .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id))
                     .await
                     .ok()?;
-                let source = LocalPoiMerkleProofSource::new(corpus.local_caches());
+                let source = corpus.merkle_proof_source();
                 source
                     .available_for_lists(self.cfg.chain.chain_id, required_poi_list_keys)
                     .await

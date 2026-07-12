@@ -1320,7 +1320,7 @@ impl WalletPoiRuntime {
                     return None;
                 }
                 let corpus = public_data_plane.ensure_poi_corpus(key).await.ok()?;
-                Some(LocalPoiStatusReader::new(corpus.local_caches()))
+                Some(corpus.status_reader())
             }
             // PoiProxy has no local corpus for actor-side refresh.
             Self::PoiProxy { .. } => None,
@@ -1347,10 +1347,7 @@ impl WalletPoiRuntime {
                         .then(|| WalletPoiStatusReaderSource::Remote(self.public_client()));
                 }
                 let corpus = public_data_plane.ensure_poi_corpus(key).await.ok()?;
-                let local_caches = corpus.local_caches();
-                Some(WalletPoiStatusReaderSource::Local(
-                    LocalPoiStatusReader::new(local_caches),
-                ))
+                Some(WalletPoiStatusReaderSource::Local(corpus.status_reader()))
             }
             Self::PoiProxy { .. } => {
                 Some(WalletPoiStatusReaderSource::Remote(self.public_client()))
@@ -1806,7 +1803,8 @@ impl WalletScanCommitRequest<'_> {
                     }
                     crate::chain::PublicDataPlaneError::InvalidRange { .. }
                     | crate::chain::PublicDataPlaneError::PublicCacheReset { .. }
-                    | crate::chain::PublicDataPlaneError::PoiCorpusUnavailable { .. } => {
+                    | crate::chain::PublicDataPlaneError::PoiCorpusUnavailable { .. }
+                    | crate::chain::PublicDataPlaneError::PoiCorpusRefresh { .. } => {
                         WalletBackfillRejectReason::ApplyFailed
                     }
                 };

@@ -4,10 +4,12 @@ use super::{
     OUTPUT_POI_RECOVERY_TABLE, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE, POI_ARTIFACT_CACHE_TABLE,
     PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord, PendingOutputPoiRole,
-    PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
-    WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE, WALLET_UTXO_TABLE, WalletCacheKey,
-    WalletMeta, WalletPendingResetRecord, WalletPrivateNamespaceDeletionReport,
-    WalletPrivateNamespaceId, WalletSyncActorStateRecord, ZKEY_INDEX_TABLE, encode,
+    PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, PoiCacheRecordSource,
+    PoiCorpusRpcHealthRecord, PoiCorpusValidationRecord, PoiPublisherManifestWatermarkRecord,
+    StoredRecord, TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE,
+    WALLET_SYNC_ACTOR_STATE_TABLE, WALLET_UTXO_TABLE, WalletCacheKey, WalletMeta,
+    WalletPendingResetRecord, WalletPrivateNamespaceDeletionReport, WalletPrivateNamespaceId,
+    WalletSyncActorStateRecord, ZKEY_INDEX_TABLE, decode, encode,
 };
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::uint;
@@ -182,15 +184,66 @@ fn sample_poi_artifact_cache_record(
         chain_id,
         txid_version: "V3_PoseidonMerkle".to_string(),
         list_key,
-        last_accepted_manifest_sequence: 7,
+        source: PoiCacheRecordSource::IndexedArtifacts,
+        validation: PoiCorpusValidationRecord::Legacy,
+        legacy_observed_manifest_sequence: 7,
         base_descriptor: descriptor.clone(),
         applied_delta_descriptors: vec![descriptor.clone()],
         blocked_shields_descriptor: descriptor,
+        artifact_tip_index: Some(99),
+        artifact_tip_root: Some(FixedBytes::from([0x77; 32])),
         current_tip_index: 99,
         current_tip_root: FixedBytes::from([0x77; 32]),
         cache_payload: vec![1, 2, 3, 4],
+        legacy_last_successful_rpc_sync_at_ms: None,
         updated_at: 0,
     }
+}
+
+#[test]
+fn legacy_poi_artifact_cache_record_defaults_to_indexed_artifact_source() {
+    #[derive(serde::Serialize)]
+    struct LegacyPoiArtifactCacheRecord {
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: String,
+        list_key: FixedBytes<32>,
+        last_accepted_manifest_sequence: u64,
+        base_descriptor: PoiArtifactDescriptorRecord,
+        applied_delta_descriptors: Vec<PoiArtifactDescriptorRecord>,
+        blocked_shields_descriptor: PoiArtifactDescriptorRecord,
+        current_tip_index: u64,
+        current_tip_root: FixedBytes<32>,
+        cache_payload: Vec<u8>,
+        last_successful_rpc_sync_at_ms: Option<u64>,
+        updated_at: u64,
+    }
+
+    let current = sample_poi_artifact_cache_record(1, FixedBytes::from([0x71; 32]));
+    let encoded = encode(&LegacyPoiArtifactCacheRecord {
+        chain_type: current.chain_type,
+        chain_id: current.chain_id,
+        txid_version: current.txid_version,
+        list_key: current.list_key,
+        last_accepted_manifest_sequence: current.legacy_observed_manifest_sequence,
+        base_descriptor: current.base_descriptor,
+        applied_delta_descriptors: current.applied_delta_descriptors,
+        blocked_shields_descriptor: current.blocked_shields_descriptor,
+        current_tip_index: current.current_tip_index,
+        current_tip_root: current.current_tip_root,
+        cache_payload: current.cache_payload,
+        last_successful_rpc_sync_at_ms: Some(42),
+        updated_at: current.updated_at,
+    })
+    .expect("encode legacy POI cache record");
+    let decoded: PoiArtifactCacheRecord = decode(&encoded).expect("decode legacy POI cache record");
+
+    assert_eq!(decoded.source, PoiCacheRecordSource::IndexedArtifacts);
+    assert_eq!(decoded.validation, PoiCorpusValidationRecord::Legacy);
+    assert_eq!(decoded.legacy_observed_manifest_sequence, 7);
+    assert_eq!(decoded.artifact_tip_index, None);
+    assert_eq!(decoded.artifact_tip_root, None);
+    assert_eq!(decoded.legacy_last_successful_rpc_sync_at_ms, Some(42));
 }
 
 #[test]
@@ -499,6 +552,337 @@ fn app_settings_records_are_transactional_plaintext_records() {
             .expect("load deleted settings")
             .is_none()
     );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_publisher_manifest_watermarks_round_trip_and_are_isolated() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let first = PoiPublisherManifestWatermarkRecord {
+        publisher_pubkey: FixedBytes::from([0x11; 32]),
+        accepted_sequence: 7,
+        updated_at: u64::MAX,
+    };
+    let second = PoiPublisherManifestWatermarkRecord {
+        publisher_pubkey: FixedBytes::from([0x22; 32]),
+        accepted_sequence: 9,
+        updated_at: u64::MAX,
+    };
+    assert_eq!(
+        first.key(),
+        format!(
+            "railgun:ppoi-sidecar:v1:publisher-manifest-watermark:{}",
+            "11".repeat(32)
+        )
+    );
+
+    store
+        .advance_poi_publisher_manifest_watermark(first.publisher_pubkey, first.accepted_sequence)
+        .expect("store first publisher watermark");
+    store
+        .advance_poi_publisher_manifest_watermark(second.publisher_pubkey, second.accepted_sequence)
+        .expect("store second publisher watermark");
+    store
+        .put_app_settings_record("wallet-settings", b"settings-v1")
+        .expect("store unrelated app setting");
+
+    let loaded_first = store
+        .get_poi_publisher_manifest_watermark(&first.publisher_pubkey)
+        .expect("load first publisher watermark")
+        .expect("first publisher watermark present");
+    let loaded_second = store
+        .get_poi_publisher_manifest_watermark(&second.publisher_pubkey)
+        .expect("load second publisher watermark")
+        .expect("second publisher watermark present");
+    assert_ne!(loaded_first.updated_at, first.updated_at);
+    assert_ne!(loaded_second.updated_at, second.updated_at);
+    let mut expected_first = first.clone();
+    expected_first.updated_at = loaded_first.updated_at;
+    let mut expected_second = second.clone();
+    expected_second.updated_at = loaded_second.updated_at;
+    assert_eq!(loaded_first, expected_first);
+    assert_eq!(loaded_second, expected_second);
+    let retained = store
+        .advance_poi_publisher_manifest_watermark(first.publisher_pubkey, 5)
+        .expect("retain monotonic publisher watermark")
+        .0;
+    assert_eq!(retained.accepted_sequence, 7);
+    assert!(
+        store
+            .get_poi_publisher_manifest_watermark(&FixedBytes::from([0x33; 32]))
+            .expect("load missing publisher watermark")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_app_settings_record("wallet-settings")
+            .expect("load unrelated app setting")
+            .expect("unrelated app setting present"),
+        b"settings-v1"
+    );
+
+    let mismatched_key = PoiPublisherManifestWatermarkRecord::key_for(&second.publisher_pubkey);
+    store
+        .put_app_settings_record(&mismatched_key, &encode(&first).expect("encode watermark"))
+        .expect("store mismatched publisher watermark");
+    assert!(matches!(
+        store.get_poi_publisher_manifest_watermark(&second.publisher_pubkey),
+        Err(DbError::InvalidPpoiSidecarRecord { .. })
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_corpus_rpc_health_records_round_trip_and_are_isolated() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let first = PoiCorpusRpcHealthRecord {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: "V3|PoseidonMerkle".to_string(),
+        list_key: FixedBytes::from([0x44; 32]),
+        cache_generation: 3,
+        last_successful_rpc_sync_at_ms: Some(1_700_000_000_123),
+        updated_at: u64::MAX,
+    };
+    let second = PoiCorpusRpcHealthRecord {
+        chain_type: 0,
+        chain_id: 137,
+        txid_version: "V3|PoseidonMerkle".to_string(),
+        list_key: FixedBytes::from([0x55; 32]),
+        cache_generation: 4,
+        last_successful_rpc_sync_at_ms: None,
+        updated_at: u64::MAX,
+    };
+    assert_eq!(
+        first.key(),
+        format!(
+            "railgun:ppoi-sidecar:v1:corpus-rpc-health:00:0000000000000001:{}:{}",
+            alloy::hex::encode(first.txid_version.as_bytes()),
+            "44".repeat(32)
+        )
+    );
+    assert_ne!(
+        first.key(),
+        PoiCorpusRpcHealthRecord::key_for(1, first.chain_id, &first.txid_version, &first.list_key,)
+    );
+    assert_ne!(
+        first.key(),
+        PoiCorpusRpcHealthRecord::key_for(
+            first.chain_type,
+            2,
+            &first.txid_version,
+            &first.list_key,
+        )
+    );
+    assert_ne!(
+        first.key(),
+        PoiCorpusRpcHealthRecord::key_for(
+            first.chain_type,
+            first.chain_id,
+            "V3|Poseidon|Merkle",
+            &first.list_key,
+        )
+    );
+    assert_ne!(
+        first.key(),
+        PoiCorpusRpcHealthRecord::key_for(
+            first.chain_type,
+            first.chain_id,
+            &first.txid_version,
+            &FixedBytes::from([0x45; 32]),
+        )
+    );
+
+    store
+        .put_poi_corpus_rpc_health(&first)
+        .expect("store first corpus RPC health");
+    store
+        .put_poi_corpus_rpc_health(&second)
+        .expect("store second corpus RPC health");
+
+    let loaded_first = store
+        .get_poi_corpus_rpc_health(
+            first.chain_type,
+            first.chain_id,
+            &first.txid_version,
+            &first.list_key,
+        )
+        .expect("load first corpus RPC health")
+        .expect("first corpus RPC health present");
+    let loaded_second = store
+        .get_poi_corpus_rpc_health(
+            second.chain_type,
+            second.chain_id,
+            &second.txid_version,
+            &second.list_key,
+        )
+        .expect("load second corpus RPC health")
+        .expect("second corpus RPC health present");
+    assert_ne!(loaded_first.updated_at, first.updated_at);
+    assert_ne!(loaded_second.updated_at, second.updated_at);
+    let mut expected_first = first.clone();
+    expected_first.updated_at = loaded_first.updated_at;
+    let mut expected_second = second.clone();
+    expected_second.updated_at = loaded_second.updated_at;
+    assert_eq!(loaded_first, expected_first);
+    assert_eq!(loaded_second, expected_second);
+    assert!(
+        store
+            .get_poi_corpus_rpc_health(
+                first.chain_type,
+                first.chain_id,
+                "V2_PoseidonMerkle",
+                &first.list_key,
+            )
+            .expect("load isolated corpus RPC health")
+            .is_none()
+    );
+
+    let mismatched_key = PoiCorpusRpcHealthRecord::key_for(
+        second.chain_type,
+        second.chain_id,
+        &second.txid_version,
+        &second.list_key,
+    );
+    store
+        .put_app_settings_record(
+            &mismatched_key,
+            &encode(&first).expect("encode corpus RPC health"),
+        )
+        .expect("store mismatched corpus RPC health");
+    assert!(matches!(
+        store.get_poi_corpus_rpc_health(
+            second.chain_type,
+            second.chain_id,
+            &second.txid_version,
+            &second.list_key,
+        ),
+        Err(DbError::InvalidPpoiSidecarRecord { .. })
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_artifact_cache_scan_isolates_undecodable_rows() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let record = sample_poi_artifact_cache_record(1, FixedBytes::from([0x61; 32]));
+    store
+        .put_poi_artifact_cache(&record)
+        .expect("store valid POI corpus");
+    let undecodable_key = PoiArtifactCacheRecord::key_for(
+        record.chain_type,
+        138,
+        &record.txid_version,
+        &record.list_key,
+    );
+    let txn = store.db.begin_write().expect("begin malformed row write");
+    {
+        let mut table = txn
+            .open_table(POI_ARTIFACT_CACHE_TABLE)
+            .expect("open POI corpus table");
+        table
+            .insert(undecodable_key.as_str(), &[0xc1_u8][..])
+            .expect("insert malformed POI corpus");
+    }
+    txn.commit().expect("commit malformed row");
+
+    let mismatched_key = PoiArtifactCacheRecord::key_for(
+        record.chain_type,
+        137,
+        &record.txid_version,
+        &record.list_key,
+    );
+    let txn = store.db.begin_write().expect("begin mismatched row write");
+    {
+        let mut table = txn
+            .open_table(POI_ARTIFACT_CACHE_TABLE)
+            .expect("open POI corpus table");
+        table
+            .insert(
+                mismatched_key.as_str(),
+                encode(&record)
+                    .expect("encode mismatched POI corpus")
+                    .as_slice(),
+            )
+            .expect("insert mismatched POI corpus");
+    }
+    txn.commit().expect("commit mismatched row");
+
+    assert!(matches!(
+        store.get_poi_artifact_cache(
+            record.chain_type,
+            137,
+            &record.txid_version,
+            &record.list_key,
+        ),
+        Err(DbError::InvalidPpoiCorpusRecord { .. })
+    ));
+    assert!(matches!(
+        store
+            .inspect_poi_artifact_cache(
+                record.chain_type,
+                137,
+                &record.txid_version,
+                &record.list_key,
+            )
+            .expect("inspect mismatched corpus"),
+        StoredRecord::Corrupt { .. }
+    ));
+    assert!(matches!(
+        store
+            .inspect_poi_artifact_cache(
+                record.chain_type,
+                138,
+                &record.txid_version,
+                &record.list_key,
+            )
+            .expect("inspect undecodable corpus"),
+        StoredRecord::Corrupt { .. }
+    ));
+
+    let scan = store
+        .scan_poi_artifact_caches()
+        .expect("scan POI corpus records");
+    assert_eq!(scan.records.len(), 1);
+    let mut expected = record.clone();
+    expected.updated_at = scan.records[0].updated_at;
+    assert_eq!(scan.records, vec![expected]);
+    assert_eq!(scan.invalid_keys, vec![mismatched_key, undecodable_key]);
+
+    let mut replacement = record;
+    replacement.chain_id = 138;
+    store
+        .put_poi_artifact_cache(&replacement)
+        .expect("replace corrupt canonical corpus");
+    assert!(matches!(
+        store
+            .inspect_poi_artifact_cache(
+                replacement.chain_type,
+                replacement.chain_id,
+                &replacement.txid_version,
+                &replacement.list_key,
+            )
+            .expect("inspect replacement corpus"),
+        StoredRecord::Valid(_)
+    ));
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

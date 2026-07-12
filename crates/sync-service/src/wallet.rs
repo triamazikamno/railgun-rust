@@ -25,6 +25,7 @@ use railgun_wallet::tx::{
 };
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(test)]
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -35,9 +36,13 @@ use local_db::{
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
     WalletCacheKey, WalletPendingResetRecord, WalletSyncActorStateRecord,
 };
+#[cfg(test)]
 use poi::artifacts::SnapshotEvent;
+#[cfg(test)]
 use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError};
-use poi::error::{PoiError, PoiRpcError};
+use poi::error::PoiError;
+#[cfg(test)]
+use poi::error::PoiRpcError;
 use poi::poi::{
     BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient,
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
@@ -146,6 +151,7 @@ pub(crate) use pending_output_poi::process_pending_output_poi_observations;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
 #[cfg(test)]
 pub(crate) use poi_refresh::LivePoiTailError;
+#[cfg(test)]
 pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
 #[cfg(test)]

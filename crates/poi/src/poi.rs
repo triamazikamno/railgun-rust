@@ -12,7 +12,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 pub const DEFAULT_WALLET_POI_RPC_URL: &str = "https://ppoi.fdi.network";
@@ -733,6 +733,7 @@ pub struct PoiRpcClient {
     base_url: Url,
     http: reqwest::Client,
     next_id: std::sync::atomic::AtomicU64,
+    request_timeout: Duration,
 }
 
 impl Clone for PoiRpcClient {
@@ -741,6 +742,7 @@ impl Clone for PoiRpcClient {
             base_url: self.base_url.clone(),
             http: self.http.clone(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            request_timeout: self.request_timeout,
         }
     }
 }
@@ -752,6 +754,7 @@ impl PoiRpcClient {
             base_url,
             http: reqwest::Client::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            request_timeout: Duration::from_mins(2),
         }
     }
 
@@ -763,7 +766,14 @@ impl PoiRpcClient {
             base_url,
             http,
             next_id: std::sync::atomic::AtomicU64::new(1),
+            request_timeout: Duration::from_mins(2),
         }
+    }
+
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     fn next_id(&self) -> u64 {
@@ -819,6 +829,7 @@ impl PoiRpcClient {
         let resp = self
             .http
             .post(self.base_url.clone())
+            .timeout(self.request_timeout)
             .json(&req)
             .send()
             .await?;

@@ -1,13 +1,18 @@
 use super::{
-    BTreeMap, BlindedCommitmentData, DbStore, EVM_CHAIN_TYPE, Error, FixedBytes, Instant,
-    OwnedPoiPrivateDelta, POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError,
-    PoiPrivateApplyOutcome, PoiRpcClient, PoiRpcError, PoiStatusReader, SnapshotEvent, U256,
-    WALLET_POI_STATUS_BATCH_SIZE, WalletBackfillRejectReason, WalletCacheStore, WalletConfig,
-    WalletPoiRefreshSelection, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
-    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, apply_poi_private_delta,
-    blinded_commitment_type, debug, now_epoch_secs, warn,
+    BTreeMap, BlindedCommitmentData, DbStore, EVM_CHAIN_TYPE, FixedBytes, Instant,
+    OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, PoiStatusReader, WALLET_POI_STATUS_BATCH_SIZE,
+    WalletBackfillRejectReason, WalletCacheStore, WalletConfig, WalletPoiRefreshSelection,
+    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletPrivateRemoteError,
+    WalletPrivateRemoteStale, WalletUtxo, apply_poi_private_delta, blinded_commitment_type, debug,
+    now_epoch_secs, warn,
+};
+#[cfg(test)]
+use super::{
+    Error, POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError, PoiRpcClient, PoiRpcError,
+    SnapshotEvent, U256,
 };
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
+#[cfg(test)]
 use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 
 pub(super) async fn refresh_wallet_poi_statuses_selected(
@@ -232,6 +237,7 @@ pub(super) async fn refresh_wallet_poi_statuses_remote_authorized(
     )
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct LivePoiTailOutcome {
     pub(crate) events: usize,
@@ -240,6 +246,7 @@ pub(crate) struct LivePoiTailOutcome {
     pub(crate) next_event_index: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Error)]
 pub(crate) enum LivePoiTailError {
     #[error("live POI tail request failed")]
@@ -252,6 +259,7 @@ pub(crate) enum LivePoiTailError {
     RootRejected,
 }
 
+#[cfg(test)]
 pub(crate) async fn sync_live_poi_event_tail(
     client: &PoiRpcClient,
     cache: &mut PoiCache,
@@ -302,6 +310,7 @@ pub(crate) async fn sync_live_poi_event_tail(
     Ok(outcome)
 }
 
+#[cfg(test)]
 pub(crate) async fn live_tail_candidate_cache(
     client: &PoiRpcClient,
     cache: &PoiCache,
@@ -311,6 +320,7 @@ pub(crate) async fn live_tail_candidate_cache(
     Ok((tailed_cache, outcome))
 }
 
+#[cfg(test)]
 pub(super) fn apply_live_poi_leaves(
     cache: &mut PoiCache,
     start_index: u64,
@@ -332,6 +342,7 @@ pub(super) fn apply_live_poi_leaves(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn trim_zero_padding(leaves: &[U256]) -> &[U256] {
     let zero_leaf = MERKLE_ZERO_VALUE;
     for (index, leaf) in leaves.iter().enumerate() {

@@ -16,6 +16,7 @@ use alloy::primitives::{FixedBytes, U256};
 use local_db::{BlobMeta, DbStore};
 use merkletree::tree::MerkleProof;
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 use url::Url;
 
 use crate::indexed_artifacts::{
@@ -30,8 +31,8 @@ use crate::txid_cache::{
     reset_txid_public_cache, txid_public_proof_for_recovered_output,
     txid_public_proof_for_recovered_output_at_index,
 };
-use crate::types::{IndexedArtifactSourceConfig, LocalPoiCaches};
-use crate::wallet::LocalPoiMerkleProofSource;
+use crate::types::{IndexedArtifactSourceConfig, LocalPoiCaches, PoiArtifactCacheProgress};
+use crate::wallet::{LocalPoiMerkleProofSource, LocalPoiStatusReader};
 
 const PUBLIC_DATA_PLANE_DIAGNOSTIC_LIMIT: usize = 128;
 const WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND: &str = "wallet_scan_artifact_chunks";
@@ -139,6 +140,17 @@ pub(crate) struct PublicPoiCorpusHandle {
 }
 
 impl PublicPoiCorpusHandle {
+    #[must_use]
+    pub(crate) fn status_reader(&self) -> LocalPoiStatusReader {
+        LocalPoiStatusReader::new(self.local_caches.clone())
+    }
+
+    #[must_use]
+    pub(crate) fn merkle_proof_source(&self) -> LocalPoiMerkleProofSource {
+        LocalPoiMerkleProofSource::new(self.local_caches.clone())
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn local_caches(&self) -> LocalPoiCaches {
         self.local_caches.clone()
@@ -294,7 +306,23 @@ impl PublicDataPlaneHandle {
                 txid_version,
             ))
             .await?;
-        Ok(LocalPoiMerkleProofSource::new(corpus.local_caches()))
+        Ok(corpus.merkle_proof_source())
+    }
+
+    #[must_use]
+    pub fn poi_artifact_cache_progress_rx(
+        &self,
+    ) -> Option<watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>>> {
+        self.service
+            .public_data_plane
+            .poi_artifact_cache_progress_rx()
+    }
+
+    pub async fn retry_poi_artifact_cache(&self) -> Result<(), PublicDataPlaneError> {
+        self.service
+            .public_data_plane
+            .retry_poi_artifact_cache(self.service.chain_id())
+            .await
     }
 
     pub async fn reset_public_cache(&self) -> Result<PublicSyncCacheReset, PublicDataPlaneError> {
@@ -414,6 +442,8 @@ pub enum PublicDataPlaneError {
     PublicCacheReset { reason: String },
     #[error("POI corpus is unavailable for chain {chain_id} and txid version {txid_version}")]
     PoiCorpusUnavailable { chain_id: u64, txid_version: String },
+    #[error("POI corpus refresh failed for chain {chain_id}: {reason}")]
+    PoiCorpusRefresh { chain_id: u64, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,7 +691,7 @@ impl ChainPublicDataPlane {
     pub(crate) async fn shutdown(&self) {
         self.indexed_artifact_maintenance.shutdown().await;
         if let Some(service) = self.poi_cache_service.as_ref() {
-            service.shutdown();
+            service.shutdown().await;
         }
     }
 
@@ -806,11 +836,11 @@ impl ChainPublicDataPlane {
                 }
             })?
         } else {
-            let reset = clear_poi_artifact_cache_for_reset(&self.db).map_err(|err| {
-                PublicDataPlaneError::PublicCacheReset {
+            let reset = clear_poi_artifact_cache_for_reset(&self.db)
+                .await
+                .map_err(|err| PublicDataPlaneError::PublicCacheReset {
                     reason: err.to_string(),
-                }
-            })?;
+                })?;
             self.clear_in_memory_poi_corpora().await;
             reset.removed
         };
@@ -838,7 +868,12 @@ impl ChainPublicDataPlane {
                 txid_version: key.txid_version,
             });
         };
-        let local_caches = service.start_chain(key.chain_id).await;
+        let local_caches = service.start_chain(key.chain_id).await.map_err(|err| {
+            PublicDataPlaneError::PoiCorpusRefresh {
+                chain_id: key.chain_id,
+                reason: err.to_string(),
+            }
+        })?;
         let mut state = self.state.lock().await;
         let local_caches = state
             .poi_corpora
@@ -846,6 +881,29 @@ impl ChainPublicDataPlane {
             .or_insert_with(|| local_caches.clone())
             .clone();
         Ok(PublicPoiCorpusHandle { local_caches })
+    }
+
+    fn poi_artifact_cache_progress_rx(
+        &self,
+    ) -> Option<watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>>> {
+        self.poi_cache_service
+            .as_ref()
+            .map(|service| service.progress_rx())
+    }
+
+    async fn retry_poi_artifact_cache(&self, chain_id: u64) -> Result<(), PublicDataPlaneError> {
+        let Some(service) = self.poi_cache_service.as_ref() else {
+            return Err(PublicDataPlaneError::PoiCorpusUnavailable {
+                chain_id,
+                txid_version: DEFAULT_TXID_VERSION.to_string(),
+            });
+        };
+        service.retry_chain(chain_id).await.map_err(|reason| {
+            PublicDataPlaneError::PoiCorpusRefresh {
+                chain_id,
+                reason: reason.to_string(),
+            }
+        })
     }
 
     pub(crate) async fn poi_corpus_ready_for_lists(
@@ -859,8 +917,7 @@ impl ChainPublicDataPlane {
         let Ok(corpus) = self.ensure_poi_corpus(key.clone()).await else {
             return false;
         };
-        let local_caches = corpus.local_caches();
-        let caches = local_caches.read().await;
+        let caches = corpus.local_caches.read().await;
         active_list_keys.iter().all(|list_key| {
             caches.get(list_key).is_some_and(|cache| {
                 cache.identity().chain_type == key.chain_type
@@ -1428,7 +1485,10 @@ mod tests {
     };
     use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
     use alloy::primitives::Address;
-    use local_db::{BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord};
+    use local_db::{
+        BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
+        PoiCacheRecordSource, PoiCorpusValidationRecord,
+    };
     use poi::cache::{PoiCache, PoiCacheIdentity};
     use poi::poi::PoiEventType;
     use sha2::{Digest, Sha256};
@@ -1539,7 +1599,7 @@ mod tests {
         );
 
         data_plane.shutdown().await;
-        reset_service.shutdown();
+        reset_service.shutdown().await;
         drop(data_plane);
         drop(reset_service);
         drop(db);
@@ -1934,13 +1994,18 @@ mod tests {
             chain_id: 1,
             txid_version: "v2".to_string(),
             list_key,
-            last_accepted_manifest_sequence: 1,
+            source: PoiCacheRecordSource::IndexedArtifacts,
+            validation: PoiCorpusValidationRecord::Legacy,
+            legacy_observed_manifest_sequence: 1,
             base_descriptor: descriptor.clone(),
             applied_delta_descriptors: Vec::new(),
             blocked_shields_descriptor: descriptor,
+            artifact_tip_index: Some(0),
+            artifact_tip_root: Some(FixedBytes::from([9_u8; 32])),
             current_tip_index: 0,
             current_tip_root: FixedBytes::from([9_u8; 32]),
             cache_payload: vec![1, 2, 3],
+            legacy_last_successful_rpc_sync_at_ms: None,
             updated_at: 1,
         })
         .expect("put poi artifact cache");

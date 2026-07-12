@@ -13,6 +13,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::artifacts::SnapshotEvent;
+use crate::artifacts::verify::{VerifyError, verify_blocked_shield, verify_poi_event};
 use crate::error::PoiRpcError;
 use crate::poi::{
     BlindedCommitmentData, BlockedShield, PoiMerkleProof, PoiRpcClient, PoiStatus,
@@ -91,6 +92,8 @@ pub struct PoiCacheSyncOutcome {
     pub events: usize,
     pub leaves: usize,
     pub blocked_shields: usize,
+    pub event_page_budget_exhausted: bool,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +124,8 @@ pub enum PoiCacheError {
     Rpc(#[from] PoiRpcError),
     #[error("POI cache merkle error: {0}")]
     Merkle(#[from] merkletree::errors::SyncError),
+    #[error("POI cache list signature verification failed: {0}")]
+    Verify(#[from] VerifyError),
     #[error("POI cache snapshot version unsupported: {version}")]
     UnsupportedVersion { version: u32 },
     #[error("POI cache metadata mismatch: {reason}")]
@@ -131,6 +136,39 @@ pub enum PoiCacheError {
     InvalidPageSize,
     #[error("POI cache sync range overflow")]
     RangeOverflow,
+    #[error(
+        "POI cache sync cursors differ: next event index {next_event_index}, next leaf index {next_leaf_index}"
+    )]
+    SyncCursorMismatch {
+        next_event_index: u64,
+        next_leaf_index: u64,
+    },
+    #[error(
+        "POI cache event response exceeds requested page {start_index}..={end_index}: requested at most {requested}, got {actual}"
+    )]
+    EventPageTooLarge {
+        start_index: u64,
+        end_index: u64,
+        requested: u64,
+        actual: usize,
+    },
+    #[error("POI cache event index is not contiguous: expected {expected}, got {actual}")]
+    NonContiguousEvent { expected: u64, actual: u64 },
+    #[error(
+        "POI cache leaf response does not cover requested range {start_index}..{end_index}: expected {expected}, got {actual}"
+    )]
+    LeafPageSizeMismatch {
+        start_index: u64,
+        end_index: u64,
+        expected: u64,
+        actual: usize,
+    },
+    #[error("POI cache merkle leaf at index {index} has no fetched signed event")]
+    LeafWithoutEvent { index: u64 },
+    #[error("POI cache event/leaf mismatch at index {index}")]
+    EventLeafMismatch { index: u64 },
+    #[error("POI cache event at index {index} has no corresponding merkle leaf")]
+    MissingEventLeaf { index: u64 },
     #[error("POI cache root validation required before proof generation")]
     RootValidationRequired,
     #[error("POI cache roots were rejected by the POI node")]
@@ -253,6 +291,19 @@ impl PoiCache {
     pub fn current_roots(&mut self) -> BTreeMap<u32, FixedBytes<32>> {
         self.snapshot.forest.compute_roots();
         fixed_roots(self.snapshot.forest.roots())
+    }
+
+    #[must_use]
+    pub fn root_at_global_index(&self, global_index: u64) -> Option<FixedBytes<32>> {
+        let (tree_number, tree_position) = normalize_tree_position(0, global_index);
+        if !self.snapshot.forest.contains_tree(tree_number) {
+            return None;
+        }
+        let leaf_count = tree_position.checked_add(1)?;
+        let root =
+            DenseMerkleTree::from_forest_prefix(&self.snapshot.forest, tree_number, leaf_count)
+                .root();
+        Some(FixedBytes::from(root.to_be_bytes::<32>()))
     }
 
     fn current_roots_readonly(&self) -> BTreeMap<u32, FixedBytes<32>> {
@@ -433,8 +484,40 @@ impl PoiCache {
         event_page_size: u64,
         leaf_page_size: u64,
     ) -> Result<PoiCacheSyncOutcome, PoiCacheError> {
-        if event_page_size == 0 || leaf_page_size == 0 {
+        self.sync_bounded(client, event_page_size, leaf_page_size, usize::MAX)
+            .await
+    }
+
+    pub async fn sync_bounded(
+        &mut self,
+        client: &PoiRpcClient,
+        event_page_size: u64,
+        leaf_page_size: u64,
+        max_event_pages: usize,
+    ) -> Result<PoiCacheSyncOutcome, PoiCacheError> {
+        let mut candidate = self.clone();
+        let outcome = candidate
+            .sync_bounded_candidate(client, event_page_size, leaf_page_size, max_event_pages)
+            .await?;
+        *self = candidate;
+        Ok(outcome)
+    }
+
+    async fn sync_bounded_candidate(
+        &mut self,
+        client: &PoiRpcClient,
+        event_page_size: u64,
+        leaf_page_size: u64,
+        max_event_pages: usize,
+    ) -> Result<PoiCacheSyncOutcome, PoiCacheError> {
+        if event_page_size == 0 || leaf_page_size == 0 || max_event_pages == 0 {
             return Err(PoiCacheError::InvalidPageSize);
+        }
+        if self.snapshot.progress.next_event_index != self.snapshot.progress.next_leaf_index {
+            return Err(PoiCacheError::SyncCursorMismatch {
+                next_event_index: self.snapshot.progress.next_event_index,
+                next_leaf_index: self.snapshot.progress.next_leaf_index,
+            });
         }
 
         let sync_started = Instant::now();
@@ -452,6 +535,8 @@ impl PoiCache {
         );
 
         let mut outcome = PoiCacheSyncOutcome::default();
+        let mut event_commitments = BTreeMap::new();
+        let mut event_pages = 0_usize;
         loop {
             let start_index = self.snapshot.progress.next_event_index;
             let end_index = start_index
@@ -468,6 +553,15 @@ impl PoiCache {
                     end_index,
                 )
                 .await?;
+            let requested_event_count = usize::try_from(event_page_size).unwrap_or(usize::MAX);
+            if events.len() > requested_event_count {
+                return Err(PoiCacheError::EventPageTooLarge {
+                    start_index,
+                    end_index,
+                    requested: event_page_size,
+                    actual: events.len(),
+                });
+            }
             if events.is_empty() {
                 debug!(
                     chain_id = self.snapshot.identity.chain_id,
@@ -479,9 +573,24 @@ impl PoiCache {
                 );
                 break;
             }
+            let mut expected_index = start_index;
+            for event in &events {
+                if event.signed_poi_event.index != expected_index {
+                    return Err(PoiCacheError::NonContiguousEvent {
+                        expected: expected_index,
+                        actual: event.signed_poi_event.index,
+                    });
+                }
+                verify_poi_event(&event.signed_poi_event, &self.snapshot.identity.list_key.0)?;
+                event_commitments.insert(expected_index, event.signed_poi_event.blinded_commitment);
+                expected_index = expected_index
+                    .checked_add(1)
+                    .ok_or(PoiCacheError::RangeOverflow)?;
+            }
             let returned = events.len();
             let applied = self.apply_poi_events(&events)?;
             outcome.events += applied;
+            event_pages = event_pages.saturating_add(1);
             debug!(
                 chain_id = self.snapshot.identity.chain_id,
                 list_key = %hex::encode(self.snapshot.identity.list_key),
@@ -494,7 +603,11 @@ impl PoiCache {
                 events_per_sec = rate_per_sec(returned, page_started.elapsed()),
                 "local POI events page synced"
             );
-            if events.len() < event_page_size as usize {
+            if events.len() < requested_event_count {
+                break;
+            }
+            if event_pages >= max_event_pages {
+                outcome.event_page_budget_exhausted = true;
                 break;
             }
         }
@@ -517,16 +630,30 @@ impl PoiCache {
                     end_index,
                 )
                 .await?;
-            if leaves.is_empty() {
-                debug!(
-                    chain_id = self.snapshot.identity.chain_id,
-                    list_key = %hex::encode(self.snapshot.identity.list_key),
+            if u64::try_from(leaves.len()) != Ok(page_size) {
+                return Err(PoiCacheError::LeafPageSizeMismatch {
                     start_index,
                     end_index,
-                    elapsed_ms = page_started.elapsed().as_millis(),
-                    "local POI leaves sync reached empty page"
-                );
-                break;
+                    expected: page_size,
+                    actual: leaves.len(),
+                });
+            }
+            for (offset, leaf) in leaves.iter().enumerate() {
+                let index = start_index
+                    .checked_add(offset as u64)
+                    .ok_or(PoiCacheError::RangeOverflow)?;
+                let expected = event_commitments
+                    .get(&index)
+                    .ok_or(PoiCacheError::LeafWithoutEvent { index })?;
+                if FixedBytes::from(leaf.to_be_bytes::<32>()) != *expected {
+                    return Err(PoiCacheError::EventLeafMismatch { index });
+                }
+            }
+            for offset in 0..leaves.len() {
+                let index = start_index
+                    .checked_add(offset as u64)
+                    .ok_or(PoiCacheError::RangeOverflow)?;
+                event_commitments.remove(&index);
             }
             let returned = leaves.len();
             let applied = self.apply_poi_leaves(start_index, &leaves)?;
@@ -543,12 +670,14 @@ impl PoiCache {
                 leaves_per_sec = rate_per_sec(returned, page_started.elapsed()),
                 "local POI leaves page synced"
             );
-            if leaves.len() < page_size as usize {
-                break;
-            }
+        }
+
+        if let Some(index) = event_commitments.keys().next().copied() {
+            return Err(PoiCacheError::MissingEventLeaf { index });
         }
 
         let blocked_started = Instant::now();
+        let previous_blocked_shields = self.snapshot.blocked_shields_by_blinded_commitment.clone();
         let blocked_shields = client
             .filtered_blocked_shields(
                 &self.snapshot.identity.txid_version,
@@ -558,7 +687,13 @@ impl PoiCache {
                 None,
             )
             .await?;
-        outcome.blocked_shields = self.apply_blocked_shields(&blocked_shields)?;
+        for blocked_shield in &blocked_shields {
+            verify_blocked_shield(blocked_shield, &self.snapshot.identity.list_key.0)?;
+        }
+        outcome.blocked_shields = self.replace_blocked_shields(&blocked_shields)?;
+        outcome.changed = outcome.events > 0
+            || outcome.leaves > 0
+            || self.snapshot.blocked_shields_by_blinded_commitment != previous_blocked_shields;
         debug!(
             chain_id = self.snapshot.identity.chain_id,
             list_key = %hex::encode(self.snapshot.identity.list_key),
@@ -784,6 +919,7 @@ fn rate_per_sec(count: usize, elapsed: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer, SigningKey};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
@@ -792,6 +928,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::artifacts::verify::{canonical_blocked_shield_message, canonical_poi_event_message};
     use crate::poi::{PoiEventType, SignedPoiEvent};
 
     struct MockJsonRpc {
@@ -800,7 +937,16 @@ mod tests {
     }
 
     fn identity() -> PoiCacheIdentity {
-        PoiCacheIdentity::new(0, 1, "V2_PoseidonMerkle", FixedBytes::from([0x11; 32]))
+        PoiCacheIdentity::new(
+            0,
+            1,
+            "V2_PoseidonMerkle",
+            FixedBytes::from(signing_key().verifying_key().to_bytes()),
+        )
+    }
+
+    fn signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x11; 32])
     }
 
     fn temp_cache_path() -> PathBuf {
@@ -814,24 +960,36 @@ mod tests {
     }
 
     fn event(index: u64, blinded_commitment: FixedBytes<32>) -> PoiSyncedListEvent {
+        let mut signed_poi_event = SignedPoiEvent {
+            index,
+            blinded_commitment,
+            signature: String::new(),
+            event_type: PoiEventType::Shield,
+        };
+        signed_poi_event.signature = hex::encode(
+            signing_key()
+                .sign(&canonical_poi_event_message(&signed_poi_event))
+                .to_bytes(),
+        );
         PoiSyncedListEvent {
-            signed_poi_event: SignedPoiEvent {
-                index,
-                blinded_commitment,
-                signature: "signature".to_string(),
-                event_type: PoiEventType::Shield,
-            },
+            signed_poi_event,
             validated_merkleroot: hex::encode(FixedBytes::from([0x44; 32])),
         }
     }
 
     fn blocked(blinded_commitment: FixedBytes<32>) -> BlockedShield {
-        BlockedShield {
+        let mut blocked = BlockedShield {
             commitment_hash: hex::encode_prefixed(FixedBytes::from([0x99; 32])),
             blinded_commitment: hex::encode_prefixed(blinded_commitment),
             block_reason: Some("blocked".to_string()),
-            signature: "signature".to_string(),
-        }
+            signature: String::new(),
+        };
+        blocked.signature = hex::encode(
+            signing_key()
+                .sign(&canonical_blocked_shield_message(&blocked))
+                .to_bytes(),
+        );
+        blocked
     }
 
     fn spawn_json_rpc(responses: Vec<String>) -> MockJsonRpc {
@@ -928,6 +1086,35 @@ mod tests {
         assert_eq!(loaded.position(&valid_commitment).unwrap().global_index, 0);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_derives_roots_at_historical_global_indexes() {
+        let mut prefix = PoiCache::new(identity());
+        prefix
+            .apply_verified_artifact_events(&[SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x21; 32],
+                signature: [0; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply prefix event");
+        let prefix_root = prefix.current_roots().remove(&0).expect("prefix root");
+
+        let mut extended = prefix;
+        extended
+            .apply_verified_artifact_events(&[SnapshotEvent {
+                event_index: 1,
+                blinded_commitment: [0x22; 32],
+                signature: [0; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply extension event");
+        let current_root = extended.current_roots().remove(&0).expect("extended root");
+
+        assert_eq!(extended.root_at_global_index(0), Some(prefix_root));
+        assert_eq!(extended.root_at_global_index(1), Some(current_root));
+        assert_eq!(extended.root_at_global_index(TREE_LEAF_COUNT), None);
     }
 
     #[test]
@@ -1078,6 +1265,7 @@ mod tests {
         assert_eq!(outcome.events, 2);
         assert_eq!(outcome.leaves, 2);
         assert_eq!(outcome.blocked_shields, 0);
+        assert!(outcome.changed);
         assert_eq!(cache.status(&commitment_0), PoiStatus::Valid);
         assert_eq!(cache.status(&commitment_1), PoiStatus::Valid);
 
@@ -1110,5 +1298,258 @@ mod tests {
         assert_eq!(requests[2]["params"]["startIndex"], 0);
         assert_eq!(requests[2]["params"]["endIndex"], 2);
         assert!(requests[3]["params"].get("bloomFilterSerialized").is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_public_range_sync_reports_no_corpus_change() {
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([])),
+            json_rpc_result(&json!([])),
+        ]);
+        let client = PoiRpcClient::new(mock.url);
+        let mut cache = PoiCache::new(identity());
+
+        let outcome = cache.sync_with_page_sizes(&client, 2, 2).await.unwrap();
+
+        assert!(!outcome.changed);
+        assert_eq!(outcome.events, 0);
+        assert_eq!(outcome.leaves, 0);
+        assert_eq!(outcome.blocked_shields, 0);
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_mismatched_cursors_before_requesting() {
+        let commitment = FixedBytes::from([0x65; 32]);
+        let mock = spawn_json_rpc(vec![]);
+        let mut cache = PoiCache::new(identity());
+        cache.apply_poi_events(&[event(0, commitment)]).unwrap();
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("mismatched cursors must fail");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::SyncCursorMismatch {
+                next_event_index: 1,
+                next_leaf_index: 0
+            }
+        ));
+        assert_eq!(cache.progress().next_leaf_index, 0);
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_invalid_event_signature() {
+        let commitment = FixedBytes::from([0x66; 32]);
+        let mut invalid = event(0, commitment);
+        invalid.signed_poi_event.signature = "00".repeat(64);
+        let mock = spawn_json_rpc(vec![json_rpc_result(&json!([invalid]))]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("invalid list signature must fail");
+
+        assert!(matches!(error, PoiCacheError::Verify(_)));
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_non_contiguous_event_index() {
+        let mock = spawn_json_rpc(vec![json_rpc_result(&json!([event(
+            1,
+            FixedBytes::from([0x67; 32])
+        )]))]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("non-contiguous range must fail");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::NonContiguousEvent {
+                expected: 0,
+                actual: 1
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_event_response_larger_than_requested_page() {
+        let mock = spawn_json_rpc(vec![json_rpc_result(&json!([
+            event(0, FixedBytes::from([0x67; 32])),
+            event(1, FixedBytes::from([0x68; 32])),
+        ]))]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 1, 2)
+            .await
+            .expect_err("oversized event page must fail");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::EventPageTooLarge {
+                start_index: 0,
+                end_index: 0,
+                requested: 1,
+                actual: 2
+            }
+        ));
+        assert_eq!(cache.progress().next_event_index, 0);
+        assert_eq!(cache.progress().next_leaf_index, 0);
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_event_leaf_mismatch() {
+        let event_commitment = FixedBytes::from([0x68; 32]);
+        let leaf_commitment = FixedBytes::from([0x69; 32]);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, event_commitment)])),
+            json_rpc_result(&json!([hex::encode_prefixed(leaf_commitment)])),
+        ]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("event/leaf mismatch must fail");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::EventLeafMismatch { index: 0 }
+        ));
+        assert_eq!(cache.progress().next_event_index, 0);
+        assert_eq!(cache.progress().next_leaf_index, 0);
+        assert_eq!(cache.leaf_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_short_leaf_response_without_advancing_leaf_state() {
+        let commitment = FixedBytes::from([0x6a; 32]);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, commitment)])),
+            json_rpc_result(&json!([])),
+        ]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("short leaf page must fail");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::LeafPageSizeMismatch {
+                start_index: 0,
+                end_index: 1,
+                expected: 1,
+                actual: 0
+            }
+        ));
+        assert_eq!(cache.progress().next_event_index, 0);
+        assert_eq!(cache.progress().next_leaf_index, 0);
+        assert_eq!(cache.leaf_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_extra_leaf_response_without_advancing_leaf_state() {
+        let commitment = FixedBytes::from([0x6b; 32]);
+        let extra = FixedBytes::from([0x6c; 32]);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, commitment)])),
+            json_rpc_result(&json!([
+                hex::encode_prefixed(commitment),
+                hex::encode_prefixed(extra),
+            ])),
+        ]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("extra leaf page must fail");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::LeafPageSizeMismatch {
+                start_index: 0,
+                end_index: 1,
+                expected: 1,
+                actual: 2
+            }
+        ));
+        assert_eq!(cache.progress().next_event_index, 0);
+        assert_eq!(cache.progress().next_leaf_index, 0);
+        assert_eq!(cache.leaf_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_range_sync_rejects_invalid_blocked_shield_signature() {
+        let commitment = FixedBytes::from([0x70; 32]);
+        let mut invalid_blocked = blocked(FixedBytes::from([0x71; 32]));
+        invalid_blocked.signature = "00".repeat(64);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, commitment)])),
+            json_rpc_result(&json!([hex::encode_prefixed(commitment)])),
+            json_rpc_result(&json!([invalid_blocked])),
+        ]);
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url), 2, 2)
+            .await
+            .expect_err("invalid blocked-shield signature must fail");
+
+        assert!(matches!(error, PoiCacheError::Verify(_)));
+    }
+
+    #[tokio::test]
+    async fn bounded_public_range_sync_reports_large_backlog() {
+        let commitment = FixedBytes::from([0x72; 32]);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, commitment)])),
+            json_rpc_result(&json!([hex::encode_prefixed(commitment)])),
+            json_rpc_result(&json!([])),
+        ]);
+        let mut cache = PoiCache::new(identity());
+
+        let outcome = cache
+            .sync_bounded(&PoiRpcClient::new(mock.url), 1, 1, 1)
+            .await
+            .expect("bounded public range sync");
+
+        assert!(outcome.event_page_budget_exhausted);
+        assert_eq!(outcome.events, 1);
+        assert_eq!(outcome.leaves, 1);
+    }
+
+    #[tokio::test]
+    async fn public_range_request_timeout_bounds_stalled_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled POI RPC");
+        let url = reqwest::Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("stalled RPC address")
+        ))
+        .expect("stalled RPC URL");
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept stalled request");
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let client = PoiRpcClient::new(url).with_request_timeout(Duration::from_millis(50));
+        let mut cache = PoiCache::new(identity());
+
+        let error = cache
+            .sync(&client)
+            .await
+            .expect_err("stalled RPC times out");
+
+        assert!(matches!(
+            error,
+            PoiCacheError::Rpc(PoiRpcError::Post(source)) if source.is_timeout()
+        ));
     }
 }

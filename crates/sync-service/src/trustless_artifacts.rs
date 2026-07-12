@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::str;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -32,6 +32,7 @@ const MANIFEST_CAR_MAX_BLOCKS: usize = 1_024;
 const ARTIFACT_CAR_MAX_BLOCKS: usize = 16_384;
 const ARTIFACT_CAR_MIN_OVERHEAD_BYTES: usize = 1024 * 1024;
 const ARTIFACT_CAR_FIXED_OVERHEAD_BYTES: usize = 64 * 1024;
+const ARTIFACT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 const CARV2_PRAGMA: [u8; 11] = [
     0x0a, 0xa1, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x02,
 ];
@@ -289,7 +290,12 @@ async fn fetch_response_bytes(
     if let Some(accept) = accept {
         request = request.header(ACCEPT, accept);
     }
-    let mut response = request.send().await?;
+    let mut response = tokio::time::timeout(ARTIFACT_HTTP_IDLE_TIMEOUT, request.send())
+        .await
+        .map_err(|_| TrustlessArtifactError::HttpTimeout {
+            url: url.clone(),
+            phase: "response headers",
+        })??;
     let status = response.status();
     if !status.is_success() {
         return Err(TrustlessArtifactError::HttpStatus {
@@ -299,7 +305,13 @@ async fn fetch_response_bytes(
     }
 
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = tokio::time::timeout(ARTIFACT_HTTP_IDLE_TIMEOUT, response.chunk())
+        .await
+        .map_err(|_| TrustlessArtifactError::HttpTimeout {
+            url: url.clone(),
+            phase: "response body",
+        })??
+    {
         let next_len = bytes.len().checked_add(chunk.len()).ok_or(
             TrustlessArtifactError::ResponseTooLarge {
                 url: url.clone(),
@@ -895,6 +907,8 @@ pub(crate) enum TrustlessArtifactError {
     },
     #[error("POI artifact HTTP request failed")]
     Http(#[from] reqwest::Error),
+    #[error("POI artifact HTTP request to {url} timed out waiting for {phase}")]
+    HttpTimeout { url: Url, phase: &'static str },
     #[error("POI artifact HTTP request to {url} returned {status}")]
     HttpStatus {
         url: Url,

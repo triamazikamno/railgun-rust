@@ -39,6 +39,9 @@ const OUTPUT_POI_RECOVERY_TABLE: ByteTableDefinition = TableDefinition::new("out
 const POI_ARTIFACT_CACHE_TABLE: ByteTableDefinition = TableDefinition::new("poi_artifact_cache");
 const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
 const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
+const POI_PUBLISHER_MANIFEST_WATERMARK_KEY_PREFIX: &str =
+    "railgun:ppoi-sidecar:v1:publisher-manifest-watermark:";
+const POI_CORPUS_RPC_HEALTH_KEY_PREFIX: &str = "railgun:ppoi-sidecar:v1:corpus-rpc-health:";
 const DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
     TableDefinition::new("desktop_wallet_vault_v1");
 const LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
@@ -363,6 +366,10 @@ pub enum DbError {
     InvalidSchemaSevenPendingOutputPoiContext { key: String },
     #[error("schema migration destination already exists in {table}: {key}")]
     SchemaMigrationDestinationConflict { table: &'static str, key: String },
+    #[error("invalid {kind} PPOI sidecar record {key}")]
+    InvalidPpoiSidecarRecord { kind: &'static str, key: String },
+    #[error("invalid PPOI corpus record {key}")]
+    InvalidPpoiCorpusRecord { key: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,20 +504,79 @@ pub struct PoiArtifactDescriptorRecord {
     pub byte_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PoiCacheRecordSource {
+    #[default]
+    IndexedArtifacts,
+    PublicRpc,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PoiCorpusValidationRecord {
+    #[default]
+    Legacy,
+    PublisherAttested {
+        publisher_pubkey: FixedBytes<32>,
+        manifest_sequence: u64,
+        manifest_root: FixedBytes<32>,
+        #[serde(default)]
+        artifact_tip_index: u64,
+    },
+    ListSignedRanges {
+        list_key: FixedBytes<32>,
+        #[serde(default)]
+        from_index: u64,
+    },
+    PublisherAndListSigned {
+        publisher_pubkey: FixedBytes<32>,
+        manifest_sequence: u64,
+        manifest_root: FixedBytes<32>,
+        artifact_tip_index: u64,
+        list_key: FixedBytes<32>,
+        list_signed_from_index: u64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoiArtifactCacheRecord {
     pub chain_type: u8,
     pub chain_id: u64,
     pub txid_version: String,
     pub list_key: FixedBytes<32>,
-    pub last_accepted_manifest_sequence: u64,
+    #[serde(default)]
+    pub source: PoiCacheRecordSource,
+    #[serde(default)]
+    pub validation: PoiCorpusValidationRecord,
+    // Compatibility metadata only. The publisher watermark sidecar owns rollback protection.
+    #[serde(default, rename = "last_accepted_manifest_sequence")]
+    pub legacy_observed_manifest_sequence: u64,
     pub base_descriptor: PoiArtifactDescriptorRecord,
     pub applied_delta_descriptors: Vec<PoiArtifactDescriptorRecord>,
     pub blocked_shields_descriptor: PoiArtifactDescriptorRecord,
+    #[serde(default)]
+    pub artifact_tip_index: Option<u64>,
+    #[serde(default)]
+    pub artifact_tip_root: Option<FixedBytes<32>>,
     pub current_tip_index: u64,
     pub current_tip_root: FixedBytes<32>,
     pub cache_payload: Vec<u8>,
+    // Compatibility metadata only. The RPC-health sidecar owns current source health.
+    #[serde(default, rename = "last_successful_rpc_sync_at_ms")]
+    pub legacy_last_successful_rpc_sync_at_ms: Option<u64>,
     pub updated_at: u64,
+}
+
+#[derive(Debug)]
+pub struct PoiArtifactCacheRecordScan {
+    pub records: Vec<PoiArtifactCacheRecord>,
+    pub invalid_keys: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum StoredRecord<T> {
+    Missing,
+    Valid(T),
+    Corrupt { key: String },
 }
 
 impl PoiArtifactCacheRecord {
@@ -533,6 +599,65 @@ impl PoiArtifactCacheRecord {
     ) -> String {
         format!(
             "{chain_type}|{chain_id}|{txid_version}|{}",
+            hex::encode(list_key)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiPublisherManifestWatermarkRecord {
+    pub publisher_pubkey: FixedBytes<32>,
+    pub accepted_sequence: u64,
+    pub updated_at: u64,
+}
+
+impl PoiPublisherManifestWatermarkRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(&self.publisher_pubkey)
+    }
+
+    #[must_use]
+    pub fn key_for(publisher_pubkey: &FixedBytes<32>) -> String {
+        format!(
+            "{POI_PUBLISHER_MANIFEST_WATERMARK_KEY_PREFIX}{}",
+            hex::encode(publisher_pubkey)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiCorpusRpcHealthRecord {
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: String,
+    pub list_key: FixedBytes<32>,
+    pub cache_generation: u64,
+    pub last_successful_rpc_sync_at_ms: Option<u64>,
+    pub updated_at: u64,
+}
+
+impl PoiCorpusRpcHealthRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(
+            self.chain_type,
+            self.chain_id,
+            &self.txid_version,
+            &self.list_key,
+        )
+    }
+
+    #[must_use]
+    pub fn key_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> String {
+        format!(
+            "{POI_CORPUS_RPC_HEALTH_KEY_PREFIX}{chain_type:02x}:{chain_id:016x}:{}:{}",
+            hex::encode(txid_version.as_bytes()),
             hex::encode(list_key)
         )
     }
@@ -1492,12 +1617,30 @@ impl DbStore {
         txid_version: &str,
         list_key: &FixedBytes<32>,
     ) -> Result<Option<PoiArtifactCacheRecord>, DbError> {
+        match self.inspect_poi_artifact_cache(chain_type, chain_id, txid_version, list_key)? {
+            StoredRecord::Missing => Ok(None),
+            StoredRecord::Valid(record) => Ok(Some(record)),
+            StoredRecord::Corrupt { key } => Err(DbError::InvalidPpoiCorpusRecord { key }),
+        }
+    }
+
+    pub fn inspect_poi_artifact_cache(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<StoredRecord<PoiArtifactCacheRecord>, DbError> {
         let key = PoiArtifactCacheRecord::key_for(chain_type, chain_id, txid_version, list_key);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
-        match table.get(key.as_str())? {
-            Some(value) => Ok(Some(decode(value.value())?)),
-            None => Ok(None),
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(StoredRecord::Missing);
+        };
+        match decode::<PoiArtifactCacheRecord>(value.value()) {
+            Ok(record) if record.key() == key => Ok(StoredRecord::Valid(record)),
+            Ok(_) | Err(DbError::Decode(_)) => Ok(StoredRecord::Corrupt { key }),
+            Err(error) => Err(error),
         }
     }
 
@@ -1513,6 +1656,26 @@ impl DbStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub fn scan_poi_artifact_caches(&self) -> Result<PoiArtifactCacheRecordScan, DbError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        let mut records = Vec::new();
+        let mut invalid_keys = Vec::new();
+        for entry in table.range::<&str>(..)? {
+            let (key, value) = entry?;
+            let key = key.value().to_string();
+            match decode::<PoiArtifactCacheRecord>(value.value()) {
+                Ok(record) if record.key() == key => records.push(record),
+                Ok(_) | Err(DbError::Decode(_)) => invalid_keys.push(key),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(PoiArtifactCacheRecordScan {
+            records,
+            invalid_keys,
+        })
     }
 
     pub fn poi_artifact_cache_generation(&self) -> Result<u64, DbError> {
@@ -1552,6 +1715,134 @@ impl DbStore {
         };
         txn.commit()?;
         Ok((removed, generation))
+    }
+
+    pub fn get_poi_publisher_manifest_watermark(
+        &self,
+        publisher_pubkey: &FixedBytes<32>,
+    ) -> Result<Option<PoiPublisherManifestWatermarkRecord>, DbError> {
+        match self.inspect_poi_publisher_manifest_watermark(publisher_pubkey)? {
+            StoredRecord::Missing => Ok(None),
+            StoredRecord::Valid(record) => Ok(Some(record)),
+            StoredRecord::Corrupt { key } => Err(DbError::InvalidPpoiSidecarRecord {
+                kind: "publisher manifest watermark",
+                key,
+            }),
+        }
+    }
+
+    pub fn inspect_poi_publisher_manifest_watermark(
+        &self,
+        publisher_pubkey: &FixedBytes<32>,
+    ) -> Result<StoredRecord<PoiPublisherManifestWatermarkRecord>, DbError> {
+        let key = PoiPublisherManifestWatermarkRecord::key_for(publisher_pubkey);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(StoredRecord::Missing);
+        };
+        match decode::<PoiPublisherManifestWatermarkRecord>(value.value()) {
+            Ok(record) if record.publisher_pubkey == *publisher_pubkey => {
+                Ok(StoredRecord::Valid(record))
+            }
+            Ok(_) | Err(DbError::Decode(_)) => Ok(StoredRecord::Corrupt { key }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn advance_poi_publisher_manifest_watermark(
+        &self,
+        publisher_pubkey: FixedBytes<32>,
+        accepted_sequence: u64,
+    ) -> Result<(PoiPublisherManifestWatermarkRecord, bool), DbError> {
+        let key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
+        let txn = self.db.begin_write()?;
+        let record = {
+            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            if let Some(value) = table.get(key.as_str())? {
+                let record: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
+                if record.publisher_pubkey != publisher_pubkey {
+                    return Err(DbError::InvalidPpoiSidecarRecord {
+                        kind: "publisher manifest watermark",
+                        key,
+                    });
+                }
+                if record.accepted_sequence >= accepted_sequence {
+                    return Ok((record, false));
+                }
+            }
+            let record = PoiPublisherManifestWatermarkRecord {
+                publisher_pubkey,
+                accepted_sequence,
+                updated_at: now_epoch_secs()?,
+            };
+            let data = encode(&record)?;
+            table.insert(key.as_str(), data.as_slice())?;
+            record
+        };
+        txn.commit()?;
+        Ok((record, true))
+    }
+
+    pub fn get_poi_corpus_rpc_health(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<Option<PoiCorpusRpcHealthRecord>, DbError> {
+        match self.inspect_poi_corpus_rpc_health(chain_type, chain_id, txid_version, list_key)? {
+            StoredRecord::Missing => Ok(None),
+            StoredRecord::Valid(record) => Ok(Some(record)),
+            StoredRecord::Corrupt { key } => Err(DbError::InvalidPpoiSidecarRecord {
+                kind: "corpus RPC health",
+                key,
+            }),
+        }
+    }
+
+    pub fn inspect_poi_corpus_rpc_health(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<StoredRecord<PoiCorpusRpcHealthRecord>, DbError> {
+        let key = PoiCorpusRpcHealthRecord::key_for(chain_type, chain_id, txid_version, list_key);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(StoredRecord::Missing);
+        };
+        match decode::<PoiCorpusRpcHealthRecord>(value.value()) {
+            Ok(record)
+                if record.chain_type == chain_type
+                    && record.chain_id == chain_id
+                    && record.txid_version == txid_version
+                    && record.list_key == *list_key =>
+            {
+                Ok(StoredRecord::Valid(record))
+            }
+            Ok(_) | Err(DbError::Decode(_)) => Ok(StoredRecord::Corrupt { key }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn put_poi_corpus_rpc_health(
+        &self,
+        record: &PoiCorpusRpcHealthRecord,
+    ) -> Result<(), DbError> {
+        let mut record = record.clone();
+        record.updated_at = now_epoch_secs()?;
+        let key = record.key();
+        let data = encode(&record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     pub fn get_pending_fee_note_assurance(
