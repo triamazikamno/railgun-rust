@@ -65,6 +65,7 @@ pub enum SyncProgressUnit {
 pub struct SyncProgressUpdate {
     pub stage: SyncProgressStage,
     pub unit: SyncProgressUnit,
+    pub source: Option<PublicScanSource>,
     pub start_block: u64,
     pub current_block: u64,
     pub target_block: u64,
@@ -149,10 +150,17 @@ impl SyncProgressUpdate {
         Self {
             stage,
             unit,
+            source: None,
             start_block,
             current_block,
             target_block,
         }
+    }
+
+    #[must_use]
+    pub const fn with_source(mut self, source: PublicScanSource) -> Self {
+        self.source = Some(source);
+        self
     }
 
     #[must_use]
@@ -1138,7 +1146,7 @@ mod tests {
     use super::{
         ChainConfigDefaults, GlobalPoiPolicy, LocalPoiCaches, PoiArtifactCachePhase,
         PoiArtifactCacheProgress, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-        PoiCorpusRevision, PoiProxyFallback, SyncProgressStage, SyncProgressUnit,
+        PoiCorpusRevision, PoiProxyFallback, PublicScanSource, SyncProgressStage, SyncProgressUnit,
         SyncProgressUpdate,
     };
     use alloy::primitives::FixedBytes;
@@ -1271,6 +1279,11 @@ mod tests {
             SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
 
         assert_eq!(progress.percent(), 25);
+        assert_eq!(progress.source, None);
+        assert_eq!(
+            progress.with_source(PublicScanSource::Rpc).source,
+            Some(PublicScanSource::Rpc)
+        );
     }
 
     #[test]

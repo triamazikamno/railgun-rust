@@ -551,6 +551,7 @@ pub(super) struct WalletActorState {
     pending_reset: Option<PendingWalletReset>,
     pending_reset_rewind_committed: bool,
     pending_reset_replay_admitted: Option<WalletSyncToken>,
+    pending_reset_progress_start_block: Option<u64>,
     active_jobs: BTreeMap<u64, WalletActorJob>,
     highest_accepted_backfill_job_id: u64,
     latest_pending_overlay_job: Option<u64>,
@@ -593,6 +594,7 @@ impl WalletActorState {
                 pending_reset,
                 pending_reset_rewind_committed: false,
                 pending_reset_replay_admitted: None,
+                pending_reset_progress_start_block: None,
                 active_jobs: BTreeMap::new(),
                 highest_accepted_backfill_job_id: 0,
                 latest_pending_overlay_job: None,
@@ -660,6 +662,7 @@ impl WalletActorState {
         self.active_jobs.clear();
         self.latest_pending_overlay_job = None;
         self.pending_reset_replay_admitted = None;
+        self.pending_reset_progress_start_block = None;
         self.poi_persistence_requirements = WalletPoiPersistenceRequirements::default();
         self.reset_replay_persistence_requirement = None;
         self.progress_persistence_requirement = None;
@@ -730,6 +733,14 @@ impl WalletActorState {
 
     pub(super) const fn pending_reset_replay_admitted(&self) -> Option<WalletSyncToken> {
         self.pending_reset_replay_admitted
+    }
+
+    pub(super) fn progress_start_block(&self, token: WalletSyncToken) -> Option<u64> {
+        if self.pending_reset_replay_admitted == Some(token) {
+            self.pending_reset_progress_start_block
+        } else {
+            None
+        }
     }
 
     pub(super) const fn poi_corpus_refresh_pending(&self) -> bool {
@@ -1195,15 +1206,21 @@ impl WalletActorMutation<'_> {
 
     pub(super) const fn set_pending_reset_replay_admitted(
         &mut self,
-        token: Option<WalletSyncToken>,
+        replay: Option<(WalletSyncToken, u64)>,
     ) {
-        self.state.pending_reset_replay_admitted = token;
+        self.state.pending_reset_replay_admitted = match replay {
+            Some((token, _)) => Some(token),
+            None => None,
+        };
+        self.state.pending_reset_progress_start_block = match replay {
+            Some((_, progress_start_block)) => Some(progress_start_block),
+            None => None,
+        };
     }
 
     pub(super) const fn clear_pending_reset(&mut self) {
         self.state.pending_reset = None;
         self.state.pending_reset_rewind_committed = false;
-        self.state.pending_reset_replay_admitted = None;
     }
 
     pub(super) fn accept_target(&mut self, token: WalletSyncToken, target_block: u64) -> bool {
@@ -1291,6 +1308,7 @@ impl WalletActorMutation<'_> {
         let retired = self.state.active_jobs.remove(&token.job_id()).is_some();
         if retired && self.state.pending_reset_replay_admitted == Some(token) {
             self.state.pending_reset_replay_admitted = None;
+            self.state.pending_reset_progress_start_block = None;
         }
         retired
     }
@@ -1430,6 +1448,7 @@ impl WalletActorMutation<'_> {
         self.state.reset_generation = pending.reset_generation;
         self.state.pending_reset_rewind_committed = false;
         self.state.pending_reset_replay_admitted = None;
+        self.state.pending_reset_progress_start_block = None;
         let indexed_catch_up_was_active = self
             .state
             .active_jobs
@@ -1877,6 +1896,26 @@ mod tests {
         });
         assert_eq!(state.test_persistence_range_for(token), Some((101, 110)));
         assert_eq!(state.test_completion_requirement(), Some((token, 110)));
+    }
+
+    #[test]
+    fn reset_replay_progress_start_is_owned_by_its_admitted_job() {
+        let (mut state, _) = test_actor_state(100);
+        let replay = WalletSyncToken::for_test(1, 1, 0, 1);
+        let other = WalletSyncToken::for_test(1, 1, 0, 2);
+        state.test_transition(|mut state| {
+            assert!(state.accept_target(replay, 200));
+            state.set_pending_reset_replay_admitted(Some((replay, 150)));
+        });
+
+        assert_eq!(state.progress_start_block(replay), Some(150));
+        assert_eq!(state.progress_start_block(other), None);
+
+        state.test_transition(|mut state| state.clear_pending_reset());
+        assert_eq!(state.progress_start_block(replay), Some(150));
+
+        state.test_transition(|mut state| assert!(state.retire_job(replay)));
+        assert_eq!(state.progress_start_block(replay), None);
     }
 
     #[test]

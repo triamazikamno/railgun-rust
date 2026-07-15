@@ -31,6 +31,7 @@ use super::{
     wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
     wallet_utxo_stable_identity, warn, watch,
 };
+use crate::PublicScanSource;
 use crate::chain::PublicPoiCorpusHandle;
 use crate::types::BackfillRequest;
 use crate::types::{PoiCorpusRevision, WalletSyncTargetLease};
@@ -592,6 +593,22 @@ struct WalletScanCommitRequest<'a> {
 struct WalletScanCommitOutcome {
     result: WalletBackfillApplyResult,
     changed: bool,
+}
+
+fn wallet_scan_progress_update(
+    configured_start_block: Option<u64>,
+    page_from_block: u64,
+    current_block: u64,
+    target_block: u64,
+    source: PublicScanSource,
+) -> SyncProgressUpdate {
+    SyncProgressUpdate::new(
+        SyncProgressStage::IndexingUtxos,
+        configured_start_block.unwrap_or(page_from_block),
+        current_block,
+        target_block,
+    )
+    .with_source(source)
 }
 
 struct WalletPoiStatusRefreshCommitRequest<'a> {
@@ -1251,7 +1268,12 @@ impl WalletScanCommitRequest<'_> {
             };
         }
 
-        let source_label = request.apply.rows.source.as_str();
+        let progress_source = request.apply.rows.source;
+        let source_label = progress_source.as_str();
+        let progress_start_block = request
+            .actor_state
+            .progress_start_block(request.job_token)
+            .or(request.cfg.start_block);
         let (delta, last_scanned_block_hash, log_count) = match request.apply.rows.payload {
             WalletScanRowsPayload::Rows(rows) => {
                 let log_count = rows.row_count();
@@ -1440,11 +1462,12 @@ impl WalletScanCommitRequest<'_> {
             WalletPrivateMutationPermit::apply_publish_progress(
                 &token,
                 request.cfg.progress_tx.as_ref(),
-                SyncProgressUpdate::new(
-                    SyncProgressStage::IndexingUtxos,
+                wallet_scan_progress_update(
+                    progress_start_block,
                     from_block,
                     to_block,
                     target_block,
+                    progress_source,
                 ),
             );
             Ok::<bool, WalletCacheError>(persisted_full_snapshot)
@@ -1920,7 +1943,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 &cancel,
                                 |mut state| {
                                     state.set_pending_reset_replay_admitted(
-                                        admitted.then_some(token),
+                                        admitted.then_some((token, replay_from)),
                                     );
                                 },
                             );
@@ -3843,6 +3866,46 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_scan_progress_retains_configured_baseline_across_pages() {
+        const DEPLOYMENT_BLOCK: u64 = 14_737_691;
+        const CURRENT_BLOCK: u64 = 25_305_894;
+        const TARGET_BLOCK: u64 = 25_537_418;
+
+        let observed_page = wallet_scan_progress_update(
+            Some(DEPLOYMENT_BLOCK),
+            25_083_449,
+            CURRENT_BLOCK,
+            TARGET_BLOCK,
+            PublicScanSource::Rpc,
+        );
+        let later_page = wallet_scan_progress_update(
+            Some(DEPLOYMENT_BLOCK),
+            CURRENT_BLOCK.saturating_add(1),
+            25_500_000,
+            TARGET_BLOCK,
+            PublicScanSource::ArchiveRpc,
+        );
+
+        assert_eq!(observed_page.start_block, DEPLOYMENT_BLOCK);
+        assert_eq!(observed_page.percent(), 97);
+        assert_eq!(observed_page.source, Some(PublicScanSource::Rpc));
+        assert_eq!(later_page.start_block, DEPLOYMENT_BLOCK);
+        assert!(later_page.percent() >= observed_page.percent());
+        assert_eq!(later_page.source, Some(PublicScanSource::ArchiveRpc));
+
+        let fallback = wallet_scan_progress_update(
+            None,
+            25_083_449,
+            CURRENT_BLOCK,
+            TARGET_BLOCK,
+            PublicScanSource::CachedCoverage,
+        );
+        assert_eq!(fallback.start_block, 25_083_449);
+        assert_eq!(fallback.percent(), 49);
+        assert_eq!(fallback.source, Some(PublicScanSource::CachedCoverage));
+    }
     use crate::WalletReadiness;
 
     use std::collections::{BTreeMap, HashMap};
@@ -8771,6 +8834,10 @@ mod tests {
     async fn wallet_scan_commit_does_not_perform_inline_poi_status_refresh() {
         // Architectural invariant: scan commit never awaits POI status I/O.
         // Remote/local status refresh is scheduled via PoiMaintenanceJob instead.
+        const DEPLOYMENT_BLOCK: u64 = 14_737_691;
+        const PAGE_FROM_BLOCK: u64 = 25_083_449;
+        const CURRENT_BLOCK: u64 = 25_305_894;
+        const TARGET_BLOCK: u64 = 25_537_418;
         let root_dir = temp_db_root("wallet-scan-commit-no-inline-poi");
         let db = Arc::new(
             DbStore::open(DbConfig {
@@ -8781,7 +8848,10 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         let mut cfg = wallet_config();
         cfg.cache_store = Some(cache_store.clone());
-        let wallet_utxo = test_wallet_utxo(105, 7);
+        cfg.start_block = Some(DEPLOYMENT_BLOCK);
+        let (progress_tx, progress_rx) = watch::channel(None);
+        cfg.progress_tx = Some(progress_tx);
+        let wallet_utxo = test_wallet_utxo(CURRENT_BLOCK, 7);
         let (started_tx, _started_rx) = oneshot::channel();
         let (_release, release_rx) = oneshot::channel();
         // If scan commit still awaited status refresh, this would hang forever.
@@ -8811,16 +8881,20 @@ mod tests {
             backfill_rx,
             cancel.clone(),
             Vec::new(),
-            100,
+            PAGE_FROM_BLOCK.saturating_sub(1),
         )
         .await
         .expect("spawn wallet worker");
-        let mut last_scanned = 100;
+        let mut last_scanned = PAGE_FROM_BLOCK.saturating_sub(1);
         let mut persist_state = WalletPersistState::default();
-        let mut live_metadata_flush = WalletLiveMetadataFlush::new(100, Instant::now());
-        let (mut actor_state, _readiness_rx) = test_actor_state_for_handle(&handle, 100);
+        let mut live_metadata_flush =
+            WalletLiveMetadataFlush::new(PAGE_FROM_BLOCK.saturating_sub(1), Instant::now());
+        let (mut actor_state, _readiness_rx) =
+            test_actor_state_for_handle(&handle, PAGE_FROM_BLOCK.saturating_sub(1));
         let job_token = WalletSyncToken::for_test(1, 1, 0, 1);
-        assert!(actor_state.test_transition(|mut state| state.accept_target(job_token, 110)));
+        assert!(
+            actor_state.test_transition(|mut state| state.accept_target(job_token, TARGET_BLOCK))
+        );
         let public_data_plane = test_public_data_plane(&db);
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
@@ -8831,8 +8905,8 @@ mod tests {
                 utxos: &handle.utxos,
                 worker_handle: &handle,
                 apply: indexed_delta_batch(
-                    101,
-                    110,
+                    PAGE_FROM_BLOCK,
+                    CURRENT_BLOCK,
                     WalletLogDelta {
                         utxos: vec![wallet_utxo.utxo],
                         nullifiers: Vec::new(),
@@ -8859,7 +8933,57 @@ mod tests {
             WalletBackfillApplyResult::Committed { .. }
         ));
         assert!(outcome.changed);
-        assert_eq!(handle.last_scanned(), Some(110));
+        assert_eq!(handle.last_scanned(), Some(CURRENT_BLOCK));
+        let observed_progress = progress_rx.borrow().expect("wallet scan progress");
+        assert_eq!(observed_progress.start_block, DEPLOYMENT_BLOCK);
+        assert_eq!(observed_progress.current_block, CURRENT_BLOCK);
+        assert_eq!(observed_progress.target_block, TARGET_BLOCK);
+        assert_eq!(observed_progress.percent(), 97);
+        assert_eq!(
+            observed_progress.source,
+            Some(PublicScanSource::IndexedArtifacts)
+        );
+
+        let mut later_apply = indexed_delta_batch(
+            CURRENT_BLOCK.saturating_add(1),
+            TARGET_BLOCK,
+            WalletLogDelta {
+                utxos: Vec::new(),
+                nullifiers: Vec::new(),
+                commitment_observations: Vec::new(),
+            },
+        );
+        later_apply.rows.source = PublicScanSource::Rpc;
+        let later_outcome = WalletScanCommitRequest {
+            db: db.as_ref(),
+            cache_store: cache_store.as_ref(),
+            cfg: &cfg,
+            utxos: &handle.utxos,
+            worker_handle: &handle,
+            apply: later_apply,
+            job_token,
+            current_reset_generation: 0,
+            event_reset_generation: 0,
+            actor_state: &mut actor_state,
+            cancel: &cancel,
+            last_scanned: &mut last_scanned,
+            persist_state: &mut persist_state,
+            live_metadata_flush: &mut live_metadata_flush,
+            public_data_plane: &public_data_plane,
+        }
+        .commit()
+        .await;
+        assert!(matches!(
+            later_outcome.result,
+            WalletBackfillApplyResult::Committed { .. }
+        ));
+        let completed_progress = progress_rx
+            .borrow()
+            .expect("completed wallet scan progress");
+        assert_eq!(completed_progress.start_block, DEPLOYMENT_BLOCK);
+        assert_eq!(completed_progress.current_block, TARGET_BLOCK);
+        assert_eq!(completed_progress.percent(), 100);
+        assert_eq!(completed_progress.source, Some(PublicScanSource::Rpc));
 
         cancel.cancel();
         drop(db);
