@@ -29,10 +29,10 @@ use super::{
     OutputPoiRecoveryRequest, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter, PoiPrivateApplyOutcome,
     PoiStatusReader, WALLET_POI_STATUS_BATCH_SIZE, WalletActorLifecycleCell, WalletHandle,
-    WalletLiveMetadataFlush, WalletPendingOverlay, WalletPendingSpent, WalletPersistState,
-    WalletPoiRefreshSelection, WalletPoiRuntime, WalletPrivateMutationAuthority,
-    WalletPrivatePoiClients, WalletProgressPersist, WalletViewState,
-    apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec,
+    WalletLiveMetadataFlush, WalletObservationPublisher, WalletPendingOverlay, WalletPendingSpent,
+    WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
+    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletProgressPersist,
+    WalletViewState, apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec,
     apply_wallet_delta_to_vec_with_outcome, force_resubmit_matching_pending_output_pois_authorized,
     now_epoch_secs, output_poi_recovery_candidates, pending_output_poi_context_fingerprint,
     pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submit_identity,
@@ -53,7 +53,7 @@ use crate::types::{
     ChainKey, GlobalPoiPolicy, PendingOutputPoiContextIntent, PoiArtifactManifestSource,
     PoiArtifactSourceConfig, PoiProxyFallback, WalletCacheStore, WalletCheckpointMutation,
     WalletConfig, WalletCurrentSnapshot, WalletInactiveReason, WalletLocalPoiCaches,
-    WalletPrivateCommit, WalletPrivateRequestError, WalletReadiness, WalletSchedulableProgress,
+    WalletPrivateCommit, WalletPrivateRequestError, WalletSchedulableProgress,
     WalletSyncActorStateCommit, WalletUtxoMutation,
 };
 use alloy::hex;
@@ -79,6 +79,7 @@ use local_db::{
     WalletSyncActorStateRecord,
 };
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleTreeUpdate};
+use poi::SensitiveUrl;
 use poi::cache::{PoiCache, PoiCacheIdentity};
 use poi::error::PoiError;
 use poi::poi::{
@@ -157,7 +158,9 @@ fn test_poi_artifact_source_config() -> PoiArtifactSourceConfig {
     PoiArtifactSourceConfig {
         trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
         manifest_source: PoiArtifactManifestSource::Url(
-            Url::parse("http://127.0.0.1:1/poi-manifest.json").expect("POI manifest URL"),
+            Url::parse("http://127.0.0.1:1/poi-manifest.json")
+                .expect("POI manifest URL")
+                .into(),
         ),
         gateway_urls: Vec::new(),
         max_manifest_age: None,
@@ -168,7 +171,9 @@ fn test_artifact_poi_runtime() -> WalletPoiRuntime {
     WalletPoiRuntime::from_policy(
         &GlobalPoiPolicy::IndexedArtifacts {
             artifact_source: test_poi_artifact_source_config(),
-            rpc_url: Url::parse("http://127.0.0.1:1").expect("POI RPC URL"),
+            rpc_url: Url::parse("http://127.0.0.1:1")
+                .expect("POI RPC URL")
+                .into(),
             wallet_read_fallback: PoiProxyFallback::Disabled,
         },
         None,
@@ -179,7 +184,7 @@ fn test_artifact_poi_runtime_with_fallback(rpc_url: Url) -> WalletPoiRuntime {
     WalletPoiRuntime::from_policy(
         &GlobalPoiPolicy::IndexedArtifacts {
             artifact_source: test_poi_artifact_source_config(),
-            rpc_url,
+            rpc_url: rpc_url.into(),
             wallet_read_fallback: PoiProxyFallback::OnCorpusUnavailable,
         },
         None,
@@ -218,18 +223,16 @@ fn test_wallet_utxo(position: u64) -> WalletUtxo {
 }
 
 fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
-    let (ready_tx, ready_rx) = watch::channel(false);
-    drop(ready_tx);
-    let (_readiness_tx, readiness_rx) = watch::channel(WalletReadiness::Syncing);
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (reset_generation_tx, reset_generation_rx) = watch::channel(0_u64);
-    let (view_tx, view_rx) = watch::channel(WalletViewState::Current(WalletCurrentSnapshot::new(
-        0,
-        0,
-        0,
-        Arc::<[WalletUtxo]>::from(utxos.clone()),
-        Arc::new(WalletPendingOverlay::default()),
-    )));
+    let (observation, observation_rx) =
+        WalletObservationPublisher::new(WalletViewState::Current(WalletCurrentSnapshot::new(
+            0,
+            0,
+            0,
+            Arc::<[WalletUtxo]>::from(utxos.clone()),
+            Arc::new(WalletPendingOverlay::default()),
+        )));
     let (pending_overlay_tx, _pending_overlay_rx) = mpsc::channel(1);
     let (private_request_tx, _private_request_rx) = mpsc::channel(1);
     let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
@@ -238,7 +241,10 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     WalletHandle {
         cache_key: test_cache_key("cache-key"),
-        chain_id: 1,
+        chain: ChainKey {
+            chain_id: 1,
+            contract: Address::ZERO,
+        },
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
         lifecycle: Arc::new(WalletActorLifecycleCell::new()),
@@ -249,10 +255,10 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         reset_generation: Arc::new(AtomicU64::new(0)),
         reset_generation_rx,
         next_sync_job_id: Arc::new(AtomicU64::new(1)),
-        ready_rx,
-        readiness_rx,
+        observation: Arc::downgrade(&observation),
+        _observation_test_owner: Some(observation),
+        observation_rx,
         rev_rx,
-        view_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
         pending_overlay_tx,
@@ -261,7 +267,6 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         indexed_catch_up_status_tx,
         rev_tx,
         reset_generation_tx,
-        view_tx,
         indexed_catch_up_tx,
     }
 }
@@ -1797,7 +1802,7 @@ async fn poi_status_refresh_chunks_unspent_utxos() {
         .map(|position| test_wallet_utxo(position as u64))
         .collect::<Vec<_>>();
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &client,
         1,
         &list_keys,
@@ -1806,7 +1811,8 @@ async fn poi_status_refresh_chunks_unspent_utxos() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     let calls = client.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].0, list_keys);
@@ -1946,7 +1952,7 @@ async fn local_poi_status_refresh_reads_cache_without_remote_pois_per_list() {
     let local_reader = LocalPoiStatusReader::new(local_caches);
     let unused_remote = RecordingPoiStatusClient::default();
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &local_reader,
         1,
         &list_keys,
@@ -1955,7 +1961,8 @@ async fn local_poi_status_refresh_reads_cache_without_remote_pois_per_list() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert!(unused_remote.calls().is_empty());
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
@@ -2013,7 +2020,7 @@ async fn indexed_artifacts_status_refresh_does_not_call_remote_pois_per_list() {
         .await
         .expect("local POI status reader");
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         status_reader.as_reader(),
         cfg.chain.chain_id,
         &list_keys,
@@ -2022,7 +2029,8 @@ async fn indexed_artifacts_status_refresh_does_not_call_remote_pois_per_list() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
         Some(&PoiStatus::Valid)
@@ -2052,7 +2060,7 @@ async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_inges
     let cfg = wallet_config(U256::ZERO);
     let poi_runtime = WalletPoiRuntime::from_policy(
         &GlobalPoiPolicy::PoiProxy {
-            rpc_url: mock.url.clone(),
+            rpc_url: mock.url.clone().into(),
         },
         None,
     );
@@ -2069,7 +2077,7 @@ async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_inges
         .await
         .expect("remote POI status reader");
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         status_reader.as_reader(),
         cfg.chain.chain_id,
         &list_keys,
@@ -2083,7 +2091,8 @@ async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_inges
         .recv_timeout(Duration::from_secs(2))
         .expect("remote status request");
     assert_eq!(request["method"], "ppoi_pois_per_list");
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
         Some(&PoiStatus::Valid)
@@ -2119,7 +2128,7 @@ async fn indexed_artifacts_proxy_fallback_calls_remote_when_corpus_unavailable()
         .await
         .expect("fallback POI status reader");
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         status_reader.as_reader(),
         cfg.chain.chain_id,
         &list_keys,
@@ -2128,7 +2137,8 @@ async fn indexed_artifacts_proxy_fallback_calls_remote_when_corpus_unavailable()
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
         Some(&PoiStatus::Valid)
@@ -2179,7 +2189,7 @@ async fn indexed_artifacts_proxy_fallback_does_not_probe_remote_for_ready_local_
         .await
         .expect("local POI status reader");
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         status_reader.as_reader(),
         cfg.chain.chain_id,
         &list_keys,
@@ -2188,7 +2198,8 @@ async fn indexed_artifacts_proxy_fallback_does_not_probe_remote_for_ready_local_
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
         Some(&PoiStatus::Missing)
@@ -2207,7 +2218,8 @@ async fn indexed_artifacts_proxy_fallback_does_not_probe_remote_for_ready_local_
 async fn wallet_poi_status_client_uses_configured_rpc_url() {
     let list_key = FixedBytes::from([0x11; 32]);
     let mock = spawn_poi_rpc(serde_json::json!({})).await;
-    let client = wallet_poi_status_client(&mock.url, None);
+    let rpc_url = SensitiveUrl::from(mock.url.clone());
+    let client = wallet_poi_status_client(&rpc_url, None);
 
     client
         .pois_per_list(DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, 1, &[list_key], &[])
@@ -2760,7 +2772,7 @@ async fn poi_status_refresh_needed_after_indexed_delta_discovers_utxo() {
     assert!(apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta));
     assert!(wallet_poi_status_refresh_needed(&wallet_utxos, &list_keys));
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &client,
         cfg.chain.chain_id,
         &list_keys,
@@ -2769,7 +2781,8 @@ async fn poi_status_refresh_needed_after_indexed_delta_discovers_utxo() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert!(!wallet_poi_status_refresh_needed(&wallet_utxos, &list_keys));
     assert_eq!(client.calls().len(), 1);
     assert_eq!(
@@ -2852,6 +2865,46 @@ fn stale_shield_missing_remains_timer_retryable_without_pending_context() {
     ));
 }
 
+#[test]
+fn blocked_shield_revision_rechecks_all_owned_shield_statuses() {
+    let list_key = FixedBytes::from([0x11; 32]);
+    let list_keys = vec![list_key];
+    let mut blocked = test_wallet_utxo_with_kind(1, UtxoCommitmentKind::Shield);
+    blocked
+        .utxo
+        .poi
+        .statuses
+        .insert(list_key, PoiStatus::ShieldBlocked);
+    blocked.utxo.poi.refreshed_at = Some(100);
+    let mut valid_shield = test_wallet_utxo_with_kind(2, UtxoCommitmentKind::Shield);
+    valid_shield
+        .utxo
+        .poi
+        .statuses
+        .insert(list_key, PoiStatus::Valid);
+    valid_shield.utxo.poi.refreshed_at = Some(100);
+    let mut valid_transact = test_wallet_utxo_with_kind(3, UtxoCommitmentKind::Transact);
+    valid_transact
+        .utxo
+        .poi
+        .statuses
+        .insert(list_key, PoiStatus::Valid);
+    valid_transact.utxo.poi.refreshed_at = Some(100);
+    let selection = WalletPoiRefreshSelection::CorpusRevision {
+        blocked_shields_changed: true,
+    };
+
+    assert!(selection.matches_wallet_utxo(&blocked, &list_keys));
+    assert!(selection.matches_wallet_utxo(&valid_shield, &list_keys));
+    assert!(!selection.matches_wallet_utxo(&valid_transact, &list_keys));
+    assert!(
+        !WalletPoiRefreshSelection::CorpusRevision {
+            blocked_shields_changed: false,
+        }
+        .matches_wallet_utxo(&blocked, &list_keys)
+    );
+}
+
 #[tokio::test]
 async fn forced_recoverable_poi_refresh_batches_missing_utxos() {
     let client = RecordingPoiStatusClient::default();
@@ -2876,7 +2929,7 @@ async fn forced_recoverable_poi_refresh_batches_missing_utxos() {
     missing_two.utxo.poi.refreshed_at = Some(100);
     let mut wallet_utxos = vec![valid, missing_one, missing_two];
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &client,
         1,
         &list_keys,
@@ -2885,7 +2938,8 @@ async fn forced_recoverable_poi_refresh_batches_missing_utxos() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     let calls = client.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1.len(), 2);
@@ -2919,7 +2973,7 @@ async fn required_or_recoverable_poi_refresh_skips_currently_valid_utxos() {
     missing.utxo.poi.refreshed_at = Some(100);
     let mut wallet_utxos = vec![valid, valid_without_refresh_time, missing];
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &client,
         1,
         &list_keys,
@@ -2928,7 +2982,8 @@ async fn required_or_recoverable_poi_refresh_skips_currently_valid_utxos() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     let calls = client.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1.len(), 2);
@@ -2954,7 +3009,7 @@ async fn poi_status_refresh_timestamp_only_update_is_changed() {
     let mut wallet_utxos = vec![valid_without_refresh_time];
 
     assert!(wallet_poi_status_refresh_needed(&wallet_utxos, &list_keys));
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &client,
         1,
         &list_keys,
@@ -2963,7 +3018,8 @@ async fn poi_status_refresh_timestamp_only_update_is_changed() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(outcome.complete);
     assert!(!wallet_poi_status_refresh_needed(&wallet_utxos, &list_keys));
     assert_eq!(client.calls().len(), 1);
     assert_eq!(
@@ -2983,7 +3039,7 @@ async fn poi_status_refresh_keeps_failed_chunks_unknown() {
         .map(|position| test_wallet_utxo(position as u64))
         .collect::<Vec<_>>();
 
-    let changed = refresh_wallet_poi_statuses_selected(
+    let outcome = refresh_wallet_poi_statuses_selected(
         &client,
         1,
         &list_keys,
@@ -2992,7 +3048,8 @@ async fn poi_status_refresh_keeps_failed_chunks_unknown() {
     )
     .await;
 
-    assert!(changed);
+    assert!(outcome.changed);
+    assert!(!outcome.complete);
     assert_eq!(client.calls().len(), 2);
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
@@ -3014,6 +3071,33 @@ async fn poi_status_refresh_keeps_failed_chunks_unknown() {
             .refreshed_at
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn poi_status_refresh_reports_incomplete_when_failed_read_is_unchanged() {
+    let client = RecordingPoiStatusClient::default();
+    client.fail_call(0);
+    let list_key = FixedBytes::from([0x11; 32]);
+    let list_keys = vec![list_key];
+    let mut wallet_utxos = vec![test_wallet_utxo(1)];
+    wallet_utxos[0]
+        .utxo
+        .poi
+        .statuses
+        .insert(list_key, PoiStatus::Unknown);
+
+    let outcome = refresh_wallet_poi_statuses_selected(
+        &client,
+        1,
+        &list_keys,
+        &mut wallet_utxos,
+        WalletPoiRefreshSelection::RequiredOrRecoverable,
+    )
+    .await;
+
+    assert!(!outcome.changed);
+    assert!(!outcome.complete);
+    assert_eq!(client.calls().len(), 1);
 }
 
 #[tokio::test]
@@ -3294,7 +3378,9 @@ async fn proxy_maintenance_refresh_before_verification_reconciles_valid_context(
         WalletPrivatePoiClients::for_status(authority.remote_authority(), transport.clone());
     let poi_runtime = WalletPoiRuntime::from_policy(
         &GlobalPoiPolicy::PoiProxy {
-            rpc_url: Url::parse("http://127.0.0.1:1").expect("POI RPC URL"),
+            rpc_url: Url::parse("http://127.0.0.1:1")
+                .expect("POI RPC URL")
+                .into(),
         },
         None,
     );
@@ -6760,58 +6846,32 @@ async fn pending_cache_reset_blocks_metadata_only_until_full_snapshot_succeeds()
 
 #[tokio::test]
 async fn notify_changed_increments_revision() {
-    let (ready_tx, ready_rx) = watch::channel(false);
-    drop(ready_tx);
-    let (_readiness_tx, readiness_rx) = watch::channel(WalletReadiness::Syncing);
-    let (rev_tx, rev_rx) = watch::channel(0_u64);
-    let (reset_generation_tx, reset_generation_rx) = watch::channel(0_u64);
-    let (view_tx, view_rx) = watch::channel(WalletViewState::Current(WalletCurrentSnapshot::new(
-        0,
-        0,
-        0,
-        Arc::<[WalletUtxo]>::from(Vec::new()),
-        Arc::new(WalletPendingOverlay::default()),
-    )));
-    let (pending_overlay_tx, _pending_overlay_rx) = mpsc::channel(1);
-    let (private_request_tx, _private_request_rx) = mpsc::channel(1);
-    let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
-    let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
-    let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
-    let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
-    let handle = WalletHandle {
-        cache_key: test_cache_key("cache-key"),
-        chain_id: 1,
-        actor_id: 1,
-        active_actor_id: Arc::new(AtomicU64::new(1)),
-        lifecycle: Arc::new(WalletActorLifecycleCell::new()),
-        authority_lock: Arc::new(tokio::sync::Mutex::new(())),
-        utxos: Arc::new(RwLock::new(Vec::new())),
-        pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
-        last_scanned: Arc::new(AtomicU64::new(0)),
-        reset_generation: Arc::new(AtomicU64::new(0)),
-        reset_generation_rx,
-        next_sync_job_id: Arc::new(AtomicU64::new(1)),
-        ready_rx,
-        readiness_rx,
-        rev_rx,
-        view_rx,
-        poi_refreshing_rx,
-        indexed_catch_up_rx,
-        pending_overlay_tx,
-        private_request_tx,
-        poi_refresh_tx,
-        indexed_catch_up_status_tx,
-        rev_tx,
-        reset_generation_tx,
-        view_tx,
-        indexed_catch_up_tx,
-    };
+    let handle = test_wallet_handle(Vec::new());
 
     handle.notify_changed().await;
     assert_eq!(*handle.rev_rx.borrow(), 1);
 
     handle.notify_changed().await;
     assert_eq!(*handle.rev_rx.borrow(), 2);
+}
+
+#[test]
+fn readiness_only_observation_change_reuses_current_view_allocation() {
+    let handle = test_wallet_handle(vec![test_wallet_utxo(7)]);
+    let before = handle.current_snapshot().expect("initial Current view");
+
+    handle.publish_readiness_for_test(&crate::types::WalletReadiness::Ready);
+
+    let observation = handle.observation();
+    let WalletViewState::Current(after) = observation.view() else {
+        panic!("readiness-only transition must preserve Current view");
+    };
+    assert!(Arc::ptr_eq(&before, after));
+    assert!(Arc::ptr_eq(&before.utxos, &after.utxos));
+    assert_eq!(
+        observation.readiness(),
+        &crate::types::WalletReadiness::Ready
+    );
 }
 
 #[tokio::test]
@@ -6906,18 +6966,16 @@ async fn start_backfill_rejects_stale_progress_ticket() {
 
 #[tokio::test]
 async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
-    let (ready_tx, ready_rx) = watch::channel(false);
-    drop(ready_tx);
-    let (_readiness_tx, readiness_rx) = watch::channel(WalletReadiness::Syncing);
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (reset_generation_tx, reset_generation_rx) = watch::channel(0_u64);
-    let (view_tx, view_rx) = watch::channel(WalletViewState::Current(WalletCurrentSnapshot::new(
-        0,
-        0,
-        0,
-        Arc::<[WalletUtxo]>::from(Vec::new()),
-        Arc::new(WalletPendingOverlay::default()),
-    )));
+    let (observation, observation_rx) =
+        WalletObservationPublisher::new(WalletViewState::Current(WalletCurrentSnapshot::new(
+            0,
+            0,
+            0,
+            Arc::<[WalletUtxo]>::from(Vec::new()),
+            Arc::new(WalletPendingOverlay::default()),
+        )));
     let (pending_overlay_tx, _pending_overlay_rx) = mpsc::channel(1);
     let (private_request_tx, _private_request_rx) = mpsc::channel(1);
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel::<WalletPoiRefreshRequest>(1);
@@ -6926,7 +6984,10 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
         cache_key: test_cache_key("cache-key"),
-        chain_id: 1,
+        chain: ChainKey {
+            chain_id: 1,
+            contract: Address::ZERO,
+        },
         actor_id: 1,
         active_actor_id: Arc::new(AtomicU64::new(1)),
         lifecycle: Arc::new(WalletActorLifecycleCell::new()),
@@ -6937,10 +6998,10 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         reset_generation: Arc::new(AtomicU64::new(0)),
         reset_generation_rx,
         next_sync_job_id: Arc::new(AtomicU64::new(1)),
-        ready_rx,
-        readiness_rx,
+        observation: Arc::downgrade(&observation),
+        _observation_test_owner: Some(observation),
+        observation_rx,
         rev_rx,
-        view_rx,
         poi_refreshing_rx,
         indexed_catch_up_rx,
         pending_overlay_tx,
@@ -6949,7 +7010,6 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         indexed_catch_up_status_tx,
         rev_tx,
         reset_generation_tx,
-        view_tx,
         indexed_catch_up_tx,
     };
 
@@ -7247,7 +7307,7 @@ async fn terminal_wallet_views_override_retained_reset_pending_state() {
     let wallet_utxo = test_wallet_utxo(7);
     let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
     let revision = *handle.rev_rx.borrow();
-    handle.view_tx.send_replace(WalletViewState::ResetPending {
+    handle.publish_view_for_test(WalletViewState::ResetPending {
         intent_id: 1,
         from_block: 10,
         reset_generation: 1,
@@ -7260,6 +7320,10 @@ async fn terminal_wallet_views_override_retained_reset_pending_state() {
             reason: WalletInactiveReason::Retired,
             reset_generation: 0,
         }
+    );
+    assert_eq!(
+        handle.observation().readiness(),
+        &crate::types::WalletReadiness::Shutdown
     );
 
     assert_eq!(
@@ -7292,20 +7356,26 @@ async fn terminal_wallet_views_override_retained_reset_pending_state() {
     );
 
     let stopping = test_wallet_handle(vec![wallet_utxo]);
-    stopping
-        .view_tx
-        .send_replace(WalletViewState::ResetPending {
-            intent_id: 2,
-            from_block: 20,
-            reset_generation: 2,
-        });
-    assert!(stopping.mark_stopping());
+    stopping.publish_view_for_test(WalletViewState::ResetPending {
+        intent_id: 2,
+        from_block: 20,
+        reset_generation: 2,
+    });
+    let observation = stopping
+        .observation
+        .upgrade()
+        .expect("test observation publisher remains owned");
+    stopping.terminalize_panicked_actor(&observation);
     assert_eq!(
         stopping.view_state(),
         WalletViewState::Inactive {
             reason: WalletInactiveReason::Shutdown,
             reset_generation: 0,
         }
+    );
+    assert_eq!(
+        stopping.observation().readiness(),
+        &crate::types::WalletReadiness::Shutdown
     );
     assert_eq!(
         stopping.clear_all_local_pending_spent().await,

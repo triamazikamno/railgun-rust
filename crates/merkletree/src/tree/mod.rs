@@ -12,6 +12,7 @@ use rayon::iter::IntoParallelRefMutIterator;
 use crate::errors::SyncError;
 
 const PARALLEL_HASH_LAYER_MIN_LEN: usize = 1024;
+const SPARSE_ROOT_MAX_LEAVES: usize = 1024;
 
 static ZERO_HASHES: LazyLock<[U256; TREE_DEPTH + 1]> = LazyLock::new(compute_zero_hashes);
 
@@ -64,6 +65,10 @@ impl MerkleTree {
     pub fn computed_root(&self) -> U256 {
         if let Some(root) = self.root {
             return root;
+        }
+
+        if self.leaves.len() <= SPARSE_ROOT_MAX_LEAVES {
+            return self.subtree_root(0, TREE_DEPTH, TREE_LEAF_COUNT);
         }
 
         let mut layer = vec![ZERO_HASHES[0]; TREE_LEAF_COUNT as usize];
@@ -297,7 +302,7 @@ impl DenseMerkleTree {
                 leaves[*position as usize] = *leaf;
             }
         }
-        Self::from_full_leaf_layer(leaves)
+        Self::from_prefix_leaf_layer(leaves, clamped_leaf_count as usize)
     }
 
     #[must_use]
@@ -310,7 +315,26 @@ impl DenseMerkleTree {
         for (index, leaf) in leaves.into_iter().take(clamped_leaf_count).enumerate() {
             layer[index] = leaf;
         }
-        Self::from_full_leaf_layer(layer)
+        Self::from_prefix_leaf_layer(layer, clamped_leaf_count)
+    }
+
+    fn from_prefix_leaf_layer(mut layer: Vec<U256>, active_leaf_count: usize) -> Self {
+        layer.resize(TREE_LEAF_COUNT as usize, MERKLE_ZERO_VALUE);
+        layer.truncate(TREE_LEAF_COUNT as usize);
+
+        let mut active_count = active_leaf_count.min(TREE_LEAF_COUNT as usize);
+        let mut layers = Vec::with_capacity(TREE_DEPTH + 1);
+        layers.push(layer.clone());
+        for level in 0..TREE_DEPTH {
+            let parent_count = layer.len() / 2;
+            let active_parent_count = active_count.div_ceil(2);
+            let mut parents = vec![ZERO_HASHES[level + 1]; parent_count];
+            hash_parent_prefix(&layer, &mut parents[..active_parent_count]);
+            layer = parents;
+            layers.push(layer.clone());
+            active_count = active_parent_count;
+        }
+        Self { layers }
     }
 
     #[must_use]
@@ -396,8 +420,13 @@ fn compute_zero_hashes() -> [U256; TREE_DEPTH + 1] {
 
 fn hash_layer(layer: &mut Vec<U256>) {
     let parent_count = layer.len() / 2;
-    if parent_count >= PARALLEL_HASH_LAYER_MIN_LEN {
-        let mut parents = vec![U256::ZERO; parent_count];
+    let mut parents = vec![U256::ZERO; parent_count];
+    hash_parent_prefix(layer, &mut parents);
+    *layer = parents;
+}
+
+fn hash_parent_prefix(layer: &[U256], parents: &mut [U256]) {
+    if parents.len() >= PARALLEL_HASH_LAYER_MIN_LEN {
         parents
             .par_iter_mut()
             .enumerate()
@@ -406,16 +435,14 @@ fn hash_layer(layer: &mut Vec<U256>) {
                 let right = layer[index * 2 + 1];
                 *parent = poseidon(vec![left, right]);
             });
-        *layer = parents;
         return;
     }
 
-    for index in 0..parent_count {
+    for (index, parent) in parents.iter_mut().enumerate() {
         let left = layer[index * 2];
         let right = layer[index * 2 + 1];
-        layer[index] = poseidon(vec![left, right]);
+        *parent = poseidon(vec![left, right]);
     }
-    layer.truncate(parent_count);
 }
 
 #[cfg(feature = "bench")]
@@ -494,6 +521,63 @@ mod tests {
 
         assert_eq!(proof.root, forest.roots()[&0]);
         assert_eq!(proof.leaf, uint!(4_U256));
+    }
+
+    #[test]
+    fn sparse_computed_root_matches_dense_tree() {
+        let mut sparse = MerkleTree::default();
+        let mut leaves = vec![MERKLE_ZERO_VALUE; TREE_LEAF_COUNT as usize];
+        for position in [0, 3, 11, 1024, TREE_LEAF_COUNT - 1] {
+            let leaf = U256::from(position + 100);
+            sparse.insert(position, leaf).unwrap();
+            leaves[position as usize] = leaf;
+        }
+
+        let dense_root = DenseMerkleTree::from_full_leaf_layer(leaves).root();
+
+        assert_eq!(sparse.computed_root(), dense_root);
+    }
+
+    #[test]
+    fn dense_prefix_roots_and_proofs_match_sparse_tree() {
+        for leaf_count in [0_u64, 1, 2, 3, 17, 43] {
+            let leaves = (0..leaf_count)
+                .map(|position| U256::from(position + 100))
+                .collect::<Vec<_>>();
+            let dense = DenseMerkleTree::from_ordered_leaves(leaves.clone(), leaf_count);
+            let mut sparse = MerkleTree::default();
+            let mut forest = MerkleForest::new();
+            for (position, leaf) in leaves.into_iter().enumerate() {
+                sparse.insert(position as u64, leaf).unwrap();
+                forest
+                    .insert_leaf(MerkleTreeUpdate {
+                        tree_number: 0,
+                        tree_position: position as u64,
+                        hash: leaf,
+                    })
+                    .unwrap();
+            }
+            let forest_dense = DenseMerkleTree::from_forest_prefix(&forest, 0, leaf_count);
+
+            for position in [
+                0,
+                leaf_count.saturating_sub(1),
+                leaf_count.min(TREE_LEAF_COUNT - 1),
+            ] {
+                let dense_proof = dense.prove(position);
+                let forest_proof = forest_dense.prove(position);
+                let sparse_proof = sparse.prove_with_leaf_count(position, leaf_count);
+
+                assert_eq!(dense_proof.root, sparse_proof.root);
+                assert_eq!(dense_proof.leaf, sparse_proof.leaf);
+                assert_eq!(dense_proof.path_elements, sparse_proof.path_elements);
+                assert_eq!(dense_proof.path_indices, sparse_proof.path_indices);
+                assert_eq!(forest_proof.root, dense_proof.root);
+                assert_eq!(forest_proof.leaf, dense_proof.leaf);
+                assert_eq!(forest_proof.path_elements, dense_proof.path_elements);
+                assert_eq!(forest_proof.path_indices, dense_proof.path_indices);
+            }
+        }
     }
 
     #[test]

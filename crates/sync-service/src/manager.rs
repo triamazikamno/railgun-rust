@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::future::join_all;
 use tokio::sync::RwLock;
 
 use local_db::DbStore;
 
-use crate::chain::ChainHandle;
-use crate::chain::{ChainError, ChainService};
+use crate::chain::{
+    ChainError, ChainHandle, ChainService, PublicDataPlaneError, PublicSyncCacheReset,
+};
 use crate::types::{ChainConfig, ChainKey, GlobalPoiPolicy, WalletConfig};
 use crate::wallet::WalletHandle;
 
@@ -18,6 +20,33 @@ pub enum SyncManagerError {
     WalletNotFound,
     #[error("chain error: {0}")]
     Chain(#[from] ChainError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainPublicSyncCacheResetResult {
+    pub chain: ChainKey,
+    pub result: Result<PublicSyncCacheReset, PublicDataPlaneError>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicSyncCachesResetReport {
+    pub chains: Vec<ChainPublicSyncCacheResetResult>,
+    pub total_removed_entries: u64,
+}
+
+impl PublicSyncCachesResetReport {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.chains.is_empty()
+    }
+
+    #[must_use]
+    pub fn failed_chain_count(&self) -> usize {
+        self.chains
+            .iter()
+            .filter(|chain| chain.result.is_err())
+            .count()
+    }
 }
 
 pub struct SyncManager {
@@ -100,20 +129,73 @@ impl SyncManager {
         chain.wallet_handle(cache_key).await
     }
 
-    pub async fn remove_wallet(
+    pub async fn remove_wallet_session(
         &self,
-        chain: &ChainKey,
-        cache_key: &str,
+        handle: &WalletHandle,
     ) -> Result<(), SyncManagerError> {
         let chain = self
             .chains
             .read()
             .await
-            .get(chain)
+            .get(handle.chain_key())
             .cloned()
             .ok_or(SyncManagerError::ChainNotFound)?;
-        chain.unregister_wallet(cache_key).await;
+        chain.unregister_wallet(handle).await;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_chain_for_test(&self, key: ChainKey, service: Arc<ChainService>) {
+        self.chains.write().await.insert(key, service);
+    }
+
+    pub async fn remove_all_wallets(&self) {
+        let chains = self
+            .chains
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for chain in chains {
+            chain.unregister_all_wallets().await;
+        }
+    }
+
+    pub async fn reset_public_sync_caches(&self) -> PublicSyncCachesResetReport {
+        let services = {
+            let chains = self.chains.read().await;
+            chains
+                .iter()
+                .map(|(chain, service)| (*chain, Arc::clone(service)))
+                .collect::<Vec<_>>()
+        };
+        let chains = join_all(services.into_iter().map(|(chain, service)| async move {
+            ChainPublicSyncCacheResetResult {
+                chain,
+                result: service.public_data_plane().reset_public_cache().await,
+            }
+        }))
+        .await;
+        let total_removed_entries = chains
+            .iter()
+            .filter_map(|chain| chain.result.as_ref().ok())
+            .fold(0_u64, |total, reset| {
+                total
+                    .saturating_add(reset.poi_cache_entries_removed)
+                    .saturating_add(reset.wallet_scan_artifact_chunk_entries_removed)
+                    .saturating_add(reset.wallet_scan_artifact_chunk_files_removed)
+                    .saturating_add(reset.txid_blob_entries_removed)
+                    .saturating_add(reset.txid_files_removed)
+                    .saturating_add(
+                        u64::try_from(reset.coverage_entries_removed).unwrap_or(u64::MAX),
+                    )
+                    .saturating_add(u64::try_from(reset.diagnostics_removed).unwrap_or(u64::MAX))
+            });
+        PublicSyncCachesResetReport {
+            chains,
+            total_removed_entries,
+        }
     }
 
     pub async fn reset_wallet(

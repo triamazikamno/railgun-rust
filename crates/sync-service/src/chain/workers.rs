@@ -2,13 +2,13 @@ use super::{
     Arc, BackfillEvent, BackfillRequest, CancellationToken, ChainService, DEFAULT_TXID_VERSION,
     Duration, DynProvider, EVM_CHAIN_TYPE, HashMap, Instant, Instrument, JoinHandle, LogBatch,
     PathBuf, PendingTipWalletRegistration, Provider, PublicDataPlaneDiagnosticKind,
-    PublicScanRange, PublicScanSource, QueryRpcPool, TXID_PUBLIC_CACHE_SYNC_INTERVAL,
-    TxidPublicCache, TxidPublicCacheKey, WalletBackfill, WalletBackfillApplyResult,
-    WalletBackfillDriver, WalletBackfillFinishResult, WalletBackfillRejectReason,
-    WalletBackfillStartResult, WalletHandle, WalletReadinessError, WalletScanApply,
-    WalletScanInputRows, WalletScanRows, WalletScanRowsPayload, WalletTailFallbackState, debug,
-    info, min, mpsc, sort_logs, wallet_backfill_from_block, wallet_backfill_lag_blocks,
-    wallet_sync_target, warn, watch,
+    PublicScanRange, PublicScanReadScope, PublicScanSource, QueryRpcPool,
+    TXID_PUBLIC_CACHE_SYNC_INTERVAL, TxidPublicCache, TxidPublicCacheKey, WalletBackfill,
+    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    WalletBackfillRejectReason, WalletBackfillStartResult, WalletHandle, WalletReadinessError,
+    WalletScanApply, WalletScanInputRows, WalletScanRows, WalletScanRowsPayload,
+    WalletTailFallbackState, debug, info, min, mpsc, sort_logs, wallet_backfill_from_block,
+    wallet_backfill_lag_blocks, wallet_sync_target, warn, watch,
 };
 
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
@@ -730,7 +730,9 @@ pub(super) fn spawn_live_log_loop(
                 match logs_result {
                     Ok(mut logs) => {
                         sort_logs(&mut logs);
-                        let block_timestamps = if service.live_log_tx.receiver_count() > 0 {
+                        let block_timestamps = if logs.is_empty() {
+                            HashMap::new()
+                        } else {
                             match tokio::select! {
                                 () = cancel.cancelled() => break,
                                 result = service.chain.fetch_log_block_timestamps(
@@ -748,9 +750,42 @@ pub(super) fn spawn_live_log_loop(
                                     continue;
                                 }
                             }
-                        } else {
-                            HashMap::new()
                         };
+                        if let Some(archive_endpoint) = service
+                            .chain
+                            .archive_boundary_crossed_by(from_block, to_block)
+                        {
+                            match tokio::select! {
+                                () = cancel.cancelled() => break,
+                                result = service.chain.fetch_block_hash(
+                                    &rpc.provider,
+                                    archive_provider.as_ref(),
+                                    archive_endpoint,
+                                ) => result,
+                            } {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    warn!(
+                                        rpc = rpc.url.as_str(),
+                                        archive_endpoint,
+                                        "live RPC range does not prove its archive boundary"
+                                    );
+                                    rpcs.mark_bad_provider(&rpc);
+                                    continue;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        ?err,
+                                        archive_endpoint,
+                                        "failed to fetch live RPC archive-boundary hash"
+                                    );
+                                    if err.should_mark_rpc_unhealthy() {
+                                        rpcs.mark_bad_provider(&rpc);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let to_block_hash = match tokio::select! {
                             () = cancel.cancelled() => break,
                             result = service.chain.fetch_confirmed_block_hash(
@@ -759,10 +794,21 @@ pub(super) fn spawn_live_log_loop(
                                 to_block,
                             ) => result,
                         } {
-                            Ok(hash) => hash,
+                            Ok(Some(hash)) => Some(hash),
+                            Ok(None) => {
+                                warn!(
+                                    rpc = rpc.url.as_str(),
+                                    to_block, "live RPC range does not prove its endpoint"
+                                );
+                                rpcs.mark_bad_provider(&rpc);
+                                continue;
+                            }
                             Err(err) => {
                                 warn!(?err, to_block, "failed to fetch confirmed block hash");
-                                None
+                                if err.should_mark_rpc_unhealthy() {
+                                    rpcs.mark_bad_provider(&rpc);
+                                }
+                                continue;
                             }
                         };
                         if cancel.is_cancelled() {
@@ -788,6 +834,24 @@ pub(super) fn spawn_live_log_loop(
                                 break;
                             }
                             let log_count = batch.logs.len();
+                            match WalletScanApply::rows_from_log_batch(
+                                from_block,
+                                to_block,
+                                &batch,
+                                service.rpc_scan_source_for_range(from_block),
+                            ) {
+                                Ok(apply) => {
+                                    service.record_public_scan_apply(&apply).await;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        ?err,
+                                        from_block,
+                                        to_block,
+                                        "failed to normalize recent public live rows"
+                                    );
+                                }
+                            }
                             if service.live_log_tx.send(batch).is_err() {
                                 debug!(
                                     from_block,
@@ -843,6 +907,9 @@ pub(super) fn spawn_backfill_loop(
     let task = async move {
         let mut cursors: HashMap<String, WalletBackfill> = HashMap::new();
         loop {
+            if cancel.is_cancelled() {
+                break;
+            }
             drain_pending_backfill_requests(&mut backfill_rx, &mut cursors).await;
 
             if cursors.is_empty() {
@@ -863,12 +930,32 @@ pub(super) fn spawn_backfill_loop(
             for cursor in cursors.values_mut() {
                 cursor.refresh_target(safe_head);
             }
+            complete_cached_acquisitions_without_delivery(&service, &mut cursors).await;
+
+            let now = Instant::now();
+            if cursors.values().all(|cursor| !cursor.is_runnable(now)) {
+                let retry_at = cursors
+                    .values()
+                    .filter_map(WalletBackfill::persistence_retry_at)
+                    .min()
+                    .expect("deferred wallet cursors have retry deadlines");
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    request = backfill_rx.recv() => {
+                        let Some(request) = request else { break };
+                        apply_backfill_request(&mut cursors, request, Instant::now()).await;
+                    }
+                    changed = safe_head_rx.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    () = tokio::time::sleep(retry_at.saturating_duration_since(Instant::now())) => {}
+                }
+                continue;
+            }
 
             let done_keys: Vec<_> = cursors
                 .iter()
-                .filter(|(_, cursor)| {
-                    cursor.target_block > 0 && cursor.from_block > cursor.target_block
-                })
+                .filter(|(_, cursor)| cursor.is_runnable(now) && cursor.can_finish())
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in done_keys {
@@ -878,13 +965,23 @@ pub(super) fn spawn_backfill_loop(
                 let result = cursor.driver.finish(&key, cursor.target_block).await;
                 let remove_cursor = wallet_finish_result_removes_cursor(&result);
                 let committed_to = result.committed_to();
+                let persistence_failed = matches!(
+                    &result,
+                    WalletBackfillFinishResult::Rejected {
+                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                        ..
+                    }
+                );
                 debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
                 if remove_cursor {
                     if let Some(cursor) = cursors.remove(&key) {
                         cursor.driver.retire(&key).await;
                     }
                 } else if let Some(cursor) = cursors.get_mut(&key) {
-                    cursor.retry_after_rejected_finish(committed_to, Instant::now());
+                    cursor.retry_after_rejected_finish(committed_to);
+                    if persistence_failed {
+                        cursor.defer_persistence_retry(Instant::now(), service.chain.poll_interval);
+                    }
                 }
             }
 
@@ -892,6 +989,9 @@ pub(super) fn spawn_backfill_loop(
             let indexed_tail_attempts: Vec<_> = cursors
                 .iter_mut()
                 .filter_map(|(key, cursor)| {
+                    if !cursor.is_runnable(now) {
+                        return None;
+                    }
                     if cursor.should_try_indexed_tail_fallback(
                         service.chain.chain_id,
                         now,
@@ -964,26 +1064,55 @@ pub(super) fn spawn_backfill_loop(
                     let result = cursor.driver.finish(&key, last_block).await;
                     let remove_cursor = wallet_finish_result_removes_cursor(&result);
                     let committed_to = result.committed_to();
+                    let persistence_failed = matches!(
+                        &result,
+                        WalletBackfillFinishResult::Rejected {
+                            reason: WalletBackfillRejectReason::PersistenceFailed,
+                            ..
+                        }
+                    );
                     debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
                     if remove_cursor {
                         if let Some(cursor) = cursors.remove(&key) {
                             cursor.driver.retire(&key).await;
                         }
                     } else if let Some(cursor) = cursors.get_mut(&key) {
-                        cursor.retry_after_rejected_finish(committed_to, Instant::now());
+                        cursor.retry_after_rejected_finish(committed_to);
+                        if persistence_failed {
+                            cursor.defer_persistence_retry(
+                                Instant::now(),
+                                service.chain.poll_interval,
+                            );
+                        }
                     }
                 }
             }
 
-            let min_from = cursors.values().map(|cursor| cursor.from_block).min();
+            let latest_safe_head = *safe_head_rx.borrow();
+            if apply_cached_backfill_rows(&service, &mut cursors, latest_safe_head).await {
+                continue;
+            }
+
+            let now = Instant::now();
+            let mut runnable_fetches = Vec::new();
+            for cursor in cursors.values().filter(|cursor| cursor.is_runnable(now)) {
+                runnable_fetches.push((
+                    wallet_backfill_fetch_from_block(&service, cursor).await,
+                    cursor.fetch_target_block(),
+                ));
+            }
+            let min_from = runnable_fetches
+                .iter()
+                .map(|(from_block, _)| *from_block)
+                .min();
             debug!(block=?min_from, "scanning wallet events");
             let Some(from_block) = min_from else {
                 continue;
             };
-            let Some(target_block) = cursors
-                .values()
-                .filter(|cursor| cursor.from_block == from_block)
-                .map(|cursor| cursor.target_block)
+            let Some(target_block) = runnable_fetches
+                .iter()
+                .filter(|(candidate_from, _)| *candidate_from == from_block)
+                .map(|(_, target_block)| *target_block)
                 .filter(|target_block| *target_block > 0)
                 .min()
             else {
@@ -999,12 +1128,24 @@ pub(super) fn spawn_backfill_loop(
                 }
                 continue;
             };
+            let requested_to_block = min(from_block + service.chain.block_range - 1, target_block);
+            let cached_suffix_from = service
+                .public_data_plane
+                .cached_wallet_scan_suffix(from_block, target_block)
+                .await
+                .and_then(|applies| applies.first().map(|apply| apply.from_block));
+            let to_block = cached_suffix_from.map_or(requested_to_block, |suffix_from| {
+                if suffix_from > from_block {
+                    requested_to_block.min(suffix_from - 1)
+                } else {
+                    requested_to_block
+                }
+            });
             let Some(rpc) = rpcs.random_provider() else {
                 warn!("no healthy rpc providers available");
                 tokio::time::sleep(service.chain.poll_interval).await;
                 continue;
             };
-            let to_block = min(from_block + service.chain.block_range - 1, target_block);
             let read_scope = service.begin_public_scan_read();
             let fetch_logs_started = Instant::now();
             match service
@@ -1050,15 +1191,69 @@ pub(super) fn spawn_backfill_loop(
                         elapsed_ms = timestamps_started.elapsed().as_millis(),
                         "fetched backfill log block timestamps"
                     );
+                    if let Some(archive_endpoint) = service
+                        .chain
+                        .archive_boundary_crossed_by(from_block, to_block)
+                    {
+                        match service
+                            .chain
+                            .fetch_block_hash(
+                                &rpc.provider,
+                                archive_provider.as_ref(),
+                                archive_endpoint,
+                            )
+                            .await
+                        {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                warn!(
+                                    rpc = rpc.url.as_str(),
+                                    archive_endpoint,
+                                    "backfill RPC range does not prove its archive boundary"
+                                );
+                                rpcs.mark_bad_provider(&rpc);
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    archive_endpoint,
+                                    "failed to fetch backfill RPC archive-boundary hash"
+                                );
+                                if err.should_mark_rpc_unhealthy() {
+                                    rpcs.mark_bad_provider(&rpc);
+                                } else {
+                                    tokio::time::sleep(service.chain.poll_interval).await;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let block_hash_started = Instant::now();
-                    let to_block_hash = service
+                    let to_block_hash = match service
                         .chain
                         .fetch_block_hash(&rpc.provider, archive_provider.as_ref(), to_block)
                         .await
-                        .unwrap_or_else(|err| {
+                    {
+                        Ok(Some(hash)) => Some(hash),
+                        Ok(None) => {
+                            warn!(
+                                rpc = rpc.url.as_str(),
+                                to_block, "backfill RPC does not cover requested endpoint"
+                            );
+                            rpcs.mark_bad_provider(&rpc);
+                            continue;
+                        }
+                        Err(err) => {
                             warn!(?err, to_block, "failed to fetch backfill block hash");
-                            None
-                        });
+                            if err.should_mark_rpc_unhealthy() {
+                                rpcs.mark_bad_provider(&rpc);
+                            } else {
+                                tokio::time::sleep(service.chain.poll_interval).await;
+                            }
+                            continue;
+                        }
+                    };
                     debug!(
                         to_block,
                         elapsed_ms = block_hash_started.elapsed().as_millis(),
@@ -1073,12 +1268,32 @@ pub(super) fn spawn_backfill_loop(
                         read_scope,
                     });
 
+                    let batch_source = service.rpc_scan_source_for_range(from_block);
+                    match WalletScanApply::rows_from_log_batch(
+                        from_block,
+                        to_block,
+                        &batch,
+                        batch_source,
+                    ) {
+                        Ok(apply) => service.record_public_scan_apply(&apply).await,
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                from_block,
+                                to_block,
+                                "failed to normalize public backfill rows for reuse"
+                            );
+                        }
+                    }
+                    complete_cached_acquisitions_without_delivery(&service, &mut cursors).await;
+
                     let keys: Vec<String> = cursors.keys().cloned().collect();
                     let latest_safe_head = *safe_head_rx.borrow();
                     for key in keys {
                         let Some((apply_from_block, apply_to_block)) =
                             cursors.get(&key).and_then(|cursor| {
-                                if cursor.target_block == 0
+                                if !cursor.is_runnable(Instant::now())
+                                    || cursor.target_block == 0
                                     || cursor.from_block > cursor.target_block
                                 {
                                     return None;
@@ -1103,6 +1318,7 @@ pub(super) fn spawn_backfill_loop(
                                 continue;
                             }
                         };
+                        let apply_read_scope = apply.read_scope;
                         service
                             .public_data_plane
                             .record_source_decision(
@@ -1113,42 +1329,76 @@ pub(super) fn spawn_backfill_loop(
                                 "RPC wallet backfill source selected",
                             )
                             .await;
-                        service
-                            .record_public_scan_coverage(
-                                PublicScanRange::new(apply_from_block, apply_to_block),
-                                source,
-                                apply.row_count(),
-                                read_scope,
-                            )
-                            .await;
                         let apply_result = cursors
                             .get(&key)
                             .expect("wallet cursor exists while applying")
                             .driver
                             .apply(&key, apply)
                             .await;
+                        let completed_acquisition =
+                            if apply_result.accepted_committed_to().is_some() {
+                                let acquisition_range = cursors
+                                    .get(&key)
+                                    .and_then(WalletBackfill::acquisition_range);
+                                match acquisition_range {
+                                    Some(range) => {
+                                        cached_acquisition_is_complete_for_scope(
+                                            &service,
+                                            range,
+                                            apply_read_scope,
+                                        )
+                                        .await
+                                    }
+                                    None => false,
+                                }
+                            } else {
+                                false
+                            };
                         let mut remove_cursor = false;
                         let mut finish_target = None;
                         if let Some(cursor) = cursors.get_mut(&key) {
                             if let Some(committed_to) = apply_result.accepted_committed_to() {
-                                cursor
-                                    .mark_progress(committed_to.saturating_add(1), Instant::now());
+                                if completed_acquisition {
+                                    cursor.finish_acquisition();
+                                }
+                                match apply_result {
+                                    WalletBackfillApplyResult::Committed { .. } => cursor
+                                        .mark_progress(
+                                            committed_to.saturating_add(1),
+                                            Instant::now(),
+                                        ),
+                                    WalletBackfillApplyResult::AlreadyCovered { .. } => cursor
+                                        .mark_already_covered(
+                                            committed_to.saturating_add(1),
+                                            Instant::now(),
+                                        ),
+                                    WalletBackfillApplyResult::Rejected { .. } => unreachable!(),
+                                }
                                 cursor.refresh_target(latest_safe_head);
-                                if cursor.from_block > cursor.target_block {
+                                if cursor.can_finish() {
                                     finish_target = Some(cursor.target_block);
                                 }
                             } else {
                                 warn!(?apply_result, cache_key = %key, "wallet backfill logs rejected");
                                 match apply_result {
                                     WalletBackfillApplyResult::Rejected {
-                                        committed_to,
                                         reason:
-                                            WalletBackfillRejectReason::NonContiguous { .. }
-                                            | WalletBackfillRejectReason::PersistenceFailed,
+                                            WalletBackfillRejectReason::NonContiguous {
+                                                expected_from,
+                                                ..
+                                            },
+                                        ..
                                     } => {
-                                        cursor.retry_after_rejected_apply(
-                                            committed_to,
+                                        cursor.mark_progress(expected_from, Instant::now());
+                                    }
+                                    WalletBackfillApplyResult::Rejected {
+                                        committed_to,
+                                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                                    } => {
+                                        cursor.retry_after_rejected_apply(committed_to);
+                                        cursor.defer_persistence_retry(
                                             Instant::now(),
+                                            service.chain.poll_interval,
                                         );
                                     }
                                     WalletBackfillApplyResult::Rejected {
@@ -1174,9 +1424,22 @@ pub(super) fn spawn_backfill_loop(
                                 .await;
                             remove_cursor = wallet_finish_result_removes_cursor(&result);
                             let committed_to = result.committed_to();
+                            let persistence_failed = matches!(
+                                &result,
+                                WalletBackfillFinishResult::Rejected {
+                                    reason: WalletBackfillRejectReason::PersistenceFailed,
+                                    ..
+                                }
+                            );
                             debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
                             if !remove_cursor && let Some(cursor) = cursors.get_mut(&key) {
-                                cursor.retry_after_rejected_finish(committed_to, Instant::now());
+                                cursor.retry_after_rejected_finish(committed_to);
+                                if persistence_failed {
+                                    cursor.defer_persistence_retry(
+                                        Instant::now(),
+                                        service.chain.poll_interval,
+                                    );
+                                }
                             }
                         }
                         if remove_cursor && let Some(cursor) = cursors.remove(&key) {
@@ -1188,6 +1451,8 @@ pub(super) fn spawn_backfill_loop(
                     warn!(
                         ?err,
                         rpc = rpc.url.as_str(),
+                        from_block,
+                        to_block,
                         "failed to fetch backfill logs"
                     );
                     if err.should_mark_rpc_unhealthy() {
@@ -1200,6 +1465,190 @@ pub(super) fn spawn_backfill_loop(
         }
     };
     tokio::spawn(task.instrument(tracing::info_span!("sync_backfill")));
+}
+
+async fn apply_cached_backfill_rows(
+    service: &ChainService,
+    cursors: &mut HashMap<String, WalletBackfill>,
+    safe_head: u64,
+) -> bool {
+    let candidates = cursors
+        .iter()
+        .filter(|(_, cursor)| {
+            cursor.is_runnable(Instant::now())
+                && cursor.target_block > 0
+                && cursor.from_block <= cursor.target_block
+        })
+        .map(|(key, cursor)| {
+            (
+                key.clone(),
+                cursor.from_block,
+                cursor.target_block,
+                cursor.acquisition_range(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut handled = false;
+    for (key, from_block, target_block, acquisition_range) in candidates {
+        if let Some(range) = acquisition_range
+            && !cached_acquisition_is_complete(service, range).await
+        {
+            continue;
+        }
+        let Some(apply) = service
+            .public_data_plane
+            .cached_wallet_scan_apply(from_block, target_block)
+            .await
+        else {
+            continue;
+        };
+        let apply_to = apply.to_block;
+        let read_scope = apply.read_scope;
+        service
+            .public_data_plane
+            .record_source_decision(
+                PublicDataPlaneDiagnosticKind::SourceSelected,
+                PublicScanSource::CachedCoverage,
+                PublicScanRange::new(from_block, apply_to),
+                read_scope,
+                "cached public scan data selected by backfill loop",
+            )
+            .await;
+        let Some(cursor) = cursors.get(&key) else {
+            continue;
+        };
+        if cursor.from_block != from_block {
+            continue;
+        }
+        handled = true;
+        let apply_result = cursor.driver.apply(&key, apply).await;
+        let completed_acquisition = apply_result.accepted_committed_to().is_some()
+            && match acquisition_range {
+                Some(range) => {
+                    cached_acquisition_is_complete_for_scope(service, range, read_scope).await
+                }
+                None => false,
+            };
+        let mut remove_cursor = false;
+        if let Some(cursor) = cursors.get_mut(&key) {
+            if let Some(committed_to) = apply_result.accepted_committed_to() {
+                if completed_acquisition {
+                    cursor.finish_acquisition();
+                }
+                match apply_result {
+                    WalletBackfillApplyResult::Committed { .. } => {
+                        cursor.mark_progress(committed_to.saturating_add(1), Instant::now());
+                    }
+                    WalletBackfillApplyResult::AlreadyCovered { .. } => {
+                        cursor.mark_already_covered(committed_to.saturating_add(1), Instant::now());
+                    }
+                    WalletBackfillApplyResult::Rejected { .. } => unreachable!(),
+                }
+                cursor.refresh_target(safe_head);
+            } else {
+                warn!(?apply_result, cache_key = %key, "cached wallet backfill rows rejected");
+                match apply_result {
+                    WalletBackfillApplyResult::Rejected {
+                        reason: WalletBackfillRejectReason::NonContiguous { expected_from, .. },
+                        ..
+                    } => cursor.mark_progress(expected_from, Instant::now()),
+                    WalletBackfillApplyResult::Rejected {
+                        committed_to,
+                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                    } => {
+                        cursor.retry_after_rejected_apply(committed_to);
+                        cursor.defer_persistence_retry(Instant::now(), service.chain.poll_interval);
+                    }
+                    WalletBackfillApplyResult::Rejected {
+                        reason:
+                            WalletBackfillRejectReason::StaleGeneration { .. }
+                            | WalletBackfillRejectReason::Shutdown,
+                        ..
+                    } => remove_cursor = true,
+                    WalletBackfillApplyResult::Rejected { .. }
+                    | WalletBackfillApplyResult::Committed { .. }
+                    | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
+                }
+            }
+        }
+        if remove_cursor && let Some(cursor) = cursors.remove(&key) {
+            cursor.driver.retire(&key).await;
+        }
+    }
+    handled
+}
+
+async fn cached_acquisition_is_complete(
+    service: &ChainService,
+    (from_block, to_block): (u64, u64),
+) -> bool {
+    service
+        .public_data_plane
+        .cached_wallet_scan_suffix(from_block, to_block)
+        .await
+        .is_some_and(|applies| {
+            applies
+                .first()
+                .is_some_and(|apply| apply.from_block == from_block)
+        })
+}
+
+async fn wallet_backfill_fetch_from_block(service: &ChainService, cursor: &WalletBackfill) -> u64 {
+    let Some((acquisition_from, _)) = cursor.acquisition_range() else {
+        return cursor.from_block;
+    };
+    let Some(prefix_to) = cursor.from_block.checked_sub(1) else {
+        return acquisition_from;
+    };
+    if acquisition_from > prefix_to {
+        return acquisition_from;
+    }
+    if service
+        .public_data_plane
+        .cached_wallet_scan_exact(acquisition_from, prefix_to)
+        .await
+        .is_some()
+    {
+        cursor.from_block
+    } else {
+        acquisition_from
+    }
+}
+
+async fn cached_acquisition_is_complete_for_scope(
+    service: &ChainService,
+    (from_block, to_block): (u64, u64),
+    read_scope: PublicScanReadScope,
+) -> bool {
+    service
+        .public_data_plane
+        .cached_wallet_scan_suffix(from_block, to_block)
+        .await
+        .is_some_and(|applies| {
+            applies
+                .first()
+                .is_some_and(|apply| apply.from_block == from_block)
+                && applies.iter().all(|apply| apply.read_scope == read_scope)
+        })
+}
+
+async fn complete_cached_acquisitions_without_delivery(
+    service: &ChainService,
+    cursors: &mut HashMap<String, WalletBackfill>,
+) {
+    let pending = cursors
+        .iter()
+        .filter(|(_, cursor)| cursor.from_block > cursor.target_block)
+        .filter_map(|(key, cursor)| cursor.acquisition_range().map(|range| (key.clone(), range)))
+        .collect::<Vec<_>>();
+    for (key, (from_block, to_block)) in pending {
+        if cached_acquisition_is_complete(service, (from_block, to_block)).await
+            && let Some(cursor) = cursors.get_mut(&key)
+            && cursor.acquisition_range() == Some((from_block, to_block))
+        {
+            cursor.finish_acquisition();
+        }
+    }
 }
 
 pub(super) async fn drain_pending_backfill_requests(
@@ -1223,6 +1672,7 @@ async fn apply_backfill_request(
             to_block,
             follow_safe_head,
             progress_start_block,
+            acquisition_range,
             driver,
         } => {
             let incoming_token = driver.token();
@@ -1248,6 +1698,7 @@ async fn apply_backfill_request(
                     to_block,
                     follow_safe_head,
                     progress_start_block,
+                    acquisition_range,
                     driver,
                     now,
                 ),
@@ -1258,8 +1709,14 @@ async fn apply_backfill_request(
                 previous.driver.retire(&cache_key).await;
             }
         }
-        BackfillRequest::Remove { cache_key } => {
-            if let Some(previous) = cursors.remove(&cache_key) {
+        BackfillRequest::Remove {
+            cache_key,
+            actor_id,
+        } => {
+            let is_current = cursors
+                .get(&cache_key)
+                .is_some_and(|cursor| cursor.driver.token().actor_id() == actor_id);
+            if is_current && let Some(previous) = cursors.remove(&cache_key) {
                 previous.driver.retire(&cache_key).await;
             }
         }

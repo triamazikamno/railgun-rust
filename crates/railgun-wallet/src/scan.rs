@@ -186,6 +186,22 @@ impl WalletScanInputRows {
             .saturating_add(self.commitment_observations.len())
     }
 
+    pub fn retain_block_range(&mut self, from_block: u64, to_block: u64) {
+        let contains = |block_number| block_number >= from_block && block_number <= to_block;
+        self.transact_commitments
+            .retain(|row| contains(row.source.block_number));
+        self.shield_commitments
+            .retain(|row| contains(row.source.block_number));
+        self.legacy_encrypted_commitments
+            .retain(|row| contains(row.source.block_number));
+        self.legacy_generated_commitments
+            .retain(|row| contains(row.source.block_number));
+        self.nullifiers
+            .retain(|row| contains(row.source.block_number));
+        self.commitment_observations
+            .retain(|row| contains(row.source.block_number));
+    }
+
     pub fn from_logs(
         logs: &[Log],
         block_timestamps: &HashMap<u64, u64>,

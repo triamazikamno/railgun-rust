@@ -1,10 +1,10 @@
 use super::{
-    BlobMeta, DbStore, Digest, ErrorKind, FixedBytes, IndexedArtifactSourceConfig, Sha256,
-    SystemTime, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_FORMAT_VERSION, TxidPublicCache,
-    TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCachePage,
-    TxidPublicCacheReadScope, TxidPublicCacheRow, TxidPublicCacheTransaction,
-    TxidPublicCacheWritePermit, U256, artifact_chunk_blob_id, artifact_chunk_file_name, fs,
-    now_epoch_secs, read_tree_leaves, warn, write_blob_file,
+    BlobMeta, DbStore, Digest, ErrorKind, FixedBytes, IndexedArtifactSourceConfig, NonZeroUsize,
+    Sha256, SystemTime, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_FORMAT_VERSION,
+    TXID_CACHE_PAGE_SIZE, TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey,
+    TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCacheReadScope, TxidPublicCacheRow,
+    TxidPublicCacheTransaction, TxidPublicCacheWritePermit, U256, artifact_chunk_blob_id,
+    artifact_chunk_file_name, fs, now_epoch_secs, read_tree_leaves, warn, write_blob_file,
 };
 
 use crate::indexed_artifacts::{
@@ -486,44 +486,58 @@ impl TryFrom<&VerifiedIndexedArtifactChunk> for Vec<TxidPublicCachePage> {
     type Error = TxidPublicCacheError;
 
     fn try_from(chunk: &VerifiedIndexedArtifactChunk) -> Result<Self, Self::Error> {
-        let envelope = decode_indexed_artifact_chunk(chunk)?;
-        if envelope.header.dataset_kind != IndexedDatasetKind::PublicTxid {
-            return Err(TxidPublicCacheError::MetadataMismatch(
-                "artifact chunk is not public_txid".to_string(),
-            ));
-        }
-        if envelope.header.scope.chain_type != ChainType::Evm {
-            return Err(TxidPublicCacheError::MetadataMismatch(
-                "artifact chunk is not an EVM chain chunk".to_string(),
-            ));
-        }
-        if envelope.header.range.kind != IndexedArtifactRangeKind::TxidIndex {
-            return Err(TxidPublicCacheError::MetadataMismatch(
-                "artifact chunk range is not txid_index".to_string(),
-            ));
-        }
-        let payload = envelope
-            .section_payload(PUBLIC_TXID_RECORD_SECTION_ID)
-            .map_err(crate::indexed_artifacts::IndexedArtifactManifestError::from)?;
-        let rows = PublicTxidCursor::new(payload).read_rows(
-            envelope.header.range.start,
-            envelope.header.range.end,
-            envelope.header.row_count,
-        )?;
-        if chunk.descriptor.metadata.stream_partition.is_some() {
-            return Err(TxidPublicCacheError::MetadataMismatch(
-                "format-v1 public_txid artifact has unsupported stream partition metadata"
-                    .to_string(),
-            ));
-        }
-        let key = TxidPublicCacheKey {
-            chain_type: 0,
-            chain_id: chunk.descriptor.scope.chain_id,
-            railgun_contract: chunk.descriptor.scope.railgun_contract,
-            txid_version: DEFAULT_TXID_VERSION,
-        };
-        TxidPublicCachePage::pages_from_rows(key, rows)
+        materialize_artifact_pages(chunk, TXID_CACHE_PAGE_SIZE)
     }
+}
+
+fn materialize_artifact_pages(
+    chunk: &VerifiedIndexedArtifactChunk,
+    page_size: NonZeroUsize,
+) -> Result<Vec<TxidPublicCachePage>, TxidPublicCacheError> {
+    let envelope = decode_indexed_artifact_chunk(chunk)?;
+    if envelope.header.dataset_kind != IndexedDatasetKind::PublicTxid {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "artifact chunk is not public_txid".to_string(),
+        ));
+    }
+    if envelope.header.scope.chain_type != ChainType::Evm {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "artifact chunk is not an EVM chain chunk".to_string(),
+        ));
+    }
+    if envelope.header.range.kind != IndexedArtifactRangeKind::TxidIndex {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "artifact chunk range is not txid_index".to_string(),
+        ));
+    }
+    let payload = envelope
+        .section_payload(PUBLIC_TXID_RECORD_SECTION_ID)
+        .map_err(crate::indexed_artifacts::IndexedArtifactManifestError::from)?;
+    let rows = PublicTxidCursor::new(payload).read_rows(
+        envelope.header.range.start,
+        envelope.header.range.end,
+        envelope.header.row_count,
+    )?;
+    if chunk.descriptor.metadata.stream_partition.is_some() {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "format-v1 public_txid artifact has unsupported stream partition metadata".to_string(),
+        ));
+    }
+    let key = TxidPublicCacheKey {
+        chain_type: 0,
+        chain_id: chunk.descriptor.scope.chain_id,
+        railgun_contract: chunk.descriptor.scope.railgun_contract,
+        txid_version: DEFAULT_TXID_VERSION,
+    };
+    TxidPublicCachePage::pages_from_rows(key, rows, page_size)
+}
+
+#[cfg(test)]
+pub(super) fn materialize_artifact_pages_with_page_size(
+    chunk: &VerifiedIndexedArtifactChunk,
+    page_size: NonZeroUsize,
+) -> Result<Vec<TxidPublicCachePage>, TxidPublicCacheError> {
+    materialize_artifact_pages(chunk, page_size)
 }
 
 fn verify_declared_merkle_root(

@@ -340,7 +340,6 @@ struct FetchedIndexedArtifactChunk {
     index: usize,
     in_flight_byte_charge: u64,
     chunk: VerifiedIndexedArtifactChunk,
-    gateway_host: String,
     gateway_index: usize,
     gateway_count: usize,
     elapsed_ms: u128,
@@ -735,7 +734,6 @@ impl IndexedArtifactManifestClient {
                             return Err(err.into());
                         }
                     };
-                    let gateway_host = fetched.gateway_host;
                     let gateway_index = fetched.gateway_index;
                     let gateway_count = fetched.gateway_count;
                     let chunk = match verify_chunk_bytes(descriptor, fetched.bytes) {
@@ -749,7 +747,6 @@ impl IndexedArtifactManifestClient {
                                 range_end,
                                 byte_size,
                                 index,
-                                gateway_host,
                                 gateway_index,
                                 gateway_count,
                                 elapsed_ms = started.elapsed().as_millis(),
@@ -762,7 +759,6 @@ impl IndexedArtifactManifestClient {
                         index,
                         in_flight_byte_charge,
                         chunk,
-                        gateway_host,
                         gateway_index,
                         gateway_count,
                         elapsed_ms: started.elapsed().as_millis(),
@@ -789,7 +785,6 @@ impl IndexedArtifactManifestClient {
                 index = fetched.index,
                 completed_chunks,
                 total_chunks,
-                gateway_host = fetched.gateway_host,
                 gateway_index = fetched.gateway_index,
                 gateway_count = fetched.gateway_count,
                 elapsed_ms = fetched.elapsed_ms,

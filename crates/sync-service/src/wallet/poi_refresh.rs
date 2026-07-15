@@ -15,15 +15,24 @@ use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 #[cfg(test)]
 use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WalletPoiStatusRefreshOutcome {
+    pub(super) changed: bool,
+    pub(super) complete: bool,
+}
+
 pub(super) async fn refresh_wallet_poi_statuses_selected(
     client: &dyn PoiStatusReader,
     chain_id: u64,
     active_list_keys: &[FixedBytes<32>],
     wallet_utxos: &mut [WalletUtxo],
     selection: WalletPoiRefreshSelection,
-) -> bool {
+) -> WalletPoiStatusRefreshOutcome {
     if active_list_keys.is_empty() {
-        return false;
+        return WalletPoiStatusRefreshOutcome {
+            changed: false,
+            complete: true,
+        };
     }
 
     let started = Instant::now();
@@ -54,6 +63,7 @@ pub(super) async fn refresh_wallet_poi_statuses_selected(
         "wallet POI status refresh started"
     );
     let mut status_changes = 0usize;
+    let mut complete = true;
     for (chunk_index, chunk) in unspent.chunks(WALLET_POI_STATUS_BATCH_SIZE).enumerate() {
         let request_data: Vec<_> = chunk.iter().map(|(_, data)| *data).collect();
         let chunk_started = Instant::now();
@@ -91,6 +101,7 @@ pub(super) async fn refresh_wallet_poi_statuses_selected(
                 );
             }
             Err(error) => {
+                complete = false;
                 let chunk_elapsed_ms = chunk_started.elapsed().as_millis();
                 warn!(
                     ?error,
@@ -119,10 +130,11 @@ pub(super) async fn refresh_wallet_poi_statuses_selected(
         commitments = unspent.len(),
         status_changes,
         changed,
+        complete,
         elapsed_ms = started.elapsed().as_millis(),
         "wallet POI status refresh complete"
     );
-    changed
+    WalletPoiStatusRefreshOutcome { changed, complete }
 }
 
 /// Remote general-status refresh for `PoiProxy` / artifact fallback jobs.

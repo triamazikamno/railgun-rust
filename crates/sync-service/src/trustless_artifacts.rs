@@ -10,6 +10,7 @@ use futures::{StreamExt, io::Cursor};
 use ipld_core::{codec::Codec, ipld::Ipld};
 use ipld_dagpb::PbNode;
 use libp2p_identity::{PeerId, PublicKey};
+use poi::SensitiveUrl;
 use quick_protobuf::BytesReader;
 use reqwest::header::{ACCEPT, HeaderValue};
 use serde_ipld_dagcbor::codec::DagCborCodec;
@@ -86,19 +87,53 @@ impl RetrievalLimits {
 
 pub(crate) struct TrustlessArtifactFetcher<'a> {
     client: &'a reqwest::Client,
-    gateways: &'a [Url],
+    gateways: GatewayUrls<'a>,
+}
+
+enum GatewayUrls<'a> {
+    Public(&'a [Url]),
+    Poi(&'a [SensitiveUrl]),
+}
+
+impl GatewayUrls<'_> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Public(gateways) => gateways.len(),
+            Self::Poi(gateways) => gateways.len(),
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn expose(&self, index: usize) -> &Url {
+        match self {
+            Self::Public(gateways) => &gateways[index],
+            Self::Poi(gateways) => gateways[index].expose_url(),
+        }
+    }
 }
 
 pub(crate) struct TrustlessArtifactFetchResult {
     pub(crate) bytes: Vec<u8>,
-    pub(crate) gateway_host: String,
     pub(crate) gateway_index: usize,
     pub(crate) gateway_count: usize,
 }
 
 impl<'a> TrustlessArtifactFetcher<'a> {
     pub(crate) const fn new(client: &'a reqwest::Client, gateways: &'a [Url]) -> Self {
-        Self { client, gateways }
+        Self {
+            client,
+            gateways: GatewayUrls::Public(gateways),
+        }
+    }
+
+    pub(crate) const fn new_poi(client: &'a reqwest::Client, gateways: &'a [SensitiveUrl]) -> Self {
+        Self {
+            client,
+            gateways: GatewayUrls::Poi(gateways),
+        }
     }
 
     pub(crate) async fn fetch_manifest_cid(
@@ -146,14 +181,20 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         let mut last_error = None;
         let gateway_count = self.gateways.len();
 
-        for (gateway_index, gateway) in self.gateways.iter().enumerate() {
-            let gateway_host = gateway_host(gateway);
+        for gateway_index in 0..gateway_count {
+            let gateway = self.gateways.expose(gateway_index);
             let attempt_started = Instant::now();
             let url = ipns_record_gateway_url(gateway, name);
-            match self.fetch_ipns_record_candidate(&url, peer_id, now).await {
+            let source = TrustlessHttpSource::Gateway {
+                index: gateway_index,
+                count: gateway_count,
+            };
+            match self
+                .fetch_ipns_record_candidate(&url, source, peer_id, now)
+                .await
+            {
                 Ok(candidate) => {
                     debug!(
-                        gateway_host,
                         gateway_index,
                         gateway_count,
                         ipns_name = name,
@@ -167,7 +208,6 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 Err(err) => {
                     debug!(
                         ?err,
-                        gateway_host,
                         gateway_index,
                         gateway_count,
                         ipns_name = name,
@@ -200,15 +240,21 @@ impl<'a> TrustlessArtifactFetcher<'a> {
 
         let mut last_error = None;
         let gateway_count = self.gateways.len();
-        for (gateway_index, gateway) in self.gateways.iter().enumerate() {
-            let gateway_host = gateway_host(gateway);
+        for gateway_index in 0..gateway_count {
+            let gateway = self.gateways.expose(gateway_index);
             let attempt_started = Instant::now();
             let url = car_gateway_url(gateway, &cid);
-            match self.fetch_cid_bytes_from_url(cid, &url, limits).await {
+            let source = TrustlessHttpSource::Gateway {
+                index: gateway_index,
+                count: gateway_count,
+            };
+            match self
+                .fetch_cid_bytes_from_url(cid, &url, source, limits)
+                .await
+            {
                 Ok(bytes) => {
                     if gateway_index > 0 {
                         debug!(
-                            gateway_host,
                             gateway_index,
                             gateway_count,
                             resource,
@@ -220,7 +266,6 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                     }
                     return Ok(TrustlessArtifactFetchResult {
                         bytes,
-                        gateway_host: gateway_host.to_string(),
                         gateway_index,
                         gateway_count,
                     });
@@ -228,7 +273,6 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 Err(err) => {
                     debug!(
                         ?err,
-                        gateway_host,
                         gateway_index,
                         gateway_count,
                         resource,
@@ -248,10 +292,17 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         &self,
         cid: Cid,
         url: &Url,
+        source: TrustlessHttpSource,
         limits: RetrievalLimits,
     ) -> Result<Vec<u8>, TrustlessArtifactError> {
-        let car_bytes =
-            fetch_response_bytes(self.client, url, Some(CAR_ACCEPT), limits.response_bytes).await?;
+        let car_bytes = fetch_response_bytes(
+            self.client,
+            url,
+            source,
+            Some(CAR_ACCEPT),
+            limits.response_bytes,
+        )
+        .await?;
         let blocks = decode_car_blocks(&car_bytes, cid, limits.block_count).await?;
         reconstruct_file(cid, &blocks, limits.reconstructed_bytes)
     }
@@ -259,12 +310,14 @@ impl<'a> TrustlessArtifactFetcher<'a> {
     async fn fetch_ipns_record_candidate(
         &self,
         url: &Url,
+        source: TrustlessHttpSource,
         peer_id: PeerId,
         now: SystemTime,
     ) -> Result<IpnsManifestCandidate, TrustlessArtifactError> {
         let bytes = fetch_response_bytes(
             self.client,
             url,
+            source,
             Some(IPNS_RECORD_ACCEPT),
             IPNS_RECORD_MAX_BYTES,
         )
@@ -277,50 +330,101 @@ pub(crate) async fn fetch_manifest_url(
     client: &reqwest::Client,
     url: &Url,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
-    fetch_response_bytes(client, url, None, MANIFEST_JSON_MAX_BYTES).await
+    fetch_response_bytes(
+        client,
+        url,
+        TrustlessHttpSource::ExplicitManifest,
+        None,
+        MANIFEST_JSON_MAX_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_sensitive_manifest_url(
+    client: &reqwest::Client,
+    url: &SensitiveUrl,
+) -> Result<Vec<u8>, TrustlessArtifactError> {
+    fetch_response_bytes(
+        client,
+        url.expose_url(),
+        TrustlessHttpSource::ExplicitManifest,
+        None,
+        MANIFEST_JSON_MAX_BYTES,
+    )
+    .await
 }
 
 async fn fetch_response_bytes(
     client: &reqwest::Client,
     url: &Url,
+    source: TrustlessHttpSource,
     accept: Option<HeaderValue>,
     limit: usize,
+) -> Result<Vec<u8>, TrustlessArtifactError> {
+    fetch_response_bytes_with_timeout(
+        client,
+        url,
+        source,
+        accept,
+        limit,
+        ARTIFACT_HTTP_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_response_bytes_with_timeout(
+    client: &reqwest::Client,
+    url: &Url,
+    source: TrustlessHttpSource,
+    accept: Option<HeaderValue>,
+    limit: usize,
+    idle_timeout: Duration,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
     let mut request = client.get(url.clone());
     if let Some(accept) = accept {
         request = request.header(ACCEPT, accept);
     }
-    let mut response = tokio::time::timeout(ARTIFACT_HTTP_IDLE_TIMEOUT, request.send())
+    let mut response = tokio::time::timeout(idle_timeout, request.send())
         .await
         .map_err(|_| TrustlessArtifactError::HttpTimeout {
-            url: url.clone(),
-            phase: "response headers",
-        })??;
+            origin: source,
+            phase: TrustlessHttpPhase::ResponseHeaders,
+        })?
+        .map_err(|error| TrustlessArtifactError::Http {
+            origin: source,
+            phase: TrustlessHttpPhase::ResponseHeaders,
+            error: error.without_url(),
+        })?;
     let status = response.status();
     if !status.is_success() {
         return Err(TrustlessArtifactError::HttpStatus {
-            url: url.clone(),
+            origin: source,
             status,
         });
     }
 
     let mut bytes = Vec::new();
-    while let Some(chunk) = tokio::time::timeout(ARTIFACT_HTTP_IDLE_TIMEOUT, response.chunk())
+    while let Some(chunk) = tokio::time::timeout(idle_timeout, response.chunk())
         .await
         .map_err(|_| TrustlessArtifactError::HttpTimeout {
-            url: url.clone(),
-            phase: "response body",
-        })??
+            origin: source,
+            phase: TrustlessHttpPhase::ResponseBody,
+        })?
+        .map_err(|error| TrustlessArtifactError::Http {
+            origin: source,
+            phase: TrustlessHttpPhase::ResponseBody,
+            error: error.without_url(),
+        })?
     {
         let next_len = bytes.len().checked_add(chunk.len()).ok_or(
             TrustlessArtifactError::ResponseTooLarge {
-                url: url.clone(),
+                origin: source,
                 limit,
             },
         )?;
         if next_len > limit {
             return Err(TrustlessArtifactError::ResponseTooLarge {
-                url: url.clone(),
+                origin: source,
                 limit,
             });
         }
@@ -799,10 +903,7 @@ fn invalid_ipns_record_error(source: &quick_protobuf::Error) -> TrustlessArtifac
 }
 
 fn parse_cid(value: &str) -> Result<Cid, TrustlessArtifactError> {
-    Cid::try_from(value).map_err(|source| TrustlessArtifactError::InvalidCid {
-        value: value.to_string(),
-        source,
-    })
+    Cid::try_from(value).map_err(|source| TrustlessArtifactError::InvalidCid { source })
 }
 
 fn car_gateway_url(gateway: &Url, cid: &Cid) -> Url {
@@ -834,10 +935,6 @@ fn gateway_resource_url(gateway: &Url, namespace: &'static str, value: &str) -> 
     };
     url.set_path(&new_path);
     url
-}
-
-fn gateway_host(gateway: &Url) -> &str {
-    gateway.host_str().unwrap_or("<unknown>")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -895,27 +992,69 @@ impl<'a> UnixFsData<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustlessHttpSource {
+    ExplicitManifest,
+    Gateway { index: usize, count: usize },
+}
+
+impl std::fmt::Display for TrustlessHttpSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExplicitManifest => formatter.write_str("explicit manifest"),
+            Self::Gateway { index, count } => {
+                write!(formatter, "gateway {index} of {count}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustlessHttpPhase {
+    ResponseHeaders,
+    ResponseBody,
+}
+
+impl std::fmt::Display for TrustlessHttpPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResponseHeaders => formatter.write_str("response headers"),
+            Self::ResponseBody => formatter.write_str("response body"),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum TrustlessArtifactError {
     #[error("POI artifact source has no gateway URLs configured")]
     NoGateways,
-    #[error("invalid CID {value}")]
+    #[error("invalid CID")]
     InvalidCid {
-        value: String,
         #[source]
         source: cid::Error,
     },
-    #[error("POI artifact HTTP request failed")]
-    Http(#[from] reqwest::Error),
-    #[error("POI artifact HTTP request to {url} timed out waiting for {phase}")]
-    HttpTimeout { url: Url, phase: &'static str },
-    #[error("POI artifact HTTP request to {url} returned {status}")]
+    #[error("POI artifact HTTP {origin} failed during {phase}")]
+    Http {
+        origin: TrustlessHttpSource,
+        phase: TrustlessHttpPhase,
+        #[source]
+        error: reqwest::Error,
+    },
+    #[error("POI artifact HTTP {origin} timed out waiting for {phase}")]
+    HttpTimeout {
+        origin: TrustlessHttpSource,
+        phase: TrustlessHttpPhase,
+    },
+    #[error("POI artifact HTTP {origin} returned {status}")]
     HttpStatus {
-        url: Url,
+        origin: TrustlessHttpSource,
         status: reqwest::StatusCode,
     },
-    #[error("POI artifact response from {url} exceeds {limit} bytes")]
-    ResponseTooLarge { url: Url, limit: usize },
+    #[error("POI artifact response from {origin} exceeds {limit} bytes")]
+    ResponseTooLarge {
+        origin: TrustlessHttpSource,
+        limit: usize,
+    },
     #[error("POI artifact CAR decode failed")]
     Car(#[from] rs_car::CarDecodeError),
     #[error("POI artifact CAR is malformed: {0}")]
@@ -992,12 +1131,166 @@ pub(crate) enum TrustlessArtifactError {
 mod tests {
     use super::*;
 
+    use std::error::Error as StdError;
     use std::time::{Duration, UNIX_EPOCH};
 
     use ipld_dagpb::{PbLink, PbNode};
     use libp2p_identity::Keypair;
     use multihash_codetable::{Code, MultihashDigest};
     use quick_protobuf::Writer;
+
+    fn sensitive_server_url(mut url: Url) -> SensitiveUrl {
+        url.set_path("/endpoint-sentinel");
+        url.set_query(Some("secret=endpoint-sentinel"));
+        url.set_fragment(Some("endpoint-sentinel"));
+        url.into()
+    }
+
+    fn spawn_stalled_server() -> SensitiveUrl {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("stalled server address")
+        ))
+        .expect("stalled server URL");
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept stalled request");
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        sensitive_server_url(url)
+    }
+
+    fn formatted_error_chain(error: &(dyn StdError + 'static)) -> String {
+        let mut formatted = String::new();
+        let mut current = Some(error);
+        while let Some(error) = current {
+            std::fmt::Write::write_fmt(&mut formatted, format_args!("{error} {error:?}\n"))
+                .expect("write error chain");
+            current = error.source();
+        }
+        formatted
+    }
+
+    fn assert_artifact_error_safe(error: &TrustlessArtifactError) {
+        let formatted = formatted_error_chain(error);
+        assert!(
+            !formatted.contains("endpoint-sentinel"),
+            "artifact error leaked endpoint: {formatted}"
+        );
+        assert!(
+            !formatted.contains("body-sentinel"),
+            "artifact error leaked response body: {formatted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_manifest_and_gateway_errors_are_url_free() {
+        let unavailable_url = sensitive_server_url(
+            Url::parse("http://127.0.0.1:0").expect("unavailable manifest URL"),
+        );
+        let send_error = fetch_sensitive_manifest_url(&reqwest::Client::new(), &unavailable_url)
+            .await
+            .expect_err("manifest send error");
+        assert!(matches!(
+            &send_error,
+            TrustlessArtifactError::Http {
+                origin: TrustlessHttpSource::ExplicitManifest,
+                phase: TrustlessHttpPhase::ResponseHeaders,
+                ..
+            }
+        ));
+        assert_artifact_error_safe(&send_error);
+
+        let status_server = spawn_once_server(503, b"body-sentinel".to_vec());
+        let manifest_url = sensitive_server_url(status_server.url.clone());
+        let status_error = fetch_sensitive_manifest_url(&reqwest::Client::new(), &manifest_url)
+            .await
+            .expect_err("manifest status error");
+        assert!(matches!(
+            &status_error,
+            TrustlessArtifactError::HttpStatus {
+                origin: TrustlessHttpSource::ExplicitManifest,
+                status,
+            } if *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert_artifact_error_safe(&status_error);
+
+        let oversized_server = spawn_once_server(200, b"oversized".to_vec());
+        let oversized_url = sensitive_server_url(oversized_server.url.clone());
+        let oversized_error = fetch_response_bytes(
+            &reqwest::Client::new(),
+            oversized_url.expose_url(),
+            TrustlessHttpSource::Gateway { index: 0, count: 1 },
+            None,
+            1,
+        )
+        .await
+        .expect_err("oversized manifest response");
+        assert!(matches!(
+            &oversized_error,
+            TrustlessArtifactError::ResponseTooLarge {
+                origin: TrustlessHttpSource::Gateway { index: 0, count: 1 },
+                limit,
+            } if *limit == 1
+        ));
+        assert_artifact_error_safe(&oversized_error);
+
+        let stalled_url = spawn_stalled_server();
+        let timeout_error = fetch_response_bytes_with_timeout(
+            &reqwest::Client::new(),
+            stalled_url.expose_url(),
+            TrustlessHttpSource::Gateway { index: 1, count: 2 },
+            None,
+            1024,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("gateway timeout");
+        assert!(matches!(
+            &timeout_error,
+            TrustlessArtifactError::HttpTimeout {
+                origin: TrustlessHttpSource::Gateway { index: 1, count: 2 },
+                phase: TrustlessHttpPhase::ResponseHeaders,
+            }
+        ));
+        assert_artifact_error_safe(&timeout_error);
+
+        let artifact_bytes = b"verified fallback artifact".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let gateway_status_server = spawn_once_server(503, b"body-sentinel".to_vec());
+        let gateway_status_urls = [sensitive_server_url(gateway_status_server.url.clone())];
+        let client = reqwest::Client::new();
+        let gateway_status_error = TrustlessArtifactFetcher::new_poi(&client, &gateway_status_urls)
+            .fetch_artifact_cid(&cid.to_string(), artifact_bytes.len() as u64)
+            .await
+            .expect_err("gateway status error");
+        assert!(matches!(
+            &gateway_status_error,
+            TrustlessArtifactError::HttpStatus {
+                origin: TrustlessHttpSource::Gateway { index: 0, count: 1 },
+                status,
+            } if *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert_artifact_error_safe(&gateway_status_error);
+
+        let failing = spawn_once_server(503, Vec::new());
+        let valid = spawn_once_server(200, car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        let gateways = [
+            sensitive_server_url(failing.url.clone()),
+            sensitive_server_url(valid.url.clone()),
+        ];
+        let fetched = TrustlessArtifactFetcher::new_poi(&client, &gateways)
+            .fetch_artifact_cid(&cid.to_string(), artifact_bytes.len() as u64)
+            .await
+            .expect("fallback to second sensitive gateway");
+        assert_eq!(fetched, artifact_bytes);
+        assert_eq!(
+            valid.request_path(),
+            format!(
+                "/endpoint-sentinel/ipfs/{cid}?secret=endpoint-sentinel&format=car&dag-scope=entity"
+            )
+        );
+    }
 
     #[test]
     fn car_gateway_url_adds_trustless_query_parameters() {

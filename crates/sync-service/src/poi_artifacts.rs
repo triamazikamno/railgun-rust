@@ -5,12 +5,14 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
-use alloy::primitives::FixedBytes;
+use alloy::primitives::{FixedBytes, keccak256};
 use broadcaster_core::tree::normalize_tree_position;
+use futures::stream::{self, Stream, StreamExt};
 use local_db::{
     DbStore, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, PoiCacheRecordSource,
     PoiCorpusRpcHealthRecord, PoiCorpusValidationRecord, StoredRecord,
 };
+use poi::SensitiveUrl;
 use poi::artifacts::{
     ArtifactDescriptor, BlockedShieldsArtifact, BlockedShieldsArtifactError, Manifest,
     ManifestEntry, ManifestError, Snapshot, SnapshotError, SnapshotKind, SnapshotReader,
@@ -20,12 +22,14 @@ use poi::poi::BlockedShield;
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tracing::{debug, warn};
+#[cfg(test)]
 use url::Url;
 
 use crate::trustless_artifacts::{self, TrustlessArtifactError, TrustlessArtifactFetcher};
 use crate::types::{PoiArtifactCachePhase, PoiArtifactManifestSource, PoiArtifactSourceConfig};
 
 const BLOCKED_SHIELDS_LIST_KEY_FIELD: &str = "blocked_shields.list_key";
+const POI_DELTA_PREFETCH_LIMIT: usize = 4;
 const ENTRY_LIST_KEY_FIELD: &str = "entry.list_key";
 
 static POI_ARTIFACT_CACHE_SYNC_STATE: LazyLock<Mutex<PoiArtifactCacheSyncState>> =
@@ -40,6 +44,7 @@ struct PoiArtifactCacheSyncState {
 pub(crate) struct PoiCorpusAuthority {
     generation: Arc<AtomicU64>,
     access: Arc<RwLock<()>>,
+    revision_access: Arc<RwLock<()>>,
 }
 
 impl PoiCorpusAuthority {
@@ -47,6 +52,7 @@ impl PoiCorpusAuthority {
         Self {
             generation: Arc::new(AtomicU64::new(generation)),
             access: Arc::new(RwLock::new(())),
+            revision_access: Arc::new(RwLock::new(())),
         }
     }
 
@@ -56,6 +62,14 @@ impl PoiCorpusAuthority {
 
     async fn reset_access(&self) -> OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.access).write_owned().await
+    }
+
+    pub(crate) async fn revision_read_access(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.revision_access).read_owned().await
+    }
+
+    pub(crate) async fn revision_write_access(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.revision_access).write_owned().await
     }
 
     pub(crate) fn generation(&self) -> &AtomicU64 {
@@ -184,7 +198,7 @@ impl PoiArtifactIngestor {
                     .fetch_manifest_from_url(url, last_accepted_sequence, now)
                     .await?;
                 debug!(
-                    url = %url,
+                    source = "explicit_url",
                     bytes,
                     manifest_sequence = manifest.sequence,
                     entries = manifest.entries.len(),
@@ -206,7 +220,7 @@ impl PoiArtifactIngestor {
 
     async fn fetch_manifest_from_url(
         &self,
-        manifest_url: &Url,
+        manifest_url: &SensitiveUrl,
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
     ) -> Result<(Manifest, usize), PoiArtifactError> {
@@ -221,7 +235,7 @@ impl PoiArtifactIngestor {
         now: SystemTime,
     ) -> Result<Manifest, PoiArtifactError> {
         let started = Instant::now();
-        let bytes = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
+        let bytes = TrustlessArtifactFetcher::new_poi(&self.client, &self.config.gateway_urls)
             .fetch_manifest_cid(cid)
             .await?;
         let (manifest, bytes_len) =
@@ -244,7 +258,7 @@ impl PoiArtifactIngestor {
         now: SystemTime,
     ) -> Result<Manifest, PoiArtifactError> {
         let started = Instant::now();
-        let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
+        let fetcher = TrustlessArtifactFetcher::new_poi(&self.client, &self.config.gateway_urls);
         let candidates = fetcher.resolve_ipns_manifest_candidates(name, now).await?;
         let candidate_count = candidates.len();
         let mut last_error = None;
@@ -323,7 +337,7 @@ impl PoiArtifactIngestor {
         descriptor: &ArtifactDescriptor,
     ) -> Result<Vec<u8>, PoiArtifactError> {
         let started = Instant::now();
-        let bytes = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
+        let bytes = TrustlessArtifactFetcher::new_poi(&self.client, &self.config.gateway_urls)
             .fetch_artifact_cid(&descriptor.cid, descriptor.byte_size)
             .await?;
         descriptor.verify_bytes(&bytes)?;
@@ -336,12 +350,22 @@ impl PoiArtifactIngestor {
         Ok(bytes)
     }
 
+    fn fetch_delta_artifacts<'a>(
+        &'a self,
+        descriptors: &'a [ArtifactDescriptor],
+    ) -> impl Stream<Item = Result<Vec<u8>, PoiArtifactError>> + 'a {
+        stream::iter(descriptors)
+            .map(|descriptor| self.fetch_artifact(descriptor))
+            .buffered(POI_DELTA_PREFETCH_LIMIT)
+    }
+
     async fn fetch_verified_cache_from_entry(
         &self,
         identity: PoiCacheIdentity,
         manifest_sequence: u64,
         entry: ManifestEntry,
         cache_generation: u64,
+        expected_base: ExpectedPoiCorpusBase,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let started = Instant::now();
         let mut cache = PoiCache::new(identity.clone());
@@ -366,23 +390,26 @@ impl PoiArtifactIngestor {
 
         let deltas_started = Instant::now();
         let mut delta_events = 0_usize;
-        for delta_descriptor in &entry.deltas {
-            self.report_progress(
-                PoiArtifactCachePhase::ApplyingDeltas,
-                Some(next_start.saturating_sub(1)),
-                target_index,
-            );
-            let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
-            let delta = SnapshotReader::read(&delta_bytes)?;
-            next_start =
-                validate_snapshot(&delta, &identity, &entry, SnapshotKind::Delta, next_start)?;
-            delta_events = delta_events.saturating_add(delta.events.len());
-            cache.apply_verified_artifact_events(&delta.events)?;
-            self.report_progress(
-                PoiArtifactCachePhase::ApplyingDeltas,
-                Some(next_start.saturating_sub(1)),
-                target_index,
-            );
+        {
+            let delta_fetches = self.fetch_delta_artifacts(&entry.deltas);
+            tokio::pin!(delta_fetches);
+            while let Some(delta_bytes) = delta_fetches.next().await {
+                self.report_progress(
+                    PoiArtifactCachePhase::ApplyingDeltas,
+                    Some(next_start.saturating_sub(1)),
+                    target_index,
+                );
+                let delta = SnapshotReader::read(&delta_bytes?)?;
+                next_start =
+                    validate_snapshot(&delta, &identity, &entry, SnapshotKind::Delta, next_start)?;
+                delta_events = delta_events.saturating_add(delta.events.len());
+                cache.apply_verified_artifact_events(&delta.events)?;
+                self.report_progress(
+                    PoiArtifactCachePhase::ApplyingDeltas,
+                    Some(next_start.saturating_sub(1)),
+                    target_index,
+                );
+            }
         }
         let deltas_elapsed_ms = deltas_started.elapsed().as_millis();
 
@@ -447,6 +474,7 @@ impl PoiArtifactIngestor {
             entry,
             cache_generation,
             corpus_advanced: true,
+            expected_base,
         })
     }
 
@@ -547,6 +575,7 @@ impl PoiArtifactIngestor {
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
         let manifest = observed_manifest.manifest();
         let entry = manifest_entry_for_identity(manifest, &identity)?.clone();
+        let expected_base = expected_corpus_base(persisted.as_ref());
 
         if let Some(persisted) = persisted.as_ref()
             && persisted.record.current_tip_index >= entry.current_tip_index
@@ -558,18 +587,88 @@ impl PoiArtifactIngestor {
                     tip_index: entry.current_tip_index,
                 });
             }
+            if persisted.record.current_tip_index > entry.current_tip_index
+                && persisted
+                    .cache
+                    .root_at_global_index(entry.current_tip_index)
+                    != Some(entry.current_tip_merkleroot)
+            {
+                let (tree_number, _) = normalize_tree_position(0, entry.current_tip_index);
+                return Err(PoiArtifactError::CorpusPrefixRootConflict {
+                    tip_index: entry.current_tip_index,
+                    tree_number,
+                });
+            }
+            if !descriptor_matches_record(
+                &entry.blocked_shields,
+                &persisted.record.blocked_shields_descriptor,
+            ) {
+                let mut cache = persisted.cache.clone();
+                self.report_progress(
+                    PoiArtifactCachePhase::SyncingBlockedShields,
+                    Some(entry.current_tip_index),
+                    Some(entry.current_tip_index),
+                );
+                let blocked_records = self
+                    .refresh_blocked_shields(&identity, &entry.blocked_shields, &mut cache)
+                    .await?;
+                debug!(
+                    chain_id = identity.chain_id,
+                    list_key = %hex::encode(identity.list_key),
+                    manifest_sequence = manifest.sequence,
+                    tip_index = entry.current_tip_index,
+                    blocked_records,
+                    "same-tip POI artifact blocked-shield snapshot refreshed"
+                );
+                return Ok(PoiArtifactRefresh {
+                    manifest_sequence: manifest.sequence,
+                    cache,
+                    entry,
+                    cache_generation,
+                    corpus_advanced: true,
+                    expected_base,
+                });
+            }
             return Ok(PoiArtifactRefresh {
                 manifest_sequence: manifest.sequence,
                 cache: persisted.cache.clone(),
                 entry,
                 cache_generation,
                 corpus_advanced: false,
+                expected_base,
             });
         }
 
         if let Some(persisted) = persisted {
-            if let Some(refresh) = self
+            let incremental = self
                 .try_incremental_refresh(
+                    &identity,
+                    manifest.sequence,
+                    &entry,
+                    &persisted,
+                    cache_generation,
+                )
+                .await;
+            match incremental {
+                Ok(Some(refresh)) => return Ok(refresh),
+                Ok(None) => {}
+                Err(PoiArtifactError::SnapshotStartMismatch { expected, actual })
+                    if actual < expected =>
+                {
+                    debug!(
+                        chain_id = identity.chain_id,
+                        list_key = %hex::encode(identity.list_key),
+                        manifest_sequence = manifest.sequence,
+                        expected_start = expected,
+                        actual_start = actual,
+                        "incremental POI artifact delta overlaps durable cursor; trying verified suffix merge"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+
+            if let Some(refresh) = self
+                .try_artifact_suffix_merge(
                     &identity,
                     manifest.sequence,
                     &entry,
@@ -580,31 +679,16 @@ impl PoiArtifactIngestor {
             {
                 return Ok(refresh);
             }
-
-            match self
-                .try_artifact_suffix_merge(
-                    &identity,
-                    manifest.sequence,
-                    &entry,
-                    &persisted,
-                    cache_generation,
-                )
-                .await
-            {
-                Ok(Some(refresh)) => return Ok(refresh),
-                Ok(None) => {}
-                Err(err) => debug!(
-                    ?err,
-                    chain_id = identity.chain_id,
-                    list_key = %hex::encode(identity.list_key),
-                    manifest_sequence = manifest.sequence,
-                    "artifact suffix POI cache merge skipped"
-                ),
-            }
         }
 
-        self.fetch_verified_cache_from_entry(identity, manifest.sequence, entry, cache_generation)
-            .await
+        self.fetch_verified_cache_from_entry(
+            identity,
+            manifest.sequence,
+            entry,
+            cache_generation,
+            expected_base,
+        )
+        .await
     }
 
     async fn try_incremental_refresh(
@@ -639,23 +723,26 @@ impl PoiArtifactIngestor {
 
         let deltas_started = Instant::now();
         let mut delta_events = 0_usize;
-        for delta_descriptor in entry.deltas.iter().skip(applied_delta_count) {
-            self.report_progress(
-                PoiArtifactCachePhase::ApplyingDeltas,
-                Some(next_start.saturating_sub(1)),
-                target_index,
-            );
-            let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
-            let delta = SnapshotReader::read(&delta_bytes)?;
-            next_start =
-                validate_snapshot(&delta, identity, entry, SnapshotKind::Delta, next_start)?;
-            delta_events = delta_events.saturating_add(delta.events.len());
-            cache.apply_verified_artifact_events(&delta.events)?;
-            self.report_progress(
-                PoiArtifactCachePhase::ApplyingDeltas,
-                Some(next_start.saturating_sub(1)),
-                target_index,
-            );
+        {
+            let delta_fetches = self.fetch_delta_artifacts(&entry.deltas[applied_delta_count..]);
+            tokio::pin!(delta_fetches);
+            while let Some(delta_bytes) = delta_fetches.next().await {
+                self.report_progress(
+                    PoiArtifactCachePhase::ApplyingDeltas,
+                    Some(next_start.saturating_sub(1)),
+                    target_index,
+                );
+                let delta = SnapshotReader::read(&delta_bytes?)?;
+                next_start =
+                    validate_snapshot(&delta, identity, entry, SnapshotKind::Delta, next_start)?;
+                delta_events = delta_events.saturating_add(delta.events.len());
+                cache.apply_verified_artifact_events(&delta.events)?;
+                self.report_progress(
+                    PoiArtifactCachePhase::ApplyingDeltas,
+                    Some(next_start.saturating_sub(1)),
+                    target_index,
+                );
+            }
         }
         let deltas_elapsed_ms = deltas_started.elapsed().as_millis();
 
@@ -719,6 +806,7 @@ impl PoiArtifactIngestor {
             entry: entry.clone(),
             cache_generation,
             corpus_advanced: true,
+            expected_base: expected_corpus_base(Some(persisted)),
         }))
     }
 
@@ -729,7 +817,7 @@ impl PoiArtifactIngestor {
         entry: &ManifestEntry,
         persisted: &PersistedPoiArtifactCache,
         cache_generation: u64,
-    ) -> Result<Option<PoiArtifactRefresh>, ArtifactSuffixMergeError> {
+    ) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
         let started = Instant::now();
         let local_tip_index = persisted.record.current_tip_index;
         let artifact_tip_index = entry.current_tip_index;
@@ -739,7 +827,7 @@ impl PoiArtifactIngestor {
 
         let start_index = local_tip_index
             .checked_add(1)
-            .ok_or(ArtifactSuffixMergeError::RangeOverflow)?;
+            .ok_or(PoiArtifactError::RangeOverflow)?;
         let (start_tree, _) = normalize_tree_position(0, start_index);
         let (artifact_tip_tree, _) = normalize_tree_position(0, artifact_tip_index);
         if start_tree != artifact_tip_tree {
@@ -819,6 +907,7 @@ impl PoiArtifactIngestor {
             entry: entry.clone(),
             cache_generation,
             corpus_advanced: true,
+            expected_base: expected_corpus_base(Some(persisted)),
         }))
     }
 
@@ -862,33 +951,37 @@ impl PoiArtifactIngestor {
             target_index,
         );
 
-        for delta_descriptor in &entry.deltas {
-            self.report_progress(
-                PoiArtifactCachePhase::ApplyingDeltas,
-                Some(expected_apply_index.saturating_sub(1)),
-                target_index,
-            );
-            let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
-            let delta = SnapshotReader::read(&delta_bytes)?;
-            expected_artifact_start = validate_snapshot(
-                &delta,
-                identity,
-                entry,
-                SnapshotKind::Delta,
-                expected_artifact_start,
-            )?;
-            outcome.delta_count += 1;
-            outcome.delta_events = outcome.delta_events.saturating_add(delta.events.len());
-            let applied = apply_snapshot_suffix_events(cache, &delta, &mut expected_apply_index)?;
-            outcome.delta_applied_events = outcome.delta_applied_events.saturating_add(applied);
-            outcome.skipped_events = outcome
-                .skipped_events
-                .saturating_add(delta.events.len().saturating_sub(applied));
-            self.report_progress(
-                PoiArtifactCachePhase::ApplyingDeltas,
-                Some(expected_apply_index.saturating_sub(1)),
-                target_index,
-            );
+        {
+            let delta_fetches = self.fetch_delta_artifacts(&entry.deltas);
+            tokio::pin!(delta_fetches);
+            while let Some(delta_bytes) = delta_fetches.next().await {
+                self.report_progress(
+                    PoiArtifactCachePhase::ApplyingDeltas,
+                    Some(expected_apply_index.saturating_sub(1)),
+                    target_index,
+                );
+                let delta = SnapshotReader::read(&delta_bytes?)?;
+                expected_artifact_start = validate_snapshot(
+                    &delta,
+                    identity,
+                    entry,
+                    SnapshotKind::Delta,
+                    expected_artifact_start,
+                )?;
+                outcome.delta_count += 1;
+                outcome.delta_events = outcome.delta_events.saturating_add(delta.events.len());
+                let applied =
+                    apply_snapshot_suffix_events(cache, &delta, &mut expected_apply_index)?;
+                outcome.delta_applied_events = outcome.delta_applied_events.saturating_add(applied);
+                outcome.skipped_events = outcome
+                    .skipped_events
+                    .saturating_add(delta.events.len().saturating_sub(applied));
+                self.report_progress(
+                    PoiArtifactCachePhase::ApplyingDeltas,
+                    Some(expected_apply_index.saturating_sub(1)),
+                    target_index,
+                );
+            }
         }
 
         let final_index = expected_apply_index
@@ -917,11 +1010,11 @@ impl PoiArtifactIngestor {
         Ok(blocked_records.len())
     }
 
-    async fn fetch_url(&self, url: &Url) -> Result<Vec<u8>, PoiArtifactError> {
+    async fn fetch_url(&self, url: &SensitiveUrl) -> Result<Vec<u8>, PoiArtifactError> {
         let started = Instant::now();
-        let bytes = trustless_artifacts::fetch_manifest_url(&self.client, url).await?;
+        let bytes = trustless_artifacts::fetch_sensitive_manifest_url(&self.client, url).await?;
         debug!(
-            url = %url,
+            source = "explicit_url",
             bytes = bytes.len(),
             elapsed_ms = started.elapsed().as_millis(),
             "fetched POI artifact URL"
@@ -936,6 +1029,19 @@ pub(crate) struct PoiArtifactRefresh {
     pub(crate) entry: ManifestEntry,
     pub(crate) cache_generation: u64,
     pub(crate) corpus_advanced: bool,
+    pub(crate) expected_base: ExpectedPoiCorpusBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpectedPoiCorpusBase {
+    NoValidCorpus,
+    PayloadHash(FixedBytes<32>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoiCorpusCommitOutcome {
+    Applied,
+    Stale,
 }
 
 #[derive(Clone)]
@@ -994,6 +1100,12 @@ pub(crate) struct PersistedPoiArtifactCache {
     pub(crate) cache_generation: u64,
 }
 
+fn expected_corpus_base(persisted: Option<&PersistedPoiArtifactCache>) -> ExpectedPoiCorpusBase {
+    persisted.map_or(ExpectedPoiCorpusBase::NoValidCorpus, |persisted| {
+        ExpectedPoiCorpusBase::PayloadHash(keccak256(&persisted.record.cache_payload))
+    })
+}
+
 pub(crate) struct PoiCorpusStore<'a> {
     db: &'a DbStore,
     generation: u64,
@@ -1024,26 +1136,34 @@ impl<'a> PoiCorpusStore<'a> {
         &self,
         cache: &PoiCache,
         refresh: &PoiArtifactRefresh,
-    ) -> Result<PersistedPoiArtifactCache, PoiArtifactError> {
-        persist_prepared_corpus(self.db, cache, refresh, self.publisher_pubkey)?;
-        self.load(cache.identity())?
-            .ok_or(PoiArtifactError::MissingCommittedCorpus)
+    ) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
+        let outcome = persist_prepared_corpus(self.db, cache, refresh, self.publisher_pubkey)?;
+        let persisted = self.load(cache.identity())?;
+        if outcome == PoiCorpusCommitOutcome::Applied && persisted.is_none() {
+            return Err(PoiArtifactError::MissingCommittedCorpus);
+        }
+        Ok(persisted)
     }
 
     pub(crate) fn commit_public_rpc(
         &self,
         cache: &PoiCache,
         range_start_index: u64,
-    ) -> Result<PersistedPoiArtifactCache, PoiArtifactError> {
-        persist_public_rpc_cache_with_publisher(
+        expected_base: ExpectedPoiCorpusBase,
+    ) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
+        let outcome = persist_public_rpc_cache_with_publisher(
             self.db,
             cache,
             self.generation,
             range_start_index,
             Some(self.publisher_pubkey),
+            expected_base,
         )?;
-        self.load(cache.identity())?
-            .ok_or(PoiArtifactError::MissingCommittedCorpus)
+        let persisted = self.load(cache.identity())?;
+        if outcome == PoiCorpusCommitOutcome::Applied && persisted.is_none() {
+            return Err(PoiArtifactError::MissingCommittedCorpus);
+        }
+        Ok(persisted)
     }
 }
 
@@ -1308,14 +1428,10 @@ pub(crate) enum PoiArtifactError {
     MissingCommittedCorpus,
     #[error("replayed POI root mismatch: expected {expected}, got {actual}")]
     ReplayRootMismatch { expected: String, actual: String },
-}
-
-#[derive(Debug, Error)]
-enum ArtifactSuffixMergeError {
-    #[error("POI artifact validation failed")]
-    Artifact(#[from] PoiArtifactError),
-    #[error("POI artifact suffix merge range overflow")]
-    RangeOverflow,
+    #[error(
+        "POI corpus candidate conflicts with durable event history through tip {tip_index} in tree {tree_number}"
+    )]
+    CorpusPrefixRootConflict { tip_index: u64, tree_number: u32 },
 }
 
 const fn normalize_legacy_artifact_metadata(record: &mut PoiArtifactCacheRecord) {
@@ -1327,10 +1443,9 @@ const fn normalize_legacy_artifact_metadata(record: &mut PoiArtifactCacheRecord)
     }
 }
 
-fn validate_persisted_corpus(
+fn validate_persisted_corpus_payload(
     record: &PoiArtifactCacheRecord,
     cache: &PoiCache,
-    expected_publisher_pubkey: Option<FixedBytes<32>>,
 ) -> Result<(), PoiArtifactError> {
     let next_event_index = cache.progress().next_event_index;
     let next_leaf_index = cache.progress().next_leaf_index;
@@ -1385,6 +1500,18 @@ fn validate_persisted_corpus(
             });
         }
     }
+
+    Ok(())
+}
+
+fn validate_persisted_corpus(
+    record: &PoiArtifactCacheRecord,
+    cache: &PoiCache,
+    expected_publisher_pubkey: Option<FixedBytes<32>>,
+) -> Result<(), PoiArtifactError> {
+    validate_persisted_corpus_payload(record, cache)?;
+    let next_event_index = cache.progress().next_event_index;
+    let payload_tip_index = next_event_index.saturating_sub(1);
 
     match &record.validation {
         PoiCorpusValidationRecord::Legacy => {
@@ -1537,7 +1664,7 @@ pub(crate) fn persist_prepared_corpus(
     cache: &PoiCache,
     refresh: &PoiArtifactRefresh,
     publisher_pubkey: FixedBytes<32>,
-) -> Result<bool, PoiArtifactError> {
+) -> Result<PoiCorpusCommitOutcome, PoiArtifactError> {
     let current_generation = poi_artifact_cache_generation_cell(db)?.load(Ordering::Acquire);
     if refresh.cache_generation != current_generation {
         return Err(PoiArtifactError::StalePublicCacheGeneration {
@@ -1591,14 +1718,14 @@ pub(crate) fn persist_prepared_corpus(
         },
     )?;
     if refresh.manifest_sequence < global_sequence {
-        return Ok(false);
+        return Ok(PoiCorpusCommitOutcome::Stale);
     }
     if refresh.manifest_sequence > global_sequence {
         return Err(PoiArtifactError::UnobservedManifestSequence {
             candidate: refresh.manifest_sequence,
         });
     }
-    persist_corpus_record_monotonic(db, record, Some(publisher_pubkey))
+    persist_corpus_record_monotonic(db, record, Some(publisher_pubkey), refresh.expected_base)
 }
 
 #[cfg(test)]
@@ -1607,8 +1734,16 @@ pub(crate) fn persist_public_rpc_cache(
     cache: &PoiCache,
     cache_generation: u64,
     range_start_index: u64,
-) -> Result<bool, PoiArtifactError> {
-    persist_public_rpc_cache_with_publisher(db, cache, cache_generation, range_start_index, None)
+    expected_base: ExpectedPoiCorpusBase,
+) -> Result<PoiCorpusCommitOutcome, PoiArtifactError> {
+    persist_public_rpc_cache_with_publisher(
+        db,
+        cache,
+        cache_generation,
+        range_start_index,
+        None,
+        expected_base,
+    )
 }
 
 fn persist_public_rpc_cache_with_publisher(
@@ -1617,7 +1752,8 @@ fn persist_public_rpc_cache_with_publisher(
     cache_generation: u64,
     range_start_index: u64,
     publisher_pubkey: Option<FixedBytes<32>>,
-) -> Result<bool, PoiArtifactError> {
+    expected_base: ExpectedPoiCorpusBase,
+) -> Result<PoiCorpusCommitOutcome, PoiArtifactError> {
     let identity = cache.identity();
     let current_tip_index = cache.progress().next_event_index.saturating_sub(1);
     let (tree_number, _) = normalize_tree_position(0, current_tip_index);
@@ -1656,22 +1792,23 @@ fn persist_public_rpc_cache_with_publisher(
             actual: cache_generation,
         });
     }
-    persist_corpus_record_monotonic(db, record, publisher_pubkey)
+    persist_corpus_record_monotonic(db, record, publisher_pubkey, expected_base)
 }
 
 fn persist_corpus_record_monotonic(
     db: &DbStore,
     mut candidate: PoiArtifactCacheRecord,
     publisher_pubkey: Option<FixedBytes<32>>,
-) -> Result<bool, PoiArtifactError> {
+    expected_base: ExpectedPoiCorpusBase,
+) -> Result<PoiCorpusCommitOutcome, PoiArtifactError> {
     let candidate_identity = PoiCacheIdentity::new(
         candidate.chain_type,
         candidate.chain_id,
         candidate.txid_version.clone(),
         candidate.list_key,
     );
-    let candidate_cache =
-        validate_persisted_record(&candidate, &candidate_identity, publisher_pubkey)?;
+    let candidate_cache = PoiCache::from_bytes(&candidate.cache_payload, &candidate_identity)?;
+    validate_persisted_corpus_payload(&candidate, &candidate_cache)?;
     let existing = db.inspect_poi_artifact_cache(
         candidate.chain_type,
         candidate.chain_id,
@@ -1693,7 +1830,7 @@ fn persist_corpus_record_monotonic(
                 existing.list_key,
             );
             match validate_persisted_record(&existing, &identity, publisher_pubkey) {
-                Ok(_) => Some(existing),
+                Ok(existing_cache) => Some((existing, existing_cache)),
                 Err(error) => {
                     warn!(?error, key = %existing.key(), "replacing semantically corrupt durable PPOI corpus");
                     None
@@ -1701,22 +1838,25 @@ fn persist_corpus_record_monotonic(
             }
         }
     };
-    if let Some(existing) = existing {
+    let observed_base = existing
+        .as_ref()
+        .map_or(ExpectedPoiCorpusBase::NoValidCorpus, |(record, _)| {
+            ExpectedPoiCorpusBase::PayloadHash(keccak256(&record.cache_payload))
+        });
+    if observed_base != expected_base {
+        return Ok(PoiCorpusCommitOutcome::Stale);
+    }
+    if let Some((existing, mut existing_cache)) = existing {
         if existing.current_tip_index > candidate.current_tip_index {
-            return Ok(false);
+            return Ok(PoiCorpusCommitOutcome::Stale);
         }
-        if existing.current_tip_index == candidate.current_tip_index
-            && existing.current_tip_root != candidate.current_tip_root
-        {
-            return Err(PoiArtifactError::CorpusTipRootConflict {
-                tip_index: candidate.current_tip_index,
-            });
-        }
-        if existing.current_tip_index == candidate.current_tip_index
-            && matches!(candidate.source, PoiCacheRecordSource::IndexedArtifacts)
-        {
-            return Ok(false);
-        }
+        validate_candidate_event_prefix(
+            &mut existing_cache,
+            &candidate_cache,
+            existing.current_tip_index,
+            existing.current_tip_root,
+            candidate.current_tip_index,
+        )?;
         if matches!(candidate.source, PoiCacheRecordSource::PublicRpc) {
             candidate.legacy_observed_manifest_sequence =
                 existing.legacy_observed_manifest_sequence;
@@ -1729,11 +1869,83 @@ fn persist_corpus_record_monotonic(
             }
             candidate.validation =
                 extend_validation_with_list_ranges(existing.validation, &candidate.validation);
+        } else if let Some((list_key, from_index)) = list_signed_range(&existing.validation) {
+            candidate.validation = extend_validation_with_list_ranges(
+                candidate.validation,
+                &PoiCorpusValidationRecord::ListSignedRanges {
+                    list_key,
+                    from_index,
+                },
+            );
+            candidate.source = PoiCacheRecordSource::PublicRpc;
         }
     }
     validate_persisted_corpus(&candidate, &candidate_cache, publisher_pubkey)?;
     db.put_poi_artifact_cache(&candidate)?;
-    Ok(true)
+    Ok(PoiCorpusCommitOutcome::Applied)
+}
+
+const fn list_signed_range(
+    validation: &PoiCorpusValidationRecord,
+) -> Option<(FixedBytes<32>, u64)> {
+    match validation {
+        PoiCorpusValidationRecord::ListSignedRanges {
+            list_key,
+            from_index,
+        } => Some((*list_key, *from_index)),
+        PoiCorpusValidationRecord::PublisherAndListSigned {
+            list_key,
+            list_signed_from_index,
+            ..
+        } => Some((*list_key, *list_signed_from_index)),
+        PoiCorpusValidationRecord::PublisherAttested { .. } | PoiCorpusValidationRecord::Legacy => {
+            None
+        }
+    }
+}
+
+fn validate_candidate_event_prefix(
+    existing_cache: &mut PoiCache,
+    candidate_cache: &PoiCache,
+    durable_tip_index: u64,
+    durable_tip_root: FixedBytes<32>,
+    candidate_tip_index: u64,
+) -> Result<(), PoiArtifactError> {
+    let (tip_tree, _) = normalize_tree_position(0, durable_tip_index);
+    let existing_roots = existing_cache.current_roots();
+    let mut candidate_cache = candidate_cache.clone();
+    let candidate_roots = candidate_cache.current_roots();
+    if let Some(tree_number) = existing_roots
+        .range(..tip_tree)
+        .zip(candidate_roots.range(..tip_tree))
+        .find_map(
+            |((tree_number, existing), (candidate_tree_number, candidate))| {
+                (tree_number != candidate_tree_number || existing != candidate)
+                    .then_some(*tree_number)
+            },
+        )
+        .or_else(|| {
+            (existing_roots.range(..tip_tree).count() != candidate_roots.range(..tip_tree).count())
+                .then_some(tip_tree.saturating_sub(1))
+        })
+    {
+        return Err(PoiArtifactError::CorpusPrefixRootConflict {
+            tip_index: durable_tip_index,
+            tree_number,
+        });
+    }
+    if candidate_cache.root_at_global_index(durable_tip_index) != Some(durable_tip_root) {
+        if candidate_tip_index == durable_tip_index {
+            return Err(PoiArtifactError::CorpusTipRootConflict {
+                tip_index: durable_tip_index,
+            });
+        }
+        return Err(PoiArtifactError::CorpusPrefixRootConflict {
+            tip_index: durable_tip_index,
+            tree_number: tip_tree,
+        });
+    }
+    Ok(())
 }
 
 fn extend_validation_with_list_ranges(
@@ -1759,7 +1971,7 @@ fn extend_validation_with_list_ranges(
             manifest_root,
             artifact_tip_index,
             list_key: *list_key,
-            list_signed_from_index: *from_index,
+            list_signed_from_index: (*from_index).max(artifact_tip_index.saturating_add(1)),
         },
         PoiCorpusValidationRecord::PublisherAndListSigned {
             publisher_pubkey,
@@ -2059,6 +2271,7 @@ pub(crate) async fn clear_poi_artifact_cache_for_reset(
     db: &DbStore,
 ) -> Result<PoiArtifactCacheReset, local_db::DbError> {
     let authority = poi_corpus_authority(db)?;
+    let _revision_access = authority.revision_write_access().await;
     let _reset_access = authority.reset_access().await;
     let mut sync_state = lock_poi_artifact_cache_sync();
     let (removed, generation) = db.clear_poi_artifact_cache_with_generation()?;
@@ -2072,10 +2285,12 @@ pub(crate) async fn clear_poi_artifact_cache_for_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::Condvar;
     use std::sync::mpsc::{self, Receiver};
 
     use cid::Cid;
@@ -2127,7 +2342,7 @@ mod tests {
             .expect("seed publisher watermark");
 
         PoiCorpusStore::new(&db, generation, publisher_pubkey)
-            .commit_public_rpc(&cache, 0)
+            .commit_public_rpc(&cache, 0, ExpectedPoiCorpusBase::NoValidCorpus)
             .expect("persist public RPC cache");
         let persisted = load_persisted_cache_for_publisher(&db, &identity, publisher_pubkey)
             .expect("load public RPC cache")
@@ -2156,7 +2371,14 @@ mod tests {
         let generation = poi_artifact_cache_generation_cell(&db)
             .expect("cache generation")
             .load(Ordering::Acquire);
-        persist_public_rpc_cache(&db, &cache, generation, 0).expect("persist RPC-only corpus");
+        persist_public_rpc_cache(
+            &db,
+            &cache,
+            generation,
+            0,
+            ExpectedPoiCorpusBase::NoValidCorpus,
+        )
+        .expect("persist RPC-only corpus");
         let mut record = db
             .get_poi_artifact_cache(
                 identity.chain_type,
@@ -2208,8 +2430,16 @@ mod tests {
         let generation = poi_artifact_cache_generation_cell(&db)
             .expect("cache generation")
             .load(Ordering::Acquire);
-        assert!(
-            persist_public_rpc_cache(&db, &cache, generation, 0).expect("replace malformed corpus")
+        assert_eq!(
+            persist_public_rpc_cache(
+                &db,
+                &cache,
+                generation,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+            )
+            .expect("replace malformed corpus"),
+            PoiCorpusCommitOutcome::Applied
         );
         let recovered = load_persisted_cache(&db, &identity)
             .expect("load replacement corpus")
@@ -2245,8 +2475,14 @@ mod tests {
         let generation = poi_artifact_cache_generation_cell(&db)
             .expect("cache generation")
             .load(Ordering::Acquire);
-        persist_public_rpc_cache(&db, &cache, generation, 0)
-            .expect("replace root-mismatched corpus");
+        persist_public_rpc_cache(
+            &db,
+            &cache,
+            generation,
+            0,
+            ExpectedPoiCorpusBase::NoValidCorpus,
+        )
+        .expect("replace root-mismatched corpus");
         let mut malformed = db
             .get_poi_artifact_cache(
                 identity.chain_type,
@@ -2292,6 +2528,7 @@ mod tests {
             entry: test_entry(&identity, 0, root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, publisher_pubkey, 4)
             .expect("observe publisher manifest");
@@ -2364,6 +2601,7 @@ mod tests {
             entry: test_entry(&identity, 0, root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, old_publisher, 9)
             .expect("observe old-publisher manifest");
@@ -2455,6 +2693,7 @@ mod tests {
             entry: test_entry(&identity, 0, root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         persist_refresh_with_publisher(&db, &identity, &refresh, publisher_pubkey)
             .expect("persist valid publisher corpus");
@@ -2483,12 +2722,16 @@ mod tests {
             entry: test_entry(&identity, 0, root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::PayloadHash(keccak256(
+                cache.to_bytes().expect("encode current corpus"),
+            )),
         };
         advance_publisher_manifest_watermark(&db, publisher_pubkey, 2)
             .expect("observe next publisher manifest");
         let committed = PoiCorpusStore::new(&db, generation, publisher_pubkey)
             .commit_artifact(&cache, &next_refresh)
-            .expect("commit artifact despite corrupt health");
+            .expect("commit artifact despite corrupt health")
+            .expect("artifact applied");
         assert_eq!(committed.record.current_tip_index, 0);
 
         drop(db);
@@ -2516,6 +2759,7 @@ mod tests {
             entry: test_entry(&identity, 0, root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         persist_refresh_with_publisher(&db, &identity, &refresh, publisher_pubkey)
             .expect("persist valid publisher corpus");
@@ -2588,12 +2832,14 @@ mod tests {
             entry: initial_entry,
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, FixedBytes::from([0x55; 32]), 7)
             .expect("observe initial manifest");
-        assert!(
+        assert_eq!(
             persist_prepared_corpus(&db, &cache, &initial_refresh, FixedBytes::from([0x55; 32]),)
-                .expect("persist initial artifact corpus")
+                .expect("persist initial artifact corpus"),
+            PoiCorpusCommitOutcome::Applied
         );
 
         advance_publisher_manifest_watermark(&db, FixedBytes::from([0x55; 32]), 8)
@@ -2625,15 +2871,17 @@ mod tests {
             entry: test_entry(&identity, 1, older_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
-        assert!(
-            !persist_prepared_corpus(
+        assert_eq!(
+            persist_prepared_corpus(
                 &db,
                 &older_cache,
                 &older_refresh,
                 FixedBytes::from([0x55; 32]),
             )
-            .expect("reject older artifact sequence")
+            .expect("reject older artifact sequence"),
+            PoiCorpusCommitOutcome::Stale
         );
         let retained = load_persisted_cache(&db, &identity)
             .expect("load retained corpus")
@@ -2647,8 +2895,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equal_tip_artifact_cannot_replace_rpc_blocked_shield_state() {
-        let root_dir = temp_db_root("equal-tip-artifact-no-replacement");
+    async fn behind_tip_artifact_updates_rpc_blocked_shield_snapshot() {
+        let root_dir = temp_db_root("behind-tip-artifact-blocked-update");
         fs::create_dir_all(&root_dir).expect("create temp DB root");
         let db = DbStore::open(DbConfig {
             root_dir: root_dir.clone(),
@@ -2656,24 +2904,41 @@ mod tests {
         .expect("open temp DB");
         let signing_key = SigningKey::from_bytes(&[0x5a; 32]);
         let identity = signed_identity(&signing_key);
-        let cache = test_cache(&identity, &[0x5b]);
-        let root = test_cache_root(&cache);
+        let blocked_commitment = FixedBytes::from([0x5c; 32]);
+        let mut cache = test_cache(&identity, &[0x5b, 0x5d]);
+        cache
+            .apply_blocked_shields(&[blocked_shield(blocked_commitment)])
+            .expect("apply RPC blocked shield");
+        let root = cache.root_at_global_index(0).expect("artifact tip root");
         let generation = poi_artifact_cache_generation_cell(&db)
             .expect("cache generation")
             .load(Ordering::Acquire);
-        persist_public_rpc_cache(&db, &cache, generation, 0).expect("persist RPC-derived corpus");
-        let before = db
-            .get_poi_artifact_cache(
-                identity.chain_type,
-                identity.chain_id,
-                &identity.txid_version,
-                &identity.list_key,
-            )
-            .expect("load RPC corpus")
-            .expect("RPC corpus");
-
+        persist_public_rpc_cache(
+            &db,
+            &cache,
+            generation,
+            0,
+            ExpectedPoiCorpusBase::NoValidCorpus,
+        )
+        .expect("persist RPC-derived corpus");
+        let empty_blocked = BlockedShieldsArtifact::from_signed_records(
+            format::FORMAT_VERSION,
+            &identity.list_key.0,
+            identity.chain_id,
+            identity.chain_type,
+            &[0_u8; 32],
+            &[],
+        );
+        let blocked_bytes = empty_blocked.to_bytes().expect("encode blocked snapshot");
+        let blocked_cid = raw_cid(&blocked_bytes);
+        let blocked_descriptor =
+            ArtifactDescriptor::from_bytes(blocked_cid.to_string(), &blocked_bytes);
+        let artifact_server = spawn_json_rpc(vec![raw_car_bytes(
+            blocked_cid,
+            &[(blocked_cid, blocked_bytes)],
+        )]);
         let mut entry = test_entry(&identity, 0, root.0);
-        entry.blocked_shields = descriptor("changed-blocked-shields");
+        entry.blocked_shields = blocked_descriptor;
         let mut manifest = Manifest::new(2, 9_500, 2, FixedBytes::ZERO, vec![entry]);
         manifest
             .sign_manifest(&signing_key)
@@ -2682,8 +2947,8 @@ mod tests {
             spawn_manifest_server(200, serde_json::to_vec(&manifest).expect("manifest JSON"));
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(server.url.clone()),
-            Vec::new(),
+            PoiArtifactManifestSource::Url(server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
             Some(Duration::from_secs(1)),
         );
 
@@ -2695,18 +2960,37 @@ mod tests {
                 UNIX_EPOCH + Duration::from_secs(10),
             )
             .await
-            .expect("prepare equal-tip artifact observation");
-        assert!(!refresh.corpus_advanced);
-        let after = db
-            .get_poi_artifact_cache(
-                identity.chain_type,
-                identity.chain_id,
-                &identity.txid_version,
-                &identity.list_key,
-            )
-            .expect("load retained RPC corpus")
-            .expect("retained RPC corpus");
-        assert_eq!(after, before);
+            .expect("prepare behind-tip artifact observation");
+        assert!(refresh.corpus_advanced);
+        assert_eq!(refresh.cache.progress().next_event_index, 2);
+        assert_eq!(
+            refresh.cache.status(&blocked_commitment),
+            PoiStatus::Missing
+        );
+        let committed = PoiCorpusStore::new(
+            &db,
+            generation,
+            FixedBytes::from(signing_key.verifying_key().to_bytes()),
+        )
+        .commit_artifact(&refresh.cache, &refresh)
+        .expect("commit behind-tip blocked snapshot")
+        .expect("artifact applied");
+        assert_eq!(
+            committed.cache.status(&blocked_commitment),
+            PoiStatus::Missing
+        );
+        assert_eq!(
+            committed.record.blocked_shields_descriptor.cid,
+            blocked_cid.to_string()
+        );
+        assert!(matches!(
+            committed.record.validation,
+            PoiCorpusValidationRecord::PublisherAndListSigned {
+                artifact_tip_index: 0,
+                list_signed_from_index: 1,
+                ..
+            }
+        ));
 
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp DB root");
@@ -2733,6 +3017,7 @@ mod tests {
             entry: test_entry(&identity, 1, artifact_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, publisher_pubkey, 3)
             .expect("observe delayed artifact manifest");
@@ -2742,20 +3027,23 @@ mod tests {
         rpc_cache
             .apply_blocked_shields(&[blocked_shield(blocked_commitment)])
             .expect("apply newer RPC blocked-shield state");
-        assert!(
+        assert_eq!(
             persist_public_rpc_cache_with_publisher(
                 &db,
                 &rpc_cache,
                 generation,
                 0,
                 Some(publisher_pubkey),
+                ExpectedPoiCorpusBase::NoValidCorpus,
             )
-            .expect("persist equal-tip RPC corpus")
+            .expect("persist equal-tip RPC corpus"),
+            PoiCorpusCommitOutcome::Applied
         );
 
-        assert!(
-            !persist_prepared_corpus(&db, &refresh.cache, &refresh, publisher_pubkey)
-                .expect("reject delayed equal-tip artifact")
+        assert_eq!(
+            persist_prepared_corpus(&db, &refresh.cache, &refresh, publisher_pubkey)
+                .expect("reject delayed equal-tip artifact"),
+            PoiCorpusCommitOutcome::Stale
         );
         let retained = load_persisted_cache_for_publisher(&db, &identity, publisher_pubkey)
             .expect("load retained RPC corpus")
@@ -2763,6 +3051,209 @@ mod tests {
         assert_eq!(
             retained.cache.status(&blocked_commitment),
             poi::poi::PoiStatus::ShieldBlocked
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp DB root");
+    }
+
+    #[test]
+    fn expected_absent_public_rpc_candidate_loses_first_writer_race() {
+        let root_dir = temp_db_root("rpc-expected-absent-first-writer");
+        fs::create_dir_all(&root_dir).expect("create temp DB root");
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open temp DB");
+        let identity = test_identity();
+        let first = test_cache(&identity, &[0x61]);
+        let stale = test_cache(&identity, &[0x62]);
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+
+        assert_eq!(
+            persist_public_rpc_cache(
+                &db,
+                &first,
+                generation,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+            )
+            .expect("persist first writer"),
+            PoiCorpusCommitOutcome::Applied
+        );
+        assert_eq!(
+            persist_public_rpc_cache(
+                &db,
+                &stale,
+                generation,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+            )
+            .expect("reject stale first-run candidate"),
+            PoiCorpusCommitOutcome::Stale
+        );
+
+        let retained = load_persisted_cache(&db, &identity)
+            .expect("load retained corpus")
+            .expect("first writer remains durable");
+        assert_eq!(
+            retained.cache.to_bytes().expect("encode retained corpus"),
+            first.to_bytes().expect("encode first corpus")
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp DB root");
+    }
+
+    #[test]
+    fn equal_tip_candidate_with_conflicting_completed_tree_is_rejected() {
+        let root_dir = temp_db_root("equal-tip-completed-tree-conflict");
+        fs::create_dir_all(&root_dir).expect("create temp DB root");
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open temp DB");
+        let identity = test_identity();
+        let mut events = Vec::with_capacity(
+            usize::try_from(broadcaster_core::tree::TREE_LEAF_COUNT + 1)
+                .expect("test event capacity"),
+        );
+        for index in 0..=broadcaster_core::tree::TREE_LEAF_COUNT {
+            let mut commitment = [0_u8; 32];
+            commitment[24..].copy_from_slice(&index.to_be_bytes());
+            events.push(SnapshotEvent {
+                event_index: index,
+                blinded_commitment: commitment,
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            });
+        }
+        let mut durable = PoiCache::new(identity.clone());
+        durable
+            .apply_verified_artifact_events(&events)
+            .expect("apply multi-tree durable events");
+        drop(events);
+        durable.accept_current_roots();
+        let durable_payload = durable.to_bytes().expect("encode durable corpus");
+
+        let mut candidate = durable.clone();
+        candidate
+            .apply_verified_artifact_events(&[SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0xff; 32],
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("replace completed-tree event");
+        candidate.accept_current_roots();
+        let durable_roots = durable.clone().current_roots();
+        let candidate_roots = candidate.clone().current_roots();
+        assert_ne!(durable_roots.get(&0), candidate_roots.get(&0));
+        assert_eq!(durable_roots.get(&1), candidate_roots.get(&1));
+
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+        assert_eq!(
+            persist_public_rpc_cache(
+                &db,
+                &durable,
+                generation,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+            )
+            .expect("persist durable multi-tree corpus"),
+            PoiCorpusCommitOutcome::Applied
+        );
+        let publisher_pubkey = FixedBytes::from([0x68; 32]);
+        let tip_index = broadcaster_core::tree::TREE_LEAF_COUNT;
+        let refresh = PoiArtifactRefresh {
+            manifest_sequence: 5,
+            cache: candidate.clone(),
+            entry: test_entry(
+                &identity,
+                tip_index,
+                candidate_roots.get(&1).expect("active-tree root").0,
+            ),
+            cache_generation: generation,
+            corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::PayloadHash(keccak256(&durable_payload)),
+        };
+        advance_publisher_manifest_watermark(&db, publisher_pubkey, 5)
+            .expect("observe artifact manifest");
+
+        assert!(matches!(
+            persist_prepared_corpus(&db, &candidate, &refresh, publisher_pubkey),
+            Err(PoiArtifactError::CorpusPrefixRootConflict {
+                tip_index: actual_tip,
+                tree_number: 0,
+            }) if actual_tip == tip_index
+        ));
+        let retained = load_persisted_cache(&db, &identity)
+            .expect("load retained multi-tree corpus")
+            .expect("durable multi-tree corpus remains");
+        assert_eq!(
+            retained.cache.to_bytes().expect("encode retained corpus"),
+            durable_payload
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp DB root");
+    }
+
+    #[test]
+    fn advancing_artifact_cannot_replace_conflicting_durable_event_prefix() {
+        let root_dir = temp_db_root("artifact-conflicting-durable-prefix");
+        fs::create_dir_all(&root_dir).expect("create temp DB root");
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open temp DB");
+        let identity = test_identity();
+        let durable_cache = test_cache(&identity, &[0x21, 0x22]);
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+        persist_public_rpc_cache(
+            &db,
+            &durable_cache,
+            generation,
+            0,
+            ExpectedPoiCorpusBase::NoValidCorpus,
+        )
+        .expect("persist durable list-signed corpus");
+
+        let candidate_cache = test_cache(&identity, &[0x21, 0x99, 0x23]);
+        let candidate_root = test_cache_root(&candidate_cache);
+        let publisher_pubkey = FixedBytes::from([0x67; 32]);
+        let refresh = PoiArtifactRefresh {
+            manifest_sequence: 4,
+            cache: candidate_cache.clone(),
+            entry: test_entry(&identity, 2, candidate_root.0),
+            cache_generation: generation,
+            corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::PayloadHash(keccak256(
+                durable_cache.to_bytes().expect("encode durable corpus"),
+            )),
+        };
+        advance_publisher_manifest_watermark(&db, publisher_pubkey, 4)
+            .expect("observe artifact manifest");
+
+        assert!(matches!(
+            persist_prepared_corpus(&db, &candidate_cache, &refresh, publisher_pubkey),
+            Err(PoiArtifactError::CorpusPrefixRootConflict { tip_index: 1, .. })
+        ));
+        let retained = load_persisted_cache(&db, &identity)
+            .expect("load retained durable corpus")
+            .expect("durable corpus remains");
+        assert_eq!(retained.record.source, PoiCacheRecordSource::PublicRpc);
+        assert_eq!(retained.record.current_tip_index, 1);
+        assert!(retained.cache.blocked_shields_match(&durable_cache));
+        assert_eq!(
+            retained.cache.to_bytes().expect("encode retained corpus"),
+            durable_cache.to_bytes().expect("encode durable corpus")
         );
 
         drop(db);
@@ -2790,18 +3281,29 @@ mod tests {
             entry: test_entry(&identity, 0, artifact_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, publisher_pubkey, 7)
             .expect("observe artifact manifest");
-        assert!(
+        assert_eq!(
             persist_prepared_corpus(&db, &artifact_cache, &refresh, publisher_pubkey,)
-                .expect("persist artifact corpus")
+                .expect("persist artifact corpus"),
+            PoiCorpusCommitOutcome::Applied
         );
 
         let rpc_cache = test_cache(&identity, &[0x51, 0x52]);
-        assert!(
-            persist_public_rpc_cache(&db, &rpc_cache, generation, 1)
-                .expect("persist public range extension")
+        assert_eq!(
+            persist_public_rpc_cache(
+                &db,
+                &rpc_cache,
+                generation,
+                1,
+                ExpectedPoiCorpusBase::PayloadHash(keccak256(
+                    artifact_cache.to_bytes().expect("encode artifact corpus"),
+                )),
+            )
+            .expect("persist public range extension"),
+            PoiCorpusCommitOutcome::Applied
         );
         let persisted = load_persisted_cache(&db, &identity)
             .expect("load mixed corpus")
@@ -2859,19 +3361,21 @@ mod tests {
             entry: test_entry(&first_identity, 0, first_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, FixedBytes::from([0x77; 32]), 9)
             .expect("observe delayed sequence 9 candidate");
         advance_publisher_manifest_watermark(&db, FixedBytes::from([0x77; 32]), 10)
             .expect("observe global manifest sequence 10");
-        assert!(
+        assert_eq!(
             persist_prepared_corpus(
                 &db,
                 &first_cache,
                 &first_refresh,
                 FixedBytes::from([0x77; 32]),
             )
-            .expect("persist first list at sequence 10")
+            .expect("persist first list at sequence 10"),
+            PoiCorpusCommitOutcome::Applied
         );
 
         let second_identity = PoiCacheIdentity::new(
@@ -2888,15 +3392,17 @@ mod tests {
             entry: test_entry(&second_identity, 0, second_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
-        assert!(
-            !persist_prepared_corpus(
+        assert_eq!(
+            persist_prepared_corpus(
                 &db,
                 &second_cache,
                 &older_refresh,
                 FixedBytes::from([0x77; 32]),
             )
-            .expect("reject older sequence for second list")
+            .expect("reject older sequence for second list"),
+            PoiCorpusCommitOutcome::Stale
         );
         assert!(
             load_persisted_cache(&db, &second_identity)
@@ -2910,15 +3416,17 @@ mod tests {
             entry: test_entry(&second_identity, 0, second_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
-        assert!(
+        assert_eq!(
             persist_prepared_corpus(
                 &db,
                 &second_cache,
                 &current_refresh,
                 FixedBytes::from([0x77; 32]),
             )
-            .expect("accept current sequence for second list")
+            .expect("accept current sequence for second list"),
+            PoiCorpusCommitOutcome::Applied
         );
 
         drop(db);
@@ -2946,6 +3454,7 @@ mod tests {
             entry: test_entry(&artifact_identity, 0, artifact_root.0),
             cache_generation: generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
         advance_publisher_manifest_watermark(&db, publisher_pubkey, 10)
             .expect("observe global manifest sequence 10");
@@ -2961,8 +3470,9 @@ mod tests {
         let store = PoiCorpusStore::new(&db, generation, publisher_pubkey);
         let first_rpc_cache = test_cache(&rpc_identity, &[0x7c]);
         let first = store
-            .commit_public_rpc(&first_rpc_cache, 0)
-            .expect("commit new RPC-only corpus below global artifact watermark");
+            .commit_public_rpc(&first_rpc_cache, 0, ExpectedPoiCorpusBase::NoValidCorpus)
+            .expect("commit new RPC-only corpus below global artifact watermark")
+            .expect("first RPC corpus applied");
         assert_eq!(first.record.current_tip_index, 0);
         assert!(matches!(
             first.record.validation,
@@ -2971,8 +3481,15 @@ mod tests {
 
         let advanced_rpc_cache = test_cache(&rpc_identity, &[0x7c, 0x7d]);
         let advanced = store
-            .commit_public_rpc(&advanced_rpc_cache, 1)
-            .expect("advance existing RPC-only corpus below global artifact watermark");
+            .commit_public_rpc(
+                &advanced_rpc_cache,
+                1,
+                ExpectedPoiCorpusBase::PayloadHash(keccak256(
+                    first_rpc_cache.to_bytes().expect("encode first RPC corpus"),
+                )),
+            )
+            .expect("advance existing RPC-only corpus below global artifact watermark")
+            .expect("advanced RPC corpus applied");
         assert_eq!(advanced.record.current_tip_index, 1);
         assert_eq!(advanced.record.legacy_observed_manifest_sequence, 0);
         assert_eq!(
@@ -3004,7 +3521,7 @@ mod tests {
         let failing_server = spawn_manifest_server(500, Vec::new());
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(failing_server.url.clone()),
+            PoiArtifactManifestSource::Url(failing_server.url.clone().into()),
             Vec::new(),
             None,
         );
@@ -3028,7 +3545,7 @@ mod tests {
         let manifest_server = spawn_manifest_server(200, serde_json::to_vec(&fresh).expect("JSON"));
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(manifest_server.url.clone()),
+            PoiArtifactManifestSource::Url(manifest_server.url.clone().into()),
             Vec::new(),
             Some(Duration::from_secs(1)),
         );
@@ -3058,7 +3575,7 @@ mod tests {
         );
         let first_ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(first_server.url.clone()),
+            PoiArtifactManifestSource::Url(first_server.url.clone().into()),
             Vec::new(),
             Some(Duration::from_secs(1)),
         );
@@ -3101,7 +3618,7 @@ mod tests {
         );
         let second_ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(second_server.url.clone()),
+            PoiArtifactManifestSource::Url(second_server.url.clone().into()),
             Vec::new(),
             Some(Duration::from_secs(1)),
         );
@@ -3130,7 +3647,7 @@ mod tests {
         let ingestor = manifest_ingestor(
             &signing_key,
             PoiArtifactManifestSource::Cid(cid.to_string()),
-            vec![manifest_server.url.clone()],
+            vec![manifest_server.url.clone().into()],
             Some(Duration::from_secs(1)),
         );
 
@@ -3155,8 +3672,8 @@ mod tests {
             spawn_manifest_server(200, raw_car_bytes(cid, &[(cid, artifact_bytes.clone())]));
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
-            vec![artifact_server.url.clone()],
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
             None,
         );
         let descriptor = ArtifactDescriptor::from_bytes(cid.to_string(), &artifact_bytes);
@@ -3171,6 +3688,55 @@ mod tests {
             artifact_server.request_path(),
             format!("/ipfs/{cid}?format=car&dag-scope=entity")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delta_prefetch_is_bounded_and_preserves_manifest_order() {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let artifact_bytes = (0..POI_DELTA_PREFETCH_LIMIT + 2)
+            .map(|index| format!("delta artifact {index}").into_bytes())
+            .collect::<Vec<_>>();
+        let descriptors = artifact_bytes
+            .iter()
+            .map(|bytes| {
+                let cid = raw_cid(bytes);
+                ArtifactDescriptor::from_bytes(cid.to_string(), bytes)
+            })
+            .collect::<Vec<_>>();
+        let mut artifact_server = spawn_concurrent_artifact_server(&artifact_bytes);
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
+            None,
+        );
+
+        let fetch_task = tokio::spawn(async move {
+            let fetches = ingestor.fetch_delta_artifacts(&descriptors);
+            tokio::pin!(fetches);
+            let mut fetched = Vec::new();
+            while let Some(bytes) = fetches.next().await {
+                fetched.push(bytes.expect("verified delta artifact"));
+            }
+            fetched
+        });
+        for _ in 0..POI_DELTA_PREFETCH_LIMIT {
+            tokio::time::timeout(Duration::from_secs(2), artifact_server.accepted.recv())
+                .await
+                .expect("prefetch connection timeout")
+                .expect("prefetch connection");
+        }
+        let excess =
+            tokio::time::timeout(Duration::from_millis(250), artifact_server.accepted.recv()).await;
+        artifact_server.release();
+        assert!(excess.is_err(), "prefetch exceeded its concurrency limit");
+
+        let fetched = tokio::time::timeout(Duration::from_secs(5), fetch_task)
+            .await
+            .expect("bounded delta prefetch completed")
+            .expect("delta prefetch task");
+
+        assert_eq!(fetched, artifact_bytes);
     }
 
     #[tokio::test]
@@ -3209,8 +3775,8 @@ mod tests {
             spawn_manifest_server(200, raw_car_bytes(base_cid, &[(base_cid, base_bytes)]));
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
-            vec![artifact_server.url.clone()],
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
             None,
         );
         let mut entry = test_entry(&identity, 2, root_2.0);
@@ -3231,6 +3797,98 @@ mod tests {
         assert_eq!(
             artifact_server.request_path(),
             format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_overlap_falls_through_to_artifact_suffix_merge() {
+        let signing_key = SigningKey::from_bytes(&[19_u8; 32]);
+        let identity = signed_identity(&signing_key);
+        let events = [
+            signed_proxy_event(&signing_key, 0, 0x10, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 1, 0x11, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 2, 0x12, [0_u8; 32]),
+            signed_proxy_event(&signing_key, 3, 0x13, [0_u8; 32]),
+        ];
+
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(
+                &events[..=2]
+                    .iter()
+                    .map(snapshot_event_from_proxy)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("apply durable events");
+        let durable_root = root_for_tip(&mut cache, 2);
+        cache.accept_current_roots();
+
+        let mut expected = cache.clone();
+        expected
+            .apply_verified_artifact_events(&[snapshot_event_from_proxy(&events[3])])
+            .expect("apply expected suffix event");
+        let artifact_root = root_for_tip(&mut expected, 3);
+
+        let base_bytes = snapshot_artifact_bytes(
+            &identity,
+            SnapshotKind::Base,
+            0,
+            1,
+            &events[..=1],
+            artifact_root,
+        );
+        let base_cid = raw_cid(&base_bytes);
+        let base_descriptor = ArtifactDescriptor::from_bytes(base_cid.to_string(), &base_bytes);
+        let delta_bytes = snapshot_artifact_bytes(
+            &identity,
+            SnapshotKind::Delta,
+            2,
+            3,
+            &events[2..],
+            artifact_root,
+        );
+        let delta_cid = raw_cid(&delta_bytes);
+        let delta_descriptor = ArtifactDescriptor::from_bytes(delta_cid.to_string(), &delta_bytes);
+        let artifact_server = spawn_json_rpc(vec![
+            raw_car_bytes(delta_cid, &[(delta_cid, delta_bytes.clone())]),
+            raw_car_bytes(base_cid, &[(base_cid, base_bytes)]),
+            raw_car_bytes(delta_cid, &[(delta_cid, delta_bytes)]),
+        ]);
+        let ingestor = manifest_ingestor(
+            &signing_key,
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
+            None,
+        );
+        let mut entry = test_entry(&identity, 3, artifact_root.0);
+        entry.base = base_descriptor;
+        entry.deltas = vec![delta_descriptor];
+        let mut persisted = persisted_cache(&identity, cache, 2, durable_root, &entry);
+        persisted.record.base_descriptor = descriptor_record(&entry.base);
+        persisted.record.applied_delta_descriptors.clear();
+        let observed_manifest = ObservedPoiManifest {
+            manifest: Manifest::new(2, 9_500, 5, FixedBytes::ZERO, vec![entry]),
+        };
+
+        let mut refresh = ingestor
+            .refresh_verified_cache(identity, Some(persisted), &observed_manifest, 0)
+            .await
+            .expect("overlapping incremental delta should use suffix merge");
+
+        assert_eq!(refresh.manifest_sequence, 5);
+        assert_eq!(refresh.cache.progress().next_event_index, 4);
+        assert_eq!(root_for_tip(&mut refresh.cache, 3), artifact_root);
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{delta_cid}?format=car&dag-scope=entity")
+        );
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{base_cid}?format=car&dag-scope=entity")
+        );
+        assert_eq!(
+            artifact_server.request_path(),
+            format!("/ipfs/{delta_cid}?format=car&dag-scope=entity")
         );
     }
 
@@ -3280,8 +3938,8 @@ mod tests {
         ]);
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
-            vec![artifact_server.url.clone()],
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
             None,
         );
         let mut entry = test_entry(&identity, 3, root_3.0);
@@ -3361,8 +4019,8 @@ mod tests {
         ]);
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
-            vec![artifact_server.url.clone()],
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
             None,
         );
         let mut entry = test_entry(&identity, 1, root_1.0);
@@ -3426,7 +4084,7 @@ mod tests {
         let proxy = spawn_json_rpc(Vec::new());
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(proxy.url.clone()),
+            PoiArtifactManifestSource::Url(proxy.url.clone().into()),
             Vec::new(),
             None,
         );
@@ -3469,8 +4127,8 @@ mod tests {
             spawn_manifest_server(200, raw_car_bytes(base_cid, &[(base_cid, base_bytes)]));
         let ingestor = manifest_ingestor(
             &signing_key,
-            PoiArtifactManifestSource::Url(artifact_server.url.clone()),
-            vec![artifact_server.url.clone()],
+            PoiArtifactManifestSource::Url(artifact_server.url.clone().into()),
+            vec![artifact_server.url.clone().into()],
             None,
         );
         let mut entry = test_entry(&identity, 1, root_1.0);
@@ -3559,6 +4217,7 @@ mod tests {
             entry,
             cache_generation: loaded.cache_generation,
             corpus_advanced: true,
+            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
         };
 
         let reset = clear_poi_artifact_cache_for_reset(&db)
@@ -3689,7 +4348,7 @@ mod tests {
     fn manifest_ingestor(
         signing_key: &SigningKey,
         manifest_source: PoiArtifactManifestSource,
-        gateway_urls: Vec<Url>,
+        gateway_urls: Vec<SensitiveUrl>,
         max_manifest_age: Option<Duration>,
     ) -> PoiArtifactIngestor {
         PoiArtifactIngestor::new(
@@ -3760,6 +4419,100 @@ mod tests {
         });
 
         MockManifestServer { url, requests }
+    }
+
+    struct ConcurrentArtifactServer {
+        url: Url,
+        accepted: tokio::sync::mpsc::UnboundedReceiver<usize>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ConcurrentArtifactServer {
+        fn release(&self) {
+            let (released, wake) = self.release.as_ref();
+            *released.lock().expect("artifact release lock") = true;
+            wake.notify_all();
+        }
+    }
+
+    fn spawn_concurrent_artifact_server(artifacts: &[Vec<u8>]) -> ConcurrentArtifactServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind artifact server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("artifact server URL");
+        let responses = Arc::new(
+            artifacts
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    let cid = raw_cid(bytes);
+                    (
+                        format!("/ipfs/{cid}?format=car&dag-scope=entity"),
+                        (index, raw_car_bytes(cid, &[(cid, bytes.clone())])),
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        );
+        let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let request_count = artifacts.len();
+        let server_release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            for accepted_index in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept artifact request");
+                accepted_tx
+                    .send(accepted_index)
+                    .expect("record accepted artifact request");
+                let responses = Arc::clone(&responses);
+                let release = Arc::clone(&server_release);
+                std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let read = stream.read(&mut buf).expect("read artifact request");
+                        assert!(read > 0, "artifact client closed before request headers");
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request_text = String::from_utf8_lossy(&request);
+                    let path = request_text
+                        .split_whitespace()
+                        .nth(1)
+                        .expect("artifact request path");
+                    let (artifact_index, body) =
+                        responses.get(path).expect("known artifact request").clone();
+                    let (released, wake) = release.as_ref();
+                    let mut released = released.lock().expect("artifact release lock");
+                    while !*released {
+                        released = wake.wait(released).expect("artifact release wait");
+                    }
+                    drop(released);
+                    if artifact_index == 0 {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/vnd.ipld.car\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write artifact response headers");
+                    stream
+                        .write_all(&body)
+                        .expect("write artifact response body");
+                });
+            }
+        });
+
+        ConcurrentArtifactServer {
+            url,
+            accepted,
+            release,
+        }
     }
 
     fn spawn_json_rpc(responses: Vec<Vec<u8>>) -> MockManifestServer {

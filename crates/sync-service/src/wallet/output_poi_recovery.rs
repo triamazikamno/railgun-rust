@@ -705,7 +705,6 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             "output POI recovery TXID data recovered"
         );
 
-        // Protocol A: last-moment fence after long TXID await, before any private-disclosing proof RPC.
         if !request
             .candidate_still_current(candidate, &recoverable_list_keys)
             .await

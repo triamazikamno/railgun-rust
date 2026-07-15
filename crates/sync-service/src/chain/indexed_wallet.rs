@@ -85,10 +85,6 @@ impl IndexedWalletArtifactProbe {
             catalog_count,
         })
     }
-
-    pub(super) fn catch_up_target(self, safe_head: u64) -> u64 {
-        self.latest_indexed_block.min(safe_head)
-    }
 }
 
 pub(super) struct IndexedWalletPage {
@@ -344,6 +340,7 @@ impl IndexedWalletPage {
 
 pub(super) struct IndexedWalletArtifactSession {
     probe: IndexedWalletArtifactProbe,
+    target_block: u64,
     chunk_descriptors: Vec<IndexedArtifactDescriptor>,
     chunks: Vec<IndexedWalletArtifactChunk>,
     coverage: WalletScanArtifactCoverage,
@@ -391,17 +388,38 @@ impl IndexedWalletArtifactSession {
         else {
             return Ok(None);
         };
-        let target_block = to_block.min(probe.latest_indexed_block);
+        let advertised_target_block = to_block.min(probe.latest_indexed_block);
         let Some(chain_entry) = manifest.chains.iter().find(|entry| entry.scope == scope) else {
             return Ok(None);
         };
         let descriptor_started = Instant::now();
-        let descriptors =
-            Self::fetch_descriptors(&client, chain_entry, &scope, from_block, target_block).await?;
+        let descriptors = Self::fetch_descriptors(
+            &client,
+            chain_entry,
+            &scope,
+            from_block,
+            advertised_target_block,
+        )
+        .await?;
         let IndexedWalletArtifactDescriptorFetchResult {
-            required_current_chunks,
+            mut required_current_chunks,
             coverage,
         } = descriptors;
+        let all_chunk_descriptors = required_current_chunks
+            .iter()
+            .map(|entry| entry.descriptor.clone())
+            .collect::<Vec<_>>();
+        let Some(target_block) = wallet_scan_artifact_target_block(
+            &coverage,
+            &all_chunk_descriptors,
+            from_block,
+            advertised_target_block,
+        )?
+        else {
+            return Ok(None);
+        };
+        required_current_chunks
+            .retain(|entry| entry.descriptor.range.intersects(from_block, target_block));
         let chunk_descriptors = required_current_chunks
             .iter()
             .map(|entry| entry.descriptor.clone())
@@ -411,6 +429,7 @@ impl IndexedWalletArtifactSession {
             from_block,
             to_block,
             target_block,
+            advertised_target_block,
             latest_indexed_block = probe.latest_indexed_block,
             catalog_count = probe.catalog_count,
             chunk_count = chunk_descriptors.len(),
@@ -433,6 +452,7 @@ impl IndexedWalletArtifactSession {
             from_block,
             to_block,
             target_block,
+            advertised_target_block,
             latest_indexed_block = probe.latest_indexed_block,
             catalog_count = probe.catalog_count,
             chunk_count = chunk_descriptors.len(),
@@ -442,6 +462,7 @@ impl IndexedWalletArtifactSession {
         );
         Ok(Some(Self {
             probe,
+            target_block,
             chunk_descriptors,
             chunks: chunks.chunks,
             coverage,
@@ -449,12 +470,12 @@ impl IndexedWalletArtifactSession {
         }))
     }
 
-    pub(super) const fn probe(&self) -> IndexedWalletArtifactProbe {
-        self.probe
-    }
-
     pub(super) const fn latest_indexed_block(&self) -> u64 {
         self.probe.latest_indexed_block
+    }
+
+    pub(super) const fn target_block(&self) -> u64 {
+        self.target_block
     }
 
     pub(super) const fn catalog_count(&self) -> usize {
@@ -474,10 +495,10 @@ impl IndexedWalletArtifactSession {
         from_block: u64,
         to_block: u64,
     ) -> Result<IndexedWalletArtifactPageOutcome, SyncError> {
-        let target_block = to_block.min(self.probe.latest_indexed_block);
+        let target_block = to_block.min(self.target_block);
         if target_block < from_block {
             return Ok(IndexedWalletArtifactPageOutcome::Exhausted {
-                checkpoint_block: self.probe.latest_indexed_block,
+                checkpoint_block: self.target_block,
             });
         }
         let started = Instant::now();
@@ -832,6 +853,34 @@ impl WalletScanArtifactCoverage {
             |checkpoint_block| Ok(WalletScanCoverageStatus::Available { checkpoint_block }),
         )
     }
+}
+
+fn wallet_scan_artifact_target_block(
+    coverage: &WalletScanArtifactCoverage,
+    chunk_descriptors: &[IndexedArtifactDescriptor],
+    from_block: u64,
+    requested_target_block: u64,
+) -> Result<Option<u64>, SyncError> {
+    let mut target_block =
+        match coverage.checkpoint_for_range(from_block, requested_target_block)? {
+            WalletScanCoverageStatus::Available { checkpoint_block }
+            | WalletScanCoverageStatus::Exhausted { checkpoint_block } => checkpoint_block,
+        };
+    if target_block < from_block {
+        return Ok(None);
+    }
+
+    for descriptor in chunk_descriptors {
+        if !descriptor.range.intersects(from_block, target_block) {
+            continue;
+        }
+        let bounds = WalletScanChunkBounds::try_from(descriptor)?;
+        if bounds.checkpoint_block < bounds.range_end {
+            target_block = target_block.min(bounds.checkpoint_block);
+        }
+    }
+
+    Ok((target_block >= from_block).then_some(target_block))
 }
 
 #[derive(Clone, Copy)]
@@ -1366,6 +1415,23 @@ pub(super) fn wallet_backfill_from_block(last_scanned: u64, start_block: u64) ->
     last_scanned.saturating_add(1).max(start_block)
 }
 
+pub(super) fn wallet_startup_warm_from_block(
+    start_block: u64,
+    sync_target: u64,
+    block_range: u64,
+) -> u64 {
+    sync_target
+        .saturating_sub(block_range.saturating_sub(1))
+        .max(start_block)
+}
+
+pub(super) fn wallet_remote_target_before_cached_suffix(
+    sync_target: u64,
+    cached_suffix_from: Option<u64>,
+) -> u64 {
+    cached_suffix_from.map_or(sync_target, |from_block| from_block.saturating_sub(1))
+}
+
 pub(super) fn wallet_reorg_backfill_from_block(reset_from_block: u64, start_block: u64) -> u64 {
     reset_from_block.max(start_block)
 }
@@ -1419,10 +1485,8 @@ pub(super) fn should_hedge_wallet_startup(
     start_block: u64,
     sync_target: u64,
     block_range: u64,
-    indexed_artifact_source_configured: bool,
 ) -> bool {
-    !indexed_artifact_source_configured
-        && block_range > 0
+    block_range > 0
         && wallet_startup_hedge_block_count(last_scanned, start_block, sync_target)
             .is_some_and(|block_count| block_count <= block_range)
 }
@@ -1782,6 +1846,44 @@ mod tests {
         assert_eq!(page.legacy_encrypted_rows, 0);
         assert_eq!(page.legacy_generated_rows, 0);
         assert_eq!(page.nullifier_rows, 0);
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_target_stops_at_catalog_checkpoint() {
+        let coverage = WalletScanArtifactCoverage {
+            ranges: vec![WalletScanCoverageRange {
+                start: 100,
+                end: 200,
+                checkpoint_block: 175,
+            }],
+        };
+
+        let target = wallet_scan_artifact_target_block(&coverage, &[], 100, 200)
+            .expect("valid coverage target");
+
+        assert_eq!(target, Some(175));
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_target_stops_at_chunk_checkpoint() {
+        let coverage = coverage_from_ranges(&[(100, 200)]);
+        let mut descriptor = wallet_scan_chunk(scope(), 100, 200, Vec::new(), 0).descriptor;
+        descriptor.metadata.checkpoint_block = Some(180);
+
+        let target = wallet_scan_artifact_target_block(&coverage, &[descriptor], 100, 200)
+            .expect("valid chunk target");
+
+        assert_eq!(target, Some(180));
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_target_accepts_proven_sparse_coverage() {
+        let coverage = coverage_from_ranges(&[(100, 200)]);
+
+        let target = wallet_scan_artifact_target_block(&coverage, &[], 100, 200)
+            .expect("valid sparse target");
+
+        assert_eq!(target, Some(200));
     }
 
     #[test]
@@ -2413,6 +2515,7 @@ mod tests {
                 latest_indexed_block,
                 catalog_count: chunk_descriptors.len(),
             },
+            target_block: latest_indexed_block,
             chunk_descriptors,
             chunks: indexed_chunks,
             coverage,

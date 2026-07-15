@@ -40,7 +40,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         recovery_chunk,
         started,
     } = request;
-    // Protocol C1: local-first public cache. Consult validated local state before requiring network.
     let endpoint = cfg.quick_sync_endpoint.as_ref();
     let has_network_source = endpoint.is_some() || indexed_artifact_source.is_some();
     let cache_key = PublicTxidCacheKey::new(

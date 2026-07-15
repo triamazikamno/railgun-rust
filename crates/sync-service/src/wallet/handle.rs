@@ -16,12 +16,13 @@ pub(super) const OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER: Duration = Duration::from_
 pub(super) const EVM_CHAIN_TYPE: u8 = 0;
 pub(super) const RETIRED_WALLET_ACTOR_ID: u64 = 0;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WalletPoiRefreshSelection {
     Required,
     RequiredOrRecoverable,
     RecoverableStale { now: u64 },
     Recoverable,
+    CorpusRevision { blocked_shields_changed: bool },
 }
 
 impl WalletPoiRefreshSelection {
@@ -31,6 +32,7 @@ impl WalletPoiRefreshSelection {
             Self::RequiredOrRecoverable => "required_or_recoverable",
             Self::RecoverableStale { .. } => "recoverable_stale",
             Self::Recoverable => "recoverable",
+            Self::CorpusRevision { .. } => "corpus_revision",
         }
     }
 
@@ -57,6 +59,19 @@ impl WalletPoiRefreshSelection {
                 .utxo
                 .poi
                 .has_recoverable_status_for_lists(active_list_keys),
+            Self::CorpusRevision {
+                blocked_shields_changed,
+            } => {
+                wallet_utxo
+                    .utxo
+                    .poi
+                    .has_recoverable_status_for_lists(active_list_keys)
+                    || (blocked_shields_changed
+                        && matches!(
+                            wallet_utxo.utxo.poi.commitment_kind,
+                            UtxoCommitmentKind::Shield
+                        ))
+            }
             Self::RecoverableStale { now } => {
                 wallet_utxo
                     .utxo
@@ -80,20 +95,20 @@ use super::{
     Mutex, Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextIntent,
     PendingOutputPoiContextRecord, PoiStatus, RwLock, SyncProgressUpdate, Utxo, UtxoCommitmentKind,
     UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
-    WalletActorLifecycle, WalletActorLifecycleCell, WalletBackfillRejectReason,
-    WalletBackfillStartResult, WalletCacheError, WalletCacheKey, WalletCurrentSnapshot,
-    WalletInactiveReason, WalletIndexedCatchUpStatus, WalletPrivateRequestError, WalletReadiness,
-    WalletResetToken, WalletScanRows, WalletSyncToken, WalletUtxo, WalletViewState,
+    WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
+    WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCacheKey,
+    WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpStatus, WalletObservation,
+    WalletObservationPublisher, WalletPrivateRequestError, WalletReadiness, WalletResetToken,
+    WalletScanRows, WalletSyncToken, WalletUtxo, WalletViewState, Weak,
     chain_pending_overlay_matches, debug, mpsc, now_epoch_secs, oneshot,
     wallet_utxo_stable_identity, warn, watch,
 };
-
-use crate::types::SyncProgressSender;
+use crate::types::{ChainKey, SyncProgressSender, WalletSyncTargetLease};
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
     pub cache_key: WalletCacheKey,
-    pub(super) chain_id: u64,
+    pub(super) chain: ChainKey,
     pub(super) actor_id: u64,
     pub(super) active_actor_id: Arc<AtomicU64>,
     pub(super) lifecycle: Arc<WalletActorLifecycleCell>,
@@ -105,11 +120,11 @@ pub struct WalletHandle {
     /// Private remote-job invalidation. Updated synchronously with reset generation.
     pub(super) reset_generation_rx: watch::Receiver<u64>,
     pub(super) next_sync_job_id: Arc<AtomicU64>,
-    pub ready_rx: watch::Receiver<bool>,
-    pub readiness_rx: watch::Receiver<WalletReadiness>,
+    pub(super) observation: Weak<WalletObservationPublisher>,
+    #[cfg(test)]
+    pub(super) _observation_test_owner: Option<Arc<WalletObservationPublisher>>,
+    pub(super) observation_rx: watch::Receiver<WalletObservation>,
     pub rev_rx: watch::Receiver<u64>,
-    /// Single-source public private-view (Current vs `ResetPending`).
-    pub(super) view_rx: watch::Receiver<WalletViewState>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
     pub indexed_catch_up_rx: watch::Receiver<Option<WalletIndexedCatchUpStatus>>,
     pub(super) pending_overlay_tx: mpsc::Sender<WalletPendingOverlayRequest>,
@@ -118,7 +133,6 @@ pub struct WalletHandle {
     pub(super) indexed_catch_up_status_tx: mpsc::UnboundedSender<WalletIndexedCatchUpCommand>,
     pub(super) rev_tx: watch::Sender<u64>,
     pub(super) reset_generation_tx: watch::Sender<u64>,
-    pub(super) view_tx: watch::Sender<WalletViewState>,
     pub(super) indexed_catch_up_tx: watch::Sender<Option<WalletIndexedCatchUpStatus>>,
 }
 
@@ -130,7 +144,7 @@ pub(crate) struct WalletActorTokenAuthority<'a> {
 impl WalletActorTokenAuthority<'_> {
     #[must_use]
     pub(crate) const fn chain_id(self) -> u64 {
-        self.handle.chain_id
+        self.handle.chain.chain_id
     }
 
     #[must_use]
@@ -516,7 +530,10 @@ impl<'a> WalletPrivateMutationAuthority<'a> {
     ) -> Result<WalletPrivateMutationPermit<'a>, WalletBackfillRejectReason> {
         self.handle
             .revalidate_durable_commit(self.cancel, self.reset_generation)?;
-        let guard = self.handle.actor_authority(self.reset_generation).await?;
+        let guard = self
+            .handle
+            .actor_authority(self.cancel, self.reset_generation)
+            .await?;
         self.revalidate()?;
         Ok(WalletPrivateMutationPermit {
             handle: self.handle,
@@ -613,38 +630,25 @@ impl WalletPrivateMutationPermit<'_> {
         self.with_active_apply(apply)
     }
 
-    /// Token-gated helpers — only call inside `with_active_apply` (no re-fence).
-    ///
-    /// Publishes a full private projection. Pass the mirrors already held/updated under apply.
-    pub(super) fn apply_set_last_scanned(
+    pub(super) fn apply_set_last_scanned_mirror(
         &self,
         _token: &WalletActorApplyToken<'_>,
         block: u64,
-        utxos: &[WalletUtxo],
-        overlay: &WalletPendingOverlay,
     ) {
         self.handle.last_scanned.store(block, Ordering::Relaxed);
-        self.handle.publish_view_current_projection(utxos, overlay);
     }
 
-    pub(super) fn apply_publish_view_reset_pending(
-        &self,
-        _token: &WalletActorApplyToken<'_>,
-        intent_id: u64,
-        from_block: u64,
-        reset_generation: u64,
-    ) {
-        self.handle
-            .publish_view_reset_pending(intent_id, from_block, reset_generation);
+    pub(super) fn apply_increment_revision(&self, _token: &WalletActorApplyToken<'_>) {
+        self.handle.increment_revision();
     }
 
-    pub(super) fn apply_publish_view_current(
+    pub(super) fn apply_current_view(
         &self,
         _token: &WalletActorApplyToken<'_>,
         utxos: &[WalletUtxo],
         overlay: &WalletPendingOverlay,
-    ) {
-        self.handle.publish_view_current_projection(utxos, overlay);
+    ) -> WalletViewState {
+        self.handle.current_view_projection(utxos, overlay)
     }
 
     pub(super) fn apply_notify_changed(
@@ -663,20 +667,6 @@ impl WalletPrivateMutationPermit<'_> {
     ) {
         if let Some(progress_tx) = progress_tx {
             let _ = progress_tx.send(Some(update));
-        }
-    }
-
-    pub(super) fn apply_publish_readiness(
-        _token: &WalletActorApplyToken<'_>,
-        ready_tx: &watch::Sender<bool>,
-        readiness_tx: &watch::Sender<WalletReadiness>,
-        readiness: &WalletReadiness,
-    ) {
-        if let Err(err) = readiness_tx.send(readiness.clone()) {
-            debug!(?err, "failed to send wallet readiness state");
-        }
-        if let Err(err) = ready_tx.send(readiness.is_ready()) {
-            debug!(?err, "failed to send ready state");
         }
     }
 
@@ -779,6 +769,19 @@ pub(super) use crate::types::{WalletPendingOverlay, WalletPendingSpent};
 
 impl WalletHandle {
     #[must_use]
+    pub(crate) const fn chain_key(&self) -> &ChainKey {
+        &self.chain
+    }
+
+    #[must_use]
+    pub(crate) fn same_actor_as(&self, other: &Self) -> bool {
+        self.chain == other.chain
+            && self.cache_key == other.cache_key
+            && self.actor_id == other.actor_id
+            && Arc::ptr_eq(&self.active_actor_id, &other.active_actor_id)
+    }
+
+    #[must_use]
     pub(crate) const fn actor_id(&self) -> u64 {
         self.actor_id
     }
@@ -798,19 +801,12 @@ impl WalletHandle {
         self.lifecycle.activate()
     }
 
-    /// Prepared/Active → Stopping. Used when cancel is observed for a still-current actor.
-    pub(crate) fn mark_stopping(&self) -> bool {
-        self.lifecycle.mark_stopping_with(|| {
-            self.view_tx.send_replace(WalletViewState::Inactive {
-                reason: WalletInactiveReason::Shutdown,
-                reset_generation: self.authority_reset_generation(),
-            });
-        })
-    }
-
     /// Exactly one terminal Shutdown publish while Stopping and still current.
     /// Runs `publish` under the lifecycle fence so retire cannot interleave.
-    pub(crate) fn publish_terminal_shutdown_if_allowed(&self, publish: impl FnOnce()) -> bool {
+    pub(crate) fn publish_terminal_shutdown_if_allowed(
+        &self,
+        publish: impl for<'a> FnOnce(WalletActorTerminalToken<'a>),
+    ) -> bool {
         self.lifecycle
             .publish_terminal_shutdown_if_allowed(self.is_current_actor(), publish)
     }
@@ -838,9 +834,14 @@ impl WalletHandle {
 
     async fn actor_authority(
         &self,
+        cancel: &CancellationToken,
         expected_reset_generation: u64,
     ) -> Result<OwnedMutexGuard<()>, WalletBackfillRejectReason> {
-        let guard = Arc::clone(&self.authority_lock).lock_owned().await;
+        let guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(WalletBackfillRejectReason::Shutdown),
+            guard = Arc::clone(&self.authority_lock).lock_owned() => guard,
+        };
         if !self.lifecycle().allows_durable_commits() || !self.is_current_actor() {
             return Err(WalletBackfillRejectReason::Shutdown);
         }
@@ -855,15 +856,62 @@ impl WalletHandle {
     }
 
     /// Thin identity fence: does not wait on `authority_lock` (which may be held across remote I/O).
+    #[cfg(test)]
     pub(crate) fn retire_actor(&self) {
+        let observation = self.observation.upgrade();
+        self.retire_actor_with_observation(observation.as_deref(), WalletInactiveReason::Retired);
+    }
+
+    pub(crate) fn retire_actor_with_publisher(&self, observation: &WalletObservationPublisher) {
+        self.retire_actor_with_observation(Some(observation), WalletInactiveReason::Retired);
+    }
+
+    pub(crate) fn retire_actor_for_shutdown(&self, observation: &WalletObservationPublisher) {
+        self.retire_actor_with_observation(Some(observation), WalletInactiveReason::Shutdown);
+    }
+
+    fn retire_actor_with_observation(
+        &self,
+        observation: Option<&WalletObservationPublisher>,
+        reason: WalletInactiveReason,
+    ) {
         self.lifecycle.mark_retired(|| {
             self.active_actor_id
                 .store(RETIRED_WALLET_ACTOR_ID, Ordering::Release);
-            self.view_tx.send_replace(WalletViewState::Inactive {
-                reason: WalletInactiveReason::Retired,
-                reset_generation: self.authority_reset_generation(),
-            });
+            if let Some(observation) = observation {
+                observation.publish_terminal(reason, self.authority_reset_generation());
+            }
         });
+    }
+
+    pub(crate) fn terminalize_panicked_actor(&self, observation: &WalletObservationPublisher) {
+        let _ = self.publish_terminal_shutdown_if_allowed(|_token| {
+            observation.publish_terminal(
+                WalletInactiveReason::Shutdown,
+                self.authority_reset_generation(),
+            );
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_actor_authority_for_test(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.authority_lock).lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_readiness_for_test(&self, readiness: &WalletReadiness) {
+        self.observation
+            .upgrade()
+            .expect("test observation publisher remains owned")
+            .publish_readiness(readiness.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_view_for_test(&self, view: WalletViewState) {
+        self.observation
+            .upgrade()
+            .expect("test observation publisher remains owned")
+            .publish_view(view);
     }
 
     /// Final validation + synchronous private apply under the lifecycle fence.
@@ -966,6 +1014,40 @@ impl WalletHandle {
             })
     }
 
+    pub(crate) async fn reserve_sync_target(
+        &self,
+        cache_key: &str,
+        sender: &mpsc::Sender<BackfillEvent>,
+        progress: crate::types::WalletSchedulableProgress,
+        target_block: u64,
+    ) -> Result<WalletSyncTargetLease, WalletBackfillRejectReason> {
+        let Some(progress) = self.revalidate_schedulable_progress(progress) else {
+            let current = self.schedulable_progress();
+            return Err(WalletBackfillRejectReason::StaleGeneration {
+                expected: current.map_or(progress.reset_generation, |p| p.reset_generation),
+                actual: progress.reset_generation,
+            });
+        };
+        let (response, result_rx) = oneshot::channel();
+        sender
+            .send(BackfillEvent::ReserveTarget {
+                target_block,
+                token: self.mint_sync_token(progress.reset_generation),
+                response,
+            })
+            .await
+            .map_err(|err| {
+                warn!(
+                    ?err,
+                    cache_key, target_block, "failed to reserve wallet sync target"
+                );
+                WalletBackfillRejectReason::Shutdown
+            })?;
+        result_rx
+            .await
+            .unwrap_or(Err(WalletBackfillRejectReason::Shutdown))
+    }
+
     /// Revalidate a stored progress ticket against the current public view.
     ///
     /// Returns refreshed progress (same generation, possibly advanced cursor) or `None` if
@@ -1016,18 +1098,18 @@ impl WalletHandle {
         &self,
         cancel: &CancellationToken,
     ) -> Option<crate::types::WalletSchedulableProgress> {
-        let mut view_rx = self.view_rx.clone();
+        let mut observation_rx = self.observation_rx.clone();
         loop {
             if cancel.is_cancelled() {
                 return None;
             }
-            let view = view_rx.borrow_and_update().clone();
-            if let Some(progress) = view.schedulable_progress() {
+            let observation = observation_rx.borrow_and_update().clone();
+            if let Some(progress) = observation.view().schedulable_progress() {
                 return Some(progress);
             }
             tokio::select! {
                 () = cancel.cancelled() => return None,
-                changed = view_rx.changed() => {
+                changed = observation_rx.changed() => {
                     if changed.is_err() {
                         return None;
                     }
@@ -1038,17 +1120,22 @@ impl WalletHandle {
 
     #[must_use]
     pub fn view_state(&self) -> WalletViewState {
-        self.view_rx.borrow().clone()
-    }
-
-    #[must_use]
-    pub fn subscribe_view(&self) -> watch::Receiver<WalletViewState> {
-        self.view_rx.clone()
+        self.observation().view().clone()
     }
 
     #[must_use]
     pub fn readiness(&self) -> WalletReadiness {
-        self.readiness_rx.borrow().clone()
+        self.observation().readiness().clone()
+    }
+
+    #[must_use]
+    pub fn observation(&self) -> WalletObservation {
+        self.observation_rx.borrow().clone()
+    }
+
+    #[must_use]
+    pub fn subscribe_observation(&self) -> watch::Receiver<WalletObservation> {
+        self.observation_rx.clone()
     }
 
     /// Authority reset generation for token revalidation and actor minting.
@@ -1103,22 +1190,26 @@ impl WalletHandle {
     }
 
     fn notify_changed_with_projection(&self, utxos: &[WalletUtxo], overlay: &WalletPendingOverlay) {
+        self.increment_revision();
+        if self.observation_rx.borrow().view().is_current() {
+            self.publish_view_current_projection(utxos, overlay);
+        }
+    }
+
+    fn increment_revision(&self) {
         let rev = self.rev_rx.borrow().wrapping_add(1);
         if let Err(err) = self.rev_tx.send(rev) {
             debug!(?err, cache_key = %self.cache_key, "failed to send wallet revision");
-        }
-        if self.view_rx.borrow().is_current() {
-            self.publish_view_current_projection(utxos, overlay);
         }
     }
 
     /// Publish full private projection as [`WalletViewState::Current`].
     /// Call only with mirrors that match actor-owned state at this apply.
-    fn publish_view_current_projection(
+    fn current_view_projection(
         &self,
         utxos: &[WalletUtxo],
         overlay: &WalletPendingOverlay,
-    ) {
+    ) -> WalletViewState {
         let last_scanned = self.last_scanned.load(Ordering::Relaxed);
         let revision = *self.rev_rx.borrow();
         let reset_generation = self.authority_reset_generation();
@@ -1129,18 +1220,17 @@ impl WalletHandle {
             Arc::<[WalletUtxo]>::from(utxos.to_vec()),
             Arc::new(overlay.clone()),
         );
-        if let Err(err) = self.view_tx.send(WalletViewState::Current(snapshot)) {
-            debug!(?err, cache_key = %self.cache_key, "failed to send wallet view state");
-        }
+        WalletViewState::Current(snapshot)
     }
 
-    fn publish_view_reset_pending(&self, intent_id: u64, from_block: u64, reset_generation: u64) {
-        if let Err(err) = self.view_tx.send(WalletViewState::ResetPending {
-            intent_id,
-            from_block,
-            reset_generation,
-        }) {
-            debug!(?err, cache_key = %self.cache_key, "failed to send wallet reset-pending view");
+    fn publish_view_current_projection(
+        &self,
+        utxos: &[WalletUtxo],
+        overlay: &WalletPendingOverlay,
+    ) {
+        let view = self.current_view_projection(utxos, overlay);
+        if let Some(observation) = self.observation.upgrade() {
+            observation.publish_view(view);
         }
     }
 

@@ -17,10 +17,21 @@ pub(super) struct WalletBackfill {
     pub(super) target_block: u64,
     pub(super) follow_safe_head: bool,
     pub(super) progress_start_block: u64,
+    acquisition_range: Option<(u64, u64)>,
     pub(super) driver: WalletBackfillDriver,
     pub(super) last_advanced_at: Instant,
     pub(super) last_indexed_tail_attempt_at: Option<Instant>,
+    run_state: WalletBackfillRunState,
 }
+
+#[derive(Clone, Copy)]
+enum WalletBackfillRunState {
+    Runnable,
+    PersistenceBackoff { attempt: u32, retry_at: Instant },
+}
+
+const PERSISTENCE_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
+const PERSISTENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 pub(super) struct WalletTailFallbackState {
     last_scanned: u64,
@@ -78,6 +89,7 @@ impl WalletBackfill {
         target_block: u64,
         follow_safe_head: bool,
         progress_start_block: u64,
+        acquisition_range: Option<(u64, u64)>,
         driver: WalletBackfillDriver,
         now: Instant,
     ) -> Self {
@@ -86,9 +98,11 @@ impl WalletBackfill {
             target_block,
             follow_safe_head,
             progress_start_block,
+            acquisition_range,
             driver,
             last_advanced_at: now,
             last_indexed_tail_attempt_at: None,
+            run_state: WalletBackfillRunState::Runnable,
         }
     }
 
@@ -103,17 +117,43 @@ impl WalletBackfill {
         }
     }
 
+    pub(super) const fn acquisition_range(&self) -> Option<(u64, u64)> {
+        self.acquisition_range
+    }
+
+    pub(super) const fn fetch_target_block(&self) -> u64 {
+        match self.acquisition_range {
+            Some((_, to_block)) => to_block,
+            None => self.target_block,
+        }
+    }
+
+    pub(super) const fn finish_acquisition(&mut self) {
+        self.acquisition_range = None;
+    }
+
+    pub(super) const fn can_finish(&self) -> bool {
+        self.acquisition_range.is_none()
+            && self.target_block > 0
+            && self.from_block > self.target_block
+    }
+
     pub(super) const fn mark_progress(&mut self, from_block: u64, now: Instant) {
         self.from_block = from_block;
         self.last_advanced_at = now;
+        self.run_state = WalletBackfillRunState::Runnable;
     }
 
-    pub(super) fn retry_after_rejected_apply(&mut self, committed_to: u64, now: Instant) {
+    pub(super) const fn mark_already_covered(&mut self, from_block: u64, now: Instant) {
+        self.mark_progress(from_block, now);
+    }
+
+    pub(super) fn retry_after_rejected_apply(&mut self, committed_to: u64) {
         let retry_from = self.from_block.min(committed_to.saturating_add(1));
-        self.mark_progress(retry_from, now);
+        self.from_block = retry_from;
     }
 
-    pub(super) fn retry_after_rejected_finish(&mut self, committed_to: u64, now: Instant) {
+    pub(super) fn retry_after_rejected_finish(&mut self, committed_to: u64) {
         let replay_from = self
             .progress_start_block
             .min(committed_to.saturating_add(1));
@@ -122,8 +162,34 @@ impl WalletBackfill {
         } else {
             replay_from.min(self.target_block)
         };
-        self.last_advanced_at = now;
         self.last_indexed_tail_attempt_at = None;
+    }
+
+    pub(super) fn is_runnable(&self, now: Instant) -> bool {
+        match self.run_state {
+            WalletBackfillRunState::Runnable => true,
+            WalletBackfillRunState::PersistenceBackoff { retry_at, .. } => now >= retry_at,
+        }
+    }
+
+    pub(super) const fn persistence_retry_at(&self) -> Option<Instant> {
+        match self.run_state {
+            WalletBackfillRunState::Runnable => None,
+            WalletBackfillRunState::PersistenceBackoff { retry_at, .. } => Some(retry_at),
+        }
+    }
+
+    pub(super) fn defer_persistence_retry(&mut self, now: Instant, poll_interval: Duration) {
+        let attempt = match self.run_state {
+            WalletBackfillRunState::Runnable => 0,
+            WalletBackfillRunState::PersistenceBackoff { attempt, .. } => attempt.saturating_add(1),
+        };
+        let base_delay = poll_interval.max(PERSISTENCE_RETRY_MIN_DELAY);
+        let max_delay = PERSISTENCE_RETRY_MAX_DELAY.max(base_delay);
+        let multiplier = 1_u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX);
+        let delay = base_delay.saturating_mul(multiplier).min(max_delay);
+        let retry_at = now.checked_add(delay).unwrap_or(now);
+        self.run_state = WalletBackfillRunState::PersistenceBackoff { attempt, retry_at };
     }
 
     pub(super) const fn mark_indexed_tail_attempt(&mut self, now: Instant) {
@@ -137,7 +203,10 @@ impl WalletBackfill {
         min_stall: Duration,
         cooldown: Duration,
     ) -> bool {
-        if self.target_block == 0 || self.from_block > self.target_block {
+        if self.acquisition_range.is_some()
+            || self.target_block == 0
+            || self.from_block > self.target_block
+        {
             return false;
         }
         let lag_blocks = wallet_backfill_lag_blocks(self.from_block, self.target_block);
@@ -489,6 +558,21 @@ impl ChainService {
 }
 
 impl ChainConfig {
+    pub(super) const fn archive_boundary_crossed_by(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Option<u64> {
+        if self.archive_until_block > 0
+            && from_block <= self.archive_until_block
+            && to_block > self.archive_until_block
+        {
+            Some(self.archive_until_block)
+        } else {
+            None
+        }
+    }
+
     pub(super) async fn fetch_confirmed_block_hash(
         &self,
         provider: &DynProvider,

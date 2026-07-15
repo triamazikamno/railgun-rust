@@ -4,7 +4,8 @@ use super::{
     JoinHandle, MerkleForest, Mutex, PersistError, PublicDataPlaneError, RwLock, SharedLogBatch,
     SyncError, SyncProgressSender, SyncProgressUpdate, TransportError, WalletBackfillResetResult,
     WalletCacheError, WalletConfig, WalletHandle, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus, WalletScanApply, WalletScanError, broadcast, debug, mpsc, watch,
+    WalletIndexedCatchUpStatus, WalletObservationPublisher, WalletScanApply, WalletScanError,
+    broadcast, debug, mpsc, watch,
 };
 use std::time::Duration;
 
@@ -138,6 +139,8 @@ impl<'a> WalletIndexedCatchUpStatusGuard<'a> {
 #[derive(Debug)]
 pub(super) enum WalletStartupSyncError {
     Cancelled,
+    IncompleteRpcCoverage { requested_to: u64, proven_to: u64 },
+    UnprovenRpcEndpoint { block_number: u64 },
     Chain(ChainError),
     Indexed(SyncError),
 }
@@ -146,6 +149,16 @@ impl std::fmt::Display for WalletStartupSyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled => f.write_str("cancelled"),
+            Self::IncompleteRpcCoverage {
+                requested_to,
+                proven_to,
+            } => write!(
+                f,
+                "RPC source covers through {proven_to}, below required block {requested_to}"
+            ),
+            Self::UnprovenRpcEndpoint { block_number } => {
+                write!(f, "RPC source did not prove endpoint block {block_number}")
+            }
             Self::Chain(err) => write!(f, "{err}"),
             Self::Indexed(err) => write!(f, "{err}"),
         }
@@ -167,6 +180,7 @@ impl From<SyncError> for WalletStartupSyncError {
 #[derive(Debug)]
 pub(super) struct WalletStartupSyncCandidate {
     pub(super) strategy: WalletStartupSyncStrategy,
+    pub(super) acquisition_applies: Vec<WalletScanApply>,
     pub(super) applies: Vec<WalletScanApply>,
     pub(super) elapsed_ms: u128,
 }
@@ -216,6 +230,20 @@ pub enum ChainError {
     WalletNotFound,
     #[error("wallet reset failed")]
     WalletResetFailed,
+    #[error(
+        "restored wallet reset replay {replay_start_block}..={replay_target_block} (follow_safe_head={follow_safe_head}) is incompatible with post-rewind cursor {post_rewind_cursor}: replay must start no later than {required_replay_start_block}, and a bounded replay below configured start block {configured_start_block} must cover through {required_replay_target_block}"
+    )]
+    IncompatiblePendingWalletResetReplay {
+        post_rewind_cursor: u64,
+        configured_start_block: u64,
+        replay_start_block: u64,
+        replay_target_block: u64,
+        follow_safe_head: bool,
+        required_replay_start_block: u64,
+        required_replay_target_block: u64,
+    },
+    #[error("chain service is shut down")]
+    Shutdown,
     #[error("wallet reset rejected: {0:?}")]
     WalletResetRejected(WalletBackfillResetResult),
     #[error("backfill request failed")]
@@ -282,6 +310,8 @@ pub(super) struct WalletRegistration {
     pub(super) handle: WalletHandle,
     pub(super) cfg: WalletConfig,
     pub(super) cancel: CancellationToken,
+    pub(super) worker: JoinHandle<()>,
+    pub(super) observation: Arc<WalletObservationPublisher>,
     pub(super) backfill_sender: mpsc::Sender<BackfillEvent>,
     pub(super) start_block: u64,
     pub(super) sync_to_block: Option<u64>,

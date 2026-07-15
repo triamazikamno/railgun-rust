@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use poi::poi::PoiMerkleProof;
 
 use broadcaster_core::contracts::railgun::{
-    ActionData, BoundParams, TokenTransfer, relayCall, transactCall,
+    ActionData, BoundParams, SnarkProof, TokenTransfer, relayCall, transactCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::ViewingKeyData;
@@ -23,7 +23,7 @@ use merkletree::tree::{MerkleForest, MerkleProof, MerkleTreeUpdate};
 
 use crate::artifacts::ArtifactSource;
 use crate::keys::{RailgunSpendSigner, WalletKeys};
-use crate::prover::ProverService;
+use crate::prover::{ProverError, ProverService};
 use crate::tx::{
     BroadcasterFeeOutput, BuildError, CompositePrivateOutputRoleKind, CompositeRelayAction,
     CompositeRelayActionToken, CompositeRelayActions, CompositeUnshieldLeg,
@@ -38,7 +38,7 @@ use crate::tx::{
 
 use super::{
     BoundParamsExt, TransactionPlanBuilder, build_fee_only_outputs, build_send_outputs,
-    build_unshield_outputs, select_utxos,
+    build_unshield_outputs, select_composite_leg_selections, select_utxos,
 };
 use super::{
     max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
@@ -59,6 +59,22 @@ impl RailgunSpendSigner for MockSpendSigner {
     fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
         self.signed_msg.set(Some(msg));
         [uint!(1_U256), uint!(2_U256), uint!(3_U256)]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MockTransactionProver;
+
+#[async_trait]
+impl super::TransactionProver for MockTransactionProver {
+    async fn prove_unshield(
+        &self,
+        _public_inputs: &PublicInputs,
+        _private_inputs: &PrivateInputs,
+        _signature: &[U256; 3],
+        _verify_proof: bool,
+    ) -> Result<SnarkProof, ProverError> {
+        Ok(SnarkProof::default())
     }
 }
 
@@ -158,6 +174,25 @@ fn forest_for_utxos(utxos: &[Utxo]) -> MerkleForest {
     forest
 }
 
+#[test]
+fn input_witness_cache_uses_sparse_proofs_for_small_forests() {
+    let wallet = test_wallet();
+    let token = Address::from([0x58; 20]);
+    let utxos = vec![
+        wallet_test_utxo(&wallet, token, 4, 0, 0),
+        wallet_test_utxo(&wallet, token, 6, 0, 1),
+    ];
+    let forest = forest_for_utxos(&utxos);
+    let expected_root = forest.roots()[&0];
+    let mut cache = super::InputWitnessProofCache::new(&forest);
+
+    let proof = cache.prove(0, 0).expect("sparse proof");
+
+    assert_eq!(proof.root, expected_root);
+    assert_eq!(cache.stats().proof_count, 1);
+    assert_eq!(cache.stats().dense_tree_build_count, 0);
+}
+
 fn test_wallet() -> WalletKeys {
     WalletKeys::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
@@ -173,10 +208,6 @@ fn test_transaction_builder() -> TransactionBuilder {
         railgun_contract: Address::from([0x51; 20]),
         relay_adapt_contract: Address::from([0x52; 20]),
     }
-}
-
-fn test_prover() -> ProverService {
-    ProverService::with_capacity_db(&ArtifactSource::default(), 1, None)
 }
 
 fn selected_positions(selection: &[Utxo]) -> Vec<u64> {
@@ -424,13 +455,11 @@ fn unproven_send_uses_proof_root_from_dirty_forest() {
     let signer = MockSpendSigner {
         signed_msg: Cell::new(None),
     };
-    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
     let plan_builder = TransactionPlanBuilder::new(
         &builder,
         &sender,
         &signer,
         &forest,
-        &prover,
         vec![input.clone()],
         token,
     )
@@ -774,7 +803,14 @@ async fn direct_composite_unshield_uses_transact_and_preserves_fee_output_role()
     };
 
     let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect("direct composite plan");
     let decoded = transactCall::abi_decode(&plan.call.data).expect("decode transact call");
@@ -857,7 +893,14 @@ async fn relay_composite_binds_action_data_and_uses_exact_actions() {
     };
 
     let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect("relay composite plan");
     let decoded = relayCall::abi_decode(&plan.call.data).expect("decode relay call");
@@ -956,7 +999,14 @@ async fn relay_composite_with_later_fee_leg_keeps_fee_transaction_first() {
     };
 
     let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect("relay composite plan");
     let decoded = relayCall::abi_decode(&plan.call.data).expect("decode relay call");
@@ -998,7 +1048,14 @@ async fn composite_unshield_rejects_empty_requests() {
     };
 
     let error = builder
-        .build_composite_unshield_plan(&wallet, &MerkleForest::new(), &[], request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect_err("empty composite request should fail");
 
@@ -1024,7 +1081,14 @@ async fn composite_unshield_rejects_relay_adapt_leg_without_actions() {
     };
 
     let error = builder
-        .build_composite_unshield_plan(&wallet, &MerkleForest::new(), &[], request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect_err("missing RelayAdapt actions should fail");
 
@@ -1053,7 +1117,14 @@ async fn composite_unshield_rejects_relay_adapt_leg_with_empty_actions() {
     };
 
     let error = builder
-        .build_composite_unshield_plan(&wallet, &MerkleForest::new(), &[], request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect_err("empty RelayAdapt actions should fail");
 
@@ -1085,7 +1156,14 @@ async fn composite_unshield_rejects_zero_amount_relay_actions() {
     };
 
     let error = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect_err("zero-amount action should fail");
 
@@ -1125,7 +1203,14 @@ async fn composite_unshield_enforces_eight_transaction_batch_limit() {
     };
 
     let error = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect_err("ninth transaction should fail");
 
@@ -1138,10 +1223,9 @@ async fn composite_unshield_enforces_eight_transaction_batch_limit() {
     ));
 }
 
-#[tokio::test]
-async fn composite_same_token_selection_retries_when_greedy_choice_starves_later_leg() {
+#[test]
+fn composite_same_token_selection_retries_when_greedy_choice_starves_later_leg() {
     let wallet = test_wallet();
-    let builder = test_transaction_builder();
     let token = Address::from([0x85; 20]);
     let recipient = Address::from([0x86; 20]);
     let utxos = vec![
@@ -1149,52 +1233,47 @@ async fn composite_same_token_selection_retries_when_greedy_choice_starves_later
         wallet_test_utxo(&wallet, token, 4, 0, 1),
         wallet_test_utxo(&wallet, token, 4, 0, 2),
     ];
-    let forest = forest_for_utxos(&utxos);
-    let request = CompositeUnshieldRequest {
-        legs: vec![
-            CompositeUnshieldLeg {
-                token_address: token,
-                amount: uint!(8_U256),
-                recipient: CompositeUnshieldRecipient::Public(recipient),
-                role: CompositeUnshieldLegRole::Primary,
-            },
-            CompositeUnshieldLeg {
-                token_address: token,
-                amount: uint!(9_U256),
-                recipient: CompositeUnshieldRecipient::Public(recipient),
-                role: CompositeUnshieldLegRole::Other,
-            },
-        ],
-        relay_actions: None,
-        broadcaster_fee: None,
-        min_gas_price: 0,
-        verify_proof: false,
-        spend_up_to: false,
-    };
+    let legs = vec![
+        CompositeUnshieldLeg {
+            token_address: token,
+            amount: uint!(8_U256),
+            recipient: CompositeUnshieldRecipient::Public(recipient),
+            role: CompositeUnshieldLegRole::Primary,
+        },
+        CompositeUnshieldLeg {
+            token_address: token,
+            amount: uint!(9_U256),
+            recipient: CompositeUnshieldRecipient::Public(recipient),
+            role: CompositeUnshieldLegRole::Other,
+        },
+    ];
 
-    let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
-        .await
-        .expect("same-token composite plan");
+    let (selections, _) = select_composite_leg_selections(&utxos, &legs, None, false, 0)
+        .expect("same-token composite selection");
 
-    assert_eq!(plan.shape.transaction_count, 2);
-    assert_eq!(plan.chunks[0].inputs.len(), 2);
-    assert_eq!(plan.chunks[1].inputs.len(), 1);
     assert_eq!(
-        plan.chunks[0]
-            .inputs
+        selections
             .iter()
-            .map(|input| input.utxo.note.value)
+            .map(|selection| selection.chunks.len())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(selections[0].chunks[0].utxos.len(), 2);
+    assert_eq!(selections[1].chunks[0].utxos.len(), 1);
+    assert_eq!(
+        selections[0].chunks[0]
+            .utxos
+            .iter()
+            .map(|utxo| utxo.note.value)
             .collect::<Vec<_>>(),
         vec![uint!(4_U256), uint!(4_U256)]
     );
-    assert_eq!(plan.chunks[1].inputs[0].utxo.note.value, uint!(9_U256));
+    assert_eq!(selections[1].chunks[0].utxos[0].note.value, uint!(9_U256));
 }
 
-#[tokio::test]
-async fn composite_same_token_selection_retries_multi_transaction_alternates() {
+#[test]
+fn composite_same_token_selection_retries_multi_transaction_alternates() {
     let wallet = test_wallet();
-    let builder = test_transaction_builder();
     let token = Address::from([0x87; 20]);
     let recipient = Address::from([0x88; 20]);
     let utxos = vec![
@@ -1202,44 +1281,39 @@ async fn composite_same_token_selection_retries_multi_transaction_alternates() {
         wallet_test_utxo(&wallet, token, 8, 1, 1),
         wallet_test_utxo(&wallet, token, 7, 2, 2),
     ];
-    let forest = forest_for_utxos(&utxos);
-    let request = CompositeUnshieldRequest {
-        legs: vec![
-            CompositeUnshieldLeg {
-                token_address: token,
-                amount: uint!(15_U256),
-                recipient: CompositeUnshieldRecipient::Public(recipient),
-                role: CompositeUnshieldLegRole::Primary,
-            },
-            CompositeUnshieldLeg {
-                token_address: token,
-                amount: uint!(12_U256),
-                recipient: CompositeUnshieldRecipient::Public(recipient),
-                role: CompositeUnshieldLegRole::Other,
-            },
-        ],
-        relay_actions: None,
-        broadcaster_fee: None,
-        min_gas_price: 0,
-        verify_proof: false,
-        spend_up_to: false,
-    };
+    let legs = vec![
+        CompositeUnshieldLeg {
+            token_address: token,
+            amount: uint!(15_U256),
+            recipient: CompositeUnshieldRecipient::Public(recipient),
+            role: CompositeUnshieldLegRole::Primary,
+        },
+        CompositeUnshieldLeg {
+            token_address: token,
+            amount: uint!(12_U256),
+            recipient: CompositeUnshieldRecipient::Public(recipient),
+            role: CompositeUnshieldLegRole::Other,
+        },
+    ];
 
-    let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
-        .await
-        .expect("same-token composite plan");
+    let (selections, _) = select_composite_leg_selections(&utxos, &legs, None, false, 0)
+        .expect("same-token composite selection");
 
-    assert_eq!(plan.shape.transaction_count, 3);
-    assert_eq!(plan.chunks[0].inputs[0].utxo.note.value, uint!(8_U256));
-    assert_eq!(plan.chunks[1].inputs[0].utxo.note.value, uint!(7_U256));
-    assert_eq!(plan.chunks[2].inputs[0].utxo.note.value, uint!(12_U256));
+    assert_eq!(
+        selections
+            .iter()
+            .map(|selection| selection.chunks.len())
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(selections[0].chunks[0].utxos[0].note.value, uint!(8_U256));
+    assert_eq!(selections[0].chunks[1].utxos[0].note.value, uint!(7_U256));
+    assert_eq!(selections[1].chunks[0].utxos[0].note.value, uint!(12_U256));
 }
 
-#[tokio::test]
-async fn composite_same_token_selection_retries_smaller_partial_tree_chunks() {
+#[test]
+fn composite_same_token_selection_retries_smaller_partial_tree_chunks() {
     let wallet = test_wallet();
-    let builder = test_transaction_builder();
     let token = Address::from([0x89; 20]);
     let recipient = Address::from([0x8a; 20]);
     let utxos = vec![
@@ -1252,58 +1326,43 @@ async fn composite_same_token_selection_retries_smaller_partial_tree_chunks() {
         wallet_test_utxo(&wallet, token, 5, 2, 20),
         wallet_test_utxo(&wallet, token, 12, 2, 21),
     ];
-    let forest = forest_for_utxos(&utxos);
-    let request = CompositeUnshieldRequest {
-        legs: vec![
-            CompositeUnshieldLeg {
-                token_address: token,
-                amount: uint!(49_U256),
-                recipient: CompositeUnshieldRecipient::Public(recipient),
-                role: CompositeUnshieldLegRole::Primary,
-            },
-            CompositeUnshieldLeg {
-                token_address: token,
-                amount: uint!(28_U256),
-                recipient: CompositeUnshieldRecipient::Public(recipient),
-                role: CompositeUnshieldLegRole::Other,
-            },
-        ],
-        relay_actions: None,
-        broadcaster_fee: None,
-        min_gas_price: 0,
-        verify_proof: false,
-        spend_up_to: false,
-    };
+    let legs = vec![
+        CompositeUnshieldLeg {
+            token_address: token,
+            amount: uint!(49_U256),
+            recipient: CompositeUnshieldRecipient::Public(recipient),
+            role: CompositeUnshieldLegRole::Primary,
+        },
+        CompositeUnshieldLeg {
+            token_address: token,
+            amount: uint!(28_U256),
+            recipient: CompositeUnshieldRecipient::Public(recipient),
+            role: CompositeUnshieldLegRole::Other,
+        },
+    ];
 
-    let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
-        .await
-        .expect("same-token composite plan");
+    let (selections, _) = select_composite_leg_selections(&utxos, &legs, None, false, 0)
+        .expect("same-token composite selection");
 
-    let leg_totals = plan
-        .leg_metadata
-        .iter()
-        .map(|leg| {
-            leg.transaction_indices
-                .iter()
-                .map(|index| {
-                    plan.chunks[*index]
-                        .inputs
-                        .iter()
-                        .fold(U256::ZERO, |sum, input| sum + input.utxo.note.value)
-                })
-                .fold(U256::ZERO, |sum, amount| sum + amount)
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(plan.shape.transaction_count, 6);
-    assert_eq!(leg_totals, vec![uint!(49_U256), uint!(28_U256)]);
+    assert_eq!(
+        selections
+            .iter()
+            .map(|selection| selection.chunks.len())
+            .sum::<usize>(),
+        6
+    );
+    assert_eq!(
+        selections
+            .iter()
+            .map(|selection| selection.total)
+            .collect::<Vec<_>>(),
+        vec![uint!(49_U256), uint!(28_U256)]
+    );
 }
 
-#[tokio::test]
-async fn composite_same_size_alternate_tree_candidate_keeps_plan_under_batch_limit() {
+#[test]
+fn composite_same_size_alternate_tree_candidate_keeps_plan_under_batch_limit() {
     let wallet = test_wallet();
-    let builder = test_transaction_builder();
     let token = Address::from([0x8b; 20]);
     let recipient = Address::from([0x8c; 20]);
     let mut utxos = vec![
@@ -1341,30 +1400,22 @@ async fn composite_same_size_alternate_tree_candidate_keeps_plan_under_batch_lim
             role: CompositeUnshieldLegRole::Other,
         });
     }
-    let forest = forest_for_utxos(&utxos);
-    let request = CompositeUnshieldRequest {
-        legs,
-        relay_actions: None,
-        broadcaster_fee: None,
-        min_gas_price: 0,
-        verify_proof: false,
-        spend_up_to: false,
-    };
-
-    let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
-        .await
-        .expect("same-size alternate tree candidate plan");
-    let first_leg_chunk = plan.leg_metadata[0].transaction_indices[0];
-    let second_leg_chunk = plan.leg_metadata[1].transaction_indices[0];
-    let second_leg_inputs = plan.chunks[second_leg_chunk]
-        .inputs
+    let (selections, _) = select_composite_leg_selections(&utxos, &legs, None, false, 0)
+        .expect("same-size alternate tree candidate selection");
+    let second_leg_inputs = selections[1].chunks[0]
+        .utxos
         .iter()
-        .map(|input| (input.utxo.tree, input.utxo.note.value))
+        .map(|utxo| (utxo.tree, utxo.note.value))
         .collect::<Vec<_>>();
 
-    assert_eq!(plan.shape.transaction_count, MAX_BATCH_TRANSACTIONS);
-    assert_eq!(plan.chunks[first_leg_chunk].inputs[0].utxo.tree, 1);
+    assert_eq!(
+        selections
+            .iter()
+            .map(|selection| selection.chunks.len())
+            .sum::<usize>(),
+        MAX_BATCH_TRANSACTIONS
+    );
+    assert_eq!(selections[0].chunks[0].utxos[0].tree, 1);
     assert_eq!(
         second_leg_inputs,
         vec![(0, uint!(10_U256)), (0, uint!(5_U256))]
@@ -1411,7 +1462,14 @@ async fn composite_fee_matching_later_leg_emits_fee_transaction_first() {
     };
 
     let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect("later-leg fee composite plan");
 
@@ -1471,7 +1529,14 @@ async fn composite_same_token_later_fee_emits_fee_transaction_first() {
     };
 
     let plan = builder
-        .build_composite_unshield_plan(&wallet, &forest, &utxos, request, &test_prover())
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &MockTransactionProver,
+        )
         .await
         .expect("same-token later fee composite plan");
 

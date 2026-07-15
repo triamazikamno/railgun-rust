@@ -5,10 +5,13 @@ use crate::types::{
     SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillDriver,
     WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
     WalletBackfillStartResult, WalletConfig, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus, WalletReadiness, WalletReadinessError, WalletResetReplayPlan,
-    WalletScanApply, WalletScanRows, WalletScanRowsPayload,
+    WalletIndexedCatchUpStatus, WalletObservation, WalletReadiness, WalletReadinessError,
+    WalletResetReplayPlan, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
 };
-use crate::wallet::{WalletHandle, WalletPoiRuntime, WalletWorkerServices, wallet_cache_store};
+use crate::wallet::{
+    WalletHandle, WalletObservationPublisher, WalletPoiRuntime, WalletWorkerServices,
+    wallet_cache_store,
+};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, FixedBytes};
 use alloy::sol_types::SolEvent;
@@ -48,7 +51,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
@@ -63,17 +66,18 @@ mod types;
 mod workers;
 
 use backfill::{WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks};
-use data_plane::PublicScanCoverageWrite;
 pub(crate) use data_plane::{
-    ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated,
-    PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest,
+    ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey, PublicTxidCacheKey,
+    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
+    PublicTxidSyncRequest,
 };
 use forest_db::MerkleForestDbExt;
 use indexed_wallet::{
     IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession, IndexedWalletPage,
     artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
     should_hedge_wallet_startup, squid_tail_target_after_artifact, wait_or_cancel,
-    wallet_backfill_from_block, wallet_reorg_backfill_from_block, wallet_sync_target,
+    wallet_backfill_from_block, wallet_remote_target_before_cached_suffix,
+    wallet_reorg_backfill_from_block, wallet_startup_warm_from_block, wallet_sync_target,
 };
 use logs::{anchor_file_name, fetch_logs_for_range_with_provider, parse_anchor_block, sort_logs};
 use merkle_artifacts::run_merkle_artifact_catch_up_into;
@@ -92,9 +96,7 @@ use workers::{
 #[cfg(test)]
 use backfill::wallet_tail_fallback_lag_threshold_blocks;
 #[cfg(test)]
-use indexed_wallet::{
-    IndexedWalletArtifactProbe, complete_stream_checkpoint, wallet_startup_hedge_block_count,
-};
+use indexed_wallet::{complete_stream_checkpoint, wallet_startup_hedge_block_count};
 #[cfg(test)]
 use logs::combined_log_event_signatures_for_range;
 #[cfg(test)]
@@ -103,9 +105,10 @@ use workers::{
 };
 
 pub use data_plane::{
-    PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,
-    PublicDataPlaneDiagnostics, PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange,
-    PublicScanRows, PublicScanRowsAnswer, PublicSyncCacheReset,
+    PoiArtifactCacheRetry, PublicCoverageAnswer, PublicDataPlaneDiagnostic,
+    PublicDataPlaneDiagnosticKind, PublicDataPlaneDiagnostics, PublicDataPlaneError,
+    PublicDataPlaneHandle, PublicScanRange, PublicScanRows, PublicScanRowsAnswer,
+    PublicSyncCacheReset,
 };
 pub use types::{ChainError, ChainHandle, ChainService};
 

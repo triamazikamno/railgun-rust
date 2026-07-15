@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
+use async_trait::async_trait;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
@@ -148,6 +149,20 @@ impl TransactionBuilder {
         request: CompositeUnshieldRequest,
         prover: &ProverService,
     ) -> Result<CompositeUnshieldPlan, BuildError> {
+        self.build_composite_unshield_plan_inner(viewing, signer, forest, utxos, request, prover)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_composite_unshield_plan_inner<P: TransactionProver>(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: CompositeUnshieldRequest,
+        prover: &P,
+    ) -> Result<CompositeUnshieldPlan, BuildError> {
         if request.legs.is_empty() {
             return Err(BuildError::EmptyCompositeUnshieldRequest);
         }
@@ -202,7 +217,6 @@ impl TransactionBuilder {
                 viewing,
                 signer,
                 forest,
-                prover,
                 fee_selection.utxos,
                 fee.token_address,
             )?;
@@ -264,7 +278,6 @@ impl TransactionBuilder {
                     viewing,
                     signer,
                     forest,
-                    prover,
                     chunk.utxos,
                     leg.token_address,
                 )?;
@@ -503,7 +516,6 @@ impl TransactionBuilder {
             viewing,
             signer,
             forest,
-            prover,
             fee_selection.utxos,
             fee.token_address,
         )?;
@@ -542,7 +554,6 @@ impl TransactionBuilder {
                 viewing,
                 signer,
                 forest,
-                prover,
                 chunk.utxos,
                 request.token_address,
             )?;
@@ -683,7 +694,6 @@ impl TransactionBuilder {
             viewing,
             signer,
             forest,
-            prover,
             fee_selection.utxos,
             fee.token_address,
         )?;
@@ -726,7 +736,6 @@ impl TransactionBuilder {
                 viewing,
                 signer,
                 forest,
-                prover,
                 chunk.utxos,
                 request.token_address,
             )?;
@@ -865,7 +874,6 @@ impl TransactionBuilder {
                 viewing,
                 signer,
                 forest,
-                prover,
                 chunk.utxos,
                 request.token_address,
             )?;
@@ -1023,7 +1031,6 @@ impl TransactionBuilder {
                 viewing,
                 signer,
                 forest,
-                prover,
                 chunk.utxos,
                 request.token_address,
             )?;
@@ -1145,12 +1152,11 @@ impl TransactionBuilder {
             &wallet.viewing,
             wallet,
             forest,
-            prover,
             inputs.to_vec(),
             token_address,
         )?;
 
-        plan_builder.build_transact().await
+        plan_builder.build_transact(prover).await
     }
 }
 
@@ -1160,7 +1166,6 @@ struct TransactionPlanBuilder<'a, S: RailgunSpendSigner> {
     viewing: &'a ViewingKeyData,
     signer: &'a S,
     forest: &'a MerkleForest,
-    prover: &'a ProverService,
     inputs: Vec<Utxo>,
     token_address: Address,
 }
@@ -1177,6 +1182,8 @@ struct InputWitnessProofCache<'a> {
     dense_trees: BTreeMap<u32, DenseMerkleTree>,
     stats: InputWitnessProofCacheStats,
 }
+
+const SPARSE_WITNESS_PROOF_MAX_LEAVES: usize = 64;
 
 impl<'a> InputWitnessProofCache<'a> {
     fn new(forest: &'a MerkleForest) -> Self {
@@ -1195,6 +1202,17 @@ impl<'a> InputWitnessProofCache<'a> {
                 tree: tree_number,
                 position: tree_position,
             });
+        }
+
+        if self.forest.leaf_count() <= SPARSE_WITNESS_PROOF_MAX_LEAVES {
+            self.stats.proof_count += 1;
+            return self
+                .forest
+                .prove(normalized_tree, normalized_position)
+                .ok_or(BuildError::MissingProof {
+                    tree: tree_number,
+                    position: tree_position,
+                });
         }
 
         if !self.dense_trees.contains_key(&normalized_tree) {
@@ -1242,6 +1260,30 @@ struct ProvenTransactionPlan {
     chunk: TransactionPlanChunk,
 }
 
+#[async_trait]
+trait TransactionProver: Clone + Send + Sync + 'static {
+    async fn prove_unshield(
+        &self,
+        public_inputs: &PublicInputs,
+        private_inputs: &PrivateInputs,
+        signature: &[U256; 3],
+        verify_proof: bool,
+    ) -> Result<SnarkProof, ProverError>;
+}
+
+#[async_trait]
+impl TransactionProver for ProverService {
+    async fn prove_unshield(
+        &self,
+        public_inputs: &PublicInputs,
+        private_inputs: &PrivateInputs,
+        signature: &[U256; 3],
+        verify_proof: bool,
+    ) -> Result<SnarkProof, ProverError> {
+        Self::prove_unshield(self, public_inputs, private_inputs, signature, verify_proof).await
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SpendAllocation {
     amount: U256,
@@ -1256,7 +1298,6 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         viewing: &'a ViewingKeyData,
         signer: &'a S,
         forest: &'a MerkleForest,
-        prover: &'a ProverService,
         inputs: Vec<Utxo>,
         token_address: Address,
     ) -> Result<Self, BuildError> {
@@ -1282,7 +1323,6 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             viewing,
             signer,
             forest,
-            prover,
             inputs,
             token_address,
         })
@@ -1547,7 +1587,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     }
 
     /// Build a transact plan.
-    async fn build_transact(self) -> Result<TransactPlan, BuildError> {
+    async fn build_transact(self, prover: &ProverService) -> Result<TransactPlan, BuildError> {
         let total = self.total_value();
         if total.is_zero() {
             return Err(BuildError::InsufficientBalance(total));
@@ -1610,8 +1650,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         );
         let signature = public_inputs.signature(self.signer);
 
-        let proof = self
-            .prover
+        let proof = prover
             .prove_unshield(&public_inputs, &private_inputs, &signature, true)
             .await?;
         transaction.proof = proof;
@@ -1877,10 +1916,10 @@ fn prepare_transaction_plan(
     }
 }
 
-async fn prove_transaction_plans(
+async fn prove_transaction_plans<P: TransactionProver>(
     plans: Vec<UnprovenTransactionPlan>,
     signer: &impl RailgunSpendSigner,
-    prover: &ProverService,
+    prover: &P,
     verify_proof: bool,
 ) -> Result<Vec<ProvenTransactionPlan>, BuildError> {
     let plan_count = plans.len();
@@ -1928,24 +1967,36 @@ async fn prove_transaction_plans(
         .collect())
 }
 
-async fn prove_prepared_transaction_plan(
+async fn prove_prepared_transaction_plan<P: TransactionProver>(
     prepared: PreparedTransactionPlan,
-    prover: &ProverService,
+    prover: &P,
     verify_proof: bool,
 ) -> Result<ProvenTransactionPlan, BuildError> {
-    let mut plan = prepared.plan;
-    let public_inputs = prepared.public_inputs;
-    let signature = prepared.signature;
     let prove_started = Instant::now();
     let proof = prover
         .prove_unshield(
-            &public_inputs,
-            &plan.private_inputs,
-            &signature,
+            &prepared.public_inputs,
+            &prepared.plan.private_inputs,
+            &prepared.signature,
             verify_proof,
         )
         .await?;
     let prove_elapsed_ms = prove_started.elapsed().as_millis();
+    Ok(finalize_prepared_transaction_plan(
+        prepared,
+        proof,
+        prove_elapsed_ms,
+    ))
+}
+
+fn finalize_prepared_transaction_plan(
+    prepared: PreparedTransactionPlan,
+    proof: SnarkProof,
+    prove_elapsed_ms: u128,
+) -> ProvenTransactionPlan {
+    let mut plan = prepared.plan;
+    let public_inputs = prepared.public_inputs;
+    let signature = prepared.signature;
     plan.transaction.proof = proof;
     let chunk = TransactionPlanChunk {
         tree_number: plan.tree_number,
@@ -1968,10 +2019,10 @@ async fn prove_prepared_transaction_plan(
         elapsed_ms = prepared.started.elapsed().as_millis(),
         "proved transaction plan"
     );
-    Ok(ProvenTransactionPlan {
+    ProvenTransactionPlan {
         transaction: plan.transaction,
         chunk,
-    })
+    }
 }
 
 #[must_use]

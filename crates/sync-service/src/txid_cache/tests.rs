@@ -1196,20 +1196,19 @@ async fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress()
 
 #[test]
 fn txid_public_artifact_chunk_splits_multi_page_chunk() {
-    let transactions = (0..=super::TXID_CACHE_PAGE_SIZE.get())
-        .map(|index| indexed_transaction((index % 251 + 1) as u8, 0x02, 0x01, 0x03))
+    let page_size = NonZeroUsize::new(2).expect("test page size is non-zero");
+    let transactions = (0_u8..3)
+        .map(|index| indexed_transaction(index + 1, 0x02, 0x01, 0x03))
         .collect::<Vec<_>>();
     let chunk = public_txid_artifact_chunk(0, &transactions, None);
 
-    let pages = Vec::<super::TxidPublicCachePage>::try_from(&chunk).expect("materialize pages");
+    let pages = super::artifact::materialize_artifact_pages_with_page_size(&chunk, page_size)
+        .expect("materialize pages");
 
     assert_eq!(pages.len(), 2);
     assert_eq!(pages[0].start_index, 0);
-    assert_eq!(pages[0].rows.len(), super::TXID_CACHE_PAGE_SIZE.get());
-    assert_eq!(
-        pages[1].start_index,
-        super::TXID_CACHE_PAGE_SIZE.get() as u64
-    );
+    assert_eq!(pages[0].rows.len(), page_size.get());
+    assert_eq!(pages[1].start_index, page_size.get() as u64);
     assert_eq!(pages[1].rows.len(), 1);
 }
 

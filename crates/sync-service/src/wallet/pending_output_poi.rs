@@ -683,7 +683,6 @@ async fn submit_observed_pending_output_pois_unchecked(
     Ok(submitted_contexts)
 }
 
-/// Remote submit with Protocol A last-moment fence: revalidate before each RPC.
 async fn submit_pending_output_poi_context_via_gateway(
     authority: &WalletPrivateMutationAuthority<'_>,
     db: &DbStore,

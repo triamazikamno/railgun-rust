@@ -6,13 +6,14 @@ use super::{
     OutputPoiRecoveryRequest, PendingOutputPoiContextRecord, PoiProxyFallback, PoiRpcClient,
     PublicPoiCorpusKey, QueryRpcPool, RwLock, SystemTime, UNIX_EPOCH, UtxoCommitmentKind,
     WalletActorCommitToken, WalletCacheError, WalletCacheStore, WalletCheckpointMutation,
-    WalletConfig, WalletHandle, WalletPoiRefreshSelection, WalletPrivateCommit,
+    WalletConfig, WalletHandle, WalletObservation, WalletPoiRefreshSelection, WalletPrivateCommit,
     WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
-    WalletReadiness, WalletUtxo, WalletUtxoMutation, debug, log_local_poi_cache_unavailable,
-    mark_valid_output_poi_recoveries, output_poi_recovery_candidates, recover_missing_output_pois,
+    WalletReadiness, WalletReadinessWaitError, WalletUtxo, WalletUtxoMutation, debug,
+    log_local_poi_cache_unavailable, mark_valid_output_poi_recoveries,
+    output_poi_recovery_candidates, recover_missing_output_pois,
 };
-use tokio::sync::mpsc;
-use url::Url;
+use poi::SensitiveUrl;
+use tokio::sync::{mpsc, watch};
 
 pub(crate) fn wallet_poi_status_refresh_needed(
     wallet_utxos: &[WalletUtxo],
@@ -44,7 +45,7 @@ pub(super) const fn blinded_commitment_type(kind: UtxoCommitmentKind) -> Blinded
 }
 
 pub(crate) fn wallet_poi_status_client(
-    poi_rpc_url: &Url,
+    poi_rpc_url: &SensitiveUrl,
     http_client: Option<&reqwest::Client>,
 ) -> PoiRpcClient {
     match http_client {
@@ -125,18 +126,141 @@ pub(super) fn now_epoch_secs() -> u64 {
 }
 
 impl WalletHandle {
-    pub async fn wait_until_ready(&mut self) {
-        loop {
-            match &*self.readiness_rx.borrow() {
-                WalletReadiness::Ready | WalletReadiness::Failed(_) | WalletReadiness::Shutdown => {
-                    break;
+    pub async fn wait_until_ready(&mut self) -> Result<(), WalletReadinessWaitError> {
+        wait_until_ready(self.subscribe_observation()).await
+    }
+}
+
+async fn wait_until_ready(
+    observation_rx: watch::Receiver<WalletObservation>,
+) -> Result<(), WalletReadinessWaitError> {
+    wait_until_ready_with_observer(observation_rx, |_| {}).await
+}
+
+async fn wait_until_ready_with_observer(
+    mut observation_rx: watch::Receiver<WalletObservation>,
+    mut observe: impl FnMut(&WalletReadiness),
+) -> Result<(), WalletReadinessWaitError> {
+    loop {
+        let readiness = observation_rx.borrow_and_update().readiness().clone();
+        observe(&readiness);
+        match readiness {
+            WalletReadiness::Ready => match observation_rx.has_changed() {
+                Ok(false) => return Ok(()),
+                Ok(true) => continue,
+                Err(_) => {
+                    let latest = observation_rx.borrow_and_update().readiness().clone();
+                    if latest == WalletReadiness::Ready {
+                        return Err(WalletReadinessWaitError::ChannelClosed);
+                    }
+                    continue;
                 }
-                WalletReadiness::Syncing => {}
+            },
+            WalletReadiness::Failed(reason) => {
+                return Err(WalletReadinessWaitError::Failed(reason));
             }
-            if self.readiness_rx.changed().await.is_err() {
-                break;
-            }
+            WalletReadiness::Shutdown => return Err(WalletReadinessWaitError::Shutdown),
+            WalletReadiness::Syncing => {}
         }
+        observation_rx
+            .changed()
+            .await
+            .map_err(|_| WalletReadinessWaitError::ChannelClosed)?;
+    }
+}
+
+#[cfg(test)]
+mod readiness_wait_tests {
+    use super::*;
+    use crate::types::{
+        WalletCurrentSnapshot, WalletInactiveReason, WalletPendingOverlay, WalletReadinessError,
+        WalletViewState,
+    };
+
+    fn observation(readiness: WalletReadiness) -> WalletObservation {
+        let view = if readiness == WalletReadiness::Shutdown {
+            WalletViewState::Inactive {
+                reason: WalletInactiveReason::Shutdown,
+                reset_generation: 0,
+            }
+        } else {
+            WalletViewState::Current(WalletCurrentSnapshot::new(
+                0,
+                0,
+                0,
+                Arc::<[WalletUtxo]>::from(Vec::new()),
+                Arc::new(WalletPendingOverlay::default()),
+            ))
+        };
+        WalletObservation::new(view, readiness)
+    }
+
+    #[tokio::test]
+    async fn ready_is_the_only_successful_readiness_terminal() {
+        let (_tx, rx) = watch::channel(observation(WalletReadiness::Ready));
+        assert_eq!(wait_until_ready(rx).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn failed_shutdown_and_channel_closure_are_distinct() {
+        let reason = WalletReadinessError::ApplyFailed;
+        let (_failed_tx, failed_rx) =
+            watch::channel(observation(WalletReadiness::Failed(reason.clone())));
+        assert_eq!(
+            wait_until_ready(failed_rx).await,
+            Err(WalletReadinessWaitError::Failed(reason))
+        );
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(observation(WalletReadiness::Shutdown));
+        assert_eq!(
+            wait_until_ready(shutdown_rx).await,
+            Err(WalletReadinessWaitError::Shutdown)
+        );
+
+        let (closed_tx, closed_rx) = watch::channel(observation(WalletReadiness::Syncing));
+        drop(closed_tx);
+        assert_eq!(
+            wait_until_ready(closed_rx).await,
+            Err(WalletReadinessWaitError::ChannelClosed)
+        );
+
+        let (closed_ready_tx, closed_ready_rx) =
+            watch::channel(observation(WalletReadiness::Ready));
+        drop(closed_ready_tx);
+        assert_eq!(
+            wait_until_ready(closed_ready_rx).await,
+            Err(WalletReadinessWaitError::ChannelClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_superseded_before_success_is_rechecked() {
+        async fn supersede_ready_with(
+            terminal: WalletReadiness,
+        ) -> Result<(), WalletReadinessWaitError> {
+            let (readiness_tx, readiness_rx) = watch::channel(observation(WalletReadiness::Ready));
+            let mut readiness_tx = Some(readiness_tx);
+            wait_until_ready_with_observer(readiness_rx, move |observed| {
+                if *observed == WalletReadiness::Ready {
+                    readiness_tx
+                        .take()
+                        .expect("Ready is observed once before supersession")
+                        .send(observation(terminal.clone()))
+                        .expect("readiness receiver remains active");
+                }
+            })
+            .await
+        }
+
+        let reason = WalletReadinessError::ApplyFailed;
+        assert_eq!(
+            supersede_ready_with(WalletReadiness::Failed(reason.clone())).await,
+            Err(WalletReadinessWaitError::Failed(reason)),
+        );
+        assert_eq!(
+            supersede_ready_with(WalletReadiness::Shutdown).await,
+            Err(WalletReadinessWaitError::Shutdown),
+        );
     }
 }
 

@@ -1,4 +1,5 @@
-use crate::error::{PoiError, PoiRpcError};
+use crate::error::{PoiError, PoiRpcError, PoiRpcTransportPhase};
+use crate::sensitive_url::SensitiveUrl;
 use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::crypto::snark_proof::Prover;
@@ -8,7 +9,6 @@ use broadcaster_core::transact::{
     txid_version_or_default,
 };
 pub use broadcaster_core::utxo::PoiStatus;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -730,7 +730,7 @@ pub type PoisPerListMap = BTreeMap<String, BTreeMap<String, PoiStatus>>;
 pub type PoisPerListStatusMap = BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>;
 
 pub struct PoiRpcClient {
-    base_url: Url,
+    base_url: SensitiveUrl,
     http: reqwest::Client,
     next_id: std::sync::atomic::AtomicU64,
     request_timeout: Duration,
@@ -749,9 +749,9 @@ impl Clone for PoiRpcClient {
 
 impl PoiRpcClient {
     #[must_use]
-    pub fn new(base_url: Url) -> Self {
+    pub fn new(base_url: impl Into<SensitiveUrl>) -> Self {
         Self {
-            base_url,
+            base_url: base_url.into(),
             http: reqwest::Client::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
             request_timeout: Duration::from_mins(2),
@@ -761,9 +761,9 @@ impl PoiRpcClient {
     /// Creates a client that routes all traffic through the given
     /// pre-configured [`reqwest::Client`] (e.g. one with a SOCKS proxy).
     #[must_use]
-    pub const fn with_http_client(base_url: Url, http: reqwest::Client) -> Self {
+    pub fn with_http_client(base_url: impl Into<SensitiveUrl>, http: reqwest::Client) -> Self {
         Self {
-            base_url,
+            base_url: base_url.into(),
             http,
             next_id: std::sync::atomic::AtomicU64::new(1),
             request_timeout: Duration::from_mins(2),
@@ -828,15 +828,22 @@ impl PoiRpcClient {
 
         let resp = self
             .http
-            .post(self.base_url.clone())
+            .post(self.base_url.expose_url().clone())
             .timeout(self.request_timeout)
             .json(&req)
             .send()
-            .await?;
+            .await
+            .map_err(|source| PoiRpcError::Post {
+                phase: PoiRpcTransportPhase::Send,
+                source: source.without_url(),
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.map_err(|source| PoiRpcError::Post {
+                phase: PoiRpcTransportPhase::ResponseBody,
+                source: source.without_url(),
+            })?;
             debug!(
                 method,
                 %status,
@@ -844,10 +851,13 @@ impl PoiRpcClient {
                 elapsed_ms = started.elapsed().as_millis(),
                 "POI RPC request failed"
             );
-            return Err(PoiRpcError::HttpStatus { status, body });
+            return Err(PoiRpcError::HttpStatus { status });
         }
 
-        let body = resp.text().await?;
+        let body = resp.text().await.map_err(|source| PoiRpcError::Post {
+            phase: PoiRpcTransportPhase::ResponseBody,
+            source: source.without_url(),
+        })?;
         debug!(
             method,
             response_bytes = body.len(),
@@ -1341,10 +1351,8 @@ fn decode_json_rpc_ack_response(method: &'static str, body: &str) -> Result<(), 
             data: error.data,
         });
     }
-    if let Some(result) = parsed.result
-        && !result.is_null()
-    {
-        debug!(method, result = %result, "POI RPC ack response contained result");
+    if parsed.result.is_some_and(|result| !result.is_null()) {
+        debug!(method, "POI RPC ack response contained a result");
     }
     Ok(())
 }
@@ -1366,15 +1374,168 @@ mod tests {
         ValidatedRailgunTxidStatus, decode_json_rpc_ack_response, decode_json_rpc_response,
         default_active_poi_list_key, encode_u256_bare, railgun_txid_leaf_hash,
     };
-    use crate::error::PoiRpcError;
+    use crate::error::{PoiRpcError, PoiRpcTransportPhase};
     use alloy::{
         hex,
         primitives::{FixedBytes, U256},
         uint,
     };
     use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
+    use reqwest::Url;
     use serde_json::to_value;
     use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn endpoint_with_sentinel(mut url: Url) -> Url {
+        url.set_path("/endpoint-sentinel");
+        url.set_query(Some("secret=endpoint-sentinel"));
+        url.set_fragment(Some("endpoint-sentinel"));
+        url
+    }
+
+    fn spawn_rpc_response(status: u16, body: &'static str, declared_len: Option<usize>) -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind RPC server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("RPC server address")
+        ))
+        .expect("RPC server URL");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept RPC request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read RPC request");
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} TEST\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                declared_len.unwrap_or(body.len())
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write RPC response");
+        });
+        endpoint_with_sentinel(url)
+    }
+
+    fn spawn_stalled_rpc() -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled RPC server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("stalled RPC address")
+        ))
+        .expect("stalled RPC URL");
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept stalled RPC request");
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        endpoint_with_sentinel(url)
+    }
+
+    fn formatted_error_chain(error: &(dyn Error + 'static)) -> String {
+        let mut formatted = String::new();
+        let mut current = Some(error);
+        while let Some(error) = current {
+            std::fmt::Write::write_fmt(&mut formatted, format_args!("{error} {error:?}\n"))
+                .expect("write error chain");
+            current = error.source();
+        }
+        formatted
+    }
+
+    fn assert_rpc_error_safe(error: &PoiRpcError, sentinels: &[&str]) {
+        let formatted = formatted_error_chain(error);
+        for sentinel in sentinels {
+            assert!(
+                !formatted.contains(sentinel),
+                "RPC error leaked {sentinel}: {formatted}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_transport_errors_strip_endpoint_and_remote_body() {
+        let send_url =
+            endpoint_with_sentinel(Url::parse("http://127.0.0.1:0").expect("unavailable RPC URL"));
+        let send_error = PoiRpcClient::new(send_url)
+            .send_request::<_, bool>("test_send", ())
+            .await
+            .expect_err("send error");
+        assert_eq!(
+            send_error.transport_phase(),
+            Some(PoiRpcTransportPhase::Send)
+        );
+        assert_rpc_error_safe(&send_error, &["endpoint-sentinel"]);
+
+        let status_client = PoiRpcClient::new(spawn_rpc_response(503, "http-body-sentinel", None));
+        let status_error = status_client
+            .send_request::<_, bool>("test_status", ())
+            .await
+            .expect_err("status error");
+        assert_eq!(
+            status_error.status(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_rpc_error_safe(&status_error, &["endpoint-sentinel", "http-body-sentinel"]);
+
+        let decode_client =
+            PoiRpcClient::new(spawn_rpc_response(200, "decode-body-sentinel", None));
+        let decode_error = decode_client
+            .send_request::<_, bool>("test_decode", ())
+            .await
+            .expect_err("decode error");
+        assert!(matches!(&decode_error, PoiRpcError::JsonDecode(_)));
+        assert_rpc_error_safe(
+            &decode_error,
+            &["endpoint-sentinel", "decode-body-sentinel"],
+        );
+
+        let body_client = PoiRpcClient::new(spawn_rpc_response(200, "short", Some(100)));
+        let body_error = body_client
+            .send_request::<_, bool>("test_body", ())
+            .await
+            .expect_err("truncated body error");
+        assert_eq!(
+            body_error.transport_phase(),
+            Some(PoiRpcTransportPhase::ResponseBody)
+        );
+        assert_rpc_error_safe(&body_error, &["endpoint-sentinel"]);
+
+        let timeout_client =
+            PoiRpcClient::new(spawn_stalled_rpc()).with_request_timeout(Duration::from_millis(20));
+        let timeout_error = timeout_client
+            .send_request::<_, bool>("test_timeout", ())
+            .await
+            .expect_err("timeout error");
+        assert!(timeout_error.is_timeout());
+        assert_rpc_error_safe(&timeout_error, &["endpoint-sentinel"]);
+    }
+
+    #[test]
+    fn rpc_remote_message_data_and_ack_result_are_not_formatted() {
+        let error = decode_json_rpc_response::<bool>(
+            r#"{"error":{"code":-32000,"message":"message-sentinel","data":{"detail":"data-sentinel"}}}"#,
+        )
+        .expect_err("JSON-RPC error");
+        assert_eq!(error.json_rpc_code(), Some(-32000));
+        assert_rpc_error_safe(&error, &["message-sentinel", "data-sentinel"]);
+
+        decode_json_rpc_ack_response(
+            "test_ack",
+            r#"{"jsonrpc":"2.0","id":2,"result":"ack-sentinel"}"#,
+        )
+        .expect("ACK result is accepted without formatting its value");
+    }
 
     fn sample_context() -> FeeNoteAssuranceContext {
         let list_key = FixedBytes::from([0x11; 32]);

@@ -306,6 +306,14 @@ impl PoiCache {
         Some(FixedBytes::from(root.to_be_bytes::<32>()))
     }
 
+    #[must_use]
+    pub fn blocked_shields_match(&self, other: &Self) -> bool {
+        self.snapshot.blocked_shields_by_blinded_commitment
+            == other.snapshot.blocked_shields_by_blinded_commitment
+            && self.snapshot.progress.blocked_shields_synced
+                == other.snapshot.progress.blocked_shields_synced
+    }
+
     fn current_roots_readonly(&self) -> BTreeMap<u32, FixedBytes<32>> {
         fixed_roots(self.snapshot.forest.computed_roots())
     }
@@ -1549,7 +1557,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            PoiCacheError::Rpc(PoiRpcError::Post(source)) if source.is_timeout()
+            PoiCacheError::Rpc(PoiRpcError::Post { source, .. }) if source.is_timeout()
         ));
     }
 }

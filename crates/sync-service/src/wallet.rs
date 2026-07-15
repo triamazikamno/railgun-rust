@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -68,11 +68,11 @@ use crate::types::{
     WalletBackfillOwnerDisposition, WalletBackfillOwnerSignal, WalletBackfillRejectReason,
     WalletBackfillResetResult, WalletBackfillStartResult, WalletCacheStore,
     WalletCheckpointMutation, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
-    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletPrivateCommit,
-    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletResetReplayPlan,
-    WalletResetRewindStatus, WalletResetToken, WalletScanApply, WalletScanRows,
-    WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken, WalletUtxoMutation,
-    WalletViewState,
+    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletObservation, WalletPrivateCommit,
+    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
+    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
+    WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
+    WalletUtxoMutation, WalletViewState,
 };
 
 mod actor;
@@ -88,9 +88,11 @@ mod poi_sources;
 mod private_remote;
 mod worker;
 
+use actor::{PendingWalletReset, WalletActorState};
 pub(crate) use actor::{
     PoiRemoteJobKey, WalletActorApplyToken, WalletActorCommitToken, WalletActorCredential,
-    WalletActorLifecycle, WalletActorLifecycleCell, WalletRemoteDone,
+    WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
+    WalletObservationPublisher, WalletRemoteDone,
 };
 use delta::{
     apply_wallet_delta_to_vec_with_outcome, chain_pending_overlay_matches, rewind_wallet_utxos,
@@ -104,7 +106,6 @@ use handle::{
     PendingOutputPoiSubmissionPredicate, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
     WalletIndexedCatchUpCommand, WalletLocalPendingSpentUpdate, WalletPendingOverlayUpdate,
     WalletPoiRefreshSelection, WalletPrivateRemoteAuthority, WalletPrivateRequest,
-    WalletPrivateViewTicket,
 };
 pub(crate) use handle::{
     OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,

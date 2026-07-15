@@ -319,8 +319,9 @@ impl TxidPublicCachePage {
     pub(super) fn pages_from_rows(
         key: TxidPublicCacheKey<'_>,
         rows: Vec<TxidPublicCacheRow>,
+        page_size: NonZeroUsize,
     ) -> Result<Vec<Self>, TxidPublicCacheError> {
-        let page_size = TXID_CACHE_PAGE_SIZE.get();
+        let page_size = page_size.get();
         let mut pages = Vec::with_capacity(rows.len().div_ceil(page_size));
         let mut page_rows = Vec::with_capacity(page_size);
         for row in rows {
