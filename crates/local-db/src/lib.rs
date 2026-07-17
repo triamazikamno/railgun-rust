@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,8 @@ const DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
     TableDefinition::new("desktop_wallet_vault_v1");
 const LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
 const WALLET_CACHE_KEY_DOMAIN: &[u8] = b"railgun-wallet-cache-key-v1";
+const WALLET_PRIVATE_CANONICALIZATION_VERSION_KEY_PREFIX: &str =
+    "wallet_private_canonicalization_version_v1:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalDbTable {
@@ -219,7 +221,7 @@ const WALLET_PRIVATE_COMPACTION_REQUESTED_KEY: &str = "wallet_private_compaction
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WalletCacheKey(String);
@@ -396,6 +398,14 @@ pub enum DbError {
     WalletPrivateV1MigrationSourceChanged { table: &'static str, key: String },
     #[error("wallet-private v1 migration must replace every source row for {kind}")]
     WalletPrivateV1MigrationRowCountMismatch { kind: &'static str },
+    #[error("wallet-private canonicalization source changed in {table}: {key}")]
+    WalletPrivateCanonicalizationSourceChanged { table: &'static str, key: String },
+    #[error("wallet-private canonicalization source set changed for {kind}")]
+    WalletPrivateCanonicalizationRowCountMismatch { kind: &'static str },
+    #[error("invalid wallet-private canonicalization version marker")]
+    InvalidWalletPrivateCanonicalizationVersion,
+    #[error("wallet-private canonicalization namespaces must be distinct")]
+    DuplicateWalletPrivateCanonicalizationNamespace,
     #[error("wallet-private {kind} row identity does not match key {key}")]
     WalletPrivateRecordIdentityMismatch { kind: &'static str, key: String },
     #[error("invalid {kind} PPOI sidecar record {key}")]
@@ -563,6 +573,30 @@ pub struct WalletPrivateV1MigrationBatch<'a> {
 pub struct WalletPrivateV1MigrationReport {
     pub pending_output_context_rows: u64,
     pub output_poi_recovery_rows: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalletPrivateCanonicalizationKindBatch<'a> {
+    pub canonical_v1_sources: &'a [WalletPrivateV1Row],
+    pub legacy_v1_sources: &'a [WalletPrivateV1Row],
+    pub canonical_v2_sources: &'a [OpaqueWalletPrivateRow],
+    pub legacy_v2_sources: &'a [OpaqueWalletPrivateRow],
+    pub canonical_v2_destinations: &'a [OpaqueWalletPrivateRow],
+}
+
+pub struct WalletPrivateCanonicalizationBatch<'a> {
+    pub canonical_namespace: &'a WalletPrivateNamespaceId,
+    pub legacy_namespace: Option<&'a WalletPrivateNamespaceId>,
+    pub target_version: u32,
+    pub pending_output_contexts: WalletPrivateCanonicalizationKindBatch<'a>,
+    pub output_poi_recoveries: WalletPrivateCanonicalizationKindBatch<'a>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletPrivateCanonicalizationReport {
+    pub pending_output_context_rows: u64,
+    pub output_poi_recovery_rows: u64,
+    pub plaintext_rows_removed: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1657,6 +1691,11 @@ impl DbStore {
             identity.wallet_id.as_str(),
         );
         let opaque_prefix = opaque_wallet_private_row_prefix(identity);
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            let marker_key = wallet_private_canonicalization_version_key(identity);
+            table.remove(marker_key.as_str())?;
+        }
         Ok({
             let wallet_utxo_rows = {
                 let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
@@ -2552,6 +2591,260 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn wallet_private_canonicalization_version(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+    ) -> Result<u32, DbError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(META_TABLE)?;
+        let key = wallet_private_canonicalization_version_key(namespace);
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(0);
+        };
+        decode_wallet_private_canonicalization_version(value.value())
+    }
+
+    pub fn canonicalize_wallet_private_rows(
+        &self,
+        batch: &WalletPrivateCanonicalizationBatch<'_>,
+    ) -> Result<WalletPrivateCanonicalizationReport, DbError> {
+        self.canonicalize_wallet_private_rows_transaction(batch, || Ok(()))
+    }
+
+    fn canonicalize_wallet_private_rows_transaction(
+        &self,
+        batch: &WalletPrivateCanonicalizationBatch<'_>,
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<WalletPrivateCanonicalizationReport, DbError> {
+        if batch.target_version == 0 {
+            return Err(DbError::InvalidWalletPrivateCanonicalizationVersion);
+        }
+        if batch
+            .legacy_namespace
+            .is_some_and(|legacy| legacy == batch.canonical_namespace)
+        {
+            return Err(DbError::DuplicateWalletPrivateCanonicalizationNamespace);
+        }
+        Self::validate_wallet_private_canonicalization_kind_batch(
+            batch,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &batch.pending_output_contexts,
+        )?;
+        Self::validate_wallet_private_canonicalization_kind_batch(
+            batch,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &batch.output_poi_recoveries,
+        )?;
+
+        let txn = self.db.begin_write()?;
+        let marker_key = wallet_private_canonicalization_version_key(batch.canonical_namespace);
+        {
+            let table = txn.open_table(META_TABLE)?;
+            if let Some(value) = table.get(marker_key.as_str())?
+                && decode_wallet_private_canonicalization_version(value.value())?
+                    >= batch.target_version
+            {
+                return Ok(WalletPrivateCanonicalizationReport::default());
+            }
+        }
+        Self::canonicalize_wallet_private_kind(
+            &txn,
+            batch,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &batch.pending_output_contexts,
+        )?;
+        Self::canonicalize_wallet_private_kind(
+            &txn,
+            batch,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &batch.output_poi_recoveries,
+        )?;
+
+        let plaintext_rows_removed = batch
+            .pending_output_contexts
+            .canonical_v1_sources
+            .len()
+            .saturating_add(batch.pending_output_contexts.legacy_v1_sources.len())
+            .saturating_add(batch.output_poi_recoveries.canonical_v1_sources.len())
+            .saturating_add(batch.output_poi_recoveries.legacy_v1_sources.len());
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            let version = batch.target_version.to_be_bytes();
+            table.insert(marker_key.as_str(), version.as_slice())?;
+            if plaintext_rows_removed > 0 {
+                table.insert(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY, &[1_u8][..])?;
+            }
+        }
+        before_commit()?;
+        txn.commit()?;
+        Ok(WalletPrivateCanonicalizationReport {
+            pending_output_context_rows: batch
+                .pending_output_contexts
+                .canonical_v2_destinations
+                .len() as u64,
+            output_poi_recovery_rows: batch.output_poi_recoveries.canonical_v2_destinations.len()
+                as u64,
+            plaintext_rows_removed: plaintext_rows_removed as u64,
+        })
+    }
+
+    fn validate_wallet_private_canonicalization_kind_batch(
+        batch: &WalletPrivateCanonicalizationBatch<'_>,
+        kind: WalletPrivateRecordKind,
+        rows: &WalletPrivateCanonicalizationKindBatch<'_>,
+    ) -> Result<(), DbError> {
+        if batch.legacy_namespace.is_none()
+            && (!rows.legacy_v1_sources.is_empty() || !rows.legacy_v2_sources.is_empty())
+        {
+            return Err(DbError::WalletPrivateCanonicalizationRowCountMismatch {
+                kind: kind.label(),
+            });
+        }
+        let mut destination_keys = BTreeSet::new();
+        for row in rows.canonical_v2_destinations {
+            validate_opaque_row(row)?;
+            let key = opaque_wallet_private_row_key(batch.canonical_namespace, &row.row_id)?;
+            if !destination_keys.insert(key.clone()) {
+                return Err(DbError::SchemaMigrationDestinationConflict {
+                    table: kind.v2_table_name(),
+                    key,
+                });
+            }
+        }
+        for row in rows
+            .canonical_v2_sources
+            .iter()
+            .chain(rows.legacy_v2_sources)
+        {
+            validate_opaque_row(row)?;
+        }
+        Ok(())
+    }
+
+    fn canonicalize_wallet_private_kind(
+        txn: &WriteTransaction,
+        batch: &WalletPrivateCanonicalizationBatch<'_>,
+        kind: WalletPrivateRecordKind,
+        rows: &WalletPrivateCanonicalizationKindBatch<'_>,
+    ) -> Result<(), DbError> {
+        Self::validate_wallet_private_v1_snapshot(
+            txn,
+            batch.canonical_namespace,
+            kind,
+            rows.canonical_v1_sources,
+        )?;
+        Self::validate_wallet_private_v2_snapshot(
+            txn,
+            batch.canonical_namespace,
+            kind,
+            rows.canonical_v2_sources,
+        )?;
+        if let Some(legacy) = batch.legacy_namespace {
+            Self::validate_wallet_private_v1_snapshot(txn, legacy, kind, rows.legacy_v1_sources)?;
+            Self::validate_wallet_private_v2_snapshot(txn, legacy, kind, rows.legacy_v2_sources)?;
+        }
+
+        {
+            let mut table = txn.open_table(kind.v1_table())?;
+            remove_table_prefix(
+                &mut table,
+                &legacy_wallet_private_row_prefix(batch.canonical_namespace),
+            )?;
+            if let Some(legacy) = batch.legacy_namespace {
+                remove_table_prefix(&mut table, &legacy_wallet_private_row_prefix(legacy))?;
+            }
+        }
+        {
+            let mut table = txn.open_table(kind.v2_table())?;
+            remove_table_prefix(
+                &mut table,
+                &opaque_wallet_private_row_prefix(batch.canonical_namespace),
+            )?;
+            if let Some(legacy) = batch.legacy_namespace {
+                remove_table_prefix(&mut table, &opaque_wallet_private_row_prefix(legacy))?;
+            }
+            for destination in rows.canonical_v2_destinations {
+                let key =
+                    opaque_wallet_private_row_key(batch.canonical_namespace, &destination.row_id)?;
+                table.insert(key.as_str(), destination.payload.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_wallet_private_v1_snapshot(
+        txn: &WriteTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        expected: &[WalletPrivateV1Row],
+    ) -> Result<(), DbError> {
+        for row in expected {
+            validate_wallet_private_v1_row(namespace, kind, row)?;
+        }
+        let prefix = legacy_wallet_private_row_prefix(namespace);
+        let range_end = prefix_range_end(&prefix);
+        let table = txn.open_table(kind.v1_table())?;
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix.as_str()..range_end)?,
+            None => table.range(prefix.as_str()..)?,
+        };
+        let mut count = 0_usize;
+        for entry in entries {
+            let (key, value) = entry?;
+            count = count.saturating_add(1);
+            if !expected.iter().any(|row| {
+                row.storage_key == key.value() && row.payload.as_slice() == value.value()
+            }) {
+                return Err(DbError::WalletPrivateCanonicalizationSourceChanged {
+                    table: kind.v1_table_name(),
+                    key: key.value().to_owned(),
+                });
+            }
+        }
+        if count != expected.len() {
+            return Err(DbError::WalletPrivateCanonicalizationRowCountMismatch {
+                kind: kind.label(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_wallet_private_v2_snapshot(
+        txn: &WriteTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        expected: &[OpaqueWalletPrivateRow],
+    ) -> Result<(), DbError> {
+        let prefix = opaque_wallet_private_row_prefix(namespace);
+        let range_end = prefix_range_end(&prefix);
+        let table = txn.open_table(kind.v2_table())?;
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix.as_str()..range_end)?,
+            None => table.range(prefix.as_str()..)?,
+        };
+        let mut count = 0_usize;
+        for entry in entries {
+            let (key, value) = entry?;
+            let row_id = opaque_wallet_private_row_id(&prefix, key.value())?;
+            count = count.saturating_add(1);
+            if !expected
+                .iter()
+                .any(|row| row.row_id == row_id && row.payload.as_slice() == value.value())
+            {
+                return Err(DbError::WalletPrivateCanonicalizationSourceChanged {
+                    table: kind.v2_table_name(),
+                    key: key.value().to_owned(),
+                });
+            }
+        }
+        if count != expected.len() {
+            return Err(DbError::WalletPrivateCanonicalizationRowCountMismatch {
+                kind: kind.label(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn get_pending_output_poi_context(
         &self,
         chain_id: u64,
@@ -3071,7 +3364,16 @@ impl DbStore {
         to: u32,
         before_commit: impl FnOnce() -> Result<(), DbError>,
     ) -> Result<(), DbError> {
-        if meta.schema_version != 7 || to != 8 {
+        let migrate_schema_seven = match (meta.schema_version, to) {
+            (7, 8 | 9) => true,
+            (8, 9) => false,
+            _ => {
+                return Err(DbError::UnsupportedSchemaVersion {
+                    version: meta.schema_version,
+                });
+            }
+        };
+        if to > CURRENT_SCHEMA_VERSION {
             return Err(DbError::UnsupportedSchemaVersion {
                 version: meta.schema_version,
             });
@@ -3084,7 +3386,9 @@ impl DbStore {
         };
         let migrated_meta = encode(&migrated_meta)?;
         let txn = self.db.begin_write()?;
-        migrations::migrate_schema_7_to_8(&txn)?;
+        if migrate_schema_seven {
+            migrations::migrate_schema_7_to_8(&txn)?;
+        }
         Self::initialize_schema_tables(&txn)?;
         {
             let mut table = txn.open_table(META_TABLE)?;
@@ -3289,6 +3593,20 @@ fn opaque_wallet_private_row_id(prefix: &str, key: &str) -> Result<Vec<u8>, DbEr
     hex::decode(encoded).map_err(|_| DbError::InvalidOpaqueWalletPrivateRowKey {
         key: key.to_owned(),
     })
+}
+
+fn wallet_private_canonicalization_version_key(namespace: &WalletPrivateNamespaceId) -> String {
+    format!(
+        "{WALLET_PRIVATE_CANONICALIZATION_VERSION_KEY_PREFIX}{}|{}",
+        namespace.chain_id, namespace.wallet_id
+    )
+}
+
+fn decode_wallet_private_canonicalization_version(value: &[u8]) -> Result<u32, DbError> {
+    let bytes: [u8; 4] = value
+        .try_into()
+        .map_err(|_| DbError::InvalidWalletPrivateCanonicalizationVersion)?;
+    Ok(u32::from_be_bytes(bytes))
 }
 
 const fn validate_opaque_row(row: &OpaqueWalletPrivateRow) -> Result<(), DbError> {

@@ -1075,7 +1075,6 @@ async fn apply_poi_private_delta_inline(
                     WalletPrivateCommit::new(
                         &token,
                         &permit,
-                        cfg.chain.chain_id,
                         WalletUtxoMutation::Preserve,
                         WalletCheckpointMutation::Preserve,
                     )
@@ -1193,7 +1192,6 @@ async fn apply_poi_private_delta_inline(
                     WalletPrivateCommit::new(
                         &token,
                         &permit,
-                        cfg.chain.chain_id,
                         WalletUtxoMutation::Preserve,
                         WalletCheckpointMutation::Preserve,
                     )
@@ -1251,7 +1249,6 @@ async fn apply_poi_private_delta_inline(
                     WalletPrivateCommit::new(
                         &token,
                         &permit,
-                        cfg.chain.chain_id,
                         WalletUtxoMutation::Preserve,
                         WalletCheckpointMutation::Preserve,
                     )
@@ -1373,7 +1370,6 @@ async fn apply_poi_private_delta_inline(
                     WalletPrivateCommit::new(
                         &token,
                         &permit,
-                        cfg.chain.chain_id,
                         if changed {
                             WalletUtxoMutation::Replace(&snapshot)
                         } else {
@@ -1443,7 +1439,6 @@ async fn apply_poi_private_delta_inline(
                 cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
                     &token,
                     &permit,
-                    cfg.chain.chain_id,
                     WalletUtxoMutation::Replace(&snapshot),
                     WalletCheckpointMutation::Preserve,
                 ))?;

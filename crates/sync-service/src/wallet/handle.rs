@@ -595,6 +595,10 @@ impl WalletPrivateRemoteAuthority {
 }
 
 impl WalletPrivateMutationPermit<'_> {
+    pub(crate) const fn chain_id(&self) -> u64 {
+        self.handle.chain.chain_id
+    }
+
     pub(crate) const fn wallet_id(&self) -> &WalletCacheKey {
         &self.handle.cache_key
     }

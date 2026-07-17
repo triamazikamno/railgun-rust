@@ -316,7 +316,6 @@ impl WalletPersistState {
                 WalletPrivateCommit::new(
                     token,
                     permit,
-                    effects.pending_output_context_chain_id,
                     WalletUtxoMutation::Replace(request.snapshot),
                     request.checkpoint,
                 )
@@ -358,7 +357,6 @@ impl WalletPersistState {
             WalletPrivateCommit::new(
                 token,
                 permit,
-                effects.pending_output_context_chain_id,
                 WalletUtxoMutation::Preserve,
                 request.checkpoint,
             )
@@ -412,7 +410,6 @@ pub(super) struct WalletProgressPersist<'a> {
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct WalletProgressPrivateEffects<'a> {
-    pub(super) pending_output_context_chain_id: u64,
     pub(super) pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
     pub(super) pending_output_context_deletes: &'a [FixedBytes<32>],
     pub(super) output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],

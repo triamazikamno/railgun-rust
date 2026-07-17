@@ -10,10 +10,11 @@ use super::{
     PoiCorpusValidationRecord, PoiPublisherManifestWatermarkRecord, StoredRecord,
     TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE,
     WALLET_UTXO_TABLE, WalletCacheKey, WalletDeletionBatch, WalletDeletionReport, WalletMeta,
-    WalletMetaMutation, WalletPendingResetRecord, WalletPrivateNamespaceDeletionReport,
-    WalletPrivateNamespaceId, WalletPrivateRecordKind, WalletPrivateStateBatch,
-    WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport, WalletSyncActorStateRecord,
-    WalletUtxoRowMutation, ZKEY_INDEX_TABLE, decode, encode,
+    WalletMetaMutation, WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
+    WalletPrivateCanonicalizationKindBatch, WalletPrivateCanonicalizationReport,
+    WalletPrivateNamespaceDeletionReport, WalletPrivateNamespaceId, WalletPrivateRecordKind,
+    WalletPrivateStateBatch, WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport,
+    WalletSyncActorStateRecord, WalletUtxoRowMutation, ZKEY_INDEX_TABLE, decode, encode,
 };
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::uint;
@@ -2725,6 +2726,167 @@ fn wallet_private_v1_migration_is_atomic_and_namespace_scoped() {
 }
 
 #[test]
+fn wallet_private_canonicalization_is_versioned_atomic_and_idempotent() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open store");
+    let canonical = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x91));
+    let legacy = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x92));
+    let pending = sample_pending_output_record(
+        legacy.chain_id,
+        legacy.wallet_id.as_str(),
+        FixedBytes::from([0x93; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode legacy v1 pending"),
+    );
+    let canonical_recovery = OpaqueWalletPrivateRow {
+        row_id: vec![0xa1, 0xa2],
+        payload: b"canonical-recovery".to_vec(),
+    };
+    let legacy_recovery = OpaqueWalletPrivateRow {
+        row_id: vec![0xb1, 0xb2],
+        payload: b"legacy-recovery".to_vec(),
+    };
+    store
+        .put_opaque_wallet_private_row(
+            &canonical,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &canonical_recovery,
+        )
+        .expect("seed canonical recovery");
+    store
+        .put_opaque_wallet_private_row(
+            &legacy,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &legacy_recovery,
+        )
+        .expect("seed legacy recovery");
+
+    let canonical_v1 = store
+        .list_wallet_private_v1_rows(&canonical)
+        .expect("list canonical v1");
+    let legacy_v1 = store
+        .list_wallet_private_v1_rows(&legacy)
+        .expect("list legacy v1");
+    let canonical_recovery_sources = store
+        .list_opaque_wallet_private_rows(&canonical, WalletPrivateRecordKind::OutputPoiRecovery)
+        .expect("list canonical recovery sources");
+    let legacy_recovery_sources = store
+        .list_opaque_wallet_private_rows(&legacy, WalletPrivateRecordKind::OutputPoiRecovery)
+        .expect("list legacy recovery sources");
+    let pending_destinations = [OpaqueWalletPrivateRow {
+        row_id: vec![0xc1, 0xc2],
+        payload: b"canonical-pending".to_vec(),
+    }];
+    let recovery_destinations = [canonical_recovery];
+    let batch = WalletPrivateCanonicalizationBatch {
+        canonical_namespace: &canonical,
+        legacy_namespace: Some(&legacy),
+        target_version: 1,
+        pending_output_contexts: WalletPrivateCanonicalizationKindBatch {
+            canonical_v1_sources: &canonical_v1.pending_output_contexts,
+            legacy_v1_sources: &legacy_v1.pending_output_contexts,
+            canonical_v2_destinations: &pending_destinations,
+            ..WalletPrivateCanonicalizationKindBatch::default()
+        },
+        output_poi_recoveries: WalletPrivateCanonicalizationKindBatch {
+            canonical_v1_sources: &canonical_v1.output_poi_recoveries,
+            legacy_v1_sources: &legacy_v1.output_poi_recoveries,
+            canonical_v2_sources: &canonical_recovery_sources,
+            legacy_v2_sources: &legacy_recovery_sources,
+            canonical_v2_destinations: &recovery_destinations,
+        },
+    };
+
+    let result = store.canonicalize_wallet_private_rows_transaction(&batch, || {
+        Err(DbError::Io(std::io::Error::other(
+            "injected canonicalization failure",
+        )))
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        store
+            .wallet_private_canonicalization_version(&canonical)
+            .expect("read rolled-back marker"),
+        0
+    );
+    assert_eq!(
+        store
+            .list_wallet_private_v1_rows(&legacy)
+            .expect("list rolled-back legacy v1"),
+        legacy_v1
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(&legacy, WalletPrivateRecordKind::OutputPoiRecovery,)
+            .expect("list rolled-back legacy v2"),
+        legacy_recovery_sources
+    );
+
+    assert_eq!(
+        store
+            .canonicalize_wallet_private_rows(&batch)
+            .expect("canonicalize wallet-private rows"),
+        WalletPrivateCanonicalizationReport {
+            pending_output_context_rows: 1,
+            output_poi_recovery_rows: 1,
+            plaintext_rows_removed: 1,
+        }
+    );
+    assert_eq!(
+        store
+            .wallet_private_canonicalization_version(&canonical)
+            .expect("read canonicalization marker"),
+        1
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(
+                &canonical,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+            )
+            .expect("list canonical pending rows"),
+        pending_destinations
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(
+                &canonical,
+                WalletPrivateRecordKind::OutputPoiRecovery,
+            )
+            .expect("list canonical recovery rows"),
+        recovery_destinations
+    );
+    assert!(
+        store
+            .list_wallet_private_v1_rows(&legacy)
+            .expect("list consumed legacy v1")
+            .pending_output_contexts
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_opaque_wallet_private_rows(&legacy, WalletPrivateRecordKind::OutputPoiRecovery,)
+            .expect("list consumed legacy v2")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .canonicalize_wallet_private_rows(&batch)
+            .expect("repeat canonicalization"),
+        WalletPrivateCanonicalizationReport::default()
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
 fn clear_poi_artifact_cache_removes_only_poi_artifact_records() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
@@ -3149,6 +3311,49 @@ fn schema_seven_migration_moves_alpha_wallet_cache_rows_atomically() {
         &reopened,
         &pending_output.key()
     ));
+    drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn schema_eight_to_nine_preserves_existing_rows() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open store");
+    store
+        .put_app_settings_record("schema-nine-sentinel", b"preserved")
+        .expect("write sentinel");
+    store
+        .write_meta(&Meta {
+            schema_version: 8,
+            app_version: "pre-canonicalization".to_string(),
+            created_at: 123,
+        })
+        .expect("write schema-eight metadata");
+    drop(store);
+
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("migrate schema eight to nine");
+    assert_eq!(
+        reopened
+            .read_meta()
+            .expect("read metadata")
+            .expect("metadata present")
+            .schema_version,
+        9
+    );
+    assert_eq!(
+        reopened
+            .get_app_settings_record("schema-nine-sentinel")
+            .expect("read sentinel")
+            .expect("sentinel present"),
+        b"preserved"
+    );
+
     drop(reopened);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

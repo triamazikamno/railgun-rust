@@ -859,13 +859,12 @@ impl<'a> WalletPrivateCommit<'a> {
     pub(crate) const fn new(
         _token: &crate::wallet::WalletActorCommitToken<'_>,
         permit: &'a crate::wallet::WalletPrivateMutationPermit<'_>,
-        chain_id: u64,
         utxos: WalletUtxoMutation<'a>,
         checkpoint: WalletCheckpointMutation,
     ) -> Self {
         Self {
             wallet_id: permit.wallet_id(),
-            chain_id,
+            chain_id: permit.chain_id(),
             utxos,
             checkpoint,
             sync_actor_state: None,

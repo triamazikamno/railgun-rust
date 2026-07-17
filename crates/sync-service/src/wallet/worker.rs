@@ -293,7 +293,6 @@ async fn commit_pending_output_contexts(
             WalletPrivateCommit::new(
                 &token,
                 &permit,
-                cfg.chain.chain_id,
                 WalletUtxoMutation::Preserve,
                 WalletCheckpointMutation::Preserve,
             )
@@ -1027,7 +1026,6 @@ impl WalletResetCommitRequest<'_> {
                 WalletPrivateCommit::new(
                     &token,
                     &permit,
-                    request.cfg.chain.chain_id,
                     WalletUtxoMutation::Replace(&candidate),
                     WalletCheckpointMutation::Set {
                         last_scanned_block: candidate_last_scanned,
@@ -1531,7 +1529,6 @@ impl WalletScanCommitRequest<'_> {
                     changed,
                 },
                 WalletProgressPrivateEffects {
-                    pending_output_context_chain_id: request.cfg.chain.chain_id,
                     pending_output_context_updates: &pending_output_context_updates,
                     pending_output_context_deletes: &outcome.spent_output_commitments,
                     output_poi_recovery_updates: &[],
@@ -4443,6 +4440,7 @@ mod tests {
     struct FailingCacheStoreState {
         store_calls: usize,
         meta_calls: usize,
+        last_chain_id: Option<u64>,
         fail_next_store: bool,
         fail_next_meta: bool,
         fail_next_actor_state: bool,
@@ -4512,6 +4510,7 @@ mod tests {
             &self,
             commit: WalletPrivateCommit<'_>,
         ) -> Result<(), WalletCacheError> {
+            self.state.lock().expect("cache state").last_chain_id = Some(commit.chain_id());
             if matches!(commit.utxo_mutation(), WalletUtxoMutation::Replace(_)) {
                 let mut state = self.state.lock().expect("cache state");
                 state.store_calls += 1;
@@ -8595,6 +8594,7 @@ mod tests {
         let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
         cache_store.fail_next_store();
         let mut cfg = wallet_config();
+        cfg.chain.chain_id = 42_161;
         cfg.cache_store = Some(cache_store.clone());
         let checkpoint = WalletMeta {
             last_scanned_block: 100,
@@ -8608,6 +8608,15 @@ mod tests {
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let public_data_plane = test_public_data_plane(&db);
+        let active_poi_list_keys = default_active_poi_list_keys();
+        let mut stale_utxo = test_wallet_utxo(105, 7);
+        stale_utxo.utxo.poi.statuses.extend(
+            active_poi_list_keys
+                .iter()
+                .copied()
+                .map(|list_key| (list_key, PoiStatus::Missing)),
+        );
+        stale_utxo.utxo.poi.refreshed_at = Some(1);
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -8628,14 +8637,13 @@ mod tests {
             live_rx,
             backfill_rx,
             cancel.clone(),
-            vec![test_wallet_utxo(105, 7)],
+            vec![stale_utxo],
             100,
         )
         .await
         .expect("spawn wallet worker");
         let mut persist_state = WalletPersistState::default();
         let (mut actor_state, mut readiness_rx) = test_actor_state_for_handle(&handle, 100);
-        let active_poi_list_keys = default_active_poi_list_keys();
         let poi_runtime = test_wallet_poi_runtime();
         // Unit test of commit request: job-style reader is fine (not actor path).
         let status_source = poi_runtime
@@ -8643,6 +8651,7 @@ mod tests {
             .await
             .expect("POI status reader");
 
+        let selection = WalletPoiRefreshSelection::RecoverableStale { now: u64::MAX };
         let result = WalletPoiStatusRefreshCommitRequest {
             cache_store: cache_store.as_ref(),
             cfg: &cfg,
@@ -8654,7 +8663,7 @@ mod tests {
             persist_state: &mut persist_state,
             status_reader: status_source.as_reader(),
             active_poi_list_keys: &active_poi_list_keys,
-            selection: WalletPoiRefreshSelection::RequiredOrRecoverable,
+            selection,
             cancel: &cancel,
         }
         .commit()
@@ -8665,11 +8674,19 @@ mod tests {
             readiness_rx.borrow().readiness(),
             &WalletReadiness::Failed(WalletReadinessError::PersistenceFailed)
         );
+        assert_eq!(cache_store.state().last_chain_id, Some(cfg.chain.chain_id));
         let _ = readiness_rx.borrow_and_update();
         assert_eq!(*handle.rev_rx.borrow(), 0);
         let snapshot = handle.utxos.read().await;
-        assert!(snapshot[0].utxo.poi.statuses.is_empty());
-        assert!(snapshot[0].utxo.poi.refreshed_at.is_none());
+        assert!(
+            snapshot[0]
+                .utxo
+                .poi
+                .statuses
+                .values()
+                .all(|status| status == &PoiStatus::Missing)
+        );
+        assert_eq!(snapshot[0].utxo.poi.refreshed_at, Some(1));
         assert_eq!(cache_store.state().store_calls, 1);
         drop(snapshot);
 
@@ -8685,7 +8702,7 @@ mod tests {
                 persist_state: &mut persist_state,
                 status_reader: status_source.as_reader(),
                 active_poi_list_keys: &active_poi_list_keys,
-                selection: WalletPoiRefreshSelection::RequiredOrRecoverable,
+                selection,
                 cancel: &cancel,
             }
             .commit()
@@ -8704,6 +8721,14 @@ mod tests {
         };
         assert_eq!(recovered_view.revision, 1);
         assert!(!recovered_view.utxos[0].utxo.poi.statuses.is_empty());
+        assert!(
+            recovered_view.utxos[0]
+                .utxo
+                .poi
+                .statuses
+                .values()
+                .any(|status| status != &PoiStatus::Missing)
+        );
         assert_eq!(recovered_observation.readiness(), &WalletReadiness::Syncing);
         let retained_checkpoint = db
             .get_wallet_meta(&cfg.cache_key)
