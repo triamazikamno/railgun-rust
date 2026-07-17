@@ -1,3 +1,4 @@
+use super::handle::LOCAL_PENDING_SPENT_TTL;
 use super::{
     Arc, AtomicU64, BackfillEvent, CancellationToken, ChainError, ChainPublicDataPlane, DbStore,
     Duration, FixedBytes, FuturesUnordered, HashSet, IndexedArtifactSourceConfig, Instant,
@@ -11,10 +12,10 @@ use super::{
     WalletBackfillResetResult, WalletBackfillStartResult, WalletCacheError, WalletCacheStore,
     WalletCheckpointMutation, WalletConfig, WalletCurrentSnapshot, WalletHandle,
     WalletInactiveReason, WalletIndexedCatchUpCommand, WalletIndexedCatchUpLease,
-    WalletLiveMetadataFlush, WalletLocalPendingSpentUpdate, WalletLogDelta,
-    WalletObservationPublisher, WalletPendingOverlay, WalletPendingOverlayUpdate,
-    WalletPendingResetRecord, WalletPendingSpent, WalletPersistState, WalletPoiRefreshSelection,
-    WalletPoiRuntime, WalletPrivateApplyClient, WalletPrivateApplyRequest, WalletPrivateCommit,
+    WalletLiveMetadataFlush, WalletLogDelta, WalletObservationPublisher, WalletPendingOverlay,
+    WalletPendingOverlayUpdate, WalletPendingResetRecord, WalletPendingSpent,
+    WalletPendingSpentMarkOutcome, WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
+    WalletPrivateApplyClient, WalletPrivateApplyRequest, WalletPrivateCommit,
     WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
     WalletPrivateRequest, WalletPrivateRequestError, WalletProgressPersist,
     WalletProgressPrivateEffects, WalletReadinessError, WalletRemoteDone, WalletResetReplayPlan,
@@ -81,11 +82,125 @@ async fn next_poi_corpus_revision(
     Some(*receiver.borrow_and_update())
 }
 
-async fn apply_local_pending_spent_update(
+async fn mark_local_pending_spent(
     handle: &WalletHandle,
     cancel: &CancellationToken,
     reset_generation: u64,
-    update: WalletLocalPendingSpentUpdate,
+    utxos: Vec<railgun_wallet::Utxo>,
+    tx_hash: Option<FixedBytes<32>>,
+) -> Result<WalletPendingSpentMarkOutcome, WalletPrivateRequestError> {
+    let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
+    let permit = authority
+        .acquire()
+        .await
+        .map_err(|reason| wallet_private_request_error(&reason))?;
+    let confirmed = permit.handle_utxos().read().await;
+    permit
+        .revalidate()
+        .map_err(|reason| wallet_private_request_error(&reason))?;
+    let current_identities = confirmed
+        .iter()
+        .map(|utxo| {
+            (
+                utxo.utxo.tree,
+                utxo.utxo.position,
+                wallet_utxo_stable_identity(utxo),
+                utxo.is_spent(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut overlay = permit.pending_overlay().write().await;
+    permit
+        .with_active_apply(|token| {
+            let now = now_epoch_secs();
+            let mut marked = prune_local_pending_spent(&mut overlay, &confirmed, now);
+            for utxo in utxos {
+                let key = (utxo.tree, utxo.position);
+                let submitted = WalletPendingSpent::submitted(&utxo, tx_hash, now);
+                let identity = submitted
+                    .stable_identity
+                    .as_ref()
+                    .expect("submitted lock has stable identity");
+                if current_identities.contains(&(utxo.tree, utxo.position, identity.clone(), true))
+                {
+                    let previous_len = overlay.local_pending_spent.len();
+                    overlay.local_pending_spent.retain(|spent| {
+                        spent.key() != key || spent.stable_identity.as_ref() != Some(identity)
+                    });
+                    marked |= overlay.local_pending_spent.len() != previous_len;
+                    continue;
+                }
+                if let Some(existing) = overlay.local_pending_spent.iter_mut().find(|spent| {
+                    spent.key() == key && spent.stable_identity.as_ref() == Some(identity)
+                }) {
+                    if existing.tx_hash != tx_hash {
+                        existing.tx_hash = tx_hash;
+                        existing.block_timestamp = Some(now);
+                        marked = true;
+                    }
+                    continue;
+                }
+                overlay.local_pending_spent.push(submitted);
+                marked = true;
+            }
+            overlay
+                .local_pending_spent
+                .sort_by_key(WalletPendingSpent::key);
+            if marked {
+                permit.apply_notify_changed(&token, &confirmed, &overlay);
+            }
+            if marked {
+                WalletPendingSpentMarkOutcome::Marked
+            } else {
+                WalletPendingSpentMarkOutcome::AlreadyProtected
+            }
+        })
+        .map_err(|reason| wallet_private_request_error(&reason))
+}
+
+fn prune_local_pending_spent(
+    overlay: &mut WalletPendingOverlay,
+    confirmed: &[WalletUtxo],
+    now: u64,
+) -> bool {
+    let before = overlay.local_pending_spent.len();
+    overlay.local_pending_spent.retain(|spent| {
+        let submitted_at = spent.block_timestamp.unwrap_or(now);
+        now.saturating_sub(submitted_at) < LOCAL_PENDING_SPENT_TTL.as_secs()
+            && !confirmed
+                .iter()
+                .any(|utxo| utxo.is_spent() && spent.matches_local_utxo(utxo))
+    });
+    overlay.local_pending_spent.len() != before
+}
+
+async fn wait_for_local_pending_spent_expiry(handle: &WalletHandle) -> u64 {
+    let now = now_epoch_secs();
+    let next_expiry = handle
+        .pending_overlay
+        .read()
+        .await
+        .local_pending_spent
+        .iter()
+        .map(|spent| {
+            spent
+                .block_timestamp
+                .unwrap_or(now)
+                .saturating_add(LOCAL_PENDING_SPENT_TTL.as_secs())
+        })
+        .min();
+    let Some(next_expiry) = next_expiry else {
+        return futures::future::pending().await;
+    };
+    tokio::time::sleep(Duration::from_secs(next_expiry.saturating_sub(now))).await;
+    next_expiry
+}
+
+async fn expire_local_pending_spent(
+    handle: &WalletHandle,
+    cancel: &CancellationToken,
+    reset_generation: u64,
+    expiry: u64,
 ) -> Result<bool, WalletPrivateRequestError> {
     let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
     let permit = authority
@@ -96,69 +211,37 @@ async fn apply_local_pending_spent_update(
     permit
         .revalidate()
         .map_err(|reason| wallet_private_request_error(&reason))?;
-    let unspent_identities = confirmed
-        .iter()
-        .filter(|utxo| !utxo.is_spent())
-        .map(|utxo| {
-            (
-                utxo.utxo.tree,
-                utxo.utxo.position,
-                wallet_utxo_stable_identity(utxo),
-            )
-        })
-        .collect::<HashSet<_>>();
     let mut overlay = permit.pending_overlay().write().await;
     permit
         .with_active_apply(|token| {
-            let changed = match update {
-                WalletLocalPendingSpentUpdate::Mark { utxos, tx_hash } => {
-                    let now = now_epoch_secs();
-                    let chain_pending = overlay
-                        .pending_spent
-                        .iter()
-                        .map(WalletPendingSpent::key)
-                        .collect::<HashSet<_>>();
-                    let mut existing = overlay
-                        .local_pending_spent
-                        .iter()
-                        .map(WalletPendingSpent::key)
-                        .collect::<HashSet<_>>();
-                    let before = overlay.local_pending_spent.len();
-                    let mut updated_existing = false;
-                    for utxo in utxos {
-                        let key = (utxo.tree, utxo.position);
-                        let identity = wallet_utxo_stable_identity(&WalletUtxo::new(utxo.clone()));
-                        if !unspent_identities.contains(&(utxo.tree, utxo.position, identity))
-                            || chain_pending.contains(&key)
-                        {
-                            continue;
-                        }
-                        if existing.insert(key) {
-                            overlay
-                                .local_pending_spent
-                                .push(WalletPendingSpent::submitted(&utxo, tx_hash, now));
-                        } else if let Some(spent) = overlay
-                            .local_pending_spent
-                            .iter_mut()
-                            .find(|spent| spent.key() == key)
-                            && spent.tx_hash != tx_hash
-                        {
-                            spent.tx_hash = tx_hash;
-                            spent.block_timestamp = Some(now);
-                            updated_existing = true;
-                        }
-                    }
-                    overlay
-                        .local_pending_spent
-                        .sort_by_key(WalletPendingSpent::key);
-                    overlay.local_pending_spent.len() != before || updated_existing
-                }
-                WalletLocalPendingSpentUpdate::ClearAll => {
-                    let changed = !overlay.local_pending_spent.is_empty();
-                    overlay.local_pending_spent.clear();
-                    changed
-                }
-            };
+            let changed = prune_local_pending_spent(&mut overlay, &confirmed, expiry);
+            if changed {
+                permit.apply_notify_changed(&token, &confirmed, &overlay);
+            }
+            changed
+        })
+        .map_err(|reason| wallet_private_request_error(&reason))
+}
+
+async fn clear_local_pending_spent(
+    handle: &WalletHandle,
+    cancel: &CancellationToken,
+    reset_generation: u64,
+) -> Result<bool, WalletPrivateRequestError> {
+    let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
+    let permit = authority
+        .acquire()
+        .await
+        .map_err(|reason| wallet_private_request_error(&reason))?;
+    let confirmed = permit.handle_utxos().read().await;
+    permit
+        .revalidate()
+        .map_err(|reason| wallet_private_request_error(&reason))?;
+    let mut overlay = permit.pending_overlay().write().await;
+    permit
+        .with_active_apply(|token| {
+            let changed = !overlay.local_pending_spent.is_empty();
+            overlay.local_pending_spent.clear();
             if changed {
                 permit.apply_notify_changed(&token, &confirmed, &overlay);
             }
@@ -170,7 +253,7 @@ async fn apply_local_pending_spent_update(
 async fn commit_pending_output_contexts(
     handle: &WalletHandle,
     cancel: &CancellationToken,
-    db: &DbStore,
+    _db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     reset_generation: u64,
@@ -192,9 +275,9 @@ async fn commit_pending_output_contexts(
             context
                 .clone()
                 .into_record(cfg.chain.chain_id, cfg.cache_key.to_string(), created_at);
-        match db.get_pending_output_poi_context(
+        match cache_store.get_pending_output_poi_context(
             record.chain_id,
-            &record.wallet_id,
+            &cfg.cache_key,
             &record.output_commitment,
         ) {
             Ok(Some(_)) => {}
@@ -573,7 +656,6 @@ impl PoiMaintenanceJob {
 }
 
 struct WalletScanCommitRequest<'a> {
-    db: &'a DbStore,
     cache_store: &'a dyn WalletCacheStore,
     cfg: &'a WalletConfig,
     utxos: &'a Arc<RwLock<Vec<WalletUtxo>>>,
@@ -962,9 +1044,22 @@ impl WalletResetCommitRequest<'_> {
                 .live_metadata_flush
                 .mark_persisted(candidate_last_scanned, Instant::now());
             *utxos_locked = candidate;
-            let next_overlay = WalletPendingOverlay::default();
+            let now = now_epoch_secs();
+            let local_pending_spent = overlay_locked
+                .local_pending_spent
+                .iter()
+                .filter(|spent| {
+                    let submitted_at = spent.block_timestamp.unwrap_or(now);
+                    now.saturating_sub(submitted_at) < LOCAL_PENDING_SPENT_TTL.as_secs()
+                })
+                .cloned()
+                .collect();
+            let next_overlay = WalletPendingOverlay {
+                local_pending_spent,
+                ..WalletPendingOverlay::default()
+            };
             let overlay_changed = !chain_pending_overlay_matches(&overlay_locked, &next_overlay)
-                || !overlay_locked.local_pending_spent.is_empty()
+                || overlay_locked.local_pending_spent != next_overlay.local_pending_spent
                 || !overlay_locked.new_utxos.is_empty();
             *overlay_locked = next_overlay;
             permit.apply_set_last_scanned_mirror(&token, candidate_last_scanned);
@@ -1339,28 +1434,30 @@ impl WalletScanCommitRequest<'_> {
             };
         }
 
-        let pending_output_context_updates = match pending_output_poi_observation_updates(
-            request.db,
+        let Ok(pending_output_context_updates) = pending_output_poi_observation_updates(
+            request.cache_store,
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
             &commitment_observations,
-        ) {
-            Ok(updates) => updates,
-            Err(err) => {
-                warn!(?err, cache_key = %request.cfg.cache_key, from_block, to_block, "failed to prepare wallet scan pending output POI observations");
-                let _ = permit.with_active_apply(|token| {
-                    request.actor_state.transition(&token, |mut state| {
-                        state.sync_progress_persist_failed(request.job_token, from_block, to_block);
-                    });
+        ) else {
+            warn!(
+                chain_id = request.cfg.chain.chain_id,
+                from_block,
+                to_block,
+                "failed to prepare wallet scan pending output POI observations"
+            );
+            let _ = permit.with_active_apply(|token| {
+                request.actor_state.transition(&token, |mut state| {
+                    state.sync_progress_persist_failed(request.job_token, from_block, to_block);
                 });
-                return WalletScanCommitOutcome {
-                    result: WalletBackfillApplyResult::Rejected {
-                        committed_to: *request.last_scanned,
-                        reason: WalletBackfillRejectReason::PersistenceFailed,
-                    },
-                    changed: false,
-                };
-            }
+            });
+            return WalletScanCommitOutcome {
+                result: WalletBackfillApplyResult::Rejected {
+                    committed_to: *request.last_scanned,
+                    reason: WalletBackfillRejectReason::PersistenceFailed,
+                },
+                changed: false,
+            };
         };
 
         let persist_started = Instant::now();
@@ -1416,6 +1513,8 @@ impl WalletScanCommitRequest<'_> {
             .unwrap_or(to_block)
             .max(to_block);
         let mut utxos_locked = request.utxos.write().await;
+        let mut overlay_locked = request.worker_handle.pending_overlay.write().await;
+        let mut projection_changed = changed;
         let apply_result = permit.with_active_apply(|token| {
             let persisted_full_snapshot = request.persist_state.commit_progress_with_token(
                 request.cache_store,
@@ -1439,21 +1538,17 @@ impl WalletScanCommitRequest<'_> {
                 },
             )?;
             *utxos_locked = candidate;
-            let overlay = request
-                .worker_handle
-                .pending_overlay
-                .try_read()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
+            projection_changed |=
+                prune_local_pending_spent(&mut overlay_locked, &utxos_locked, now_epoch_secs());
             *request.last_scanned = to_block;
             request
                 .live_metadata_flush
                 .mark_persisted(to_block, Instant::now());
             permit.apply_set_last_scanned_mirror(&token, to_block);
-            if changed {
+            if projection_changed {
                 permit.apply_increment_revision(&token);
             }
-            let view = permit.apply_current_view(&token, &utxos_locked, &overlay);
+            let view = permit.apply_current_view(&token, &utxos_locked, &overlay_locked);
             request
                 .actor_state
                 .transition_with_view(&token, view, |mut state| {
@@ -1472,6 +1567,7 @@ impl WalletScanCommitRequest<'_> {
             );
             Ok::<bool, WalletCacheError>(persisted_full_snapshot)
         });
+        drop(overlay_locked);
         drop(utxos_locked);
         let persisted_full_snapshot = match apply_result {
             Ok(Ok(persisted_full_snapshot)) => persisted_full_snapshot,
@@ -1518,7 +1614,7 @@ impl WalletScanCommitRequest<'_> {
             total = snapshot.len(),
             unspent,
             spent,
-            changed,
+            changed = projection_changed,
             commitment_observations = commitment_observation_count,
             persisted_full_snapshot,
             needs_full_persist = request.persist_state.needs_full_persist,
@@ -1531,7 +1627,7 @@ impl WalletScanCommitRequest<'_> {
             result: WalletBackfillApplyResult::Committed {
                 committed_to: to_block,
             },
-            changed,
+            changed: projection_changed,
         }
     }
 }
@@ -2287,6 +2383,16 @@ pub(crate) async fn prepare_wallet_worker(
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
+                expiry = wait_for_local_pending_spent_expiry(&worker_handle) => {
+                    if let Err(error) = expire_local_pending_spent(
+                        &worker_handle,
+                        &cancel,
+                        actor_state.reset_generation(),
+                        expiry,
+                    ).await {
+                        debug!(%error, cache_key = %cfg.cache_key, "local pending-spend expiry skipped");
+                    }
+                }
                 Some((token, signal)) = accepted_backfill_liveness.next(), if !accepted_backfill_liveness.is_empty() => {
                     let WalletBackfillOwnerSignal {
                         disposition,
@@ -2666,24 +2772,39 @@ pub(crate) async fn prepare_wallet_worker(
                 }
                 Some(request) = private_request_rx.recv() => {
                     match request {
-                        WalletPrivateRequest::LocalPendingSpent {
-                            ticket,
-                            update,
+                        WalletPrivateRequest::MarkLocalPendingSpent {
+                            utxos,
+                            tx_hash,
                             reply,
                         } => {
-                            let result = match actor_state.validate_private_request(
+                            let result = match actor_state.validate_pending_overlay_request(
                                 &worker_handle,
                                 &cancel,
-                                ticket,
-                                last_scanned,
-                                true,
                             ) {
                                 Ok(reset_generation) => {
-                                    apply_local_pending_spent_update(
+                                    mark_local_pending_spent(
                                         &worker_handle,
                                         &cancel,
                                         reset_generation,
-                                        update,
+                                        utxos,
+                                        tx_hash,
+                                    )
+                                    .await
+                                }
+                                Err(err) => Err(err),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        WalletPrivateRequest::ClearLocalPendingSpent { reply } => {
+                            let result = match actor_state.validate_pending_overlay_request(
+                                &worker_handle,
+                                &cancel,
+                            ) {
+                                Ok(reset_generation) => {
+                                    clear_local_pending_spent(
+                                        &worker_handle,
+                                        &cancel,
+                                        reset_generation,
                                     )
                                     .await
                                 }
@@ -3208,7 +3329,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 continue;
                             }
                             let outcome = WalletScanCommitRequest {
-                                db: db.as_ref(),
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
                                 utxos: &utxos,
@@ -3656,7 +3776,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 continue;
                             }
                             let outcome = WalletScanCommitRequest {
-                                db: db.as_ref(),
                                 cache_store: cache_store.as_ref(),
                                 cfg: &cfg,
                                 utxos: &utxos,
@@ -3920,8 +4039,8 @@ mod tests {
     use broadcaster_core::query_rpc_pool::QueryRpcPool;
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
     use local_db::{
-        DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey,
-        WalletMeta,
+        DbConfig, DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord,
+        PendingOutputPoiRole, WalletCacheKey, WalletMeta,
     };
     use merkletree::tree::MerkleForest;
     use poi::artifacts::SnapshotEvent;
@@ -4462,6 +4581,58 @@ mod tests {
             self.db.put_wallet_sync_actor_state(commit.state())?;
             *self.actor_state.lock().expect("actor state") = Some(commit.state().clone());
             Ok(())
+        }
+
+        fn get_pending_output_poi_context(
+            &self,
+            chain_id: u64,
+            wallet_id: &WalletCacheKey,
+            output_commitment: &FixedBytes<32>,
+        ) -> Result<Option<PendingOutputPoiContextRecord>, WalletCacheError> {
+            <DbStore as WalletCacheStore>::get_pending_output_poi_context(
+                self.db.as_ref(),
+                chain_id,
+                wallet_id,
+                output_commitment,
+            )
+        }
+
+        fn list_pending_output_poi_contexts(
+            &self,
+            chain_id: u64,
+            wallet_id: &WalletCacheKey,
+        ) -> Result<Vec<PendingOutputPoiContextRecord>, WalletCacheError> {
+            <DbStore as WalletCacheStore>::list_pending_output_poi_contexts(
+                self.db.as_ref(),
+                chain_id,
+                wallet_id,
+            )
+        }
+
+        fn get_output_poi_recovery(
+            &self,
+            chain_id: u64,
+            wallet_id: &WalletCacheKey,
+            output_commitment: &FixedBytes<32>,
+        ) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError> {
+            <DbStore as WalletCacheStore>::get_output_poi_recovery(
+                self.db.as_ref(),
+                chain_id,
+                wallet_id,
+                output_commitment,
+            )
+        }
+
+        fn list_output_poi_recoveries(
+            &self,
+            chain_id: u64,
+            wallet_id: &WalletCacheKey,
+        ) -> Result<Vec<OutputPoiRecoveryRecord>, WalletCacheError> {
+            <DbStore as WalletCacheStore>::list_output_poi_recoveries(
+                self.db.as_ref(),
+                chain_id,
+                wallet_id,
+            )
         }
     }
 
@@ -5279,7 +5450,6 @@ mod tests {
         )
         .await
         .expect("spawn wallet worker");
-
         assert_eq!(
             send_target(&handle, &backfill_tx, 900, 0).await,
             WalletBackfillFinishResult::Ready { committed_to: 900 }
@@ -5408,6 +5578,14 @@ mod tests {
         let snapshot = handle.utxos.read().await;
         assert_eq!(snapshot.len(), 1);
         assert!(snapshot[0].spent.is_some());
+        assert!(
+            handle
+                .pending_overlay
+                .read()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
 
         cancel.cancel();
         drop(snapshot);
@@ -5641,6 +5819,12 @@ mod tests {
         .expect("spawn wallet worker");
 
         assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::Marked)
+        );
+        assert_eq!(
             send_apply(
                 &handle,
                 &backfill_tx,
@@ -5726,6 +5910,7 @@ mod tests {
         let pending_spent = WalletPendingSpent {
             tree: wallet_utxo.utxo.tree,
             position: wallet_utxo.utxo.position,
+            stable_identity: None,
             tx_hash: Some(spent_source.tx_hash),
             block_number: Some(spent_source.block_number),
             block_timestamp: Some(spent_source.block_timestamp),
@@ -5818,6 +6003,7 @@ mod tests {
         let older_spent = WalletPendingSpent {
             tree: wallet_utxo.utxo.tree,
             position: wallet_utxo.utxo.position,
+            stable_identity: None,
             tx_hash: Some(older_source.tx_hash),
             block_number: Some(older_source.block_number),
             block_timestamp: Some(older_source.block_timestamp),
@@ -7047,6 +7233,7 @@ mod tests {
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let wallet_utxo = test_wallet_utxo(105, 7);
+        let expired_wallet_utxo = test_wallet_utxo(106, 8);
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -7067,7 +7254,7 @@ mod tests {
             live_rx,
             backfill_rx,
             cancel.clone(),
-            vec![wallet_utxo.clone()],
+            vec![wallet_utxo.clone(), expired_wallet_utxo.clone()],
             120,
         )
         .await
@@ -7076,6 +7263,7 @@ mod tests {
         let pending_spent = WalletPendingSpent {
             tree: wallet_utxo.utxo.tree,
             position: wallet_utxo.utxo.position,
+            stable_identity: None,
             tx_hash: Some(spent_source.tx_hash),
             block_number: Some(spent_source.block_number),
             block_timestamp: Some(spent_source.block_timestamp),
@@ -7112,6 +7300,18 @@ mod tests {
         })
         .await
         .expect("pending overlay applied");
+        let now = now_epoch_secs();
+        let recent_local =
+            WalletPendingSpent::submitted(&wallet_utxo.utxo, Some([0xbb; 32].into()), now);
+        let expired_local = WalletPendingSpent::submitted(
+            &expired_wallet_utxo.utxo,
+            Some([0xcc; 32].into()),
+            now.saturating_sub(LOCAL_PENDING_SPENT_TTL.as_secs() + 1),
+        );
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay.local_pending_spent = vec![recent_local.clone(), expired_local];
+        }
 
         assert_eq!(
             send_reset(&backfill_tx, 1, 100).await,
@@ -7120,6 +7320,8 @@ mod tests {
         let overlay = handle.pending_overlay().expect("current after rewind");
         assert!(overlay.pending_spent.is_empty());
         assert!(overlay.new_utxos.is_empty());
+        assert_eq!(overlay.local_pending_spent, vec![recent_local]);
+        assert!(overlay.local_pending_spent[0].matches_local_utxo(&wallet_utxo));
 
         cancel.cancel();
         drop(db);
@@ -8657,7 +8859,6 @@ mod tests {
         assert!(actor_state.test_transition(|mut state| state.accept_target(job_token, 101)));
         let spent_source = source(101, 0xaa);
         let outcome = WalletScanCommitRequest {
-            db: db.as_ref(),
             cache_store: cache_store.as_ref(),
             cfg: &cfg,
             utxos: &handle.utxos,
@@ -8899,7 +9100,6 @@ mod tests {
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
             WalletScanCommitRequest {
-                db: db.as_ref(),
                 cache_store: cache_store.as_ref(),
                 cfg: &cfg,
                 utxos: &handle.utxos,
@@ -8955,7 +9155,6 @@ mod tests {
         );
         later_apply.rows.source = PublicScanSource::Rpc;
         let later_outcome = WalletScanCommitRequest {
-            db: db.as_ref(),
             cache_store: cache_store.as_ref(),
             cfg: &cfg,
             utxos: &handle.utxos,
@@ -9114,7 +9313,6 @@ mod tests {
         );
         let public_data_plane = test_public_data_plane(&db);
         let outcome = WalletScanCommitRequest {
-            db: db.as_ref(),
             cache_store: cache_store.as_ref(),
             cfg: &cfg,
             utxos: &handle.utxos,
@@ -9944,7 +10142,7 @@ mod tests {
             handle
                 .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), Some(tx_hash))
                 .await,
-            Ok(true)
+            Ok(WalletPendingSpentMarkOutcome::Marked)
         );
         let marked = handle.current_snapshot().expect("marked wallet view");
         assert_eq!(marked.utxos.len(), 1);
@@ -9954,14 +10152,36 @@ mod tests {
             marked.pending_overlay.local_pending_spent[0].tx_hash,
             Some(tx_hash)
         );
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), Some(tx_hash))
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::AlreadyProtected)
+        );
+        assert_eq!(
+            handle
+                .current_snapshot()
+                .expect("duplicate mark view")
+                .revision,
+            marked.revision
+        );
 
         let missing = test_wallet_utxo(106, 99);
         assert_eq!(
             handle
                 .mark_pending_spent_utxos(std::slice::from_ref(&missing.utxo), None)
                 .await,
-            Ok(false),
-            "the actor must not mark an input outside its current unspent projection"
+            Ok(WalletPendingSpentMarkOutcome::Marked),
+            "the actor retains a latent intent until an identical input replays"
+        );
+        assert!(
+            handle
+                .current_snapshot()
+                .expect("latent input view")
+                .pending_overlay
+                .local_pending_spent
+                .iter()
+                .any(|spent| spent.matches_local_utxo(&missing))
         );
         let mut stale_replacement = wallet_utxo.utxo.clone();
         stale_replacement.note.value = U256::from(999);
@@ -9969,8 +10189,24 @@ mod tests {
             handle
                 .mark_pending_spent_utxos(std::slice::from_ref(&stale_replacement), None)
                 .await,
-            Ok(false),
-            "a stale input must not mark a different current output at the same position"
+            Ok(WalletPendingSpentMarkOutcome::Marked),
+            "a distinct latent identity may coexist at the same tree position"
+        );
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&missing.utxo), None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::AlreadyProtected),
+            "a duplicate latent intent does not refresh its timestamp"
+        );
+        assert!(
+            handle
+                .current_snapshot()
+                .expect("replayed input view")
+                .pending_overlay
+                .local_pending_spent
+                .iter()
+                .any(|spent| spent.matches_local_utxo(&missing))
         );
         assert_eq!(handle.clear_all_local_pending_spent().await, Ok(true));
         assert!(
@@ -9978,6 +10214,37 @@ mod tests {
                 .current_snapshot()
                 .expect("cleared wallet view")
                 .pending_overlay
+                .local_pending_spent
+                .is_empty()
+        );
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay.pending_spent.push(WalletPendingSpent::from_source(
+                &wallet_utxo.utxo,
+                &source(106, 0x72),
+            ));
+        }
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::Marked),
+            "the local intent remains latent while chain pending state protects the position"
+        );
+        handle.pending_overlay.write().await.pending_spent.clear();
+        handle.utxos.write().await[0].spent = Some(source(107, 0x73));
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::Marked),
+            "a confirmed spend retires the local intent for the exact input"
+        );
+        assert!(
+            handle
+                .pending_overlay
+                .read()
+                .await
                 .local_pending_spent
                 .is_empty()
         );
@@ -9996,27 +10263,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_private_mailbox_clears_mixed_visible_and_latent_spend_intents() {
+        let visible = test_wallet_utxo(105, 7);
+        let latent = test_wallet_utxo(106, 8);
+        let (root_dir, db, _cache_store, handle, cancel, _backfill_tx, _live_tx) =
+            spawn_consumer_api_wallet("wallet-private-mixed-pending", vec![visible.clone()]).await;
+
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(&[visible.utxo.clone(), latent.utxo.clone()], None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::Marked)
+        );
+        let overlay = handle.pending_overlay.read().await.clone();
+        assert_eq!(overlay.local_pending_spent.len(), 2);
+        assert!(
+            overlay
+                .local_pending_spent
+                .iter()
+                .any(|spent| spent.matches_local_utxo(&visible))
+        );
+        assert!(
+            overlay
+                .local_pending_spent
+                .iter()
+                .any(|spent| spent.matches_local_utxo(&latent))
+        );
+
+        assert_eq!(handle.clear_all_local_pending_spent().await, Ok(true));
+        handle.utxos.write().await.push(latent);
+        assert!(
+            handle
+                .pending_overlay
+                .read()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wallet_private_mailbox_expires_local_spend_intent_without_other_commands() {
+        let wallet_utxo = test_wallet_utxo(105, 7);
+        let (root_dir, db, _cache_store, handle, cancel, _backfill_tx, _live_tx) =
+            spawn_consumer_api_wallet("wallet-private-pending-expiry", vec![wallet_utxo.clone()])
+                .await;
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::Marked)
+        );
+
+        tokio::time::advance(LOCAL_PENDING_SPENT_TTL + Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            if handle
+                .pending_overlay
+                .read()
+                .await
+                .local_pending_spent
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle
+                .pending_overlay
+                .read()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
     async fn wallet_private_mailbox_orders_mark_before_clear_across_command_kinds() {
         let wallet_utxo = test_wallet_utxo(105, 7);
         let (root_dir, db, _cache_store, handle, cancel, _backfill_tx, _live_tx) =
             spawn_consumer_api_wallet("wallet-private-command-order", vec![wallet_utxo.clone()])
                 .await;
         let snapshot = handle.current_snapshot().expect("current wallet view");
-        let ticket = WalletPrivateViewTicket::Current {
-            reset_generation: snapshot.reset_generation,
-            last_scanned: snapshot.last_scanned,
-        };
         let revision = snapshot.revision;
         let held = Arc::clone(&handle.authority_lock).lock_owned().await;
         let (mark_reply, mark_result) = oneshot::channel();
         handle
             .private_request_tx
-            .send(WalletPrivateRequest::LocalPendingSpent {
-                ticket,
-                update: WalletLocalPendingSpentUpdate::Mark {
-                    utxos: vec![wallet_utxo.utxo],
-                    tx_hash: None,
-                },
+            .send(WalletPrivateRequest::MarkLocalPendingSpent {
+                utxos: vec![wallet_utxo.utxo],
+                tx_hash: None,
                 reply: mark_reply,
             })
             .await
@@ -10024,17 +10368,16 @@ mod tests {
         let (clear_reply, clear_result) = oneshot::channel();
         handle
             .private_request_tx
-            .send(WalletPrivateRequest::LocalPendingSpent {
-                ticket,
-                update: WalletLocalPendingSpentUpdate::ClearAll,
-                reply: clear_reply,
-            })
+            .send(WalletPrivateRequest::ClearLocalPendingSpent { reply: clear_reply })
             .await
             .expect("queue clear request");
         wait_for_sender_capacity(&handle.private_request_tx, 7, "ordered private commands").await;
 
         drop(held);
-        assert_eq!(mark_result.await.expect("mark result"), Ok(true));
+        assert_eq!(
+            mark_result.await.expect("mark result"),
+            Ok(WalletPendingSpentMarkOutcome::Marked)
+        );
         assert_eq!(clear_result.await.expect("clear result"), Ok(true));
         let final_snapshot = handle.current_snapshot().expect("final wallet view");
         assert!(
@@ -10214,7 +10557,7 @@ mod tests {
             handle
                 .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
                 .await,
-            Ok(true)
+            Ok(WalletPendingSpentMarkOutcome::Marked)
         );
         let revision = *handle.rev_rx.borrow();
 
@@ -10231,14 +10574,29 @@ mod tests {
             handle.view_state(),
             WalletViewState::ResetPending { .. }
         ));
-        assert_private_command_error(
-            &handle,
-            &wallet_utxo,
-            context.clone(),
-            WalletPrivateRequestError::ResetPending,
-        )
-        .await;
-        assert_private_command_state_unchanged(&handle, revision).await;
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::AlreadyProtected)
+        );
+        assert_eq!(handle.clear_all_local_pending_spent().await, Ok(true));
+        assert_eq!(
+            handle
+                .create_pending_output_poi_contexts(vec![context.clone()])
+                .await,
+            Err(WalletPrivateRequestError::ResetPending)
+        );
+        let revision_after_clear = *handle.rev_rx.borrow();
+        assert!(revision_after_clear > revision);
+        assert!(
+            handle
+                .pending_overlay
+                .read()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
         assert!(
             db.get_pending_output_poi_context(
                 cfg.chain.chain_id,
@@ -10262,7 +10620,15 @@ mod tests {
             WalletPrivateRequestError::Inactive,
         )
         .await;
-        assert_private_command_state_unchanged(&handle, revision).await;
+        assert_eq!(*handle.rev_rx.borrow(), revision_after_clear);
+        assert!(
+            handle
+                .pending_overlay
+                .read()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
         assert!(
             db.get_pending_output_poi_context(
                 cfg.chain.chain_id,
@@ -10292,7 +10658,7 @@ mod tests {
             handle
                 .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
                 .await,
-            Ok(true)
+            Ok(WalletPendingSpentMarkOutcome::Marked)
         );
         let revision = *handle.rev_rx.borrow();
 
@@ -10341,35 +10707,6 @@ mod tests {
         let (root_dir, db, _cache_store, handle, cancel, _backfill_tx, _live_tx) =
             spawn_consumer_api_wallet("wallet-private-stale-queue", vec![wallet_utxo.clone()])
                 .await;
-        let (pending_reply, pending_result) = oneshot::channel();
-        handle
-            .private_request_tx
-            .send(WalletPrivateRequest::LocalPendingSpent {
-                ticket: WalletPrivateViewTicket::Current {
-                    reset_generation: 0,
-                    last_scanned: 99,
-                },
-                update: WalletLocalPendingSpentUpdate::Mark {
-                    utxos: vec![wallet_utxo.utxo.clone()],
-                    tx_hash: None,
-                },
-                reply: pending_reply,
-            })
-            .await
-            .expect("queue stale pending-spend request");
-        assert_eq!(
-            pending_result.await.expect("stale pending-spend response"),
-            Err(WalletPrivateRequestError::StaleView)
-        );
-        assert!(
-            handle
-                .current_snapshot()
-                .expect("current wallet view")
-                .pending_overlay
-                .local_pending_spent
-                .is_empty()
-        );
-
         let cfg = wallet_config();
         let context = pending_output_context_intent_for_wallet_utxo(&wallet_utxo);
         let (context_reply, context_result) = oneshot::channel();
@@ -10416,25 +10753,17 @@ mod tests {
             handle
                 .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), None)
                 .await,
-            Ok(true)
+            Ok(WalletPendingSpentMarkOutcome::Marked)
         );
         let revision_before = handle
             .current_snapshot()
             .expect("marked wallet view")
             .revision;
         let held = Arc::clone(&handle.authority_lock).lock_owned().await;
-        let snapshot = handle.current_snapshot().expect("current clear-all view");
         let (clear_reply, clear_result) = oneshot::channel();
         handle
             .private_request_tx
-            .send(WalletPrivateRequest::LocalPendingSpent {
-                ticket: WalletPrivateViewTicket::Current {
-                    reset_generation: snapshot.reset_generation,
-                    last_scanned: snapshot.last_scanned,
-                },
-                update: WalletLocalPendingSpentUpdate::ClearAll,
-                reply: clear_reply,
-            })
+            .send(WalletPrivateRequest::ClearLocalPendingSpent { reply: clear_reply })
             .await
             .expect("queue clear-all request");
         wait_for_sender_capacity(&handle.private_request_tx, 8, "dequeued clear-all").await;
@@ -10559,7 +10888,7 @@ mod tests {
         );
         assert!(matches!(
             mark.await.expect("pending-spend task"),
-            Err(WalletPrivateRequestError::ResetPending | WalletPrivateRequestError::StaleView)
+            Ok(WalletPendingSpentMarkOutcome::Marked)
         ));
         assert!(matches!(
             create.await.expect("pending-context task"),

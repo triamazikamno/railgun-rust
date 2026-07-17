@@ -27,9 +27,9 @@ use super::{
     expected_pending_context_state, expected_recovery_state, generate_post_transaction_pois, hex,
     json, log_local_poi_cache_unavailable, now_epoch_secs, pending_output_poi_context_fingerprint,
     pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submission_plan_current,
-    pending_output_poi_submit_identity, preflight_and_remote_submit_pending_output_poi,
-    railgun_txid_leaf_hash_with_output_start, relayCall, shared_symmetric_key, split_iv_tag,
-    submit_observed_pending_output_pois_inner, transactCall, warn,
+    preflight_and_remote_submit_pending_output_poi, railgun_txid_leaf_hash_with_output_start,
+    relayCall, shared_symmetric_key, split_iv_tag, submit_observed_pending_output_pois_inner,
+    transactCall, warn,
 };
 #[cfg(test)]
 use super::{PendingOutputPoiSubmitter, SingleCommitmentProofContext};
@@ -86,7 +86,7 @@ enum OutputPoiProofSourceResolution {
 pub(super) struct OutputRecoveryRemoteProofSource<'a> {
     pub(super) private_poi: &'a WalletPrivatePoiClients,
     pub(super) authority: &'a WalletPrivateMutationAuthority<'a>,
-    pub(super) db: &'a DbStore,
+    pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
     pub(super) candidate: &'a WalletUtxo,
     pub(super) required_poi_list_keys: &'a [FixedBytes<32>],
@@ -115,7 +115,7 @@ impl PoiMerkleProofSource for OutputRecoveryRemoteProofSource<'_> {
                     Ok::<bool, std::convert::Infallible>(
                         output_poi_recovery_candidate_still_current(
                             self.authority,
-                            self.db,
+                            self.cache_store,
                             self.cfg,
                             self.candidate,
                             self.required_poi_list_keys,
@@ -200,7 +200,7 @@ impl OutputPoiRecoveryRequest<'_> {
     ) -> bool {
         output_poi_recovery_candidate_still_current(
             self.authority,
-            self.db,
+            self.cache_store,
             self.cfg,
             candidate,
             required_poi_list_keys,
@@ -211,7 +211,7 @@ impl OutputPoiRecoveryRequest<'_> {
 
 async fn output_poi_recovery_candidate_still_current(
     authority: &WalletPrivateMutationAuthority<'_>,
-    db: &DbStore,
+    cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     candidate: &WalletUtxo,
     required_poi_list_keys: &[FixedBytes<32>],
@@ -219,26 +219,19 @@ async fn output_poi_recovery_candidate_still_current(
     if required_poi_list_keys.is_empty() {
         return false;
     }
-    if let Err(reason) = authority.revalidate() {
+    if authority.revalidate().is_err() {
         debug!(
-            ?reason,
-            cache_key = %cfg.cache_key,
-            commitment = %hex::encode(candidate.utxo.poi.commitment),
+            chain_id = cfg.chain.chain_id,
             "output POI recovery side effect rejected"
         );
         return false;
     }
-    let snapshot = match authority.wallet_utxos().await {
-        Ok(snapshot) => snapshot,
-        Err(reason) => {
-            debug!(
-                ?reason,
-                cache_key = %cfg.cache_key,
-                commitment = %hex::encode(candidate.utxo.poi.commitment),
-                "output POI recovery side effect skipped before wallet state check"
-            );
-            return false;
-        }
+    let Ok(snapshot) = authority.wallet_utxos().await else {
+        debug!(
+            chain_id = cfg.chain.chain_id,
+            "output POI recovery side effect skipped before wallet state check"
+        );
+        return false;
     };
     if !snapshot.iter().any(|wallet_utxo| {
         !wallet_utxo.is_spent()
@@ -252,13 +245,12 @@ async fn output_poi_recovery_candidate_still_current(
             )
     }) {
         debug!(
-            cache_key = %cfg.cache_key,
-            commitment = %hex::encode(candidate.utxo.poi.commitment),
+            chain_id = cfg.chain.chain_id,
             "output POI recovery side effect skipped; output no longer matches wallet state"
         );
         return false;
     }
-    match db.get_output_poi_recovery(
+    match cache_store.get_output_poi_recovery(
         cfg.chain.chain_id,
         &cfg.cache_key,
         &candidate.utxo.poi.commitment,
@@ -266,28 +258,22 @@ async fn output_poi_recovery_candidate_still_current(
         Ok(record) if output_poi_recovery_source_matches_candidate(record.as_ref(), candidate) => {}
         Ok(_) => {
             debug!(
-                cache_key = %cfg.cache_key,
-                commitment = %hex::encode(candidate.utxo.poi.commitment),
-                source_tx_hash = %hex::encode(candidate.utxo.source.tx_hash),
+                chain_id = cfg.chain.chain_id,
                 "output POI recovery side effect skipped; cached recovery source transaction is stale"
             );
             return false;
         }
-        Err(err) => {
+        Err(_) => {
             debug!(
-                ?err,
-                cache_key = %cfg.cache_key,
-                commitment = %hex::encode(candidate.utxo.poi.commitment),
+                chain_id = cfg.chain.chain_id,
                 "output POI recovery side effect skipped; recovery source could not be checked"
             );
             return false;
         }
     }
-    if let Err(reason) = authority.revalidate() {
+    if authority.revalidate().is_err() {
         debug!(
-            ?reason,
-            cache_key = %cfg.cache_key,
-            commitment = %hex::encode(candidate.utxo.poi.commitment),
+            chain_id = cfg.chain.chain_id,
             "output POI recovery side effect rejected after wallet state check"
         );
         return false;
@@ -478,7 +464,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
     let candidates = output_poi_recovery_candidates(request.wallet_utxos, request.active_list_keys);
     let wallet_nullifiers = WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys);
     debug!(
-        cache_key = %request.cfg.cache_key,
+        chain_id = request.cfg.chain.chain_id,
         candidates = candidates.len(),
         force_retry = request.force_retry,
         "output POI recovery scan started"
@@ -493,16 +479,16 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         if recoverable_list_keys.is_empty() {
             continue;
         }
-        let existing_pending_context = match request.db.get_pending_output_poi_context(
+        let Ok(existing_pending_context) = request.cache_store.get_pending_output_poi_context(
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
             &output_commitment,
-        ) {
-            Ok(record) => record,
-            Err(err) => {
-                warn!(?err, cache_key = %request.cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to load pending output POI recovery predecessor");
-                continue;
-            }
+        ) else {
+            warn!(
+                chain_id = request.cfg.chain.chain_id,
+                "failed to load pending output POI recovery predecessor"
+            );
+            continue;
         };
         let Some(expected_pending_context) =
             expected_pending_context_state(existing_pending_context.as_ref())
@@ -523,9 +509,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                 ) {
                     MatchingPendingOutputPoiContextDisposition::Skip => {
                         debug!(
-                            cache_key = %request.cfg.cache_key,
-                            commitment = %hex::encode(output_commitment),
-                            source_tx_hash = %hex::encode(source_tx_hash),
+                            chain_id = request.cfg.chain.chain_id,
                             "output POI recovery skipped; matching pending context does not require recovery"
                         );
                         continue;
@@ -554,31 +538,23 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             }
         }
 
-        let existing_recovery = match request.db.get_output_poi_recovery(
+        let Ok(existing_recovery) = request.cache_store.get_output_poi_recovery(
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
             &output_commitment,
-        ) {
-            Ok(record) => record,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    cache_key = %request.cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
-                    "failed to load output POI recovery cache"
-                );
-                continue;
-            }
+        ) else {
+            warn!(
+                chain_id = request.cfg.chain.chain_id,
+                "failed to load output POI recovery cache"
+            );
+            continue;
         };
-        if let Some(record) = existing_recovery
+        if existing_recovery
             .as_ref()
-            .filter(|record| record.source_tx_hash != source_tx_hash)
+            .is_some_and(|record| record.source_tx_hash != source_tx_hash)
         {
             debug!(
-                cache_key = %request.cfg.cache_key,
-                commitment = %hex::encode(output_commitment),
-                source_tx_hash = %hex::encode(source_tx_hash),
-                cached_source_tx_hash = %hex::encode(record.source_tx_hash),
+                chain_id = request.cfg.chain.chain_id,
                 "output POI recovery skipped; cached recovery source transaction is stale"
             );
             continue;
@@ -594,12 +570,9 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                 && record.status == OutputPoiRecoveryStatus::Submitted)
         {
             debug!(
-                cache_key = %request.cfg.cache_key,
-                commitment = %hex::encode(output_commitment),
-                source_tx_hash = %hex::encode(source_tx_hash),
+                chain_id = request.cfg.chain.chain_id,
                 status = ?record.status,
                 force_retry = request.force_retry,
-                last_error = ?record.last_error,
                 "output POI recovery skipped; cached recovery state is not retryable"
             );
             continue;
@@ -645,12 +618,9 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             };
         let build_chunk_elapsed_ms = build_chunk_started.elapsed().as_millis();
         debug!(
-            cache_key = %request.cfg.cache_key,
-            commitment = %hex::encode(output_commitment),
-            source_tx_hash = %hex::encode(source_tx_hash),
+            chain_id = request.cfg.chain.chain_id,
             inputs = recovery_chunk.chunk.inputs.len(),
             outputs = recovery_chunk.chunk.outputs.len(),
-            output_start_global = recovery_chunk.output_start_global,
             build_chunk_elapsed_ms,
             candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
             "output POI recovery chunk built"
@@ -664,8 +634,6 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                 poi_client: request.poi_client,
                 http_client: request.http_client,
                 indexed_artifact_source: request.indexed_artifact_source,
-                source_tx_hash,
-                output_commitment,
                 recovery_chunk: &recovery_chunk,
                 started: Instant::now(),
             })
@@ -695,11 +663,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             };
         let txid_data_elapsed_ms = txid_data_started.elapsed().as_millis();
         debug!(
-            cache_key = %request.cfg.cache_key,
-            commitment = %hex::encode(output_commitment),
-            source_tx_hash = %hex::encode(source_tx_hash),
-            target_txid_index = txid_data.target_txid_index,
-            txid_merkleroot_index = txid_data.poi_data.txid_merkleroot_index,
+            chain_id = request.cfg.chain.chain_id,
             txid_data_elapsed_ms,
             candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
             "output POI recovery TXID data recovered"
@@ -722,7 +686,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         let remote_proof_source = OutputRecoveryRemoteProofSource {
             private_poi: request.private_poi,
             authority: request.authority,
-            db: request.db,
+            cache_store: request.cache_store,
             cfg: request.cfg,
             candidate,
             required_poi_list_keys: &recoverable_list_keys,
@@ -798,16 +762,16 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                         now,
                     )
                 };
-                let current_recovery = match request.db.get_output_poi_recovery(
+                let Ok(current_recovery) = request.cache_store.get_output_poi_recovery(
                     request.cfg.chain.chain_id,
                     &request.cfg.cache_key,
                     &output_commitment,
-                ) {
-                    Ok(record) => record,
-                    Err(err) => {
-                        warn!(?err, cache_key = %request.cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to load recovered output POI predecessor");
-                        continue;
-                    }
+                ) else {
+                    warn!(
+                        chain_id = request.cfg.chain.chain_id,
+                        "failed to load recovered output POI predecessor"
+                    );
+                    continue;
                 };
                 let Some(expected_recovery) = expected_recovery_state(current_recovery.as_ref())
                 else {
@@ -844,26 +808,18 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                 {
                     Ok(PoiPrivateApplyOutcome::Applied { .. }) => {}
                     Ok(PoiPrivateApplyOutcome::Skipped) => continue,
-                    Err(err) => {
+                    Err(_) => {
                         warn!(
-                            ?err,
-                            cache_key = %request.cfg.cache_key,
-                            commitment = %hex::encode(output_commitment),
+                            chain_id = request.cfg.chain.chain_id,
                             "failed to persist recovered output POI context"
                         );
                         continue;
                     }
                 }
                 debug!(
-                    cache_key = %request.cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
-                    wallet_blinded_commitment = %hex::encode(candidate.utxo.poi.blinded_commitment),
-                    source_tx_hash = %hex::encode(source_tx_hash),
-                    txid_merkleroot_index = txid_data.poi_data.txid_merkleroot_index,
-                    target_txid_index = txid_data.target_txid_index,
+                    chain_id = request.cfg.chain.chain_id,
                     inputs = recovery_chunk.chunk.inputs.len(),
                     outputs = recovery_chunk.chunk.outputs.len(),
-                    input_tree = recovery_chunk.chunk.tree_number,
                     proof_generation_elapsed_ms,
                     candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
                     "reconstructed output POI context"
@@ -879,12 +835,9 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                 }
                 let proof_generation_elapsed_ms = proof_generation_started.elapsed().as_millis();
                 warn!(
-                    cache_key = %request.cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
-                    source_tx_hash = %hex::encode(source_tx_hash),
+                    chain_id = request.cfg.chain.chain_id,
                     proof_generation_elapsed_ms,
                     candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
-                    error = %err,
                     "output POI recovery proof generation failed"
                 );
                 let retry_after = output_poi_recovery_proof_retry_after(&err);
@@ -908,17 +861,13 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         let candidate_elapsed = candidate_started.elapsed();
         if candidate_elapsed >= OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER {
             warn!(
-                cache_key = %request.cfg.cache_key,
-                commitment = %hex::encode(output_commitment),
-                source_tx_hash = %hex::encode(source_tx_hash),
+                chain_id = request.cfg.chain.chain_id,
                 elapsed_ms = candidate_elapsed.as_millis(),
                 "slow output POI recovery candidate"
             );
         } else {
             debug!(
-                cache_key = %request.cfg.cache_key,
-                commitment = %hex::encode(output_commitment),
-                source_tx_hash = %hex::encode(source_tx_hash),
+                chain_id = request.cfg.chain.chain_id,
                 elapsed_ms = candidate_elapsed.as_millis(),
                 "output POI recovery candidate complete"
             );
@@ -939,26 +888,24 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         {
             Ok(submitted_contexts) => {
                 debug!(
-                    cache_key = %request.cfg.cache_key,
+                    chain_id = request.cfg.chain.chain_id,
                     recovered,
                     submitted_contexts,
                     elapsed_ms = started.elapsed().as_millis(),
                     "recovered missing output POI contexts"
                 );
             }
-            Err(err) => {
+            Err(_) => {
                 warn!(
-                    ?err,
-                    cache_key = %request.cfg.cache_key,
-                    recovered,
-                    "failed to submit recovered output POI contexts"
+                    chain_id = request.cfg.chain.chain_id,
+                    recovered, "failed to submit recovered output POI contexts"
                 );
             }
         }
     }
 
     debug!(
-        cache_key = %request.cfg.cache_key,
+        chain_id = request.cfg.chain.chain_id,
         recovered,
         elapsed_ms = started.elapsed().as_millis(),
         "output POI recovery scan complete"
@@ -994,8 +941,11 @@ pub(super) async fn force_resubmit_matching_pending_output_pois_authorized(
     active_list_keys: &[FixedBytes<32>],
     private_poi: &WalletPrivatePoiClients,
 ) -> usize {
-    if let Err(reason) = authority.revalidate() {
-        debug!(?reason, cache_key = %cfg.cache_key, "forced pending output POI resubmission skipped");
+    if authority.revalidate().is_err() {
+        debug!(
+            chain_id = cfg.chain.chain_id,
+            "forced pending output POI resubmission skipped"
+        );
         return 0;
     }
     let snapshot = utxos.read().await.clone();
@@ -1029,18 +979,16 @@ async fn force_resubmit_matching_pending_output_pois_impl(
     // Snapshot is discovery-only; liveness is revalidated per candidate via the shared choke point.
     for candidate in output_poi_recovery_candidates(wallet_utxos, active_list_keys) {
         let output_commitment = candidate.utxo.poi.commitment;
-        let record = match db.get_pending_output_poi_context(
+        let record = match cache_store.get_pending_output_poi_context(
             cfg.chain.chain_id,
             &cfg.cache_key,
             &output_commitment,
         ) {
             Ok(Some(record)) => record,
             Ok(None) => continue,
-            Err(err) => {
+            Err(_) => {
                 warn!(
-                    ?err,
-                    cache_key = %cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
+                    chain_id = cfg.chain.chain_id,
                     "failed to load matching pending output POI context"
                 );
                 continue;
@@ -1055,16 +1003,16 @@ async fn force_resubmit_matching_pending_output_pois_impl(
         let Some(observation) = record.observation.clone() else {
             continue;
         };
-        let current_recovery = match db.get_output_poi_recovery(
+        let Ok(current_recovery) = cache_store.get_output_poi_recovery(
             cfg.chain.chain_id,
             &cfg.cache_key,
             &output_commitment,
-        ) {
-            Ok(current) => current,
-            Err(err) => {
-                warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to load forced pending output POI recovery predecessor");
-                continue;
-            }
+        ) else {
+            warn!(
+                chain_id = cfg.chain.chain_id,
+                "failed to load forced pending output POI recovery predecessor"
+            );
+            continue;
         };
         let Some(expected_recovery) = expected_recovery_state(current_recovery.as_ref()) else {
             continue;
@@ -1081,14 +1029,13 @@ async fn force_resubmit_matching_pending_output_pois_impl(
             continue;
         };
         debug!(
-            cache_key = %cfg.cache_key,
-            commitment = %hex::encode(record.output_commitment),
-            list_keys = ?plan.list_keys(),
+            chain_id = cfg.chain.chain_id,
+            poi_lists = plan.list_keys().len(),
             "force-resubmitting matching pending output POI context"
         );
-        let attempt = match preflight_and_remote_submit_pending_output_poi(
+        let Ok(attempt) = preflight_and_remote_submit_pending_output_poi(
             authority,
-            db,
+            cache_store,
             cfg,
             active_list_keys,
             &record,
@@ -1097,17 +1044,12 @@ async fn force_resubmit_matching_pending_output_pois_impl(
             private_poi,
         )
         .await
-        {
-            Ok(attempt) => attempt,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    cache_key = %cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
-                    "forced pending output POI preflight/submit failed"
-                );
-                continue;
-            }
+        else {
+            warn!(
+                chain_id = cfg.chain.chain_id,
+                "forced pending output POI preflight/submit failed"
+            );
+            continue;
         };
         // Count only after preflight allowed remote work to start.
         match &attempt {
@@ -1123,7 +1065,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
             PendingOutputPoiRemoteAttempt::NotCurrent => {}
             PendingOutputPoiRemoteAttempt::AuthorityStale => break,
             PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
-                if let Err(err) = apply_poi_private_delta(
+                if apply_poi_private_delta(
                     authority,
                     db,
                     cache_store,
@@ -1136,11 +1078,10 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     },
                 )
                 .await
+                .is_err()
                 {
                     warn!(
-                        ?err,
-                        cache_key = %cfg.cache_key,
-                        commitment = %hex::encode(output_commitment),
+                        chain_id = cfg.chain.chain_id,
                         "failed to mark pending output POI context terminal"
                     );
                 }
@@ -1151,7 +1092,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                 if !matches!(
                     pending_output_poi_submission_plan_current(
                         authority,
-                        db,
+                        cache_store,
                         cfg,
                         active_list_keys,
                         &record,
@@ -1162,7 +1103,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                 ) {
                     continue;
                 }
-                if let Err(err) = apply_poi_private_delta(
+                if apply_poi_private_delta(
                     authority,
                     db,
                     cache_store,
@@ -1182,11 +1123,10 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     },
                 )
                 .await
+                .is_err()
                 {
                     warn!(
-                        ?err,
-                        cache_key = %cfg.cache_key,
-                        commitment = %hex::encode(output_commitment),
+                        chain_id = cfg.chain.chain_id,
                         "failed to persist resubmitted pending output POI state"
                     );
                 }
@@ -1195,7 +1135,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                 if !matches!(
                     pending_output_poi_submission_plan_current(
                         authority,
-                        db,
+                        cache_store,
                         cfg,
                         active_list_keys,
                         &record,
@@ -1206,7 +1146,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                 ) {
                     continue;
                 }
-                if let Err(cache_err) = apply_poi_private_delta(
+                if apply_poi_private_delta(
                     authority,
                     db,
                     cache_store,
@@ -1227,18 +1167,15 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     },
                 )
                 .await
+                .is_err()
                 {
                     warn!(
-                        ?cache_err,
-                        cache_key = %cfg.cache_key,
-                        commitment = %hex::encode(output_commitment),
+                        chain_id = cfg.chain.chain_id,
                         "failed to persist failed pending output POI resubmission state"
                     );
                 }
                 warn!(
-                    ?err,
-                    cache_key = %cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
+                    chain_id = cfg.chain.chain_id,
                     "forced pending output POI resubmission failed"
                 );
             }
@@ -1271,8 +1208,11 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
         ) {
             Ok(Some(record)) => record,
             Ok(None) => continue,
-            Err(err) => {
-                warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to load matching pending output POI context");
+            Err(_) => {
+                warn!(
+                    chain_id = cfg.chain.chain_id,
+                    "failed to load matching pending output POI context"
+                );
                 continue;
             }
         };
@@ -1291,8 +1231,11 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
         if pre_transaction_pois.len() != submitted_list_keys.len() {
             record.terminal_error =
                 Some("missing pre-transaction POI for pending output".to_string());
-            if let Err(err) = db.put_pending_output_poi_context(&record) {
-                warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to mark pending output POI context terminal");
+            if db.put_pending_output_poi_context(&record).is_err() {
+                warn!(
+                    chain_id = cfg.chain.chain_id,
+                    "failed to mark pending output POI context terminal"
+                );
             }
             continue;
         }
@@ -1327,8 +1270,11 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
-                    Err(err) => {
-                        warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to revalidate resubmitted pending output POI context");
+                    Err(_) => {
+                        warn!(
+                            chain_id = cfg.chain.chain_id,
+                            "failed to revalidate resubmitted pending output POI context"
+                        );
                         continue;
                     }
                 }
@@ -1337,7 +1283,7 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                         record.submitted_poi_list_keys.push(*list_key);
                     }
                 }
-                let pending_recovery = match pending_output_poi_recovery_update(
+                let Ok(pending_recovery) = pending_output_poi_recovery_update(
                     db,
                     cfg.chain.chain_id,
                     &record,
@@ -1346,12 +1292,12 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                     OutputPoiRecoveryAction::Submitted {
                         retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
                     },
-                ) {
-                    Ok(record) => record,
-                    Err(err) => {
-                        warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to prepare resubmitted pending output POI recovery state");
-                        continue;
-                    }
+                ) else {
+                    warn!(
+                        chain_id = cfg.chain.chain_id,
+                        "failed to prepare resubmitted pending output POI recovery state"
+                    );
+                    continue;
                 };
                 let mut recovery_updates = vec![pending_recovery];
                 if record.wallet_id != cfg.cache_key.as_str() {
@@ -1365,13 +1311,19 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                         },
                     ));
                 }
-                if let Err(err) = db.put_pending_output_poi_context(&record) {
-                    warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to persist resubmitted pending output POI context");
+                if db.put_pending_output_poi_context(&record).is_err() {
+                    warn!(
+                        chain_id = cfg.chain.chain_id,
+                        "failed to persist resubmitted pending output POI context"
+                    );
                     continue;
                 }
                 for recovery in &recovery_updates {
-                    if let Err(err) = db.put_output_poi_recovery(recovery) {
-                        warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to persist resubmitted pending output POI recovery state");
+                    if db.put_output_poi_recovery(recovery).is_err() {
+                        warn!(
+                            chain_id = cfg.chain.chain_id,
+                            "failed to persist resubmitted pending output POI recovery state"
+                        );
                     }
                 }
             }
@@ -1384,8 +1336,11 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
-                    Err(db_err) => {
-                        warn!(?db_err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to revalidate failed pending output POI resubmission");
+                    Err(_) => {
+                        warn!(
+                            chain_id = cfg.chain.chain_id,
+                            "failed to revalidate failed pending output POI resubmission"
+                        );
                         continue;
                     }
                 }
@@ -1399,10 +1354,16 @@ async fn force_resubmit_matching_pending_output_pois_unchecked(
                         retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                     },
                 );
-                if let Err(cache_err) = db.put_output_poi_recovery(&recovery) {
-                    warn!(?cache_err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "failed to persist failed pending output POI resubmission state");
+                if db.put_output_poi_recovery(&recovery).is_err() {
+                    warn!(
+                        chain_id = cfg.chain.chain_id,
+                        "failed to persist failed pending output POI resubmission state"
+                    );
                 }
-                warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(output_commitment), "forced pending output POI resubmission failed");
+                warn!(
+                    chain_id = cfg.chain.chain_id,
+                    "forced pending output POI resubmission failed"
+                );
             }
         }
     }
@@ -1467,7 +1428,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
         candidate_started,
     } = input;
     let current_recovery = request
-        .db
+        .cache_store
         .get_output_poi_recovery(
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
@@ -1534,7 +1495,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
                 .candidate_still_current(candidate, required_poi_list_keys)
                 .await
             && let Some(expected_recovery) = expected_recovery_state(current_recovery.as_ref())
-            && let Err(err) = apply_poi_private_delta(
+            && apply_poi_private_delta(
                 request.authority,
                 request.db,
                 request.cache_store,
@@ -1552,11 +1513,10 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
                 },
             )
             .await
+            .is_err()
         {
             warn!(
-                ?err,
-                cache_key = %request.cfg.cache_key,
-                commitment = %hex::encode(candidate.utxo.poi.commitment),
+                chain_id = request.cfg.chain.chain_id,
                 "failed to persist output POI recovery transaction input"
             );
         }
@@ -1564,9 +1524,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
     };
     let tx_input_elapsed_ms = tx_input_started.elapsed().as_millis();
     debug!(
-        cache_key = %request.cfg.cache_key,
-        commitment = %hex::encode(output_commitment),
-        source_tx_hash = %hex::encode(source_tx_hash),
+        chain_id = request.cfg.chain.chain_id,
         tx_input_source,
         tx_input_elapsed_ms,
         candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
@@ -1578,9 +1536,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
     let decoded = decode_railgun_transactions(&tx_input)?;
     let decode_elapsed_ms = decode_started.elapsed().as_millis();
     debug!(
-        cache_key = %request.cfg.cache_key,
-        commitment = %hex::encode(output_commitment),
-        source_tx_hash = %hex::encode(source_tx_hash),
+        chain_id = request.cfg.chain.chain_id,
         transactions = decoded.len(),
         decode_elapsed_ms,
         candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
@@ -1615,9 +1571,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
         {
             Ok(()) => {
                 debug!(
-                    cache_key = %request.cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
-                    source_tx_hash = %hex::encode(source_tx_hash),
+                    chain_id = request.cfg.chain.chain_id,
                     preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
                     candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
                     "output POI recovery local proof preflight complete"
@@ -1625,12 +1579,9 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
             }
             Err(failure) => {
                 warn!(
-                    cache_key = %request.cfg.cache_key,
-                    commitment = %hex::encode(output_commitment),
-                    source_tx_hash = %hex::encode(source_tx_hash),
+                    chain_id = request.cfg.chain.chain_id,
                     preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
                     candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
-                    error = %failure.message,
                     "output POI recovery local proof preflight failed"
                 );
                 return Err(failure);
@@ -2350,28 +2301,11 @@ pub(super) fn extend_pending_output_poi_context(
 
 pub(super) fn log_forced_output_poi_recovery_regeneration(
     cfg: &WalletConfig,
-    candidate: &WalletUtxo,
-    existing_pending_context: &PendingOutputPoiContextRecord,
+    _candidate: &WalletUtxo,
+    _existing_pending_context: &PendingOutputPoiContextRecord,
 ) {
-    let stored_derived_blinded_commitment = existing_pending_context
-        .observation
-        .as_ref()
-        .and_then(|observation| {
-            pending_output_poi_submit_identity(existing_pending_context, observation)
-                .map(|identity| identity.derived_blinded_commitment)
-        })
-        .map_or_else(|| "none".to_string(), hex::encode);
-    let stored_source_tx_hash = existing_pending_context.observation.as_ref().map_or_else(
-        || "none".to_string(),
-        |observation| hex::encode(observation.tx_hash),
-    );
     debug!(
-        cache_key = %cfg.cache_key,
-        commitment = %hex::encode(candidate.utxo.poi.commitment),
-        wallet_blinded_commitment = %hex::encode(candidate.utxo.poi.blinded_commitment),
-        stored_derived_blinded_commitment = %stored_derived_blinded_commitment,
-        stored_source_tx_hash = %stored_source_tx_hash,
-        source_tx_hash = %hex::encode(candidate.utxo.source.tx_hash),
+        chain_id = cfg.chain.chain_id,
         "force-regenerating recovered output POI context"
     );
 }
@@ -2442,21 +2376,21 @@ pub(super) async fn record_output_poi_recovery_failure(
 ) {
     let status = failure.status;
     let message = failure.message;
-    let current_recovery = match db.get_output_poi_recovery(
+    let Ok(current_recovery) = cache_store.get_output_poi_recovery(
         cfg.chain.chain_id,
         &cfg.cache_key,
         &candidate.utxo.poi.commitment,
-    ) {
-        Ok(record) => record,
-        Err(err) => {
-            warn!(?err, cache_key = %cfg.cache_key, commitment = %hex::encode(candidate.utxo.poi.commitment), "failed to load output POI recovery failure predecessor");
-            return;
-        }
+    ) else {
+        warn!(
+            chain_id = cfg.chain.chain_id,
+            "failed to load output POI recovery failure predecessor"
+        );
+        return;
     };
     let Some(expected_recovery) = expected_recovery_state(current_recovery.as_ref()) else {
         return;
     };
-    if let Err(err) = apply_poi_private_delta(
+    if apply_poi_private_delta(
         authority,
         db,
         cache_store,
@@ -2477,20 +2411,16 @@ pub(super) async fn record_output_poi_recovery_failure(
         },
     )
     .await
+    .is_err()
     {
         warn!(
-            ?err,
-            cache_key = %cfg.cache_key,
-            commitment = %hex::encode(candidate.utxo.poi.commitment),
+            chain_id = cfg.chain.chain_id,
             "failed to persist output POI recovery failure state"
         );
     }
     debug!(
-        cache_key = %cfg.cache_key,
+        chain_id = cfg.chain.chain_id,
         status = ?status,
-        commitment = %hex::encode(candidate.utxo.poi.commitment),
-        source_tx_hash = %hex::encode(candidate.utxo.source.tx_hash),
-        error = %message,
         "output POI recovery skipped"
     );
 }
@@ -2512,7 +2442,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
             && wallet_utxo.utxo.poi.is_valid_for_lists(active_list_keys)
             && wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Transact
     }) {
-        let Ok(Some(record)) = db.get_output_poi_recovery(
+        let Ok(Some(record)) = cache_store.get_output_poi_recovery(
             cfg.chain.chain_id,
             &cfg.cache_key,
             &wallet_utxo.utxo.poi.commitment,
@@ -2525,7 +2455,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
         let Some(expected_recovery) = expected_recovery_state(Some(&record)) else {
             continue;
         };
-        if let Err(err) = apply_poi_private_delta(
+        if apply_poi_private_delta(
             authority,
             db,
             cache_store,
@@ -2541,8 +2471,12 @@ pub(super) async fn mark_valid_output_poi_recoveries(
             },
         )
         .await
+        .is_err()
         {
-            warn!(?err, cache_key = %cfg.cache_key, "failed to mark output POI recovery valid");
+            warn!(
+                chain_id = cfg.chain.chain_id,
+                "failed to mark output POI recovery valid"
+            );
         }
     }
 }
@@ -2555,8 +2489,11 @@ pub(super) async fn mark_valid_output_poi_recoveries_authorized(
     utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
     active_list_keys: &[FixedBytes<32>],
 ) {
-    if let Err(reason) = authority.revalidate() {
-        debug!(?reason, cache_key = %cfg.cache_key, "mark output POI recoveries valid skipped");
+    if authority.revalidate().is_err() {
+        debug!(
+            chain_id = cfg.chain.chain_id,
+            "mark output POI recoveries valid skipped"
+        );
         return;
     }
     let snapshot = utxos.read().await.clone();

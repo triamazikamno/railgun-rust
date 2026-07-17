@@ -91,16 +91,16 @@ impl WalletPoiRefreshSelection {
 }
 
 use super::{
-    Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, HashSet,
-    Mutex, Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextIntent,
+    Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, Mutex,
+    Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextIntent,
     PendingOutputPoiContextRecord, PoiStatus, RwLock, SyncProgressUpdate, Utxo, UtxoCommitmentKind,
     UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
     WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCacheKey,
     WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpStatus, WalletObservation,
-    WalletObservationPublisher, WalletPrivateRequestError, WalletReadiness, WalletResetToken,
-    WalletScanRows, WalletSyncToken, WalletUtxo, WalletViewState, Weak,
-    chain_pending_overlay_matches, debug, mpsc, now_epoch_secs, oneshot,
+    WalletObservationPublisher, WalletPendingSpentMarkOutcome, WalletPrivateRequestError,
+    WalletReadiness, WalletResetToken, WalletScanRows, WalletSyncToken, WalletUtxo,
+    WalletViewState, Weak, chain_pending_overlay_matches, debug, mpsc, now_epoch_secs, oneshot,
     wallet_utxo_stable_identity, warn, watch,
 };
 use crate::types::{ChainKey, SyncProgressSender, WalletSyncTargetLease};
@@ -191,15 +191,6 @@ pub(super) enum WalletPendingOverlayUpdate {
     Clear,
 }
 
-#[derive(Debug)]
-pub(super) enum WalletLocalPendingSpentUpdate {
-    Mark {
-        utxos: Vec<Utxo>,
-        tx_hash: Option<FixedBytes<32>>,
-    },
-    ClearAll,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(super) enum WalletPrivateViewTicket {
     Current {
@@ -224,9 +215,12 @@ impl WalletPrivateViewTicket {
 
 #[derive(Debug)]
 pub(super) enum WalletPrivateRequest {
-    LocalPendingSpent {
-        ticket: WalletPrivateViewTicket,
-        update: WalletLocalPendingSpentUpdate,
+    MarkLocalPendingSpent {
+        utxos: Vec<Utxo>,
+        tx_hash: Option<FixedBytes<32>>,
+        reply: oneshot::Sender<Result<WalletPendingSpentMarkOutcome, WalletPrivateRequestError>>,
+    },
+    ClearLocalPendingSpent {
         reply: oneshot::Sender<Result<bool, WalletPrivateRequestError>>,
     },
     CreatePendingOutputContexts {
@@ -765,7 +759,9 @@ impl WalletPrivateMutationPermit<'_> {
     }
 }
 
-pub(super) use crate::types::{WalletPendingOverlay, WalletPendingSpent};
+pub(super) use crate::types::WalletPendingOverlay;
+#[cfg(test)]
+pub(super) use crate::types::WalletPendingSpent;
 
 impl WalletHandle {
     #[must_use]
@@ -1327,16 +1323,12 @@ impl WalletHandle {
         &self,
         utxos: &[Utxo],
         tx_hash: Option<FixedBytes<32>>,
-    ) -> Result<bool, WalletPrivateRequestError> {
-        let ticket = self.private_request_ticket()?;
+    ) -> Result<WalletPendingSpentMarkOutcome, WalletPrivateRequestError> {
         let (reply, result) = oneshot::channel();
         self.private_request_tx
-            .send(WalletPrivateRequest::LocalPendingSpent {
-                ticket,
-                update: WalletLocalPendingSpentUpdate::Mark {
-                    utxos: utxos.to_vec(),
-                    tx_hash,
-                },
+            .send(WalletPrivateRequest::MarkLocalPendingSpent {
+                utxos: utxos.to_vec(),
+                tx_hash,
                 reply,
             })
             .await
@@ -1348,14 +1340,9 @@ impl WalletHandle {
 
     /// Clears every local submitted-transaction lock for this wallet as one explicit action.
     pub async fn clear_all_local_pending_spent(&self) -> Result<bool, WalletPrivateRequestError> {
-        let ticket = self.private_request_ticket()?;
         let (reply, result) = oneshot::channel();
         self.private_request_tx
-            .send(WalletPrivateRequest::LocalPendingSpent {
-                ticket,
-                update: WalletLocalPendingSpentUpdate::ClearAll,
-                reply,
-            })
+            .send(WalletPrivateRequest::ClearLocalPendingSpent { reply })
             .await
             .map_err(|_| WalletPrivateRequestError::Inactive)?;
         result
@@ -1408,36 +1395,20 @@ impl WalletHandle {
         let now = now_epoch_secs();
         let changed = {
             let mut overlay = self.pending_overlay.write().await;
-            let chain_pending: HashSet<_> = overlay
-                .pending_spent
-                .iter()
-                .map(WalletPendingSpent::key)
-                .collect();
-            let mut existing: HashSet<_> = overlay
-                .local_pending_spent
-                .iter()
-                .map(WalletPendingSpent::key)
-                .collect();
             let before = overlay.local_pending_spent.len();
             let mut updated_existing = false;
             for utxo in utxos {
-                let key = (utxo.tree, utxo.position);
-                if chain_pending.contains(&key) {
-                    continue;
-                }
-                if existing.insert(key) {
-                    overlay
-                        .local_pending_spent
-                        .push(WalletPendingSpent::submitted(utxo, tx_hash, now));
-                } else if let Some(spent) = overlay
-                    .local_pending_spent
-                    .iter_mut()
-                    .find(|spent| spent.key() == key)
-                    && spent.tx_hash != tx_hash
-                {
-                    spent.tx_hash = tx_hash;
-                    spent.block_timestamp = Some(now);
-                    updated_existing = true;
+                let submitted = WalletPendingSpent::submitted(utxo, tx_hash, now);
+                if let Some(existing) = overlay.local_pending_spent.iter_mut().find(|spent| {
+                    spent.key() == submitted.key()
+                        && spent.stable_identity == submitted.stable_identity
+                }) {
+                    if existing != &submitted {
+                        *existing = submitted;
+                        updated_existing = true;
+                    }
+                } else {
+                    overlay.local_pending_spent.push(submitted);
                 }
             }
             overlay
@@ -1467,27 +1438,24 @@ impl WalletHandle {
     ) -> Result<bool, WalletBackfillRejectReason> {
         permit.revalidate()?;
         let now = now_epoch_secs();
-        let confirmed_spent: HashSet<_> = {
+        let confirmed_spent: Vec<_> = {
             let utxos = self.utxos.read().await;
             permit.revalidate()?;
             utxos
                 .iter()
                 .filter(|utxo| utxo.is_spent())
-                .map(|utxo| (utxo.utxo.tree, utxo.utxo.position))
+                .cloned()
                 .collect()
         };
-        let chain_pending_spent: HashSet<_> = next
-            .pending_spent
-            .iter()
-            .map(WalletPendingSpent::key)
-            .collect();
         let mut overlay = self.pending_overlay.write().await;
         permit.with_active_apply(|_token| {
             let chain_changed = !chain_pending_overlay_matches(&overlay, &next);
             let before_local = overlay.local_pending_spent.len();
             overlay.local_pending_spent.retain(|spent| {
-                let key = spent.key();
-                if confirmed_spent.contains(&key) || chain_pending_spent.contains(&key) {
+                if confirmed_spent
+                    .iter()
+                    .any(|utxo| spent.matches_local_utxo(utxo))
+                {
                     return false;
                 }
                 let submitted_at = spent.block_timestamp.unwrap_or(now);
@@ -1506,26 +1474,23 @@ impl WalletHandle {
         next: WalletPendingOverlay,
     ) -> Result<bool, WalletBackfillRejectReason> {
         let now = now_epoch_secs();
-        let confirmed_spent: HashSet<_> = {
+        let confirmed_spent: Vec<_> = {
             let utxos = self.utxos.read().await;
             utxos
                 .iter()
                 .filter(|utxo| utxo.is_spent())
-                .map(|utxo| (utxo.utxo.tree, utxo.utxo.position))
+                .cloned()
                 .collect()
         };
-        let chain_pending_spent: HashSet<_> = next
-            .pending_spent
-            .iter()
-            .map(WalletPendingSpent::key)
-            .collect();
         let changed = {
             let mut overlay = self.pending_overlay.write().await;
             let chain_changed = !chain_pending_overlay_matches(&overlay, &next);
             let before_local = overlay.local_pending_spent.len();
             overlay.local_pending_spent.retain(|spent| {
-                let key = spent.key();
-                if confirmed_spent.contains(&key) || chain_pending_spent.contains(&key) {
+                if confirmed_spent
+                    .iter()
+                    .any(|utxo| spent.matches_local_utxo(utxo))
+                {
                     return false;
                 }
                 let submitted_at = spent.block_timestamp.unwrap_or(now);

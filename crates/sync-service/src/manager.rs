@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::future::join_all;
 use tokio::sync::RwLock;
 
 use local_db::DbStore;
 
 use crate::chain::{
-    ChainError, ChainHandle, ChainService, PublicDataPlaneError, PublicSyncCacheReset,
+    ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, PublicDataPlaneError,
+};
+use crate::public_cache::{
+    PersistedPublicSyncCacheResetError, PersistedPublicSyncCacheResetReport,
+    reset_persisted_public_sync_caches_with_generation,
 };
 use crate::types::{ChainConfig, ChainKey, GlobalPoiPolicy, WalletConfig};
 use crate::wallet::WalletHandle;
@@ -25,19 +28,34 @@ pub enum SyncManagerError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainPublicSyncCacheResetResult {
     pub chain: ChainKey,
-    pub result: Result<PublicSyncCacheReset, PublicDataPlaneError>,
+    pub result: Result<ChainPublicSyncCacheReset, PublicDataPlaneError>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicSyncCachesResetReport {
     pub chains: Vec<ChainPublicSyncCacheResetResult>,
+    pub persisted: Result<PersistedPublicSyncCacheResetReport, PersistedPublicSyncCacheResetError>,
     pub total_removed_entries: u64,
+}
+
+impl Default for PublicSyncCachesResetReport {
+    fn default() -> Self {
+        Self {
+            chains: Vec::new(),
+            persisted: Ok(PersistedPublicSyncCacheResetReport::default()),
+            total_removed_entries: 0,
+        }
+    }
 }
 
 impl PublicSyncCachesResetReport {
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.chains.is_empty()
+            && self
+                .persisted
+                .as_ref()
+                .is_ok_and(|persisted| persisted.total_removed_entries() == 0)
     }
 
     #[must_use]
@@ -163,37 +181,66 @@ impl SyncManager {
     }
 
     pub async fn reset_public_sync_caches(&self) -> PublicSyncCachesResetReport {
-        let services = {
+        let mut services = {
             let chains = self.chains.read().await;
             chains
                 .iter()
                 .map(|(chain, service)| (*chain, Arc::clone(service)))
                 .collect::<Vec<_>>()
         };
-        let chains = join_all(services.into_iter().map(|(chain, service)| async move {
-            ChainPublicSyncCacheResetResult {
+        services.sort_by(|(left, _), (right, _)| {
+            left.chain_id
+                .cmp(&right.chain_id)
+                .then_with(|| left.contract.as_slice().cmp(right.contract.as_slice()))
+        });
+        let mut permits = Vec::with_capacity(services.len());
+        for (chain, service) in services {
+            permits.push((
                 chain,
-                result: service.public_data_plane().reset_public_cache().await,
-            }
-        }))
-        .await;
+                service
+                    .public_data_plane()
+                    .acquire_public_cache_reset_permit()
+                    .await,
+            ));
+        }
+        let persisted_reset =
+            match reset_persisted_public_sync_caches_with_generation(&self.db).await {
+                Ok(reset) => reset,
+                Err(error) => {
+                    let chain_error = PublicDataPlaneError::PublicCacheReset {
+                        reason: error.to_string(),
+                    };
+                    let total_removed_entries = error.partial_report.total_removed_entries();
+                    return PublicSyncCachesResetReport {
+                        chains: permits
+                            .into_iter()
+                            .map(|(chain, _permit)| ChainPublicSyncCacheResetResult {
+                                chain,
+                                result: Err(chain_error.clone()),
+                            })
+                            .collect(),
+                        persisted: Err(error),
+                        total_removed_entries,
+                    };
+                }
+            };
+        let mut chains = Vec::with_capacity(permits.len());
+        for (chain, permit) in permits {
+            chains.push(ChainPublicSyncCacheResetResult {
+                chain,
+                result: permit.apply(&persisted_reset).await,
+            });
+        }
+        let persisted = persisted_reset.report;
         let total_removed_entries = chains
             .iter()
             .filter_map(|chain| chain.result.as_ref().ok())
-            .fold(0_u64, |total, reset| {
-                total
-                    .saturating_add(reset.poi_cache_entries_removed)
-                    .saturating_add(reset.wallet_scan_artifact_chunk_entries_removed)
-                    .saturating_add(reset.wallet_scan_artifact_chunk_files_removed)
-                    .saturating_add(reset.txid_blob_entries_removed)
-                    .saturating_add(reset.txid_files_removed)
-                    .saturating_add(
-                        u64::try_from(reset.coverage_entries_removed).unwrap_or(u64::MAX),
-                    )
-                    .saturating_add(u64::try_from(reset.diagnostics_removed).unwrap_or(u64::MAX))
+            .fold(persisted.total_removed_entries(), |total, reset| {
+                total.saturating_add(reset.total_removed_entries())
             });
         PublicSyncCachesResetReport {
             chains,
+            persisted: Ok(persisted),
             total_removed_entries,
         }
     }

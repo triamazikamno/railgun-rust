@@ -7,15 +7,15 @@ use super::{
     PublicCoverageAnswer, PublicDataPlaneDiagnosticKind, PublicDataPlaneEpoch,
     PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange, PublicScanReadScope,
     PublicScanRowsAnswer, PublicScanSource, QueryRpcPool, QuickSyncClient, RwLock,
-    WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
-    WalletBackfillStartResult, WalletConfig, WalletHandle, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatusGuard, WalletObservation, WalletPoiRuntime, WalletReadiness,
-    WalletReadinessError, WalletRegistration, WalletResetReplayPlan, WalletScanApply,
-    WalletStartupSyncCandidate, WalletStartupSyncError, WalletStartupSyncStrategy,
-    WalletWorkerServices, artifact_failure_can_fallback_to_squid, broadcast,
-    build_provider_with_http_client, debug, info, mpsc, oneshot, send_wallet_startup_events,
-    should_hedge_wallet_startup, sort_logs, spawn_backfill_loop, spawn_head_poller,
-    spawn_live_log_loop, spawn_pending_tip_loop, spawn_txid_public_cache_loop,
+    SyncProgressSender, WalletBackfillFinishResult, WalletBackfillRejectReason,
+    WalletBackfillResetResult, WalletBackfillStartResult, WalletConfig, WalletHandle,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatusGuard, WalletObservation,
+    WalletPoiRuntime, WalletReadiness, WalletReadinessError, WalletRegistration,
+    WalletResetReplayPlan, WalletScanApply, WalletStartupSyncCandidate, WalletStartupSyncError,
+    WalletStartupSyncStrategy, WalletWorkerServices, artifact_failure_can_fallback_to_squid,
+    broadcast, build_provider_with_http_client, debug, info, mpsc, oneshot,
+    send_wallet_startup_events, should_hedge_wallet_startup, sort_logs, spawn_backfill_loop,
+    spawn_head_poller, spawn_live_log_loop, spawn_pending_tip_loop, spawn_txid_public_cache_loop,
     spawn_wallet_lag_fallback_loop, squid_tail_target_after_artifact, wait_or_cancel,
     wallet_backfill_from_block, wallet_cache_store, wallet_finish_result_removes_cursor,
     wallet_finish_retry_request, wallet_remote_target_before_cached_suffix,
@@ -384,6 +384,7 @@ impl ChainService {
                 "public_scan_rows",
                 source_range.from_block,
                 source_range.to_block,
+                None,
             )
             .await
         {
@@ -648,6 +649,22 @@ impl ChainService {
                 "public scan rows were not recorded"
             );
         }
+    }
+
+    async fn restage_captured_public_scan_applies(&self, applies: &[WalletScanApply]) -> bool {
+        for apply in applies {
+            if let Err(err) = self.record_public_scan_apply_result(apply).await {
+                debug!(
+                    ?err,
+                    from_block = apply.from_block,
+                    to_block = apply.to_block,
+                    source = ?apply.rows.source,
+                    "captured public scan suffix could not be restaged"
+                );
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) async fn apply_cached_public_scan_coverage(
@@ -1370,14 +1387,17 @@ impl ChainService {
                 return;
             };
             let mut checkpoint = progress.last_scanned;
-            let cached_suffix_from = service
+            let mut cached_suffix = service
                 .public_data_plane
                 .cached_wallet_scan_suffix(
                     wallet_backfill_from_block(checkpoint, start_block),
                     sync_target,
                 )
-                .await
-                .and_then(|applies| applies.first().map(|apply| apply.from_block));
+                .await;
+            let cached_suffix_from = cached_suffix
+                .as_ref()
+                .and_then(|applies| applies.first())
+                .map(|apply| apply.from_block);
             let historical_target =
                 wallet_remote_target_before_cached_suffix(sync_target, cached_suffix_from);
             if let Some(cached_suffix_from) = cached_suffix_from {
@@ -1463,7 +1483,8 @@ impl ChainService {
                 return;
             }
             // Superseded if view generation advanced or reset-pending (no public progress).
-            let Some(progress) = catch_up_handle.revalidate_schedulable_progress(startup) else {
+            let Some(mut progress) = catch_up_handle.revalidate_schedulable_progress(startup)
+            else {
                 debug!(
                     cache_key = %catch_up_cfg.cache_key,
                     startup_reset_generation = startup.reset_generation,
@@ -1474,6 +1495,68 @@ impl ChainService {
                 );
                 return;
             };
+            if short_startup_plan.is_none()
+                && checkpoint < sync_target
+                && let Some(suffix) = cached_suffix.take()
+                && suffix.first().is_some_and(|apply| {
+                    apply.from_block == wallet_backfill_from_block(checkpoint, start_block)
+                })
+            {
+                let suffix_applies = suffix.len();
+                let suffix_restaged = service.restage_captured_public_scan_applies(&suffix).await;
+                if suffix_restaged
+                    && send_wallet_startup_events(
+                        &catch_up_cfg.cache_key,
+                        suffix,
+                        Some(sync_target),
+                        progress,
+                        &backfill_sender,
+                        &catch_up_handle,
+                    )
+                    .await
+                {
+                    debug!(
+                        cache_key = %catch_up_cfg.cache_key,
+                        checkpoint,
+                        sync_target,
+                        suffix_applies,
+                        "captured public scan suffix delivered after historical catch-up"
+                    );
+                    if catch_up_cfg.sync_to_block.is_none()
+                        && let Some(progress) =
+                            catch_up_handle.revalidate_schedulable_progress(startup)
+                    {
+                        service
+                            .enqueue_wallet_backfill(
+                                &catch_up_cfg,
+                                start_block,
+                                sync_target,
+                                sync_target,
+                                true,
+                                &catch_up_handle,
+                                progress,
+                                backfill_sender,
+                                true,
+                                None,
+                            )
+                            .await;
+                    }
+                    return;
+                }
+                let Some(refreshed_progress) =
+                    catch_up_handle.revalidate_schedulable_progress(startup)
+                else {
+                    return;
+                };
+                checkpoint = refreshed_progress.last_scanned;
+                progress = refreshed_progress;
+                debug!(
+                    cache_key = %catch_up_cfg.cache_key,
+                    checkpoint,
+                    sync_target,
+                    "captured public scan suffix was rejected; continuing with normal backfill"
+                );
+            }
             service
                 .enqueue_wallet_backfill(
                     &catch_up_cfg,
@@ -2116,6 +2199,7 @@ impl ChainService {
                 cfg,
                 acquisition_from,
                 plan.acquisition.to_block,
+                cfg.progress_tx.as_ref(),
             ),
         )
         .await?
@@ -2493,11 +2577,13 @@ impl ChainService {
         cfg: &WalletConfig,
         from_block: u64,
         safe_head: u64,
+        progress_tx: Option<&SyncProgressSender>,
     ) -> Option<IndexedWalletArtifactSession> {
         self.prepare_indexed_wallet_artifact_session_for_label(
             &cfg.cache_key,
             from_block,
             safe_head,
+            progress_tx,
         )
         .await
     }
@@ -2507,6 +2593,7 @@ impl ChainService {
         cache_key: &str,
         from_block: u64,
         safe_head: u64,
+        progress_tx: Option<&SyncProgressSender>,
     ) -> Option<IndexedWalletArtifactSession> {
         self.chain.indexed_artifact_source.as_ref()?;
         let read_scope = self.begin_public_scan_read();
@@ -2527,6 +2614,7 @@ impl ChainService {
             safe_head,
             read_scope,
             &self.public_data_plane,
+            progress_tx,
         )
         .await
         {
@@ -2710,6 +2798,7 @@ impl ChainService {
             return last_scanned;
         }
         let mut last_scanned = last_scanned;
+        let initial_last_scanned = last_scanned;
         let mut from_block = last_scanned.saturating_add(1).max(start_block);
         let Some(status_guard) =
             WalletIndexedCatchUpStatusGuard::claim(handle, expose_status).await
@@ -2739,10 +2828,20 @@ impl ChainService {
         if wallet_has_persistence_failure(handle) {
             return last_scanned;
         }
+        let artifact_progress_tx = if last_scanned == initial_last_scanned {
+            cfg.progress_tx.as_ref()
+        } else {
+            None
+        };
         let mut artifact_session =
             if source_order == IndexedWalletCatchUpSourceOrder::ArtifactsFirst {
-                self.prepare_indexed_wallet_artifact_session(cfg, from_block, safe_head)
-                    .await
+                self.prepare_indexed_wallet_artifact_session(
+                    cfg,
+                    from_block,
+                    safe_head,
+                    artifact_progress_tx,
+                )
+                .await
             } else {
                 None
             };
@@ -2763,7 +2862,12 @@ impl ChainService {
                             safe_head,
                         );
                         artifact_session = self
-                            .prepare_indexed_wallet_artifact_session(cfg, from_block, safe_head)
+                            .prepare_indexed_wallet_artifact_session(
+                                cfg,
+                                from_block,
+                                safe_head,
+                                artifact_progress_tx,
+                            )
                             .await;
                         let Some(session) = artifact_session.as_ref() else {
                             self.record_public_scan_fallback(
@@ -2789,7 +2893,12 @@ impl ChainService {
                         safe_head,
                     );
                     artifact_session = self
-                        .prepare_indexed_wallet_artifact_session(cfg, from_block, safe_head)
+                        .prepare_indexed_wallet_artifact_session(
+                            cfg,
+                            from_block,
+                            safe_head,
+                            artifact_progress_tx,
+                        )
                         .await;
                     let Some(session) = artifact_session.as_ref() else {
                         self.record_public_scan_fallback(
@@ -2860,7 +2969,7 @@ impl ChainService {
             cache_key = %cfg.cache_key,
             indexed_source = indexed_source.as_str(),
             indexed_height,
-            safe_head,
+            catch_up_ceiling = safe_head,
             from_block,
             target,
             indexed_block_range = self.chain.indexed_wallet_block_range,
@@ -3095,7 +3204,12 @@ impl ChainService {
                             safe_head,
                         );
                         artifact_session = self
-                            .prepare_indexed_wallet_artifact_session(cfg, from_block, safe_head)
+                            .prepare_indexed_wallet_artifact_session(
+                                cfg,
+                                from_block,
+                                safe_head,
+                                artifact_progress_tx,
+                            )
                             .await;
                         let Some(session) = artifact_session.as_ref() else {
                             driver.retire(&cfg.cache_key).await;

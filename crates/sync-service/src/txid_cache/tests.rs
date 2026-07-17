@@ -281,6 +281,7 @@ async fn txid_public_cache_v3_rebuild_leaves_contractless_v2_cache_untouched() {
             relative_path: DbStore::relative_blob_path(super::TXID_CACHE_BLOB_KIND, legacy_name),
             content_hash: Sha256::digest(legacy_bytes).into(),
             source_hash: None,
+            source_sequence: None,
             created_at: 1,
             updated_at: 1,
             last_accessed_at: 1,

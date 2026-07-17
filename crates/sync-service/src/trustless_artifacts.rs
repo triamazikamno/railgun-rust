@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use chrono::Utc;
 use cid::{Cid, Version};
-use futures::{StreamExt, io::Cursor};
+use futures::{StreamExt, io::Cursor, stream::FuturesUnordered};
 use ipld_core::{codec::Codec, ipld::Ipld};
 use ipld_dagpb::PbNode;
 use libp2p_identity::{PeerId, PublicKey};
@@ -34,6 +34,7 @@ const ARTIFACT_CAR_MAX_BLOCKS: usize = 16_384;
 const ARTIFACT_CAR_MIN_OVERHEAD_BYTES: usize = 1024 * 1024;
 const ARTIFACT_CAR_FIXED_OVERHEAD_BYTES: usize = 64 * 1024;
 const ARTIFACT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
+const MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS: usize = 8;
 const CARV2_PRAGMA: [u8; 11] = [
     0x0a, 0xa1, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x02,
 ];
@@ -157,14 +158,20 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             .map(|result| result.bytes)
     }
 
-    pub(crate) async fn fetch_artifact_cid_with_metadata(
+    pub(crate) async fn fetch_artifact_cid_with_metadata_from_gateway(
         &self,
         cid: &str,
         byte_size: u64,
+        preferred_gateway_index: usize,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         let cid = parse_cid(cid)?;
-        self.fetch_cid_bytes(cid, RetrievalLimits::artifact(byte_size)?, "artifact")
-            .await
+        self.fetch_cid_bytes_from_gateway(
+            cid,
+            RetrievalLimits::artifact(byte_size)?,
+            "artifact",
+            preferred_gateway_index,
+        )
+        .await
     }
 
     pub(crate) async fn resolve_ipns_manifest_candidates(
@@ -178,21 +185,34 @@ impl<'a> TrustlessArtifactFetcher<'a> {
 
         let peer_id = expected_ipns_peer_id(name)?;
         let mut candidates = Vec::new();
-        let mut last_error = None;
+        let mut errors = Vec::new();
         let gateway_count = self.gateways.len();
-
-        for gateway_index in 0..gateway_count {
-            let gateway = self.gateways.expose(gateway_index);
-            let attempt_started = Instant::now();
-            let url = ipns_record_gateway_url(gateway, name);
-            let source = TrustlessHttpSource::Gateway {
-                index: gateway_index,
-                count: gateway_count,
-            };
-            match self
-                .fetch_ipns_record_candidate(&url, source, peer_id, now)
-                .await
+        let mut requests = FuturesUnordered::new();
+        let mut next_gateway_index = 0;
+        while next_gateway_index < gateway_count || !requests.is_empty() {
+            while next_gateway_index < gateway_count
+                && requests.len() < MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS
             {
+                let gateway_index = next_gateway_index;
+                next_gateway_index += 1;
+                let gateway = self.gateways.expose(gateway_index);
+                let url = ipns_record_gateway_url(gateway, name);
+                let source = TrustlessHttpSource::Gateway {
+                    index: gateway_index,
+                    count: gateway_count,
+                };
+                requests.push(async move {
+                    let attempt_started = Instant::now();
+                    let result = self
+                        .fetch_ipns_record_candidate(&url, source, peer_id, now)
+                        .await;
+                    (gateway_index, attempt_started.elapsed().as_millis(), result)
+                });
+            }
+            let Some((gateway_index, elapsed_ms, result)) = requests.next().await else {
+                continue;
+            };
+            match result {
                 Ok(candidate) => {
                     debug!(
                         gateway_index,
@@ -200,10 +220,10 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                         ipns_name = name,
                         cid = %candidate.cid,
                         ipns_sequence = candidate.sequence,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        elapsed_ms,
                         "POI artifact IPNS gateway returned verified record"
                     );
-                    candidates.push(candidate);
+                    candidates.push((gateway_index, candidate));
                 }
                 Err(err) => {
                     debug!(
@@ -211,21 +231,32 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                         gateway_index,
                         gateway_count,
                         ipns_name = name,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        elapsed_ms,
                         "POI artifact IPNS gateway failed"
                     );
-                    last_error = Some(err);
+                    errors.push((gateway_index, err));
                 }
             }
         }
 
         if candidates.is_empty() {
-            return Err(last_error.unwrap_or(TrustlessArtifactError::NoValidIpnsRecords));
+            return Err(errors
+                .into_iter()
+                .max_by_key(|(gateway_index, _)| *gateway_index)
+                .map_or(TrustlessArtifactError::NoValidIpnsRecords, |(_, err)| err));
         }
 
-        candidates.sort_by_key(|candidate| Reverse(candidate.sequence));
-        candidates.dedup_by(|left, right| left.sequence == right.sequence && left.cid == right.cid);
-        Ok(candidates)
+        candidates.sort_by_key(|(gateway_index, candidate)| {
+            (Reverse(candidate.sequence), *gateway_index)
+        });
+        let mut unique_candidates = Vec::with_capacity(candidates.len());
+        let mut seen_candidates = HashSet::with_capacity(candidates.len());
+        for (_, candidate) in candidates {
+            if seen_candidates.insert((candidate.sequence, candidate.cid)) {
+                unique_candidates.push(candidate);
+            }
+        }
+        Ok(unique_candidates)
     }
 
     async fn fetch_cid_bytes(
@@ -234,13 +265,26 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         limits: RetrievalLimits,
         resource: &'static str,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
+        self.fetch_cid_bytes_from_gateway(cid, limits, resource, 0)
+            .await
+    }
+
+    async fn fetch_cid_bytes_from_gateway(
+        &self,
+        cid: Cid,
+        limits: RetrievalLimits,
+        resource: &'static str,
+        preferred_gateway_index: usize,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         if self.gateways.is_empty() {
             return Err(TrustlessArtifactError::NoGateways);
         }
 
         let mut last_error = None;
         let gateway_count = self.gateways.len();
-        for gateway_index in 0..gateway_count {
+        let preferred_gateway_index = preferred_gateway_index % gateway_count;
+        for attempt in 0..gateway_count {
+            let gateway_index = (preferred_gateway_index + attempt) % gateway_count;
             let gateway = self.gateways.expose(gateway_index);
             let attempt_started = Instant::now();
             let url = car_gateway_url(gateway, &cid);
@@ -253,10 +297,11 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 .await
             {
                 Ok(bytes) => {
-                    if gateway_index > 0 {
+                    if attempt > 0 {
                         debug!(
                             gateway_index,
                             gateway_count,
+                            preferred_gateway_index,
                             resource,
                             cid = %cid,
                             bytes = bytes.len(),
@@ -1657,6 +1702,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipns_gateways_are_queried_concurrently() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let blocked_cid = raw_cid(b"blocked");
+        let fast_cid = raw_cid(b"fast");
+        let (blocked, release) =
+            spawn_blocked_once_server(200, ipns_record(&keypair, blocked_cid.to_string(), 2));
+        let fast = spawn_once_server(200, ipns_record(&keypair, fast_cid.to_string(), 2));
+        let blocked_url = blocked.url.clone();
+        let fast_url = fast.url.clone();
+        let fast_requests = fast.requests;
+        let resolve = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let gateways = [blocked_url, fast_url];
+            TrustlessArtifactFetcher::new(&client, &gateways)
+                .resolve_ipns_manifest_candidates(
+                    &name,
+                    UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                )
+                .await
+        });
+
+        let fast_request =
+            tokio::task::spawn_blocking(move || fast_requests.recv_timeout(Duration::from_secs(1)))
+                .await
+                .expect("fast gateway request wait");
+        release.send(()).expect("release blocked gateway");
+        assert!(
+            fast_request.is_ok(),
+            "second gateway was not queried while the first was blocked"
+        );
+        let candidates = resolve
+            .await
+            .expect("IPNS resolution task")
+            .expect("IPNS candidates");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.cid)
+                .collect::<Vec<_>>(),
+            vec![blocked_cid, fast_cid]
+        );
+    }
+
+    #[tokio::test]
     async fn ipns_resolution_uses_valid_gateway_when_one_fails() {
         let keypair = test_ipns_keypair();
         let name = ipns_name(&keypair);
@@ -1676,6 +1766,40 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn artifact_fetch_starts_from_preferred_gateway() {
+        let artifact_bytes = b"preferred gateway artifact".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let skipped = spawn_once_server(503, Vec::new());
+        let preferred = spawn_once_server(200, car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        let client = reqwest::Client::new();
+        let gateways = [skipped.url.clone(), preferred.url.clone()];
+
+        let fetched = TrustlessArtifactFetcher::new(&client, &gateways)
+            .fetch_artifact_cid_with_metadata_from_gateway(
+                &cid.to_string(),
+                artifact_bytes.len() as u64,
+                1,
+            )
+            .await
+            .expect("fetch from preferred gateway");
+
+        assert_eq!(fetched.bytes, artifact_bytes);
+        assert_eq!(fetched.gateway_index, 1);
+        assert_eq!(fetched.gateway_count, 2);
+        assert_eq!(
+            preferred.request_path(),
+            format!("/ipfs/{cid}?format=car&dag-scope=entity")
+        );
+        assert!(
+            skipped
+                .requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "earlier gateway should not be contacted before preferred gateway succeeds"
+        );
     }
 
     #[tokio::test]
@@ -1926,6 +2050,25 @@ mod tests {
     }
 
     fn spawn_once_server(status: u16, body: Vec<u8>) -> MockServer {
+        spawn_once_server_controlled(status, body, None)
+    }
+
+    fn spawn_blocked_once_server(
+        status: u16,
+        body: Vec<u8>,
+    ) -> (MockServer, std::sync::mpsc::Sender<()>) {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        (
+            spawn_once_server_controlled(status, body, Some(release_rx)),
+            release,
+        )
+    }
+
+    fn spawn_once_server_controlled(
+        status: u16,
+        body: Vec<u8>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+    ) -> MockServer {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
         let url = Url::parse(&format!(
             "http://{}",
@@ -1952,6 +2095,9 @@ mod tests {
                 .expect("request path")
                 .to_string();
             tx.send(path).expect("record request path");
+            if let Some(release) = release {
+                release.recv().expect("release response");
+            }
 
             let reason = if status == 200 { "OK" } else { "ERROR" };
             let response = format!(

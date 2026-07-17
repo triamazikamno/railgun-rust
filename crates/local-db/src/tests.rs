@@ -1,23 +1,28 @@
 use super::{
     APP_SETTINGS_TABLE, BLOB_INDEX_TABLE, CURRENT_SCHEMA_VERSION, DESKTOP_WALLET_VAULT_TABLE,
-    DbConfig, DbError, DbStore, MERKLE_FOREST_INDEX_TABLE, META_TABLE, Meta,
-    OUTPUT_POI_RECOVERY_TABLE, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE, POI_ARTIFACT_CACHE_TABLE,
-    PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord, PendingOutputPoiRole,
-    PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, PoiCacheRecordSource,
-    PoiCorpusRpcHealthRecord, PoiCorpusValidationRecord, PoiPublisherManifestWatermarkRecord,
-    StoredRecord, TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE,
-    WALLET_SYNC_ACTOR_STATE_TABLE, WALLET_UTXO_TABLE, WalletCacheKey, WalletMeta,
-    WalletPendingResetRecord, WalletPrivateNamespaceDeletionReport, WalletPrivateNamespaceId,
-    WalletSyncActorStateRecord, ZKEY_INDEX_TABLE, decode, encode,
+    DbConfig, DbError, DbStore, DesktopWalletVaultRecord, MERKLE_FOREST_INDEX_TABLE, META_TABLE,
+    Meta, OUTPUT_POI_RECOVERY_TABLE, OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow,
+    OpaqueWalletPrivateRowMutation, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+    PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE,
+    PENDING_OUTPUT_POI_CONTEXT_V2_TABLE, POI_ARTIFACT_CACHE_TABLE, PendingFeeNoteAssuranceRecord,
+    PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheRecord,
+    PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusRpcHealthRecord,
+    PoiCorpusValidationRecord, PoiPublisherManifestWatermarkRecord, StoredRecord,
+    TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE,
+    WALLET_UTXO_TABLE, WalletCacheKey, WalletDeletionBatch, WalletDeletionReport, WalletMeta,
+    WalletMetaMutation, WalletPendingResetRecord, WalletPrivateNamespaceDeletionReport,
+    WalletPrivateNamespaceId, WalletPrivateRecordKind, WalletPrivateStateBatch,
+    WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport, WalletSyncActorStateRecord,
+    WalletUtxoRowMutation, ZKEY_INDEX_TABLE, decode, encode,
 };
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::uint;
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
-use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableHandle};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -160,6 +165,17 @@ fn put_raw_pending_output_record(store: &DbStore, key: &str, payload: &[u8]) {
         table.insert(key, payload).expect("insert raw pending row");
     }
     txn.commit().expect("commit raw pending write");
+}
+
+fn put_raw_output_poi_recovery_record(store: &DbStore, key: &str, payload: &[u8]) {
+    let txn = store.db.begin_write().expect("begin raw recovery write");
+    {
+        let mut table = txn
+            .open_table(OUTPUT_POI_RECOVERY_TABLE)
+            .expect("open recovery table");
+        table.insert(key, payload).expect("insert raw recovery row");
+    }
+    txn.commit().expect("commit raw recovery write");
 }
 
 fn raw_pending_output_record_exists(store: &DbStore, key: &str) -> bool {
@@ -378,6 +394,7 @@ fn pending_output_poi_context_roundtrip_and_listing() {
     .expect("open db");
 
     let wallet_id = wallet_cache_key(0x01).to_string();
+    let other_wallet_id = wallet_cache_key(0x02).to_string();
     let record = sample_pending_output_record(1, &wallet_id, FixedBytes::from([0x77; 32]));
     store
         .put_pending_output_poi_context(&record)
@@ -413,7 +430,7 @@ fn pending_output_poi_context_roundtrip_and_listing() {
     );
     assert!(
         store
-            .list_pending_output_poi_contexts(record.chain_id, "other-wallet")
+            .list_pending_output_poi_contexts(record.chain_id, &other_wallet_id)
             .expect("list other wallet pending output POI contexts")
             .is_empty()
     );
@@ -1013,6 +1030,16 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
         target.wallet_id.as_str(),
         FixedBytes::from([0x43; 32]),
     );
+    let target_v1_pending = sample_pending_output_record(
+        target.chain_id,
+        target.wallet_id.as_str(),
+        FixedBytes::from([0x35; 32]),
+    );
+    let target_v1_recovery = sample_output_poi_recovery_record(
+        target.chain_id,
+        target.wallet_id.as_str(),
+        FixedBytes::from([0x44; 32]),
+    );
     let public_poi_cache =
         sample_poi_artifact_cache_record(target.chain_id, FixedBytes::from([0x51; 32]));
 
@@ -1065,6 +1092,16 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
             .put_output_poi_recovery(recovery)
             .expect("store output recovery");
     }
+    put_raw_pending_output_record(
+        &store,
+        &target_v1_pending.key(),
+        &encode(&target_v1_pending).expect("encode target v1 pending context"),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &target_v1_recovery.key(),
+        &encode(&target_v1_recovery).expect("encode target v1 recovery"),
+    );
     store
         .put_poi_artifact_cache(&public_poi_cache)
         .expect("store public POI cache");
@@ -1078,8 +1115,8 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
             wallet_utxo_rows: 4,
             wallet_meta_rows: 1,
             wallet_sync_actor_state_rows: 1,
-            pending_output_poi_context_rows: 2,
-            output_poi_recovery_rows: 1,
+            pending_output_poi_context_rows: 3,
+            output_poi_recovery_rows: 2,
         }
     );
     assert!(
@@ -1285,6 +1322,1400 @@ fn wallet_private_namespace_deletion_rolls_back_before_commit_failure() {
         store
             .list_output_poi_recoveries(identity.chain_id, identity.wallet_id.as_str())
             .expect("list rolled-back recoveries")
+            .len(),
+        1
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_private_state_and_vault_records_commit_atomically() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x21));
+    let utxos = [("new-utxo".to_string(), b"new-payload".to_vec())];
+    let meta = WalletMeta {
+        last_scanned_block: 90,
+        updated_at: 10,
+        last_scanned_block_hash: None,
+    };
+    let actor_state = WalletSyncActorStateRecord {
+        chain_id: namespace.chain_id,
+        wallet_id: namespace.wallet_id.to_string(),
+        highest_accepted_reset_intent: 7,
+        pending_reset: None,
+        updated_at: 20,
+    };
+    let vault_records = [DesktopWalletVaultRecord {
+        key: "wallet-chain-metadata|21".to_string(),
+        payload: b"encrypted-metadata".to_vec(),
+    }];
+
+    store
+        .batch_commit_wallet_private_state_with_vault_records(
+            &WalletPrivateStateBatch {
+                namespace: &namespace,
+                utxos: WalletUtxoRowMutation::Replace(&utxos),
+                metadata: WalletMetaMutation::Set(&meta),
+                sync_actor_state: Some(&actor_state),
+                pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
+                output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+            },
+            &vault_records,
+        )
+        .expect("commit private state and vault record");
+
+    assert_eq!(
+        store
+            .list_wallet_utxos(&namespace.wallet_id)
+            .expect("list committed UTXOs")[0]
+            .payload
+            .as_slice(),
+        b"new-payload"
+    );
+    let stored_meta = store
+        .get_wallet_meta(&namespace.wallet_id)
+        .expect("load committed metadata")
+        .expect("committed metadata present");
+    assert_eq!(stored_meta.last_scanned_block, meta.last_scanned_block);
+    assert_eq!(stored_meta.updated_at, meta.updated_at);
+    assert_eq!(
+        stored_meta.last_scanned_block_hash,
+        meta.last_scanned_block_hash
+    );
+    assert_eq!(
+        store
+            .get_wallet_sync_actor_state(namespace.chain_id, namespace.wallet_id.as_str())
+            .expect("load committed actor state"),
+        Some(actor_state)
+    );
+    assert_eq!(
+        store
+            .get_desktop_wallet_vault_record(&vault_records[0].key)
+            .expect("load committed vault record"),
+        Some(vault_records[0].payload.clone())
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_private_state_and_vault_records_roll_back_before_commit_failure() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x22));
+    let original_meta = WalletMeta {
+        last_scanned_block: 150,
+        updated_at: 1,
+        last_scanned_block_hash: Some([0xaa; 32]),
+    };
+    let original_actor_state = WalletSyncActorStateRecord {
+        chain_id: namespace.chain_id,
+        wallet_id: namespace.wallet_id.to_string(),
+        highest_accepted_reset_intent: 4,
+        pending_reset: None,
+        updated_at: 1,
+    };
+    store
+        .put_wallet_utxo(&namespace.wallet_id, "old-utxo", b"old-payload")
+        .expect("seed old UTXO");
+    store
+        .put_wallet_meta(&namespace.wallet_id, &original_meta)
+        .expect("seed old metadata");
+    store
+        .put_wallet_sync_actor_state(&original_actor_state)
+        .expect("seed old actor state");
+    store
+        .put_desktop_wallet_vault_record("wallet-chain-metadata|22", b"old-encrypted-metadata")
+        .expect("seed old vault record");
+
+    let replacement_utxos = [("new-utxo".to_string(), b"new-payload".to_vec())];
+    let replacement_meta = WalletMeta {
+        last_scanned_block: 90,
+        updated_at: 2,
+        last_scanned_block_hash: None,
+    };
+    let replacement_actor_state = WalletSyncActorStateRecord {
+        chain_id: namespace.chain_id,
+        wallet_id: namespace.wallet_id.to_string(),
+        highest_accepted_reset_intent: 5,
+        pending_reset: None,
+        updated_at: 2,
+    };
+    let vault_records = [DesktopWalletVaultRecord {
+        key: "wallet-chain-metadata|22".to_string(),
+        payload: b"new-encrypted-metadata".to_vec(),
+    }];
+    let result = store.batch_commit_wallet_private_state_with_vault_records_transaction(
+        &WalletPrivateStateBatch {
+            namespace: &namespace,
+            utxos: WalletUtxoRowMutation::Replace(&replacement_utxos),
+            metadata: WalletMetaMutation::Set(&replacement_meta),
+            sync_actor_state: Some(&replacement_actor_state),
+            pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
+            output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+        },
+        &vault_records,
+        || {
+            Err(DbError::Io(std::io::Error::other(
+                "injected pre-commit failure",
+            )))
+        },
+    );
+
+    assert!(result.is_err());
+    let stored_utxos = store
+        .list_wallet_utxos(&namespace.wallet_id)
+        .expect("list rolled-back UTXOs");
+    assert_eq!(stored_utxos.len(), 1);
+    assert_eq!(stored_utxos[0].utxo_id, "old-utxo");
+    assert_eq!(stored_utxos[0].payload.as_slice(), b"old-payload");
+    let stored_meta = store
+        .get_wallet_meta(&namespace.wallet_id)
+        .expect("load rolled-back metadata")
+        .expect("rolled-back metadata present");
+    assert_eq!(
+        stored_meta.last_scanned_block,
+        original_meta.last_scanned_block
+    );
+    assert_eq!(stored_meta.updated_at, original_meta.updated_at);
+    assert_eq!(
+        stored_meta.last_scanned_block_hash,
+        original_meta.last_scanned_block_hash
+    );
+    assert_eq!(
+        store
+            .get_wallet_sync_actor_state(namespace.chain_id, namespace.wallet_id.as_str())
+            .expect("load rolled-back actor state"),
+        Some(original_actor_state)
+    );
+    assert_eq!(
+        store
+            .get_desktop_wallet_vault_record(&vault_records[0].key)
+            .expect("load rolled-back vault record"),
+        Some(b"old-encrypted-metadata".to_vec())
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespaces = [
+        WalletPrivateNamespaceId::new(1, wallet_cache_key(0x71)),
+        WalletPrivateNamespaceId::new(137, wallet_cache_key(0x72)),
+    ];
+    for (index, namespace) in namespaces.iter().enumerate() {
+        store
+            .put_wallet_utxo(&namespace.wallet_id, "utxo", b"encrypted")
+            .expect("store wallet UTXO");
+        store
+            .put_wallet_meta(
+                &namespace.wallet_id,
+                &WalletMeta {
+                    last_scanned_block: index as u64,
+                    updated_at: 10,
+                    last_scanned_block_hash: None,
+                },
+            )
+            .expect("store wallet metadata");
+        store
+            .put_wallet_sync_actor_state(&WalletSyncActorStateRecord {
+                chain_id: namespace.chain_id,
+                wallet_id: namespace.wallet_id.to_string(),
+                highest_accepted_reset_intent: 3,
+                pending_reset: None,
+                updated_at: 30,
+            })
+            .expect("store wallet sync actor state");
+        store
+            .put_pending_output_poi_context(&sample_pending_output_record(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                FixedBytes::from([0x81 + index as u8; 32]),
+            ))
+            .expect("store pending output context");
+        store
+            .put_output_poi_recovery(&sample_output_poi_recovery_record(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                FixedBytes::from([0x91 + index as u8; 32]),
+            ))
+            .expect("store output recovery");
+    }
+    let delete_keys = vec![
+        "wallet-meta|delete-a".to_string(),
+        "wallet-view|delete-b".to_string(),
+    ];
+    let put_records = vec![
+        ("hardware-reservation|a".to_string(), b"reserved-a".to_vec()),
+        ("hardware-reservation|b".to_string(), b"reserved-b".to_vec()),
+    ];
+    store
+        .put_desktop_wallet_vault_records(&[
+            (delete_keys[0].clone(), b"metadata".to_vec()),
+            (delete_keys[1].clone(), b"view".to_vec()),
+            (put_records[0].0.clone(), b"old-reservation".to_vec()),
+            ("wallet-meta|other".to_string(), b"other".to_vec()),
+        ])
+        .expect("seed vault records");
+    let batch = WalletDeletionBatch {
+        private_namespaces: &namespaces,
+        desktop_wallet_vault_delete_keys: &delete_keys,
+        desktop_wallet_vault_put_records: &put_records,
+    };
+
+    let hook_called = std::cell::Cell::new(false);
+    let result = store.delete_wallet_transaction(&batch, || {
+        hook_called.set(true);
+        Err(DbError::Io(std::io::Error::other(
+            "injected wallet deletion failure",
+        )))
+    });
+    assert!(result.is_err());
+    assert!(hook_called.get());
+    for namespace in &namespaces {
+        assert_eq!(
+            store
+                .list_wallet_utxos(&namespace.wallet_id)
+                .expect("list rolled-back wallet UTXOs")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get_wallet_meta(&namespace.wallet_id)
+                .expect("load rolled-back wallet metadata")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_wallet_sync_actor_state(namespace.chain_id, namespace.wallet_id.as_str())
+                .expect("load rolled-back wallet sync actor state")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .list_pending_output_poi_contexts(namespace.chain_id, namespace.wallet_id.as_str(),)
+                .expect("list rolled-back pending output contexts")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_output_poi_recoveries(namespace.chain_id, namespace.wallet_id.as_str())
+                .expect("list rolled-back output recoveries")
+                .len(),
+            1
+        );
+    }
+    for key in &delete_keys {
+        assert!(
+            store
+                .get_desktop_wallet_vault_record(key)
+                .expect("load rolled-back deleted vault record")
+                .is_some()
+        );
+    }
+    assert_eq!(
+        store
+            .get_desktop_wallet_vault_record(&put_records[0].0)
+            .expect("load rolled-back updated vault record")
+            .expect("original updated vault record present"),
+        b"old-reservation"
+    );
+    assert!(
+        store
+            .get_desktop_wallet_vault_record(&put_records[1].0)
+            .expect("load rolled-back inserted vault record")
+            .is_none()
+    );
+
+    assert_eq!(
+        store.delete_wallet(&batch).expect("commit wallet deletion"),
+        WalletDeletionReport {
+            private_namespace_rows: WalletPrivateNamespaceDeletionReport {
+                wallet_utxo_rows: 2,
+                wallet_meta_rows: 2,
+                wallet_sync_actor_state_rows: 2,
+                pending_output_poi_context_rows: 2,
+                output_poi_recovery_rows: 2,
+            },
+            desktop_wallet_vault_rows_deleted: 2,
+            desktop_wallet_vault_rows_put: 2,
+        }
+    );
+    for namespace in &namespaces {
+        assert!(
+            store
+                .list_wallet_utxos(&namespace.wallet_id)
+                .expect("list deleted wallet UTXOs")
+                .is_empty()
+        );
+    }
+    for key in &delete_keys {
+        assert!(
+            store
+                .get_desktop_wallet_vault_record(key)
+                .expect("load deleted vault record")
+                .is_none()
+        );
+    }
+    for (key, payload) in &put_records {
+        assert_eq!(
+            store
+                .get_desktop_wallet_vault_record(key)
+                .expect("load put vault record")
+                .expect("put vault record present")
+                .as_slice(),
+            payload.as_slice()
+        );
+    }
+    assert_eq!(
+        store
+            .get_desktop_wallet_vault_record("wallet-meta|other")
+            .expect("load unrelated vault record")
+            .expect("unrelated vault record present"),
+        b"other"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn opaque_wallet_private_v2_rows_are_isolated_by_namespace_and_kind() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let first = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x31));
+    let second = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x32));
+    let semantic_output_commitment = FixedBytes::from([0xcc; 32]);
+    let row = OpaqueWalletPrivateRow {
+        row_id: vec![0x10, 0x20, 0x30],
+        payload: b"opaque-ciphertext".to_vec(),
+    };
+    assert_ne!(row.row_id, semantic_output_commitment.as_slice());
+
+    store
+        .put_opaque_wallet_private_row(
+            &first,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &row,
+        )
+        .expect("put first pending row");
+    store
+        .put_opaque_wallet_private_row(
+            &second,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &OpaqueWalletPrivateRow {
+                row_id: row.row_id.clone(),
+                payload: b"other-wallet".to_vec(),
+            },
+        )
+        .expect("put second pending row");
+    store
+        .put_opaque_wallet_private_row(
+            &first,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &OpaqueWalletPrivateRow {
+                row_id: row.row_id.clone(),
+                payload: b"other-kind".to_vec(),
+            },
+        )
+        .expect("put first recovery row");
+
+    assert_eq!(
+        store
+            .get_opaque_wallet_private_row(
+                &first,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+                &row.row_id,
+            )
+            .expect("get first pending row"),
+        Some(row.clone())
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(
+                &second,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+            )
+            .expect("list second pending rows")[0]
+            .payload,
+        b"other-wallet"
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(&first, WalletPrivateRecordKind::OutputPoiRecovery,)
+            .expect("list first recovery rows")[0]
+            .payload,
+        b"other-kind"
+    );
+
+    let txn = store.db.begin_read().expect("begin raw v2 read");
+    let pending_table = txn
+        .open_table(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE)
+        .expect("open pending v2 table");
+    for entry in pending_table.iter().expect("iterate pending v2 rows") {
+        let (key, _) = entry.expect("read pending v2 row");
+        assert!(
+            !key.value()
+                .contains(&alloy::hex::encode(semantic_output_commitment))
+        );
+    }
+    drop(pending_table);
+    drop(txn);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x33));
+    let meta = WalletMeta {
+        last_scanned_block: 55,
+        updated_at: 10,
+        last_scanned_block_hash: Some([0x44; 32]),
+    };
+    let actor_state = WalletSyncActorStateRecord {
+        chain_id: namespace.chain_id,
+        wallet_id: namespace.wallet_id.to_string(),
+        highest_accepted_reset_intent: 9,
+        pending_reset: None,
+        updated_at: 11,
+    };
+    let pending = [OpaqueWalletPrivateRow {
+        row_id: vec![0x01],
+        payload: b"pending-ciphertext".to_vec(),
+    }];
+    let recoveries = [OpaqueWalletPrivateRow {
+        row_id: vec![0x02],
+        payload: b"recovery-ciphertext".to_vec(),
+    }];
+    let batch = WalletPrivateStateBatch {
+        namespace: &namespace,
+        utxos: WalletUtxoRowMutation::Preserve,
+        metadata: WalletMetaMutation::Set(&meta),
+        sync_actor_state: Some(&actor_state),
+        pending_output_contexts: OpaqueWalletPrivateRowMutation {
+            updates: &pending,
+            deletes: &[],
+        },
+        output_poi_recoveries: OpaqueWalletPrivateRowMutation {
+            updates: &recoveries,
+            deletes: &[],
+        },
+    };
+
+    let result =
+        store.batch_commit_wallet_private_state_with_vault_records_transaction(&batch, &[], || {
+            Err(DbError::Io(std::io::Error::other("injected failure")))
+        });
+    assert!(result.is_err());
+    assert!(
+        store
+            .get_wallet_meta(&namespace.wallet_id)
+            .expect("load rolled-back metadata")
+            .is_none()
+    );
+    assert!(
+        store
+            .list_opaque_wallet_private_rows(
+                &namespace,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+            )
+            .expect("list rolled-back pending rows")
+            .is_empty()
+    );
+
+    store
+        .batch_commit_wallet_private_state(&batch)
+        .expect("commit private state batch");
+    assert_eq!(
+        store
+            .get_wallet_meta(&namespace.wallet_id)
+            .expect("load committed metadata")
+            .expect("metadata present")
+            .last_scanned_block,
+        55
+    );
+    assert_eq!(
+        store
+            .get_wallet_sync_actor_state(namespace.chain_id, namespace.wallet_id.as_str())
+            .expect("load committed actor state"),
+        Some(actor_state)
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(
+                &namespace,
+                WalletPrivateRecordKind::OutputPoiRecovery,
+            )
+            .expect("list committed recoveries"),
+        recoveries
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_db_store_pending_and_recovery_records_use_plaintext_v2_encoding() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x34));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0x71; 32]),
+    );
+    let recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0x72; 32]),
+    );
+
+    store
+        .put_pending_output_poi_context(&pending)
+        .expect("put typed pending context");
+    store
+        .put_output_poi_recovery(&recovery)
+        .expect("put typed recovery");
+
+    assert_eq!(
+        store
+            .get_pending_output_poi_context(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &pending.output_commitment,
+            )
+            .expect("get typed pending context")
+            .expect("pending context present")
+            .output_npk,
+        pending.output_npk
+    );
+    assert_eq!(
+        store
+            .get_output_poi_recovery(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &recovery.output_commitment,
+            )
+            .expect("get typed recovery")
+            .expect("recovery present")
+            .source_tx_hash,
+        recovery.source_tx_hash
+    );
+    assert!(
+        store
+            .list_wallet_private_v1_rows(&namespace)
+            .expect("list v1 rows")
+            .pending_output_contexts
+            .is_empty()
+    );
+    let opaque_pending = store
+        .list_opaque_wallet_private_rows(
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+        )
+        .expect("list opaque pending rows");
+    assert_eq!(
+        opaque_pending[0].row_id,
+        pending.output_commitment.as_slice()
+    );
+    assert_eq!(
+        decode::<PendingOutputPoiContextRecord>(&opaque_pending[0].payload)
+            .expect("decode plaintext DbStore payload")
+            .output_commitment,
+        pending.output_commitment
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_db_store_reads_shipped_v1_wallet_private_records() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x37));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0x91; 32]),
+    );
+    let recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0x92; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode v1 pending"),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode v1 recovery"),
+    );
+
+    assert_eq!(
+        store
+            .get_pending_output_poi_context(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &pending.output_commitment,
+            )
+            .expect("get v1 pending")
+            .expect("v1 pending present")
+            .output_commitment,
+        pending.output_commitment
+    );
+    let recoveries = store
+        .list_output_poi_recoveries(namespace.chain_id, namespace.wallet_id.as_str())
+        .expect("list v1 recoveries");
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(recoveries[0].output_commitment, recovery.output_commitment);
+    assert_eq!(recoveries[0].source_tx_hash, recovery.source_tx_hash);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_wallet_private_crud_consumes_shipped_v1_rows() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x38));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xa1; 32]),
+    );
+    let recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xa2; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode v1 pending"),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode v1 recovery"),
+    );
+
+    store
+        .delete_pending_output_poi_context(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &pending.output_commitment,
+        )
+        .expect("delete v1 pending");
+    store
+        .delete_output_poi_recovery(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &recovery.output_commitment,
+        )
+        .expect("delete v1 recovery");
+    assert!(
+        store
+            .get_pending_output_poi_context(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &pending.output_commitment,
+            )
+            .expect("read deleted pending")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_output_poi_recovery(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &recovery.output_commitment,
+            )
+            .expect("read deleted recovery")
+            .is_none()
+    );
+    let v1_rows = store
+        .list_wallet_private_v1_rows(&namespace)
+        .expect("list remaining v1 rows");
+    assert!(v1_rows.pending_output_contexts.is_empty());
+    assert!(v1_rows.output_poi_recoveries.is_empty());
+    assert!(
+        store
+            .wallet_private_compaction_requested()
+            .expect("read committed compaction marker")
+    );
+
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode replacement v1 pending"),
+    );
+    store
+        .put_pending_output_poi_context(&pending)
+        .expect("put consumes matching v1 pending");
+    assert!(
+        store
+            .list_wallet_private_v1_rows(&namespace)
+            .expect("list v1 rows after typed pending put")
+            .pending_output_contexts
+            .is_empty()
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode shadow v1 pending"),
+    );
+    store
+        .delete_pending_output_poi_context(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &pending.output_commitment,
+        )
+        .expect("delete both pending versions");
+    assert!(
+        store
+            .get_pending_output_poi_context(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &pending.output_commitment,
+            )
+            .expect("read dual-version deletion")
+            .is_none()
+    );
+    store
+        .delete_pending_output_poi_context(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &pending.output_commitment,
+        )
+        .expect("repeat pending deletion");
+
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode replacement v1 recovery"),
+    );
+    store
+        .put_output_poi_recovery(&recovery)
+        .expect("put consumes matching v1 recovery");
+    assert!(
+        store
+            .list_wallet_private_v1_rows(&namespace)
+            .expect("list v1 rows after typed put")
+            .output_poi_recoveries
+            .is_empty()
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode shadow v1 recovery"),
+    );
+    store
+        .delete_output_poi_recovery(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &recovery.output_commitment,
+        )
+        .expect("delete both recovery versions");
+    assert!(
+        store
+            .get_output_poi_recovery(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &recovery.output_commitment,
+            )
+            .expect("read dual-version recovery deletion")
+            .is_none()
+    );
+    store
+        .delete_output_poi_recovery(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &recovery.output_commitment,
+        )
+        .expect("repeat recovery deletion");
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_wallet_private_dual_version_delete_rolls_back_atomically() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x39));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xb1; 32]),
+    );
+    store
+        .put_pending_output_poi_context(&pending)
+        .expect("put v2 pending");
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode v1 pending"),
+    );
+
+    let error = store
+        .delete_typed_wallet_private_row_transaction(
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &pending.key(),
+            pending.output_commitment.as_slice(),
+            || {
+                Err(DbError::Io(std::io::Error::other(
+                    "injected typed delete failure",
+                )))
+            },
+        )
+        .expect_err("typed delete must roll back");
+    assert!(matches!(error, DbError::Io(_)));
+    assert!(
+        store
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+                pending.output_commitment.as_slice(),
+            )
+            .expect("read v2 after rollback")
+            .is_some()
+    );
+    assert!(raw_pending_output_record_exists(&store, &pending.key()));
+    assert!(
+        !store
+            .wallet_private_compaction_requested()
+            .expect("read rolled-back compaction marker")
+    );
+
+    let recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xb2; 32]),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode v1 recovery"),
+    );
+    let recovery_row = OpaqueWalletPrivateRow {
+        row_id: recovery.output_commitment.to_vec(),
+        payload: encode(&recovery).expect("encode v2 recovery"),
+    };
+    let error = store
+        .put_typed_wallet_private_row_transaction(
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &recovery.key(),
+            &recovery_row,
+            || {
+                Err(DbError::Io(std::io::Error::other(
+                    "injected typed put failure",
+                )))
+            },
+        )
+        .expect_err("typed put must roll back");
+    assert!(matches!(error, DbError::Io(_)));
+    assert!(
+        store
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::OutputPoiRecovery,
+                recovery.output_commitment.as_slice(),
+            )
+            .expect("read v2 recovery after rollback")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_wallet_private_v1_rows(&namespace)
+            .expect("read v1 recovery after rollback")
+            .output_poi_recoveries
+            .len(),
+        1
+    );
+    assert!(
+        !store
+            .wallet_private_compaction_requested()
+            .expect("read put rollback compaction marker")
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_wallet_private_point_reads_validate_exact_identity_and_v2_precedence() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x3a));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xc1; 32]),
+    );
+    let recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xc2; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode v1 pending"),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode v1 recovery"),
+    );
+    for kind in [
+        WalletPrivateRecordKind::PendingOutputPoiContext,
+        WalletPrivateRecordKind::OutputPoiRecovery,
+    ] {
+        store
+            .put_opaque_wallet_private_row(
+                &namespace,
+                kind,
+                &OpaqueWalletPrivateRow {
+                    row_id: vec![0xee; 32],
+                    payload: vec![0xc1],
+                },
+            )
+            .expect("put unrelated malformed opaque row");
+    }
+    assert!(
+        store
+            .get_pending_output_poi_context(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &pending.output_commitment,
+            )
+            .expect("exact pending v1 fallback")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_output_poi_recovery(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &recovery.output_commitment,
+            )
+            .expect("exact recovery v1 fallback")
+            .is_some()
+    );
+    let v1_rows = store
+        .list_wallet_private_v1_rows(&namespace)
+        .expect("generic opaque writes preserve v1 rows");
+    assert_eq!(v1_rows.pending_output_contexts.len(), 1);
+    assert_eq!(v1_rows.output_poi_recoveries.len(), 1);
+
+    let mut newer_recovery = recovery.clone();
+    newer_recovery.attempt_count = 9;
+    store
+        .put_opaque_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &OpaqueWalletPrivateRow {
+                row_id: recovery.output_commitment.to_vec(),
+                payload: encode(&newer_recovery).expect("encode newer v2 recovery"),
+            },
+        )
+        .expect("put exact v2 recovery");
+    assert_eq!(
+        store
+            .get_output_poi_recovery(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &recovery.output_commitment,
+            )
+            .expect("read v2 precedence")
+            .expect("v2 recovery present")
+            .attempt_count,
+        9
+    );
+
+    let mismatched = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xcf; 32]),
+    );
+    store
+        .put_opaque_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &OpaqueWalletPrivateRow {
+                row_id: pending.output_commitment.to_vec(),
+                payload: encode(&mismatched).expect("encode mismatched v2 pending"),
+            },
+        )
+        .expect("put mismatched v2 pending");
+    assert!(matches!(
+        store.get_pending_output_poi_context(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &pending.output_commitment,
+        ),
+        Err(DbError::WalletPrivateRecordIdentityMismatch { .. })
+    ));
+    let mismatched_recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xce; 32]),
+    );
+    store
+        .put_opaque_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &OpaqueWalletPrivateRow {
+                row_id: recovery.output_commitment.to_vec(),
+                payload: encode(&mismatched_recovery).expect("encode mismatched v2 recovery"),
+            },
+        )
+        .expect("put mismatched v2 recovery");
+    assert!(matches!(
+        store.get_output_poi_recovery(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &recovery.output_commitment,
+        ),
+        Err(DbError::WalletPrivateRecordIdentityMismatch { .. })
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_wallet_private_lists_isolate_v1_record_kinds() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let pending_namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x3b));
+    let recovery_namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x3c));
+    let pending = sample_pending_output_record(
+        pending_namespace.chain_id,
+        pending_namespace.wallet_id.as_str(),
+        FixedBytes::from([0xd1; 32]),
+    );
+    let recovery = sample_output_poi_recovery_record(
+        recovery_namespace.chain_id,
+        recovery_namespace.wallet_id.as_str(),
+        FixedBytes::from([0xd2; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode valid pending"),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &OutputPoiRecoveryRecord::key_for(
+            pending_namespace.chain_id,
+            pending_namespace.wallet_id.as_str(),
+            &FixedBytes::from([0xde; 32]),
+        ),
+        &[0xc1],
+    );
+    assert_eq!(
+        store
+            .list_pending_output_poi_contexts(
+                pending_namespace.chain_id,
+                pending_namespace.wallet_id.as_str(),
+            )
+            .expect("pending list ignores malformed recovery rows")
+            .len(),
+        1
+    );
+
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode valid recovery"),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &PendingOutputPoiContextRecord::key_for(
+            recovery_namespace.chain_id,
+            recovery_namespace.wallet_id.as_str(),
+            &FixedBytes::from([0xdf; 32]),
+        ),
+        &[0xc1],
+    );
+    assert_eq!(
+        store
+            .list_output_poi_recoveries(
+                recovery_namespace.chain_id,
+                recovery_namespace.wallet_id.as_str(),
+            )
+            .expect("recovery list ignores malformed pending rows")
+            .len(),
+        1
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn typed_wallet_private_read_is_snapshot_consistent_with_v1_to_v2_put() {
+    let root_dir = temp_db_root();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x3d));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0xe1; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode v1 pending"),
+    );
+    let row = OpaqueWalletPrivateRow {
+        row_id: pending.output_commitment.to_vec(),
+        payload: encode(&pending).expect("encode v2 pending"),
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer_store = Arc::clone(&store);
+    let writer_namespace = namespace.clone();
+    let writer_key = pending.key();
+    let writer = std::thread::spawn(move || {
+        writer_store.put_typed_wallet_private_row_transaction(
+            &writer_namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &writer_key,
+            &row,
+            || {
+                ready_tx.send(()).expect("signal staged typed put");
+                release_rx.recv().expect("release typed put");
+                Ok(())
+            },
+        )
+    });
+    ready_rx.recv().expect("typed put reached pre-commit hook");
+
+    let read = store
+        .get_pending_output_poi_context_with_probe_hook(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &pending.output_commitment,
+            || {
+                release_tx.send(()).expect("release typed put commit");
+                writer
+                    .join()
+                    .expect("join typed put")
+                    .map_err(|error| DbError::Io(std::io::Error::other(error.to_string())))
+            },
+        )
+        .expect("read old snapshot after inter-probe put commit");
+    assert!(read.is_some());
+    assert!(
+        store
+            .get_pending_output_poi_context(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                &pending.output_commitment,
+            )
+            .expect("read new snapshot after put")
+            .is_some()
+    );
+
+    store
+        .delete_pending_output_poi_context(
+            namespace.chain_id,
+            namespace.wallet_id.as_str(),
+            &pending.output_commitment,
+        )
+        .expect("clear point-read fixture");
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("restore v1 pending"),
+    );
+    assert_eq!(
+        store
+            .list_pending_output_poi_contexts_with_probe_hook(
+                namespace.chain_id,
+                namespace.wallet_id.as_str(),
+                || store.put_pending_output_poi_context(&pending),
+            )
+            .expect("list retains its v1 snapshot after inter-probe put commit")
+            .len(),
+        1
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_private_v1_migration_is_atomic_and_namespace_scoped() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x35));
+    let other = WalletPrivateNamespaceId::new(1, wallet_cache_key(0x36));
+    let pending = sample_pending_output_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0x81; 32]),
+    );
+    let recovery = sample_output_poi_recovery_record(
+        namespace.chain_id,
+        namespace.wallet_id.as_str(),
+        FixedBytes::from([0x82; 32]),
+    );
+    let other_pending = sample_pending_output_record(
+        other.chain_id,
+        other.wallet_id.as_str(),
+        FixedBytes::from([0x83; 32]),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &pending.key(),
+        &encode(&pending).expect("encode v1 pending"),
+    );
+    put_raw_output_poi_recovery_record(
+        &store,
+        &recovery.key(),
+        &encode(&recovery).expect("encode v1 recovery"),
+    );
+    put_raw_pending_output_record(
+        &store,
+        &other_pending.key(),
+        &encode(&other_pending).expect("encode other v1 pending"),
+    );
+    let sources = store
+        .list_wallet_private_v1_rows(&namespace)
+        .expect("list migration sources");
+    let pending_destinations = [OpaqueWalletPrivateRow {
+        row_id: vec![0xa1, 0xa2],
+        payload: b"encrypted-pending".to_vec(),
+    }];
+    let recovery_destinations = [OpaqueWalletPrivateRow {
+        row_id: vec![0xb1, 0xb2],
+        payload: b"encrypted-recovery".to_vec(),
+    }];
+    let batch = WalletPrivateV1MigrationBatch {
+        namespace: &namespace,
+        pending_output_context_sources: &sources.pending_output_contexts,
+        output_poi_recovery_sources: &sources.output_poi_recoveries,
+        pending_output_context_destinations: &pending_destinations,
+        output_poi_recovery_destinations: &recovery_destinations,
+    };
+
+    let result = store.migrate_wallet_private_v1_rows_transaction(&batch, || {
+        Err(DbError::Io(std::io::Error::other(
+            "injected migration failure",
+        )))
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        store
+            .list_wallet_private_v1_rows(&namespace)
+            .expect("list rolled-back sources"),
+        sources
+    );
+    assert!(
+        store
+            .list_opaque_wallet_private_rows(
+                &namespace,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+            )
+            .expect("list rolled-back destinations")
+            .is_empty()
+    );
+
+    assert_eq!(
+        store
+            .migrate_wallet_private_v1_rows(&batch)
+            .expect("migrate v1 rows"),
+        WalletPrivateV1MigrationReport {
+            pending_output_context_rows: 1,
+            output_poi_recovery_rows: 1,
+        }
+    );
+    assert_eq!(
+        store
+            .list_opaque_wallet_private_rows(
+                &namespace,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+            )
+            .expect("list migrated pending rows"),
+        pending_destinations
+    );
+    assert!(
+        store
+            .list_wallet_private_v1_rows(&namespace)
+            .expect("list consumed v1 rows")
+            .pending_output_contexts
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_wallet_private_v1_rows(&other)
+            .expect("list other namespace v1 rows")
+            .pending_output_contexts
             .len(),
         1
     );
@@ -1648,15 +3079,18 @@ fn schema_seven_migration_moves_alpha_wallet_cache_rows_atomically() {
             .is_none()
     );
     assert_eq!(
-        reopened
-            .get_pending_output_poi_context(
-                pending_output.chain_id,
-                wallet_id.as_str(),
-                &pending_output.output_commitment,
-            )
-            .expect("load migrated pending context")
-            .expect("migrated pending context present")
-            .wallet_id,
+        decode::<PendingOutputPoiContextRecord>(
+            &reopened
+                .list_wallet_private_v1_rows(&WalletPrivateNamespaceId::new(
+                    pending_output.chain_id,
+                    wallet_id.clone(),
+                ))
+                .expect("load migrated pending context")
+                .pending_output_contexts[0]
+                .payload,
+        )
+        .expect("decode migrated pending context")
+        .wallet_id,
         wallet_id.as_str()
     );
     assert!(!raw_pending_output_record_exists(
@@ -2096,6 +3530,8 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
         .collect::<BTreeSet<_>>();
     let mut expected_tables = tables_before;
     expected_tables.insert(WALLET_SYNC_ACTOR_STATE_TABLE.name().to_string());
+    expected_tables.insert(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE.name().to_string());
+    expected_tables.insert(OUTPUT_POI_RECOVERY_V2_TABLE.name().to_string());
     assert_eq!(migrated_tables, expected_tables);
     drop(read_txn);
     assert_eq!(

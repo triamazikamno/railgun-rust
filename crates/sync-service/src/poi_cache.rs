@@ -19,11 +19,13 @@ use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
+#[cfg(test)]
+use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
 use crate::poi_artifacts::{
     ExpectedPoiCorpusBase, ObservedPoiManifest, PersistedPoiArtifactCache, PoiArtifactIngestor,
-    PoiArtifactRefresh, PoiCorpusAuthority, PoiCorpusStore, clear_poi_artifact_cache_for_reset,
-    load_persisted_cache_for_publisher, load_poi_rpc_health, poi_corpus_authority,
-    record_poi_rpc_success, with_poi_artifact_cache_generation,
+    PoiArtifactRefresh, PoiCorpusAuthority, PoiCorpusStore, load_persisted_cache_for_publisher,
+    load_poi_rpc_health, poi_corpus_authority, record_poi_rpc_success,
+    with_poi_artifact_cache_generation,
 };
 use crate::types::{
     LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
@@ -370,12 +372,27 @@ impl PoiCacheService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn reset_poi_artifact_cache(&self) -> Result<u64, PoiCacheServiceError> {
         let reset = clear_poi_artifact_cache_for_reset(&self.db).await?;
         debug!(
             generation = reset.generation,
             "POI artifact cache generation published after durable reset"
         );
+        self.synchronize_after_persisted_reset(reset.generation)
+            .await?;
+        info!(
+            persisted_records = reset.removed,
+            generation = reset.generation,
+            "reset local artifact POI cache"
+        );
+        Ok(reset.removed)
+    }
+
+    pub(crate) async fn synchronize_after_persisted_reset(
+        &self,
+        generation: u64,
+    ) -> Result<(), PoiCacheServiceError> {
         let chains: Vec<_> = self
             .chains
             .read()
@@ -391,7 +408,7 @@ impl PoiCacheService {
             let send_result = handle
                 .command_tx
                 .send(ChainPoiCacheCommand::Reset {
-                    generation: reset.generation,
+                    generation,
                     response,
                 })
                 .await;
@@ -436,13 +453,11 @@ impl PoiCacheService {
             return Err(err);
         }
 
-        info!(
-            persisted_records = reset.removed,
-            generation = reset.generation,
-            chain_count,
-            "reset local artifact POI cache"
+        debug!(
+            generation,
+            chain_count, "synchronized POI cache coordinators after reset"
         );
-        Ok(reset.removed)
+        Ok(())
     }
 
     pub(crate) async fn shutdown(&self) {

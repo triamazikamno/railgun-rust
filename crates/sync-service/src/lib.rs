@@ -13,19 +13,24 @@ pub mod indexed_artifacts;
 mod manager;
 pub(crate) mod poi_artifacts;
 mod poi_cache;
+mod public_cache;
 mod trustless_artifacts;
 pub(crate) mod txid_cache;
 pub mod types;
 mod wallet;
 
 pub use chain::{
-    ChainError, ChainHandle, ChainService, PoiArtifactCacheRetry, PublicCoverageAnswer,
-    PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind, PublicDataPlaneDiagnostics,
-    PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange, PublicScanRows,
-    PublicScanRowsAnswer, PublicSyncCacheReset,
+    ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, PoiArtifactCacheRetry,
+    PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,
+    PublicDataPlaneDiagnostics, PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange,
+    PublicScanRows, PublicScanRowsAnswer, PublicSyncCacheReset,
 };
 pub use manager::{
     ChainPublicSyncCacheResetResult, PublicSyncCachesResetReport, SyncManager, SyncManagerError,
+};
+pub use public_cache::{
+    PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
+    PersistedPublicSyncCacheResetReport, reset_persisted_public_sync_caches,
 };
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
@@ -35,8 +40,9 @@ pub use types::{
     PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource, SyncProgressSender,
     SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletCacheStore, WalletConfig,
     WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus, WalletObservation, WalletPrivateRequestError, WalletReadiness,
-    WalletReadinessError, WalletReadinessWaitError, WalletSchedulableProgress, WalletViewState,
+    WalletIndexedCatchUpStatus, WalletObservation, WalletPendingSpentMarkOutcome,
+    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
+    WalletSchedulableProgress, WalletViewState,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

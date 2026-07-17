@@ -10,7 +10,6 @@ use super::{
 
 #[derive(Debug)]
 pub(in crate::wallet) struct RecoveredOutputTxidData {
-    pub(in crate::wallet) target_txid_index: u64,
     pub(super) poi_data: PostTransactionPoiData,
 }
 
@@ -20,8 +19,6 @@ pub(in crate::wallet) struct PublicCacheTxidRecoveryRequest<'a> {
     pub(in crate::wallet) poi_client: &'a PoiRpcClient,
     pub(in crate::wallet) http_client: Option<&'a reqwest::Client>,
     pub(in crate::wallet) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
-    pub(in crate::wallet) source_tx_hash: FixedBytes<32>,
-    pub(in crate::wallet) output_commitment: FixedBytes<32>,
     pub(in crate::wallet) recovery_chunk: &'a RecoveryChunk,
     pub(in crate::wallet) started: Instant,
 }
@@ -35,8 +32,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         poi_client,
         http_client,
         indexed_artifact_source,
-        source_tx_hash,
-        output_commitment,
         recovery_chunk,
         started,
     } = request;
@@ -92,7 +87,7 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
     } else {
         None
     };
-    let (cached, latest_validated, latest_validated_source, cache_sync_elapsed_ms) = if let Some(
+    let (cached, _latest_validated, latest_validated_source, cache_sync_elapsed_ms) = if let Some(
         (proof, latest),
     ) =
         cached_proof
@@ -174,15 +169,7 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         ));
     }
     debug!(
-        cache_key = %cfg.cache_key,
-        source_tx_hash = %hex::encode(source_tx_hash),
-        output_commitment = %hex::encode(output_commitment),
-        target_txid_index = cached.target_txid_index,
-        root_txid_index = cached.root_txid_index,
-        target_tree,
-        target_index,
-        leaf_count = root_index.saturating_add(1),
-        latest_validated_txid_index = latest_validated.txid_index,
+        chain_id = cfg.chain.chain_id,
         latest_validated_elapsed_ms,
         latest_validated_source,
         cache_sync_elapsed_ms,
@@ -193,7 +180,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
     );
 
     Ok(RecoveredOutputTxidData {
-        target_txid_index: cached.target_txid_index,
         poi_data: PostTransactionPoiData {
             txid_leaf_hash: FixedBytes::from(cached.proof.leaf.to_be_bytes::<32>()),
             txid_merkleroot,

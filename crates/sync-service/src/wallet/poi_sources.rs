@@ -157,7 +157,6 @@ impl LocalPoiMerkleProofSource {
         debug!(
             chain_type,
             chain_id,
-            list_key = %hex::encode(list_key),
             commitments = blinded_commitments.len(),
             lock_wait_elapsed_ms,
             elapsed_ms = started.elapsed().as_millis(),
@@ -191,19 +190,6 @@ impl PoiMerkleProofSource for LocalPoiMerkleProofSource {
                 hex::encode(list_key)
             )));
         };
-        let positions = cache.positions_for_blinded_commitments(blinded_commitments);
-        let proof_global_indices = positions
-            .iter()
-            .map(|position| position.map(|position| position.global_index))
-            .collect::<Vec<_>>();
-        let proof_tree_numbers = positions
-            .iter()
-            .map(|position| position.map(|position| position.tree_number))
-            .collect::<Vec<_>>();
-        let proof_tree_positions = positions
-            .iter()
-            .map(|position| position.map(|position| position.tree_position))
-            .collect::<Vec<_>>();
         let proof_started = Instant::now();
         let proofs = cache
             .poi_merkle_proofs(blinded_commitments)
@@ -211,12 +197,8 @@ impl PoiMerkleProofSource for LocalPoiMerkleProofSource {
         debug!(
             chain_type,
             chain_id,
-            list_key = %hex::encode(list_key),
             commitments = blinded_commitments.len(),
             proofs = proofs.len(),
-            ?proof_global_indices,
-            ?proof_tree_numbers,
-            ?proof_tree_positions,
             lock_wait_elapsed_ms,
             proof_elapsed_ms = proof_started.elapsed().as_millis(),
             elapsed_ms = started.elapsed().as_millis(),

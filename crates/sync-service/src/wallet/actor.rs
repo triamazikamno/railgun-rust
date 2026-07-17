@@ -880,6 +880,14 @@ impl WalletActorState {
         })
     }
 
+    pub(super) fn validate_pending_overlay_request(
+        &self,
+        handle: &crate::wallet::WalletHandle,
+        cancel: &CancellationToken,
+    ) -> Result<u64, WalletPrivateRequestError> {
+        handle.with_active_private_request(cancel, || Ok(self.reset_generation))
+    }
+
     fn is_active_job(&self, token: WalletSyncToken, kind: WalletActorJobKind) -> bool {
         token.chain_id() == self.chain_id
             && token.actor_id() == self.actor_id

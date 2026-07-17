@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub use railgun_indexed_artifacts::{
     ChainScope, ChainType, ChunkError as IndexedArtifactChunkError, CompressionAlgorithm,
@@ -37,6 +37,7 @@ use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
 const INDEXED_ARTIFACT_MAINTENANCE_CAPACITY: usize = 8;
 const INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES: u64 =
     INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES;
+const SLOW_INDEXED_ARTIFACT_CHUNK_FETCH: Duration = Duration::from_secs(3);
 type IndexedArtifactMaintenanceJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type IndexedArtifactMaintenanceWorker = Shared<IndexedArtifactMaintenanceJob>;
 
@@ -340,9 +341,23 @@ struct FetchedIndexedArtifactChunk {
     index: usize,
     in_flight_byte_charge: u64,
     chunk: VerifiedIndexedArtifactChunk,
+    preferred_gateway_index: usize,
     gateway_index: usize,
     gateway_count: usize,
     elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IndexedArtifactChunkFetchMetrics {
+    pub(crate) slowest_chunk_elapsed_ms: u128,
+    pub(crate) byte_budget_waits: u64,
+    pub(crate) max_observed_in_flight_chunks: usize,
+    pub(crate) max_observed_in_flight_bytes: u64,
+}
+
+pub(crate) struct IndexedArtifactChunkFetchBatch {
+    pub(crate) chunks: Vec<VerifiedIndexedArtifactChunk>,
+    pub(crate) metrics: IndexedArtifactChunkFetchMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -636,8 +651,9 @@ impl IndexedArtifactManifestClient {
         &self,
         descriptors: &[IndexedArtifactDescriptor],
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError> {
-        self.fetch_chunks_bounded_with_progress(descriptors, |_, _| {})
+        self.fetch_chunks_bounded_with_verified_progress(descriptors, |_, _, _| {})
             .await
+            .map(|batch| batch.chunks)
     }
 
     pub async fn fetch_chunks_bounded_with_progress<F>(
@@ -647,6 +663,24 @@ impl IndexedArtifactManifestClient {
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError>
     where
         F: FnMut(usize, usize),
+    {
+        self.fetch_chunks_bounded_with_verified_progress(
+            descriptors,
+            |_, completed_chunks, total_chunks| {
+                on_chunk_verified(completed_chunks, total_chunks);
+            },
+        )
+        .await
+        .map(|batch| batch.chunks)
+    }
+
+    pub(crate) async fn fetch_chunks_bounded_with_verified_progress<F>(
+        &self,
+        descriptors: &[IndexedArtifactDescriptor],
+        mut on_chunk_verified: F,
+    ) -> Result<IndexedArtifactChunkFetchBatch, IndexedArtifactManifestError>
+    where
+        F: FnMut(&VerifiedIndexedArtifactChunk, usize, usize),
     {
         let total_chunks = descriptors.len();
         let concurrency = self.config.concurrency;
@@ -672,6 +706,7 @@ impl IndexedArtifactManifestClient {
         let mut max_observed_in_flight_chunks = 0_usize;
         let mut max_observed_in_flight_bytes = 0_u64;
         let mut byte_budget_waits = 0_u64;
+        let mut slowest_chunk_elapsed_ms = 0_u128;
         let mut in_flight = FuturesUnordered::new();
 
         while next_index < descriptors.len() || !in_flight.is_empty() {
@@ -706,6 +741,7 @@ impl IndexedArtifactManifestClient {
                 let index = next_index;
                 let byte_size = descriptor.byte_size;
                 let cid = descriptor.cid.clone();
+                let preferred_gateway_index = preferred_artifact_gateway_index(&descriptor);
                 let dataset_kind = descriptor.dataset_kind;
                 let range_start = descriptor.range.start;
                 let range_end = descriptor.range.end;
@@ -715,7 +751,11 @@ impl IndexedArtifactManifestClient {
                 in_flight.push(async move {
                     let started = Instant::now();
                     let fetched = match fetcher
-                        .fetch_artifact_cid_with_metadata(&descriptor.cid, descriptor.byte_size)
+                        .fetch_artifact_cid_with_metadata_from_gateway(
+                            &descriptor.cid,
+                            descriptor.byte_size,
+                            preferred_gateway_index,
+                        )
                         .await
                     {
                         Ok(fetched) => fetched,
@@ -728,6 +768,7 @@ impl IndexedArtifactManifestClient {
                                 range_end,
                                 byte_size,
                                 index,
+                                preferred_gateway_index,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 "indexed artifact chunk fetch failed"
                             );
@@ -759,6 +800,7 @@ impl IndexedArtifactManifestClient {
                         index,
                         in_flight_byte_charge,
                         chunk,
+                        preferred_gateway_index,
                         gateway_index,
                         gateway_count,
                         elapsed_ms: started.elapsed().as_millis(),
@@ -774,22 +816,41 @@ impl IndexedArtifactManifestClient {
             let fetched = completed?;
             in_flight_bytes = in_flight_bytes.saturating_sub(fetched.in_flight_byte_charge);
             completed_chunks += 1;
-            on_chunk_verified(completed_chunks, total_chunks);
-            debug!(
-                cid = %fetched.chunk.descriptor.cid,
-                dataset_kind = ?fetched.chunk.descriptor.dataset_kind,
-                range_start = fetched.chunk.descriptor.range.start,
-                range_end = fetched.chunk.descriptor.range.end,
-                byte_size = fetched.chunk.descriptor.byte_size,
-                in_flight_byte_charge = fetched.in_flight_byte_charge,
-                index = fetched.index,
-                completed_chunks,
-                total_chunks,
-                gateway_index = fetched.gateway_index,
-                gateway_count = fetched.gateway_count,
-                elapsed_ms = fetched.elapsed_ms,
-                "indexed artifact chunk fetch verified"
-            );
+            on_chunk_verified(&fetched.chunk, completed_chunks, total_chunks);
+            slowest_chunk_elapsed_ms = slowest_chunk_elapsed_ms.max(fetched.elapsed_ms);
+            if fetched.elapsed_ms >= SLOW_INDEXED_ARTIFACT_CHUNK_FETCH.as_millis() {
+                info!(
+                    dataset_kind = ?fetched.chunk.descriptor.dataset_kind,
+                    range_start = fetched.chunk.descriptor.range.start,
+                    range_end = fetched.chunk.descriptor.range.end,
+                    byte_size = fetched.chunk.descriptor.byte_size,
+                    index = fetched.index,
+                    preferred_gateway_index = fetched.preferred_gateway_index,
+                    completed_chunks,
+                    total_chunks,
+                    gateway_index = fetched.gateway_index,
+                    gateway_count = fetched.gateway_count,
+                    elapsed_ms = fetched.elapsed_ms,
+                    "slow indexed artifact chunk fetch verified"
+                );
+            } else {
+                debug!(
+                    cid = %fetched.chunk.descriptor.cid,
+                    dataset_kind = ?fetched.chunk.descriptor.dataset_kind,
+                    range_start = fetched.chunk.descriptor.range.start,
+                    range_end = fetched.chunk.descriptor.range.end,
+                    byte_size = fetched.chunk.descriptor.byte_size,
+                    in_flight_byte_charge = fetched.in_flight_byte_charge,
+                    index = fetched.index,
+                    preferred_gateway_index = fetched.preferred_gateway_index,
+                    completed_chunks,
+                    total_chunks,
+                    gateway_index = fetched.gateway_index,
+                    gateway_count = fetched.gateway_count,
+                    elapsed_ms = fetched.elapsed_ms,
+                    "indexed artifact chunk fetch verified"
+                );
+            }
             results.push((fetched.index, fetched.chunk));
         }
 
@@ -800,12 +861,21 @@ impl IndexedArtifactManifestClient {
             max_observed_in_flight_bytes,
             max_in_flight_bytes,
             byte_budget_waits,
+            slowest_chunk_elapsed_ms,
             elapsed_ms = batch_started.elapsed().as_millis(),
             "indexed artifact chunk fetch batch complete"
         );
 
         results.sort_unstable_by_key(|(index, _)| *index);
-        Ok(results.into_iter().map(|(_, chunk)| chunk).collect())
+        Ok(IndexedArtifactChunkFetchBatch {
+            chunks: results.into_iter().map(|(_, chunk)| chunk).collect(),
+            metrics: IndexedArtifactChunkFetchMetrics {
+                slowest_chunk_elapsed_ms,
+                byte_budget_waits,
+                max_observed_in_flight_chunks,
+                max_observed_in_flight_bytes,
+            },
+        })
     }
 
     async fn fetch_manifest_from_cid(
@@ -937,6 +1007,10 @@ impl IndexedArtifactManifestClient {
         )?;
         Ok(manifest)
     }
+}
+
+fn preferred_artifact_gateway_index(descriptor: &IndexedArtifactDescriptor) -> usize {
+    usize::from(descriptor.sha256[0])
 }
 
 pub fn validate_manifest(
@@ -2481,6 +2555,16 @@ mod tests {
             server.max_active() <= 2,
             "byte budget should cap active 5-byte chunks at two"
         );
+    }
+
+    #[test]
+    fn artifact_gateway_preference_uses_descriptor_identity() {
+        let scope = scope();
+        let mut descriptors = descriptors_for_bytes(&scope, &[b"gateway identity".to_vec()]);
+        let mut descriptor = descriptors.pop().expect("descriptor");
+        descriptor.sha256.0[0] = 17;
+
+        assert_eq!(preferred_artifact_gateway_index(&descriptor), 17);
     }
 
     #[tokio::test]

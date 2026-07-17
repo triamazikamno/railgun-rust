@@ -40,12 +40,13 @@ use paths::{
     artifact_chunk_blob_id, artifact_chunk_file_name, cache_id, index_shard_file_name,
     manifest_file_name, now_epoch_secs, page_file_name, staged_artifact_page_file_name,
 };
+pub(crate) use types::TXID_CACHE_BLOB_KIND;
 use types::{
-    TXID_CACHE_BLOB_KIND, TXID_CACHE_FORMAT_VERSION, TXID_CACHE_PAGE_SIZE, TXID_CACHE_SYNC_LOCK,
-    TXID_CACHE_TEMP_COUNTER, TxidPublicCacheIndexEntry, TxidPublicCacheIndexShard,
-    TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCachePageRef, TxidPublicCacheReadScope,
-    TxidPublicCacheRefresh, TxidPublicCacheRow, TxidPublicCacheSyncState,
-    TxidPublicCacheTransaction, TxidPublicCacheWritePermit,
+    TXID_CACHE_FORMAT_VERSION, TXID_CACHE_PAGE_SIZE, TXID_CACHE_SYNC_LOCK, TXID_CACHE_TEMP_COUNTER,
+    TxidPublicCacheIndexEntry, TxidPublicCacheIndexShard, TxidPublicCacheManifest,
+    TxidPublicCachePage, TxidPublicCachePageRef, TxidPublicCacheReadScope, TxidPublicCacheRefresh,
+    TxidPublicCacheRow, TxidPublicCacheSyncState, TxidPublicCacheTransaction,
+    TxidPublicCacheWritePermit,
 };
 
 #[cfg(test)]

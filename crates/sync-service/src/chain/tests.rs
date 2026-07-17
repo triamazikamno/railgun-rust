@@ -14,7 +14,7 @@ use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 use cid::Cid;
 use ed25519_dalek::SigningKey;
-use local_db::{DbConfig, DbStore, WalletCacheKey, WalletMeta};
+use local_db::{BlobMeta, DbConfig, DbStore, WalletCacheKey, WalletMeta};
 use merkletree::tree::MerkleForest;
 use multihash_codetable::{Code, MultihashDigest};
 use poi::cache::{PoiCache, PoiCacheIdentity};
@@ -64,8 +64,8 @@ use crate::indexed_artifacts::{
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, ChainKey, GlobalPoiPolicy,
     IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LogBatch,
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
-    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback, SyncProgressStage,
+    SyncProgressUnit, WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
     WalletBackfillGrant, WalletBackfillOwnerDisposition, WalletBackfillRejectReason,
     WalletBackfillStartResult, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
     WalletIndexedCatchUpSource, WalletObservation, WalletPendingOverlay, WalletReadiness,
@@ -576,7 +576,7 @@ async fn unexpected_terminal_wallet_is_reaped_and_concurrent_retry_replaces_once
 }
 
 #[tokio::test]
-async fn manager_resets_every_registered_public_data_plane_without_wallet_handles() {
+async fn manager_resets_persisted_cache_once_and_every_registered_public_data_plane() {
     let root_dir = temp_db_root("manager-public-cache-reset");
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -585,6 +585,32 @@ async fn manager_resets_every_registered_public_data_plane_without_wallet_handle
         .expect("open manager reset db"),
     );
     let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let txid_kind = crate::txid_cache::TXID_CACHE_BLOB_KIND;
+    let txid_name = "manager-reset-page.bin";
+    let txid_id = "manager-reset-page";
+    db.ensure_blob_dir(txid_kind).expect("ensure TXID blob dir");
+    fs::write(db.blob_path(txid_kind, txid_name), b"TXID cache").expect("write TXID cache file");
+    db.put_blob_meta(
+        txid_kind,
+        txid_id,
+        &BlobMeta {
+            format_version: 1,
+            relative_path: DbStore::relative_blob_path(txid_kind, txid_name),
+            content_hash: Sha256::digest(b"TXID cache").into(),
+            source_hash: None,
+            source_sequence: None,
+            created_at: 1,
+            updated_at: 1,
+            last_accessed_at: 1,
+            last_block: None,
+        },
+    )
+    .expect("write TXID cache metadata");
+    assert_eq!(
+        db.poi_artifact_cache_generation()
+            .expect("initial POI cache generation"),
+        0
+    );
     let scopes = [
         ChainScope {
             chain_type: ChainType::Evm,
@@ -627,7 +653,30 @@ async fn manager_resets_every_registered_public_data_plane_without_wallet_handle
     let report = manager.reset_public_sync_caches().await;
 
     assert_eq!(report.chains.len(), 2);
+    assert_eq!(
+        report
+            .chains
+            .iter()
+            .map(|reset| reset.chain.chain_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
     assert_eq!(report.failed_chain_count(), 0);
+    let persisted = report
+        .persisted
+        .as_ref()
+        .expect("persisted manager reset succeeds");
+    assert_eq!(persisted.txid_blob_entries_removed, 1);
+    assert_eq!(persisted.txid_files_removed, 1);
+    assert_eq!(persisted.poi_cache_entries_removed, 0);
+    assert_eq!(persisted.total_removed_entries(), 2);
+    assert_eq!(report.total_removed_entries, 2);
+    assert_eq!(
+        db.poi_artifact_cache_generation()
+            .expect("POI cache generation after manager reset"),
+        1,
+        "a multi-chain manager reset advances the shared POI generation once"
+    );
     for (key, service) in &registered {
         let reset = report
             .chains
@@ -1445,6 +1494,125 @@ async fn wallet_startup_warms_pre_cursor_gap_before_cached_suffix() {
     service.unregister_all_wallets().await;
     service.shutdown().await;
     drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn historical_catch_up_delivers_captured_suffix_after_cache_eviction() {
+    let root_dir = temp_db_root("wallet-historical-captured-suffix");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let (artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 101, 150, 150);
+    let PathServerBlockControl {
+        request_started,
+        release,
+    } = manifest_block;
+    let rpc = JsonRpcServer::spawn(vec![serde_json::json!([])]);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    chain.block_range = 10;
+    chain.finality_depth = 0;
+    chain.quick_sync_endpoint = None;
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    public_data_plane
+        .record_recent_public_scan_rows(PublicScanRows {
+            range: PublicScanRange::new(151, 200),
+            source: PublicScanSource::Rpc,
+            to_block_hash: Some([0x22; 32]),
+            rows: WalletScanInputRows {
+                nullifiers: vec![IndexedNullifierInput {
+                    tree_number: 1,
+                    nullifier: U256::from(151),
+                    source: UtxoSource {
+                        tx_hash: FixedBytes::from([0x22; 32]),
+                        block_number: 151,
+                        block_timestamp: 1_700_000_151,
+                    },
+                }],
+                ..WalletScanInputRows::default()
+            },
+            epoch: public_data_plane.current_epoch(),
+        })
+        .await
+        .expect("seed captured suffix");
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+    service.safe_head_tx.send_replace(200);
+    let mut cfg = test_wallet_config(&scope, rpc.url.clone());
+    cfg.cache_key = test_cache_key("captured-suffix-wallet");
+    cfg.start_block = Some(101);
+    cfg.sync_to_block = Some(200);
+    db.put_wallet_meta(
+        &cfg.cache_key,
+        &WalletMeta {
+            last_scanned_block: 100,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("seed wallet cursor");
+
+    let mut handle = service.register_wallet(cfg).await.expect("register wallet");
+    wait_for_std_signal(request_started, "artifact manifest request started").await;
+    for block_number in 201..=205 {
+        public_data_plane
+            .record_recent_public_scan_rows(PublicScanRows {
+                range: PublicScanRange::new(block_number, block_number),
+                source: PublicScanSource::Rpc,
+                to_block_hash: Some([0x33; 32]),
+                rows: WalletScanInputRows {
+                    nullifiers: vec![IndexedNullifierInput {
+                        tree_number: 1,
+                        nullifier: U256::from(block_number),
+                        source: UtxoSource {
+                            tx_hash: FixedBytes::from([0x33; 32]),
+                            block_number,
+                            block_timestamp: block_number.saturating_add(1_700_000_000),
+                        },
+                    }],
+                    ..WalletScanInputRows::default()
+                },
+                epoch: public_data_plane.current_epoch(),
+            })
+            .await
+            .expect("record newer pending-tip page");
+    }
+    assert!(
+        public_data_plane
+            .cached_wallet_scan_apply(151, 200)
+            .await
+            .is_none(),
+        "test must evict the original suffix from the shared cache"
+    );
+    release.send(()).expect("release artifact manifest");
+
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_until_ready())
+        .await
+        .expect("captured suffix startup completed")
+        .expect("wallet readiness succeeded");
+    assert_eq!(handle.last_scanned(), Some(200));
+    assert!(
+        rpc.requests.try_recv().is_err(),
+        "captured suffix delivery must not refetch the evicted range through RPC"
+    );
+
+    service.unregister_all_wallets().await;
+    service.shutdown().await;
+    drop(service);
+    drop(public_data_plane);
+    drop(artifact_source.server);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -2487,7 +2655,11 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
         .expect("replacement wallet reused artifact warm window")
         .expect("wallet readiness succeeded");
     assert_eq!(second.last_scanned(), Some(110));
-    assert_eq!(artifact_source.server.request_count(), 3);
+    assert_eq!(
+        artifact_source.server.request_count(),
+        3,
+        "replacement wallet should reuse the cached acquisition window without HTTP"
+    );
     assert!(rpc.requests.try_recv().is_err());
     assert!(squid.requests.try_recv().is_err());
 
@@ -4325,10 +4497,12 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     let (wallet_backfill_tx, wallet_backfill_rx) = mpsc::channel(8);
     let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(1);
     let worker_cancel = CancellationToken::new();
-    let wallet_cfg = test_wallet_config(
+    let (progress_tx, progress_rx) = watch::channel(None);
+    let mut wallet_cfg = test_wallet_config(
         &scope,
         Url::parse("http://127.0.0.1:1").expect("quick-sync url"),
     );
+    wallet_cfg.progress_tx = Some(progress_tx);
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
@@ -4388,12 +4562,23 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     .await
     .expect("artifact manifest fetch started")
     .expect("manifest wait task completed");
+    let preparation = progress_rx
+        .borrow()
+        .expect("wallet artifact preparation progress");
+    assert_eq!(preparation.stage, SyncProgressStage::PreparingUtxoIndex);
+    assert_eq!(preparation.unit, SyncProgressUnit::ArtifactPreparation);
+    assert_eq!(preparation.source, Some(PublicScanSource::IndexedArtifacts));
+    assert_eq!(preparation.percent(), 5);
 
     public_data_plane
         .invalidate_public_scan_coverage_from(101)
         .await;
     release.send(()).expect("release artifact manifest fetch");
     let checkpoint = catch_up.await.expect("indexed catch-up task");
+    let retained_progress = progress_rx
+        .borrow()
+        .expect("pre-invalidation artifact progress");
+    assert_eq!(retained_progress, preparation);
 
     assert_eq!(checkpoint, 100);
     assert_eq!(handle.last_scanned(), Some(100));
@@ -4435,7 +4620,14 @@ async fn wallet_snapshot_does_not_fetch_optional_prior_endpoint() {
 
     let session = tokio::time::timeout(
         Duration::from_secs(2),
-        IndexedWalletArtifactSession::prepare(&chain, 110, 120, read_scope, &public_data_plane),
+        IndexedWalletArtifactSession::prepare(
+            &chain,
+            110,
+            120,
+            read_scope,
+            &public_data_plane,
+            None,
+        ),
     )
     .await
     .expect("required wallet artifact preparation was not blocked by optional retention")
@@ -4483,7 +4675,7 @@ async fn superseded_wallet_descriptor_stays_uncached_after_invalidation() {
         release: _,
     } = optional_block;
     let read_scope = public_data_plane.begin_public_scan_read();
-    IndexedWalletArtifactSession::prepare(&chain, 110, 120, read_scope, &public_data_plane)
+    IndexedWalletArtifactSession::prepare(&chain, 110, 120, read_scope, &public_data_plane, None)
         .await
         .expect("prepare wallet artifacts")
         .expect("wallet artifact session");
@@ -4503,6 +4695,227 @@ async fn superseded_wallet_descriptor_stays_uncached_after_invalidation() {
             .cached_wallet_scan_artifact_chunk(&optional_descriptor)
             .is_none(),
         "superseded descriptors must remain uncached"
+    );
+
+    public_data_plane.shutdown().await;
+    drop(public_data_plane);
+    drop(chain);
+    drop(artifact_source.server);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_artifact_prepare_reuses_retained_chunks() {
+    let root_dir = temp_db_root("wallet-artifact-warm-cache-reuse");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let (artifact_source, block) = checkpointed_wallet_artifact_source_controlled_with_requests(
+        &scope,
+        100,
+        150,
+        150,
+        false,
+        6,
+        Some(125),
+        false,
+    );
+    assert!(block.is_none());
+    let retained_descriptor = artifact_source.chunk_descriptors[0].clone();
+    let transient_descriptor = artifact_source.chunk_descriptors[1].clone();
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+
+    IndexedWalletArtifactSession::prepare(
+        &chain,
+        100,
+        150,
+        public_data_plane.begin_public_scan_read(),
+        &public_data_plane,
+        None,
+    )
+    .await
+    .expect("prepare cold wallet artifacts")
+    .expect("cold wallet artifact session");
+    for _ in 0..100 {
+        if public_data_plane
+            .cached_wallet_scan_artifact_chunk(&retained_descriptor)
+            .is_some()
+            && public_data_plane
+                .cached_wallet_scan_transient_artifact_chunk(&transient_descriptor)
+                .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        public_data_plane
+            .cached_wallet_scan_artifact_chunk(&retained_descriptor)
+            .is_some(),
+        "stable wallet artifact chunk was not retained"
+    );
+    assert!(
+        public_data_plane
+            .cached_wallet_scan_transient_artifact_chunk(&transient_descriptor)
+            .is_some(),
+        "transient wallet artifact chunk was not retained"
+    );
+    assert_eq!(artifact_source.server.request_count(), 4);
+
+    IndexedWalletArtifactSession::prepare(
+        &chain,
+        100,
+        150,
+        public_data_plane.begin_public_scan_read(),
+        &public_data_plane,
+        None,
+    )
+    .await
+    .expect("prepare warm wallet artifacts")
+    .expect("warm wallet artifact session");
+    assert_eq!(
+        artifact_source.server.request_count(),
+        6,
+        "warm preparation should reuse stable history and the unchanged transient tail"
+    );
+
+    public_data_plane.shutdown().await;
+    drop(public_data_plane);
+    drop(chain);
+    drop(artifact_source.server);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn partial_cached_replay_does_not_publish_regressive_artifact_preparation() {
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 100, 200, 200);
+    let mut context = IndexedCatchUpTestContext::new(
+        &scope,
+        Url::parse("http://127.0.0.1:1").expect("quick-sync url"),
+        Some(artifact_source.config.clone()),
+        100,
+        100,
+    )
+    .await;
+    context
+        .public_data_plane
+        .record_public_scan_coverage(PublicScanCoverageWrite {
+            range: PublicScanRange::new(101, 150),
+            source: PublicScanSource::Rpc,
+            row_count: 0,
+            read_scope: context.public_data_plane.begin_public_scan_read(),
+        })
+        .await
+        .expect("record cached prefix");
+    let (progress_tx, progress_rx) = watch::channel(None);
+    context.wallet_cfg.progress_tx = Some(progress_tx);
+
+    let checkpoint = context
+        .spawn_catch_up(200, IndexedWalletCatchUpSourceOrder::ArtifactsFirst)
+        .await
+        .expect("indexed catch-up task");
+
+    assert_eq!(checkpoint, 200);
+    assert!(
+        progress_rx.borrow().is_none(),
+        "artifact preparation must not overwrite progress after cached indexing begins"
+    );
+    context.cleanup();
+    drop(artifact_source.server);
+}
+
+#[tokio::test]
+async fn verified_stable_chunk_is_retained_when_later_chunk_fails() {
+    let root_dir = temp_db_root("wallet-artifact-partial-retention");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: Address::from([0xbb; 20]),
+    };
+    let (artifact_source, block) = checkpointed_wallet_artifact_source_controlled_with_requests(
+        &scope,
+        100,
+        150,
+        150,
+        false,
+        4,
+        Some(125),
+        true,
+    );
+    assert!(block.is_none());
+    let stable_descriptor = artifact_source.chunk_descriptors[0].clone();
+    let failed_tail_descriptor = artifact_source.chunk_descriptors[1].clone();
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+
+    let preparation = IndexedWalletArtifactSession::prepare(
+        &chain,
+        100,
+        150,
+        public_data_plane.begin_public_scan_read(),
+        &public_data_plane,
+        None,
+    )
+    .await;
+    assert!(
+        preparation.is_err(),
+        "missing tail chunk must fail preparation"
+    );
+    for _ in 0..100 {
+        if public_data_plane
+            .cached_wallet_scan_artifact_chunk(&stable_descriptor)
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        public_data_plane
+            .cached_wallet_scan_artifact_chunk(&stable_descriptor)
+            .is_some(),
+        "verified stable chunk should survive a later fetch failure"
+    );
+    assert!(
+        public_data_plane
+            .cached_wallet_scan_artifact_chunk(&failed_tail_descriptor)
+            .is_none()
     );
 
     public_data_plane.shutdown().await;
@@ -6055,6 +6468,7 @@ fn test_chain_service_with_policy(
 struct TestArtifactSource {
     config: IndexedArtifactSourceConfig,
     server: PathServer,
+    chunk_descriptors: Vec<IndexedArtifactDescriptor>,
 }
 
 struct BlockedWalletOptionalMaintenanceFixture {
@@ -6610,7 +7024,11 @@ fn blocked_wallet_optional_maintenance_fixture(
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
     };
-    let artifact_source = TestArtifactSource { config, server };
+    let artifact_source = TestArtifactSource {
+        config,
+        server,
+        chunk_descriptors: vec![optional_descriptor.clone()],
+    };
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
         Duration::from_secs(1),
@@ -6649,28 +7067,67 @@ fn checkpointed_wallet_artifact_source_controlled(
     checkpoint_block: u64,
     block_manifest: bool,
 ) -> (TestArtifactSource, Option<PathServerBlockControl>) {
-    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
-    let chunk_bytes = empty_wallet_scan_chunk_bytes(scope, start, end);
-    let chunk_cid = raw_cid(&chunk_bytes);
-    let chunk_descriptor = wallet_artifact_descriptor(
-        scope.clone(),
+    checkpointed_wallet_artifact_source_controlled_with_requests(
+        scope,
         start,
         end,
-        0,
-        chunk_cid,
-        &chunk_bytes,
-        DatasetDescriptorMetadata {
-            catalog_generation: Some(1),
-            checkpoint_block: Some(checkpoint_block),
-            ..Default::default()
+        checkpoint_block,
+        block_manifest,
+        3,
+        None,
+        false,
+    )
+}
+
+fn checkpointed_wallet_artifact_source_controlled_with_requests(
+    scope: &ChainScope,
+    start: u64,
+    end: u64,
+    checkpoint_block: u64,
+    block_manifest: bool,
+    request_count: usize,
+    split_at: Option<u64>,
+    omit_last_chunk: bool,
+) -> (TestArtifactSource, Option<PathServerBlockControl>) {
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let chunk_ranges = split_at.map_or_else(
+        || vec![(start, end)],
+        |split_at| {
+            assert!(start < split_at && split_at <= end);
+            vec![(start, split_at - 1), (split_at, end)]
         },
-        CompressionAlgorithm::None,
     );
+    let chunks = chunk_ranges
+        .into_iter()
+        .map(|(chunk_start, chunk_end)| {
+            let bytes = empty_wallet_scan_chunk_bytes(scope, chunk_start, chunk_end);
+            let cid = raw_cid(&bytes);
+            let descriptor = wallet_artifact_descriptor(
+                scope.clone(),
+                chunk_start,
+                chunk_end,
+                0,
+                cid,
+                &bytes,
+                DatasetDescriptorMetadata {
+                    catalog_generation: Some(1),
+                    checkpoint_block: Some(chunk_end.min(checkpoint_block)),
+                    ..Default::default()
+                },
+                CompressionAlgorithm::None,
+            );
+            (descriptor, cid, bytes)
+        })
+        .collect::<Vec<_>>();
+    let chunk_descriptors = chunks
+        .iter()
+        .map(|(descriptor, _, _)| descriptor.clone())
+        .collect::<Vec<_>>();
     let catalog = IndexedArtifactCatalog {
         format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
         dataset_kind: IndexedDatasetKind::WalletScan,
         scope: scope.clone(),
-        chunks: vec![chunk_descriptor],
+        chunks: chunk_descriptors.clone(),
     };
     let catalog_bytes = serde_json::to_vec(&catalog).expect("catalog json");
     let catalog_cid = raw_cid(&catalog_bytes);
@@ -6704,24 +7161,32 @@ fn checkpointed_wallet_artifact_source_controlled(
     );
     manifest.sign_manifest(&signing_key).expect("sign manifest");
     let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest json");
-    let chunk_path = format!("/ipfs/{chunk_cid}?format=car&dag-scope=entity");
-    let routes = HashMap::from([
+    let mut routes = HashMap::from([
         ("/manifest.json".to_string(), manifest_bytes),
         (
             format!("/ipfs/{catalog_cid}?format=car&dag-scope=entity"),
             car_bytes(catalog_cid, &[(catalog_cid, catalog_bytes)]),
         ),
-        (
-            chunk_path,
-            car_bytes(chunk_cid, &[(chunk_cid, chunk_bytes)]),
-        ),
     ]);
+    let chunk_count = chunks.len();
+    for (index, (_, cid, bytes)) in chunks.into_iter().enumerate() {
+        if omit_last_chunk && index + 1 == chunk_count {
+            continue;
+        }
+        routes.insert(
+            format!("/ipfs/{cid}?format=car&dag-scope=entity"),
+            car_bytes(cid, &[(cid, bytes)]),
+        );
+    }
     let (server, block) = if block_manifest {
-        let (server, block) =
-            PathServer::spawn_with_blocked_path(routes, 3, "/manifest.json".to_string());
+        let (server, block) = PathServer::spawn_with_blocked_path(
+            routes,
+            request_count,
+            "/manifest.json".to_string(),
+        );
         (server, Some(block))
     } else {
-        (PathServer::spawn(routes, 3), None)
+        (PathServer::spawn(routes, request_count), None)
     };
     let manifest_url = server.url.join("/manifest.json").expect("manifest url");
     let config = IndexedArtifactSourceConfig {
@@ -6732,7 +7197,14 @@ fn checkpointed_wallet_artifact_source_controlled(
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
     };
-    (TestArtifactSource { config, server }, block)
+    (
+        TestArtifactSource {
+            config,
+            server,
+            chunk_descriptors,
+        },
+        block,
+    )
 }
 
 fn wallet_artifact_descriptor(

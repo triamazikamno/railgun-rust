@@ -17,8 +17,8 @@ use super::output_poi_recovery::{
     recovered_output_txid_data_from_public_cache, recovery_input_merkle_tree_for_root,
 };
 use super::pending_output_poi::{
-    process_pending_output_poi_observations_inner, verify_submitted_pending_output_pois,
-    verify_submitted_pending_output_pois_authorized,
+    pending_output_poi_observation_updates, process_pending_output_poi_observations_inner,
+    verify_submitted_pending_output_pois, verify_submitted_pending_output_pois_authorized,
     verify_submitted_pending_output_pois_authorized_with_projection,
     verify_submitted_pending_output_pois_with_config,
 };
@@ -88,7 +88,7 @@ use poi::poi::{
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
 use railgun_wallet::tx::{PoiMerkleProofSource, PreTransactionPoiError};
-use railgun_wallet::wallet_cache::WalletCacheError;
+use railgun_wallet::wallet_cache::{WalletCacheError, wallet_utxo_stable_identity};
 use railgun_wallet::{
     NoteCiphertext, PoiStatus, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletUtxo,
 };
@@ -275,6 +275,7 @@ fn local_pending_spent_for(utxo: &WalletUtxo, submitted_at: u64) -> WalletPendin
     WalletPendingSpent {
         tree: utxo.utxo.tree,
         position: utxo.utxo.position,
+        stable_identity: Some(wallet_utxo_stable_identity(utxo)),
         tx_hash: Some(FixedBytes::from([0x77; 32])),
         block_number: None,
         block_timestamp: Some(submitted_at),
@@ -1147,7 +1148,7 @@ fn pending_output_submit_identity_derives_status_query_blinded_commitment() {
 }
 
 #[test]
-fn pending_output_submit_identity_uses_included_txid_leaf_for_recovery() {
+fn pending_output_submit_identity_accepts_included_txid_leaf_for_recovery() {
     let chain_id = 1;
     let output_commitment = FixedBytes::from([0x77; 32]);
     let list_key = FixedBytes::from([0x11; 32]);
@@ -1169,11 +1170,9 @@ fn pending_output_submit_identity_uses_included_txid_leaf_for_recovery() {
         block_timestamp: 1_700_000_011,
     };
 
-    let identity =
-        pending_output_poi_submit_identity(&record, &observation).expect("submit identity");
+    pending_output_poi_submit_identity(&record, &observation).expect("submit identity");
 
-    assert_eq!(identity.txid_leaf_hash, included_txid_leaf);
-    assert_ne!(identity.txid_leaf_hash, dummy_txid_leaf);
+    assert_ne!(included_txid_leaf, dummy_txid_leaf);
 }
 
 #[test]
@@ -1206,6 +1205,8 @@ struct RecordingCacheState {
     store_calls: usize,
     meta_calls: usize,
     reset_calls: usize,
+    pending_output_read_calls: usize,
+    output_recovery_read_calls: usize,
     fail_next_store: bool,
 }
 
@@ -1246,23 +1247,7 @@ impl WalletCacheStore for RecordingCacheStore {
         } else {
             self.state.lock().expect("cache state").meta_calls += 1;
         }
-        for record in commit.pending_output_context_updates() {
-            self.db.put_pending_output_poi_context(record)?;
-        }
-        for output_commitment in commit.pending_output_context_deletes() {
-            self.db.delete_pending_output_poi_context(
-                commit.chain_id(),
-                commit.wallet_id(),
-                output_commitment,
-            )?;
-        }
-        for record in commit.output_poi_recovery_updates() {
-            self.db.put_output_poi_recovery(record)?;
-        }
-        if let Some(state) = commit.sync_actor_state() {
-            self.db.put_wallet_sync_actor_state(state)?;
-        }
-        Ok(())
+        <DbStore as WalletCacheStore>::commit_wallet_private_state(self.db.as_ref(), commit)
     }
 
     fn load_wallet_utxos(
@@ -1294,6 +1279,123 @@ impl WalletCacheStore for RecordingCacheStore {
         self.db.put_wallet_sync_actor_state(commit.state())?;
         Ok(())
     }
+
+    fn get_pending_output_poi_context(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<PendingOutputPoiContextRecord>, WalletCacheError> {
+        self.state
+            .lock()
+            .expect("cache state")
+            .pending_output_read_calls += 1;
+        <DbStore as WalletCacheStore>::get_pending_output_poi_context(
+            self.db.as_ref(),
+            chain_id,
+            wallet_id,
+            output_commitment,
+        )
+    }
+
+    fn list_pending_output_poi_contexts(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<PendingOutputPoiContextRecord>, WalletCacheError> {
+        self.state
+            .lock()
+            .expect("cache state")
+            .pending_output_read_calls += 1;
+        <DbStore as WalletCacheStore>::list_pending_output_poi_contexts(
+            self.db.as_ref(),
+            chain_id,
+            wallet_id,
+        )
+    }
+
+    fn get_output_poi_recovery(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError> {
+        self.state
+            .lock()
+            .expect("cache state")
+            .output_recovery_read_calls += 1;
+        <DbStore as WalletCacheStore>::get_output_poi_recovery(
+            self.db.as_ref(),
+            chain_id,
+            wallet_id,
+            output_commitment,
+        )
+    }
+
+    fn list_output_poi_recoveries(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<OutputPoiRecoveryRecord>, WalletCacheError> {
+        self.state
+            .lock()
+            .expect("cache state")
+            .output_recovery_read_calls += 1;
+        <DbStore as WalletCacheStore>::list_output_poi_recoveries(
+            self.db.as_ref(),
+            chain_id,
+            wallet_id,
+        )
+    }
+}
+
+#[test]
+fn pending_output_and_recovery_reads_route_through_wallet_cache_store() {
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let chain_id = 1;
+    let wallet_id = test_cache_key("wallet-1");
+    let output_commitment = FixedBytes::from([0x73; 32]);
+    let pending = pending_output_record(chain_id, output_commitment, FixedBytes::from([0x74; 32]));
+    db.put_pending_output_poi_context(&pending)
+        .expect("seed pending context");
+    db.put_output_poi_recovery(&output_poi_recovery_record(
+        chain_id,
+        wallet_id.as_str(),
+        output_commitment,
+        OutputPoiRecoveryStatus::Recoverable,
+        None,
+    ))
+    .expect("seed recovery");
+    let cache_store = RecordingCacheStore::new(Arc::clone(&db));
+    let observation = CommitmentObservation {
+        tree: 12,
+        position: 34,
+        commitment: U256::from_be_bytes(output_commitment.0),
+        source: source(8),
+    };
+
+    let updates =
+        pending_output_poi_observation_updates(&cache_store, chain_id, &wallet_id, &[observation])
+            .expect("prepare observation update");
+    assert_eq!(updates.len(), 1);
+    assert!(
+        cache_store
+            .get_output_poi_recovery(chain_id, &wallet_id, &output_commitment)
+            .expect("load recovery through cache store")
+            .is_some()
+    );
+    assert_eq!(cache_store.state().pending_output_read_calls, 1);
+    assert_eq!(cache_store.state().output_recovery_read_calls, 1);
+
+    drop(cache_store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[test]
@@ -1734,21 +1836,18 @@ async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() 
     let mut cfg = wallet_config(scan_keys.nullifying_key);
     cfg.quick_sync_endpoint = Some(graph_endpoint);
 
-    let recovered = recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
+    recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
         public_data_plane: &public_data_plane,
         cfg: &cfg,
         poi_client: &poi_client,
         http_client: None,
         indexed_artifact_source: None,
-        source_tx_hash: output.utxo.source.tx_hash,
-        output_commitment: output.utxo.poi.commitment,
         recovery_chunk: &recovery_chunk,
         started: Instant::now(),
     })
     .await
     .expect("current marker sync should recover the unknown target");
 
-    assert_eq!(recovered.target_txid_index, 1);
     let latest_request = poi_mock
         .requests
         .recv_timeout(Duration::from_secs(2))
@@ -2490,7 +2589,7 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
     let remote_proof_source = OutputRecoveryRemoteProofSource {
         private_poi: &private_poi,
         authority: &authority,
-        db: store.as_ref(),
+        cache_store: store.as_ref(),
         cfg: &cfg,
         candidate: &candidate,
         required_poi_list_keys: &required_poi_list_keys,
@@ -5006,7 +5105,7 @@ async fn output_recovery_mixed_statuses_request_and_persist_only_recoverable_lis
         let source = OutputRecoveryRemoteProofSource {
             private_poi: &private_poi,
             authority: &authority,
-            db: &store,
+            cache_store: &store,
             cfg: &cfg,
             candidate: &candidate,
             required_poi_list_keys: &recoverable_list_keys,
@@ -5815,7 +5914,7 @@ async fn remote_proof_gateway_revalidates_after_source_resolution_wait() {
     let source = OutputRecoveryRemoteProofSource {
         private_poi: &private_poi,
         authority: &authority,
-        db: &store,
+        cache_store: &store,
         cfg: &cfg,
         candidate: &candidate,
         required_poi_list_keys: &active_list_keys,
@@ -5903,7 +6002,7 @@ async fn remote_proof_gateway_rejects_mixed_candidate_with_no_recoverable_lists(
     let source = OutputRecoveryRemoteProofSource {
         private_poi: &private_poi,
         authority: &authority,
-        db: &store,
+        cache_store: &store,
         cfg: &cfg,
         candidate: &candidate,
         required_poi_list_keys: &recoverable_list_keys,
@@ -7234,7 +7333,7 @@ async fn local_pending_spent_updates_existing_submitted_tx_hash() {
 }
 
 #[tokio::test]
-async fn local_pending_spent_prunes_when_chain_pending_covers_key() {
+async fn local_pending_spent_remains_latent_while_chain_pending_covers_key() {
     let wallet_utxo = test_wallet_utxo(7);
     let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
     let submitted_at = now_epoch_secs();
@@ -7252,7 +7351,7 @@ async fn local_pending_spent_prunes_when_chain_pending_covers_key() {
         .await;
 
     let overlay = handle.pending_overlay().expect("current view");
-    assert!(overlay.local_pending_spent.is_empty());
+    assert_eq!(overlay.local_pending_spent.len(), 1);
     assert_eq!(overlay.pending_spent.len(), 1);
 }
 

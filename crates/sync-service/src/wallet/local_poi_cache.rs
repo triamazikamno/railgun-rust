@@ -23,9 +23,7 @@ pub(super) async fn install_tailed_poi_cache_if_current(
 
 pub(super) fn log_local_poi_cache_unavailable(cfg: &WalletConfig, reason: &'static str) {
     warn!(
-        cache_key = %cfg.cache_key,
         chain_id = cfg.chain.chain_id,
-        reason,
-        "artifact POI local cache unavailable; skipping local POI refresh"
+        reason, "artifact POI local cache unavailable; skipping local POI refresh"
     );
 }

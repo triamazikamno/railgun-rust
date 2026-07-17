@@ -13,30 +13,58 @@ use super::{
     find_target_row_in_page,
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub(crate) struct TxidPublicCacheResetFailure {
+    pub(crate) reset: TxidPublicCacheReset,
+    #[source]
+    pub(crate) error: TxidPublicCacheError,
+}
+
 pub(crate) async fn reset_txid_public_cache(
     db: &DbStore,
-) -> Result<TxidPublicCacheReset, TxidPublicCacheError> {
+) -> Result<TxidPublicCacheReset, TxidPublicCacheResetFailure> {
     let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
     TxidPublicCacheSyncState::lock().bump_generation(db);
+    let mut reset = TxidPublicCacheReset {
+        blob_entries_removed: 0,
+        files_removed: 0,
+    };
+    reset.blob_entries_removed =
+        db.clear_blob_meta_kind(TXID_CACHE_BLOB_KIND)
+            .map_err(|error| TxidPublicCacheResetFailure {
+                reset,
+                error: error.into(),
+            })?;
     let cache_dir = db.blob_dir().join(TXID_CACHE_BLOB_KIND);
-    let files_removed = match count_path_entries(&cache_dir) {
+    reset.files_removed = match count_path_entries(&cache_dir) {
         Ok(files_removed) => {
             match fs::remove_dir_all(&cache_dir) {
                 Ok(()) => {}
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+                Err(error) => {
+                    return Err(TxidPublicCacheResetFailure {
+                        reset,
+                        error: error.into(),
+                    });
+                }
             }
             files_removed
         }
         Err(err) if err.kind() == ErrorKind::NotFound => 0,
-        Err(err) => return Err(err.into()),
+        Err(error) => {
+            return Err(TxidPublicCacheResetFailure {
+                reset,
+                error: error.into(),
+            });
+        }
     };
-    let blob_entries_removed = db.clear_blob_meta_kind(TXID_CACHE_BLOB_KIND)?;
-    db.ensure_blob_dir(TXID_CACHE_BLOB_KIND)?;
-    Ok(TxidPublicCacheReset {
-        blob_entries_removed,
-        files_removed,
-    })
+    db.ensure_blob_dir(TXID_CACHE_BLOB_KIND)
+        .map_err(|error| TxidPublicCacheResetFailure {
+            reset,
+            error: error.into(),
+        })?;
+    Ok(reset)
 }
 
 fn count_path_entries(path: &Path) -> Result<u64, std::io::Error> {

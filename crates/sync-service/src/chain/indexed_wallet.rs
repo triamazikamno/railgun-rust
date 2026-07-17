@@ -2,11 +2,14 @@ use super::{
     BackfillEvent, CancellationToken, ChainConfig, ChainPublicDataPlane, DEFAULT_PAGE_SIZE, Future,
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    IndexedWalletPageKind, Instant, PublicScanReadScope, QuickSyncClient, SyncError, UtxoSource,
+    IndexedWalletPageKind, Instant, PublicScanReadScope, PublicScanSource, QuickSyncClient,
+    SyncError, SyncProgressSender, SyncProgressStage, SyncProgressUpdate, UtxoSource,
     WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillStartResult, WalletHandle,
-    WalletScanApply, WalletScanInputRows, WalletStartupSyncError, debug, mpsc,
+    WalletScanApply, WalletScanInputRows, WalletStartupSyncError, artifact_chunk_progress, debug,
+    info, mpsc, send_sync_progress,
 };
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 #[cfg(test)]
@@ -23,8 +26,9 @@ use crate::indexed_artifacts::{
     ChainScope, ChainType, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
     IndexedArtifactMaintenanceAdmission, IndexedArtifactMaintenanceKey, IndexedArtifactManifest,
     IndexedArtifactManifestClient, IndexedArtifactManifestError, IndexedArtifactPlannedChunk,
-    IndexedArtifactRange, IndexedArtifactRangeKind, IndexedArtifactStreamCatalog,
-    IndexedArtifactStreamCoverage, IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
+    IndexedArtifactPlannedChunkPlacement, IndexedArtifactRange, IndexedArtifactRangeKind,
+    IndexedArtifactStreamCatalog, IndexedArtifactStreamCoverage,
+    IndexedArtifactStreamPartitionPolicy, IndexedArtifactStreamPlan,
     IndexedArtifactStreamPlanRequest, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
     decode_indexed_artifact_chunk,
 };
@@ -34,6 +38,11 @@ const WALLET_SHIELD_SECTION_ID: u16 = 2;
 const WALLET_NULLIFIER_SECTION_ID: u16 = 3;
 const WALLET_LEGACY_ENCRYPTED_SECTION_ID: u16 = 4;
 const WALLET_LEGACY_GENERATED_SECTION_ID: u16 = 5;
+const WALLET_ARTIFACT_PROGRESS_TOTAL: u64 = 100;
+const WALLET_ARTIFACT_MANIFEST_START_PROGRESS: u64 = 5;
+const WALLET_ARTIFACT_MANIFEST_DONE_PROGRESS: u64 = 20;
+const WALLET_ARTIFACT_DESCRIPTORS_DONE_PROGRESS: u64 = 35;
+const WALLET_ARTIFACT_CHUNKS_DONE_PROGRESS: u64 = 90;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexedWalletArtifactProbe {
     pub(super) latest_indexed_block: u64,
@@ -369,6 +378,7 @@ impl IndexedWalletArtifactSession {
         to_block: u64,
         read_scope: PublicScanReadScope,
         public_data_plane: &ChainPublicDataPlane,
+        progress_tx: Option<&SyncProgressSender>,
     ) -> Result<Option<Self>, SyncError> {
         let Some(config) = chain.indexed_artifact_source.clone() else {
             return Ok(None);
@@ -378,11 +388,23 @@ impl IndexedWalletArtifactSession {
         let client = IndexedArtifactManifestClient::new(config, http_client);
         let started = Instant::now();
         let manifest_started = Instant::now();
+        if public_data_plane.current_epoch() == read_scope.epoch() {
+            send_wallet_artifact_preparation_progress(
+                progress_tx,
+                WALLET_ARTIFACT_MANIFEST_START_PROGRESS,
+            );
+        }
         let manifest = client
             .fetch_manifest(&scope, None, SystemTime::now())
             .await
             .map_err(|err| wallet_artifact_error(&err))?;
         let manifest_elapsed_ms = manifest_started.elapsed().as_millis();
+        if public_data_plane.current_epoch() == read_scope.epoch() {
+            send_wallet_artifact_preparation_progress(
+                progress_tx,
+                WALLET_ARTIFACT_MANIFEST_DONE_PROGRESS,
+            );
+        }
         let Some(probe) =
             IndexedWalletArtifactProbe::from_manifest(&manifest, &scope, from_block, to_block)
         else {
@@ -425,6 +447,12 @@ impl IndexedWalletArtifactSession {
             .map(|entry| entry.descriptor.clone())
             .collect::<Vec<_>>();
         let descriptor_elapsed_ms = descriptor_started.elapsed().as_millis();
+        if public_data_plane.current_epoch() == read_scope.epoch() {
+            send_wallet_artifact_preparation_progress(
+                progress_tx,
+                WALLET_ARTIFACT_DESCRIPTORS_DONE_PROGRESS,
+            );
+        }
         debug!(
             from_block,
             to_block,
@@ -440,15 +468,23 @@ impl IndexedWalletArtifactSession {
         );
         let indexed_chunk_descriptors: Vec<_> =
             chunk_descriptors.iter().cloned().enumerate().collect();
-        let chunks =
-            Self::fetch_chunks(&client, &indexed_chunk_descriptors, public_data_plane).await?;
+        let chunks = Self::fetch_chunks(
+            &client,
+            &indexed_chunk_descriptors,
+            &required_current_chunks,
+            manifest.sequence,
+            public_data_plane,
+            read_scope,
+            progress_tx,
+        )
+        .await?;
         Self::schedule_chunk_maintenance(
             &required_current_chunks,
             &chunks.chunks,
             public_data_plane,
             read_scope,
         );
-        debug!(
+        info!(
             from_block,
             to_block,
             target_block,
@@ -456,9 +492,18 @@ impl IndexedWalletArtifactSession {
             latest_indexed_block = probe.latest_indexed_block,
             catalog_count = probe.catalog_count,
             chunk_count = chunk_descriptors.len(),
+            cache_hits = chunks.cache_hits,
+            fetched_chunks = chunks.fetched_chunks,
+            fetched_bytes = chunks.fetched_bytes,
+            manifest_elapsed_ms,
+            descriptor_elapsed_ms,
             chunk_fetch_verify_elapsed_ms = chunks.fetch_verify_elapsed_ms,
+            slowest_chunk_elapsed_ms = chunks.slowest_chunk_elapsed_ms,
+            chunk_byte_budget_waits = chunks.byte_budget_waits,
+            max_in_flight_chunks = chunks.max_observed_in_flight_chunks,
+            max_in_flight_bytes = chunks.max_observed_in_flight_bytes,
             elapsed_ms = started.elapsed().as_millis(),
-            "indexed wallet artifact chunks prepared"
+            "indexed wallet artifact preparation complete"
         );
         Ok(Some(Self {
             probe,
@@ -652,7 +697,11 @@ impl IndexedWalletArtifactSession {
     async fn fetch_chunks(
         client: &IndexedArtifactManifestClient,
         chunk_descriptors: &[(usize, IndexedArtifactDescriptor)],
+        required_entries: &[IndexedArtifactPlannedChunk],
+        manifest_sequence: u64,
         public_data_plane: &ChainPublicDataPlane,
+        read_scope: PublicScanReadScope,
+        progress_tx: Option<&SyncProgressSender>,
     ) -> Result<IndexedWalletArtifactChunkFetchResult, SyncError> {
         let descriptors: Vec<_> = chunk_descriptors
             .iter()
@@ -662,7 +711,15 @@ impl IndexedWalletArtifactSession {
         let mut indexed_chunks = Vec::with_capacity(chunk_descriptors.len());
         let mut missing = Vec::new();
         for (descriptor_index, descriptor) in chunk_descriptors {
-            if let Some(chunk) = public_data_plane.cached_wallet_scan_artifact_chunk(descriptor) {
+            let cached = match wallet_artifact_cache_class(required_entries, descriptor) {
+                Some(WalletArtifactCacheClass::Transient) => {
+                    public_data_plane.cached_wallet_scan_transient_artifact_chunk(descriptor)
+                }
+                Some(WalletArtifactCacheClass::Stable) | None => {
+                    public_data_plane.cached_wallet_scan_artifact_chunk(descriptor)
+                }
+            };
+            if let Some(chunk) = cached {
                 indexed_chunks.push((*descriptor_index, chunk));
             } else {
                 missing.push((*descriptor_index, descriptor.clone()));
@@ -673,20 +730,81 @@ impl IndexedWalletArtifactSession {
             .iter()
             .map(|(_, descriptor)| descriptor.clone())
             .collect();
+        let cache_hits = descriptors.len().saturating_sub(missing_descriptors.len());
+        let fetched_chunks = missing_descriptors.len();
+        let fetched_bytes = missing_descriptors.iter().fold(0_u64, |total, descriptor| {
+            total.saturating_add(descriptor.byte_size)
+        });
+        let stable_chunk_cids = required_entries
+            .iter()
+            .filter(|entry| entry.is_stable_current())
+            .map(|entry| entry.descriptor.cid.clone())
+            .collect::<HashSet<_>>();
+        let transient_chunk_cids = required_entries
+            .iter()
+            .filter(|entry| {
+                entry.placement == IndexedArtifactPlannedChunkPlacement::CurrentTransient
+            })
+            .map(|entry| entry.descriptor.cid.clone())
+            .collect::<HashSet<_>>();
+        let mut fetch_metrics =
+            crate::indexed_artifacts::IndexedArtifactChunkFetchMetrics::default();
+        info!(
+            requested_chunks = descriptors.len(),
+            cache_hits, fetched_chunks, fetched_bytes, "wallet-scan artifact chunk fetch starting"
+        );
+        if public_data_plane.current_epoch() == read_scope.epoch() {
+            send_wallet_artifact_chunk_progress(progress_tx, cache_hits, descriptors.len());
+        }
         if !missing_descriptors.is_empty() {
-            let fetched_chunks = client
-                .fetch_chunks_bounded(&missing_descriptors)
+            let fetched_batch = client
+                .fetch_chunks_bounded_with_verified_progress(
+                    &missing_descriptors,
+                    |chunk, completed_chunks, _| {
+                        if stable_chunk_cids.contains(&chunk.descriptor.cid) {
+                            Self::schedule_verified_chunk_maintenance(
+                                chunk.clone(),
+                                public_data_plane,
+                                read_scope,
+                            );
+                        }
+                        if public_data_plane.current_epoch() == read_scope.epoch() {
+                            send_wallet_artifact_chunk_progress(
+                                progress_tx,
+                                cache_hits.saturating_add(completed_chunks),
+                                descriptors.len(),
+                            );
+                        }
+                    },
+                )
                 .await
                 .map_err(|err| wallet_artifact_error(&err))?;
-            for ((descriptor_index, _), chunk) in missing.into_iter().zip(fetched_chunks) {
+            fetch_metrics = fetched_batch.metrics;
+            for chunk in &fetched_batch.chunks {
+                if transient_chunk_cids.contains(&chunk.descriptor.cid) {
+                    let retained = public_data_plane
+                        .retain_wallet_scan_transient_artifact_chunk_for_generation(
+                            chunk,
+                            read_scope,
+                            public_data_plane.wallet_scan_artifact_cache_generation(),
+                            manifest_sequence,
+                        )
+                        .await;
+                    debug!(retained, "retained wallet-scan transient artifact chunk");
+                }
+            }
+            for ((descriptor_index, _), chunk) in missing.into_iter().zip(fetched_batch.chunks) {
                 indexed_chunks.push((descriptor_index, chunk));
             }
         }
         let fetch_verify_elapsed_ms = fetch_started.elapsed().as_millis();
         debug!(
             requested_chunks = descriptors.len(),
-            cache_hits = descriptors.len().saturating_sub(missing_descriptors.len()),
-            fetched_chunks = missing_descriptors.len(),
+            cache_hits,
+            fetched_chunks,
+            fetched_bytes,
+            slowest_chunk_elapsed_ms = fetch_metrics.slowest_chunk_elapsed_ms,
+            byte_budget_waits = fetch_metrics.byte_budget_waits,
             "wallet-scan artifact chunks resolved through public cache"
         );
         let mut indexed_chunks: Vec<_> = indexed_chunks
@@ -704,7 +822,63 @@ impl IndexedWalletArtifactSession {
         Ok(IndexedWalletArtifactChunkFetchResult {
             chunks: indexed_chunks,
             fetch_verify_elapsed_ms,
+            cache_hits,
+            fetched_chunks,
+            fetched_bytes,
+            slowest_chunk_elapsed_ms: fetch_metrics.slowest_chunk_elapsed_ms,
+            byte_budget_waits: fetch_metrics.byte_budget_waits,
+            max_observed_in_flight_chunks: fetch_metrics.max_observed_in_flight_chunks,
+            max_observed_in_flight_bytes: fetch_metrics.max_observed_in_flight_bytes,
         })
+    }
+
+    fn schedule_verified_chunk_maintenance(
+        chunk: VerifiedIndexedArtifactChunk,
+        public_data_plane: &ChainPublicDataPlane,
+        read_scope: PublicScanReadScope,
+    ) {
+        if public_data_plane
+            .cached_wallet_scan_artifact_chunk(&chunk.descriptor)
+            .is_some()
+        {
+            return;
+        }
+        let cache_generation = public_data_plane.wallet_scan_artifact_cache_generation();
+        let key = IndexedArtifactMaintenanceKey::wallet_chunk(
+            &chunk.descriptor,
+            read_scope.epoch().value,
+        );
+        let retained_payload_bytes = chunk.bytes.len() as u64;
+        let descriptor = chunk.descriptor.clone();
+        let cid = descriptor.cid.clone();
+        let maintenance_plane = (*public_data_plane).clone();
+        let admission = public_data_plane.schedule_indexed_artifact_maintenance(
+            key,
+            retained_payload_bytes,
+            async move {
+                if maintenance_plane
+                    .cached_wallet_scan_artifact_chunk(&descriptor)
+                    .is_some()
+                {
+                    return;
+                }
+                let retained = maintenance_plane
+                    .retain_wallet_scan_artifact_chunks_for_generation(
+                        std::slice::from_ref(&chunk),
+                        read_scope,
+                        cache_generation,
+                    )
+                    .await;
+                debug!(retained, "retained stable wallet-scan artifact chunk");
+            },
+        );
+        if admission != IndexedArtifactMaintenanceAdmission::Admitted {
+            debug!(
+                ?admission,
+                cid = %cid,
+                "stable wallet-scan artifact maintenance was not admitted"
+            );
+        }
     }
 
     fn schedule_chunk_maintenance(
@@ -713,54 +887,42 @@ impl IndexedWalletArtifactSession {
         public_data_plane: &ChainPublicDataPlane,
         read_scope: PublicScanReadScope,
     ) {
-        let stable_current_chunks = current_chunks
-            .iter()
-            .filter(|chunk| {
-                required_entries.iter().any(|entry| {
-                    entry.is_stable_current() && entry.descriptor == chunk.chunk.descriptor
-                }) && public_data_plane
-                    .cached_wallet_scan_artifact_chunk(&chunk.chunk.descriptor)
-                    .is_none()
-            })
-            .map(|chunk| chunk.chunk.clone())
-            .collect::<Vec<_>>();
-        for chunk in stable_current_chunks {
-            let key = IndexedArtifactMaintenanceKey::wallet_chunk(
-                &chunk.descriptor,
-                read_scope.epoch().value,
-            );
-            let retained_payload_bytes = chunk.bytes.len() as u64;
-            let descriptor = chunk.descriptor.clone();
-            let cid = descriptor.cid.clone();
-            let maintenance_plane = (*public_data_plane).clone();
-            let admission = public_data_plane.schedule_indexed_artifact_maintenance(
-                key,
-                retained_payload_bytes,
-                async move {
-                    if maintenance_plane
-                        .cached_wallet_scan_artifact_chunk(&descriptor)
-                        .is_some()
-                    {
-                        return;
-                    }
-                    let retained = maintenance_plane
-                        .retain_wallet_scan_artifact_chunks(
-                            std::slice::from_ref(&chunk),
-                            read_scope,
-                        )
-                        .await;
-                    debug!(retained, "retained stable wallet-scan artifact chunk");
-                },
-            );
-            if admission != IndexedArtifactMaintenanceAdmission::Admitted {
-                debug!(
-                    ?admission,
-                    cid = %cid,
-                    "stable wallet-scan artifact maintenance was not admitted"
+        for chunk in current_chunks {
+            if wallet_artifact_cache_class(required_entries, &chunk.chunk.descriptor)
+                == Some(WalletArtifactCacheClass::Stable)
+            {
+                Self::schedule_verified_chunk_maintenance(
+                    chunk.chunk.clone(),
+                    public_data_plane,
+                    read_scope,
                 );
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletArtifactCacheClass {
+    Stable,
+    Transient,
+}
+
+fn wallet_artifact_cache_class(
+    required_entries: &[IndexedArtifactPlannedChunk],
+    descriptor: &IndexedArtifactDescriptor,
+) -> Option<WalletArtifactCacheClass> {
+    required_entries
+        .iter()
+        .find(|entry| entry.descriptor == *descriptor)
+        .and_then(|entry| match entry.placement {
+            IndexedArtifactPlannedChunkPlacement::CurrentStable => {
+                Some(WalletArtifactCacheClass::Stable)
+            }
+            IndexedArtifactPlannedChunkPlacement::CurrentTransient => {
+                Some(WalletArtifactCacheClass::Transient)
+            }
+            IndexedArtifactPlannedChunkPlacement::OptionalPriorTail => None,
+        })
 }
 
 struct IndexedWalletArtifactChunk {
@@ -772,6 +934,51 @@ struct IndexedWalletArtifactChunk {
 struct IndexedWalletArtifactChunkFetchResult {
     chunks: Vec<IndexedWalletArtifactChunk>,
     fetch_verify_elapsed_ms: u128,
+    cache_hits: usize,
+    fetched_chunks: usize,
+    fetched_bytes: u64,
+    slowest_chunk_elapsed_ms: u128,
+    byte_budget_waits: u64,
+    max_observed_in_flight_chunks: usize,
+    max_observed_in_flight_bytes: u64,
+}
+
+fn send_wallet_artifact_preparation_progress(
+    progress_tx: Option<&SyncProgressSender>,
+    current_progress: u64,
+) {
+    send_sync_progress(
+        progress_tx,
+        SyncProgressUpdate::artifact_preparation(
+            SyncProgressStage::PreparingUtxoIndex,
+            current_progress,
+            WALLET_ARTIFACT_PROGRESS_TOTAL,
+        )
+        .with_source(PublicScanSource::IndexedArtifacts),
+    );
+}
+
+fn send_wallet_artifact_chunk_progress(
+    progress_tx: Option<&SyncProgressSender>,
+    completed_chunks: usize,
+    total_chunks: usize,
+) {
+    send_sync_progress(
+        progress_tx,
+        SyncProgressUpdate::artifact_chunk(
+            SyncProgressStage::PreparingUtxoIndex,
+            artifact_chunk_progress(
+                completed_chunks,
+                total_chunks,
+                WALLET_ARTIFACT_DESCRIPTORS_DONE_PROGRESS,
+                WALLET_ARTIFACT_CHUNKS_DONE_PROGRESS,
+            ),
+            WALLET_ARTIFACT_PROGRESS_TOTAL,
+            u64::try_from(completed_chunks).unwrap_or(u64::MAX),
+            u64::try_from(total_chunks).unwrap_or(u64::MAX),
+        )
+        .with_source(PublicScanSource::IndexedArtifacts),
+    );
 }
 
 struct IndexedWalletArtifactDescriptorFetchResult {

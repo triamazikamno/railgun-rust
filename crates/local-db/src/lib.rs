@@ -10,8 +10,8 @@ use alloy::hex;
 use alloy::primitives::{Address, FixedBytes, U256};
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, railgun_txid_leaf_hash};
 use redb::{
-    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table, TableDefinition,
-    TableHandle, WriteTransaction,
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table,
+    TableDefinition, TableHandle, WriteTransaction,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -36,6 +36,10 @@ const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
 const PENDING_OUTPUT_POI_CONTEXT_TABLE: ByteTableDefinition =
     TableDefinition::new("pending_output_poi_context");
 const OUTPUT_POI_RECOVERY_TABLE: ByteTableDefinition = TableDefinition::new("output_poi_recovery");
+const PENDING_OUTPUT_POI_CONTEXT_V2_TABLE: ByteTableDefinition =
+    TableDefinition::new("pending_output_poi_context_v2");
+const OUTPUT_POI_RECOVERY_V2_TABLE: ByteTableDefinition =
+    TableDefinition::new("output_poi_recovery_v2");
 const POI_ARTIFACT_CACHE_TABLE: ByteTableDefinition = TableDefinition::new("poi_artifact_cache");
 const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
 const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
@@ -58,8 +62,10 @@ pub enum LocalDbTable {
     WalletSyncActorState,
     PendingFeeNoteAssurance,
     TerminalFeeNoteAssurance,
-    PendingOutputPoiContext,
-    OutputPoiRecovery,
+    PendingOutputPoiContextV1,
+    OutputPoiRecoveryV1,
+    PendingOutputPoiContextV2,
+    OutputPoiRecoveryV2,
     PoiArtifactCache,
     AppSettings,
     DesktopWalletVault,
@@ -76,8 +82,9 @@ pub enum LocalDbTableDecodeKind {
     WalletSyncActorState,
     PendingFeeNoteAssurance,
     TerminalFeeNoteAssurance,
-    PendingOutputPoiContext,
-    OutputPoiRecovery,
+    PendingOutputPoiContextV1,
+    OutputPoiRecoveryV1,
+    OpaqueBytes,
     PoiArtifactCache,
     AppSettings,
     DesktopWalletVault,
@@ -137,14 +144,24 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::TerminalFeeNoteAssurance,
     },
     LocalDbTableInfo {
-        table: LocalDbTable::PendingOutputPoiContext,
+        table: LocalDbTable::PendingOutputPoiContextV1,
         name: "pending_output_poi_context",
-        decode_kind: LocalDbTableDecodeKind::PendingOutputPoiContext,
+        decode_kind: LocalDbTableDecodeKind::PendingOutputPoiContextV1,
     },
     LocalDbTableInfo {
-        table: LocalDbTable::OutputPoiRecovery,
+        table: LocalDbTable::OutputPoiRecoveryV1,
         name: "output_poi_recovery",
-        decode_kind: LocalDbTableDecodeKind::OutputPoiRecovery,
+        decode_kind: LocalDbTableDecodeKind::OutputPoiRecoveryV1,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::PendingOutputPoiContextV2,
+        name: "pending_output_poi_context_v2",
+        decode_kind: LocalDbTableDecodeKind::OpaqueBytes,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::OutputPoiRecoveryV2,
+        name: "output_poi_recovery_v2",
+        decode_kind: LocalDbTableDecodeKind::OpaqueBytes,
     },
     LocalDbTableInfo {
         table: LocalDbTable::PoiArtifactCache,
@@ -176,8 +193,10 @@ impl LocalDbTable {
             Self::WalletSyncActorState => WALLET_SYNC_ACTOR_STATE_TABLE,
             Self::PendingFeeNoteAssurance => PENDING_FEE_NOTE_ASSURANCE_TABLE,
             Self::TerminalFeeNoteAssurance => TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
-            Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
-            Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_TABLE,
+            Self::PendingOutputPoiContextV1 => PENDING_OUTPUT_POI_CONTEXT_TABLE,
+            Self::OutputPoiRecoveryV1 => OUTPUT_POI_RECOVERY_TABLE,
+            Self::PendingOutputPoiContextV2 => PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
+            Self::OutputPoiRecoveryV2 => OUTPUT_POI_RECOVERY_V2_TABLE,
             Self::PoiArtifactCache => POI_ARTIFACT_CACHE_TABLE,
             Self::AppSettings => APP_SETTINGS_TABLE,
             Self::DesktopWalletVault => DESKTOP_WALLET_VAULT_TABLE,
@@ -196,6 +215,7 @@ impl LocalDbTableInfo {
 }
 
 const META_KEY: &str = "meta";
+const WALLET_PRIVATE_COMPACTION_REQUESTED_KEY: &str = "wallet_private_compaction_requested_v1";
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
@@ -345,6 +365,8 @@ pub enum DbError {
     Storage(#[from] redb::StorageError),
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
+    #[error("compaction error: {0}")]
+    Compaction(#[from] redb::CompactionError),
     #[error("encode error: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("decode error: {0}")]
@@ -366,6 +388,16 @@ pub enum DbError {
     InvalidSchemaSevenPendingOutputPoiContext { key: String },
     #[error("schema migration destination already exists in {table}: {key}")]
     SchemaMigrationDestinationConflict { table: &'static str, key: String },
+    #[error("opaque wallet-private row id must not be empty")]
+    EmptyOpaqueWalletPrivateRowId,
+    #[error("invalid opaque wallet-private row key {key}")]
+    InvalidOpaqueWalletPrivateRowKey { key: String },
+    #[error("wallet-private v1 migration source changed in {table}: {key}")]
+    WalletPrivateV1MigrationSourceChanged { table: &'static str, key: String },
+    #[error("wallet-private v1 migration must replace every source row for {kind}")]
+    WalletPrivateV1MigrationRowCountMismatch { kind: &'static str },
+    #[error("wallet-private {kind} row identity does not match key {key}")]
+    WalletPrivateRecordIdentityMismatch { kind: &'static str, key: String },
     #[error("invalid {kind} PPOI sidecar record {key}")]
     InvalidPpoiSidecarRecord { kind: &'static str, key: String },
     #[error("invalid PPOI corpus record {key}")]
@@ -396,6 +428,8 @@ pub struct BlobMeta {
     pub content_hash: [u8; 32],
     #[serde(default)]
     pub source_hash: Option<[u8; 32]>,
+    #[serde(default)]
+    pub source_sequence: Option<u64>,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default)]
@@ -450,6 +484,87 @@ impl WalletPrivateNamespaceId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletPrivateRecordKind {
+    PendingOutputPoiContext,
+    OutputPoiRecovery,
+}
+
+impl WalletPrivateRecordKind {
+    const fn v1_table(self) -> ByteTableDefinition {
+        match self {
+            Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
+            Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_TABLE,
+        }
+    }
+
+    const fn v2_table(self) -> ByteTableDefinition {
+        match self {
+            Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
+            Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_V2_TABLE,
+        }
+    }
+
+    const fn v1_table_name(self) -> &'static str {
+        match self {
+            Self::PendingOutputPoiContext => "pending_output_poi_context",
+            Self::OutputPoiRecovery => "output_poi_recovery",
+        }
+    }
+
+    const fn v2_table_name(self) -> &'static str {
+        match self {
+            Self::PendingOutputPoiContext => "pending_output_poi_context_v2",
+            Self::OutputPoiRecovery => "output_poi_recovery_v2",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PendingOutputPoiContext => "pending output POI context",
+            Self::OutputPoiRecovery => "output POI recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueWalletPrivateRow {
+    pub row_id: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpaqueWalletPrivateRowMutation<'a> {
+    pub updates: &'a [OpaqueWalletPrivateRow],
+    pub deletes: &'a [Vec<u8>],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletPrivateV1Row {
+    pub storage_key: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalletPrivateV1Rows {
+    pub pending_output_contexts: Vec<WalletPrivateV1Row>,
+    pub output_poi_recoveries: Vec<WalletPrivateV1Row>,
+}
+
+pub struct WalletPrivateV1MigrationBatch<'a> {
+    pub namespace: &'a WalletPrivateNamespaceId,
+    pub pending_output_context_sources: &'a [WalletPrivateV1Row],
+    pub output_poi_recovery_sources: &'a [WalletPrivateV1Row],
+    pub pending_output_context_destinations: &'a [OpaqueWalletPrivateRow],
+    pub output_poi_recovery_destinations: &'a [OpaqueWalletPrivateRow],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletPrivateV1MigrationReport {
+    pub pending_output_context_rows: u64,
+    pub output_poi_recovery_rows: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalletPrivateNamespaceDeletionReport {
     pub wallet_utxo_rows: u64,
@@ -457,6 +572,36 @@ pub struct WalletPrivateNamespaceDeletionReport {
     pub wallet_sync_actor_state_rows: u64,
     pub pending_output_poi_context_rows: u64,
     pub output_poi_recovery_rows: u64,
+}
+
+impl WalletPrivateNamespaceDeletionReport {
+    const fn add_assign_saturating(&mut self, other: Self) {
+        self.wallet_utxo_rows = self.wallet_utxo_rows.saturating_add(other.wallet_utxo_rows);
+        self.wallet_meta_rows = self.wallet_meta_rows.saturating_add(other.wallet_meta_rows);
+        self.wallet_sync_actor_state_rows = self
+            .wallet_sync_actor_state_rows
+            .saturating_add(other.wallet_sync_actor_state_rows);
+        self.pending_output_poi_context_rows = self
+            .pending_output_poi_context_rows
+            .saturating_add(other.pending_output_poi_context_rows);
+        self.output_poi_recovery_rows = self
+            .output_poi_recovery_rows
+            .saturating_add(other.output_poi_recovery_rows);
+    }
+}
+
+/// Typed inputs for permanently deleting a wallet's private and vault state.
+pub struct WalletDeletionBatch<'a> {
+    pub private_namespaces: &'a [WalletPrivateNamespaceId],
+    pub desktop_wallet_vault_delete_keys: &'a [String],
+    pub desktop_wallet_vault_put_records: &'a [(String, Vec<u8>)],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletDeletionReport {
+    pub private_namespace_rows: WalletPrivateNamespaceDeletionReport,
+    pub desktop_wallet_vault_rows_deleted: u64,
+    pub desktop_wallet_vault_rows_put: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1014,9 +1159,8 @@ pub struct WalletPrivateStateBatch<'a> {
     pub utxos: WalletUtxoRowMutation<'a>,
     pub metadata: WalletMetaMutation<'a>,
     pub sync_actor_state: Option<&'a WalletSyncActorStateRecord>,
-    pub pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
-    pub pending_output_context_deletes: &'a [FixedBytes<32>],
-    pub output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+    pub pending_output_contexts: OpaqueWalletPrivateRowMutation<'a>,
+    pub output_poi_recoveries: OpaqueWalletPrivateRowMutation<'a>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1054,7 +1198,7 @@ impl DbStore {
                 store.initialize_schema()?;
                 let meta = Meta::new()?;
                 store.write_meta(&meta)?;
-                return Ok(store);
+                return store.finish_open();
             }
 
             match store.read_meta()? {
@@ -1062,7 +1206,7 @@ impl DbStore {
                     store.initialize_schema()?;
                     let meta = Meta::new()?;
                     store.write_meta(&meta)?;
-                    return Ok(store);
+                    return store.finish_open();
                 }
                 Some(meta) if meta.schema_version > CURRENT_SCHEMA_VERSION => {
                     drop(store);
@@ -1077,11 +1221,11 @@ impl DbStore {
                         }
                         return Err(err);
                     }
-                    return Ok(store);
+                    return store.finish_open();
                 }
                 Some(_) => {
                     store.initialize_schema()?;
-                    return Ok(store);
+                    return store.finish_open();
                 }
             }
         }
@@ -1105,6 +1249,27 @@ impl DbStore {
     #[must_use]
     pub fn blob_dir(&self) -> PathBuf {
         blobs_dir(&self.root_dir)
+    }
+
+    fn finish_open(mut self) -> Result<Self, DbError> {
+        if self.wallet_private_compaction_requested()? {
+            while self.db.compact()? {}
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(META_TABLE)?;
+                table.remove(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY)?;
+            }
+            txn.commit()?;
+        }
+        Ok(self)
+    }
+
+    fn wallet_private_compaction_requested(&self) -> Result<bool, DbError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(META_TABLE)?;
+        Ok(table
+            .get(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY)?
+            .is_some())
     }
 
     pub fn ensure_blob_dir(&self, kind: &str) -> Result<PathBuf, DbError> {
@@ -1337,6 +1502,44 @@ impl DbStore {
         &self,
         batch: &WalletPrivateStateBatch<'_>,
     ) -> Result<(), DbError> {
+        self.batch_commit_wallet_private_state_with_vault_records(batch, &[])
+    }
+
+    pub fn batch_commit_wallet_private_state_with_vault_records(
+        &self,
+        batch: &WalletPrivateStateBatch<'_>,
+        vault_records: &[DesktopWalletVaultRecord],
+    ) -> Result<(), DbError> {
+        self.batch_commit_wallet_private_state_with_vault_records_transaction(
+            batch,
+            vault_records,
+            || Ok(()),
+        )
+    }
+
+    fn batch_commit_wallet_private_state_with_vault_records_transaction(
+        &self,
+        batch: &WalletPrivateStateBatch<'_>,
+        vault_records: &[DesktopWalletVaultRecord],
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        Self::validate_wallet_private_state_batch(batch)?;
+        let txn = self.db.begin_write()?;
+        Self::write_wallet_private_state_batch(&txn, batch)?;
+        if !vault_records.is_empty() {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            for record in vault_records {
+                table.insert(record.key.as_str(), record.payload.as_slice())?;
+            }
+        }
+        before_commit()?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn validate_wallet_private_state_batch(
+        batch: &WalletPrivateStateBatch<'_>,
+    ) -> Result<(), DbError> {
         let wallet_id = &batch.namespace.wallet_id;
         let chain_id = batch.namespace.chain_id;
         if let Some(state) = batch.sync_actor_state
@@ -1349,80 +1552,72 @@ impl DbStore {
                 actual_wallet_id: state.wallet_id.clone(),
             });
         }
-        for record in batch.pending_output_context_updates {
-            if record.chain_id != chain_id || record.wallet_id != wallet_id.as_str() {
-                return Err(DbError::InvalidWalletPrivateCommitNamespace {
-                    expected_chain_id: chain_id,
-                    expected_wallet_id: wallet_id.to_string(),
-                    actual_chain_id: record.chain_id,
-                    actual_wallet_id: record.wallet_id.clone(),
-                });
-            }
-        }
-        for record in batch.output_poi_recovery_updates {
-            if record.chain_id != chain_id || record.wallet_id != wallet_id.as_str() {
-                return Err(DbError::InvalidWalletPrivateCommitNamespace {
-                    expected_chain_id: chain_id,
-                    expected_wallet_id: wallet_id.to_string(),
-                    actual_chain_id: record.chain_id,
-                    actual_wallet_id: record.wallet_id.clone(),
-                });
-            }
-        }
+        validate_opaque_row_mutation(&batch.pending_output_contexts)?;
+        validate_opaque_row_mutation(&batch.output_poi_recoveries)?;
+        Ok(())
+    }
+
+    fn write_wallet_private_state_batch(
+        txn: &WriteTransaction,
+        batch: &WalletPrivateStateBatch<'_>,
+    ) -> Result<(), DbError> {
+        let wallet_id = &batch.namespace.wallet_id;
         let prefix = wallet_utxo_prefix(wallet_id);
-        let txn = self.db.begin_write()?;
-        {
-            if let WalletUtxoRowMutation::Replace(utxos) = batch.utxos {
-                let mut utxo_table = txn.open_table(WALLET_UTXO_TABLE)?;
-                remove_table_prefix(&mut utxo_table, &prefix)?;
-                for (utxo_id, payload) in utxos {
-                    let key = wallet_utxo_key(wallet_id, utxo_id);
-                    utxo_table.insert(key.as_str(), payload.as_slice())?;
-                }
-            }
-
-            if let WalletMetaMutation::Set(meta) = batch.metadata {
-                let data = encode(meta)?;
-                let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
-                meta_table.insert(wallet_id.as_str(), data.as_slice())?;
-            }
-
-            if let Some(state) = batch.sync_actor_state {
-                let key = state.key();
-                let data = encode(state)?;
-                let mut state_table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
-                state_table.insert(key.as_str(), data.as_slice())?;
-            }
-
-            if !batch.pending_output_context_updates.is_empty()
-                || !batch.pending_output_context_deletes.is_empty()
-            {
-                let mut pending_table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-                for record in batch.pending_output_context_updates {
-                    let key = record.key();
-                    let data = encode(record)?;
-                    pending_table.insert(key.as_str(), data.as_slice())?;
-                }
-                for output_commitment in batch.pending_output_context_deletes {
-                    let key = PendingOutputPoiContextRecord::key_for(
-                        chain_id,
-                        wallet_id.as_str(),
-                        output_commitment,
-                    );
-                    pending_table.remove(key.as_str())?;
-                }
-            }
-
-            if !batch.output_poi_recovery_updates.is_empty() {
-                let mut recovery_table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
-                for record in batch.output_poi_recovery_updates {
-                    let key = record.key();
-                    let data = encode(record)?;
-                    recovery_table.insert(key.as_str(), data.as_slice())?;
-                }
+        if let WalletUtxoRowMutation::Replace(utxos) = batch.utxos {
+            let mut utxo_table = txn.open_table(WALLET_UTXO_TABLE)?;
+            remove_table_prefix(&mut utxo_table, &prefix)?;
+            for (utxo_id, payload) in utxos {
+                let key = wallet_utxo_key(wallet_id, utxo_id);
+                utxo_table.insert(key.as_str(), payload.as_slice())?;
             }
         }
-        txn.commit()?;
+
+        if let WalletMetaMutation::Set(meta) = batch.metadata {
+            let data = encode(meta)?;
+            let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
+            meta_table.insert(wallet_id.as_str(), data.as_slice())?;
+        }
+
+        if let Some(state) = batch.sync_actor_state {
+            let key = state.key();
+            let data = encode(state)?;
+            let mut state_table = txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
+            state_table.insert(key.as_str(), data.as_slice())?;
+        }
+
+        Self::write_opaque_wallet_private_rows(
+            txn,
+            batch.namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            batch.pending_output_contexts,
+        )?;
+        Self::write_opaque_wallet_private_rows(
+            txn,
+            batch.namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            batch.output_poi_recoveries,
+        )?;
+        Ok(())
+    }
+
+    fn write_opaque_wallet_private_rows(
+        txn: &WriteTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        mutation: OpaqueWalletPrivateRowMutation<'_>,
+    ) -> Result<(), DbError> {
+        if mutation.updates.is_empty() && mutation.deletes.is_empty() {
+            return Ok(());
+        }
+        let mut table = txn.open_table(kind.v2_table())?;
+        for row in mutation.updates {
+            let key = opaque_wallet_private_row_key(namespace, &row.row_id)?;
+            table.insert(key.as_str(), row.payload.as_slice())?;
+        }
+        for row_id in mutation.deletes {
+            let key = opaque_wallet_private_row_key(namespace, row_id)?;
+            table.remove(key.as_str())?;
+        }
         Ok(())
     }
 
@@ -1438,6 +1633,17 @@ impl DbStore {
         identity: &WalletPrivateNamespaceId,
         before_commit: impl FnOnce() -> Result<(), DbError>,
     ) -> Result<WalletPrivateNamespaceDeletionReport, DbError> {
+        let txn = self.db.begin_write()?;
+        let report = Self::delete_wallet_private_namespace_in_transaction(&txn, identity)?;
+        before_commit()?;
+        txn.commit()?;
+        Ok(report)
+    }
+
+    fn delete_wallet_private_namespace_in_transaction(
+        txn: &WriteTransaction,
+        identity: &WalletPrivateNamespaceId,
+    ) -> Result<WalletPrivateNamespaceDeletionReport, DbError> {
         let wallet_utxo_prefix = wallet_utxo_prefix(&identity.wallet_id);
         let wallet_sync_actor_state_key =
             WalletSyncActorStateRecord::key_for(identity.chain_id, identity.wallet_id.as_str());
@@ -1450,8 +1656,8 @@ impl DbStore {
             identity.chain_id,
             identity.wallet_id.as_str(),
         );
-        let txn = self.db.begin_write()?;
-        let report = {
+        let opaque_prefix = opaque_wallet_private_row_prefix(identity);
+        Ok({
             let wallet_utxo_rows = {
                 let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
                 remove_table_prefix(&mut table, &wallet_utxo_prefix)?
@@ -1470,7 +1676,7 @@ impl DbStore {
             };
             let pending_output_poi_context_rows = {
                 let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-                remove_table_prefix_matching(
+                let v1_rows = remove_table_prefix_matching(
                     &mut table,
                     &pending_output_poi_context_prefix,
                     |key| {
@@ -1478,14 +1684,20 @@ impl DbStore {
                             namespace == chain_wallet_namespace.as_str()
                         })
                     },
-                )?
+                )?;
+                let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE)?;
+                v1_rows.saturating_add(remove_table_prefix(&mut table, &opaque_prefix)?)
             };
             let output_poi_recovery_rows = {
                 let mut table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
-                remove_table_prefix_matching(&mut table, &output_poi_recovery_prefix, |key| {
-                    key.rsplit_once('|')
-                        .is_some_and(|(namespace, _)| namespace == chain_wallet_namespace.as_str())
-                })?
+                let v1_rows =
+                    remove_table_prefix_matching(&mut table, &output_poi_recovery_prefix, |key| {
+                        key.rsplit_once('|').is_some_and(|(namespace, _)| {
+                            namespace == chain_wallet_namespace.as_str()
+                        })
+                    })?;
+                let mut table = txn.open_table(OUTPUT_POI_RECOVERY_V2_TABLE)?;
+                v1_rows.saturating_add(remove_table_prefix(&mut table, &opaque_prefix)?)
             };
             WalletPrivateNamespaceDeletionReport {
                 wallet_utxo_rows,
@@ -1494,7 +1706,45 @@ impl DbStore {
                 pending_output_poi_context_rows,
                 output_poi_recovery_rows,
             }
-        };
+        })
+    }
+
+    /// Applies all namespace and desktop-vault mutations in one write transaction.
+    pub fn delete_wallet(
+        &self,
+        batch: &WalletDeletionBatch<'_>,
+    ) -> Result<WalletDeletionReport, DbError> {
+        self.delete_wallet_transaction(batch, || Ok(()))
+    }
+
+    fn delete_wallet_transaction(
+        &self,
+        batch: &WalletDeletionBatch<'_>,
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<WalletDeletionReport, DbError> {
+        let txn = self.db.begin_write()?;
+        let mut report = WalletDeletionReport::default();
+        for identity in batch.private_namespaces {
+            let namespace_report =
+                Self::delete_wallet_private_namespace_in_transaction(&txn, identity)?;
+            report
+                .private_namespace_rows
+                .add_assign_saturating(namespace_report);
+        }
+        {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            for key in batch.desktop_wallet_vault_delete_keys {
+                if table.remove(key.as_str())?.is_some() {
+                    report.desktop_wallet_vault_rows_deleted =
+                        report.desktop_wallet_vault_rows_deleted.saturating_add(1);
+                }
+            }
+            for (key, payload) in batch.desktop_wallet_vault_put_records {
+                table.insert(key.as_str(), payload.as_slice())?;
+                report.desktop_wallet_vault_rows_put =
+                    report.desktop_wallet_vault_rows_put.saturating_add(1);
+            }
+        }
         before_commit()?;
         txn.commit()?;
         Ok(report)
@@ -1944,35 +2194,439 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn get_opaque_wallet_private_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        row_id: &[u8],
+    ) -> Result<Option<OpaqueWalletPrivateRow>, DbError> {
+        let txn = self.db.begin_read()?;
+        Self::get_opaque_wallet_private_row_in_transaction(&txn, namespace, kind, row_id)
+    }
+
+    fn get_opaque_wallet_private_row_in_transaction(
+        txn: &ReadTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        row_id: &[u8],
+    ) -> Result<Option<OpaqueWalletPrivateRow>, DbError> {
+        let key = opaque_wallet_private_row_key(namespace, row_id)?;
+        let table = txn.open_table(kind.v2_table())?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(OpaqueWalletPrivateRow {
+                row_id: row_id.to_vec(),
+                payload: value.value().to_vec(),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_opaque_wallet_private_rows(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+    ) -> Result<Vec<OpaqueWalletPrivateRow>, DbError> {
+        let txn = self.db.begin_read()?;
+        Self::list_opaque_wallet_private_rows_in_transaction(&txn, namespace, kind)
+    }
+
+    fn list_opaque_wallet_private_rows_in_transaction(
+        txn: &ReadTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+    ) -> Result<Vec<OpaqueWalletPrivateRow>, DbError> {
+        let prefix = opaque_wallet_private_row_prefix(namespace);
+        let range_end = prefix_range_end(&prefix);
+        let table = txn.open_table(kind.v2_table())?;
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix.as_str()..range_end)?,
+            None => table.range(prefix.as_str()..)?,
+        };
+        let mut rows = Vec::new();
+        for entry in entries {
+            let (key, value) = entry?;
+            rows.push(OpaqueWalletPrivateRow {
+                row_id: opaque_wallet_private_row_id(&prefix, key.value())?,
+                payload: value.value().to_vec(),
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn put_opaque_wallet_private_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        row: &OpaqueWalletPrivateRow,
+    ) -> Result<(), DbError> {
+        validate_opaque_row(row)?;
+        let txn = self.db.begin_write()?;
+        Self::write_opaque_wallet_private_rows(
+            &txn,
+            namespace,
+            kind,
+            OpaqueWalletPrivateRowMutation {
+                updates: std::slice::from_ref(row),
+                deletes: &[],
+            },
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_opaque_wallet_private_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        row_id: &[u8],
+    ) -> Result<(), DbError> {
+        let key = opaque_wallet_private_row_key(namespace, row_id)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(kind.v2_table())?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn put_typed_wallet_private_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        v1_key: &str,
+        row: &OpaqueWalletPrivateRow,
+    ) -> Result<(), DbError> {
+        self.put_typed_wallet_private_row_transaction(namespace, kind, v1_key, row, || Ok(()))
+    }
+
+    fn put_typed_wallet_private_row_transaction<F>(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        v1_key: &str,
+        row: &OpaqueWalletPrivateRow,
+        before_commit: F,
+    ) -> Result<(), DbError>
+    where
+        F: FnOnce() -> Result<(), DbError>,
+    {
+        validate_opaque_row(row)?;
+        let v2_key = opaque_wallet_private_row_key(namespace, &row.row_id)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(kind.v2_table())?;
+            table.insert(v2_key.as_str(), row.payload.as_slice())?;
+        }
+        let removed_v1 = {
+            let mut table = txn.open_table(kind.v1_table())?;
+            table.remove(v1_key)?.is_some()
+        };
+        if removed_v1 {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY, &[1_u8][..])?;
+        }
+        before_commit()?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn delete_typed_wallet_private_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        v1_key: &str,
+        row_id: &[u8],
+    ) -> Result<(), DbError> {
+        self.delete_typed_wallet_private_row_transaction(namespace, kind, v1_key, row_id, || Ok(()))
+    }
+
+    fn delete_typed_wallet_private_row_transaction<F>(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        v1_key: &str,
+        row_id: &[u8],
+        before_commit: F,
+    ) -> Result<(), DbError>
+    where
+        F: FnOnce() -> Result<(), DbError>,
+    {
+        let v2_key = opaque_wallet_private_row_key(namespace, row_id)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(kind.v2_table())?;
+            table.remove(v2_key.as_str())?;
+        }
+        let removed_v1 = {
+            let mut table = txn.open_table(kind.v1_table())?;
+            table.remove(v1_key)?.is_some()
+        };
+        if removed_v1 {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY, &[1_u8][..])?;
+        }
+        before_commit()?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn get_wallet_private_v1_payload_in_transaction(
+        txn: &ReadTransaction,
+        kind: WalletPrivateRecordKind,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let table = txn.open_table(kind.v1_table())?;
+        Ok(table.get(key)?.map(|value| value.value().to_vec()))
+    }
+
+    pub fn list_wallet_private_v1_rows(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+    ) -> Result<WalletPrivateV1Rows, DbError> {
+        let txn = self.db.begin_read()?;
+        Ok(WalletPrivateV1Rows {
+            pending_output_contexts: Self::list_wallet_private_v1_rows_for_kind_in_transaction(
+                &txn,
+                namespace,
+                WalletPrivateRecordKind::PendingOutputPoiContext,
+            )?,
+            output_poi_recoveries: Self::list_wallet_private_v1_rows_for_kind_in_transaction(
+                &txn,
+                namespace,
+                WalletPrivateRecordKind::OutputPoiRecovery,
+            )?,
+        })
+    }
+
+    fn list_wallet_private_v1_rows_for_kind_in_transaction(
+        txn: &ReadTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+    ) -> Result<Vec<WalletPrivateV1Row>, DbError> {
+        let prefix = legacy_wallet_private_row_prefix(namespace);
+        let range_end = prefix_range_end(&prefix);
+        let table = txn.open_table(kind.v1_table())?;
+        let entries = match range_end.as_deref() {
+            Some(range_end) => table.range(prefix.as_str()..range_end)?,
+            None => table.range(prefix.as_str()..)?,
+        };
+        let mut rows = Vec::new();
+        for entry in entries {
+            let (key, value) = entry?;
+            let row = WalletPrivateV1Row {
+                storage_key: key.value().to_owned(),
+                payload: value.value().to_vec(),
+            };
+            validate_wallet_private_v1_row(namespace, kind, &row)?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    pub fn migrate_wallet_private_v1_rows(
+        &self,
+        batch: &WalletPrivateV1MigrationBatch<'_>,
+    ) -> Result<WalletPrivateV1MigrationReport, DbError> {
+        self.migrate_wallet_private_v1_rows_transaction(batch, || Ok(()))
+    }
+
+    fn migrate_wallet_private_v1_rows_transaction(
+        &self,
+        batch: &WalletPrivateV1MigrationBatch<'_>,
+        before_commit: impl FnOnce() -> Result<(), DbError>,
+    ) -> Result<WalletPrivateV1MigrationReport, DbError> {
+        if batch.pending_output_context_sources.len()
+            != batch.pending_output_context_destinations.len()
+        {
+            return Err(DbError::WalletPrivateV1MigrationRowCountMismatch {
+                kind: "pending output POI context",
+            });
+        }
+        if batch.output_poi_recovery_sources.len() != batch.output_poi_recovery_destinations.len() {
+            return Err(DbError::WalletPrivateV1MigrationRowCountMismatch {
+                kind: "output POI recovery",
+            });
+        }
+        for row in batch.pending_output_context_destinations {
+            validate_opaque_row(row)?;
+        }
+        for row in batch.output_poi_recovery_destinations {
+            validate_opaque_row(row)?;
+        }
+
+        let txn = self.db.begin_write()?;
+        Self::migrate_wallet_private_v1_kind(
+            &txn,
+            batch.namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            batch.pending_output_context_sources,
+            batch.pending_output_context_destinations,
+        )?;
+        Self::migrate_wallet_private_v1_kind(
+            &txn,
+            batch.namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            batch.output_poi_recovery_sources,
+            batch.output_poi_recovery_destinations,
+        )?;
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY, &[1_u8][..])?;
+        }
+        before_commit()?;
+        txn.commit()?;
+        Ok(WalletPrivateV1MigrationReport {
+            pending_output_context_rows: batch.pending_output_context_sources.len() as u64,
+            output_poi_recovery_rows: batch.output_poi_recovery_sources.len() as u64,
+        })
+    }
+
+    fn migrate_wallet_private_v1_kind(
+        txn: &WriteTransaction,
+        namespace: &WalletPrivateNamespaceId,
+        kind: WalletPrivateRecordKind,
+        sources: &[WalletPrivateV1Row],
+        destinations: &[OpaqueWalletPrivateRow],
+    ) -> Result<(), DbError> {
+        for source in sources {
+            validate_wallet_private_v1_row(namespace, kind, source)?;
+        }
+        {
+            let source_table = txn.open_table(kind.v1_table())?;
+            let prefix = legacy_wallet_private_row_prefix(namespace);
+            let range_end = prefix_range_end(&prefix);
+            let entries = match range_end.as_deref() {
+                Some(range_end) => source_table.range(prefix.as_str()..range_end)?,
+                None => source_table.range(prefix.as_str()..)?,
+            };
+            let mut current_source_count = 0_usize;
+            for entry in entries {
+                let (key, value) = entry?;
+                current_source_count = current_source_count.saturating_add(1);
+                if !sources.iter().any(|source| {
+                    source.storage_key == key.value() && source.payload.as_slice() == value.value()
+                }) {
+                    return Err(DbError::WalletPrivateV1MigrationSourceChanged {
+                        table: kind.v1_table_name(),
+                        key: key.value().to_owned(),
+                    });
+                }
+            }
+            if current_source_count != sources.len() {
+                return Err(DbError::WalletPrivateV1MigrationRowCountMismatch {
+                    kind: kind.label(),
+                });
+            }
+            for source in sources {
+                let unchanged = source_table
+                    .get(source.storage_key.as_str())?
+                    .is_some_and(|value| value.value() == source.payload.as_slice());
+                if !unchanged {
+                    return Err(DbError::WalletPrivateV1MigrationSourceChanged {
+                        table: kind.v1_table_name(),
+                        key: source.storage_key.clone(),
+                    });
+                }
+            }
+        }
+        {
+            let mut destination_table = txn.open_table(kind.v2_table())?;
+            for destination in destinations {
+                let key = opaque_wallet_private_row_key(namespace, &destination.row_id)?;
+                if destination_table.get(key.as_str())?.is_some() {
+                    return Err(DbError::SchemaMigrationDestinationConflict {
+                        table: kind.v2_table_name(),
+                        key,
+                    });
+                }
+                destination_table.insert(key.as_str(), destination.payload.as_slice())?;
+            }
+        }
+        {
+            let mut source_table = txn.open_table(kind.v1_table())?;
+            for source in sources {
+                source_table.remove(source.storage_key.as_str())?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_pending_output_poi_context(
         &self,
         chain_id: u64,
         wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<Option<PendingOutputPoiContextRecord>, DbError> {
-        let key = PendingOutputPoiContextRecord::key_for(chain_id, wallet_id, output_commitment);
+        self.get_pending_output_poi_context_with_probe_hook(
+            chain_id,
+            wallet_id,
+            output_commitment,
+            || Ok(()),
+        )
+    }
+
+    fn get_pending_output_poi_context_with_probe_hook<F>(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+        output_commitment: &FixedBytes<32>,
+        after_v2_miss: F,
+    ) -> Result<Option<PendingOutputPoiContextRecord>, DbError>
+    where
+        F: FnOnce() -> Result<(), DbError>,
+    {
+        let namespace = wallet_private_namespace(chain_id, wallet_id)?;
+        let v1_key = PendingOutputPoiContextRecord::key_for(chain_id, wallet_id, output_commitment);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-        match table.get(key.as_str())? {
-            Some(value) => Ok(Some(decode(value.value())?)),
-            None => Ok(None),
+        if let Some(row) = Self::get_opaque_wallet_private_row_in_transaction(
+            &txn,
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            output_commitment.as_slice(),
+        )? {
+            let record: PendingOutputPoiContextRecord = decode(&row.payload)?;
+            validate_pending_output_record_identity(
+                &record,
+                &namespace,
+                output_commitment.as_slice(),
+                &v1_key,
+            )?;
+            return Ok(Some(record));
         }
+        after_v2_miss()?;
+        let Some(payload) = Self::get_wallet_private_v1_payload_in_transaction(
+            &txn,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &v1_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let record: PendingOutputPoiContextRecord = decode(&payload)?;
+        validate_pending_output_record_identity(
+            &record,
+            &namespace,
+            output_commitment.as_slice(),
+            &v1_key,
+        )?;
+        Ok(Some(record))
     }
 
     pub fn put_pending_output_poi_context(
         &self,
         record: &PendingOutputPoiContextRecord,
     ) -> Result<(), DbError> {
-        record.wallet_id.parse::<WalletCacheKey>()?;
-        let key = record.key();
-        let data = encode(record)?;
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-            table.insert(key.as_str(), data.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(())
+        let namespace = wallet_private_namespace(record.chain_id, &record.wallet_id)?;
+        self.put_typed_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &record.key(),
+            &OpaqueWalletPrivateRow {
+                row_id: record.output_commitment.to_vec(),
+                payload: encode(record)?,
+            },
+        )
     }
 
     pub fn delete_pending_output_poi_context(
@@ -1981,14 +2635,13 @@ impl DbStore {
         wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<(), DbError> {
-        let key = PendingOutputPoiContextRecord::key_for(chain_id, wallet_id, output_commitment);
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-            table.remove(key.as_str())?;
-        }
-        txn.commit()?;
-        Ok(())
+        let namespace = wallet_private_namespace(chain_id, wallet_id)?;
+        self.delete_typed_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+            &PendingOutputPoiContextRecord::key_for(chain_id, wallet_id, output_commitment),
+            output_commitment.as_slice(),
+        )
     }
 
     pub fn list_pending_output_poi_contexts(
@@ -1996,13 +2649,59 @@ impl DbStore {
         chain_id: u64,
         wallet_id: &str,
     ) -> Result<Vec<PendingOutputPoiContextRecord>, DbError> {
-        let prefix = PendingOutputPoiContextRecord::prefix_for_wallet(chain_id, wallet_id);
-        let records: Vec<PendingOutputPoiContextRecord> =
-            self.list_decoded_by_prefix(PENDING_OUTPUT_POI_CONTEXT_TABLE, &prefix)?;
-        Ok(records
-            .into_iter()
-            .filter(|record| record.chain_id == chain_id && record.wallet_id == wallet_id)
-            .collect())
+        self.list_pending_output_poi_contexts_with_probe_hook(chain_id, wallet_id, || Ok(()))
+    }
+
+    fn list_pending_output_poi_contexts_with_probe_hook<F>(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+        after_v2_read: F,
+    ) -> Result<Vec<PendingOutputPoiContextRecord>, DbError>
+    where
+        F: FnOnce() -> Result<(), DbError>,
+    {
+        let namespace = wallet_private_namespace(chain_id, wallet_id)?;
+        let txn = self.db.begin_read()?;
+        let records = Self::list_opaque_wallet_private_rows_in_transaction(
+            &txn,
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+        )?
+        .into_iter()
+        .map(|row| {
+            let record: PendingOutputPoiContextRecord = decode(&row.payload)?;
+            validate_pending_output_record_identity(
+                &record,
+                &namespace,
+                &row.row_id,
+                &opaque_wallet_private_row_key(&namespace, &row.row_id)?,
+            )?;
+            Ok(record)
+        })
+        .collect::<Result<Vec<PendingOutputPoiContextRecord>, DbError>>()?;
+        let mut records = records;
+        after_v2_read()?;
+        for row in Self::list_wallet_private_v1_rows_for_kind_in_transaction(
+            &txn,
+            &namespace,
+            WalletPrivateRecordKind::PendingOutputPoiContext,
+        )? {
+            let record: PendingOutputPoiContextRecord = decode(&row.payload)?;
+            validate_pending_output_record_identity(
+                &record,
+                &namespace,
+                record.output_commitment.as_slice(),
+                &row.storage_key,
+            )?;
+            if !records
+                .iter()
+                .any(|current| current.output_commitment == record.output_commitment)
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn get_output_poi_recovery(
@@ -2011,26 +2710,53 @@ impl DbStore {
         wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<Option<OutputPoiRecoveryRecord>, DbError> {
-        let key = OutputPoiRecoveryRecord::key_for(chain_id, wallet_id, output_commitment);
+        let namespace = wallet_private_namespace(chain_id, wallet_id)?;
+        let v1_key = OutputPoiRecoveryRecord::key_for(chain_id, wallet_id, output_commitment);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
-        match table.get(key.as_str())? {
-            Some(value) => Ok(Some(decode(value.value())?)),
-            None => Ok(None),
+        if let Some(row) = Self::get_opaque_wallet_private_row_in_transaction(
+            &txn,
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            output_commitment.as_slice(),
+        )? {
+            let record: OutputPoiRecoveryRecord = decode(&row.payload)?;
+            validate_output_recovery_record_identity(
+                &record,
+                &namespace,
+                output_commitment.as_slice(),
+                &v1_key,
+            )?;
+            return Ok(Some(record));
         }
+        let Some(payload) = Self::get_wallet_private_v1_payload_in_transaction(
+            &txn,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &v1_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let record: OutputPoiRecoveryRecord = decode(&payload)?;
+        validate_output_recovery_record_identity(
+            &record,
+            &namespace,
+            output_commitment.as_slice(),
+            &v1_key,
+        )?;
+        Ok(Some(record))
     }
 
     pub fn put_output_poi_recovery(&self, record: &OutputPoiRecoveryRecord) -> Result<(), DbError> {
-        record.wallet_id.parse::<WalletCacheKey>()?;
-        let key = record.key();
-        let data = encode(record)?;
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
-            table.insert(key.as_str(), data.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(())
+        let namespace = wallet_private_namespace(record.chain_id, &record.wallet_id)?;
+        self.put_typed_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &record.key(),
+            &OpaqueWalletPrivateRow {
+                row_id: record.output_commitment.to_vec(),
+                payload: encode(record)?,
+            },
+        )
     }
 
     pub fn delete_output_poi_recovery(
@@ -2039,14 +2765,13 @@ impl DbStore {
         wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<(), DbError> {
-        let key = OutputPoiRecoveryRecord::key_for(chain_id, wallet_id, output_commitment);
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
-            table.remove(key.as_str())?;
-        }
-        txn.commit()?;
-        Ok(())
+        let namespace = wallet_private_namespace(chain_id, wallet_id)?;
+        self.delete_typed_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+            &OutputPoiRecoveryRecord::key_for(chain_id, wallet_id, output_commitment),
+            output_commitment.as_slice(),
+        )
     }
 
     pub fn list_output_poi_recoveries(
@@ -2054,13 +2779,46 @@ impl DbStore {
         chain_id: u64,
         wallet_id: &str,
     ) -> Result<Vec<OutputPoiRecoveryRecord>, DbError> {
-        let prefix = OutputPoiRecoveryRecord::prefix_for_wallet(chain_id, wallet_id);
-        let records: Vec<OutputPoiRecoveryRecord> =
-            self.list_decoded_by_prefix(OUTPUT_POI_RECOVERY_TABLE, &prefix)?;
-        Ok(records
-            .into_iter()
-            .filter(|record| record.chain_id == chain_id && record.wallet_id == wallet_id)
-            .collect())
+        let namespace = wallet_private_namespace(chain_id, wallet_id)?;
+        let txn = self.db.begin_read()?;
+        let records = Self::list_opaque_wallet_private_rows_in_transaction(
+            &txn,
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+        )?
+        .into_iter()
+        .map(|row| {
+            let record: OutputPoiRecoveryRecord = decode(&row.payload)?;
+            validate_output_recovery_record_identity(
+                &record,
+                &namespace,
+                &row.row_id,
+                &opaque_wallet_private_row_key(&namespace, &row.row_id)?,
+            )?;
+            Ok(record)
+        })
+        .collect::<Result<Vec<OutputPoiRecoveryRecord>, DbError>>()?;
+        let mut records = records;
+        for row in Self::list_wallet_private_v1_rows_for_kind_in_transaction(
+            &txn,
+            &namespace,
+            WalletPrivateRecordKind::OutputPoiRecovery,
+        )? {
+            let record: OutputPoiRecoveryRecord = decode(&row.payload)?;
+            validate_output_recovery_record_identity(
+                &record,
+                &namespace,
+                record.output_commitment.as_slice(),
+                &row.storage_key,
+            )?;
+            if !records
+                .iter()
+                .any(|current| current.output_commitment == record.output_commitment)
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn get_app_settings_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
@@ -2268,6 +3026,8 @@ impl DbStore {
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+        txn.open_table(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE)?;
+        txn.open_table(OUTPUT_POI_RECOVERY_V2_TABLE)?;
         txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
         txn.open_table(APP_SETTINGS_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
@@ -2450,6 +3210,133 @@ fn wallet_utxo_key(wallet_id: &WalletCacheKey, utxo_id: &str) -> String {
 
 fn wallet_utxo_prefix(wallet_id: &WalletCacheKey) -> String {
     format!("{wallet_id}|")
+}
+
+fn wallet_private_namespace(
+    chain_id: u64,
+    wallet_id: &str,
+) -> Result<WalletPrivateNamespaceId, DbError> {
+    Ok(WalletPrivateNamespaceId::new(chain_id, wallet_id.parse()?))
+}
+
+fn validate_pending_output_record_identity(
+    record: &PendingOutputPoiContextRecord,
+    namespace: &WalletPrivateNamespaceId,
+    row_id: &[u8],
+    storage_key: &str,
+) -> Result<(), DbError> {
+    if record.chain_id != namespace.chain_id
+        || record.wallet_id != namespace.wallet_id.as_str()
+        || record.output_commitment.as_slice() != row_id
+        || record.key() != storage_key
+    {
+        return Err(DbError::WalletPrivateRecordIdentityMismatch {
+            kind: WalletPrivateRecordKind::PendingOutputPoiContext.label(),
+            key: storage_key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_output_recovery_record_identity(
+    record: &OutputPoiRecoveryRecord,
+    namespace: &WalletPrivateNamespaceId,
+    row_id: &[u8],
+    storage_key: &str,
+) -> Result<(), DbError> {
+    if record.chain_id != namespace.chain_id
+        || record.wallet_id != namespace.wallet_id.as_str()
+        || record.output_commitment.as_slice() != row_id
+        || record.key() != storage_key
+    {
+        return Err(DbError::WalletPrivateRecordIdentityMismatch {
+            kind: WalletPrivateRecordKind::OutputPoiRecovery.label(),
+            key: storage_key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn legacy_wallet_private_row_prefix(namespace: &WalletPrivateNamespaceId) -> String {
+    format!("{}|{}|", namespace.chain_id, namespace.wallet_id)
+}
+
+fn opaque_wallet_private_row_prefix(namespace: &WalletPrivateNamespaceId) -> String {
+    legacy_wallet_private_row_prefix(namespace)
+}
+
+fn opaque_wallet_private_row_key(
+    namespace: &WalletPrivateNamespaceId,
+    row_id: &[u8],
+) -> Result<String, DbError> {
+    if row_id.is_empty() {
+        return Err(DbError::EmptyOpaqueWalletPrivateRowId);
+    }
+    Ok(format!(
+        "{}{}",
+        opaque_wallet_private_row_prefix(namespace),
+        hex::encode(row_id)
+    ))
+}
+
+fn opaque_wallet_private_row_id(prefix: &str, key: &str) -> Result<Vec<u8>, DbError> {
+    let encoded = key
+        .strip_prefix(prefix)
+        .filter(|encoded| !encoded.is_empty())
+        .ok_or_else(|| DbError::InvalidOpaqueWalletPrivateRowKey {
+            key: key.to_owned(),
+        })?;
+    hex::decode(encoded).map_err(|_| DbError::InvalidOpaqueWalletPrivateRowKey {
+        key: key.to_owned(),
+    })
+}
+
+const fn validate_opaque_row(row: &OpaqueWalletPrivateRow) -> Result<(), DbError> {
+    if row.row_id.is_empty() {
+        return Err(DbError::EmptyOpaqueWalletPrivateRowId);
+    }
+    Ok(())
+}
+
+fn validate_opaque_row_mutation(
+    mutation: &OpaqueWalletPrivateRowMutation<'_>,
+) -> Result<(), DbError> {
+    for row in mutation.updates {
+        validate_opaque_row(row)?;
+    }
+    if mutation.deletes.iter().any(Vec::is_empty) {
+        return Err(DbError::EmptyOpaqueWalletPrivateRowId);
+    }
+    Ok(())
+}
+
+fn validate_wallet_private_v1_row(
+    namespace: &WalletPrivateNamespaceId,
+    kind: WalletPrivateRecordKind,
+    row: &WalletPrivateV1Row,
+) -> Result<(), DbError> {
+    let valid = match kind {
+        WalletPrivateRecordKind::PendingOutputPoiContext => {
+            let record: PendingOutputPoiContextRecord = decode(&row.payload)?;
+            record.chain_id == namespace.chain_id
+                && record.wallet_id == namespace.wallet_id.as_str()
+                && record.key() == row.storage_key
+        }
+        WalletPrivateRecordKind::OutputPoiRecovery => {
+            let record: OutputPoiRecoveryRecord = decode(&row.payload)?;
+            record.chain_id == namespace.chain_id
+                && record.wallet_id == namespace.wallet_id.as_str()
+                && record.key() == row.storage_key
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::WalletPrivateV1MigrationSourceChanged {
+            table: kind.v1_table_name(),
+            key: row.storage_key.clone(),
+        })
+    }
 }
 
 #[cfg(test)]

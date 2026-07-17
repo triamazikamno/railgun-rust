@@ -441,8 +441,11 @@ impl OutputPoiRecoveryRun<'_> {
         if self.cfg.spending_public_key.is_none() || self.cfg.poi_recovery_prover.is_none() {
             return 0;
         }
-        if let Err(reason) = self.authority.revalidate() {
-            debug!(?reason, cache_key = %self.cfg.cache_key, "output POI recovery skipped");
+        if self.authority.revalidate().is_err() {
+            debug!(
+                chain_id = self.cfg.chain.chain_id,
+                "output POI recovery skipped"
+            );
             return 0;
         }
         let snapshot = self.utxos.read().await.clone();

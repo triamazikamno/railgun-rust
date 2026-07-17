@@ -68,11 +68,11 @@ use crate::types::{
     WalletBackfillOwnerDisposition, WalletBackfillOwnerSignal, WalletBackfillRejectReason,
     WalletBackfillResetResult, WalletBackfillStartResult, WalletCacheStore,
     WalletCheckpointMutation, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
-    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletObservation, WalletPrivateCommit,
-    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
-    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
-    WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
-    WalletUtxoMutation, WalletViewState,
+    WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletObservation,
+    WalletPendingSpentMarkOutcome, WalletPrivateCommit, WalletPrivateRequestError, WalletReadiness,
+    WalletReadinessError, WalletReadinessWaitError, WalletResetReplayPlan, WalletResetRewindStatus,
+    WalletResetToken, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
+    WalletSyncActorStateCommit, WalletSyncToken, WalletUtxoMutation, WalletViewState,
 };
 
 mod actor;
@@ -104,8 +104,8 @@ use handle::{
     OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_VERIFY_PROOF, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiSubmissionPredicate, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
-    WalletIndexedCatchUpCommand, WalletLocalPendingSpentUpdate, WalletPendingOverlayUpdate,
-    WalletPoiRefreshSelection, WalletPrivateRemoteAuthority, WalletPrivateRequest,
+    WalletIndexedCatchUpCommand, WalletPendingOverlayUpdate, WalletPoiRefreshSelection,
+    WalletPrivateRemoteAuthority, WalletPrivateRequest,
 };
 pub(crate) use handle::{
     OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,
@@ -118,13 +118,15 @@ use output_poi_recovery::{
     mark_valid_output_poi_recoveries, mark_valid_output_poi_recoveries_authorized,
     new_output_poi_recovery_record, output_poi_recovery_candidates, recover_missing_output_pois,
 };
+#[cfg(test)]
+use pending_output_poi::pending_output_poi_submit_identity;
 use pending_output_poi::{
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
     apply_owned_poi_private_delta_on_actor, apply_poi_private_delta,
     expected_pending_context_state, expected_recovery_state,
     pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
     pending_output_poi_observation_updates, pending_output_poi_submission_plan_current,
-    pending_output_poi_submit_identity, preflight_and_remote_submit_pending_output_poi,
+    preflight_and_remote_submit_pending_output_poi,
     process_pending_output_poi_observations_authorized, submit_observed_pending_output_pois_inner,
     verify_submitted_pending_output_pois_with_config_authorized,
 };

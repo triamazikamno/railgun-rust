@@ -10,9 +10,10 @@ use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::PreTxPoi;
 use local_db::{
-    DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, PendingOutputPoiRole,
-    WalletCacheKey, WalletMeta, WalletMetaMutation, WalletPrivateNamespaceId,
-    WalletPrivateStateBatch, WalletSyncActorStateRecord, WalletUtxoRowMutation,
+    DbError, DbStore, OpaqueWalletPrivateRow, OpaqueWalletPrivateRowMutation,
+    OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey,
+    WalletMeta, WalletMetaMutation, WalletPrivateNamespaceId, WalletPrivateStateBatch,
+    WalletPrivateV1MigrationBatch, WalletSyncActorStateRecord, WalletUtxoRowMutation,
 };
 use poi::SensitiveUrl;
 use poi::cache::PoiCache;
@@ -830,6 +831,7 @@ pub struct WalletPrivateCommit<'a> {
     pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
     pending_output_context_deletes: &'a [FixedBytes<32>],
     output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+    output_poi_recovery_deletes: &'a [FixedBytes<32>],
 }
 
 pub struct WalletSyncActorStateCommit<'a> {
@@ -870,6 +872,7 @@ impl<'a> WalletPrivateCommit<'a> {
             pending_output_context_updates: &[],
             pending_output_context_deletes: &[],
             output_poi_recovery_updates: &[],
+            output_poi_recovery_deletes: &[],
         }
     }
 
@@ -921,6 +924,12 @@ impl<'a> WalletPrivateCommit<'a> {
     }
 
     #[must_use]
+    pub const fn with_output_poi_recovery_deletes(mut self, deletes: &'a [FixedBytes<32>]) -> Self {
+        self.output_poi_recovery_deletes = deletes;
+        self
+    }
+
+    #[must_use]
     pub const fn with_sync_actor_state(
         mut self,
         sync_actor_state: &'a WalletSyncActorStateRecord,
@@ -947,6 +956,46 @@ impl<'a> WalletPrivateCommit<'a> {
     #[must_use]
     pub const fn output_poi_recovery_updates(&self) -> &[OutputPoiRecoveryRecord] {
         self.output_poi_recovery_updates
+    }
+
+    #[must_use]
+    pub const fn output_poi_recovery_deletes(&self) -> &[FixedBytes<32>] {
+        self.output_poi_recovery_deletes
+    }
+
+    pub fn validate_namespace(&self) -> Result<(), WalletCacheError> {
+        for (chain_id, wallet_id) in self
+            .pending_output_context_updates
+            .iter()
+            .map(|record| (record.chain_id, record.wallet_id.as_str()))
+            .chain(
+                self.output_poi_recovery_updates
+                    .iter()
+                    .map(|record| (record.chain_id, record.wallet_id.as_str())),
+            )
+        {
+            if chain_id != self.chain_id || wallet_id != self.wallet_id.as_str() {
+                return Err(DbError::InvalidWalletPrivateCommitNamespace {
+                    expected_chain_id: self.chain_id,
+                    expected_wallet_id: self.wallet_id.to_string(),
+                    actual_chain_id: chain_id,
+                    actual_wallet_id: wallet_id.to_owned(),
+                }
+                .into());
+            }
+        }
+        if let Some(state) = self.sync_actor_state
+            && (state.chain_id != self.chain_id || state.wallet_id != self.wallet_id.as_str())
+        {
+            return Err(DbError::InvalidWalletPrivateCommitNamespace {
+                expected_chain_id: self.chain_id,
+                expected_wallet_id: self.wallet_id.to_string(),
+                actual_chain_id: state.chain_id,
+                actual_wallet_id: state.wallet_id.clone(),
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -976,6 +1025,32 @@ pub trait WalletCacheStore: Send + Sync {
         &self,
         commit: WalletSyncActorStateCommit<'_>,
     ) -> Result<(), WalletCacheError>;
+
+    fn get_pending_output_poi_context(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<PendingOutputPoiContextRecord>, WalletCacheError>;
+
+    fn list_pending_output_poi_contexts(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<PendingOutputPoiContextRecord>, WalletCacheError>;
+
+    fn get_output_poi_recovery(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError>;
+
+    fn list_output_poi_recoveries(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<OutputPoiRecoveryRecord>, WalletCacheError>;
 }
 
 impl WalletCacheStore for DbStore {
@@ -983,6 +1058,7 @@ impl WalletCacheStore for DbStore {
         &self,
         commit: WalletPrivateCommit<'_>,
     ) -> Result<(), WalletCacheError> {
+        commit.validate_namespace()?;
         let utxo_entries = match commit.utxo_mutation() {
             WalletUtxoMutation::Preserve => None,
             WalletUtxoMutation::Replace(utxos) => Some(wallet_utxo_entries(utxos)?),
@@ -1000,6 +1076,27 @@ impl WalletCacheStore for DbStore {
         };
         let namespace =
             WalletPrivateNamespaceId::new(commit.chain_id(), commit.wallet_id().clone());
+        migrate_db_store_wallet_private_v1_rows(self, &namespace)?;
+        let pending_output_context_updates = commit
+            .pending_output_context_updates()
+            .iter()
+            .map(pending_output_context_opaque_row)
+            .collect::<Result<Vec<_>, WalletCacheError>>()?;
+        let pending_output_context_deletes = commit
+            .pending_output_context_deletes()
+            .iter()
+            .map(|commitment| commitment.to_vec())
+            .collect::<Vec<_>>();
+        let output_poi_recovery_updates = commit
+            .output_poi_recovery_updates()
+            .iter()
+            .map(output_poi_recovery_opaque_row)
+            .collect::<Result<Vec<_>, WalletCacheError>>()?;
+        let output_poi_recovery_deletes = commit
+            .output_poi_recovery_deletes()
+            .iter()
+            .map(|commitment| commitment.to_vec())
+            .collect::<Vec<_>>();
         self.batch_commit_wallet_private_state(&WalletPrivateStateBatch {
             namespace: &namespace,
             utxos: utxo_entries.as_deref().map_or(
@@ -1010,9 +1107,14 @@ impl WalletCacheStore for DbStore {
                 .as_ref()
                 .map_or(WalletMetaMutation::Preserve, WalletMetaMutation::Set),
             sync_actor_state: commit.sync_actor_state(),
-            pending_output_context_updates: commit.pending_output_context_updates(),
-            pending_output_context_deletes: commit.pending_output_context_deletes(),
-            output_poi_recovery_updates: commit.output_poi_recovery_updates(),
+            pending_output_contexts: OpaqueWalletPrivateRowMutation {
+                updates: &pending_output_context_updates,
+                deletes: &pending_output_context_deletes,
+            },
+            output_poi_recoveries: OpaqueWalletPrivateRowMutation {
+                updates: &output_poi_recovery_updates,
+                deletes: &output_poi_recovery_deletes,
+            },
         })?;
         Ok(())
     }
@@ -1049,6 +1151,120 @@ impl WalletCacheStore for DbStore {
     ) -> Result<(), WalletCacheError> {
         Ok(Self::put_wallet_sync_actor_state(self, commit.state())?)
     }
+
+    fn get_pending_output_poi_context(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<PendingOutputPoiContextRecord>, WalletCacheError> {
+        Ok(Self::get_pending_output_poi_context(
+            self,
+            chain_id,
+            wallet_id.as_str(),
+            output_commitment,
+        )?)
+    }
+
+    fn list_pending_output_poi_contexts(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<PendingOutputPoiContextRecord>, WalletCacheError> {
+        Ok(Self::list_pending_output_poi_contexts(
+            self,
+            chain_id,
+            wallet_id.as_str(),
+        )?)
+    }
+
+    fn get_output_poi_recovery(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError> {
+        Ok(Self::get_output_poi_recovery(
+            self,
+            chain_id,
+            wallet_id.as_str(),
+            output_commitment,
+        )?)
+    }
+
+    fn list_output_poi_recoveries(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<OutputPoiRecoveryRecord>, WalletCacheError> {
+        Ok(Self::list_output_poi_recoveries(
+            self,
+            chain_id,
+            wallet_id.as_str(),
+        )?)
+    }
+}
+
+fn pending_output_context_opaque_row(
+    record: &PendingOutputPoiContextRecord,
+) -> Result<OpaqueWalletPrivateRow, WalletCacheError> {
+    Ok(OpaqueWalletPrivateRow {
+        row_id: record.output_commitment.to_vec(),
+        payload: rmp_serde::to_vec_named(record)?,
+    })
+}
+
+fn migrate_db_store_wallet_private_v1_rows(
+    db: &DbStore,
+    namespace: &WalletPrivateNamespaceId,
+) -> Result<(), WalletCacheError> {
+    let sources = db.list_wallet_private_v1_rows(namespace)?;
+    if sources.pending_output_contexts.is_empty() && sources.output_poi_recoveries.is_empty() {
+        return Ok(());
+    }
+    let pending_output_context_destinations = sources
+        .pending_output_contexts
+        .iter()
+        .map(|source| {
+            let record: PendingOutputPoiContextRecord = rmp_serde::from_slice(&source.payload)?;
+            if record.chain_id != namespace.chain_id
+                || record.wallet_id != namespace.wallet_id.as_str()
+            {
+                return Err(WalletCacheError::Crypto);
+            }
+            pending_output_context_opaque_row(&record)
+        })
+        .collect::<Result<Vec<_>, WalletCacheError>>()?;
+    let output_poi_recovery_destinations = sources
+        .output_poi_recoveries
+        .iter()
+        .map(|source| {
+            let record: OutputPoiRecoveryRecord = rmp_serde::from_slice(&source.payload)?;
+            if record.chain_id != namespace.chain_id
+                || record.wallet_id != namespace.wallet_id.as_str()
+            {
+                return Err(WalletCacheError::Crypto);
+            }
+            output_poi_recovery_opaque_row(&record)
+        })
+        .collect::<Result<Vec<_>, WalletCacheError>>()?;
+    db.migrate_wallet_private_v1_rows(&WalletPrivateV1MigrationBatch {
+        namespace,
+        pending_output_context_sources: &sources.pending_output_contexts,
+        pending_output_context_destinations: &pending_output_context_destinations,
+        output_poi_recovery_sources: &sources.output_poi_recoveries,
+        output_poi_recovery_destinations: &output_poi_recovery_destinations,
+    })?;
+    Ok(())
+}
+
+fn output_poi_recovery_opaque_row(
+    record: &OutputPoiRecoveryRecord,
+) -> Result<OpaqueWalletPrivateRow, WalletCacheError> {
+    Ok(OpaqueWalletPrivateRow {
+        row_id: record.output_commitment.to_vec(),
+        payload: rmp_serde::to_vec_named(record)?,
+    })
 }
 
 fn wallet_utxo_entries(utxos: &[WalletUtxo]) -> Result<Vec<(String, Vec<u8>)>, WalletCacheError> {
@@ -1715,6 +1931,7 @@ pub struct WalletPendingOverlay {
 pub struct WalletPendingSpent {
     pub tree: u32,
     pub position: u64,
+    pub stable_identity: Option<Vec<u8>>,
     pub tx_hash: Option<FixedBytes<32>>,
     pub block_number: Option<u64>,
     pub block_timestamp: Option<u64>,
@@ -1734,6 +1951,7 @@ impl WalletPendingSpent {
         Self {
             tree: utxo.tree,
             position: utxo.position,
+            stable_identity: None,
             tx_hash: Some(source.tx_hash),
             block_number: Some(source.block_number),
             block_timestamp: Some(source.block_timestamp),
@@ -1741,19 +1959,38 @@ impl WalletPendingSpent {
     }
 
     #[must_use]
-    pub(crate) const fn submitted(
+    pub(crate) fn submitted(
         utxo: &railgun_wallet::Utxo,
         tx_hash: Option<FixedBytes<32>>,
         now: u64,
     ) -> Self {
+        let wallet_utxo = railgun_wallet::WalletUtxo::new(utxo.clone());
         Self {
             tree: utxo.tree,
             position: utxo.position,
+            stable_identity: Some(railgun_wallet::wallet_cache::wallet_utxo_stable_identity(
+                &wallet_utxo,
+            )),
             tx_hash,
             block_number: None,
             block_timestamp: Some(now),
         }
     }
+
+    #[must_use]
+    pub fn matches_local_utxo(&self, utxo: &railgun_wallet::WalletUtxo) -> bool {
+        self.key() == (utxo.utxo.tree, utxo.utxo.position)
+            && self.stable_identity.as_ref()
+                == Some(&railgun_wallet::wallet_cache::wallet_utxo_stable_identity(
+                    utxo,
+                ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletPendingSpentMarkOutcome {
+    Marked,
+    AlreadyProtected,
 }
 
 /// Coherent current private wallet projection (only valid when not reset-pending).

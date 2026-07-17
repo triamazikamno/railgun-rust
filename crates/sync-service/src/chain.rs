@@ -105,10 +105,10 @@ use workers::{
 };
 
 pub use data_plane::{
-    PoiArtifactCacheRetry, PublicCoverageAnswer, PublicDataPlaneDiagnostic,
-    PublicDataPlaneDiagnosticKind, PublicDataPlaneDiagnostics, PublicDataPlaneError,
-    PublicDataPlaneHandle, PublicScanRange, PublicScanRows, PublicScanRowsAnswer,
-    PublicSyncCacheReset,
+    ChainPublicSyncCacheReset, PoiArtifactCacheRetry, PublicCoverageAnswer,
+    PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind, PublicDataPlaneDiagnostics,
+    PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange, PublicScanRows,
+    PublicScanRowsAnswer, PublicSyncCacheReset,
 };
 pub use types::{ChainError, ChainHandle, ChainService};
 

@@ -123,6 +123,7 @@ impl TxidPublicCacheManifest {
                 relative_path: DbStore::relative_blob_path(TXID_CACHE_BLOB_KIND, &name),
                 content_hash: Sha256::digest(&bytes).into(),
                 source_hash: None,
+                source_sequence: None,
                 created_at: existing.map_or(now, |meta| meta.created_at),
                 updated_at: now,
                 last_accessed_at: now,
