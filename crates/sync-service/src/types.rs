@@ -2335,15 +2335,50 @@ impl WalletReadiness {
     }
 }
 
+/// Privacy-safe aggregate of sender-created pending-output PPOI work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletPpoiWorkflowStatus {
+    pub awaiting_submission: u64,
+    pub awaiting_validation: u64,
+    pub needs_attention: u64,
+    pub validation_revision: u64,
+}
+
+impl WalletPpoiWorkflowStatus {
+    #[must_use]
+    pub const fn has_outstanding(&self) -> bool {
+        self.awaiting_submission > 0 || self.awaiting_validation > 0 || self.needs_attention > 0
+    }
+
+    #[must_use]
+    pub const fn cleared(self) -> Self {
+        Self {
+            awaiting_submission: 0,
+            awaiting_validation: 0,
+            needs_attention: 0,
+            validation_revision: self.validation_revision,
+        }
+    }
+}
+
 /// One authoritative public observation of a wallet actor's private projection and readiness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletObservation {
     view: WalletViewState,
     readiness: WalletReadiness,
+    ppoi_workflow_status: WalletPpoiWorkflowStatus,
 }
 
 impl WalletObservation {
     pub(crate) fn new(view: WalletViewState, readiness: WalletReadiness) -> Self {
+        Self::with_ppoi_workflow_status(view, readiness, WalletPpoiWorkflowStatus::default())
+    }
+
+    pub(crate) fn with_ppoi_workflow_status(
+        view: WalletViewState,
+        readiness: WalletReadiness,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus,
+    ) -> Self {
         assert_eq!(
             matches!(&view, WalletViewState::Inactive { .. }),
             readiness == WalletReadiness::Shutdown
@@ -2352,7 +2387,11 @@ impl WalletObservation {
             !matches!(&view, WalletViewState::ResetPending { .. })
                 || readiness != WalletReadiness::Ready
         );
-        Self { view, readiness }
+        Self {
+            view,
+            readiness,
+            ppoi_workflow_status,
+        }
     }
 
     #[must_use]
@@ -2363,6 +2402,11 @@ impl WalletObservation {
     #[must_use]
     pub const fn readiness(&self) -> &WalletReadiness {
         &self.readiness
+    }
+
+    #[must_use]
+    pub const fn ppoi_workflow_status(&self) -> &WalletPpoiWorkflowStatus {
+        &self.ppoi_workflow_status
     }
 }
 

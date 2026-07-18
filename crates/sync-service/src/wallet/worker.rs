@@ -25,11 +25,12 @@ use super::{
     apply_wallet_delta_to_vec_with_outcome, broadcast, chain_pending_overlay_matches, debug,
     default_active_poi_list_keys, force_resubmit_matching_pending_output_pois_authorized, info,
     mark_valid_output_poi_recoveries_authorized, mpsc, now_epoch_secs, oneshot,
-    pending_output_poi_observation_updates, pending_overlay_from_delta,
-    process_pending_output_poi_observations_authorized,
+    pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,
+    pending_overlay_from_delta, process_pending_output_poi_observations_authorized,
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
     rewind_wallet_utxos, verify_submitted_pending_output_pois_with_config_authorized,
     wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
+    wallet_ppoi_workflow_status, wallet_ppoi_workflow_status_after_mutations,
     wallet_utxo_stable_identity, warn, watch,
 };
 use crate::PublicScanSource;
@@ -297,7 +298,8 @@ async fn commit_pending_output_contexts(
                 WalletCheckpointMutation::Preserve,
             )
             .with_pending_output_context_updates(&new_records),
-        )
+        )?;
+        Ok::<(), WalletCacheError>(())
     }) {
         Ok(Ok(())) => Ok(new_records.len()),
         Ok(Err(_)) => Err(WalletPrivateRequestError::PersistenceFailed),
@@ -986,8 +988,33 @@ impl WalletResetCommitRequest<'_> {
 
         let candidate_last_scanned =
             committed_to_before.min(request.pending.rewind_from_block().saturating_sub(1));
-        let mut candidate = request.utxos.read().await.clone();
+        let wallet_utxos_before_rewind = request.utxos.read().await.clone();
+        let mut candidate = wallet_utxos_before_rewind.clone();
         let rewind = rewind_wallet_utxos(&mut candidate, request.pending.rewind_from_block());
+        let pending_output_rewind = match pending_output_poi_rewind_state_updates(
+            request.cache_store,
+            request.cfg.chain.chain_id,
+            &request.cfg.cache_key,
+            request.pending.rewind_from_block(),
+            &wallet_utxos_before_rewind,
+        ) {
+            Ok(updates) => updates,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %request.cfg.cache_key,
+                    intent_id = request.pending.intent_id(),
+                    from_block = request.pending.rewind_from_block(),
+                    "failed to prepare pending output POI reset cleanup"
+                );
+                return WalletResetCommitOutcome {
+                    rewind: WalletResetRewindOutcome::Deferred {
+                        committed_to: committed_to_before,
+                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                    },
+                };
+            }
+        };
         let authority = WalletPrivateMutationAuthority::new(
             request.worker_handle,
             request.pending.reset_generation(),
@@ -1012,6 +1039,34 @@ impl WalletResetCommitRequest<'_> {
                 },
             };
         }
+        let active_list_keys = default_active_poi_list_keys();
+        let workflow_status = match wallet_ppoi_workflow_status_after_mutations(
+            request.cache_store,
+            request.cfg,
+            &active_list_keys,
+            permit.ppoi_workflow_status().validation_revision,
+            &pending_output_rewind.context_updates,
+            &rewind.removed_output_commitments,
+            &[],
+            &pending_output_rewind.recovery_deletes,
+        ) {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %request.cfg.cache_key,
+                    intent_id = request.pending.intent_id(),
+                    from_block = request.pending.rewind_from_block(),
+                    "failed to derive pending output PPOI workflow reset candidate"
+                );
+                return WalletResetCommitOutcome {
+                    rewind: WalletResetRewindOutcome::Deferred {
+                        committed_to: committed_to_before,
+                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                    },
+                };
+            }
+        };
 
         let persist_started = Instant::now();
         let sync_actor_state = wallet_sync_actor_state_record(
@@ -1032,9 +1087,12 @@ impl WalletResetCommitRequest<'_> {
                         last_scanned_block_hash: None,
                     },
                 )
+                .with_pending_output_context_updates(&pending_output_rewind.context_updates)
                 .with_pending_output_context_deletes(&rewind.removed_output_commitments)
+                .with_output_poi_recovery_deletes(&pending_output_rewind.recovery_deletes)
                 .with_sync_actor_state(&sync_actor_state),
             )?;
+            permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
             *request.last_scanned = candidate_last_scanned;
             request.persist_state.needs_full_persist = false;
             request.persist_state.pending_cache_reset = None;
@@ -1123,6 +1181,7 @@ impl WalletResetCommitRequest<'_> {
             spent,
             changed = rewind.changed,
             pending_context_deletes = rewind.removed_output_commitments.len(),
+            pending_context_rewinds = pending_output_rewind.context_updates.len(),
             reset_generation = request.pending.reset_generation(),
             persist_elapsed_ms = persist_started.elapsed().as_millis(),
             "wallet reset candidate committed"
@@ -1432,7 +1491,7 @@ impl WalletScanCommitRequest<'_> {
             };
         }
 
-        let Ok(pending_output_context_updates) = pending_output_poi_observation_updates(
+        let Ok(pending_output_observation_updates) = pending_output_poi_observation_state_updates(
             request.cache_store,
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
@@ -1504,6 +1563,40 @@ impl WalletScanCommitRequest<'_> {
                 changed: false,
             };
         }
+        let active_list_keys = default_active_poi_list_keys();
+        let workflow_status = match wallet_ppoi_workflow_status_after_mutations(
+            request.cache_store,
+            request.cfg,
+            &active_list_keys,
+            permit.ppoi_workflow_status().validation_revision,
+            &pending_output_observation_updates.context_updates,
+            &outcome.spent_output_commitments,
+            &[],
+            &pending_output_observation_updates.recovery_deletes,
+        ) {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %request.cfg.cache_key,
+                    from_block,
+                    to_block,
+                    "failed to derive pending output PPOI workflow scan candidate"
+                );
+                let _ = permit.with_active_apply(|token| {
+                    request.actor_state.transition(&token, |mut state| {
+                        state.sync_progress_persist_failed(request.job_token, from_block, to_block);
+                    });
+                });
+                return WalletScanCommitOutcome {
+                    result: WalletBackfillApplyResult::Rejected {
+                        committed_to: *request.last_scanned,
+                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                    },
+                    changed: false,
+                };
+            }
+        };
 
         let target_block = request
             .actor_state
@@ -1529,11 +1622,15 @@ impl WalletScanCommitRequest<'_> {
                     changed,
                 },
                 WalletProgressPrivateEffects {
-                    pending_output_context_updates: &pending_output_context_updates,
+                    pending_output_context_updates: &pending_output_observation_updates
+                        .context_updates,
                     pending_output_context_deletes: &outcome.spent_output_commitments,
                     output_poi_recovery_updates: &[],
+                    output_poi_recovery_deletes: &pending_output_observation_updates
+                        .recovery_deletes,
                 },
             )?;
+            permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
             *utxos_locked = candidate;
             projection_changed |=
                 prune_local_pending_spent(&mut overlay_locked, &utxos_locked, now_epoch_secs());
@@ -1731,6 +1828,9 @@ pub(crate) async fn prepare_wallet_worker(
         None
     };
     let cache_store = wallet_cache_store(&db, &cfg);
+    let active_poi_list_keys = default_active_poi_list_keys();
+    let initial_ppoi_workflow_status =
+        wallet_ppoi_workflow_status(cache_store.as_ref(), &cfg, &active_poi_list_keys, 0)?;
     let restored_sync_state =
         cache_store.get_wallet_sync_actor_state(cfg.chain.chain_id, &cfg.cache_key)?;
     let restored_pending_reset = restored_sync_state
@@ -1786,6 +1886,7 @@ pub(crate) async fn prepare_wallet_worker(
         initial_view,
     );
     let observation = actor_state.observation_publisher();
+    observation.publish_ppoi_workflow_status(initial_ppoi_workflow_status);
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (reset_generation_tx, reset_generation_rx) = watch::channel(initial_reset_generation);
     let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel(1);
@@ -1857,7 +1958,6 @@ pub(crate) async fn prepare_wallet_worker(
         let mut persist_state = WalletPersistState::default();
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = Some(poi_runtime.public_client());
-        let active_poi_list_keys = default_active_poi_list_keys();
         let mut pending_reset_retry = tokio::time::interval_at(
             tokio::time::Instant::now() + WALLET_RESET_RETRY_INTERVAL,
             WALLET_RESET_RETRY_INTERVAL,
@@ -4022,7 +4122,7 @@ mod tests {
         assert_eq!(fallback.percent(), 49);
         assert_eq!(fallback.source, Some(PublicScanSource::CachedCoverage));
     }
-    use crate::WalletReadiness;
+    use crate::{WalletPpoiWorkflowStatus, WalletReadiness};
 
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -4036,8 +4136,9 @@ mod tests {
     use broadcaster_core::query_rpc_pool::QueryRpcPool;
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
     use local_db::{
-        DbConfig, DbStore, OutputPoiRecoveryRecord, PendingOutputPoiContextRecord,
-        PendingOutputPoiRole, WalletCacheKey, WalletMeta,
+        DbConfig, DbStore, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+        PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
+        WalletCacheKey, WalletMeta,
     };
     use merkletree::tree::MerkleForest;
     use poi::artifacts::SnapshotEvent;
@@ -4047,7 +4148,7 @@ mod tests {
     use tokio::sync::{RwLock, broadcast, mpsc, oneshot, watch};
     use url::Url;
 
-    use railgun_wallet::scan::{SpentNullifier, WalletLogDelta};
+    use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
     use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 
     use crate::chain::ChainPublicDataPlane;
@@ -4057,7 +4158,14 @@ mod tests {
         WalletBackfillDriver, WalletConfig, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
         WalletObservation, WalletPendingSpent, WalletScanRows,
     };
-    use crate::wallet::handle::{WalletPendingOverlayRequest, WalletPrivateViewTicket};
+    use crate::wallet::handle::{
+        PendingOutputPoiSubject, WalletPendingOverlayRequest, WalletPrivateViewTicket,
+    };
+    use crate::wallet::pending_output_poi::{
+        PendingOutputPoiPreflight, PendingOutputPoiSubmissionPlan,
+        current_pending_output_poi_subject, expected_recovery_state,
+        pending_output_poi_submission_plan_current, pending_output_poi_submit_identity,
+    };
     use crate::wallet::{EVM_CHAIN_TYPE, WalletActorLifecycle};
 
     #[tokio::test]
@@ -4434,6 +4542,69 @@ mod tests {
 
     const fn test_public_scan_read_scope() -> PublicScanReadScope {
         PublicScanReadScope::new(PublicDataPlaneEpoch::new(0))
+    }
+
+    #[tokio::test]
+    async fn wallet_worker_restores_submitted_external_ppoi_workflow_status() {
+        let root_dir = temp_db_root("wallet-ppoi-workflow-restore");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let cfg = wallet_config();
+        let list_key = default_active_poi_list_keys()[0];
+        let output = test_wallet_utxo_with_random(110, 17, [0x31; 16]);
+        let mut context =
+            observed_external_pending_output_context(&cfg, &output, list_key, &source(110, 0xd0));
+        context.terminal_error = None;
+        let recovery =
+            output_poi_recovery_for_pending_context(&context, OutputPoiRecoveryStatus::Submitted);
+        db.put_pending_output_poi_context(&context)
+            .expect("seed pending context");
+        db.put_output_poi_recovery(&recovery)
+            .expect("seed recovery");
+
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx,
+                public_data_plane: test_public_data_plane(&db),
+            },
+            cfg,
+            1,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        )
+        .await
+        .expect("spawn wallet worker");
+
+        let status = *handle.observation().ppoi_workflow_status();
+        assert_eq!(status.awaiting_submission, 0);
+        assert_eq!(status.awaiting_validation, 1);
+        assert_eq!(status.needs_attention, 0);
+        assert_eq!(status.validation_revision, 0);
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -5634,7 +5805,6 @@ mod tests {
         )
         .await
         .expect("spawn wallet worker");
-
         assert_eq!(
             send_apply(
                 &handle,
@@ -7509,6 +7679,26 @@ mod tests {
         let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let initial_utxo = test_wallet_utxo(105, 7);
+        let list_key = default_active_poi_list_keys()[0];
+        let external_output = test_wallet_utxo_with_random(110, 17, [0x17; 16]);
+        let stale_context = observed_external_pending_output_context(
+            &cfg,
+            &external_output,
+            list_key,
+            &source(110, 0xd1),
+        );
+        let stale_recovery = output_poi_recovery_for_pending_context(
+            &stale_context,
+            OutputPoiRecoveryStatus::Submitted,
+        );
+        assert_ne!(
+            stale_context.output_commitment, initial_utxo.utxo.poi.commitment,
+            "external test context must not alias the rewound owned output"
+        );
+        db.put_pending_output_poi_context(&stale_context)
+            .expect("seed external pending context");
+        db.put_output_poi_recovery(&stale_recovery)
+            .expect("seed external recovery");
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
@@ -7524,7 +7714,7 @@ mod tests {
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
             },
-            cfg,
+            cfg.clone(),
             1,
             live_rx,
             backfill_rx,
@@ -7534,6 +7724,9 @@ mod tests {
         )
         .await
         .expect("spawn wallet worker");
+        let workflow_before_reset = *handle.observation().ppoi_workflow_status();
+        assert_eq!(workflow_before_reset.needs_attention, 1);
+        assert_eq!(workflow_before_reset.validation_revision, 0);
 
         assert_eq!(
             send_target(&handle, &backfill_tx, 120, 0).await,
@@ -7576,6 +7769,37 @@ mod tests {
         assert!(!handle.readiness().is_ready());
         assert_eq!(*handle.rev_rx.borrow(), rev_before_reset);
         assert_eq!(
+            reset_pending_observation.ppoi_workflow_status(),
+            &workflow_before_reset
+        );
+        let retained_context = db
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load external context after failed rewind")
+            .expect("failed rewind retains external context");
+        assert_eq!(retained_context.observation, stale_context.observation);
+        assert_eq!(
+            retained_context.submitted_poi_list_keys,
+            stale_context.submitted_poi_list_keys
+        );
+        assert_eq!(
+            retained_context.terminal_error,
+            stale_context.terminal_error
+        );
+        assert!(
+            db.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load recovery after failed rewind")
+            .is_some(),
+            "failed atomic rewind must retain the matching recovery"
+        );
+        assert_eq!(
             cache_store.state().store_calls,
             store_calls_before_reset + 1
         );
@@ -7597,12 +7821,36 @@ mod tests {
         .await
         .expect("actor-owned reset retry commits rewind");
         assert!(handle.utxos.read().await.is_empty());
+        let rewound_context = db
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load external context after rewind retry")
+            .expect("external proof context is retained");
+        assert!(rewound_context.observation.is_none());
+        assert!(rewound_context.submitted_poi_list_keys.is_empty());
+        assert!(rewound_context.terminal_error.is_none());
+        assert!(
+            db.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load recovery after rewind retry")
+            .is_none()
+        );
         let rewind_observation = handle.observation();
         let WalletViewState::Current(rewound) = rewind_observation.view() else {
             panic!("successful rewind must publish Current");
         };
         assert_eq!(rewound.last_scanned, 99);
         assert_eq!(rewind_observation.readiness(), &WalletReadiness::Syncing);
+        assert_eq!(
+            rewind_observation.ppoi_workflow_status(),
+            &WalletPpoiWorkflowStatus::default()
+        );
         assert_ne!(*handle.rev_rx.borrow(), rev_before_reset);
         let state = db
             .get_wallet_sync_actor_state(1, handle.cache_key.as_str())
@@ -7877,6 +8125,224 @@ mod tests {
             .is_none()
         );
         assert_eq!(cache_store.state().store_calls, 1);
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_reset_rewinds_external_pending_observation_for_canonical_replay() {
+        let root_dir = temp_db_root("wallet-reset-external-pending-observation");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let cfg = wallet_config();
+        let list_key = default_active_poi_list_keys()[0];
+        let external_output = test_wallet_utxo_with_random(110, 17, [0x17; 16]);
+        let stale_context = observed_external_pending_output_context(
+            &cfg,
+            &external_output,
+            list_key,
+            &source(110, 0xd2),
+        );
+        let stale_observation = stale_context
+            .observation
+            .clone()
+            .expect("stale observation");
+        let stale_identity = pending_output_poi_submit_identity(&stale_context, &stale_observation)
+            .expect("stale external identity");
+        let stale_subject = PendingOutputPoiSubject::External {
+            output_commitment: stale_context.output_commitment,
+            derived_blinded_commitment: stale_identity.derived_blinded_commitment,
+        };
+        let stale_recovery = output_poi_recovery_for_pending_context(
+            &stale_context,
+            OutputPoiRecoveryStatus::Submitted,
+        );
+        let stale_plan = PendingOutputPoiSubmissionPlan::force_matching(
+            vec![list_key],
+            expected_recovery_state(Some(&stale_recovery)).expect("recovery fingerprint"),
+        );
+        db.put_pending_output_poi_context(&stale_context)
+            .expect("seed external pending context");
+        db.put_output_poi_recovery(&stale_recovery)
+            .expect("seed stale external recovery");
+
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                rpcs: Arc::new(QueryRpcPool::new(
+                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+                    Duration::from_secs(1),
+                )),
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+                public_data_plane: test_public_data_plane(&db),
+            },
+            cfg.clone(),
+            1,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            120,
+        )
+        .await
+        .expect("spawn wallet worker");
+
+        assert_eq!(
+            send_reset(&backfill_tx, 1, 100).await,
+            WalletBackfillResetResult::accepted_committed(1, 99)
+        );
+        assert_eq!(
+            handle.observation().ppoi_workflow_status(),
+            &WalletPpoiWorkflowStatus::default()
+        );
+        let rewound = db
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load rewound external context")
+            .expect("retain immutable external proof context");
+        assert!(rewound.observation.is_none());
+        assert!(rewound.submitted_poi_list_keys.is_empty());
+        assert!(rewound.terminal_error.is_none());
+        assert_eq!(rewound.railgun_txid, stale_context.railgun_txid);
+        assert_eq!(
+            rewound.pre_transaction_pois_per_txid_leaf_per_list.len(),
+            stale_context
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .len()
+        );
+        assert!(
+            db.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load rewound recovery")
+            .is_none()
+        );
+
+        let authority = WalletPrivateMutationAuthority::new(&handle, 1, &cancel);
+        assert_eq!(
+            pending_output_poi_submission_plan_current(
+                &authority,
+                db.as_ref(),
+                &cfg,
+                &[list_key],
+                &stale_context,
+                &stale_subject,
+                &stale_plan,
+            )
+            .await
+            .expect("stale submission preflight"),
+            PendingOutputPoiPreflight::NotCurrent,
+            "a submission planned from the rewound observation must be rejected"
+        );
+
+        db.put_pending_output_poi_context(&stale_context)
+            .expect("reseed legacy stale observation to exercise scan reconciliation");
+        db.put_output_poi_recovery(&stale_recovery)
+            .expect("reseed legacy stale recovery to exercise scan reconciliation");
+        let canonical_source = source(105, 0xe2);
+        let canonical_observation = CommitmentObservation {
+            tree: 3,
+            position: 21,
+            commitment: U256::from_be_bytes(stale_context.output_commitment.0),
+            source: canonical_source.clone(),
+        };
+        assert_eq!(
+            send_apply(
+                &handle,
+                &backfill_tx,
+                indexed_delta_batch(
+                    100,
+                    110,
+                    WalletLogDelta {
+                        utxos: Vec::new(),
+                        nullifiers: Vec::new(),
+                        commitment_observations: vec![canonical_observation],
+                    },
+                ),
+                1,
+            )
+            .await,
+            WalletBackfillApplyResult::Committed { committed_to: 110 }
+        );
+
+        let canonical = db
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &stale_context.output_commitment,
+            )
+            .expect("load canonical external context")
+            .expect("canonical external context");
+        let observed = canonical
+            .observation
+            .as_ref()
+            .expect("canonical observation attached");
+        assert_eq!(observed.output_tree, 3);
+        assert_eq!(observed.output_position, 21);
+        assert_eq!(observed.tx_hash, canonical_source.tx_hash);
+        assert!(canonical.submitted_poi_list_keys.is_empty());
+        assert!(canonical.terminal_error.is_none());
+        assert_eq!(canonical.missing_list_keys(), vec![list_key]);
+        assert_eq!(
+            handle.observation().ppoi_workflow_status(),
+            &WalletPpoiWorkflowStatus {
+                awaiting_submission: 1,
+                ..WalletPpoiWorkflowStatus::default()
+            }
+        );
+        assert!(
+            db.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &canonical.output_commitment,
+            )
+            .expect("load canonical recovery state")
+            .is_none()
+        );
+
+        let (canonical_subject, owned_output) =
+            current_pending_output_poi_subject(&authority, &cfg, &canonical)
+                .await
+                .expect("canonical external subject is authorized");
+        assert!(owned_output.is_none());
+        let canonical_plan = PendingOutputPoiSubmissionPlan::force_matching(
+            vec![list_key],
+            expected_recovery_state(None).expect("absent recovery state"),
+        );
+        assert_eq!(
+            pending_output_poi_submission_plan_current(
+                &authority,
+                db.as_ref(),
+                &cfg,
+                &[list_key],
+                &canonical,
+                &canonical_subject,
+                &canonical_plan,
+            )
+            .await
+            .expect("canonical submission preflight"),
+            PendingOutputPoiPreflight::Ready
+        );
 
         cancel.cancel();
         drop(db);
@@ -10968,12 +11434,20 @@ mod tests {
     }
 
     fn test_wallet_utxo(block_number: u64, position: u64) -> WalletUtxo {
+        test_wallet_utxo_with_random(block_number, position, [0; 16])
+    }
+
+    fn test_wallet_utxo_with_random(
+        block_number: u64,
+        position: u64,
+        random: [u8; 16],
+    ) -> WalletUtxo {
         WalletUtxo::new(Utxo::new(
             Note {
                 token_hash: U256::from(1),
                 value: U256::from(10),
-                random: [0u8; 16],
-                npk: U256::from(2),
+                random,
+                npk: U256::from(u64::from(random[0]) + 2),
             },
             2,
             position,
@@ -11003,6 +11477,53 @@ mod tests {
             observation: None,
             submitted_poi_list_keys: Vec::new(),
             terminal_error: None,
+        }
+    }
+
+    fn observed_external_pending_output_context(
+        cfg: &WalletConfig,
+        output: &WalletUtxo,
+        list_key: FixedBytes<32>,
+        observed_source: &UtxoSource,
+    ) -> PendingOutputPoiContextRecord {
+        let mut context = pending_output_context_for_wallet_utxo(cfg, output);
+        context.pre_transaction_pois_per_txid_leaf_per_list =
+            BTreeMap::from([(list_key, BTreeMap::new())]);
+        context.required_poi_list_keys = vec![list_key];
+        context.observation = Some(PendingOutputPoiObservation {
+            output_tree: u64::from(output.utxo.tree),
+            output_position: output.utxo.position,
+            tx_hash: observed_source.tx_hash,
+            block_number: observed_source.block_number,
+            block_timestamp: observed_source.block_timestamp,
+        });
+        context.submitted_poi_list_keys = vec![list_key];
+        context.terminal_error = Some("stale observation terminal state".to_string());
+        context
+    }
+
+    fn output_poi_recovery_for_pending_context(
+        context: &PendingOutputPoiContextRecord,
+        status: OutputPoiRecoveryStatus,
+    ) -> OutputPoiRecoveryRecord {
+        OutputPoiRecoveryRecord {
+            chain_id: context.chain_id,
+            wallet_id: context.wallet_id.clone(),
+            output_commitment: context.output_commitment,
+            source_tx_hash: context
+                .observation
+                .as_ref()
+                .expect("observed pending context")
+                .tx_hash,
+            tx_input: None,
+            status,
+            created_at: 123,
+            updated_at: 124,
+            last_detection_at: None,
+            last_submission_at: Some(124),
+            next_retry_at: Some(125),
+            attempt_count: 1,
+            last_error: None,
         }
     }
 

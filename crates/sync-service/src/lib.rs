@@ -41,8 +41,8 @@ pub use types::{
     SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletCacheStore, WalletConfig,
     WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpSource,
     WalletIndexedCatchUpStatus, WalletObservation, WalletPendingSpentMarkOutcome,
-    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
-    WalletSchedulableProgress, WalletViewState,
+    WalletPpoiWorkflowStatus, WalletPrivateRequestError, WalletReadiness, WalletReadinessError,
+    WalletReadinessWaitError, WalletSchedulableProgress, WalletViewState,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

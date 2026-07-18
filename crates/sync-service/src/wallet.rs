@@ -69,10 +69,11 @@ use crate::types::{
     WalletBackfillResetResult, WalletBackfillStartResult, WalletCacheStore,
     WalletCheckpointMutation, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
     WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletObservation,
-    WalletPendingSpentMarkOutcome, WalletPrivateCommit, WalletPrivateRequestError, WalletReadiness,
-    WalletReadinessError, WalletReadinessWaitError, WalletResetReplayPlan, WalletResetRewindStatus,
-    WalletResetToken, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
-    WalletSyncActorStateCommit, WalletSyncToken, WalletUtxoMutation, WalletViewState,
+    WalletPendingSpentMarkOutcome, WalletPpoiWorkflowStatus, WalletPrivateCommit,
+    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
+    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
+    WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
+    WalletUtxoMutation, WalletViewState,
 };
 
 mod actor;
@@ -103,7 +104,8 @@ use handle::{
     OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES, OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER,
     OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_VERIFY_PROOF, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-    PendingOutputPoiSubmissionPredicate, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
+    PendingOutputPoiSubject, PendingOutputPoiSubmissionPredicate,
+    PendingOutputPoiValidationEvidence, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
     WalletIndexedCatchUpCommand, WalletPendingOverlayUpdate, WalletPoiRefreshSelection,
     WalletPrivateRemoteAuthority, WalletPrivateRequest,
 };
@@ -123,12 +125,13 @@ use pending_output_poi::pending_output_poi_submit_identity;
 use pending_output_poi::{
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
     apply_owned_poi_private_delta_on_actor, apply_poi_private_delta,
-    expected_pending_context_state, expected_recovery_state,
+    current_pending_output_poi_subject, expected_pending_context_state, expected_recovery_state,
     pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
-    pending_output_poi_observation_updates, pending_output_poi_submission_plan_current,
-    preflight_and_remote_submit_pending_output_poi,
+    pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,
+    pending_output_poi_submission_plan_current, preflight_and_remote_submit_pending_output_poi,
     process_pending_output_poi_observations_authorized, submit_observed_pending_output_pois_inner,
-    verify_submitted_pending_output_pois_with_config_authorized,
+    verify_submitted_pending_output_pois_with_config_authorized, wallet_ppoi_workflow_status,
+    wallet_ppoi_workflow_status_after_mutations,
 };
 pub(crate) use persist::WalletPoiRuntime;
 use persist::{

@@ -321,7 +321,8 @@ impl WalletPersistState {
                 )
                 .with_pending_output_context_updates(effects.pending_output_context_updates)
                 .with_pending_output_context_deletes(effects.pending_output_context_deletes)
-                .with_output_poi_recovery_updates(effects.output_poi_recovery_updates),
+                .with_output_poi_recovery_updates(effects.output_poi_recovery_updates)
+                .with_output_poi_recovery_deletes(effects.output_poi_recovery_deletes),
             ) {
                 Ok(()) => {
                     self.needs_full_persist = false;
@@ -362,7 +363,8 @@ impl WalletPersistState {
             )
             .with_pending_output_context_updates(effects.pending_output_context_updates)
             .with_pending_output_context_deletes(effects.pending_output_context_deletes)
-            .with_output_poi_recovery_updates(effects.output_poi_recovery_updates),
+            .with_output_poi_recovery_updates(effects.output_poi_recovery_updates)
+            .with_output_poi_recovery_deletes(effects.output_poi_recovery_deletes),
         )?;
         debug!(
             cache_key = %request.cache_key,
@@ -413,6 +415,7 @@ pub(super) struct WalletProgressPrivateEffects<'a> {
     pub(super) pending_output_context_updates: &'a [PendingOutputPoiContextRecord],
     pub(super) pending_output_context_deletes: &'a [FixedBytes<32>],
     pub(super) output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
+    pub(super) output_poi_recovery_deletes: &'a [FixedBytes<32>],
 }
 
 pub(super) struct OutputPoiRecoveryRun<'a> {

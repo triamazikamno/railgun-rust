@@ -4,17 +4,143 @@ use super::{
     ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant,
     OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
     OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-    PendingOutputPoiContextRecord, PendingOutputPoiObservation,
-    PendingOutputPoiSubmissionPredicate, PoiError, PoiPrivateApplyOutcome, PoiStatus,
+    PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
+    PendingOutputPoiSubject, PendingOutputPoiSubmissionPredicate,
+    PendingOutputPoiValidationEvidence, PoiError, PoiPrivateApplyOutcome, PoiStatus,
     PoiStatusReader, PublicPoiCorpusKey, SingleCommitmentProofContext, UtxoPoiMetadata,
     WalletCacheError, WalletCacheKey, WalletCacheStore, WalletCheckpointMutation, WalletConfig,
-    WalletHandle, WalletPoiRuntime, WalletPrivateCommit, WalletPrivateMutationAuthority,
-    WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo,
-    WalletUtxoMutation, debug, new_output_poi_recovery_record, now_epoch_secs, warn,
+    WalletHandle, WalletPoiRuntime, WalletPpoiWorkflowStatus, WalletPrivateCommit,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug,
+    new_output_poi_recovery_record, now_epoch_secs, warn,
 };
 
 #[cfg(test)]
 use super::{PendingOutputPoiSubmitter, PoiRpcClient};
+
+pub(super) fn wallet_ppoi_workflow_status(
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    validation_revision: u64,
+) -> Result<WalletPpoiWorkflowStatus, WalletCacheError> {
+    wallet_ppoi_workflow_status_after_mutations(
+        cache_store,
+        cfg,
+        active_list_keys,
+        validation_revision,
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+}
+
+pub(super) fn wallet_ppoi_workflow_status_after_mutations(
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    validation_revision: u64,
+    pending_updates: &[PendingOutputPoiContextRecord],
+    pending_deletes: &[FixedBytes<32>],
+    recovery_updates: &[OutputPoiRecoveryRecord],
+    recovery_deletes: &[FixedBytes<32>],
+) -> Result<WalletPpoiWorkflowStatus, WalletCacheError> {
+    let mut recoveries = cache_store
+        .list_output_poi_recoveries(cfg.chain.chain_id, &cfg.cache_key)?
+        .into_iter()
+        .map(|record| (record.output_commitment, record))
+        .collect::<BTreeMap<_, _>>();
+    for recovery in recovery_updates {
+        recoveries.insert(recovery.output_commitment, recovery.clone());
+    }
+    for output_commitment in recovery_deletes {
+        recoveries.remove(output_commitment);
+    }
+    let mut contexts = cache_store
+        .list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)?
+        .into_iter()
+        .map(|record| (record.output_commitment, record))
+        .collect::<BTreeMap<_, _>>();
+    for context in pending_updates {
+        contexts.insert(context.output_commitment, context.clone());
+    }
+    for output_commitment in pending_deletes {
+        contexts.remove(output_commitment);
+    }
+    let mut status = WalletPpoiWorkflowStatus {
+        validation_revision,
+        ..WalletPpoiWorkflowStatus::default()
+    };
+    for context in contexts.values() {
+        let Some(observation) = context.observation.as_ref() else {
+            continue;
+        };
+        let required_active_lists = context
+            .list_keys()
+            .into_iter()
+            .filter(|list_key| active_list_keys.contains(list_key))
+            .collect::<Vec<_>>();
+        if required_active_lists.is_empty() {
+            continue;
+        }
+        let matching_valid_recovery =
+            recoveries
+                .get(&context.output_commitment)
+                .is_some_and(|recovery| {
+                    recovery.source_tx_hash == observation.tx_hash
+                        && recovery.status == OutputPoiRecoveryStatus::Valid
+                });
+        let recovery_needs_attention =
+            recoveries
+                .get(&context.output_commitment)
+                .is_some_and(|recovery| {
+                    recovery.source_tx_hash != observation.tx_hash
+                        || !matches!(
+                            recovery.status,
+                            OutputPoiRecoveryStatus::Recoverable
+                                | OutputPoiRecoveryStatus::Submitted
+                                | OutputPoiRecoveryStatus::Valid
+                        )
+                });
+        if context.terminal_error.is_some() || recovery_needs_attention {
+            status.needs_attention = status.needs_attention.saturating_add(1);
+        } else if matching_valid_recovery
+            || required_active_lists
+                .iter()
+                .all(|list_key| context.submitted_poi_list_keys.contains(list_key))
+        {
+            status.awaiting_validation = status.awaiting_validation.saturating_add(1);
+        } else {
+            status.awaiting_submission = status.awaiting_submission.saturating_add(1);
+        }
+    }
+    Ok(status)
+}
+
+fn wallet_ppoi_workflow_status_after_validation(
+    permit: &WalletPrivateMutationPermit<'_>,
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    retired_output_commitment: FixedBytes<32>,
+) -> Result<WalletPpoiWorkflowStatus, WalletCacheError> {
+    let pending_deletes = [retired_output_commitment];
+    let recovery_deletes = [retired_output_commitment];
+    wallet_ppoi_workflow_status_after_mutations(
+        cache_store,
+        cfg,
+        active_list_keys,
+        permit
+            .ppoi_workflow_status()
+            .validation_revision
+            .saturating_add(1),
+        &[],
+        &pending_deletes,
+        &[],
+        &recovery_deletes,
+    )
+}
 
 #[cfg(test)]
 pub(crate) async fn process_pending_output_poi_observations(
@@ -160,21 +286,47 @@ pub(super) fn record_pending_output_poi_observations(
     let wallet_id = wallet_id
         .parse::<WalletCacheKey>()
         .map_err(local_db::DbError::from)?;
-    let updates = pending_output_poi_observation_updates(db, chain_id, &wallet_id, observations)?;
-    let recorded = updates.len();
-    for record in updates {
+    let updates =
+        pending_output_poi_observation_state_updates(db, chain_id, &wallet_id, observations)?;
+    let recorded = updates.context_updates.len();
+    for output_commitment in updates.recovery_deletes {
+        db.delete_output_poi_recovery(chain_id, wallet_id.as_str(), &output_commitment)?;
+    }
+    for record in updates.context_updates {
         db.put_pending_output_poi_context(&record)?;
     }
     Ok(recorded)
 }
 
+#[cfg(test)]
 pub(super) fn pending_output_poi_observation_updates(
     cache_store: &dyn WalletCacheStore,
     chain_id: u64,
     wallet_id: &WalletCacheKey,
     observations: &[CommitmentObservation],
 ) -> Result<Vec<PendingOutputPoiContextRecord>, WalletCacheError> {
-    let mut updates = Vec::new();
+    Ok(pending_output_poi_observation_state_updates(
+        cache_store,
+        chain_id,
+        wallet_id,
+        observations,
+    )?
+    .context_updates)
+}
+
+#[derive(Default)]
+pub(super) struct PendingOutputPoiStateUpdates {
+    pub(super) context_updates: Vec<PendingOutputPoiContextRecord>,
+    pub(super) recovery_deletes: Vec<FixedBytes<32>>,
+}
+
+pub(super) fn pending_output_poi_observation_state_updates(
+    cache_store: &dyn WalletCacheStore,
+    chain_id: u64,
+    wallet_id: &WalletCacheKey,
+    observations: &[CommitmentObservation],
+) -> Result<PendingOutputPoiStateUpdates, WalletCacheError> {
+    let mut updates = PendingOutputPoiStateUpdates::default();
     for observation in observations {
         let output_commitment = FixedBytes::from(observation.commitment.to_be_bytes::<32>());
         let Some(mut record) =
@@ -189,9 +341,55 @@ pub(super) fn pending_output_poi_observation_updates(
             block_number: observation.source.block_number,
             block_timestamp: observation.source.block_timestamp,
         };
-        if record.observe(observed) {
-            updates.push(record);
+        let observation_changed = record.observe(observed.clone());
+        let recovery_mismatch = if observation_changed {
+            false
+        } else {
+            cache_store
+                .get_output_poi_recovery(chain_id, wallet_id, &output_commitment)?
+                .is_some_and(|recovery| recovery.source_tx_hash != observed.tx_hash)
+        };
+        if observation_changed || recovery_mismatch {
+            // An observation identifies the post-transaction recovery subject. Any state
+            // derived from a different (or previously cleared) observation must be retired
+            // in the same durable scan commit before this subject becomes submit-ready.
+            record.submitted_poi_list_keys.clear();
+            record.terminal_error = None;
+            updates.context_updates.push(record);
+            updates.recovery_deletes.push(output_commitment);
         }
+    }
+    Ok(updates)
+}
+
+pub(super) fn pending_output_poi_rewind_state_updates(
+    cache_store: &dyn WalletCacheStore,
+    chain_id: u64,
+    wallet_id: &WalletCacheKey,
+    rewind_from_block: u64,
+    wallet_utxos_before_rewind: &[WalletUtxo],
+) -> Result<PendingOutputPoiStateUpdates, WalletCacheError> {
+    let mut updates = PendingOutputPoiStateUpdates::default();
+    for mut record in cache_store.list_pending_output_poi_contexts(chain_id, wallet_id)? {
+        let rewound_external_observation = record.observation.as_ref().is_some_and(|observation| {
+            observation.block_number >= rewind_from_block
+                && matches!(
+                    record.output_role,
+                    PendingOutputPoiRole::Recipient | PendingOutputPoiRole::BroadcasterFee
+                )
+                && !wallet_utxos_before_rewind
+                    .iter()
+                    .any(|wallet_utxo| wallet_utxo.utxo.poi.commitment == record.output_commitment)
+        });
+        if !rewound_external_observation {
+            continue;
+        }
+
+        record.observation = None;
+        record.submitted_poi_list_keys.clear();
+        record.terminal_error = None;
+        updates.recovery_deletes.push(record.output_commitment);
+        updates.context_updates.push(record);
     }
     Ok(updates)
 }
@@ -304,7 +502,7 @@ impl PendingOutputPoiSubmissionPlan {
         &mut self,
         context: &PendingOutputPoiContextRecord,
         active_list_keys: &[FixedBytes<32>],
-        poi: &UtxoPoiMetadata,
+        poi: Option<&UtxoPoiMetadata>,
     ) {
         self.list_keys = recoverable_pending_submission_list_keys(
             context,
@@ -338,7 +536,7 @@ impl PendingOutputPoiSubmissionPlan {
 fn recoverable_pending_submission_list_keys(
     context: &PendingOutputPoiContextRecord,
     active_list_keys: &[FixedBytes<32>],
-    poi: &UtxoPoiMetadata,
+    poi: Option<&UtxoPoiMetadata>,
     predicate: PendingOutputPoiSubmissionPredicate,
 ) -> Vec<FixedBytes<32>> {
     let submitted_list_keys = &context.submitted_poi_list_keys;
@@ -353,10 +551,11 @@ fn recoverable_pending_submission_list_keys(
     };
     list_keys.retain(|list_key| {
         active_list_keys.contains(list_key)
-            && poi
-                .statuses
-                .get(list_key)
-                .is_none_or(|status| status.is_recoverable())
+            && poi.is_none_or(|poi| {
+                poi.statuses
+                    .get(list_key)
+                    .is_none_or(|status| status.is_recoverable())
+            })
     });
     list_keys
 }
@@ -390,14 +589,18 @@ async fn submit_observed_pending_output_pois_impl(
         let Some(expected_recovery) = expected_recovery_state(recovery.as_ref()) else {
             continue;
         };
-        let Some(current_output) =
-            current_wallet_output_for_pending_context(authority, cfg, &record).await
+        let Some((subject, current_output)) =
+            current_pending_output_poi_subject(authority, cfg, &record).await
         else {
             continue;
         };
         let mut plan =
             PendingOutputPoiSubmissionPlan::missing(record.missing_list_keys(), expected_recovery);
-        plan.retain_current_recoverable(&record, active_list_keys, &current_output.utxo.poi);
+        plan.retain_current_recoverable(
+            &record,
+            active_list_keys,
+            current_output.as_ref().map(|output| &output.utxo.poi),
+        );
         if plan.list_keys.is_empty()
             && let Some(recovery) = recovery.as_ref()
             && recovery.submission_retry_allowed(now, force_submission_retry)
@@ -407,12 +610,15 @@ async fn submit_observed_pending_output_pois_impl(
                 plan.expected_recovery.clone(),
                 force_submission_retry,
             );
-            plan.retain_current_recoverable(&record, active_list_keys, &current_output.utxo.poi);
+            plan.retain_current_recoverable(
+                &record,
+                active_list_keys,
+                current_output.as_ref().map(|output| &output.utxo.poi),
+            );
         }
         if plan.list_keys.is_empty() {
             continue;
         }
-        let expected_output = ExpectedWalletOutput::new(&current_output);
         let Some(expected_context_fingerprint) = pending_output_poi_context_fingerprint(&record)
         else {
             continue;
@@ -424,6 +630,7 @@ async fn submit_observed_pending_output_pois_impl(
             active_list_keys,
             &record,
             &observation,
+            &subject,
             &plan,
             private_poi,
         )
@@ -438,9 +645,11 @@ async fn submit_observed_pending_output_pois_impl(
                     cache_store,
                     cfg,
                     OwnedPoiPrivateDelta::PendingContextTerminal {
-                        expected_output,
+                        subject: subject.clone(),
                         expected_context_fingerprint,
-                        active_list_keys: plan.list_keys.clone(),
+                        expected_recovery: plan.expected_recovery.clone(),
+                        active_list_keys: active_list_keys.to_vec(),
+                        target_list_keys: plan.list_keys.clone(),
                         error: "missing pre-transaction POI for pending output".to_string(),
                     },
                 )
@@ -462,6 +671,7 @@ async fn submit_observed_pending_output_pois_impl(
                     &record,
                     cfg,
                     active_list_keys,
+                    &subject,
                     &plan,
                 )
                 .await?
@@ -474,7 +684,7 @@ async fn submit_observed_pending_output_pois_impl(
                     cache_store,
                     cfg,
                     OwnedPoiPrivateDelta::PendingSubmission {
-                        expected_output,
+                        subject: subject.clone(),
                         expected_context_fingerprint,
                         expected_recovery: plan.expected_recovery.clone(),
                         active_list_keys: active_list_keys.to_vec(),
@@ -506,6 +716,7 @@ async fn submit_observed_pending_output_pois_impl(
                     &record,
                     cfg,
                     active_list_keys,
+                    &subject,
                     &plan,
                 )
                 .await?
@@ -518,7 +729,7 @@ async fn submit_observed_pending_output_pois_impl(
                     cache_store,
                     cfg,
                     OwnedPoiPrivateDelta::PendingSubmission {
-                        expected_output,
+                        subject: subject.clone(),
                         expected_context_fingerprint,
                         expected_recovery: plan.expected_recovery.clone(),
                         active_list_keys: active_list_keys.to_vec(),
@@ -675,6 +886,7 @@ async fn submit_pending_output_poi_context_via_gateway(
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
+    subject: &PendingOutputPoiSubject,
     plan: &PendingOutputPoiSubmissionPlan,
     private_poi: &WalletPrivatePoiClients,
     chain_id: u64,
@@ -702,6 +914,7 @@ async fn submit_pending_output_poi_context_via_gateway(
                                     cfg,
                                     active_list_keys,
                                     record,
+                                    subject,
                                     plan,
                                 )
                                 .await?,
@@ -745,6 +958,7 @@ async fn submit_pending_output_poi_context_via_gateway(
                             cfg,
                             active_list_keys,
                             record,
+                            subject,
                             plan,
                         )
                         .await?,
@@ -993,10 +1207,15 @@ async fn apply_poi_private_delta_inline(
         .wallet_utxos()
         .await
         .map_err(|_| WalletCacheError::Crypto)?;
+    if permit.chain_id() != cfg.chain.chain_id || permit.wallet_id() != &cfg.cache_key {
+        drop(permit);
+        return Ok(PoiPrivateApplyOutcome::Skipped);
+    }
     match delta {
         OwnedPoiPrivateDelta::OutputRecovery {
             expected_output,
             active_list_keys,
+            target_list_keys,
             required_poi_status,
             pending_update,
             expected_recovery,
@@ -1011,9 +1230,13 @@ async fn apply_poi_private_delta_inline(
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             };
             if active_list_keys.is_empty()
+                || target_list_keys.is_empty()
+                || target_list_keys
+                    .iter()
+                    .any(|list_key| !active_list_keys.contains(list_key))
                 || !expected_poi_status_matches(
                     &wallet_utxo.utxo.poi,
-                    &active_list_keys,
+                    &target_list_keys,
                     required_poi_status,
                 )
             {
@@ -1070,6 +1293,16 @@ async fn apply_poi_private_delta_inline(
             recovery.apply_action(action, now);
             let pending_updates: Vec<_> = pending_update.into_iter().collect();
             let recovery_updates = [recovery];
+            let workflow_status = wallet_ppoi_workflow_status_after_mutations(
+                cache_store,
+                cfg,
+                &active_list_keys,
+                permit.ppoi_workflow_status().validation_revision,
+                &pending_updates,
+                &[],
+                &recovery_updates,
+                &[],
+            )?;
             let result = permit.with_durable_apply(|token| {
                 cache_store.commit_wallet_private_state(
                     WalletPrivateCommit::new(
@@ -1080,7 +1313,9 @@ async fn apply_poi_private_delta_inline(
                     )
                     .with_pending_output_context_updates(&pending_updates)
                     .with_output_poi_recovery_updates(&recovery_updates),
-                )
+                )?;
+                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                Ok::<(), WalletCacheError>(())
             });
             drop(permit);
             match result {
@@ -1092,7 +1327,7 @@ async fn apply_poi_private_delta_inline(
             }
         }
         OwnedPoiPrivateDelta::PendingSubmission {
-            expected_output,
+            subject,
             expected_context_fingerprint,
             expected_recovery,
             active_list_keys,
@@ -1102,19 +1337,11 @@ async fn apply_poi_private_delta_inline(
             action,
             now,
         } => {
-            let Some(wallet_utxo) = snapshot
-                .iter()
-                .find(|wallet_utxo| expected_output.matches(wallet_utxo))
-            else {
-                drop(permit);
-                return Ok(PoiPrivateApplyOutcome::Skipped);
-            };
             if active_list_keys.is_empty()
                 || list_keys.is_empty()
                 || list_keys
                     .iter()
                     .any(|list_key| !active_list_keys.contains(list_key))
-                || !poi_statuses_are_recoverable_for_lists(&wallet_utxo.utxo.poi, &list_keys)
             {
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -1122,7 +1349,7 @@ async fn apply_poi_private_delta_inline(
             let Some(mut current_context) = cache_store.get_pending_output_poi_context(
                 cfg.chain.chain_id,
                 &cfg.cache_key,
-                &expected_output.output_commitment(),
+                &subject.output_commitment(),
             )?
             else {
                 drop(permit);
@@ -1136,10 +1363,26 @@ async fn apply_poi_private_delta_inline(
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             }
+            let Some(subject_match) = pending_output_poi_subject_matches_snapshot(
+                cfg,
+                &snapshot,
+                &current_context,
+                &subject,
+            ) else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            if subject_match
+                .poi()
+                .is_some_and(|poi| !poi_statuses_are_recoverable_for_lists(poi, &list_keys))
+            {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
             let current_recovery = cache_store.get_output_poi_recovery(
                 cfg.chain.chain_id,
                 &cfg.cache_key,
-                &expected_output.output_commitment(),
+                &subject.output_commitment(),
             )?;
             if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
                 || current_recovery
@@ -1166,11 +1409,13 @@ async fn apply_poi_private_delta_inline(
                         current_context.submitted_poi_list_keys.push(*list_key);
                     }
                 }
-                prune_nonrecoverable_unsubmitted_poi_lists(
-                    &mut current_context,
-                    &wallet_utxo.utxo.poi,
-                    &active_list_keys,
-                );
+                if let Some(poi) = subject_match.poi() {
+                    prune_nonrecoverable_unsubmitted_poi_lists(
+                        &mut current_context,
+                        poi,
+                        &active_list_keys,
+                    );
+                }
             }
             let mut recovery = current_recovery.unwrap_or_else(|| {
                 new_pending_output_poi_recovery_record(
@@ -1187,6 +1432,16 @@ async fn apply_poi_private_delta_inline(
                 .into_iter()
                 .collect();
             let recovery_updates = [recovery];
+            let workflow_status = wallet_ppoi_workflow_status_after_mutations(
+                cache_store,
+                cfg,
+                &active_list_keys,
+                permit.ppoi_workflow_status().validation_revision,
+                &pending_updates,
+                &[],
+                &recovery_updates,
+                &[],
+            )?;
             let result = permit.with_durable_apply(|token| {
                 cache_store.commit_wallet_private_state(
                     WalletPrivateCommit::new(
@@ -1197,7 +1452,9 @@ async fn apply_poi_private_delta_inline(
                     )
                     .with_pending_output_context_updates(&pending_updates)
                     .with_output_poi_recovery_updates(&recovery_updates),
-                )
+                )?;
+                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                Ok::<(), WalletCacheError>(())
             });
             drop(permit);
             match result {
@@ -1209,20 +1466,18 @@ async fn apply_poi_private_delta_inline(
             }
         }
         OwnedPoiPrivateDelta::PendingContextTerminal {
-            expected_output,
+            subject,
             expected_context_fingerprint,
+            expected_recovery,
             active_list_keys,
+            target_list_keys,
             error,
         } => {
-            let Some(wallet_utxo) = snapshot
-                .iter()
-                .find(|wallet_utxo| expected_output.matches(wallet_utxo))
-            else {
-                drop(permit);
-                return Ok(PoiPrivateApplyOutcome::Skipped);
-            };
             if active_list_keys.is_empty()
-                || !poi_statuses_are_recoverable_for_lists(&wallet_utxo.utxo.poi, &active_list_keys)
+                || target_list_keys.is_empty()
+                || target_list_keys
+                    .iter()
+                    .any(|list_key| !active_list_keys.contains(list_key))
             {
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -1230,7 +1485,7 @@ async fn apply_poi_private_delta_inline(
             let Some(mut current_context) = cache_store.get_pending_output_poi_context(
                 cfg.chain.chain_id,
                 &cfg.cache_key,
-                &expected_output.output_commitment(),
+                &subject.output_commitment(),
             )?
             else {
                 drop(permit);
@@ -1242,8 +1497,51 @@ async fn apply_poi_private_delta_inline(
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             }
+            let Some(subject_match) = pending_output_poi_subject_matches_snapshot(
+                cfg,
+                &snapshot,
+                &current_context,
+                &subject,
+            ) else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            if subject_match
+                .poi()
+                .is_some_and(|poi| !poi_statuses_are_recoverable_for_lists(poi, &target_list_keys))
+            {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
+            let Some(observation) = current_context.observation.as_ref() else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            let current_recovery = cache_store.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &subject.output_commitment(),
+            )?;
+            if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
+                || current_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.source_tx_hash != observation.tx_hash)
+            {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
             current_context.terminal_error = Some(error);
             let pending_updates = [current_context];
+            let workflow_status = wallet_ppoi_workflow_status_after_mutations(
+                cache_store,
+                cfg,
+                &active_list_keys,
+                permit.ppoi_workflow_status().validation_revision,
+                &pending_updates,
+                &[],
+                &[],
+                &[],
+            )?;
             let result = permit.with_durable_apply(|token| {
                 cache_store.commit_wallet_private_state(
                     WalletPrivateCommit::new(
@@ -1253,7 +1551,9 @@ async fn apply_poi_private_delta_inline(
                         WalletCheckpointMutation::Preserve,
                     )
                     .with_pending_output_context_updates(&pending_updates),
-                )
+                )?;
+                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                Ok::<(), WalletCacheError>(())
             });
             drop(permit);
             match result {
@@ -1265,21 +1565,16 @@ async fn apply_poi_private_delta_inline(
             }
         }
         OwnedPoiPrivateDelta::VerifiedValid {
-            output_commitment,
+            subject,
+            evidence,
             expected_context_fingerprint,
-            expected_output,
+            expected_recovery,
             expected_poi_list_state,
             active_list_keys,
             valid_list_keys,
             now,
         } => {
-            let Some(wallet_utxo) = snapshot
-                .iter_mut()
-                .find(|wallet_utxo| expected_output.matches(wallet_utxo))
-            else {
-                drop(permit);
-                return Ok(PoiPrivateApplyOutcome::Skipped);
-            };
+            let output_commitment = subject.output_commitment();
             let Some(current_context) = cache_store.get_pending_output_poi_context(
                 cfg.chain.chain_id,
                 &cfg.cache_key,
@@ -1289,26 +1584,125 @@ async fn apply_poi_private_delta_inline(
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             };
+            let Some(subject_match) = pending_output_poi_subject_matches_snapshot(
+                cfg,
+                &snapshot,
+                &current_context,
+                &subject,
+            ) else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
             let current_list_keys = current_context.list_keys();
+            let submitted_lists_match = valid_list_keys
+                .iter()
+                .all(|list_key| current_context.submitted_poi_list_keys.contains(list_key));
+            let evidence_matches = match evidence {
+                PendingOutputPoiValidationEvidence::SubmittedStatus => submitted_lists_match,
+                PendingOutputPoiValidationEvidence::OwnedStatusRefresh => {
+                    matches!(
+                        &subject_match,
+                        PendingOutputPoiSubjectMatch::Owned(output)
+                            if expected_poi_list_state.as_ref().is_some_and(|expected| {
+                                expected.matches_valid(&output.utxo.poi, &valid_list_keys)
+                            })
+                    )
+                }
+            };
             if active_list_keys.is_empty()
                 || valid_list_keys.is_empty()
                 || valid_list_keys
                     .iter()
                     .any(|list_key| !active_list_keys.contains(list_key))
-                || !expected_poi_list_state
-                    .matches_recoverable_or_valid(&wallet_utxo.utxo.poi, &valid_list_keys)
                 || pending_output_poi_context_fingerprint(&current_context).as_ref()
                     != Some(&expected_context_fingerprint)
-                || !pending_output_poi_context_matches_wallet_utxo(
-                    cfg,
-                    wallet_utxo,
-                    &current_context,
-                )
-                || valid_list_keys.iter().any(|list_key| {
-                    !current_list_keys.contains(list_key)
-                        || !current_context.submitted_poi_list_keys.contains(list_key)
-                })
+                || valid_list_keys
+                    .iter()
+                    .any(|list_key| !current_list_keys.contains(list_key))
+                || !evidence_matches
             {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
+            let Some(observation) = current_context.observation.as_ref() else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            let current_recovery = cache_store.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &output_commitment,
+            )?;
+            if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
+                || current_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.source_tx_hash != observation.tx_hash)
+            {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
+
+            if matches!(subject_match, PendingOutputPoiSubjectMatch::External) {
+                if expected_poi_list_state.is_some() {
+                    drop(permit);
+                    return Ok(PoiPrivateApplyOutcome::Skipped);
+                }
+                let workflow_candidate = wallet_ppoi_workflow_status_after_validation(
+                    &permit,
+                    cache_store,
+                    cfg,
+                    &active_list_keys,
+                    output_commitment,
+                )?;
+                let pending_deletes = [output_commitment];
+                let recovery_deletes = [output_commitment];
+                let result = permit.with_durable_apply(|token| {
+                    cache_store.commit_wallet_private_state(
+                        WalletPrivateCommit::new(
+                            &token,
+                            &permit,
+                            WalletUtxoMutation::Preserve,
+                            WalletCheckpointMutation::Preserve,
+                        )
+                        .with_pending_output_context_deletes(&pending_deletes)
+                        .with_output_poi_recovery_deletes(&recovery_deletes),
+                    )?;
+                    permit.apply_publish_ppoi_workflow_status(&token, workflow_candidate);
+                    Ok::<(), WalletCacheError>(())
+                });
+                drop(permit);
+                return match result {
+                    Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
+                        utxo_changed: false,
+                    }),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => Err(WalletCacheError::Crypto),
+                };
+            }
+
+            let PendingOutputPoiSubject::Owned(expected_output) = subject else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            let Some(wallet_utxo) = snapshot
+                .iter_mut()
+                .find(|wallet_utxo| expected_output.matches(wallet_utxo))
+            else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            let Some(expected_poi_list_state) = expected_poi_list_state else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            let poi_state_matches = match evidence {
+                PendingOutputPoiValidationEvidence::SubmittedStatus => expected_poi_list_state
+                    .matches_recoverable_or_valid(&wallet_utxo.utxo.poi, &valid_list_keys),
+                PendingOutputPoiValidationEvidence::OwnedStatusRefresh => {
+                    expected_poi_list_state.matches_valid(&wallet_utxo.utxo.poi, &valid_list_keys)
+                }
+            };
+            if !poi_state_matches {
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             }
@@ -1341,23 +1735,22 @@ async fn apply_poi_private_delta_inline(
             } else {
                 OutputPoiRecoveryAction::Valid
             };
-            let current_recovery = cache_store.get_output_poi_recovery(
-                cfg.chain.chain_id,
-                &cfg.cache_key,
-                &output_commitment,
-            )?;
-            let mut recovery = match current_recovery {
-                Some(recovery) if recovery.source_tx_hash == wallet_utxo.utxo.source.tx_hash => {
-                    recovery
-                }
-                _ => new_output_poi_recovery_record(
+            let mut recovery = current_recovery.unwrap_or_else(|| {
+                new_output_poi_recovery_record(
                     cfg,
                     wallet_utxo,
                     output_poi_recovery_default_status(&recovery_action),
                     now,
-                ),
-            };
+                )
+            });
             recovery.apply_action(recovery_action, now);
+            let workflow_candidate = wallet_ppoi_workflow_status_after_validation(
+                &permit,
+                cache_store,
+                cfg,
+                &active_list_keys,
+                output_commitment,
+            )?;
             let recovery_updates_owned = [recovery];
             let pending_deletes_owned = [output_commitment];
             let mut utxos_locked = if changed {
@@ -1394,6 +1787,7 @@ async fn apply_poi_private_delta_inline(
                         .map_or(&[] as &[WalletUtxo], |locked| locked.as_slice());
                     permit.apply_notify_changed(&token, utxos, &overlay);
                 }
+                permit.apply_publish_ppoi_workflow_status(&token, workflow_candidate);
                 Ok::<(), WalletCacheError>(())
             });
             drop(utxos_locked);
@@ -1598,6 +1992,105 @@ pub(super) fn pending_output_poi_context_matches_wallet_utxo(
     })
 }
 
+enum PendingOutputPoiSubjectMatch {
+    Owned(Box<WalletUtxo>),
+    External,
+}
+
+impl PendingOutputPoiSubjectMatch {
+    const fn poi(&self) -> Option<&UtxoPoiMetadata> {
+        match self {
+            Self::Owned(output) => Some(&output.utxo.poi),
+            Self::External => None,
+        }
+    }
+}
+
+fn pending_output_poi_subject_matches_snapshot(
+    cfg: &WalletConfig,
+    snapshot: &[WalletUtxo],
+    record: &PendingOutputPoiContextRecord,
+    subject: &PendingOutputPoiSubject,
+) -> Option<PendingOutputPoiSubjectMatch> {
+    if record.chain_id != cfg.chain.chain_id || record.wallet_id != cfg.cache_key.as_str() {
+        return None;
+    }
+    let observation = record.observation.as_ref()?;
+    let identity = pending_output_poi_submit_identity(record, observation)?;
+    match subject {
+        PendingOutputPoiSubject::Owned(expected_output) => snapshot
+            .iter()
+            .find(|output| {
+                expected_output.matches(output)
+                    && pending_output_poi_context_matches_wallet_utxo(cfg, output, record)
+            })
+            .cloned()
+            .map(Box::new)
+            .map(PendingOutputPoiSubjectMatch::Owned),
+        PendingOutputPoiSubject::External {
+            output_commitment,
+            derived_blinded_commitment,
+        } => {
+            if !matches!(
+                record.output_role,
+                PendingOutputPoiRole::Recipient | PendingOutputPoiRole::BroadcasterFee
+            ) || record.output_commitment != *output_commitment
+                || identity.derived_blinded_commitment != *derived_blinded_commitment
+                || snapshot.iter().any(|output| {
+                    !output.is_spent() && output.utxo.poi.commitment == record.output_commitment
+                })
+            {
+                return None;
+            }
+            Some(PendingOutputPoiSubjectMatch::External)
+        }
+    }
+}
+
+pub(super) async fn current_pending_output_poi_subject(
+    authority: &WalletPrivateMutationAuthority<'_>,
+    cfg: &WalletConfig,
+    record: &PendingOutputPoiContextRecord,
+) -> Option<(PendingOutputPoiSubject, Option<WalletUtxo>)> {
+    if authority.revalidate().is_err()
+        || authority.chain_id() != cfg.chain.chain_id
+        || authority.wallet_id() != &cfg.cache_key
+        || record.chain_id != cfg.chain.chain_id
+        || record.wallet_id != cfg.cache_key.as_str()
+    {
+        return None;
+    }
+    let observation = record.observation.as_ref()?;
+    let identity = pending_output_poi_submit_identity(record, observation)?;
+    let snapshot = authority.wallet_utxos().await.ok()?;
+    let matching_output = snapshot.iter().find(|output| {
+        !output.is_spent() && pending_output_poi_context_matches_wallet_utxo(cfg, output, record)
+    });
+    let result = if let Some(output) = matching_output {
+        (
+            PendingOutputPoiSubject::Owned(ExpectedWalletOutput::new(output)),
+            Some(output.clone()),
+        )
+    } else {
+        if !matches!(
+            record.output_role,
+            PendingOutputPoiRole::Recipient | PendingOutputPoiRole::BroadcasterFee
+        ) || snapshot.iter().any(|output| {
+            !output.is_spent() && output.utxo.poi.commitment == record.output_commitment
+        }) {
+            return None;
+        }
+        (
+            PendingOutputPoiSubject::External {
+                output_commitment: record.output_commitment,
+                derived_blinded_commitment: identity.derived_blinded_commitment,
+            },
+            None,
+        )
+    };
+    authority.revalidate().is_ok().then_some(result)
+}
+
 /// Sole preflight gate before remote pending-output POI disclosure.
 pub(super) async fn pending_output_poi_submission_plan_current(
     authority: &WalletPrivateMutationAuthority<'_>,
@@ -1605,6 +2098,7 @@ pub(super) async fn pending_output_poi_submission_plan_current(
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
     expected: &PendingOutputPoiContextRecord,
+    subject: &PendingOutputPoiSubject,
     plan: &PendingOutputPoiSubmissionPlan,
 ) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
     if authority.revalidate().is_err() {
@@ -1613,6 +2107,9 @@ pub(super) async fn pending_output_poi_submission_plan_current(
             "pending output POI submission skipped before plan validation"
         );
         return Ok(PendingOutputPoiPreflight::AuthorityStale);
+    }
+    if authority.chain_id() != cfg.chain.chain_id || authority.wallet_id() != &cfg.cache_key {
+        return Ok(PendingOutputPoiPreflight::NotCurrent);
     }
     let Some(current) = cache_store.get_pending_output_poi_context(
         cfg.chain.chain_id,
@@ -1728,21 +2225,19 @@ pub(super) async fn pending_output_poi_submission_plan_current(
             PendingOutputPoiPreflight::NotCurrent
         });
     };
-    let current_output = snapshot.iter().find(|wallet_utxo| {
-        !wallet_utxo.is_spent()
-            && pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, expected)
-    });
-    let Some(current_output) = current_output else {
+    let Some(subject_match) =
+        pending_output_poi_subject_matches_snapshot(cfg, &snapshot, &current, subject)
+    else {
         debug!(
             chain_id = cfg.chain.chain_id,
-            "pending output POI submission skipped; output no longer matches wallet state"
+            "pending output POI submission skipped; subject no longer matches wallet state"
         );
         return Ok(PendingOutputPoiPreflight::NotCurrent);
     };
     let current_recoverable_list_keys = recoverable_pending_submission_list_keys(
         &current,
         active_list_keys,
-        &current_output.utxo.poi,
+        subject_match.poi(),
         plan.predicate(),
     );
     if current_recoverable_list_keys != plan.list_keys {
@@ -1752,6 +2247,41 @@ pub(super) async fn pending_output_poi_submission_plan_current(
             current_recoverable_poi_lists = current_recoverable_list_keys.len(),
             "pending output POI submission skipped; recoverable target-list subset changed"
         );
+        return Ok(PendingOutputPoiPreflight::NotCurrent);
+    }
+    let Some(postflight_context) = cache_store.get_pending_output_poi_context(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &expected.output_commitment,
+    )?
+    else {
+        return Ok(PendingOutputPoiPreflight::NotCurrent);
+    };
+    let postflight_recovery = cache_store.get_output_poi_recovery(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &expected.output_commitment,
+    )?;
+    let Some(final_context) = cache_store.get_pending_output_poi_context(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &expected.output_commitment,
+    )?
+    else {
+        return Ok(PendingOutputPoiPreflight::NotCurrent);
+    };
+    if pending_output_poi_context_fingerprint(&postflight_context)
+        != pending_output_poi_context_fingerprint(expected)
+        || pending_output_poi_context_fingerprint(&final_context)
+            != pending_output_poi_context_fingerprint(expected)
+        || !expected_recovery_matches(&plan.expected_recovery, postflight_recovery.as_ref())
+        || postflight_recovery.as_ref().is_some_and(|recovery| {
+            final_context
+                .observation
+                .as_ref()
+                .is_none_or(|observation| recovery.source_tx_hash != observation.tx_hash)
+        })
+    {
         return Ok(PendingOutputPoiPreflight::NotCurrent);
     }
     if authority.revalidate().is_err() {
@@ -1770,6 +2300,7 @@ async fn pending_output_poi_submission_side_effect_current(
     expected: &PendingOutputPoiContextRecord,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
+    subject: &PendingOutputPoiSubject,
     plan: &PendingOutputPoiSubmissionPlan,
 ) -> Result<bool, WalletCacheError> {
     Ok(matches!(
@@ -1779,6 +2310,7 @@ async fn pending_output_poi_submission_side_effect_current(
             cfg,
             active_list_keys,
             expected,
+            subject,
             plan,
         )
         .await?,
@@ -1795,15 +2327,20 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
     active_list_keys: &[FixedBytes<32>],
     record: &PendingOutputPoiContextRecord,
     observation: &PendingOutputPoiObservation,
+    subject: &PendingOutputPoiSubject,
     plan: &PendingOutputPoiSubmissionPlan,
     private_poi: &WalletPrivatePoiClients,
 ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
+    if record.observation.as_ref() != Some(observation) {
+        return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
+    }
     match pending_output_poi_submission_plan_current(
         authority,
         cache_store,
         cfg,
         active_list_keys,
         record,
+        subject,
         plan,
     )
     .await?
@@ -1848,6 +2385,7 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
         cache_store,
         cfg,
         active_list_keys,
+        subject,
         plan,
         private_poi,
         cfg.chain.chain_id,
@@ -1857,33 +2395,6 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
         &submitted_list_keys,
     )
     .await
-}
-
-pub(super) fn pending_output_poi_context_still_current(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    cache_store: &dyn WalletCacheStore,
-    chain_id: u64,
-    wallet_id: &WalletCacheKey,
-    expected: &PendingOutputPoiContextRecord,
-) -> Result<bool, WalletCacheError> {
-    if authority.revalidate().is_err() {
-        debug!(chain_id, "pending output POI context side effect rejected");
-        return Ok(false);
-    }
-    let Some(current) = cache_store.get_pending_output_poi_context(
-        chain_id,
-        wallet_id,
-        &expected.output_commitment,
-    )?
-    else {
-        debug!(
-            chain_id,
-            "pending output POI context side effect skipped; context disappeared"
-        );
-        return Ok(false);
-    };
-    Ok(pending_output_poi_context_fingerprint(&current)
-        .is_some_and(|current| Some(current) == pending_output_poi_context_fingerprint(expected)))
 }
 
 #[cfg(test)]
@@ -1972,6 +2483,8 @@ async fn read_pending_output_poi_statuses(
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     record: &PendingOutputPoiContextRecord,
+    subject: &PendingOutputPoiSubject,
+    expected_recovery: &ExpectedRecordState,
     list_keys: &[FixedBytes<32>],
     identity: &PendingOutputPoiSubmitIdentity,
 ) -> Result<Option<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>>, String> {
@@ -1993,18 +2506,15 @@ async fn read_pending_output_poi_statuses(
         AuthorizedPoiStatusSource::Remote(private_poi) => match private_poi
             .pois_per_list(
                 || async {
-                    if !pending_output_poi_context_has_current_wallet_utxo(authority, cfg, record)
-                        .await
-                    {
-                        return Ok(false);
-                    }
-                    pending_output_poi_context_still_current(
+                    pending_output_poi_subject_still_current(
                         authority,
                         cache_store,
-                        cfg.chain.chain_id,
-                        &cfg.cache_key,
+                        cfg,
                         record,
+                        subject,
+                        expected_recovery,
                     )
+                    .await
                 },
                 &record.txid_version,
                 EVM_CHAIN_TYPE,
@@ -2155,30 +2665,6 @@ pub(super) async fn verify_submitted_pending_output_pois_with_config_authorized(
 }
 
 #[cfg(test)]
-pub(super) async fn verify_submitted_pending_output_pois_authorized(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    status_reader: &dyn PoiStatusReader,
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    active_list_keys: &[FixedBytes<32>],
-) -> PendingOutputPoiVerificationOutcome {
-    if authority.revalidate().is_err() {
-        debug!(chain_id, "pending output POI verification skipped");
-        return PendingOutputPoiVerificationOutcome::default();
-    }
-    verify_submitted_pending_output_pois_check_only(
-        authority,
-        status_reader,
-        db,
-        chain_id,
-        wallet_id,
-        active_list_keys,
-    )
-    .await
-}
-
-#[cfg(test)]
 pub(super) async fn verify_submitted_pending_output_pois_authorized_with_projection(
     authority: &WalletPrivateMutationAuthority<'_>,
     status_reader: &dyn PoiStatusReader,
@@ -2260,54 +2746,75 @@ async fn verify_submitted_pending_output_pois_unchecked(
     .await
 }
 
-pub(super) async fn pending_output_poi_context_has_current_wallet_utxo(
+async fn pending_output_poi_subject_still_current(
     authority: &WalletPrivateMutationAuthority<'_>,
+    cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     record: &PendingOutputPoiContextRecord,
-) -> bool {
-    current_wallet_output_for_pending_context(authority, cfg, record)
+    subject: &PendingOutputPoiSubject,
+    expected_recovery: &ExpectedRecordState,
+) -> Result<bool, WalletCacheError> {
+    if authority.revalidate().is_err() {
+        return Ok(false);
+    }
+    let Some(current) = cache_store.get_pending_output_poi_context(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &record.output_commitment,
+    )?
+    else {
+        return Ok(false);
+    };
+    if pending_output_poi_context_fingerprint(&current)
+        != pending_output_poi_context_fingerprint(record)
+    {
+        return Ok(false);
+    }
+    let snapshot = authority
+        .wallet_utxos()
         .await
-        .is_some()
-}
-
-async fn current_wallet_output_for_pending_context(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    cfg: &WalletConfig,
-    record: &PendingOutputPoiContextRecord,
-) -> Option<WalletUtxo> {
-    if authority.revalidate().is_err() {
-        debug!(
-            chain_id = cfg.chain.chain_id,
-            "pending output POI verification skipped before status query"
-        );
-        return None;
-    }
-    let Ok(snapshot) = authority.wallet_utxos().await else {
-        debug!(
-            chain_id = cfg.chain.chain_id,
-            "pending output POI verification skipped before wallet state check"
-        );
-        return None;
+        .map_err(|_| WalletCacheError::Crypto)?;
+    let Some(postflight_context) = cache_store.get_pending_output_poi_context(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &record.output_commitment,
+    )?
+    else {
+        return Ok(false);
     };
-    let current = snapshot.into_iter().find(|wallet_utxo| {
-        !wallet_utxo.is_spent()
-            && pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, record)
-    });
-    let Some(current) = current else {
-        debug!(
-            chain_id = cfg.chain.chain_id,
-            "pending output POI verification skipped; output no longer matches wallet state"
-        );
-        return None;
-    };
-    if authority.revalidate().is_err() {
-        debug!(
-            chain_id = cfg.chain.chain_id,
-            "pending output POI verification skipped after wallet state check"
-        );
-        return None;
+    if authority.revalidate().is_err()
+        || pending_output_poi_context_fingerprint(&postflight_context)
+            != pending_output_poi_context_fingerprint(record)
+        || pending_output_poi_subject_matches_snapshot(cfg, &snapshot, &postflight_context, subject)
+            .is_none()
+    {
+        return Ok(false);
     }
-    Some(current)
+    let current_recovery = cache_store.get_output_poi_recovery(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &record.output_commitment,
+    )?;
+    let Some(final_context) = cache_store.get_pending_output_poi_context(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        &record.output_commitment,
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(authority.revalidate().is_ok()
+        && pending_output_poi_context_fingerprint(&final_context)
+            == pending_output_poi_context_fingerprint(record)
+        && pending_output_poi_subject_matches_snapshot(cfg, &snapshot, &final_context, subject)
+            .is_some()
+        && expected_recovery_matches(expected_recovery, current_recovery.as_ref())
+        && current_recovery.as_ref().is_none_or(|recovery| {
+            final_context
+                .observation
+                .as_ref()
+                .is_some_and(|observation| recovery.source_tx_hash == observation.tx_hash)
+        }))
 }
 
 async fn commit_verified_pending_output_poi_context(
@@ -2316,8 +2823,10 @@ async fn commit_verified_pending_output_poi_context(
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     record: &PendingOutputPoiContextRecord,
-    expected_output: ExpectedWalletOutput,
-    expected_poi_list_state: ExpectedPoiListState,
+    subject: PendingOutputPoiSubject,
+    evidence: PendingOutputPoiValidationEvidence,
+    expected_recovery: ExpectedRecordState,
+    expected_poi_list_state: Option<ExpectedPoiListState>,
     active_list_keys: &[FixedBytes<32>],
     valid_list_keys: &[FixedBytes<32>],
     now: u64,
@@ -2332,9 +2841,10 @@ async fn commit_verified_pending_output_poi_context(
         cache_store,
         cfg,
         OwnedPoiPrivateDelta::VerifiedValid {
-            output_commitment: record.output_commitment,
+            subject,
+            evidence,
             expected_context_fingerprint,
-            expected_output,
+            expected_recovery,
             expected_poi_list_state,
             active_list_keys: active_list_keys.to_vec(),
             valid_list_keys: valid_list_keys.to_vec(),
@@ -2373,7 +2883,7 @@ async fn verify_submitted_pending_output_pois_impl(
     let now = now_epoch_secs();
     let mut outcome = PendingOutputPoiVerificationOutcome::default();
     for record in records {
-        if record.terminal_error.is_some() || record.submitted_poi_list_keys.is_empty() {
+        if record.terminal_error.is_some() {
             continue;
         }
         let Some(observation) = record.observation.as_ref() else {
@@ -2384,69 +2894,124 @@ async fn verify_submitted_pending_output_pois_impl(
             .into_iter()
             .filter(|list_key| active_list_keys.contains(list_key))
             .collect::<Vec<_>>();
-        if required_list_keys.is_empty()
-            || required_list_keys
-                .iter()
-                .any(|list_key| !record.submitted_poi_list_keys.contains(list_key))
-        {
+        if required_list_keys.is_empty() {
             continue;
         }
-        let Some(identity) = pending_output_poi_submit_identity(&record, observation) else {
-            continue;
-        };
-        let Some(current_output) =
-            current_wallet_output_for_pending_context(authority, cfg, &record).await
+        let Some((subject, current_output)) =
+            current_pending_output_poi_subject(authority, cfg, &record).await
         else {
             continue;
         };
-        let expected_output = ExpectedWalletOutput::new(&current_output);
-        let expected_poi_list_state =
-            ExpectedPoiListState::new(&current_output.utxo.poi, &required_list_keys);
-        let statuses = match read_pending_output_poi_statuses(
-            status_source,
+        let all_lists_submitted = required_list_keys
+            .iter()
+            .all(|list_key| record.submitted_poi_list_keys.contains(list_key));
+        let evidence = if all_lists_submitted {
+            PendingOutputPoiValidationEvidence::SubmittedStatus
+        } else if current_output
+            .as_ref()
+            .is_some_and(|output| output.utxo.poi.is_valid_for_lists(&required_list_keys))
+        {
+            PendingOutputPoiValidationEvidence::OwnedStatusRefresh
+        } else {
+            continue;
+        };
+        let expected_poi_list_state = current_output
+            .as_ref()
+            .map(|output| ExpectedPoiListState::new(&output.utxo.poi, &required_list_keys));
+        let Ok(recovery) = cache_store.get_output_poi_recovery(
+            chain_id,
+            &cfg.cache_key,
+            &record.output_commitment,
+        ) else {
+            outcome.errors += 1;
+            continue;
+        };
+        if recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.source_tx_hash != observation.tx_hash)
+        {
+            continue;
+        }
+        let Some(expected_recovery) = expected_recovery_state(recovery.as_ref()) else {
+            outcome.errors += 1;
+            continue;
+        };
+        match pending_output_poi_subject_still_current(
             authority,
             cache_store,
             cfg,
             &record,
-            &required_list_keys,
-            &identity,
+            &subject,
+            &expected_recovery,
         )
         .await
         {
-            Ok(Some(mut statuses)) => statuses
-                .remove(&identity.derived_blinded_commitment)
-                .unwrap_or_default(),
-            Ok(None) => continue,
-            Err(_) => {
-                outcome.errors += 1;
-                warn!(
-                    chain_id,
-                    "failed to verify submitted pending output POI status"
-                );
-                continue;
-            }
-        };
-        match pending_output_poi_context_still_current(
-            authority,
-            cache_store,
-            chain_id,
-            &cfg.cache_key,
-            &record,
-        ) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(_) => {
                 outcome.errors += 1;
-                warn!(
-                    chain_id,
-                    "failed to revalidate submitted pending output POI context"
-                );
                 continue;
             }
         }
-        let all_valid = required_list_keys
-            .iter()
-            .all(|list_key| statuses.get(list_key) == Some(&PoiStatus::Valid));
+        let all_valid = match evidence {
+            PendingOutputPoiValidationEvidence::OwnedStatusRefresh => true,
+            PendingOutputPoiValidationEvidence::SubmittedStatus => {
+                let Some(identity) = pending_output_poi_submit_identity(&record, observation)
+                else {
+                    continue;
+                };
+                let statuses = match read_pending_output_poi_statuses(
+                    status_source,
+                    authority,
+                    cache_store,
+                    cfg,
+                    &record,
+                    &subject,
+                    &expected_recovery,
+                    &required_list_keys,
+                    &identity,
+                )
+                .await
+                {
+                    Ok(Some(mut statuses)) => statuses
+                        .remove(&identity.derived_blinded_commitment)
+                        .unwrap_or_default(),
+                    Ok(None) => continue,
+                    Err(_) => {
+                        outcome.errors += 1;
+                        warn!(
+                            chain_id,
+                            "failed to verify submitted pending output POI status"
+                        );
+                        continue;
+                    }
+                };
+                match pending_output_poi_subject_still_current(
+                    authority,
+                    cache_store,
+                    cfg,
+                    &record,
+                    &subject,
+                    &expected_recovery,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => {
+                        outcome.errors += 1;
+                        warn!(
+                            chain_id,
+                            "failed to revalidate submitted pending output POI context"
+                        );
+                        continue;
+                    }
+                }
+                required_list_keys
+                    .iter()
+                    .all(|list_key| statuses.get(list_key) == Some(&PoiStatus::Valid))
+            }
+        };
         if all_valid {
             match commit_verified_pending_output_poi_context(
                 authority,
@@ -2454,7 +3019,9 @@ async fn verify_submitted_pending_output_pois_impl(
                 cache_store,
                 cfg,
                 &record,
-                expected_output,
+                subject.clone(),
+                evidence,
+                expected_recovery.clone(),
                 expected_poi_list_state,
                 active_list_keys,
                 &required_list_keys,
@@ -2477,57 +3044,42 @@ async fn verify_submitted_pending_output_pois_impl(
             debug!(
                 chain_id,
                 poi_lists = required_list_keys.len(),
-                "verified pending output POI context"
+                "reconciled valid pending output POI context"
             );
         } else {
-            match cache_store.get_output_poi_recovery(
-                chain_id,
-                &cfg.cache_key,
-                &record.output_commitment,
-            ) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let Some(expected_context_fingerprint) =
-                        pending_output_poi_context_fingerprint(&record)
-                    else {
-                        outcome.errors += 1;
-                        continue;
-                    };
-                    if apply_poi_private_delta(
-                        authority,
-                        db,
-                        cache_store,
-                        cfg,
-                        OwnedPoiPrivateDelta::PendingSubmission {
-                            expected_output,
-                            expected_context_fingerprint,
-                            expected_recovery: ExpectedRecordState::Absent,
-                            active_list_keys: active_list_keys.to_vec(),
-                            list_keys: required_list_keys.clone(),
-                            predicate: PendingOutputPoiSubmissionPredicate::RetrySubmitted,
-                            merge_submitted_list_keys: false,
-                            action: OutputPoiRecoveryAction::Submitted {
-                                retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-                            },
-                            now,
+            if recovery.is_none() {
+                let Some(expected_context_fingerprint) =
+                    pending_output_poi_context_fingerprint(&record)
+                else {
+                    outcome.errors += 1;
+                    continue;
+                };
+                if apply_poi_private_delta(
+                    authority,
+                    db,
+                    cache_store,
+                    cfg,
+                    OwnedPoiPrivateDelta::PendingSubmission {
+                        subject,
+                        expected_context_fingerprint,
+                        expected_recovery,
+                        active_list_keys: active_list_keys.to_vec(),
+                        list_keys: required_list_keys.clone(),
+                        predicate: PendingOutputPoiSubmissionPredicate::RetrySubmitted,
+                        merge_submitted_list_keys: false,
+                        action: OutputPoiRecoveryAction::Submitted {
+                            retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
                         },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        outcome.errors += 1;
-                        warn!(
-                            chain_id,
-                            "failed to commit pending output POI submission state"
-                        );
-                        continue;
-                    }
-                }
-                Err(_) => {
+                        now,
+                    },
+                )
+                .await
+                .is_err()
+                {
                     outcome.errors += 1;
                     warn!(
                         chain_id,
-                        "failed to load pending output POI submission state"
+                        "failed to commit pending output POI submission state"
                     );
                     continue;
                 }
@@ -2541,91 +3093,8 @@ async fn verify_submitted_pending_output_pois_impl(
             completed = outcome.completed,
             pending = outcome.pending,
             errors = outcome.errors,
-            "verified submitted pending output POI contexts"
+            "reconciled pending output POI contexts"
         );
-    }
-    outcome
-}
-
-#[cfg(test)]
-async fn verify_submitted_pending_output_pois_check_only(
-    _authority: &WalletPrivateMutationAuthority<'_>,
-    status_reader: &dyn PoiStatusReader,
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    active_list_keys: &[FixedBytes<32>],
-) -> PendingOutputPoiVerificationOutcome {
-    let mut outcome = PendingOutputPoiVerificationOutcome::default();
-    let Ok(records) = db.list_pending_output_poi_contexts(chain_id, wallet_id) else {
-        warn!(chain_id, "failed to list pending output POI contexts");
-        outcome.errors += 1;
-        return outcome;
-    };
-    for record in records {
-        if record.terminal_error.is_some() || record.submitted_poi_list_keys.is_empty() {
-            continue;
-        }
-        let Some(observation) = record.observation.as_ref() else {
-            continue;
-        };
-        let required_list_keys = record
-            .list_keys()
-            .into_iter()
-            .filter(|list_key| active_list_keys.contains(list_key))
-            .collect::<Vec<_>>();
-        if required_list_keys.is_empty()
-            || required_list_keys
-                .iter()
-                .any(|list_key| !record.submitted_poi_list_keys.contains(list_key))
-        {
-            continue;
-        }
-        let Some(identity) = pending_output_poi_submit_identity(&record, observation) else {
-            continue;
-        };
-        let Ok(mut statuses) = status_reader
-            .pois_per_list(
-                &record.txid_version,
-                EVM_CHAIN_TYPE,
-                chain_id,
-                &required_list_keys,
-                &[BlindedCommitmentData::transact(
-                    identity.derived_blinded_commitment,
-                )],
-            )
-            .await
-        else {
-            warn!(
-                chain_id,
-                "failed to verify submitted pending output POI status"
-            );
-            outcome.errors += 1;
-            continue;
-        };
-        let statuses = statuses
-            .remove(&identity.derived_blinded_commitment)
-            .unwrap_or_default();
-        match pending_output_poi_context_still_current_unchecked(db, chain_id, wallet_id, &record) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(_) => {
-                warn!(
-                    chain_id,
-                    "failed to revalidate submitted pending output POI context"
-                );
-                outcome.errors += 1;
-                continue;
-            }
-        }
-        if required_list_keys
-            .iter()
-            .all(|list_key| statuses.get(list_key) == Some(&PoiStatus::Valid))
-        {
-            outcome.completed += 1;
-        } else {
-            outcome.pending += 1;
-        }
     }
     outcome
 }

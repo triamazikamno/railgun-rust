@@ -23,13 +23,13 @@ use super::{
     Transaction, TransactionPlanChunk, TxidPublicCacheError, U256, Utxo, UtxoCommitmentKind,
     UtxoPoiMetadata, ValidatedRailgunTxidStatus, WalletCacheStore, WalletConfig, WalletPoiRuntime,
     WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletPrivateRemoteError, WalletUtxo,
-    apply_poi_private_delta, async_trait, debug, decrypt_in_place_16b_iv, executeCall,
-    expected_pending_context_state, expected_recovery_state, generate_post_transaction_pois, hex,
-    json, log_local_poi_cache_unavailable, now_epoch_secs, pending_output_poi_context_fingerprint,
-    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submission_plan_current,
-    preflight_and_remote_submit_pending_output_poi, railgun_txid_leaf_hash_with_output_start,
-    relayCall, shared_symmetric_key, split_iv_tag, submit_observed_pending_output_pois_inner,
-    transactCall, warn,
+    apply_poi_private_delta, async_trait, current_pending_output_poi_subject, debug,
+    decrypt_in_place_16b_iv, executeCall, expected_pending_context_state, expected_recovery_state,
+    generate_post_transaction_pois, hex, json, log_local_poi_cache_unavailable, now_epoch_secs,
+    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
+    pending_output_poi_submission_plan_current, preflight_and_remote_submit_pending_output_poi,
+    railgun_txid_leaf_hash_with_output_start, relayCall, shared_symmetric_key, split_iv_tag,
+    submit_observed_pending_output_pois_inner, transactCall, warn,
 };
 #[cfg(test)]
 use super::{PendingOutputPoiSubmitter, SingleCommitmentProofContext};
@@ -608,6 +608,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                         request.cache_store,
                         request.cfg,
                         candidate,
+                        request.active_list_keys,
                         &recoverable_list_keys,
                         failure,
                         now,
@@ -653,6 +654,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                         request.cache_store,
                         request.cfg,
                         candidate,
+                        request.active_list_keys,
                         &recoverable_list_keys,
                         failure,
                         now,
@@ -711,6 +713,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                     request.cache_store,
                     request.cfg,
                     candidate,
+                    request.active_list_keys,
                     &recoverable_list_keys,
                     RecoveryFailure::retryable(
                         OutputPoiRecoveryStatus::ProofGenerationFailed,
@@ -787,7 +790,8 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                     request.cfg,
                     OwnedPoiPrivateDelta::OutputRecovery {
                         expected_output: ExpectedWalletOutput::new(candidate),
-                        active_list_keys: recoverable_list_keys.clone(),
+                        active_list_keys: request.active_list_keys.to_vec(),
+                        target_list_keys: recoverable_list_keys.clone(),
                         required_poi_status: ExpectedPoiStatus::Recoverable,
                         pending_update: Box::new(Some((expected_pending_context, record))),
                         expected_recovery,
@@ -847,6 +851,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                     request.cache_store,
                     request.cfg,
                     candidate,
+                    request.active_list_keys,
                     &recoverable_list_keys,
                     RecoveryFailure::retryable(
                         OutputPoiRecoveryStatus::ProofGenerationFailed,
@@ -937,7 +942,7 @@ pub(super) async fn force_resubmit_matching_pending_output_pois_authorized(
     db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
-    utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
+    _utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
     active_list_keys: &[FixedBytes<32>],
     private_poi: &WalletPrivatePoiClients,
 ) -> usize {
@@ -948,13 +953,11 @@ pub(super) async fn force_resubmit_matching_pending_output_pois_authorized(
         );
         return 0;
     }
-    let snapshot = utxos.read().await.clone();
     force_resubmit_matching_pending_output_pois_impl(
         authority,
         db,
         cache_store,
         cfg,
-        &snapshot,
         active_list_keys,
         private_poi,
     )
@@ -966,7 +969,6 @@ async fn force_resubmit_matching_pending_output_pois_impl(
     db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
-    wallet_utxos: &[WalletUtxo],
     active_list_keys: &[FixedBytes<32>],
     private_poi: &WalletPrivatePoiClients,
 ) -> usize {
@@ -976,31 +978,26 @@ async fn force_resubmit_matching_pending_output_pois_impl(
 
     let now = now_epoch_secs();
     let mut attempted_contexts = 0usize;
-    // Snapshot is discovery-only; liveness is revalidated per candidate via the shared choke point.
-    for candidate in output_poi_recovery_candidates(wallet_utxos, active_list_keys) {
-        let output_commitment = candidate.utxo.poi.commitment;
-        let record = match cache_store.get_pending_output_poi_context(
-            cfg.chain.chain_id,
-            &cfg.cache_key,
-            &output_commitment,
-        ) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(_) => {
-                warn!(
-                    chain_id = cfg.chain.chain_id,
-                    "failed to load matching pending output POI context"
-                );
-                continue;
-            }
-        };
-        if record.terminal_error.is_some()
-            || !pending_output_poi_context_matches_wallet_utxo(cfg, candidate, &record)
-        {
+    let Ok(records) =
+        cache_store.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)
+    else {
+        warn!(
+            chain_id = cfg.chain.chain_id,
+            "failed to list pending output POI contexts for resubmission"
+        );
+        return 0;
+    };
+    for record in records {
+        if record.terminal_error.is_some() {
             continue;
         }
-
+        let output_commitment = record.output_commitment;
         let Some(observation) = record.observation.clone() else {
+            continue;
+        };
+        let Some((subject, current_output)) =
+            current_pending_output_poi_subject(authority, cfg, &record).await
+        else {
             continue;
         };
         let Ok(current_recovery) = cache_store.get_output_poi_recovery(
@@ -1019,11 +1016,14 @@ async fn force_resubmit_matching_pending_output_pois_impl(
         };
         let mut plan =
             PendingOutputPoiSubmissionPlan::force_matching(record.list_keys(), expected_recovery);
-        plan.retain_current_recoverable(&record, active_list_keys, &candidate.utxo.poi);
+        plan.retain_current_recoverable(
+            &record,
+            active_list_keys,
+            current_output.as_ref().map(|output| &output.utxo.poi),
+        );
         if plan.list_keys().is_empty() {
             continue;
         }
-        let expected_output = ExpectedWalletOutput::new(candidate);
         let Some(expected_context_fingerprint) = pending_output_poi_context_fingerprint(&record)
         else {
             continue;
@@ -1040,6 +1040,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
             active_list_keys,
             &record,
             &observation,
+            &subject,
             &plan,
             private_poi,
         )
@@ -1071,9 +1072,11 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     cache_store,
                     cfg,
                     OwnedPoiPrivateDelta::PendingContextTerminal {
-                        expected_output,
+                        subject: subject.clone(),
                         expected_context_fingerprint,
-                        active_list_keys: plan.list_keys().to_vec(),
+                        expected_recovery: plan.expected_recovery(),
+                        active_list_keys: active_list_keys.to_vec(),
+                        target_list_keys: plan.list_keys().to_vec(),
                         error: "missing pre-transaction POI for pending output".to_string(),
                     },
                 )
@@ -1096,6 +1099,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                         cfg,
                         active_list_keys,
                         &record,
+                        &subject,
                         &plan,
                     )
                     .await,
@@ -1109,7 +1113,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     cache_store,
                     cfg,
                     OwnedPoiPrivateDelta::PendingSubmission {
-                        expected_output,
+                        subject: subject.clone(),
                         expected_context_fingerprint,
                         expected_recovery: plan.expected_recovery(),
                         active_list_keys: active_list_keys.to_vec(),
@@ -1139,6 +1143,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                         cfg,
                         active_list_keys,
                         &record,
+                        &subject,
                         &plan,
                     )
                     .await,
@@ -1152,7 +1157,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     cache_store,
                     cfg,
                     OwnedPoiPrivateDelta::PendingSubmission {
-                        expected_output,
+                        subject: subject.clone(),
                         expected_context_fingerprint,
                         expected_recovery: plan.expected_recovery(),
                         active_list_keys: active_list_keys.to_vec(),
@@ -1502,7 +1507,8 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
                 request.cfg,
                 OwnedPoiPrivateDelta::OutputRecovery {
                     expected_output: ExpectedWalletOutput::new(candidate),
-                    active_list_keys: required_poi_list_keys.to_vec(),
+                    active_list_keys: request.active_list_keys.to_vec(),
+                    target_list_keys: required_poi_list_keys.to_vec(),
                     required_poi_status: ExpectedPoiStatus::Recoverable,
                     pending_update: Box::new(None),
                     expected_recovery,
@@ -2371,6 +2377,7 @@ pub(super) async fn record_output_poi_recovery_failure(
     cfg: &WalletConfig,
     candidate: &WalletUtxo,
     active_list_keys: &[FixedBytes<32>],
+    target_list_keys: &[FixedBytes<32>],
     failure: RecoveryFailure,
     now: u64,
 ) {
@@ -2398,6 +2405,7 @@ pub(super) async fn record_output_poi_recovery_failure(
         OwnedPoiPrivateDelta::OutputRecovery {
             expected_output: ExpectedWalletOutput::new(candidate),
             active_list_keys: active_list_keys.to_vec(),
+            target_list_keys: target_list_keys.to_vec(),
             required_poi_status: ExpectedPoiStatus::Recoverable,
             pending_update: Box::new(None),
             expected_recovery,
@@ -2463,6 +2471,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
             OwnedPoiPrivateDelta::OutputRecovery {
                 expected_output: ExpectedWalletOutput::new(wallet_utxo),
                 active_list_keys: active_list_keys.to_vec(),
+                target_list_keys: active_list_keys.to_vec(),
                 required_poi_status: ExpectedPoiStatus::Valid,
                 pending_update: Box::new(None),
                 expected_recovery,

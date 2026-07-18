@@ -98,10 +98,10 @@ use super::{
     WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCacheKey,
     WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpStatus, WalletObservation,
-    WalletObservationPublisher, WalletPendingSpentMarkOutcome, WalletPrivateRequestError,
-    WalletReadiness, WalletResetToken, WalletScanRows, WalletSyncToken, WalletUtxo,
-    WalletViewState, Weak, chain_pending_overlay_matches, debug, mpsc, now_epoch_secs, oneshot,
-    wallet_utxo_stable_identity, warn, watch,
+    WalletObservationPublisher, WalletPendingSpentMarkOutcome, WalletPpoiWorkflowStatus,
+    WalletPrivateRequestError, WalletReadiness, WalletResetToken, WalletScanRows, WalletSyncToken,
+    WalletUtxo, WalletViewState, Weak, chain_pending_overlay_matches, debug, mpsc, now_epoch_secs,
+    oneshot, wallet_utxo_stable_identity, warn, watch,
 };
 use crate::types::{ChainKey, SyncProgressSender, WalletSyncTargetLease};
 
@@ -337,6 +337,20 @@ impl ExpectedPoiListState {
                 })
             })
     }
+
+    pub(crate) fn matches_valid(
+        &self,
+        poi: &UtxoPoiMetadata,
+        list_keys: &[FixedBytes<32>],
+    ) -> bool {
+        self.statuses
+            .keys()
+            .all(|list_key| list_keys.contains(list_key))
+            && list_keys.iter().all(|list_key| {
+                self.statuses.get(list_key) == Some(&Some(PoiStatus::Valid))
+                    && poi.statuses.get(list_key) == Some(&PoiStatus::Valid)
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +372,37 @@ pub(crate) enum PendingOutputPoiSubmissionPredicate {
     ForceMatching,
 }
 
+/// Exact actor-owned subject for a pending-output POI side effect.
+/// External subjects authorize context/recovery mutation, never UTXO mutation.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingOutputPoiSubject {
+    Owned(ExpectedWalletOutput),
+    External {
+        output_commitment: FixedBytes<32>,
+        derived_blinded_commitment: FixedBytes<32>,
+    },
+}
+
+impl PendingOutputPoiSubject {
+    pub(crate) const fn output_commitment(&self) -> FixedBytes<32> {
+        match self {
+            Self::Owned(expected) => expected.output_commitment(),
+            Self::External {
+                output_commitment, ..
+            } => *output_commitment,
+        }
+    }
+}
+
+/// Evidence that authorizes retirement of an exact pending-output POI context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingOutputPoiValidationEvidence {
+    /// Every required active list was durably recorded as submitted before status verification.
+    SubmittedStatus,
+    /// The exact owned output was authoritatively refreshed as Valid for every required list.
+    OwnedStatusRefresh,
+}
+
 /// Owned semantic POI intent for actor re-entry (jobs never write mirrors or stale rows).
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
@@ -366,6 +411,7 @@ pub(crate) enum OwnedPoiPrivateDelta {
     OutputRecovery {
         expected_output: ExpectedWalletOutput,
         active_list_keys: Vec<FixedBytes<32>>,
+        target_list_keys: Vec<FixedBytes<32>>,
         required_poi_status: ExpectedPoiStatus,
         pending_update: Box<Option<(ExpectedRecordState, PendingOutputPoiContextRecord)>>,
         expected_recovery: ExpectedRecordState,
@@ -374,7 +420,7 @@ pub(crate) enum OwnedPoiPrivateDelta {
     },
     /// Apply a completed submission to the current context/recovery records.
     PendingSubmission {
-        expected_output: ExpectedWalletOutput,
+        subject: PendingOutputPoiSubject,
         expected_context_fingerprint: Vec<u8>,
         expected_recovery: ExpectedRecordState,
         active_list_keys: Vec<FixedBytes<32>>,
@@ -386,17 +432,20 @@ pub(crate) enum OwnedPoiPrivateDelta {
     },
     /// Mark a still-current context terminal after a structural submission failure.
     PendingContextTerminal {
-        expected_output: ExpectedWalletOutput,
+        subject: PendingOutputPoiSubject,
         expected_context_fingerprint: Vec<u8>,
+        expected_recovery: ExpectedRecordState,
         active_list_keys: Vec<FixedBytes<32>>,
+        target_list_keys: Vec<FixedBytes<32>>,
         error: String,
     },
     /// Mark list keys Valid only for the stable output and target-list state that were verified.
     VerifiedValid {
-        output_commitment: FixedBytes<32>,
+        subject: PendingOutputPoiSubject,
+        evidence: PendingOutputPoiValidationEvidence,
         expected_context_fingerprint: Vec<u8>,
-        expected_output: ExpectedWalletOutput,
-        expected_poi_list_state: ExpectedPoiListState,
+        expected_recovery: ExpectedRecordState,
+        expected_poi_list_state: Option<ExpectedPoiListState>,
         active_list_keys: Vec<FixedBytes<32>>,
         valid_list_keys: Vec<FixedBytes<32>>,
         now: u64,
@@ -508,6 +557,14 @@ impl<'a> WalletPrivateMutationAuthority<'a> {
 
     pub(super) const fn reset_generation(&self) -> u64 {
         self.reset_generation
+    }
+
+    pub(super) const fn chain_id(&self) -> u64 {
+        self.handle.chain.chain_id
+    }
+
+    pub(super) const fn wallet_id(&self) -> &WalletCacheKey {
+        &self.handle.cache_key
     }
 
     #[must_use]
@@ -656,6 +713,25 @@ impl WalletPrivateMutationPermit<'_> {
         overlay: &WalletPendingOverlay,
     ) {
         self.handle.notify_changed_with_projection(utxos, overlay);
+    }
+
+    pub(super) fn apply_publish_ppoi_workflow_status(
+        &self,
+        _token: &WalletActorApplyToken<'_>,
+        status: WalletPpoiWorkflowStatus,
+    ) {
+        if let Some(observation) = self.handle.observation.upgrade() {
+            observation.publish_ppoi_workflow_status(status);
+        }
+    }
+
+    pub(super) fn ppoi_workflow_status(&self) -> WalletPpoiWorkflowStatus {
+        self.handle
+            .observation
+            .upgrade()
+            .map_or_else(WalletPpoiWorkflowStatus::default, |observation| {
+                observation.ppoi_workflow_status()
+            })
     }
 
     pub(super) fn apply_publish_progress(
