@@ -1,13 +1,15 @@
 use super::{
-    APP_SETTINGS_TABLE, BLOB_INDEX_TABLE, CURRENT_SCHEMA_VERSION, DESKTOP_WALLET_VAULT_TABLE,
-    DbConfig, DbError, DbStore, DesktopWalletVaultRecord, MERKLE_FOREST_INDEX_TABLE, META_TABLE,
-    Meta, OUTPUT_POI_RECOVERY_TABLE, OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow,
-    OpaqueWalletPrivateRowMutation, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE,
-    PENDING_OUTPUT_POI_CONTEXT_V2_TABLE, POI_ARTIFACT_CACHE_TABLE, PendingFeeNoteAssuranceRecord,
-    PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheRecord,
-    PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusRpcHealthRecord,
-    PoiCorpusValidationRecord, PoiPublisherManifestWatermarkRecord, StoredRecord,
+    APP_SETTINGS_TABLE, BLOB_INDEX_TABLE, CURRENT_SCHEMA_VERSION, CanonicalBlobMetaIdentity,
+    DESKTOP_WALLET_VAULT_TABLE, DbConfig, DbError, DbStore, DesktopWalletVaultRecord,
+    MERKLE_FOREST_INDEX_TABLE, META_TABLE, Meta, OUTPUT_POI_RECOVERY_TABLE,
+    OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow, OpaqueWalletPrivateRowMutation,
+    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, PENDING_FEE_NOTE_ASSURANCE_TABLE,
+    PENDING_OUTPUT_POI_CONTEXT_TABLE, PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
+    POI_ARTIFACT_CACHE_GENERATION_KEY, POI_ARTIFACT_CACHE_TABLE, PendingFeeNoteAssuranceRecord,
+    PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheCommitCondition,
+    PoiArtifactCacheCommitOutcome, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
+    PoiCacheRecordSource, PoiCorpusRpcHealthRecord, PoiCorpusValidationRecord,
+    PoiPublisherManifestObservation, PoiPublisherManifestWatermarkRecord, StoredRecord,
     TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE,
     WALLET_UTXO_TABLE, WalletCacheKey, WalletDeletionBatch, WalletDeletionReport, WalletMeta,
     WalletMetaMutation, WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
@@ -16,7 +18,7 @@ use super::{
     WalletPrivateStateBatch, WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport,
     WalletSyncActorStateRecord, WalletUtxoRowMutation, ZKEY_INDEX_TABLE, decode, encode,
 };
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256, keccak256};
 use alloy::uint;
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
@@ -62,6 +64,487 @@ fn temp_db_root() -> PathBuf {
         .map_or(0, |duration| duration.as_nanos());
     let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     dir.join(format!("db-{pid}-{nanos}-{counter}"))
+}
+
+#[test]
+fn database_directory_lock_rejects_second_store_for_same_root() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open first db");
+
+    assert!(matches!(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        }),
+        Err(DbError::DatabaseInUse { path })
+            if path == root_dir.join("railgun").join("db.lock")
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn database_directory_lock_releases_after_store_drop() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open first db");
+    drop(store);
+
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen db after lock release");
+    drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn database_directory_locks_are_scoped_by_root() {
+    let first_root = temp_db_root();
+    let second_root = temp_db_root();
+    let first = DbStore::open(DbConfig {
+        root_dir: first_root.clone(),
+    })
+    .expect("open first root");
+    let second = DbStore::open(DbConfig {
+        root_dir: second_root.clone(),
+    })
+    .expect("open second root");
+
+    drop((first, second));
+    fs::remove_dir_all(first_root).expect("remove first temp db dir");
+    fs::remove_dir_all(second_root).expect("remove second temp db dir");
+}
+
+#[test]
+fn canonical_blob_meta_identity_requires_direct_child_components() {
+    let identity =
+        CanonicalBlobMetaIdentity::from_leaf("poi_v4_artifact_chunks", "poi-v4-artifact-0123.bin")
+            .expect("generate direct-child identity");
+    assert_eq!(
+        identity.relative_path(),
+        "blobs/poi_v4_artifact_chunks/poi-v4-artifact-0123.bin"
+    );
+
+    for (kind, leaf) in [
+        ("", "leaf.bin"),
+        (".", "leaf.bin"),
+        ("..", "leaf.bin"),
+        ("nested/kind", "leaf.bin"),
+        (r"nested\kind", "leaf.bin"),
+        ("kind:stream", "leaf.bin"),
+        ("kind\0suffix", "leaf.bin"),
+        ("kind", ""),
+        ("kind", "."),
+        ("kind", ".."),
+        ("kind", "nested/leaf.bin"),
+        ("kind", r"nested\leaf.bin"),
+        ("kind", "leaf:stream"),
+        ("kind", "leaf\0suffix"),
+    ] {
+        assert!(matches!(
+            CanonicalBlobMetaIdentity::from_leaf(kind, leaf),
+            Err(DbError::InvalidBlobRelativePath { .. })
+        ));
+    }
+}
+
+#[test]
+fn checked_blob_open_handles_regular_missing_and_directory_entries() {
+    use std::io::Read;
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "blob-file-operations";
+    let kind_dir = store.ensure_blob_dir(kind).expect("create kind");
+    let identity = CanonicalBlobMetaIdentity::from_leaf(kind, "leaf.bin").expect("identity");
+
+    assert!(
+        store
+            .open_blob_meta_file(&identity)
+            .expect("missing open")
+            .is_none()
+    );
+    fs::write(kind_dir.join("leaf.bin"), b"regular bytes").expect("write regular leaf");
+    let mut file = store
+        .open_blob_meta_file(&identity)
+        .expect("open regular leaf")
+        .expect("regular leaf exists");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read regular leaf");
+    assert_eq!(bytes, b"regular bytes");
+    drop(file);
+    fs::remove_file(kind_dir.join("leaf.bin")).expect("remove regular leaf");
+    fs::create_dir(kind_dir.join("leaf.bin")).expect("create directory leaf");
+    assert!(matches!(
+        store.open_blob_meta_file(&identity),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_blob_open_rejects_static_symlink_parent_and_leaf() {
+    use std::os::unix::fs::symlink;
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let external_dir = root_dir.join("external");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    fs::write(external_dir.join("leaf.bin"), b"sentinel").expect("write sentinel");
+
+    let parent_kind = "symlink-parent";
+    symlink(&external_dir, store.blob_dir().join(parent_kind)).expect("create parent symlink");
+    let parent_identity =
+        CanonicalBlobMetaIdentity::from_leaf(parent_kind, "leaf.bin").expect("parent identity");
+    assert!(matches!(
+        store.open_blob_meta_file(&parent_identity),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    let leaf_kind = "symlink-leaf";
+    let kind_dir = store.ensure_blob_dir(leaf_kind).expect("create real kind");
+    let leaf_path = kind_dir.join("leaf.bin");
+    symlink(external_dir.join("leaf.bin"), &leaf_path).expect("create leaf symlink");
+    let leaf_identity =
+        CanonicalBlobMetaIdentity::from_leaf(leaf_kind, "leaf.bin").expect("leaf identity");
+    assert!(matches!(
+        store.open_blob_meta_file(&leaf_identity),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    assert_eq!(
+        fs::read(external_dir.join("leaf.bin")).expect("read sentinel"),
+        b"sentinel"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[cfg(windows)]
+#[test]
+fn checked_blob_open_rejects_static_reparse_parent_and_leaf() {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let external_dir = root_dir.join("external");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_file = external_dir.join("leaf.bin");
+    fs::write(&external_file, b"sentinel").expect("write sentinel");
+
+    let parent_kind = "reparse-parent";
+    if let Err(error) = symlink_dir(&external_dir, store.blob_dir().join(parent_kind)) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(1314)
+        {
+            drop(store);
+            fs::remove_dir_all(root_dir).expect("remove skipped test root");
+            return;
+        }
+        panic!("create parent reparse fixture: {error}");
+    }
+    let parent_identity =
+        CanonicalBlobMetaIdentity::from_leaf(parent_kind, "leaf.bin").expect("parent identity");
+    assert!(matches!(
+        store.open_blob_meta_file(&parent_identity),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+
+    let leaf_kind = "reparse-leaf";
+    let kind_dir = store.ensure_blob_dir(leaf_kind).expect("create real kind");
+    let leaf_path = kind_dir.join("leaf.bin");
+    symlink_file(&external_file, &leaf_path).expect("create leaf reparse fixture");
+    let leaf_identity =
+        CanonicalBlobMetaIdentity::from_leaf(leaf_kind, "leaf.bin").expect("leaf identity");
+    assert!(matches!(
+        store.open_blob_meta_file(&leaf_identity),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    assert_eq!(fs::read(external_file).expect("read sentinel"), b"sentinel");
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn failed_create_new_does_not_remove_preexisting_temp_entry() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "atomic-preexisting-temp";
+    let kind_dir = store.ensure_blob_dir(kind).expect("create kind directory");
+    let temp_name = ".preexisting-temp";
+    let temp_path = kind_dir.join(temp_name);
+    fs::write(&temp_path, b"preexisting").expect("write preexisting temp entry");
+
+    assert!(
+        store
+            .replace_blob_file_atomic_with_test_temp_name(
+                kind,
+                "final.bin",
+                b"new bytes",
+                temp_name,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("read preexisting temp entry"),
+        b"preexisting"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn atomic_blob_replace_allows_missing_and_existing_regular_file() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "atomic-regular";
+    let path = store
+        .ensure_blob_dir(kind)
+        .expect("create kind")
+        .join("final.bin");
+
+    store
+        .replace_blob_file_atomic(kind, "final.bin", b"created")
+        .expect("create missing file");
+    assert_eq!(fs::read(&path).expect("read created file"), b"created");
+
+    fs::write(&path, b"old").expect("write old file");
+
+    store
+        .replace_blob_file_atomic(kind, "final.bin", b"new")
+        .expect("replace regular file");
+    assert_eq!(fs::read(path).expect("read new file"), b"new");
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn atomic_blob_replace_cleans_temp_after_unsafe_destination_rejection() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "atomic-directory-final";
+    let kind_dir = store.ensure_blob_dir(kind).expect("create kind");
+    fs::create_dir(kind_dir.join("final.bin")).expect("create final directory");
+
+    assert!(matches!(
+        store.replace_blob_file_atomic(kind, "final.bin", b"new"),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    assert_no_atomic_temps(&kind_dir);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_blob_replace_rejects_final_symlink_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "atomic-final-symlink";
+    let kind_dir = store.ensure_blob_dir(kind).expect("create kind");
+    let external_target = root_dir.join("external-atomic-target.bin");
+    fs::write(&external_target, b"sentinel").expect("write external target");
+    symlink(&external_target, kind_dir.join("final.bin")).expect("create final symlink");
+
+    assert!(matches!(
+        store.replace_blob_file_atomic(kind, "final.bin", b"new"),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    assert_eq!(
+        fs::read(external_target).expect("read external target"),
+        b"sentinel"
+    );
+    assert_no_atomic_temps(&kind_dir);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[cfg(windows)]
+#[test]
+fn atomic_blob_replace_rejects_final_reparse_without_touching_target() {
+    use std::os::windows::fs::symlink_file;
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "atomic-final-reparse";
+    let kind_dir = store.ensure_blob_dir(kind).expect("create kind");
+    let external_target = root_dir.join("external-atomic-target.bin");
+    fs::write(&external_target, b"sentinel").expect("write external target");
+    if let Err(error) = symlink_file(&external_target, kind_dir.join("final.bin")) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(1314)
+        {
+            drop(store);
+            fs::remove_dir_all(root_dir).expect("remove skipped test root");
+            return;
+        }
+        panic!("create final reparse fixture: {error}");
+    }
+
+    assert!(matches!(
+        store.replace_blob_file_atomic(kind, "final.bin", b"new"),
+        Err(DbError::UnsafeBlobEntry { .. })
+    ));
+    assert_eq!(
+        fs::read(external_target).expect("read external target"),
+        b"sentinel"
+    );
+    assert_no_atomic_temps(&kind_dir);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn blob_kind_purge_unlinks_root_symlink_without_following_target() {
+    use std::os::unix::fs::symlink;
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "purge-root-symlink";
+    let external = root_dir.join("external-purge-root");
+    fs::create_dir_all(&external).expect("create external tree");
+    fs::write(external.join("sentinel"), b"sentinel").expect("write sentinel");
+    symlink(&external, store.blob_dir().join(kind)).expect("symlink kind root");
+
+    store.purge_blob_kind(kind).expect("purge root symlink");
+    assert_eq!(
+        fs::read(external.join("sentinel")).expect("read sentinel"),
+        b"sentinel"
+    );
+    assert!(store.blob_dir().join(kind).is_dir());
+    assert!(
+        !fs::symlink_metadata(store.blob_dir().join(kind))
+            .expect("read replacement kind")
+            .file_type()
+            .is_symlink()
+    );
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_blob_kind_purge_replaces_root_reparse_without_following_target() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "purge-root-reparse";
+    let external = root_dir.join("external-purge-root");
+    fs::create_dir_all(&external).expect("create external tree");
+    fs::write(external.join("sentinel"), b"sentinel").expect("write sentinel");
+    if let Err(error) = symlink_dir(&external, store.blob_dir().join(kind)) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(1314)
+        {
+            drop(store);
+            fs::remove_dir_all(root_dir).expect("remove skipped test root");
+            return;
+        }
+        panic!("create root reparse fixture: {error}");
+    }
+
+    store.purge_blob_kind(kind).expect("purge root reparse");
+    assert_eq!(
+        fs::read(external.join("sentinel")).expect("read external sentinel"),
+        b"sentinel"
+    );
+    let recreated = store.blob_dir().join(kind);
+    assert!(recreated.is_dir());
+    assert!(
+        !fs::symlink_metadata(recreated)
+            .expect("read recreated kind")
+            .file_type()
+            .is_symlink()
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn blob_kind_purge_removes_nested_regular_tree_and_recreates_kind() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let kind = "purge-nested-regular";
+    let kind_dir = store.ensure_blob_dir(kind).expect("create kind");
+    fs::create_dir_all(kind_dir.join("one/two/three")).expect("create nested tree");
+    fs::write(kind_dir.join("root.bin"), b"root").expect("write root file");
+    fs::write(kind_dir.join("one/two/three/leaf.bin"), b"leaf").expect("write leaf file");
+
+    store.purge_blob_kind(kind).expect("purge regular tree");
+    let recreated = store.blob_dir().join(kind);
+    assert!(recreated.is_dir());
+    assert!(
+        fs::read_dir(recreated)
+            .expect("read recreated kind")
+            .next()
+            .is_none()
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+fn assert_no_atomic_temps(kind_dir: &std::path::Path) {
+    assert!(
+        fs::read_dir(kind_dir)
+            .expect("read kind directory")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".railgun-blob-"))
+    );
 }
 
 fn sample_record(chain_id: u64, public_tx_hash: FixedBytes<32>) -> PendingFeeNoteAssuranceRecord {
@@ -187,6 +670,19 @@ fn raw_pending_output_record_exists(store: &DbStore, key: &str) -> bool {
     table.get(key).expect("read raw pending row").is_some()
 }
 
+fn put_raw_poi_artifact_record(store: &DbStore, key: &str, payload: &[u8]) {
+    let txn = store.db.begin_write().expect("begin raw POI corpus write");
+    {
+        let mut table = txn
+            .open_table(POI_ARTIFACT_CACHE_TABLE)
+            .expect("open POI corpus table");
+        table
+            .insert(key, payload)
+            .expect("insert raw POI corpus row");
+    }
+    txn.commit().expect("commit raw POI corpus write");
+}
+
 fn sample_poi_artifact_cache_record(
     chain_id: u64,
     list_key: FixedBytes<32>,
@@ -201,6 +697,7 @@ fn sample_poi_artifact_cache_record(
         chain_id,
         txid_version: "V3_PoseidonMerkle".to_string(),
         list_key,
+        cache_generation: 0,
         source: PoiCacheRecordSource::IndexedArtifacts,
         validation: PoiCorpusValidationRecord::Legacy,
         legacy_observed_manifest_sequence: 7,
@@ -257,10 +754,110 @@ fn legacy_poi_artifact_cache_record_defaults_to_indexed_artifact_source() {
 
     assert_eq!(decoded.source, PoiCacheRecordSource::IndexedArtifacts);
     assert_eq!(decoded.validation, PoiCorpusValidationRecord::Legacy);
+    assert_eq!(decoded.cache_generation, 0);
     assert_eq!(decoded.legacy_observed_manifest_sequence, 7);
     assert_eq!(decoded.artifact_tip_index, None);
     assert_eq!(decoded.artifact_tip_root, None);
     assert_eq!(decoded.legacy_last_successful_rpc_sync_at_ms, Some(42));
+}
+
+#[test]
+fn poi_corpus_candidate_commit_rechecks_generation_watermark_and_base_atomically() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let publisher = FixedBytes::from([0x41; 32]);
+    let existing = sample_poi_artifact_cache_record(1, FixedBytes::from([0x42; 32]));
+    store
+        .put_poi_artifact_cache(&existing)
+        .expect("seed corpus");
+    store
+        .advance_poi_publisher_manifest_watermark(publisher, 5)
+        .expect("observe publisher sequence");
+    let mut candidate = existing.clone();
+    candidate.current_tip_root = FixedBytes::from([0x43; 32]);
+    let expected_payload_hash = Some(keccak256(&existing.cache_payload));
+
+    assert_eq!(
+        store
+            .commit_poi_artifact_cache_if_current(
+                &candidate,
+                PoiArtifactCacheCommitCondition {
+                    expected_generation: 0,
+                    expected_publisher: Some((publisher, 5)),
+                    expected_manifest_hash: None,
+                    expected_payload_hash,
+                },
+            )
+            .expect("commit current candidate"),
+        PoiArtifactCacheCommitOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .get_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &candidate.list_key)
+            .expect("read committed candidate")
+            .expect("candidate present")
+            .cache_generation,
+        0
+    );
+
+    store
+        .advance_poi_publisher_manifest_watermark(publisher, 6)
+        .expect("advance publisher concurrently");
+    assert_eq!(
+        store
+            .commit_poi_artifact_cache_if_current(
+                &existing,
+                PoiArtifactCacheCommitCondition {
+                    expected_generation: 0,
+                    expected_publisher: Some((publisher, 5)),
+                    expected_manifest_hash: None,
+                    expected_payload_hash: Some(keccak256(&candidate.cache_payload)),
+                },
+            )
+            .expect("reject stale candidate"),
+        PoiArtifactCacheCommitOutcome::PublisherSequenceConflict { actual: Some(6) }
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_corpus_candidate_commit_rechecks_exact_manifest_hash() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let publisher = FixedBytes::from([0x44; 32]);
+    let accepted_hash = FixedBytes::from([0x45; 32]);
+    let candidate = sample_poi_artifact_cache_record(1, FixedBytes::from([0x46; 32]));
+    store
+        .observe_poi_v4_publisher_manifest(publisher, 5, accepted_hash)
+        .expect("observe exact publication");
+
+    assert_eq!(
+        store
+            .commit_poi_artifact_cache_if_current(
+                &candidate,
+                PoiArtifactCacheCommitCondition {
+                    expected_generation: 0,
+                    expected_publisher: Some((publisher, 5)),
+                    expected_manifest_hash: Some(FixedBytes::from([0x47; 32])),
+                    expected_payload_hash: None,
+                },
+            )
+            .expect("reject wrong publication hash"),
+        PoiArtifactCacheCommitOutcome::PublisherManifestConflict {
+            actual: Some(accepted_hash)
+        }
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[test]
@@ -585,11 +1182,13 @@ fn poi_publisher_manifest_watermarks_round_trip_and_are_isolated() {
     let first = PoiPublisherManifestWatermarkRecord {
         publisher_pubkey: FixedBytes::from([0x11; 32]),
         accepted_sequence: 7,
+        accepted_manifest_hash: None,
         updated_at: u64::MAX,
     };
     let second = PoiPublisherManifestWatermarkRecord {
         publisher_pubkey: FixedBytes::from([0x22; 32]),
         accepted_sequence: 9,
+        accepted_manifest_hash: None,
         updated_at: u64::MAX,
     };
     assert_eq!(
@@ -655,6 +1254,76 @@ fn poi_publisher_manifest_watermarks_round_trip_and_are_isolated() {
     ));
 
     drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_v4_publisher_manifest_binding_is_atomic_and_durable() {
+    let root_dir = temp_db_root();
+    let publisher = FixedBytes::from([0x51; 32]);
+    let first_hash = FixedBytes::from([0x52; 32]);
+    let second_hash = FixedBytes::from([0x53; 32]);
+    {
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        store
+            .advance_poi_publisher_manifest_watermark(publisher, 7)
+            .expect("seed unbound legacy watermark");
+        assert!(matches!(
+            store
+                .observe_poi_v4_publisher_manifest(publisher, 7, first_hash)
+                .expect("bind publication"),
+            PoiPublisherManifestObservation::Accepted { changed: true, .. }
+        ));
+        assert!(matches!(
+            store
+                .observe_poi_v4_publisher_manifest(publisher, 7, first_hash)
+                .expect("observe same publication"),
+            PoiPublisherManifestObservation::Accepted { changed: false, .. }
+        ));
+        assert!(matches!(
+            store
+                .observe_poi_v4_publisher_manifest(publisher, 7, second_hash)
+                .expect("reject equivocation"),
+            PoiPublisherManifestObservation::Equivocation { .. }
+        ));
+    }
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen db");
+    let watermark = reopened
+        .get_poi_publisher_manifest_watermark(&publisher)
+        .expect("read watermark")
+        .expect("watermark present");
+    assert_eq!(watermark.accepted_sequence, 7);
+    assert_eq!(watermark.accepted_manifest_hash, Some(first_hash));
+    let (retained, advanced) = reopened
+        .advance_poi_publisher_manifest_watermark(publisher, 7)
+        .expect("equal legacy observation preserves binding");
+    assert!(!advanced);
+    assert_eq!(retained.accepted_manifest_hash, Some(first_hash));
+    assert!(matches!(
+        reopened
+            .observe_poi_v4_publisher_manifest(publisher, 6, first_hash)
+            .expect("reject rollback"),
+        PoiPublisherManifestObservation::Rollback { .. }
+    ));
+    let (unbound, advanced) = reopened
+        .advance_poi_publisher_manifest_watermark(publisher, 8)
+        .expect("higher legacy observation advances unbound");
+    assert!(advanced);
+    assert_eq!(unbound.accepted_manifest_hash, None);
+    assert!(matches!(
+        reopened
+            .observe_poi_v4_publisher_manifest(publisher, 8, second_hash)
+            .expect("bind higher publication"),
+        PoiPublisherManifestObservation::Accepted { changed: true, .. }
+    ));
+
+    drop(reopened);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
@@ -3316,7 +3985,198 @@ fn schema_seven_migration_moves_alpha_wallet_cache_rows_atomically() {
 }
 
 #[test]
-fn schema_eight_to_nine_preserves_existing_rows() {
+fn schema_nine_released_poi_corpus_fixture_preserves_record_and_binds_generation() {
+    #[derive(serde::Serialize)]
+    struct ReleasedSchemaNinePoiArtifactCacheRecord {
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: String,
+        list_key: FixedBytes<32>,
+        source: PoiCacheRecordSource,
+        validation: PoiCorpusValidationRecord,
+        last_accepted_manifest_sequence: u64,
+        base_descriptor: PoiArtifactDescriptorRecord,
+        applied_delta_descriptors: Vec<PoiArtifactDescriptorRecord>,
+        blocked_shields_descriptor: PoiArtifactDescriptorRecord,
+        artifact_tip_index: Option<u64>,
+        artifact_tip_root: Option<FixedBytes<32>>,
+        current_tip_index: u64,
+        current_tip_root: FixedBytes<32>,
+        cache_payload: Vec<u8>,
+        last_successful_rpc_sync_at_ms: Option<u64>,
+        updated_at: u64,
+    }
+
+    let root_dir = temp_db_root();
+    let fixture = sample_poi_artifact_cache_record(1, FixedBytes::from([0xa1; 32]));
+    let key = fixture.key();
+    let payload = encode(&ReleasedSchemaNinePoiArtifactCacheRecord {
+        chain_type: fixture.chain_type,
+        chain_id: fixture.chain_id,
+        txid_version: fixture.txid_version.clone(),
+        list_key: fixture.list_key,
+        source: fixture.source,
+        validation: fixture.validation.clone(),
+        last_accepted_manifest_sequence: fixture.legacy_observed_manifest_sequence,
+        base_descriptor: fixture.base_descriptor.clone(),
+        applied_delta_descriptors: fixture.applied_delta_descriptors.clone(),
+        blocked_shields_descriptor: fixture.blocked_shields_descriptor.clone(),
+        artifact_tip_index: fixture.artifact_tip_index,
+        artifact_tip_root: fixture.artifact_tip_root,
+        current_tip_index: fixture.current_tip_index,
+        current_tip_root: fixture.current_tip_root,
+        cache_payload: fixture.cache_payload.clone(),
+        last_successful_rpc_sync_at_ms: fixture.legacy_last_successful_rpc_sync_at_ms,
+        updated_at: fixture.updated_at,
+    })
+    .expect("encode released schema-9 fixture");
+    {
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open fixture db");
+        put_raw_poi_artifact_record(&store, &key, &payload);
+        store
+            .put_app_settings_record(
+                POI_ARTIFACT_CACHE_GENERATION_KEY,
+                &encode(&4_u64).expect("encode generation"),
+            )
+            .expect("seed generation");
+        store
+            .write_meta(&Meta {
+                schema_version: 9,
+                app_version: "0.1.0-alpha.9".to_string(),
+                created_at: 321,
+            })
+            .expect("write schema-9 meta");
+    }
+
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("migrate released schema-9 fixture");
+    let migrated = reopened
+        .get_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &fixture.list_key)
+        .expect("read migrated corpus")
+        .expect("migrated corpus present");
+    assert_eq!(migrated.cache_generation, 4);
+    assert_eq!(migrated.cache_payload, fixture.cache_payload);
+    assert_eq!(
+        reopened
+            .read_meta()
+            .expect("read migrated meta")
+            .expect("meta present")
+            .schema_version,
+        CURRENT_SCHEMA_VERSION
+    );
+
+    drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove fixture db");
+}
+
+#[test]
+fn schema_nine_poi_corpus_migration_rejects_key_conflict_without_mutation() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let record = sample_poi_artifact_cache_record(1, FixedBytes::from([0xa2; 32]));
+    let conflicting_key = PoiArtifactCacheRecord::key_for(
+        record.chain_type,
+        137,
+        &record.txid_version,
+        &record.list_key,
+    );
+    let payload = encode(&record).expect("encode conflicting corpus");
+    put_raw_poi_artifact_record(&store, &conflicting_key, &payload);
+    let schema_nine = Meta {
+        schema_version: 9,
+        app_version: "0.1.0-alpha.9".to_string(),
+        created_at: 322,
+    };
+    store.write_meta(&schema_nine).expect("write schema-9 meta");
+
+    assert!(matches!(
+        store.run_migrations_transaction(&schema_nine, 10, || Ok(())),
+        Err(DbError::InvalidSchemaNinePpoiCorpusRecord { key }) if key == conflicting_key
+    ));
+    assert_eq!(
+        store
+            .read_meta()
+            .expect("read retained meta")
+            .expect("meta present")
+            .schema_version,
+        9
+    );
+    assert_eq!(
+        store
+            .db
+            .begin_read()
+            .expect("begin retained row read")
+            .open_table(POI_ARTIFACT_CACHE_TABLE)
+            .expect("open POI corpus table")
+            .get(conflicting_key.as_str())
+            .expect("read retained row")
+            .expect("retained row present")
+            .value(),
+        payload.as_slice()
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn schema_nine_poi_corpus_migration_rejects_malformed_row_without_mutation() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key =
+        PoiArtifactCacheRecord::key_for(0, 1, "V3_PoseidonMerkle", &FixedBytes::from([0xa3; 32]));
+    let payload = b"not-msgpack";
+    put_raw_poi_artifact_record(&store, &key, payload);
+    let schema_nine = Meta {
+        schema_version: 9,
+        app_version: "0.1.0-alpha.9".to_string(),
+        created_at: 323,
+    };
+    store.write_meta(&schema_nine).expect("write schema-9 meta");
+
+    assert!(matches!(
+        store.run_migrations_transaction(&schema_nine, 10, || Ok(())),
+        Err(DbError::InvalidSchemaNinePpoiCorpusRecord { key: invalid }) if invalid == key
+    ));
+    assert_eq!(
+        store
+            .read_meta()
+            .expect("read retained meta")
+            .expect("meta present")
+            .schema_version,
+        9
+    );
+    assert_eq!(
+        store
+            .db
+            .begin_read()
+            .expect("begin retained row read")
+            .open_table(POI_ARTIFACT_CACHE_TABLE)
+            .expect("open POI corpus table")
+            .get(key.as_str())
+            .expect("read retained row")
+            .expect("retained row present")
+            .value(),
+        payload
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn schema_eight_to_current_preserves_existing_rows() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3337,14 +4197,14 @@ fn schema_eight_to_nine_preserves_existing_rows() {
     let reopened = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
     })
-    .expect("migrate schema eight to nine");
+    .expect("migrate schema eight to current");
     assert_eq!(
         reopened
             .read_meta()
             .expect("read metadata")
             .expect("metadata present")
             .schema_version,
-        9
+        CURRENT_SCHEMA_VERSION
     );
     assert_eq!(
         reopened

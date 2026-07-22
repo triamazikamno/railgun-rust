@@ -22,53 +22,6 @@ use super::{
     wallet_startup_warm_from_block, wallet_sync_target, warn, watch,
 };
 
-#[cfg(test)]
-use super::{WalletBackfillApplyResult, WalletBackfillDriver};
-#[cfg(test)]
-use crate::types::WalletSyncToken;
-
-#[cfg(test)]
-pub(super) async fn send_wallet_scan_apply(
-    cache_key: &str,
-    sender: &mpsc::Sender<BackfillEvent>,
-    apply: WalletScanApply,
-    token: WalletSyncToken,
-) -> WalletBackfillApplyResult {
-    WalletBackfillDriver::from_token(token, sender.clone())
-        .apply(cache_key, apply)
-        .await
-}
-
-#[cfg(test)]
-pub(super) async fn send_wallet_target(
-    _cache_key: &str,
-    sender: &mpsc::Sender<BackfillEvent>,
-    target_block: u64,
-    token: WalletSyncToken,
-) -> WalletBackfillStartResult {
-    let (response, result_rx) = oneshot::channel();
-    if sender
-        .send(BackfillEvent::Start {
-            target_block,
-            token,
-            response,
-        })
-        .await
-        .is_err()
-    {
-        return WalletBackfillStartResult::Rejected {
-            committed_to: target_block.saturating_sub(1),
-            reason: WalletBackfillRejectReason::Shutdown,
-        };
-    }
-    result_rx
-        .await
-        .unwrap_or(WalletBackfillStartResult::Rejected {
-            committed_to: target_block.saturating_sub(1),
-            reason: WalletBackfillRejectReason::Shutdown,
-        })
-}
-
 pub(in crate::chain) async fn send_wallet_reset(
     cache_key: &str,
     sender: &mpsc::Sender<BackfillEvent>,
@@ -806,10 +759,12 @@ impl ChainService {
             ..
         } = &poi_policy
         {
-            let poi_cache_service = crate::poi_cache::PoiCacheService::new(
+            let poi_artifact_persistence = public_data_plane.poi_artifact_persistence();
+            let poi_cache_service = crate::poi_cache::PoiCacheService::new_with_persistence(
                 Arc::clone(&db),
                 artifact_source.clone(),
                 chain.http_client.clone(),
+                poi_artifact_persistence,
             )?
             .with_poi_rpc_url(rpc_url.clone());
             public_data_plane =
@@ -1742,13 +1697,6 @@ impl ChainService {
             let result = Arc::clone(&rpc_service)
                 .wallet_startup_rpc_candidate(&rpc_cfg, plan, rpc_cancel)
                 .await;
-            #[cfg(test)]
-            if result.is_ok() {
-                rpc_service
-                    .public_data_plane
-                    .note_short_startup_candidate_completion_for_test()
-                    .await;
-            }
             (WalletStartupSyncStrategy::Rpc, result)
         });
 
@@ -1760,21 +1708,9 @@ impl ChainService {
                 let result = Arc::clone(&indexed_service)
                     .wallet_startup_indexed_candidate(&indexed_cfg, plan, indexed_cancel)
                     .await;
-                #[cfg(test)]
-                if result.is_ok() {
-                    indexed_service
-                        .public_data_plane
-                        .note_short_startup_candidate_completion_for_test()
-                        .await;
-                }
                 (WalletStartupSyncStrategy::Indexed, result)
             });
         }
-
-        #[cfg(test)]
-        self.public_data_plane
-            .wait_before_short_startup_arbitration_for_test()
-            .await;
 
         let mut failures = 0_u8;
         let mut selected = None;
@@ -1908,10 +1844,6 @@ impl ChainService {
         handle: &WalletHandle,
         cancel: &CancellationToken,
     ) -> Option<crate::types::WalletSchedulableProgress> {
-        #[cfg(test)]
-        self.public_data_plane
-            .wait_before_short_startup_commit_for_test()
-            .await;
         if cancel.is_cancelled() {
             return None;
         }
@@ -3324,10 +3256,6 @@ impl ChainService {
                 return checkpoint;
             };
             checkpoint = committed_checkpoint;
-            #[cfg(test)]
-            self.public_data_plane
-                .wait_after_indexed_wallet_page_for_test(checkpoint)
-                .await;
             debug!(
                 cache_key = %cfg.cache_key,
                 indexed_source = indexed_source.as_str(),

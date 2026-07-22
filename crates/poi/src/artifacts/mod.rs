@@ -1,6 +1,7 @@
 pub mod blocked;
 pub mod manifest;
 pub mod snapshot;
+pub mod v4;
 pub mod verify;
 
 pub use blocked::{

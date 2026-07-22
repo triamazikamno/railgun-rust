@@ -156,14 +156,6 @@ impl IndexedArtifactMaintenanceScheduler {
         )
     }
 
-    #[cfg(test)]
-    fn with_capacity(capacity: usize) -> Self {
-        Self::with_limits(
-            capacity,
-            INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES,
-        )
-    }
-
     fn with_limits(capacity: usize, max_retained_payload_bytes: u64) -> Self {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         Self {
@@ -775,9 +767,9 @@ impl IndexedArtifactManifestClient {
                             return Err(err.into());
                         }
                     };
-                    let gateway_index = fetched.gateway_index;
-                    let gateway_count = fetched.gateway_count;
-                    let chunk = match verify_chunk_bytes(descriptor, fetched.bytes) {
+                    let gateway_index = fetched.gateway_index();
+                    let gateway_count = fetched.gateway_count();
+                    let chunk = match verify_chunk_bytes(descriptor, fetched.into_bytes()) {
                         Ok(chunk) => chunk,
                         Err(err) => {
                             debug!(
@@ -934,7 +926,7 @@ impl IndexedArtifactManifestClient {
     ) -> Result<IndexedArtifactManifest, IndexedArtifactManifestError> {
         let started = Instant::now();
         let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
-        let candidates = fetcher.resolve_ipns_manifest_candidates(name, now).await?;
+        let candidates = fetcher.resolve_ipns_manifest_candidates(name).await?;
         let candidate_count = candidates.len();
         let mut last_error = None;
         for (candidate_index, candidate) in candidates.into_iter().enumerate() {
@@ -1676,6 +1668,16 @@ impl From<IndexedArtifactChunkError> for IndexedArtifactManifestError {
                 Self::ChunkSectionMissing { section_id }
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl IndexedArtifactMaintenanceScheduler {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(
+            capacity,
+            INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES,
+        )
     }
 }
 

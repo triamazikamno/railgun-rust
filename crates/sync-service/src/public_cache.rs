@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use local_db::DbStore;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
-use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
+use crate::poi_artifacts::{
+    POI_V4_RAW_CHUNK_BLOB_KIND, RawChunkCacheResetFailure, clear_poi_artifact_cache_for_reset,
+    reset_raw_chunk_cache,
+};
 use crate::txid_cache::reset_txid_public_cache;
 
 pub(crate) const WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND: &str = "wallet_scan_artifact_chunks";
@@ -39,6 +40,7 @@ impl WalletScanArtifactCacheAuthority {
 pub enum PersistedPublicSyncCacheKind {
     Txid,
     WalletScanArtifactChunks,
+    PoiArtifactCheckpointChunks,
     PoiCorpus,
 }
 
@@ -47,6 +49,7 @@ impl fmt::Display for PersistedPublicSyncCacheKind {
         f.write_str(match self {
             Self::Txid => "TXID public cache",
             Self::WalletScanArtifactChunks => "wallet-scan artifact chunk cache",
+            Self::PoiArtifactCheckpointChunks => "POI artifact checkpoint chunk cache",
             Self::PoiCorpus => "POI corpus",
         })
     }
@@ -57,6 +60,7 @@ pub struct PersistedPublicSyncCacheResetError {
     pub kind: PersistedPublicSyncCacheKind,
     pub reason: String,
     pub partial_report: PersistedPublicSyncCacheResetReport,
+    pub poi_corpus_entries_removed: u64,
 }
 
 impl PersistedPublicSyncCacheResetError {
@@ -69,6 +73,7 @@ impl PersistedPublicSyncCacheResetError {
             kind,
             reason: error.to_string(),
             partial_report,
+            poi_corpus_entries_removed: 0,
         }
     }
 }
@@ -76,7 +81,10 @@ impl PersistedPublicSyncCacheResetError {
 impl fmt::Display for PersistedPublicSyncCacheResetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "failed to reset persisted {}", self.kind)?;
-        let removed = self.partial_report.total_removed_entries();
+        let removed = self
+            .partial_report
+            .total_removed_entries()
+            .saturating_add(self.poi_corpus_entries_removed);
         if removed > 0 {
             write!(f, " after removing {removed} cache entries")?;
         }
@@ -89,55 +97,35 @@ impl std::error::Error for PersistedPublicSyncCacheResetError {}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PersistedPublicSyncCacheResetReport {
     pub wallet_scan_artifact_chunk_entries_removed: u64,
-    pub wallet_scan_artifact_chunk_files_removed: u64,
     pub txid_blob_entries_removed: u64,
-    pub txid_files_removed: u64,
-    pub poi_cache_entries_removed: u64,
+    pub poi_artifact_checkpoint_chunk_entries_removed: u64,
 }
 
 impl PersistedPublicSyncCacheResetReport {
     #[must_use]
     pub const fn total_removed_entries(self) -> u64 {
         self.wallet_scan_artifact_chunk_entries_removed
-            .saturating_add(self.wallet_scan_artifact_chunk_files_removed)
             .saturating_add(self.txid_blob_entries_removed)
-            .saturating_add(self.txid_files_removed)
-            .saturating_add(self.poi_cache_entries_removed)
+            .saturating_add(self.poi_artifact_checkpoint_chunk_entries_removed)
     }
 
     const fn record_txid_reset(&mut self, reset: crate::txid_cache::TxidPublicCacheReset) {
         self.txid_blob_entries_removed = reset.blob_entries_removed;
-        self.txid_files_removed = reset.files_removed;
     }
 
     const fn record_wallet_scan_reset(&mut self, reset: WalletScanArtifactChunkCacheReset) {
         self.wallet_scan_artifact_chunk_entries_removed = reset.blob_entries_removed;
-        self.wallet_scan_artifact_chunk_files_removed = reset.files_removed;
     }
-}
-
-pub(crate) struct PersistedPublicSyncCacheReset {
-    pub(crate) report: PersistedPublicSyncCacheResetReport,
-    pub(crate) poi_generation: u64,
 }
 
 /// Clears only reconstructible persisted public synchronization caches.
 ///
 /// This API is intended for maintenance while chain services are not active. The active manager
 /// acquires every public-data-plane commit fence before using the same operation; a single data
-/// plane acquires its own fence. Both active paths then invalidate in-memory state and notify POI
-/// cache coordinators.
+/// plane acquires its own fence. Materialized POI serving corpora are deliberately excluded.
 pub async fn reset_persisted_public_sync_caches(
     db: &DbStore,
 ) -> Result<PersistedPublicSyncCacheResetReport, PersistedPublicSyncCacheResetError> {
-    reset_persisted_public_sync_caches_with_generation(db)
-        .await
-        .map(|reset| reset.report)
-}
-
-pub(crate) async fn reset_persisted_public_sync_caches_with_generation(
-    db: &DbStore,
-) -> Result<PersistedPublicSyncCacheReset, PersistedPublicSyncCacheResetError> {
     let _reset_guard = PERSISTED_PUBLIC_SYNC_CACHE_RESET_LOCK.lock().await;
     let mut report = PersistedPublicSyncCacheResetReport::default();
     match reset_txid_public_cache(db).await {
@@ -162,26 +150,77 @@ pub(crate) async fn reset_persisted_public_sync_caches_with_generation(
             ));
         }
     }
-    let poi = clear_poi_artifact_cache_for_reset(db)
+    let poi_chunks = match reset_raw_chunk_cache(db).await {
+        Ok(reset) => reset,
+        Err(failure) => return Err(poi_chunk_reset_error(failure, report)),
+    };
+    report.poi_artifact_checkpoint_chunk_entries_removed = poi_chunks;
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OfflinePoiCorpusReset {
+    pub corpus_entries_removed: u64,
+    pub raw_chunk_entries_removed: u64,
+    pub generation: u64,
+}
+
+/// Destructively removes all persisted PPOI serving data and POI artifact raw chunks.
+///
+/// Every sync manager, chain service, public data plane, and PPOI cache service
+/// using this database must be fully shut down before this offline operation is
+/// called. Publisher anti-rollback state and wallet-private data are preserved.
+/// If raw-chunk purge fails after serving data was removed, the returned error's
+/// partial report records the completed removals.
+pub async fn reset_offline_poi_corpus(
+    db: &DbStore,
+) -> Result<OfflinePoiCorpusReset, PersistedPublicSyncCacheResetError> {
+    db.ensure_blob_kind_purge_supported(POI_V4_RAW_CHUNK_BLOB_KIND)
+        .map_err(|error| {
+            PersistedPublicSyncCacheResetError::new(
+                PersistedPublicSyncCacheKind::PoiArtifactCheckpointChunks,
+                error,
+                PersistedPublicSyncCacheResetReport::default(),
+            )
+        })?;
+    let _reset_guard = PERSISTED_PUBLIC_SYNC_CACHE_RESET_LOCK.lock().await;
+    let corpus = clear_poi_artifact_cache_for_reset(db)
         .await
         .map_err(|error| {
             PersistedPublicSyncCacheResetError::new(
                 PersistedPublicSyncCacheKind::PoiCorpus,
                 error,
-                report,
+                PersistedPublicSyncCacheResetReport::default(),
             )
         })?;
-    report.poi_cache_entries_removed = poi.removed;
-    Ok(PersistedPublicSyncCacheReset {
-        report,
-        poi_generation: poi.generation,
+    let raw = reset_raw_chunk_cache(db).await.map_err(|failure| {
+        let mut error =
+            poi_chunk_reset_error(failure, PersistedPublicSyncCacheResetReport::default());
+        error.poi_corpus_entries_removed = corpus.removed;
+        error
+    })?;
+    Ok(OfflinePoiCorpusReset {
+        corpus_entries_removed: corpus.removed,
+        raw_chunk_entries_removed: raw,
+        generation: corpus.generation,
     })
+}
+
+fn poi_chunk_reset_error(
+    failure: RawChunkCacheResetFailure,
+    mut report: PersistedPublicSyncCacheResetReport,
+) -> PersistedPublicSyncCacheResetError {
+    report.poi_artifact_checkpoint_chunk_entries_removed = failure.entries_removed;
+    PersistedPublicSyncCacheResetError::new(
+        PersistedPublicSyncCacheKind::PoiArtifactCheckpointChunks,
+        failure,
+        report,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalletScanArtifactChunkCacheReset {
     blob_entries_removed: u64,
-    files_removed: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -195,37 +234,24 @@ struct WalletScanArtifactChunkCacheResetFailure {
 async fn reset_wallet_scan_artifact_chunk_cache(
     db: &DbStore,
 ) -> Result<WalletScanArtifactChunkCacheReset, WalletScanArtifactChunkCacheResetFailure> {
+    let mut reset = WalletScanArtifactChunkCacheReset {
+        blob_entries_removed: 0,
+    };
+    db.ensure_blob_kind_purge_supported(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
+        .map_err(|error| WalletScanArtifactChunkCacheResetFailure {
+            reset,
+            error: std::io::Error::other(error),
+        })?;
     let authority = wallet_scan_artifact_cache_authority(db);
     let _access = Arc::clone(&authority.access).write_owned().await;
     authority.generation.fetch_add(1, Ordering::AcqRel);
-    let mut reset = WalletScanArtifactChunkCacheReset {
-        blob_entries_removed: 0,
-        files_removed: 0,
-    };
     reset.blob_entries_removed = db
         .clear_blob_meta_kind(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
         .map_err(|error| WalletScanArtifactChunkCacheResetFailure {
             reset,
             error: std::io::Error::other(error),
         })?;
-    let cache_dir = db.blob_dir().join(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND);
-    reset.files_removed = match count_path_entries(&cache_dir) {
-        Ok(files_removed) => {
-            match fs::remove_dir_all(&cache_dir) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(WalletScanArtifactChunkCacheResetFailure { reset, error });
-                }
-            }
-            files_removed
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => 0,
-        Err(error) => {
-            return Err(WalletScanArtifactChunkCacheResetFailure { reset, error });
-        }
-    };
-    db.ensure_blob_dir(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
+    db.purge_blob_kind(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
         .map_err(|error| WalletScanArtifactChunkCacheResetFailure {
             reset,
             error: std::io::Error::other(error),
@@ -267,25 +293,9 @@ pub(crate) async fn wallet_scan_artifact_transient_commit_access(
         .await
 }
 
-fn count_path_entries(path: &Path) -> Result<u64, std::io::Error> {
-    if path.is_file() {
-        return Ok(1);
-    }
-    let mut entries = 0_u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
-            entries = entries.saturating_add(count_path_entries(&entry_path)?);
-        } else {
-            entries = entries.saturating_add(1);
-        }
-    }
-    Ok(entries)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -314,7 +324,37 @@ mod tests {
             "wallet-chunk",
             "chunk.bin",
         );
+        seed_blob(
+            &db,
+            POI_V4_RAW_CHUNK_BLOB_KIND,
+            "poi-v4-chunk",
+            "poi-v4.bin",
+        );
         seed_blob(&db, "unrelated-cache", "unrelated", "keep.bin");
+        fs::remove_file(db.blob_path(TXID_CACHE_BLOB_KIND, "page.bin"))
+            .expect("remove metadata-backed TXID file");
+        for kind in [
+            TXID_CACHE_BLOB_KIND,
+            WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND,
+            POI_V4_RAW_CHUNK_BLOB_KIND,
+        ] {
+            fs::write(db.blob_path(kind, "orphan.bin"), b"orphan").expect("write unindexed orphan");
+        }
+        #[cfg(unix)]
+        let external_sentinel = {
+            use std::os::unix::fs::symlink;
+            let sentinel = root_dir.join("external-reset-sentinel");
+            fs::write(&sentinel, b"sentinel").expect("write external reset sentinel");
+            for kind in [
+                TXID_CACHE_BLOB_KIND,
+                WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND,
+                POI_V4_RAW_CHUNK_BLOB_KIND,
+            ] {
+                symlink(&sentinel, db.blob_path(kind, "external-link"))
+                    .expect("link external reset sentinel");
+            }
+            sentinel
+        };
 
         let list_key = FixedBytes::from([0x44; 32]);
         db.put_poi_artifact_cache(&poi_record(list_key))
@@ -344,11 +384,9 @@ mod tests {
             .expect("reset persisted public caches");
 
         assert_eq!(report.txid_blob_entries_removed, 1);
-        assert_eq!(report.txid_files_removed, 1);
         assert_eq!(report.wallet_scan_artifact_chunk_entries_removed, 1);
-        assert_eq!(report.wallet_scan_artifact_chunk_files_removed, 1);
-        assert_eq!(report.poi_cache_entries_removed, 1);
-        assert_eq!(report.total_removed_entries(), 5);
+        assert_eq!(report.poi_artifact_checkpoint_chunk_entries_removed, 1);
+        assert_eq!(report.total_removed_entries(), 3);
         assert!(
             db.get_blob_meta(TXID_CACHE_BLOB_KIND, "txid-page")
                 .expect("read TXID metadata")
@@ -362,13 +400,32 @@ mod tests {
         assert!(matches!(
             db.inspect_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &list_key)
                 .expect("inspect POI corpus"),
-            local_db::StoredRecord::Missing
+            local_db::StoredRecord::Valid(_)
         ));
         assert!(db.blob_dir().join(TXID_CACHE_BLOB_KIND).is_dir());
         assert!(
             db.blob_dir()
                 .join(WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND)
                 .is_dir()
+        );
+        assert!(db.blob_dir().join(POI_V4_RAW_CHUNK_BLOB_KIND).is_dir());
+        for kind in [
+            TXID_CACHE_BLOB_KIND,
+            WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND,
+            POI_V4_RAW_CHUNK_BLOB_KIND,
+        ] {
+            assert!(
+                fs::read_dir(db.blob_dir().join(kind))
+                    .expect("read purged cache kind")
+                    .next()
+                    .is_none(),
+                "orphan entries must be purged without affecting reported metadata count"
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(external_sentinel).expect("read external reset sentinel"),
+            b"sentinel"
         );
 
         assert!(
@@ -414,11 +471,120 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("remove reset test db");
     }
 
+    #[tokio::test]
+    async fn destructive_poi_corpus_reset_removes_public_corpus_and_raw_chunks_only() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open reset test db");
+        let list_key = FixedBytes::from([0x81; 32]);
+        db.put_poi_artifact_cache(&poi_record(list_key))
+            .expect("seed POI corpus");
+        seed_blob(
+            &db,
+            POI_V4_RAW_CHUNK_BLOB_KIND,
+            "raw-chunk",
+            "raw-chunk.bin",
+        );
+        let publisher = FixedBytes::from([0x82; 32]);
+        db.advance_poi_publisher_manifest_watermark(publisher, 23)
+            .expect("seed publisher watermark");
+        let wallet_key = WalletCacheKey::new("wallet", 1, Address::from([0x83; 20]));
+        db.put_wallet_utxo(&wallet_key, "private-row", b"encrypted")
+            .expect("seed wallet-private row");
+        db.put_desktop_wallet_vault_record("wallet-key", b"encrypted-key")
+            .expect("seed vault row");
+
+        let reset = reset_offline_poi_corpus(&db)
+            .await
+            .expect("destructively reset POI corpus");
+
+        assert_eq!(reset.corpus_entries_removed, 1);
+        assert_eq!(reset.raw_chunk_entries_removed, 1);
+        assert_eq!(reset.generation, 1);
+        assert!(
+            db.get_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &list_key)
+                .expect("read reset corpus")
+                .is_none()
+        );
+        assert_eq!(
+            db.get_poi_publisher_manifest_watermark(&publisher)
+                .expect("read watermark")
+                .expect("watermark retained")
+                .accepted_sequence,
+            23
+        );
+        assert_eq!(
+            db.list_wallet_utxos(&wallet_key)
+                .expect("read wallet-private rows")
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.get_desktop_wallet_vault_record("wallet-key")
+                .expect("read vault")
+                .expect("vault retained"),
+            b"encrypted-key"
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove reset test db");
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[tokio::test]
+    async fn destructive_poi_reset_fails_before_corpus_or_raw_mutation_when_purge_is_unsupported() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open reset test db");
+        let list_key = FixedBytes::from([0x91; 32]);
+        db.put_poi_artifact_cache(&poi_record(list_key))
+            .expect("seed POI corpus");
+        seed_blob(
+            &db,
+            POI_V4_RAW_CHUNK_BLOB_KIND,
+            "raw-chunk",
+            "raw-chunk.bin",
+        );
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("read initial corpus generation");
+
+        let error = reset_offline_poi_corpus(&db)
+            .await
+            .expect_err("unsupported purge fails closed");
+        assert_eq!(
+            error.kind,
+            PersistedPublicSyncCacheKind::PoiArtifactCheckpointChunks
+        );
+        assert!(error.reason.contains("unsupported"));
+        assert_eq!(
+            db.poi_artifact_cache_generation()
+                .expect("read retained corpus generation"),
+            generation
+        );
+        assert!(
+            db.get_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &list_key)
+                .expect("read retained corpus")
+                .is_some()
+        );
+        assert!(
+            db.get_blob_meta(POI_V4_RAW_CHUNK_BLOB_KIND, "raw-chunk")
+                .expect("read retained raw metadata")
+                .is_some()
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove reset test db");
+    }
+
     #[test]
     fn reset_error_exposes_completed_deletions() {
         let partial_report = PersistedPublicSyncCacheResetReport {
             txid_blob_entries_removed: 2,
-            txid_files_removed: 3,
             ..PersistedPublicSyncCacheResetReport::default()
         };
 
@@ -429,7 +595,26 @@ mod tests {
         );
 
         assert_eq!(error.partial_report, partial_report);
-        assert!(error.to_string().contains("after removing 5 cache entries"));
+        assert!(error.to_string().contains("after removing 2 cache entries"));
+    }
+
+    #[test]
+    fn raw_chunk_reset_error_exposes_deleted_metadata() {
+        let failure = RawChunkCacheResetFailure {
+            entries_removed: 7,
+            error: crate::poi_artifacts::RawChunkCacheError::Io(std::io::Error::other(
+                "injected purge failure",
+            )),
+        };
+
+        let error = poi_chunk_reset_error(failure, PersistedPublicSyncCacheResetReport::default());
+
+        assert_eq!(
+            error
+                .partial_report
+                .poi_artifact_checkpoint_chunk_entries_removed,
+            7
+        );
     }
 
     fn seed_blob(db: &DbStore, kind: &str, id: &str, name: &str) {
@@ -464,6 +649,7 @@ mod tests {
             chain_id: 1,
             txid_version: "V3_PoseidonMerkle".to_string(),
             list_key,
+            cache_generation: 0,
             source: PoiCacheRecordSource::IndexedArtifacts,
             validation: PoiCorpusValidationRecord::Legacy,
             legacy_observed_manifest_sequence: 0,

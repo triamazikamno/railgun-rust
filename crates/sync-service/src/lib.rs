@@ -13,6 +13,7 @@ pub mod indexed_artifacts;
 mod manager;
 pub(crate) mod poi_artifacts;
 mod poi_cache;
+pub mod poi_v4;
 mod public_cache;
 mod trustless_artifacts;
 pub(crate) mod txid_cache;
@@ -29,20 +30,22 @@ pub use manager::{
     ChainPublicSyncCacheResetResult, PublicSyncCachesResetReport, SyncManager, SyncManagerError,
 };
 pub use public_cache::{
-    PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
-    PersistedPublicSyncCacheResetReport, reset_persisted_public_sync_caches,
+    OfflinePoiCorpusReset, PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
+    PersistedPublicSyncCacheResetReport, reset_offline_poi_corpus,
+    reset_persisted_public_sync_caches,
 };
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
     GlobalPoiPolicy, IndexedArtifactManifestSource, IndexedArtifactSourceConfig,
-    PendingOutputPoiContextIntent, PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress,
-    PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
-    PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource, SyncProgressSender,
-    SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletCacheStore, WalletConfig,
-    WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus, WalletObservation, WalletPendingSpentMarkOutcome,
-    WalletPpoiWorkflowStatus, WalletPrivateRequestError, WalletReadiness, WalletReadinessError,
-    WalletReadinessWaitError, WalletSchedulableProgress, WalletViewState,
+    PendingOutputPoiContextIntent, PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind,
+    PoiArtifactCacheGraphProgress, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
+    PoiArtifactCacheProgress, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
+    PublicScanSource, SyncProgressSender, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
+    WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletObservation,
+    WalletPendingSpentMarkOutcome, WalletPpoiWorkflowStatus, WalletPrivateRequestError,
+    WalletReadiness, WalletReadinessError, WalletReadinessWaitError, WalletSchedulableProgress,
+    WalletViewState,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

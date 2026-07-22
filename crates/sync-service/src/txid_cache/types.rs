@@ -186,7 +186,6 @@ impl<'a> TxidPublicCacheWritePermit<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TxidPublicCacheReset {
     pub(crate) blob_entries_removed: u64,
-    pub(crate) files_removed: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -200,13 +199,6 @@ pub(crate) struct TxidPublicProof {
 pub(crate) struct TxidPublicLatestValidated {
     pub txid_index: u64,
     pub merkleroot: Option<FixedBytes<32>>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct TxidPublicCachedTransaction {
-    pub txid_index: u64,
-    pub transaction: TxidPublicCacheTransaction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,16 +357,6 @@ pub(super) struct TxidPublicCacheRow {
     pub(super) transaction: TxidPublicCacheTransaction,
 }
 
-#[cfg(test)]
-impl From<TxidPublicCacheRow> for TxidPublicCachedTransaction {
-    fn from(row: TxidPublicCacheRow) -> Self {
-        Self {
-            txid_index: row.txid_index,
-            transaction: row.transaction,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TxidPublicCacheTransaction {
     pub id: String,
@@ -415,12 +397,34 @@ impl TxidPublicCacheTransaction {
         u128::from(self.utxo_tree_out) * u128::from(TREE_LEAF_COUNT)
             + u128::from(self.utxo_batch_start_position_out)
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn output_index(&self, output_commitment: FixedBytes<32>) -> Option<usize> {
+#[cfg(test)]
+impl TxidPublicCacheTransaction {
+    pub(super) fn output_index(&self, output_commitment: FixedBytes<32>) -> Option<usize> {
         let output_commitment = U256::from_be_bytes(output_commitment.0);
         self.commitments
             .iter()
             .position(|commitment| *commitment == output_commitment)
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub(in super::super) struct TxidPublicCachedTransaction {
+        pub(in super::super) txid_index: u64,
+        pub(in super::super) transaction: TxidPublicCacheTransaction,
+    }
+
+    impl From<TxidPublicCacheRow> for TxidPublicCachedTransaction {
+        fn from(row: TxidPublicCacheRow) -> Self {
+            Self {
+                txid_index: row.txid_index,
+                transaction: row.transaction,
+            }
+        }
     }
 }

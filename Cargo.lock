@@ -6602,8 +6602,12 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "broadcaster-core",
+ "cid",
  "ed25519-dalek",
+ "hmac 0.13.0",
+ "libp2p-identity",
  "merkletree",
+ "multibase",
  "reqwest",
  "rmp-serde",
  "serde",

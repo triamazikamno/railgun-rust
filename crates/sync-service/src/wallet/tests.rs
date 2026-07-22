@@ -1,27 +1,38 @@
-use super::delta::{discard_pending_output_poi_contexts_for_spent_outputs, spent_source_for_utxo};
-use super::handle::{
-    LOCAL_PENDING_SPENT_TTL, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
-    WALLET_METADATA_LIVE_FLUSH_INTERVAL, WALLET_POI_RECOVERABLE_REFRESH_AFTER,
-    WalletPoiRefreshRequest,
+use super::delta::{
+    spent_source_for_utxo,
+    test_support::{
+        apply_wallet_delta_to_vec, discard_pending_output_poi_contexts_for_spent_outputs,
+    },
 };
-use super::local_poi_cache::install_tailed_poi_cache_if_current;
+use super::handle::{
+    LOCAL_PENDING_SPENT_TTL, WALLET_POI_RECOVERABLE_REFRESH_AFTER, WalletPoiRefreshRequest,
+    test_support::{WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL},
+};
+use super::local_poi_cache::test_support::install_tailed_poi_cache_if_current;
+use super::output_poi_recovery::test_support::{
+    PublicCacheTxidRecoveryRequest, force_resubmit_matching_pending_output_pois,
+    recovered_output_txid_data_from_public_cache,
+};
 use super::output_poi_recovery::{
     CalldataRecoveryBuildRequest, MatchingPendingOutputPoiContextDisposition,
-    OutputRecoveryRemoteProofSource, PublicCacheTxidRecoveryRequest, WalletNullifierIndex,
-    build_output_poi_recovery_chunk, build_output_poi_recovery_chunk_from_calldata,
-    decode_railgun_transactions, extend_pending_output_poi_context,
-    force_resubmit_matching_pending_output_pois, matching_pending_output_poi_context_disposition,
+    OutputRecoveryRemoteProofSource, WalletNullifierIndex, build_output_poi_recovery_chunk,
+    build_output_poi_recovery_chunk_from_calldata, decode_railgun_transactions,
+    extend_pending_output_poi_context, matching_pending_output_poi_context_disposition,
     newly_recoverable_output_poi_list_keys, output_poi_recovery_proof_retry_after,
     output_poi_recovery_retry_allowed_for_lists, output_start_global_position,
     preflight_local_output_poi_input_proofs, recoverable_output_poi_list_keys,
-    recovered_output_txid_data_from_public_cache, recovery_input_merkle_tree_for_root,
+    recovery_input_merkle_tree_for_root,
 };
 use super::pending_output_poi::{
-    pending_output_poi_observation_updates, process_pending_output_poi_observations_inner,
-    verify_submitted_pending_output_pois,
-    verify_submitted_pending_output_pois_authorized_with_projection,
-    verify_submitted_pending_output_pois_with_config,
+    pending_output_poi_submit_identity,
+    test_support::{
+        pending_output_poi_observation_updates, process_pending_output_poi_observations,
+        process_pending_output_poi_observations_inner, verify_submitted_pending_output_pois,
+        verify_submitted_pending_output_pois_authorized_with_projection,
+        verify_submitted_pending_output_pois_with_config,
+    },
 };
+use super::test_support::sync_live_poi_event_tail;
 use super::{
     DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
     ExpectedRecordState, ExpectedWalletOutput, LocalPoiMerkleProofSource, LocalPoiStatusReader,
@@ -33,17 +44,16 @@ use super::{
     WalletObservationPublisher, WalletPendingOverlay, WalletPendingSpent, WalletPersistState,
     WalletPoiRefreshSelection, WalletPoiRuntime, WalletPrivateMutationAuthority,
     WalletPrivatePoiClients, WalletProgressPersist, WalletViewState,
-    apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec,
-    apply_wallet_delta_to_vec_with_outcome, force_resubmit_matching_pending_output_pois_authorized,
-    now_epoch_secs, output_poi_recovery_candidates, pending_output_poi_context_fingerprint,
-    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submit_identity,
-    pending_overlay_from_delta, preflight_and_remote_submit_pending_output_poi,
-    process_pending_output_poi_observations, process_pending_output_poi_observations_authorized,
+    apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec_with_outcome,
+    force_resubmit_matching_pending_output_pois_authorized, now_epoch_secs,
+    output_poi_recovery_candidates, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_overlay_from_delta,
+    preflight_and_remote_submit_pending_output_poi,
+    process_pending_output_poi_observations_authorized,
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
-    rewind_wallet_utxos, sync_live_poi_event_tail,
-    verify_submitted_pending_output_pois_with_config_authorized, wallet_poi_status_client,
-    wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
-    wallet_ppoi_workflow_status,
+    rewind_wallet_utxos, verify_submitted_pending_output_pois_with_config_authorized,
+    wallet_poi_status_client, wallet_poi_status_refresh_needed,
+    wallet_poi_status_refresh_needed_for_selection, wallet_ppoi_workflow_status,
 };
 use crate::chain::{
     ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey as DataPlanePublicTxidCacheKey,
@@ -96,6 +106,7 @@ use railgun_wallet::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -224,7 +235,26 @@ fn test_wallet_utxo(position: u64) -> WalletUtxo {
     test_wallet_utxo_with_kind(position, UtxoCommitmentKind::Transact)
 }
 
-fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
+struct TestWalletHandle {
+    handle: WalletHandle,
+    _observation: Arc<WalletObservationPublisher>,
+}
+
+impl Deref for TestWalletHandle {
+    type Target = WalletHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl DerefMut for TestWalletHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> TestWalletHandle {
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let (reset_generation_tx, reset_generation_rx) = watch::channel(0_u64);
     let (observation, observation_rx) =
@@ -241,7 +271,7 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
     let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
-    WalletHandle {
+    let handle = WalletHandle {
         cache_key: test_cache_key("cache-key"),
         chain: ChainKey {
             chain_id: 1,
@@ -258,7 +288,6 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         reset_generation_rx,
         next_sync_job_id: Arc::new(AtomicU64::new(1)),
         observation: Arc::downgrade(&observation),
-        _observation_test_owner: Some(observation),
         observation_rx,
         rev_rx,
         poi_refreshing_rx,
@@ -270,6 +299,10 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
         rev_tx,
         reset_generation_tx,
         indexed_catch_up_tx,
+    };
+    TestWalletHandle {
+        handle,
+        _observation: observation,
     }
 }
 
@@ -8461,7 +8494,6 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
         reset_generation_rx,
         next_sync_job_id: Arc::new(AtomicU64::new(1)),
         observation: Arc::downgrade(&observation),
-        _observation_test_owner: Some(observation),
         observation_rx,
         rev_rx,
         poi_refreshing_rx,

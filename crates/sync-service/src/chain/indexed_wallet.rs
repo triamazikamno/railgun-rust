@@ -12,9 +12,6 @@ use super::{
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-#[cfg(test)]
-use super::{PublicDataPlaneEpoch, parse_indexed_wallet_delta};
-
 use alloy::primitives::{FixedBytes as AlloyFixedBytes, U256};
 use alloy::sol_types::SolValue;
 use broadcaster_core::contracts::railgun::{
@@ -359,16 +356,6 @@ pub(super) struct IndexedWalletArtifactSession {
 pub(super) enum IndexedWalletArtifactPageOutcome {
     Page(IndexedWalletPage),
     Exhausted { checkpoint_block: u64 },
-}
-
-#[cfg(test)]
-impl IndexedWalletArtifactPageOutcome {
-    fn expect(self, message: &str) -> IndexedWalletPage {
-        match self {
-            Self::Page(page) => page,
-            Self::Exhausted { .. } => panic!("{message}"),
-        }
-    }
 }
 
 impl IndexedWalletArtifactSession {
@@ -1005,11 +992,6 @@ impl WalletScanArtifactCoverage {
             .push(WalletScanCoverageRange::try_from(coverage)?);
         self.ranges.sort_by_key(|range| (range.start, range.end));
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn add_descriptor(&mut self, descriptor: &IndexedArtifactDescriptor) -> Result<(), SyncError> {
-        self.add_range(&IndexedArtifactStreamCoverage::from(descriptor))
     }
 
     fn checkpoint_for_range(
@@ -1791,11 +1773,29 @@ pub(super) async fn send_wallet_startup_events(
 }
 
 #[cfg(test)]
+impl IndexedWalletArtifactPageOutcome {
+    fn expect(self, message: &str) -> IndexedWalletPage {
+        match self {
+            Self::Page(page) => page,
+            Self::Exhausted { .. } => panic!("{message}"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl WalletScanArtifactCoverage {
+    fn add_descriptor(&mut self, descriptor: &IndexedArtifactDescriptor) -> Result<(), SyncError> {
+        self.add_range(&IndexedArtifactStreamCoverage::from(descriptor))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
 
+    use super::super::PublicDataPlaneEpoch;
     use crate::indexed_artifacts::{
         CompressionAlgorithm, DatasetDescriptorMetadata, INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
         INDEXED_ARTIFACT_CHUNK_MAGIC, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
@@ -1805,6 +1805,7 @@ mod tests {
     use alloy::sol_types::SolValue;
     use broadcaster_core::contracts::railgun::TokenData;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
+    use railgun_wallet::scan::parse_indexed_wallet_delta;
     use sha2::{Digest, Sha256};
 
     #[test]

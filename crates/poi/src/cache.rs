@@ -275,6 +275,15 @@ impl PoiCache {
     }
 
     #[must_use]
+    pub fn commitment_at_global_index(&self, global_index: u64) -> Option<FixedBytes<32>> {
+        let (tree_number, tree_position) = normalize_tree_position(0, global_index);
+        self.snapshot
+            .forest
+            .leaf_at(tree_number, tree_position)
+            .map(|leaf| FixedBytes::from(leaf.to_be_bytes::<32>()))
+    }
+
+    #[must_use]
     pub fn status(&self, blinded_commitment: &FixedBytes<32>) -> PoiStatus {
         self.snapshot
             .status_by_blinded_commitment
@@ -1351,6 +1360,7 @@ mod tests {
     async fn public_range_sync_rejects_invalid_event_signature() {
         let commitment = FixedBytes::from([0x66; 32]);
         let mut invalid = event(0, commitment);
+        invalid.signed_poi_event.event_type = PoiEventType::Transact;
         invalid.signed_poi_event.signature = "00".repeat(64);
         let mock = spawn_json_rpc(vec![json_rpc_result(&json!([invalid]))]);
         let mut cache = PoiCache::new(identity());

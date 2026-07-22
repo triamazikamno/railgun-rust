@@ -1,8 +1,12 @@
-use super::{
-    TxidPublicCache, TxidPublicCacheKey, TxidPublicLatestValidated, index_entries_for_hash,
-    safe_file_component, txid_public_proof_for_recovered_output,
-    txid_public_proof_for_recovered_output_at_index, txid_public_transaction_for_recovered_output,
+use super::index::{load_index_shard, test_support::index_entries_for_hash};
+use super::paths::safe_file_component;
+use super::proof::{
+    row_for_txid_index, test_support::txid_public_transaction_for_recovered_output,
     txid_root_index_for_target,
+};
+use super::{
+    TxidPublicCache, TxidPublicCacheKey, TxidPublicLatestValidated,
+    txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
 use crate::indexed_artifacts::{
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
@@ -174,14 +178,14 @@ async fn txid_public_cache_isolates_contracts_on_the_same_chain_and_db() {
         page_b.rows[0].transaction.transaction_hash,
         row_b.transaction_hash
     );
-    let index_a = super::load_index_shard(&db, key_a, 0x31).expect("read contract A index");
-    let index_b = super::load_index_shard(&db, key_b, 0x32).expect("read contract B index");
+    let index_a = load_index_shard(&db, key_a, 0x31).expect("read contract A index");
+    let index_b = load_index_shard(&db, key_b, 0x32).expect("read contract B index");
     assert_eq!(index_a.railgun_contract, key_a.railgun_contract);
     assert_eq!(index_b.railgun_contract, key_b.railgun_contract);
     assert_eq!(index_a.entries.len(), 1);
     assert_eq!(index_b.entries.len(), 1);
     assert!(
-        super::load_index_shard(&db, key_b, 0x31)
+        load_index_shard(&db, key_b, 0x31)
             .expect("read isolated contract B index shard")
             .entries
             .is_empty()
@@ -485,7 +489,7 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
         .load_manifest()
         .expect("load manifest")
         .expect("manifest present");
-    let refreshed_row = super::row_for_txid_index(&manifest, &db, 0)
+    let refreshed_row = row_for_txid_index(&manifest, &db, 0)
         .expect("read refreshed row")
         .expect("refreshed row present");
     assert_eq!(
@@ -557,7 +561,7 @@ async fn txid_public_cache_lookup_prefers_validated_duplicate_over_unvalidated_s
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let stale_row = super::row_for_txid_index(&manifest, &db, 1)
+    let stale_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read stale row")
         .expect("stale row present");
     assert_eq!(
@@ -684,7 +688,7 @@ async fn txid_public_cache_recovery_refreshes_rewritten_rows_below_high_water_ma
         .expect("reload manifest")
         .expect("manifest present");
     assert_eq!(manifest.next_txid_index, 2);
-    let refreshed = super::row_for_txid_index(&manifest, &db, 0)
+    let refreshed = row_for_txid_index(&manifest, &db, 0)
         .expect("read refreshed row")
         .expect("refreshed row present");
     assert_eq!(
@@ -799,7 +803,7 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let refreshed_row = super::row_for_txid_index(&manifest, &db, 0)
+    let refreshed_row = row_for_txid_index(&manifest, &db, 0)
         .expect("read refreshed row")
         .expect("refreshed row present");
     assert_eq!(
@@ -969,7 +973,7 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
     assert_eq!(manifest.latest_validated_txid_index, Some(0));
     assert_eq!(manifest.latest_validated_merkleroot, Some(first_root));
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read background row")
         .expect("background row present");
     assert_eq!(
@@ -1117,10 +1121,10 @@ async fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_ro
 
     assert_eq!(applied, 2);
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let first_row = super::row_for_txid_index(&manifest, &db, 0)
+    let first_row = row_for_txid_index(&manifest, &db, 0)
         .expect("read first row")
         .expect("first row present");
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read second row")
         .expect("second row present");
     assert_eq!(
@@ -1203,8 +1207,9 @@ fn txid_public_artifact_chunk_splits_multi_page_chunk() {
         .collect::<Vec<_>>();
     let chunk = public_txid_artifact_chunk(0, &transactions, None);
 
-    let pages = super::artifact::materialize_artifact_pages_with_page_size(&chunk, page_size)
-        .expect("materialize pages");
+    let pages =
+        super::artifact::test_support::materialize_artifact_pages_with_page_size(&chunk, page_size)
+            .expect("materialize pages");
 
     assert_eq!(pages.len(), 2);
     assert_eq!(pages[0].start_index, 0);
@@ -1252,7 +1257,7 @@ async fn txid_public_artifact_failure_before_progress_falls_back_to_graphql() {
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read fallback row")
         .expect("fallback row present");
     assert_eq!(row.transaction.transaction_hash, graph_row.transaction_hash);
@@ -1628,7 +1633,7 @@ async fn txid_public_full_range_artifact_root_mismatch_falls_back_to_graphql() {
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
     assert_eq!(manifest.latest_validated_merkleroot, Some(graph_root));
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read fallback row")
         .expect("fallback row present");
     assert_eq!(row.transaction.transaction_hash, graph_row.transaction_hash);
@@ -1770,7 +1775,7 @@ async fn txid_public_cache_prefers_configured_artifact_source_before_graphql() {
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read artifact row")
         .expect("artifact row present");
     assert_eq!(
@@ -1937,10 +1942,10 @@ async fn txid_public_rejects_overlapping_current_snapshot_repack() {
         .load_manifest()
         .expect("load seeded manifest")
         .expect("seeded manifest present");
-    let before_row_5 = super::row_for_txid_index(&before_manifest, &db, 5)
+    let before_row_5 = row_for_txid_index(&before_manifest, &db, 5)
         .expect("read row 5 before invalid repack")
         .expect("row 5 present before invalid repack");
-    let before_row_9 = super::row_for_txid_index(&before_manifest, &db, 9)
+    let before_row_9 = row_for_txid_index(&before_manifest, &db, 9)
         .expect("read row 9 before invalid repack")
         .expect("row 9 present before invalid repack");
 
@@ -1991,10 +1996,10 @@ async fn txid_public_rejects_overlapping_current_snapshot_repack() {
         .expect("manifest present after invalid repack");
     assert_eq!(after_manifest.validated_cached_txid_index, Some(9));
     assert_eq!(after_manifest.next_txid_index, 10);
-    let after_row_5 = super::row_for_txid_index(&after_manifest, &db, 5)
+    let after_row_5 = row_for_txid_index(&after_manifest, &db, 5)
         .expect("read row 5 after invalid repack")
         .expect("row 5 present after invalid repack");
-    let after_row_9 = super::row_for_txid_index(&after_manifest, &db, 9)
+    let after_row_9 = row_for_txid_index(&after_manifest, &db, 9)
         .expect("read row 9 after invalid repack")
         .expect("row 9 present after invalid repack");
     assert_eq!(
@@ -2006,7 +2011,7 @@ async fn txid_public_rejects_overlapping_current_snapshot_repack() {
         before_row_9.transaction.transaction_hash
     );
     assert!(
-        super::row_for_txid_index(&after_manifest, &db, 10)
+        row_for_txid_index(&after_manifest, &db, 10)
             .expect("read row 10 after invalid repack")
             .is_none(),
         "invalid stream view must not append current rows after the prior conflict"
@@ -2069,7 +2074,7 @@ async fn txid_public_background_does_not_retain_superseded_prior_tail() {
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read current row")
         .expect("current row present");
     assert_eq!(
@@ -2420,7 +2425,7 @@ async fn txid_public_background_does_not_fetch_prior_only_catalog() {
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read current row")
         .expect("current row present");
     assert_eq!(
@@ -2683,7 +2688,7 @@ async fn txid_public_optional_prior_tail_failure_does_not_block_current_chunk() 
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read current row")
         .expect("current row present");
     assert_eq!(
@@ -2776,7 +2781,7 @@ async fn txid_public_prior_only_catalog_failure_does_not_block_current_progress(
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read current row")
         .expect("current row present");
     assert_eq!(
@@ -2851,7 +2856,7 @@ async fn txid_public_optional_prior_tail_root_mismatch_does_not_write_retention(
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
-    let second_row = super::row_for_txid_index(&manifest, &db, 1)
+    let second_row = row_for_txid_index(&manifest, &db, 1)
         .expect("read current row")
         .expect("current row present");
     assert_eq!(
@@ -3172,7 +3177,7 @@ async fn txid_public_cache_rejects_root_mismatched_high_water_without_correction
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
     assert_eq!(manifest.latest_validated_txid_index, None);
     assert_eq!(manifest.latest_validated_merkleroot, None);
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read stale row")
         .expect("stale row present");
     assert_eq!(row.transaction.transaction_hash, stale_row.transaction_hash);
@@ -3213,7 +3218,7 @@ async fn txid_public_cache_background_falls_back_to_graphql_after_zero_artifact_
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.next_txid_index, 1);
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read fallback row")
         .expect("fallback row present");
     assert_eq!(row.transaction.transaction_hash, graph_row.transaction_hash);
@@ -3267,12 +3272,12 @@ async fn txid_public_cache_truncates_artifact_chunk_past_latest_validated() {
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
     assert_eq!(manifest.next_txid_index, 1);
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read validated prefix row")
         .expect("validated prefix row present");
     assert_eq!(row.transaction.transaction_hash, first.transaction_hash);
     assert!(
-        super::row_for_txid_index(&manifest, &db, 1)
+        row_for_txid_index(&manifest, &db, 1)
             .expect("read unvalidated tail row")
             .is_none()
     );
@@ -3320,12 +3325,12 @@ async fn txid_public_cache_artifact_only_truncates_spanning_chunk_to_validated_p
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
     assert_eq!(manifest.next_txid_index, 1);
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read validated prefix row")
         .expect("validated prefix row present");
     assert_eq!(row.transaction.transaction_hash, first.transaction_hash);
     assert!(
-        super::row_for_txid_index(&manifest, &db, 1)
+        row_for_txid_index(&manifest, &db, 1)
             .expect("read unvalidated tail row")
             .is_none()
     );
@@ -3388,7 +3393,7 @@ async fn txid_public_cache_artifact_only_advances_from_inside_chunk() {
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
     assert_eq!(manifest.next_txid_index, 2);
-    let row = super::row_for_txid_index(&manifest, &db, 1)
+    let row = row_for_txid_index(&manifest, &db, 1)
         .expect("read overlapped artifact row")
         .expect("overlapped artifact row present");
     assert_eq!(row.transaction.transaction_hash, second.transaction_hash);
@@ -3451,7 +3456,7 @@ async fn txid_public_cache_artifact_only_refreshes_changed_validated_root() {
         .expect("manifest present");
     assert_eq!(manifest.latest_validated_merkleroot, Some(new_root));
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read refreshed row")
         .expect("refreshed row present");
     assert_eq!(row.transaction.transaction_hash, new_row.transaction_hash);
@@ -3498,7 +3503,7 @@ async fn txid_public_cache_falls_back_to_graphql_when_artifact_descriptors_are_u
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let row = super::row_for_txid_index(&manifest, &db, 0)
+    let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read fallback row")
         .expect("fallback row present");
     assert_eq!(row.transaction.transaction_hash, graph_row.transaction_hash);

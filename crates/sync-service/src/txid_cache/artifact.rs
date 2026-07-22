@@ -50,13 +50,6 @@ impl TxidPublicArtifactMaintenance {
         }
     }
 
-    #[cfg(test)]
-    pub(super) async fn run(self, cache: &TxidPublicCache<'_>) {
-        for chunk in self.stable_current {
-            Self::retain_stable_chunk(cache, chunk, self.read_scope).await;
-        }
-    }
-
     pub(super) fn take_stable_current(&mut self) -> Vec<VerifiedIndexedArtifactChunk> {
         std::mem::take(&mut self.stable_current)
     }
@@ -361,15 +354,6 @@ impl TxidPublicCacheWritePermit<'_> {
 }
 
 impl TxidPublicCacheManifest {
-    #[cfg(test)]
-    pub(crate) fn apply_artifact_chunks(
-        &mut self,
-        permit: &TxidPublicCacheWritePermit<'_>,
-        chunks: &[VerifiedIndexedArtifactChunk],
-    ) -> Result<u64, TxidPublicCacheError> {
-        self.apply_artifact_chunks_bounded(permit, chunks, None, None)
-    }
-
     pub(crate) fn apply_artifact_chunks_bounded(
         &mut self,
         permit: &TxidPublicCacheWritePermit<'_>,
@@ -531,14 +515,6 @@ fn materialize_artifact_pages(
         txid_version: DEFAULT_TXID_VERSION,
     };
     TxidPublicCachePage::pages_from_rows(key, rows, page_size)
-}
-
-#[cfg(test)]
-pub(super) fn materialize_artifact_pages_with_page_size(
-    chunk: &VerifiedIndexedArtifactChunk,
-    page_size: NonZeroUsize,
-) -> Result<Vec<TxidPublicCachePage>, TxidPublicCacheError> {
-    materialize_artifact_pages(chunk, page_size)
 }
 
 fn verify_declared_merkle_root(
@@ -831,5 +807,37 @@ impl<'a> PublicTxidCursor<'a> {
         })?;
         self.position = end;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+impl TxidPublicArtifactMaintenance {
+    pub(super) async fn run(self, cache: &TxidPublicCache<'_>) {
+        for chunk in self.stable_current {
+            Self::retain_stable_chunk(cache, chunk, self.read_scope).await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl TxidPublicCacheManifest {
+    pub(super) fn apply_artifact_chunks(
+        &mut self,
+        permit: &TxidPublicCacheWritePermit<'_>,
+        chunks: &[VerifiedIndexedArtifactChunk],
+    ) -> Result<u64, TxidPublicCacheError> {
+        self.apply_artifact_chunks_bounded(permit, chunks, None, None)
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in super::super) fn materialize_artifact_pages_with_page_size(
+        chunk: &VerifiedIndexedArtifactChunk,
+        page_size: NonZeroUsize,
+    ) -> Result<Vec<TxidPublicCachePage>, TxidPublicCacheError> {
+        materialize_artifact_pages(chunk, page_size)
     }
 }

@@ -3,12 +3,6 @@ use super::{
     TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCacheRow, TxidPublicProof, U256,
     find_target_row, read_tree_leaves,
 };
-#[cfg(test)]
-use super::{
-    TxidPublicCacheIndexEntry, TxidPublicCachePage, TxidPublicCacheWritePermit,
-    TxidPublicCachedTransaction, index_entries_for_hash, rebuild_index_for_manifest,
-};
-
 pub(crate) fn txid_public_proof_for_recovered_output(
     db: &DbStore,
     key: TxidPublicCacheKey<'_>,
@@ -176,168 +170,6 @@ pub(super) fn validated_root_txid_index(
     Ok(root_txid_index)
 }
 
-#[cfg(test)]
-pub(crate) fn txid_public_transaction_for_recovered_output(
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
-    tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-) -> Result<TxidPublicCachedTransaction, TxidPublicCacheError> {
-    let cache = TxidPublicCache::new(db, key);
-    let manifest = cache
-        .load_manifest()?
-        .ok_or(TxidPublicCacheError::CacheNotReady {
-            next_index: 0,
-            required_index: 0,
-        })?;
-    manifest.validate_for(key)?;
-    let row = find_target_row_by_hash_index(&manifest, db, key, tx_hash, output_commitment)?
-        .map_or_else(
-            || find_target_row_by_scan(&manifest, db, tx_hash, output_commitment),
-            Ok,
-        )?;
-    Ok(row.into())
-}
-
-#[cfg(test)]
-pub(super) fn find_public_recovery_transaction_in_manifest(
-    manifest: &TxidPublicCacheManifest,
-    permit: &TxidPublicCacheWritePermit<'_>,
-    tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
-    let db = permit.db();
-    let key = permit.key();
-    if let Some(row) = find_target_row_by_hash_index(manifest, db, key, tx_hash, output_commitment)?
-    {
-        return Ok(row);
-    }
-    rebuild_index_for_manifest(manifest, permit)?;
-    if let Some(row) = find_target_row_by_hash_index(manifest, db, key, tx_hash, output_commitment)?
-    {
-        return Ok(row);
-    }
-    find_target_row_by_scan(manifest, db, tx_hash, output_commitment)
-}
-
-#[cfg(test)]
-pub(super) fn find_target_row_by_hash_index(
-    manifest: &TxidPublicCacheManifest,
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
-    tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-) -> Result<Option<TxidPublicCacheRow>, TxidPublicCacheError> {
-    let entries = index_entries_for_hash(db, key, tx_hash)?;
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    let mut found = RecoveredOutputMatch::default();
-    for entry in entries {
-        let Some(row) = row_for_index_entry(manifest, db, &entry)? else {
-            continue;
-        };
-        found.remember(manifest, row, tx_hash, output_commitment)?;
-    }
-    Ok(found.row)
-}
-
-#[cfg(test)]
-pub(super) fn find_target_row_by_scan(
-    manifest: &TxidPublicCacheManifest,
-    db: &DbStore,
-    tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
-    let mut found = RecoveredOutputMatch::default();
-    for page_ref in &manifest.pages {
-        let page = page_ref.read(db, manifest.cache_key())?;
-        for row in page.rows {
-            found.remember(manifest, row, tx_hash, output_commitment)?;
-        }
-    }
-    found.row.ok_or(TxidPublicCacheError::MissingTarget)
-}
-
-#[cfg(test)]
-pub(super) fn find_target_row_in_page(
-    manifest: &TxidPublicCacheManifest,
-    page: &TxidPublicCachePage,
-    tx_hash: FixedBytes<32>,
-    output_commitment: FixedBytes<32>,
-) -> Result<Option<TxidPublicCacheRow>, TxidPublicCacheError> {
-    let mut found = RecoveredOutputMatch::default();
-    for row in page.rows.iter().cloned() {
-        found.remember(manifest, row, tx_hash, output_commitment)?;
-    }
-    Ok(found.row)
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(super) struct RecoveredOutputMatch {
-    pub(super) row: Option<TxidPublicCacheRow>,
-    pub(super) validated: bool,
-}
-
-#[cfg(test)]
-impl RecoveredOutputMatch {
-    fn remember(
-        &mut self,
-        manifest: &TxidPublicCacheManifest,
-        row: TxidPublicCacheRow,
-        tx_hash: FixedBytes<32>,
-        output_commitment: FixedBytes<32>,
-    ) -> Result<(), TxidPublicCacheError> {
-        if row.transaction.transaction_hash != tx_hash
-            || row.transaction.output_index(output_commitment).is_none()
-        {
-            return Ok(());
-        }
-        let validated = manifest
-            .validated_cached_txid_index
-            .is_some_and(|index| row.txid_index <= index);
-        match (&self.row, self.validated, validated) {
-            (None, _, _) => {
-                self.row = Some(row);
-                self.validated = validated;
-            }
-            (Some(_), true, false) => {}
-            (Some(_), false, true) => {
-                self.row = Some(row);
-                self.validated = true;
-            }
-            (Some(_), _, _) => return Err(TxidPublicCacheError::AmbiguousTarget),
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-fn row_for_index_entry(
-    manifest: &TxidPublicCacheManifest,
-    db: &DbStore,
-    entry: &TxidPublicCacheIndexEntry,
-) -> Result<Option<TxidPublicCacheRow>, TxidPublicCacheError> {
-    let Some(page_ref) = manifest
-        .pages
-        .iter()
-        .find(|page_ref| page_ref.start_index == entry.page_start_index)
-    else {
-        return Ok(None);
-    };
-    let page = page_ref.read(db, manifest.cache_key())?;
-    let Some(row) = page.rows.get(entry.row_offset as usize).cloned() else {
-        return Ok(None);
-    };
-    if row.txid_index != entry.txid_index
-        || row.transaction.transaction_hash != entry.transaction_hash
-    {
-        return Ok(None);
-    }
-    Ok(Some(row))
-}
-
 pub(super) fn row_for_txid_index(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,
@@ -371,5 +203,171 @@ pub(super) const fn txid_root_index_for_target(
         latest_validated_txid_index
     } else {
         (target_tree + 1) * TREE_LEAF_COUNT - 1
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::super::index::{rebuild_index_for_manifest, test_support::index_entries_for_hash};
+    use super::super::types::{
+        TxidPublicCacheIndexEntry, TxidPublicCachePage, TxidPublicCacheWritePermit,
+        test_support::TxidPublicCachedTransaction,
+    };
+    use super::*;
+
+    pub(in super::super) fn txid_public_transaction_for_recovered_output(
+        db: &DbStore,
+        key: TxidPublicCacheKey<'_>,
+        tx_hash: FixedBytes<32>,
+        output_commitment: FixedBytes<32>,
+    ) -> Result<TxidPublicCachedTransaction, TxidPublicCacheError> {
+        let cache = TxidPublicCache::new(db, key);
+        let manifest = cache
+            .load_manifest()?
+            .ok_or(TxidPublicCacheError::CacheNotReady {
+                next_index: 0,
+                required_index: 0,
+            })?;
+        manifest.validate_for(key)?;
+        let row = find_target_row_by_hash_index(&manifest, db, key, tx_hash, output_commitment)?
+            .map_or_else(
+                || find_target_row_by_scan(&manifest, db, tx_hash, output_commitment),
+                Ok,
+            )?;
+        Ok(row.into())
+    }
+
+    pub(in super::super) fn find_public_recovery_transaction_in_manifest(
+        manifest: &TxidPublicCacheManifest,
+        permit: &TxidPublicCacheWritePermit<'_>,
+        tx_hash: FixedBytes<32>,
+        output_commitment: FixedBytes<32>,
+    ) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
+        let db = permit.db();
+        let key = permit.key();
+        if let Some(row) =
+            find_target_row_by_hash_index(manifest, db, key, tx_hash, output_commitment)?
+        {
+            return Ok(row);
+        }
+        rebuild_index_for_manifest(manifest, permit)?;
+        if let Some(row) =
+            find_target_row_by_hash_index(manifest, db, key, tx_hash, output_commitment)?
+        {
+            return Ok(row);
+        }
+        find_target_row_by_scan(manifest, db, tx_hash, output_commitment)
+    }
+
+    fn find_target_row_by_hash_index(
+        manifest: &TxidPublicCacheManifest,
+        db: &DbStore,
+        key: TxidPublicCacheKey<'_>,
+        tx_hash: FixedBytes<32>,
+        output_commitment: FixedBytes<32>,
+    ) -> Result<Option<TxidPublicCacheRow>, TxidPublicCacheError> {
+        let entries = index_entries_for_hash(db, key, tx_hash)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut found = RecoveredOutputMatch::default();
+        for entry in entries {
+            let Some(row) = row_for_index_entry(manifest, db, &entry)? else {
+                continue;
+            };
+            found.remember(manifest, row, tx_hash, output_commitment)?;
+        }
+        Ok(found.row)
+    }
+
+    fn find_target_row_by_scan(
+        manifest: &TxidPublicCacheManifest,
+        db: &DbStore,
+        tx_hash: FixedBytes<32>,
+        output_commitment: FixedBytes<32>,
+    ) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
+        let mut found = RecoveredOutputMatch::default();
+        for page_ref in &manifest.pages {
+            let page = page_ref.read(db, manifest.cache_key())?;
+            for row in page.rows {
+                found.remember(manifest, row, tx_hash, output_commitment)?;
+            }
+        }
+        found.row.ok_or(TxidPublicCacheError::MissingTarget)
+    }
+
+    pub(in super::super) fn find_target_row_in_page(
+        manifest: &TxidPublicCacheManifest,
+        page: &TxidPublicCachePage,
+        tx_hash: FixedBytes<32>,
+        output_commitment: FixedBytes<32>,
+    ) -> Result<Option<TxidPublicCacheRow>, TxidPublicCacheError> {
+        let mut found = RecoveredOutputMatch::default();
+        for row in page.rows.iter().cloned() {
+            found.remember(manifest, row, tx_hash, output_commitment)?;
+        }
+        Ok(found.row)
+    }
+
+    #[derive(Default)]
+    struct RecoveredOutputMatch {
+        row: Option<TxidPublicCacheRow>,
+        validated: bool,
+    }
+
+    impl RecoveredOutputMatch {
+        fn remember(
+            &mut self,
+            manifest: &TxidPublicCacheManifest,
+            row: TxidPublicCacheRow,
+            tx_hash: FixedBytes<32>,
+            output_commitment: FixedBytes<32>,
+        ) -> Result<(), TxidPublicCacheError> {
+            if row.transaction.transaction_hash != tx_hash
+                || row.transaction.output_index(output_commitment).is_none()
+            {
+                return Ok(());
+            }
+            let validated = manifest
+                .validated_cached_txid_index
+                .is_some_and(|index| row.txid_index <= index);
+            match (&self.row, self.validated, validated) {
+                (None, _, _) => {
+                    self.row = Some(row);
+                    self.validated = validated;
+                }
+                (Some(_), true, false) => {}
+                (Some(_), false, true) => {
+                    self.row = Some(row);
+                    self.validated = true;
+                }
+                (Some(_), _, _) => return Err(TxidPublicCacheError::AmbiguousTarget),
+            }
+            Ok(())
+        }
+    }
+
+    fn row_for_index_entry(
+        manifest: &TxidPublicCacheManifest,
+        db: &DbStore,
+        entry: &TxidPublicCacheIndexEntry,
+    ) -> Result<Option<TxidPublicCacheRow>, TxidPublicCacheError> {
+        let Some(page_ref) = manifest
+            .pages
+            .iter()
+            .find(|page_ref| page_ref.start_index == entry.page_start_index)
+        else {
+            return Ok(None);
+        };
+        let page = page_ref.read(db, manifest.cache_key())?;
+        let Some(row) = page.rows.get(entry.row_offset as usize).cloned() else {
+            return Ok(None);
+        };
+        if row.txid_index != entry.txid_index
+            || row.transaction.transaction_hash != entry.transaction_hash
+        {
+            return Ok(None);
+        }
+        Ok(Some(row))
     }
 }

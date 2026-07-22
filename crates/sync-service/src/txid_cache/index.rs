@@ -103,20 +103,6 @@ pub(super) fn clear_index_shards(
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn index_entries_for_hash(
-    db: &DbStore,
-    key: TxidPublicCacheKey<'_>,
-    tx_hash: FixedBytes<32>,
-) -> Result<Vec<TxidPublicCacheIndexEntry>, TxidPublicCacheError> {
-    let index = load_index_shard(db, key, index_shard(tx_hash))?;
-    Ok(index
-        .entries
-        .into_iter()
-        .filter(|entry| entry.transaction_hash == tx_hash)
-        .collect())
-}
-
 pub(super) fn load_index_shard(
     db: &DbStore,
     key: TxidPublicCacheKey<'_>,
@@ -186,4 +172,22 @@ pub(super) fn empty_index_shard(
 
 pub(super) const fn index_shard(tx_hash: FixedBytes<32>) -> u8 {
     tx_hash.0[0]
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in super::super) fn index_entries_for_hash(
+        db: &DbStore,
+        key: TxidPublicCacheKey<'_>,
+        tx_hash: FixedBytes<32>,
+    ) -> Result<Vec<TxidPublicCacheIndexEntry>, TxidPublicCacheError> {
+        let index = load_index_shard(db, key, index_shard(tx_hash))?;
+        Ok(index
+            .entries
+            .into_iter()
+            .filter(|entry| entry.transaction_hash == tx_hash)
+            .collect())
+    }
 }

@@ -1,18 +1,12 @@
 use super::{
     DbStore, DenseMerkleTree, ErrorKind, FixedBytes, IndexedArtifactSourceConfig, NonZeroUsize,
-    Path, QuickSyncClient, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_PAGE_SIZE,
+    QuickSyncClient, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_PAGE_SIZE,
     TXID_CACHE_SYNC_LOCK, TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey,
     TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCacheReadScope, TxidPublicCacheRefresh,
     TxidPublicCacheReset, TxidPublicCacheSyncState, TxidPublicCacheWritePermit,
-    TxidPublicLatestValidated, Url, artifact, debug, fs, info, read_tree_leaves,
+    TxidPublicLatestValidated, Url, artifact, debug, info, read_tree_leaves,
     rebuild_index_for_manifest, update_index_for_page, warn,
 };
-#[cfg(test)]
-use super::{
-    TxidPublicCachedTransaction, find_public_recovery_transaction_in_manifest,
-    find_target_row_in_page,
-};
-
 #[derive(Debug, thiserror::Error)]
 #[error("{error}")]
 pub(crate) struct TxidPublicCacheResetFailure {
@@ -24,42 +18,23 @@ pub(crate) struct TxidPublicCacheResetFailure {
 pub(crate) async fn reset_txid_public_cache(
     db: &DbStore,
 ) -> Result<TxidPublicCacheReset, TxidPublicCacheResetFailure> {
-    let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
-    TxidPublicCacheSyncState::lock().bump_generation(db);
     let mut reset = TxidPublicCacheReset {
         blob_entries_removed: 0,
-        files_removed: 0,
     };
+    db.ensure_blob_kind_purge_supported(TXID_CACHE_BLOB_KIND)
+        .map_err(|error| TxidPublicCacheResetFailure {
+            reset,
+            error: error.into(),
+        })?;
+    let _guard = TXID_CACHE_SYNC_LOCK.lock().await;
+    TxidPublicCacheSyncState::lock().bump_generation(db);
     reset.blob_entries_removed =
         db.clear_blob_meta_kind(TXID_CACHE_BLOB_KIND)
             .map_err(|error| TxidPublicCacheResetFailure {
                 reset,
                 error: error.into(),
             })?;
-    let cache_dir = db.blob_dir().join(TXID_CACHE_BLOB_KIND);
-    reset.files_removed = match count_path_entries(&cache_dir) {
-        Ok(files_removed) => {
-            match fs::remove_dir_all(&cache_dir) {
-                Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(TxidPublicCacheResetFailure {
-                        reset,
-                        error: error.into(),
-                    });
-                }
-            }
-            files_removed
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => 0,
-        Err(error) => {
-            return Err(TxidPublicCacheResetFailure {
-                reset,
-                error: error.into(),
-            });
-        }
-    };
-    db.ensure_blob_dir(TXID_CACHE_BLOB_KIND)
+    db.purge_blob_kind(TXID_CACHE_BLOB_KIND)
         .map_err(|error| TxidPublicCacheResetFailure {
             reset,
             error: error.into(),
@@ -67,55 +42,7 @@ pub(crate) async fn reset_txid_public_cache(
     Ok(reset)
 }
 
-fn count_path_entries(path: &Path) -> Result<u64, std::io::Error> {
-    if path.is_file() {
-        return Ok(1);
-    }
-    let mut entries = 0_u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
-            entries = entries.saturating_add(count_path_entries(&entry_path)?);
-        } else {
-            entries = entries.saturating_add(1);
-        }
-    }
-    Ok(entries)
-}
-
 impl TxidPublicCache<'_> {
-    #[cfg(test)]
-    pub(crate) async fn sync(
-        &self,
-        endpoint: &Url,
-        http_client: Option<&reqwest::Client>,
-        latest: TxidPublicLatestValidated,
-    ) -> Result<(), TxidPublicCacheError> {
-        let permit = self.begin_write().await;
-        let read_scope = permit.scope();
-        drop(permit);
-        self.sync_inner(Some(endpoint), http_client, latest, None, false, read_scope)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn sync_with_artifact_source(
-        &self,
-        endpoint: Option<&Url>,
-        http_client: Option<&reqwest::Client>,
-        latest: TxidPublicLatestValidated,
-        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
-    ) -> Result<(), TxidPublicCacheError> {
-        let maintenance = self
-            .sync_with_artifact_source_plan(endpoint, http_client, latest, indexed_artifact_source)
-            .await?;
-        if let Some(maintenance) = maintenance {
-            maintenance.run(self).await;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn sync_with_artifact_source_maintained(
         &self,
         endpoint: Option<&Url>,
@@ -214,28 +141,6 @@ impl TxidPublicCache<'_> {
         Ok(artifact_fetch.map(|(_source, plan)| {
             artifact::TxidPublicArtifactMaintenance::new(plan.stable_current, read_scope)
         }))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn sync_with_artifact_chunks(
-        &self,
-        endpoint: &Url,
-        http_client: Option<&reqwest::Client>,
-        latest: TxidPublicLatestValidated,
-        artifact_chunks: Option<&[crate::indexed_artifacts::VerifiedIndexedArtifactChunk]>,
-    ) -> Result<(), TxidPublicCacheError> {
-        let permit = self.begin_write().await;
-        let read_scope = permit.scope();
-        drop(permit);
-        self.sync_inner(
-            Some(endpoint),
-            http_client,
-            latest,
-            artifact_chunks,
-            false,
-            read_scope,
-        )
-        .await
     }
 
     async fn sync_inner(
@@ -450,22 +355,6 @@ impl TxidPublicCache<'_> {
         Ok(fetched_rows)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn sync_to_indexed_tip(
-        &self,
-        endpoint: Option<&Url>,
-        http_client: Option<&reqwest::Client>,
-        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
-    ) -> Result<u64, TxidPublicCacheError> {
-        let (fetched_rows, maintenance) = self
-            .sync_to_indexed_tip_plan(endpoint, http_client, indexed_artifact_source)
-            .await?;
-        if let Some(maintenance) = maintenance {
-            maintenance.run(self).await;
-        }
-        Ok(fetched_rows)
-    }
-
     pub(crate) async fn sync_to_indexed_tip_maintained(
         &self,
         endpoint: Option<&Url>,
@@ -577,87 +466,6 @@ impl TxidPublicCache<'_> {
         Ok((fetched_rows, maintenance_after_graphql))
     }
 
-    #[cfg(test)]
-    pub(super) async fn sync_until_recovered_output_with_page_size(
-        &self,
-        endpoint: &Url,
-        http_client: Option<&reqwest::Client>,
-        tx_hash: FixedBytes<32>,
-        output_commitment: FixedBytes<32>,
-        page_size: NonZeroUsize,
-    ) -> Result<TxidPublicCachedTransaction, TxidPublicCacheError> {
-        let permit = self.begin_write().await;
-        let started = std::time::Instant::now();
-        let cache = permit.cache();
-        let mut manifest = cache.load_or_new_manifest()?;
-        match find_public_recovery_transaction_in_manifest(
-            &manifest,
-            &permit,
-            tx_hash,
-            output_commitment,
-        ) {
-            Ok(row) => return Ok(row.into()),
-            Err(TxidPublicCacheError::MissingTarget) => {}
-            Err(err) => return Err(err),
-        }
-        let client = match http_client.cloned() {
-            Some(http_client) => QuickSyncClient::with_http_client(endpoint.clone(), http_client),
-            None => QuickSyncClient::new(endpoint.clone()),
-        };
-
-        let mut next_index = manifest
-            .validated_cached_txid_index
-            .map_or(0, |index| index.saturating_add(1))
-            .min(manifest.next_txid_index);
-        let mut fetched_rows = 0_u64;
-        loop {
-            let start_index = next_index;
-            let rows = client
-                .fetch_public_txid_page(start_index, page_size)
-                .await?;
-            if rows.is_empty() {
-                manifest.write_to(&permit)?;
-                return Err(TxidPublicCacheError::MissingTarget);
-            }
-            let row_count = rows.len() as u64;
-            let page = TxidPublicCachePage::from_indexed_transactions(self.key, start_index, rows);
-            if start_index < manifest.next_txid_index {
-                manifest.insert_or_replace_page(&permit, &page)?;
-                rebuild_index_for_manifest(&manifest, &permit)?;
-            } else {
-                manifest.append_page(&permit, &page)?;
-                update_index_for_page(&permit, &page)?;
-            }
-            next_index = start_index.saturating_add(row_count);
-            fetched_rows = fetched_rows.saturating_add(row_count);
-            manifest.write_to(&permit)?;
-            debug!(
-                chain_id = self.key.chain_id,
-                start_index,
-                row_count,
-                next_txid_index = manifest.next_txid_index,
-                "TXID public cache recovery page synced"
-            );
-
-            if let Some(row) =
-                find_target_row_in_page(&manifest, &page, tx_hash, output_commitment)?
-            {
-                info!(
-                    chain_id = self.key.chain_id,
-                    txid_version = self.key.txid_version,
-                    target_txid_index = row.txid_index,
-                    fetched_rows,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "TXID public cache recovery target synced"
-                );
-                return Ok(row.into());
-            }
-            if row_count < page_size.get() as u64 {
-                return Err(TxidPublicCacheError::MissingTarget);
-            }
-        }
-    }
-
     pub(crate) fn cached_latest_validated(
         &self,
     ) -> Result<Option<TxidPublicLatestValidated>, TxidPublicCacheError> {
@@ -677,17 +485,6 @@ impl TxidPublicCache<'_> {
             TxidPublicLocalLatestStatus::NeedsRows
             | TxidPublicLocalLatestStatus::NeedsValidatedRefresh => Ok(None),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn put_latest_validated(
-        &self,
-        latest: TxidPublicLatestValidated,
-    ) -> Result<(), TxidPublicCacheError> {
-        let permit = self.begin_write().await;
-        let mut manifest = permit.cache().load_or_new_manifest()?;
-        manifest.set_latest_validated(latest);
-        manifest.write_to(&permit)
     }
 
     fn artifact_source(
@@ -1072,5 +869,167 @@ impl TxidPublicCacheManifest {
             fetched_rows,
             refreshed_to,
         })
+    }
+}
+
+#[cfg(test)]
+impl TxidPublicCache<'_> {
+    pub(super) async fn sync(
+        &self,
+        endpoint: &Url,
+        http_client: Option<&reqwest::Client>,
+        latest: TxidPublicLatestValidated,
+    ) -> Result<(), TxidPublicCacheError> {
+        let permit = self.begin_write().await;
+        let read_scope = permit.scope();
+        drop(permit);
+        self.sync_inner(Some(endpoint), http_client, latest, None, false, read_scope)
+            .await
+    }
+
+    pub(super) async fn sync_with_artifact_source(
+        &self,
+        endpoint: Option<&Url>,
+        http_client: Option<&reqwest::Client>,
+        latest: TxidPublicLatestValidated,
+        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
+    ) -> Result<(), TxidPublicCacheError> {
+        let maintenance = self
+            .sync_with_artifact_source_plan(endpoint, http_client, latest, indexed_artifact_source)
+            .await?;
+        if let Some(maintenance) = maintenance {
+            maintenance.run(self).await;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn sync_with_artifact_chunks(
+        &self,
+        endpoint: &Url,
+        http_client: Option<&reqwest::Client>,
+        latest: TxidPublicLatestValidated,
+        artifact_chunks: Option<&[crate::indexed_artifacts::VerifiedIndexedArtifactChunk]>,
+    ) -> Result<(), TxidPublicCacheError> {
+        let permit = self.begin_write().await;
+        let read_scope = permit.scope();
+        drop(permit);
+        self.sync_inner(
+            Some(endpoint),
+            http_client,
+            latest,
+            artifact_chunks,
+            false,
+            read_scope,
+        )
+        .await
+    }
+
+    pub(super) async fn sync_to_indexed_tip(
+        &self,
+        endpoint: Option<&Url>,
+        http_client: Option<&reqwest::Client>,
+        indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
+    ) -> Result<u64, TxidPublicCacheError> {
+        let (fetched_rows, maintenance) = self
+            .sync_to_indexed_tip_plan(endpoint, http_client, indexed_artifact_source)
+            .await?;
+        if let Some(maintenance) = maintenance {
+            maintenance.run(self).await;
+        }
+        Ok(fetched_rows)
+    }
+
+    pub(super) async fn sync_until_recovered_output_with_page_size(
+        &self,
+        endpoint: &Url,
+        http_client: Option<&reqwest::Client>,
+        tx_hash: FixedBytes<32>,
+        output_commitment: FixedBytes<32>,
+        page_size: NonZeroUsize,
+    ) -> Result<super::types::test_support::TxidPublicCachedTransaction, TxidPublicCacheError> {
+        use super::proof::test_support::{
+            find_public_recovery_transaction_in_manifest, find_target_row_in_page,
+        };
+
+        let permit = self.begin_write().await;
+        let started = std::time::Instant::now();
+        let cache = permit.cache();
+        let mut manifest = cache.load_or_new_manifest()?;
+        match find_public_recovery_transaction_in_manifest(
+            &manifest,
+            &permit,
+            tx_hash,
+            output_commitment,
+        ) {
+            Ok(row) => return Ok(row.into()),
+            Err(TxidPublicCacheError::MissingTarget) => {}
+            Err(err) => return Err(err),
+        }
+        let client = match http_client.cloned() {
+            Some(http_client) => QuickSyncClient::with_http_client(endpoint.clone(), http_client),
+            None => QuickSyncClient::new(endpoint.clone()),
+        };
+
+        let mut next_index = manifest
+            .validated_cached_txid_index
+            .map_or(0, |index| index.saturating_add(1))
+            .min(manifest.next_txid_index);
+        let mut fetched_rows = 0_u64;
+        loop {
+            let start_index = next_index;
+            let rows = client
+                .fetch_public_txid_page(start_index, page_size)
+                .await?;
+            if rows.is_empty() {
+                manifest.write_to(&permit)?;
+                return Err(TxidPublicCacheError::MissingTarget);
+            }
+            let row_count = rows.len() as u64;
+            let page = TxidPublicCachePage::from_indexed_transactions(self.key, start_index, rows);
+            if start_index < manifest.next_txid_index {
+                manifest.insert_or_replace_page(&permit, &page)?;
+                rebuild_index_for_manifest(&manifest, &permit)?;
+            } else {
+                manifest.append_page(&permit, &page)?;
+                update_index_for_page(&permit, &page)?;
+            }
+            next_index = start_index.saturating_add(row_count);
+            fetched_rows = fetched_rows.saturating_add(row_count);
+            manifest.write_to(&permit)?;
+            debug!(
+                chain_id = self.key.chain_id,
+                start_index,
+                row_count,
+                next_txid_index = manifest.next_txid_index,
+                "TXID public cache recovery page synced"
+            );
+
+            if let Some(row) =
+                find_target_row_in_page(&manifest, &page, tx_hash, output_commitment)?
+            {
+                info!(
+                    chain_id = self.key.chain_id,
+                    txid_version = self.key.txid_version,
+                    target_txid_index = row.txid_index,
+                    fetched_rows,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "TXID public cache recovery target synced"
+                );
+                return Ok(row.into());
+            }
+            if row_count < page_size.get() as u64 {
+                return Err(TxidPublicCacheError::MissingTarget);
+            }
+        }
+    }
+
+    pub(super) async fn put_latest_validated(
+        &self,
+        latest: TxidPublicLatestValidated,
+    ) -> Result<(), TxidPublicCacheError> {
+        let permit = self.begin_write().await;
+        let mut manifest = permit.cache().load_or_new_manifest()?;
+        manifest.set_latest_validated(latest);
+        manifest.write_to(&permit)
     }
 }

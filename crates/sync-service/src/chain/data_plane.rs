@@ -10,13 +10,15 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{FixedBytes, U256};
 use local_db::{BlobMeta, DbStore};
 use merkletree::tree::MerkleProof;
+use poi::artifacts::v4::{Manifest, Scope};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedMutexGuard, watch};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::indexed_artifacts::{
@@ -24,9 +26,16 @@ use crate::indexed_artifacts::{
     IndexedArtifactMaintenanceKey, IndexedArtifactMaintenanceScheduler, IndexedArtifactRangeKind,
     IndexedDatasetKind, VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
 };
-use crate::poi_cache::{PoiCacheRetryHandle, PoiCacheService};
+use crate::poi_artifacts::{
+    CorpusCandidate, CorpusCommitOutcome, CurrentChunk, FetchedArtifact, ObservedManifest,
+    PersistedPoiArtifactCache, PoiCorpusStore, RawChunkCache, RawChunkRetainOutcome,
+    SemanticVerifiedChunk, TransportVerifiedChunk, VerifiedBlockedShields, VerifiedCatalog,
+    VerifiedCorpusCandidate, observe_manifest_with_clock, persist_prepared_corpus,
+    prepare_candidate,
+};
+use crate::poi_cache::{PoiCacheRetryHandle, PoiCacheService, PoiPublicCacheResetLease};
 use crate::public_cache::{
-    WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, reset_persisted_public_sync_caches_with_generation,
+    WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND, reset_persisted_public_sync_caches,
     wallet_scan_artifact_cache_commit_access, wallet_scan_artifact_cache_generation,
     wallet_scan_artifact_transient_commit_access,
 };
@@ -169,12 +178,6 @@ impl PublicPoiCorpusHandle {
     pub(crate) fn installed_generation_is_current(&self) -> bool {
         self.local_caches.installed_generation() == self.local_caches.current_generation()
     }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn local_caches(&self) -> LocalPoiCaches {
-        self.local_caches.clone()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +297,198 @@ pub struct PoiArtifactCacheRetry {
     retry: PoiCacheRetryHandle,
 }
 
+pub(crate) struct PoiArtifactAttemptCommit {
+    pub(crate) persisted: Option<PersistedPoiArtifactCache>,
+}
+
+#[derive(Clone)]
+pub struct PoiArtifactPersistenceHandle {
+    db: Arc<DbStore>,
+    commit_fence: Arc<Mutex<()>>,
+}
+
+impl PoiArtifactPersistenceHandle {
+    pub(crate) const fn new(db: Arc<DbStore>, commit_fence: Arc<Mutex<()>>) -> Self {
+        Self { db, commit_fence }
+    }
+
+    pub async fn observe_manifest(
+        &self,
+        trusted_publisher_pubkey: FixedBytes<32>,
+        manifest: Manifest,
+        max_age: Option<Duration>,
+    ) -> Result<ObservedManifest, PublicDataPlaneError> {
+        self.observe_manifest_with_clock(
+            trusted_publisher_pubkey,
+            manifest,
+            max_age,
+            &SystemTime::now,
+        )
+        .await
+    }
+
+    pub(crate) async fn observe_manifest_with_clock<F>(
+        &self,
+        trusted_publisher_pubkey: FixedBytes<32>,
+        manifest: Manifest,
+        max_age: Option<Duration>,
+        acceptance_time: &F,
+    ) -> Result<ObservedManifest, PublicDataPlaneError>
+    where
+        F: Fn() -> SystemTime + Sync + ?Sized,
+    {
+        let _commit_guard = self.commit_fence.lock().await;
+        observe_manifest_with_clock(
+            self.db.as_ref(),
+            trusted_publisher_pubkey,
+            manifest,
+            max_age,
+            acceptance_time,
+        )
+        .map_err(poi_artifact_persistence_error)
+    }
+
+    pub async fn begin_candidate(
+        &self,
+        observed: &ObservedManifest,
+        catalog: &VerifiedCatalog,
+    ) -> Result<CorpusCandidate, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        prepare_candidate(self.db.as_ref(), observed, catalog)
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub fn verify_checkpoint_catalog(
+        &self,
+        observed: &ObservedManifest,
+        scope: &Scope,
+        fetched: FetchedArtifact,
+    ) -> Result<VerifiedCatalog, PublicDataPlaneError> {
+        observed
+            .verify_checkpoint_catalog(scope, fetched)
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub fn current_graph_chunk(
+        &self,
+        observed: &ObservedManifest,
+        scope: &Scope,
+        catalog: Option<&VerifiedCatalog>,
+        descriptor: &poi::artifacts::v4::EventArtifactDescriptor,
+    ) -> Result<CurrentChunk, PublicDataPlaneError> {
+        let admission = RawChunkCache::new(self.db.as_ref()).admission(observed.publication_id());
+        observed
+            .current_graph_chunk(scope, catalog, descriptor, admission)
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub fn verify_fetched_chunk(
+        &self,
+        current: CurrentChunk,
+        fetched: FetchedArtifact,
+    ) -> Result<TransportVerifiedChunk, PublicDataPlaneError> {
+        current
+            .verify_fetched(fetched)
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub fn verify_event_signatures(
+        &self,
+        chunk: TransportVerifiedChunk,
+    ) -> Result<SemanticVerifiedChunk, PublicDataPlaneError> {
+        chunk
+            .verify_event_signatures()
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub fn verify_blocked_shields(
+        &self,
+        observed: &ObservedManifest,
+        scope: &Scope,
+        fetched: FetchedArtifact,
+    ) -> Result<VerifiedBlockedShields, PublicDataPlaneError> {
+        observed
+            .verify_blocked_shields(scope, fetched)
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub async fn cached_chunk(
+        &self,
+        current: &CurrentChunk,
+    ) -> Result<Option<SemanticVerifiedChunk>, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        RawChunkCache::new(self.db.as_ref())
+            .get(current)
+            .await
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub async fn retain_chunk(
+        &self,
+        chunk: &SemanticVerifiedChunk,
+    ) -> Result<RawChunkRetainOutcome, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        RawChunkCache::new(self.db.as_ref())
+            .retain(chunk)
+            .await
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub async fn commit_candidate(
+        &self,
+        candidate: VerifiedCorpusCandidate,
+    ) -> Result<CorpusCommitOutcome, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        persist_prepared_corpus(self.db.as_ref(), candidate).map_err(poi_artifact_persistence_error)
+    }
+
+    pub(crate) async fn retain_chunk_for_attempt(
+        &self,
+        chunk: &SemanticVerifiedChunk,
+        cancel: &CancellationToken,
+    ) -> Result<Option<RawChunkRetainOutcome>, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        RawChunkCache::new(self.db.as_ref())
+            .retain_with_fence(chunk, || !cancel.is_cancelled())
+            .await
+            .map_err(poi_artifact_persistence_error)
+    }
+
+    pub(crate) async fn commit_candidate_for_attempt(
+        &self,
+        candidate: VerifiedCorpusCandidate,
+        cancel: &CancellationToken,
+    ) -> Result<Option<PoiArtifactAttemptCommit>, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let store = PoiCorpusStore::new(
+            self.db.as_ref(),
+            candidate.cache_generation(),
+            candidate.publisher_pubkey(),
+        );
+        let identity = candidate.cache().identity().clone();
+        let outcome = persist_prepared_corpus(self.db.as_ref(), candidate)
+            .map_err(poi_artifact_persistence_error)?;
+        let persisted = store
+            .load(&identity)
+            .map_err(poi_artifact_persistence_error)?;
+        if outcome == CorpusCommitOutcome::Applied && persisted.is_none() {
+            return Err(poi_artifact_persistence_error(
+                "committed POI corpus is missing",
+            ));
+        }
+        Ok(Some(PoiArtifactAttemptCommit { persisted }))
+    }
+}
+
+fn poi_artifact_persistence_error(error: impl std::fmt::Display) -> PublicDataPlaneError {
+    PublicDataPlaneError::PoiArtifactPersistence {
+        reason: error.to_string(),
+    }
+}
+
 impl PoiArtifactCacheRetry {
     #[must_use]
     pub const fn attempt_id(&self) -> PoiArtifactCacheAttemptId {
@@ -371,6 +566,11 @@ impl PublicDataPlaneHandle {
 
     pub async fn reset_public_cache(&self) -> Result<PublicSyncCacheReset, PublicDataPlaneError> {
         self.service.public_data_plane.reset_public_cache().await
+    }
+
+    #[must_use]
+    pub fn poi_artifact_persistence(&self) -> PoiArtifactPersistenceHandle {
+        self.service.public_data_plane.poi_artifact_persistence()
     }
 
     pub(crate) async fn acquire_public_cache_reset_permit(&self) -> PublicCacheResetPermit {
@@ -494,10 +694,8 @@ pub struct PublicSyncCacheReset {
     pub coverage_entries_removed: usize,
     pub diagnostics_removed: usize,
     pub wallet_scan_artifact_chunk_entries_removed: u64,
-    pub wallet_scan_artifact_chunk_files_removed: u64,
     pub txid_blob_entries_removed: u64,
-    pub txid_files_removed: u64,
-    pub poi_cache_entries_removed: u64,
+    pub poi_artifact_checkpoint_chunk_entries_removed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -526,6 +724,8 @@ pub enum PublicDataPlaneError {
     PoiCorpusUnavailable { chain_id: u64, txid_version: String },
     #[error("POI corpus refresh failed for chain {chain_id}: {reason}")]
     PoiCorpusRefresh { chain_id: u64, reason: String },
+    #[error("POI persistence operation failed: {reason}")]
+    PoiArtifactPersistence { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,11 +899,6 @@ impl PublicCoverageStore {
             record.row_count = 0;
         }
     }
-
-    #[cfg(test)]
-    fn records(&self) -> &[PublicScanCoverageRecord] {
-        &self.records
-    }
 }
 
 #[derive(Debug, Default)]
@@ -712,28 +907,6 @@ struct ChainPublicDataPlaneState {
     diagnostics: Vec<PublicDataPlaneDiagnostic>,
     recent_scan_rows: VecDeque<PublicScanRows>,
     poi_corpora: BTreeMap<PublicPoiCorpusKey, LocalPoiCaches>,
-}
-
-#[cfg(test)]
-struct IndexedWalletPageTestBlock {
-    checkpoint: u64,
-    reached: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-}
-
-#[cfg(test)]
-struct ShortStartupCommitTestBlock {
-    reached: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-}
-
-#[cfg(test)]
-struct ShortStartupArbitrationTestBlock {
-    expected_completions: usize,
-    completion_tx: tokio::sync::mpsc::Sender<()>,
-    completion_rx: Mutex<tokio::sync::mpsc::Receiver<()>>,
-    reached: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl ChainPublicDataPlaneState {
@@ -936,28 +1109,30 @@ pub(crate) struct ChainPublicDataPlane {
     commit_fence: Arc<Mutex<()>>,
     indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler,
     poi_cache_service: Option<Arc<PoiCacheService>>,
-    #[cfg(test)]
-    indexed_wallet_page_test_block: Arc<Mutex<Option<IndexedWalletPageTestBlock>>>,
-    #[cfg(test)]
-    short_startup_commit_test_block: Arc<Mutex<Option<ShortStartupCommitTestBlock>>>,
-    #[cfg(test)]
-    short_startup_arbitration_test_block: Arc<Mutex<Option<Arc<ShortStartupArbitrationTestBlock>>>>,
 }
 
 pub(crate) struct PublicCacheResetPermit {
     data_plane: ChainPublicDataPlane,
-    _commit_guard: OwnedMutexGuard<()>,
+    commit_guard: Option<OwnedMutexGuard<()>>,
+    poi_reset_lease: Option<PoiPublicCacheResetLease>,
 }
 
 impl PublicCacheResetPermit {
-    pub(crate) async fn apply(
-        self,
-        persisted_reset: &crate::public_cache::PersistedPublicSyncCacheReset,
-    ) -> Result<ChainPublicSyncCacheReset, PublicDataPlaneError> {
-        self.data_plane
-            .synchronize_after_persisted_reset(persisted_reset.poi_generation)
-            .await?;
-        Ok(self.data_plane.invalidate_public_cache_state().await)
+    pub(crate) async fn apply(mut self) -> Result<ChainPublicSyncCacheReset, PublicDataPlaneError> {
+        let reset = self.data_plane.invalidate_public_cache_state().await;
+        self.release();
+        Ok(reset)
+    }
+
+    fn release(&mut self) {
+        drop(self.commit_guard.take());
+        drop(self.poi_reset_lease.take());
+    }
+}
+
+impl Drop for PublicCacheResetPermit {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -971,13 +1146,11 @@ impl ChainPublicDataPlane {
             commit_fence: Arc::new(Mutex::new(())),
             indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler::new(),
             poi_cache_service: None,
-            #[cfg(test)]
-            indexed_wallet_page_test_block: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            short_startup_commit_test_block: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            short_startup_arbitration_test_block: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn poi_artifact_persistence(&self) -> PoiArtifactPersistenceHandle {
+        PoiArtifactPersistenceHandle::new(Arc::clone(&self.db), Arc::clone(&self.commit_fence))
     }
 
     #[must_use]
@@ -1024,133 +1197,6 @@ impl ChainPublicDataPlane {
         wallet_scan_artifact_cache_generation(self.db.as_ref())
     }
 
-    #[cfg(test)]
-    pub(super) async fn block_after_indexed_wallet_page_for_test(
-        &self,
-        checkpoint: u64,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (reached, reached_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = tokio::sync::oneshot::channel();
-        *self.indexed_wallet_page_test_block.lock().await = Some(IndexedWalletPageTestBlock {
-            checkpoint,
-            reached,
-            release: release_rx,
-        });
-        (reached_rx, release)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn wait_after_indexed_wallet_page_for_test(&self, checkpoint: u64) {
-        let block = {
-            let mut block = self.indexed_wallet_page_test_block.lock().await;
-            if block
-                .as_ref()
-                .is_some_and(|block| block.checkpoint == checkpoint)
-            {
-                block.take()
-            } else {
-                None
-            }
-        };
-        if let Some(block) = block {
-            let _ = block.reached.send(());
-            let _ = block.release.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn block_before_short_startup_commit_for_test(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (reached, reached_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = tokio::sync::oneshot::channel();
-        *self.short_startup_commit_test_block.lock().await = Some(ShortStartupCommitTestBlock {
-            reached,
-            release: release_rx,
-        });
-        (reached_rx, release)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn wait_before_short_startup_commit_for_test(&self) {
-        let block = self.short_startup_commit_test_block.lock().await.take();
-        if let Some(block) = block {
-            let _ = block.reached.send(());
-            let _ = block.release.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn block_before_short_startup_arbitration_for_test(
-        &self,
-        expected_completions: usize,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(expected_completions);
-        let (reached, reached_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = tokio::sync::oneshot::channel();
-        *self.short_startup_arbitration_test_block.lock().await =
-            Some(Arc::new(ShortStartupArbitrationTestBlock {
-                expected_completions,
-                completion_tx,
-                completion_rx: Mutex::new(completion_rx),
-                reached: Mutex::new(Some(reached)),
-                release: Mutex::new(Some(release_rx)),
-            }));
-        (reached_rx, release)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn note_short_startup_candidate_completion_for_test(&self) {
-        let completion_tx = self
-            .short_startup_arbitration_test_block
-            .lock()
-            .await
-            .as_ref()
-            .map(|block| block.completion_tx.clone());
-        if let Some(completion_tx) = completion_tx {
-            let _ = completion_tx.send(()).await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn wait_before_short_startup_arbitration_for_test(&self) {
-        let block = self
-            .short_startup_arbitration_test_block
-            .lock()
-            .await
-            .clone();
-        if let Some(block) = block {
-            let mut completion_rx = block.completion_rx.lock().await;
-            for _ in 0..block.expected_completions {
-                let _ = completion_rx.recv().await;
-            }
-            drop(completion_rx);
-            tokio::task::yield_now().await;
-            if let Some(reached) = block.reached.lock().await.take() {
-                let _ = reached.send(());
-            }
-            if let Some(release) = block.release.lock().await.take() {
-                let _ = release.await;
-            }
-            let mut active = self.short_startup_arbitration_test_block.lock().await;
-            if active
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &block))
-            {
-                *active = None;
-            }
-        }
-    }
-
     pub(crate) async fn cached_public_scan_coverage(
         &self,
         range: PublicScanRange,
@@ -1190,13 +1236,12 @@ impl ChainPublicDataPlane {
         &self,
     ) -> Result<PublicSyncCacheReset, PublicDataPlaneError> {
         let permit = self.acquire_public_cache_reset_permit().await;
-        let persisted_reset = reset_persisted_public_sync_caches_with_generation(self.db.as_ref())
+        let persisted = reset_persisted_public_sync_caches(self.db.as_ref())
             .await
             .map_err(|err| PublicDataPlaneError::PublicCacheReset {
                 reason: err.to_string(),
             })?;
-        let chain_reset = permit.apply(&persisted_reset).await?;
-        let persisted = persisted_reset.report;
+        let chain_reset = permit.apply().await?;
         Ok(PublicSyncCacheReset {
             previous_epoch: chain_reset.previous_epoch,
             new_epoch: chain_reset.new_epoch,
@@ -1204,18 +1249,22 @@ impl ChainPublicDataPlane {
             diagnostics_removed: chain_reset.diagnostics_removed,
             wallet_scan_artifact_chunk_entries_removed: persisted
                 .wallet_scan_artifact_chunk_entries_removed,
-            wallet_scan_artifact_chunk_files_removed: persisted
-                .wallet_scan_artifact_chunk_files_removed,
             txid_blob_entries_removed: persisted.txid_blob_entries_removed,
-            txid_files_removed: persisted.txid_files_removed,
-            poi_cache_entries_removed: persisted.poi_cache_entries_removed,
+            poi_artifact_checkpoint_chunk_entries_removed: persisted
+                .poi_artifact_checkpoint_chunk_entries_removed,
         })
     }
 
     async fn acquire_public_cache_reset_permit(&self) -> PublicCacheResetPermit {
+        let poi_reset_lease = if let Some(service) = self.poi_cache_service.as_ref() {
+            Some(service.quiesce_for_public_cache_reset().await)
+        } else {
+            None
+        };
         PublicCacheResetPermit {
             data_plane: self.clone(),
-            _commit_guard: Arc::clone(&self.commit_fence).lock_owned().await,
+            commit_guard: Some(Arc::clone(&self.commit_fence).lock_owned().await),
+            poi_reset_lease,
         }
     }
 
@@ -1249,23 +1298,6 @@ impl ChainPublicDataPlane {
             coverage_entries_removed,
             diagnostics_removed,
         }
-    }
-
-    async fn synchronize_after_persisted_reset(
-        &self,
-        poi_generation: u64,
-    ) -> Result<(), PublicDataPlaneError> {
-        if let Some(service) = self.poi_cache_service.as_ref() {
-            service
-                .synchronize_after_persisted_reset(poi_generation)
-                .await
-                .map_err(|err| PublicDataPlaneError::PublicCacheReset {
-                    reason: err.to_string(),
-                })?;
-        } else {
-            self.clear_in_memory_poi_corpora().await;
-        }
-        Ok(())
     }
 
     pub(crate) async fn ensure_poi_corpus(
@@ -1342,20 +1374,6 @@ impl ChainPublicDataPlane {
                         || cache.progress().next_leaf_index > 0)
             })
         })
-    }
-
-    async fn clear_in_memory_poi_corpora(&self) {
-        let corpora = self
-            .state
-            .lock()
-            .await
-            .poi_corpora
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for corpus in corpora {
-            corpus.write().await.clear();
-        }
     }
 
     pub(crate) fn cached_txid_latest_validated(
@@ -1499,17 +1517,6 @@ impl ChainPublicDataPlane {
                 None
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn retain_wallet_scan_artifact_chunks(
-        &self,
-        chunks: &[VerifiedIndexedArtifactChunk],
-        read_scope: PublicScanReadScope,
-    ) -> usize {
-        let cache_generation = self.wallet_scan_artifact_cache_generation();
-        self.retain_wallet_scan_artifact_chunks_for_generation(chunks, read_scope, cache_generation)
-            .await
     }
 
     pub(crate) async fn retain_wallet_scan_artifact_chunks_for_generation(
@@ -1680,20 +1687,6 @@ impl ChainPublicDataPlane {
             )
             .map_err(|err| err.to_string())?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn record_public_scan_coverage(
-        &self,
-        write: PublicScanCoverageWrite,
-    ) -> Result<PublicDataPlaneEpoch, PublicDataPlaneError> {
-        let to_block_hash = matches!(
-            write.source,
-            PublicScanSource::Rpc | PublicScanSource::ArchiveRpc
-        )
-        .then_some([0; 32]);
-        self.record_public_scan_coverage_with_hash(write, to_block_hash)
-            .await
     }
 
     async fn record_public_scan_coverage_with_hash(
@@ -2006,24 +1999,6 @@ impl ChainPublicDataPlane {
         });
     }
 
-    #[cfg(test)]
-    pub(crate) async fn validate_public_scan_read(
-        &self,
-        range: PublicScanRange,
-        source: PublicScanSource,
-        read_scope: PublicScanReadScope,
-    ) -> Result<(), PublicDataPlaneError> {
-        if !range.is_valid() {
-            return Err(PublicDataPlaneError::InvalidRange {
-                from_block: range.from_block,
-                to_block: range.to_block,
-            });
-        }
-        let mut state = self.state.lock().await;
-        let current_epoch = self.current_epoch();
-        Self::validate_public_scan_read_locked(&mut state, current_epoch, range, source, read_scope)
-    }
-
     pub(crate) async fn public_scan_commit_permit(
         &self,
         range: PublicScanRange,
@@ -2310,11 +2285,71 @@ struct EmptyCoverageForRange {
 }
 
 #[cfg(test)]
+impl PublicPoiCorpusHandle {
+    #[must_use]
+    pub(crate) fn local_caches(&self) -> LocalPoiCaches {
+        self.local_caches.clone()
+    }
+}
+
+#[cfg(test)]
+impl PublicCoverageStore {
+    fn records(&self) -> &[PublicScanCoverageRecord] {
+        &self.records
+    }
+}
+
+#[cfg(test)]
+impl ChainPublicDataPlane {
+    pub(crate) async fn retain_wallet_scan_artifact_chunks(
+        &self,
+        chunks: &[VerifiedIndexedArtifactChunk],
+        read_scope: PublicScanReadScope,
+    ) -> usize {
+        let cache_generation = self.wallet_scan_artifact_cache_generation();
+        self.retain_wallet_scan_artifact_chunks_for_generation(chunks, read_scope, cache_generation)
+            .await
+    }
+
+    pub(crate) async fn record_public_scan_coverage(
+        &self,
+        write: PublicScanCoverageWrite,
+    ) -> Result<PublicDataPlaneEpoch, PublicDataPlaneError> {
+        let to_block_hash = matches!(
+            write.source,
+            PublicScanSource::Rpc | PublicScanSource::ArchiveRpc
+        )
+        .then_some([0; 32]);
+        self.record_public_scan_coverage_with_hash(write, to_block_hash)
+            .await
+    }
+
+    pub(crate) async fn validate_public_scan_read(
+        &self,
+        range: PublicScanRange,
+        source: PublicScanSource,
+        read_scope: PublicScanReadScope,
+    ) -> Result<(), PublicDataPlaneError> {
+        if !range.is_valid() {
+            return Err(PublicDataPlaneError::InvalidRange {
+                from_block: range.from_block,
+                to_block: range.to_block,
+            });
+        }
+        let mut state = self.state.lock().await;
+        let current_epoch = self.current_epoch();
+        Self::validate_public_scan_read_locked(&mut state, current_epoch, range, source, read_scope)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     use std::fs;
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc as std_mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2322,9 +2357,11 @@ mod tests {
         ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
         INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION, IndexedArtifactRange,
     };
+    use crate::poi_cache::PoiCacheServiceError;
     use crate::types::{PoiArtifactManifestSource, PoiArtifactSourceConfig};
     use alloy::primitives::Address;
     use broadcaster_core::utxo::UtxoSource;
+    use ed25519_dalek::SigningKey;
     use local_db::{
         BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
         PoiCacheRecordSource, PoiCorpusValidationRecord,
@@ -2333,6 +2370,36 @@ mod tests {
     use poi::poi::PoiEventType;
     use railgun_wallet::scan::IndexedNullifierInput;
     use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn poi_artifact_persistence_handle_observes_manifest_watermark() {
+        let (db, data_plane, root_dir) = test_data_plane_with_db("poi-v4-persistence-handle");
+        let persistence = data_plane.poi_artifact_persistence();
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let mut manifest = Manifest::new(1_700_000_000_000, 7, publisher, Vec::new());
+        manifest
+            .sign_manifest(&signing_key)
+            .expect("sign POI manifest");
+
+        let observed = persistence
+            .observe_manifest(publisher, manifest, None)
+            .await
+            .expect("observe POI manifest through data plane");
+
+        assert_eq!(observed.manifest().sequence, 7);
+        assert_eq!(
+            db.get_poi_publisher_manifest_watermark(&publisher)
+                .expect("load publisher watermark")
+                .expect("publisher watermark present")
+                .accepted_sequence,
+            7
+        );
+
+        drop(persistence);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
 
     #[tokio::test]
     async fn poi_corpus_registry_reuses_chain_scoped_handle() {
@@ -2375,7 +2442,7 @@ mod tests {
             .await
             .expect("reset public cache");
         assert!(
-            !data_plane
+            data_plane
                 .poi_corpus_ready_for_lists(key, &[list_key])
                 .await
         );
@@ -3586,7 +3653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_cache_reset_clears_durable_public_txid_and_poi_cache() {
+    async fn public_cache_reset_clears_raw_public_artifacts_but_preserves_poi_corpus() {
         let (db, data_plane, root_dir) = test_data_plane_with_db("public-cache-reset-durable");
         let txid_kind = "txid_public_cache";
         let txid_name = "stale.msgpack";
@@ -3621,6 +3688,7 @@ mod tests {
             chain_id: 1,
             txid_version: "v2".to_string(),
             list_key,
+            cache_generation: 0,
             source: PoiCacheRecordSource::IndexedArtifacts,
             validation: PoiCorpusValidationRecord::Legacy,
             legacy_observed_manifest_sequence: 1,
@@ -3636,6 +3704,28 @@ mod tests {
             updated_at: 1,
         })
         .expect("put poi artifact cache");
+        let poi_raw_kind = crate::poi_artifacts::POI_V4_RAW_CHUNK_BLOB_KIND;
+        let poi_raw_name = "poi-v4.bin";
+        db.ensure_blob_dir(poi_raw_kind)
+            .expect("ensure POI raw blob dir");
+        fs::write(db.blob_path(poi_raw_kind, poi_raw_name), b"raw POI v4")
+            .expect("write POI raw blob");
+        db.put_blob_meta(
+            poi_raw_kind,
+            "poi-v4",
+            &BlobMeta {
+                format_version: 1,
+                relative_path: DbStore::relative_blob_path(poi_raw_kind, poi_raw_name),
+                content_hash: Sha256::digest(b"raw POI v4").into(),
+                source_hash: None,
+                source_sequence: None,
+                created_at: 1,
+                updated_at: 1,
+                last_accessed_at: 1,
+                last_block: None,
+            },
+        )
+        .expect("put POI raw metadata");
         let wallet_scan_chunk = test_wallet_scan_chunk(1, 2, &[1, 2, 3], |metadata| {
             metadata.chunk_sealed = true;
         });
@@ -3677,14 +3767,12 @@ mod tests {
             .expect("reset public cache");
 
         assert_eq!(reset.txid_blob_entries_removed, 1);
-        assert!(reset.txid_files_removed >= 1);
         assert_eq!(reset.wallet_scan_artifact_chunk_entries_removed, 2);
-        assert!(reset.wallet_scan_artifact_chunk_files_removed >= 1);
-        assert_eq!(reset.poi_cache_entries_removed, 1);
+        assert_eq!(reset.poi_artifact_checkpoint_chunk_entries_removed, 1);
         assert_eq!(
             db.poi_artifact_cache_generation()
                 .expect("load POI cache generation after reset"),
-            1
+            0
         );
         assert!(
             db.get_blob_meta(txid_kind, txid_id)
@@ -3702,7 +3790,7 @@ mod tests {
         assert!(
             db.get_poi_artifact_cache(0, 1, "v2", &list_key)
                 .expect("get poi cache after reset")
-                .is_none()
+                .is_some()
         );
         assert!(
             data_plane
@@ -3710,7 +3798,198 @@ mod tests {
                 .is_none()
         );
 
+        data_plane.shutdown().await;
+        let destructive = crate::reset_offline_poi_corpus(db.as_ref())
+            .await
+            .expect("destructively reset offline POI corpus");
+        assert_eq!(destructive.corpus_entries_removed, 1);
+        assert_eq!(destructive.generation, 1);
+        assert!(
+            db.get_poi_artifact_cache(0, 1, "v2", &list_key)
+                .expect("get destructively reset POI corpus")
+                .is_none()
+        );
+
         drop(data_plane);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_cache_reset_cancels_active_poi_attempt_before_raw_reset_and_restarts() {
+        let (db, data_plane, stalled, root_dir) =
+            test_data_plane_with_stalled_poi_service("public-cache-reset-poi-attempt");
+        let key = PublicPoiCorpusKey::wallet_default(1);
+        let list_key = poi::poi::default_active_poi_list_key();
+        let corpus = data_plane
+            .ensure_poi_corpus(key.clone())
+            .await
+            .expect("start POI coordinator");
+        let local_caches = corpus.local_caches();
+        stalled
+            .accepted
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup attempt reached network");
+
+        let mut serving_cache = PoiCache::new(PoiCacheIdentity::new(
+            key.chain_type,
+            key.chain_id,
+            key.txid_version.clone(),
+            list_key,
+        ));
+        serving_cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x71; 32],
+                signature: [0; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("build serving corpus");
+        serving_cache.accept_current_roots();
+        let serving_bytes = serving_cache.to_bytes().expect("encode serving corpus");
+        local_caches.write().await.insert(list_key, serving_cache);
+
+        let service = Arc::clone(
+            data_plane
+                .poi_cache_service
+                .as_ref()
+                .expect("POI cache service"),
+        );
+        let old_attempt = service.retry_chain(1).await.expect("admit old attempt");
+        let old_attempt_id = old_attempt.attempt_id();
+        stalled
+            .accepted
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old attempt reached network");
+        assert!(service.progress_rx().borrow()[&1].ready_for_wallet_checks);
+        let serving_generation = local_caches.current_generation();
+
+        let raw_kind = crate::poi_artifacts::POI_V4_RAW_CHUNK_BLOB_KIND;
+        db.ensure_blob_dir(raw_kind)
+            .expect("ensure raw POI cache directory");
+        fs::write(db.blob_path(raw_kind, "stale.bin"), b"stale").expect("write stale raw chunk");
+        db.put_blob_meta(
+            raw_kind,
+            "stale",
+            &BlobMeta {
+                format_version: 1,
+                relative_path: DbStore::relative_blob_path(raw_kind, "stale.bin"),
+                content_hash: Sha256::digest(b"stale").into(),
+                source_hash: None,
+                source_sequence: None,
+                created_at: 1,
+                updated_at: 1,
+                last_accessed_at: 1,
+                last_block: None,
+            },
+        )
+        .expect("persist stale raw chunk metadata");
+
+        data_plane
+            .reset_public_cache()
+            .await
+            .expect("reset public cache");
+        assert!(matches!(
+            old_attempt.wait().await,
+            Err(PoiCacheServiceError::StaleAttempt { attempt_id })
+                if attempt_id == old_attempt_id
+        ));
+        stalled
+            .accepted
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement attempt reached network");
+
+        let replacement = service.progress_rx().borrow()[&1].clone();
+        assert!(replacement.attempt_id > old_attempt_id);
+        assert!(replacement.ready_for_wallet_checks);
+        assert_eq!(local_caches.current_generation(), serving_generation);
+        assert_eq!(local_caches.installed_generation(), serving_generation);
+        assert!(
+            db.get_blob_meta(raw_kind, "stale")
+                .expect("read reset raw metadata")
+                .is_none()
+        );
+        let retained = local_caches
+            .read()
+            .await
+            .get(&list_key)
+            .cloned()
+            .expect("serving corpus retained");
+        assert_eq!(
+            retained.to_bytes().expect("encode retained corpus"),
+            serving_bytes,
+        );
+        assert!(
+            db.get_poi_artifact_cache(key.chain_type, key.chain_id, &key.txid_version, &list_key,)
+                .expect("read absent stale candidate")
+                .is_none()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.progress_rx().borrow()[&1].attempt_id,
+            replacement.attempt_id,
+        );
+
+        data_plane.shutdown().await;
+        drop(data_plane);
+        drop(service);
+        drop(stalled);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_public_cache_reset_releases_poi_attempt_lease() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (db, data_plane, stalled, root_dir) =
+            test_data_plane_with_stalled_poi_service("failed-public-cache-reset-poi-attempt");
+        data_plane
+            .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(1))
+            .await
+            .expect("start POI coordinator");
+        stalled
+            .accepted
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old attempt reached network");
+        let service = Arc::clone(
+            data_plane
+                .poi_cache_service
+                .as_ref()
+                .expect("POI cache service"),
+        );
+        let old_attempt_id = service.progress_rx().borrow()[&1].attempt_id;
+
+        let txid_cache_dir = db.blob_dir().join(crate::txid_cache::TXID_CACHE_BLOB_KIND);
+        match fs::remove_dir_all(&txid_cache_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("remove TXID cache directory: {error}"),
+        }
+        fs::create_dir_all(&txid_cache_dir).expect("create TXID cache directory");
+        fs::write(txid_cache_dir.join("blocked"), b"blocked").expect("seed TXID cache file");
+        fs::set_permissions(&txid_cache_dir, fs::Permissions::from_mode(0o500))
+            .expect("make TXID cache directory non-writable");
+
+        let reset = data_plane.reset_public_cache().await;
+        fs::set_permissions(&txid_cache_dir, fs::Permissions::from_mode(0o700))
+            .expect("restore TXID cache directory permissions");
+        assert!(matches!(
+            reset,
+            Err(PublicDataPlaneError::PublicCacheReset { .. })
+        ));
+        stalled
+            .accepted
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failed reset admitted replacement attempt");
+        assert!(service.progress_rx().borrow()[&1].attempt_id > old_attempt_id);
+
+        fs::remove_dir_all(txid_cache_dir).expect("remove failing TXID cache path");
+        data_plane.shutdown().await;
+        drop(data_plane);
+        drop(service);
+        drop(stalled);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
@@ -3767,7 +4046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_poi_synchronization_preserves_chain_cache_state() {
+    async fn public_cache_reset_does_not_depend_on_stopped_poi_service() {
         let (data_plane, root_dir) = test_data_plane_with_poi_service("reset-poi-sync-failure");
         data_plane
             .record_public_scan_coverage(PublicScanCoverageWrite {
@@ -3790,20 +4069,16 @@ mod tests {
         );
         service.shutdown().await;
         let permit = data_plane.acquire_public_cache_reset_permit().await;
-        let persisted_reset = crate::public_cache::PersistedPublicSyncCacheReset {
-            report: crate::public_cache::PersistedPublicSyncCacheResetReport::default(),
-            poi_generation: 0,
-        };
 
-        let result = permit.apply(&persisted_reset).await;
+        let result = permit.apply().await;
 
-        assert!(result.is_err());
-        assert_eq!(data_plane.current_epoch(), PublicDataPlaneEpoch::new(0));
+        assert!(result.is_ok());
+        assert_eq!(data_plane.current_epoch(), PublicDataPlaneEpoch::new(1));
         assert!(matches!(
             data_plane
                 .cached_public_scan_coverage(PublicScanRange::new(1, 2))
                 .await,
-            PublicCoverageAnswer::ReplayableEmpty { .. }
+            PublicCoverageAnswer::Missing { .. }
         ));
         drop(data_plane);
         drop(service);
@@ -4104,7 +4379,8 @@ mod tests {
 
     fn test_data_plane_with_poi_service(name: &str) -> (ChainPublicDataPlane, PathBuf) {
         let (db, root_dir) = test_db(name);
-        let poi_cache_service = PoiCacheService::new(
+        let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+        let poi_cache_service = PoiCacheService::new_with_persistence(
             Arc::clone(&db),
             PoiArtifactSourceConfig {
                 trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
@@ -4117,12 +4393,87 @@ mod tests {
                 max_manifest_age: None,
             },
             None,
+            data_plane.poi_artifact_persistence(),
         )
         .expect("initialize POI cache generation")
         .with_poi_rpc_url(Url::parse("http://127.0.0.1:1").expect("POI RPC URL"));
-        let data_plane = ChainPublicDataPlane::new(db, Arc::new(AtomicU64::new(0)))
-            .with_poi_cache_service(Arc::new(poi_cache_service));
+        let data_plane = data_plane.with_poi_cache_service(Arc::new(poi_cache_service));
         (data_plane, root_dir)
+    }
+
+    struct StalledHttpServer {
+        url: Url,
+        accepted: std_mpsc::Receiver<()>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Drop for StalledHttpServer {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::Release);
+        }
+    }
+
+    fn test_data_plane_with_stalled_poi_service(
+        name: &str,
+    ) -> (
+        Arc<DbStore>,
+        ChainPublicDataPlane,
+        StalledHttpServer,
+        PathBuf,
+    ) {
+        let (db, root_dir) = test_db(name);
+        let stalled = spawn_stalled_http_server();
+        let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+        let poi_cache_service = PoiCacheService::new_with_persistence(
+            Arc::clone(&db),
+            PoiArtifactSourceConfig {
+                trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+                manifest_source: PoiArtifactManifestSource::Url(stalled.url.clone().into()),
+                gateway_urls: vec![stalled.url.clone().into()],
+                max_manifest_age: None,
+            },
+            None,
+            data_plane.poi_artifact_persistence(),
+        )
+        .expect("initialize stalled POI cache service")
+        .with_poi_rpc_url(stalled.url.clone());
+        let data_plane = data_plane.with_poi_cache_service(Arc::new(poi_cache_service));
+        (db, data_plane, stalled, root_dir)
+    }
+
+    fn spawn_stalled_http_server() -> StalledHttpServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled HTTP server");
+        listener
+            .set_nonblocking(true)
+            .expect("set stalled HTTP listener nonblocking");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("stalled HTTP local address")
+        ))
+        .expect("stalled HTTP URL");
+        let (accepted_tx, accepted) = std_mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            let mut streams = Vec::new();
+            while !thread_release.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        streams.push(stream);
+                        let _ = accepted_tx.send(());
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        StalledHttpServer {
+            url,
+            accepted,
+            release,
+        }
     }
 
     fn test_data_plane_with_db(name: &str) -> (Arc<DbStore>, ChainPublicDataPlane, PathBuf) {

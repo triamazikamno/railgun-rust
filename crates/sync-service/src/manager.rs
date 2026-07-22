@@ -10,7 +10,7 @@ use crate::chain::{
 };
 use crate::public_cache::{
     PersistedPublicSyncCacheResetError, PersistedPublicSyncCacheResetReport,
-    reset_persisted_public_sync_caches_with_generation,
+    reset_persisted_public_sync_caches,
 };
 use crate::types::{ChainConfig, ChainKey, GlobalPoiPolicy, WalletConfig};
 use crate::wallet::WalletHandle;
@@ -162,11 +162,6 @@ impl SyncManager {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn insert_chain_for_test(&self, key: ChainKey, service: Arc<ChainService>) {
-        self.chains.write().await.insert(key, service);
-    }
-
     pub async fn remove_all_wallets(&self) {
         let chains = self
             .chains
@@ -203,35 +198,33 @@ impl SyncManager {
                     .await,
             ));
         }
-        let persisted_reset =
-            match reset_persisted_public_sync_caches_with_generation(&self.db).await {
-                Ok(reset) => reset,
-                Err(error) => {
-                    let chain_error = PublicDataPlaneError::PublicCacheReset {
-                        reason: error.to_string(),
-                    };
-                    let total_removed_entries = error.partial_report.total_removed_entries();
-                    return PublicSyncCachesResetReport {
-                        chains: permits
-                            .into_iter()
-                            .map(|(chain, _permit)| ChainPublicSyncCacheResetResult {
-                                chain,
-                                result: Err(chain_error.clone()),
-                            })
-                            .collect(),
-                        persisted: Err(error),
-                        total_removed_entries,
-                    };
-                }
-            };
+        let persisted = match reset_persisted_public_sync_caches(&self.db).await {
+            Ok(reset) => reset,
+            Err(error) => {
+                let chain_error = PublicDataPlaneError::PublicCacheReset {
+                    reason: error.to_string(),
+                };
+                let total_removed_entries = error.partial_report.total_removed_entries();
+                return PublicSyncCachesResetReport {
+                    chains: permits
+                        .into_iter()
+                        .map(|(chain, _permit)| ChainPublicSyncCacheResetResult {
+                            chain,
+                            result: Err(chain_error.clone()),
+                        })
+                        .collect(),
+                    persisted: Err(error),
+                    total_removed_entries,
+                };
+            }
+        };
         let mut chains = Vec::with_capacity(permits.len());
         for (chain, permit) in permits {
             chains.push(ChainPublicSyncCacheResetResult {
                 chain,
-                result: permit.apply(&persisted_reset).await,
+                result: permit.apply().await,
             });
         }
-        let persisted = persisted_reset.report;
         let total_removed_entries = chains
             .iter()
             .filter_map(|chain| chain.result.as_ref().ok())
@@ -259,5 +252,12 @@ impl SyncManager {
             }
         }
         Err(SyncManagerError::WalletNotFound)
+    }
+}
+
+#[cfg(test)]
+impl SyncManager {
+    pub(crate) async fn insert_chain_for_test(&self, key: ChainKey, service: Arc<ChainService>) {
+        self.chains.write().await.insert(key, service);
     }
 }

@@ -1,13 +1,18 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt::{self, Display};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, U256, keccak256};
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, railgun_txid_leaf_hash};
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table,
@@ -52,6 +57,7 @@ const LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
 const WALLET_CACHE_KEY_DOMAIN: &[u8] = b"railgun-wallet-cache-key-v1";
 const WALLET_PRIVATE_CANONICALIZATION_VERSION_KEY_PREFIX: &str =
     "wallet_private_canonicalization_version_v1:";
+static BLOB_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalDbTable {
@@ -221,7 +227,7 @@ const WALLET_PRIVATE_COMPACTION_REQUESTED_KEY: &str = "wallet_private_compaction
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WalletCacheKey(String);
@@ -349,6 +355,7 @@ impl Default for DbConfig {
 pub struct DbStore {
     root_dir: PathBuf,
     db: Database,
+    _lock_file: Arc<File>,
 }
 
 #[derive(Debug, Error)]
@@ -357,6 +364,8 @@ pub enum DbError {
     InvalidWalletCacheKey(#[from] WalletCacheKeyError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("database is already in use at {}", path.display())]
+    DatabaseInUse { path: PathBuf },
     #[error("db error: {0}")]
     Database(#[from] redb::DatabaseError),
     #[error("transaction error: {0}")]
@@ -412,6 +421,12 @@ pub enum DbError {
     InvalidPpoiSidecarRecord { kind: &'static str, key: String },
     #[error("invalid PPOI corpus record {key}")]
     InvalidPpoiCorpusRecord { key: String },
+    #[error("invalid schema-9 PPOI corpus record {key}")]
+    InvalidSchemaNinePpoiCorpusRecord { key: String },
+    #[error("invalid blob relative path for kind {kind}")]
+    InvalidBlobRelativePath { kind: String },
+    #[error("unsafe blob entry for kind {kind}")]
+    UnsafeBlobEntry { kind: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +460,40 @@ pub struct BlobMeta {
     #[serde(default)]
     pub last_accessed_at: u64,
     pub last_block: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalBlobMetaIdentity {
+    kind: String,
+    leaf: String,
+}
+
+impl CanonicalBlobMetaIdentity {
+    pub fn from_leaf(expected_kind: &str, leaf: &str) -> Result<Self, DbError> {
+        validate_single_blob_component(expected_kind, expected_kind)?;
+        validate_single_blob_component(leaf, expected_kind)?;
+        Ok(Self {
+            kind: expected_kind.to_string(),
+            leaf: leaf.to_string(),
+        })
+    }
+
+    #[must_use]
+    pub fn relative_path(&self) -> String {
+        Self::relative_path_for(&self.kind, &self.leaf)
+    }
+
+    fn relative_path_for(kind: &str, leaf: &str) -> String {
+        format!("{BLOBS_DIR}/{kind}/{leaf}")
+    }
+
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn leaf(&self) -> &str {
+        &self.leaf
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -714,6 +763,36 @@ pub enum PoiCorpusValidationRecord {
         list_key: FixedBytes<32>,
         list_signed_from_index: u64,
     },
+    PublisherAttestedV4 {
+        publisher_pubkey: FixedBytes<32>,
+        manifest_sequence: u64,
+        #[serde(default)]
+        manifest_body_hash: Option<FixedBytes<32>>,
+        manifest_root: FixedBytes<32>,
+        artifact_tip_index: u64,
+        format_version: u16,
+        checkpoint_catalog: PoiV4CatalogIdentityRecord,
+    },
+    PublisherV4AndListSigned {
+        publisher_pubkey: FixedBytes<32>,
+        manifest_sequence: u64,
+        #[serde(default)]
+        manifest_body_hash: Option<FixedBytes<32>>,
+        manifest_root: FixedBytes<32>,
+        artifact_tip_index: u64,
+        format_version: u16,
+        checkpoint_catalog: PoiV4CatalogIdentityRecord,
+        list_key: FixedBytes<32>,
+        list_signed_from_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiV4CatalogIdentityRecord {
+    pub cid: String,
+    pub sha256: FixedBytes<32>,
+    pub byte_size: u64,
+    pub descriptor_hash: FixedBytes<32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -722,6 +801,8 @@ pub struct PoiArtifactCacheRecord {
     pub chain_id: u64,
     pub txid_version: String,
     pub list_key: FixedBytes<32>,
+    #[serde(default)]
+    pub cache_generation: u64,
     #[serde(default)]
     pub source: PoiCacheRecordSource,
     #[serde(default)]
@@ -743,6 +824,23 @@ pub struct PoiArtifactCacheRecord {
     #[serde(default, rename = "last_successful_rpc_sync_at_ms")]
     pub legacy_last_successful_rpc_sync_at_ms: Option<u64>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoiArtifactCacheCommitCondition {
+    pub expected_generation: u64,
+    pub expected_publisher: Option<(FixedBytes<32>, u64)>,
+    pub expected_manifest_hash: Option<FixedBytes<32>>,
+    pub expected_payload_hash: Option<FixedBytes<32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoiArtifactCacheCommitOutcome {
+    Applied,
+    GenerationConflict { actual: u64 },
+    PublisherSequenceConflict { actual: Option<u64> },
+    PublisherManifestConflict { actual: Option<FixedBytes<32>> },
+    CorpusConflict,
 }
 
 #[derive(Debug)]
@@ -787,7 +885,23 @@ impl PoiArtifactCacheRecord {
 pub struct PoiPublisherManifestWatermarkRecord {
     pub publisher_pubkey: FixedBytes<32>,
     pub accepted_sequence: u64,
+    #[serde(default)]
+    pub accepted_manifest_hash: Option<FixedBytes<32>>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoiPublisherManifestObservation {
+    Accepted {
+        record: PoiPublisherManifestWatermarkRecord,
+        changed: bool,
+    },
+    Rollback {
+        record: PoiPublisherManifestWatermarkRecord,
+    },
+    Equivocation {
+        record: PoiPublisherManifestWatermarkRecord,
+    },
 }
 
 impl PoiPublisherManifestWatermarkRecord {
@@ -1213,10 +1327,22 @@ impl DbStore {
     pub fn open(config: DbConfig) -> Result<Self, DbError> {
         let root_dir = config.root_dir;
         let railgun_dir = railgun_dir(&root_dir);
-        std::fs::create_dir_all(&railgun_dir)?;
+        std::fs::create_dir_all(&root_dir)?;
+        ensure_storage_directory(&railgun_dir, RAILGUN_DIR)?;
+        let lock_path = db_lock_path(&root_dir);
+        let lock_file = Arc::new(open_database_lock(&lock_path)?);
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(DbError::DatabaseInUse { path: lock_path });
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        ensure_storage_directory(&blobs_dir(&root_dir), BLOBS_DIR)?;
         let db_path = db_path(&root_dir);
 
         loop {
+            validate_database_path(&db_path)?;
             let db = if db_path.exists() {
                 Database::open(&db_path)?
             } else {
@@ -1226,6 +1352,7 @@ impl DbStore {
             let store = Self {
                 root_dir: root_dir.clone(),
                 db,
+                _lock_file: Arc::clone(&lock_file),
             };
 
             if !store.has_meta_table()? {
@@ -1307,8 +1434,10 @@ impl DbStore {
     }
 
     pub fn ensure_blob_dir(&self, kind: &str) -> Result<PathBuf, DbError> {
+        validate_single_blob_component(kind, kind)?;
+        ensure_storage_directory(&self.blob_dir(), BLOBS_DIR)?;
         let dir = self.blob_dir().join(kind);
-        std::fs::create_dir_all(&dir)?;
+        ensure_storage_directory(&dir, kind)?;
         Ok(dir)
     }
 
@@ -1339,6 +1468,125 @@ impl DbStore {
     #[must_use]
     pub fn relative_blob_path(kind: &str, name: &str) -> String {
         format!("{BLOBS_DIR}/{kind}/{name}")
+    }
+
+    pub fn open_blob_meta_file(
+        &self,
+        identity: &CanonicalBlobMetaIdentity,
+    ) -> Result<Option<File>, DbError> {
+        let kind_dir = self.blob_dir().join(identity.kind());
+        if !validate_existing_blob_directory(&kind_dir, identity.kind())? {
+            return Ok(None);
+        }
+        let path = kind_dir.join(identity.leaf());
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(DbError::UnsafeBlobEntry {
+                kind: identity.kind().to_string(),
+            });
+        }
+        let file = File::open(path)?;
+        Ok(Some(file))
+    }
+
+    pub fn replace_blob_file_atomic(
+        &self,
+        kind: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), DbError> {
+        self.replace_blob_file_atomic_impl(kind, name, bytes, None)
+    }
+
+    pub fn purge_blob_kind(&self, kind: &str) -> Result<(), DbError> {
+        self.ensure_blob_kind_purge_supported(kind)?;
+        ensure_storage_directory(&self.blob_dir(), BLOBS_DIR)?;
+        let kind_dir = self.blob_dir().join(kind);
+        match std::fs::symlink_metadata(&kind_dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                std::fs::remove_dir_all(&kind_dir)?;
+            }
+            Ok(_metadata) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileTypeExt;
+
+                    if _metadata.file_type().is_symlink_dir() {
+                        std::fs::remove_dir(&kind_dir)?;
+                    } else {
+                        std::fs::remove_file(&kind_dir)?;
+                    }
+                }
+                #[cfg(not(windows))]
+                std::fs::remove_file(&kind_dir)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure_storage_directory(&kind_dir, kind)
+    }
+
+    pub fn ensure_blob_kind_purge_supported(&self, kind: &str) -> Result<(), DbError> {
+        validate_single_blob_component(kind, kind)
+    }
+
+    fn replace_blob_file_atomic_impl(
+        &self,
+        kind: &str,
+        name: &str,
+        bytes: &[u8],
+        forced_temp_name: Option<&str>,
+    ) -> Result<(), DbError> {
+        validate_single_blob_component(kind, kind)?;
+        validate_single_blob_component(name, kind)?;
+        if let Some(temp_name) = forced_temp_name {
+            validate_single_blob_component(temp_name, kind)?;
+        }
+        let parent = self.ensure_blob_dir(kind)?;
+        let (temp_path, mut temp_file) = loop {
+            let temp_name = forced_temp_name.map_or_else(
+                || {
+                    let nonce = BLOB_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    format!(".railgun-blob-{}-{nonce}.tmp", std::process::id())
+                },
+                ToString::to_string,
+            );
+            let temp_path = parent.join(temp_name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => break (temp_path, file),
+                Err(error)
+                    if forced_temp_name.is_none()
+                        && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let mut guard = BlobTempGuard::new(temp_path);
+        temp_file.write_all(bytes)?;
+        drop(temp_file);
+        let final_path = parent.join(name);
+        validate_blob_replace_destination(&final_path, kind)?;
+        std::fs::rename(guard.path(), final_path)?;
+        guard.disarm();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn replace_blob_file_atomic_with_test_temp_name(
+        &self,
+        kind: &str,
+        name: &str,
+        bytes: &[u8],
+        temp_name: &str,
+    ) -> Result<(), DbError> {
+        self.replace_blob_file_atomic_impl(kind, name, bytes, Some(temp_name))
     }
 
     fn list_decoded_by_prefix<T>(
@@ -1947,6 +2195,89 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn commit_poi_artifact_cache_if_current(
+        &self,
+        record: &PoiArtifactCacheRecord,
+        condition: PoiArtifactCacheCommitCondition,
+    ) -> Result<PoiArtifactCacheCommitOutcome, DbError> {
+        let mut record = record.clone();
+        record.cache_generation = condition.expected_generation;
+        record.updated_at = now_epoch_secs()?;
+        let key = record.key();
+        let data = encode(&record)?;
+        let txn = self.db.begin_write()?;
+
+        let generation = {
+            let table = txn.open_table(APP_SETTINGS_TABLE)?;
+            match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
+                Some(value) => decode(value.value())?,
+                None => 0_u64,
+            }
+        };
+        if generation != condition.expected_generation {
+            return Ok(PoiArtifactCacheCommitOutcome::GenerationConflict { actual: generation });
+        }
+
+        if let Some((publisher_pubkey, expected_sequence)) = condition.expected_publisher {
+            let watermark_key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
+            let actual = {
+                let table = txn.open_table(APP_SETTINGS_TABLE)?;
+                match table.get(watermark_key.as_str())? {
+                    Some(value) => {
+                        let watermark: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
+                        if watermark.publisher_pubkey != publisher_pubkey {
+                            return Err(DbError::InvalidPpoiSidecarRecord {
+                                kind: "publisher manifest watermark",
+                                key: watermark_key,
+                            });
+                        }
+                        Some((
+                            watermark.accepted_sequence,
+                            watermark.accepted_manifest_hash,
+                        ))
+                    }
+                    None => None,
+                }
+            };
+            if actual.map(|(sequence, _)| sequence) != Some(expected_sequence) {
+                return Ok(PoiArtifactCacheCommitOutcome::PublisherSequenceConflict {
+                    actual: actual.map(|(sequence, _)| sequence),
+                });
+            }
+            if let Some(expected_hash) = condition.expected_manifest_hash
+                && actual.and_then(|(_, hash)| hash) != Some(expected_hash)
+            {
+                return Ok(PoiArtifactCacheCommitOutcome::PublisherManifestConflict {
+                    actual: actual.and_then(|(_, hash)| hash),
+                });
+            }
+        }
+
+        let observed_payload_hash = {
+            let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+            match table.get(key.as_str())? {
+                None => None,
+                Some(value) => match decode::<PoiArtifactCacheRecord>(value.value()) {
+                    Ok(existing) if existing.key() == key => {
+                        Some(keccak256(&existing.cache_payload))
+                    }
+                    Ok(_) | Err(DbError::Decode(_)) => None,
+                    Err(error) => return Err(error),
+                },
+            }
+        };
+        if observed_payload_hash != condition.expected_payload_hash {
+            return Ok(PoiArtifactCacheCommitOutcome::CorpusConflict);
+        }
+
+        {
+            let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(PoiArtifactCacheCommitOutcome::Applied)
+    }
+
     pub fn scan_poi_artifact_caches(&self) -> Result<PoiArtifactCacheRecordScan, DbError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
@@ -2063,6 +2394,7 @@ impl DbStore {
             let record = PoiPublisherManifestWatermarkRecord {
                 publisher_pubkey,
                 accepted_sequence,
+                accepted_manifest_hash: None,
                 updated_at: now_epoch_secs()?,
             };
             let data = encode(&record)?;
@@ -2071,6 +2403,63 @@ impl DbStore {
         };
         txn.commit()?;
         Ok((record, true))
+    }
+
+    pub fn observe_poi_v4_publisher_manifest(
+        &self,
+        publisher_pubkey: FixedBytes<32>,
+        accepted_sequence: u64,
+        manifest_hash: FixedBytes<32>,
+    ) -> Result<PoiPublisherManifestObservation, DbError> {
+        let key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
+        let txn = self.db.begin_write()?;
+        let observation = {
+            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            let existing = match table.get(key.as_str())? {
+                Some(value) => {
+                    let record: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
+                    if record.publisher_pubkey != publisher_pubkey {
+                        return Err(DbError::InvalidPpoiSidecarRecord {
+                            kind: "publisher manifest watermark",
+                            key,
+                        });
+                    }
+                    Some(record)
+                }
+                None => None,
+            };
+            if let Some(record) = existing {
+                if accepted_sequence < record.accepted_sequence {
+                    return Ok(PoiPublisherManifestObservation::Rollback { record });
+                }
+                if accepted_sequence == record.accepted_sequence
+                    && let Some(accepted_hash) = record.accepted_manifest_hash
+                {
+                    return Ok(if accepted_hash == manifest_hash {
+                        PoiPublisherManifestObservation::Accepted {
+                            record,
+                            changed: false,
+                        }
+                    } else {
+                        PoiPublisherManifestObservation::Equivocation { record }
+                    });
+                }
+            }
+            let record = PoiPublisherManifestWatermarkRecord {
+                publisher_pubkey,
+                accepted_sequence,
+                accepted_manifest_hash: Some(manifest_hash),
+                updated_at: now_epoch_secs()?,
+            };
+            let data = encode(&record)?;
+            table.insert(key.as_str(), data.as_slice())?;
+            PoiPublisherManifestObservation::Accepted {
+                record,
+                changed: true,
+            }
+        };
+        txn.commit()?;
+        Ok(observation)
     }
 
     pub fn get_poi_corpus_rpc_health(
@@ -3365,8 +3754,8 @@ impl DbStore {
         before_commit: impl FnOnce() -> Result<(), DbError>,
     ) -> Result<(), DbError> {
         let migrate_schema_seven = match (meta.schema_version, to) {
-            (7, 8 | 9) => true,
-            (8, 9) => false,
+            (7, 8..=10) => true,
+            (8, 9..=10) | (9, 10) => false,
             _ => {
                 return Err(DbError::UnsupportedSchemaVersion {
                     version: meta.schema_version,
@@ -3388,6 +3777,9 @@ impl DbStore {
         let txn = self.db.begin_write()?;
         if migrate_schema_seven {
             migrations::migrate_schema_7_to_8(&txn)?;
+        }
+        if to == 10 {
+            migrations::migrate_schema_9_to_10(&txn)?;
         }
         Self::initialize_schema_tables(&txn)?;
         {
@@ -3418,8 +3810,133 @@ impl DbStore {
     }
 }
 
+fn validate_single_blob_component(value: &str, kind: &str) -> Result<(), DbError> {
+    let mut components = Path::new(value).components();
+    if value.is_empty()
+        || value.contains(['/', '\\', '\0', ':'])
+        || !matches!(components.next(), Some(Component::Normal(component)) if component == OsStr::new(value))
+        || components.next().is_some()
+    {
+        return Err(DbError::InvalidBlobRelativePath {
+            kind: kind.to_string(),
+        });
+    }
+    Ok(())
+}
+
+struct BlobTempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BlobTempGuard {
+    const fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BlobTempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn ensure_storage_directory(path: &Path, kind: &str) -> Result<(), DbError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(DbError::InvalidBlobRelativePath {
+            kind: kind.to_string(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_storage_directory(path, kind)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_existing_blob_directory(path: &Path, kind: &str) -> Result<bool, DbError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(DbError::UnsafeBlobEntry {
+            kind: kind.to_string(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_blob_replace_destination(path: &Path, kind: &str) -> Result<(), DbError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(DbError::UnsafeBlobEntry {
+            kind: kind.to_string(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_database_lock(path: &Path) -> Result<File, DbError> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "database lock path is not a regular file",
+                )
+                .into());
+            }
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "database lock path is not a regular file",
+                )
+                .into());
+            }
+            Ok(file)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_database_path(path: &Path) -> Result<(), DbError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "database path is not a regular file",
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn railgun_dir(root_dir: &Path) -> PathBuf {
     root_dir.join(RAILGUN_DIR)
+}
+
+fn db_lock_path(root_dir: &Path) -> PathBuf {
+    railgun_dir(root_dir).join("db.lock")
 }
 
 fn db_path(root_dir: &Path) -> PathBuf {

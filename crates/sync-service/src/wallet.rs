@@ -25,8 +25,6 @@ use railgun_wallet::tx::{
 };
 use serde::Deserialize;
 use serde_json::json;
-#[cfg(test)]
-use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
@@ -36,13 +34,7 @@ use local_db::{
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
     WalletCacheKey, WalletPendingResetRecord, WalletSyncActorStateRecord,
 };
-#[cfg(test)]
-use poi::artifacts::SnapshotEvent;
-#[cfg(test)]
-use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError};
 use poi::error::PoiError;
-#[cfg(test)]
-use poi::error::PoiRpcError;
 use poi::poi::{
     BlindedCommitmentData, BlindedCommitmentType, PoiMerkleProof, PoiRpcClient,
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
@@ -120,8 +112,6 @@ use output_poi_recovery::{
     mark_valid_output_poi_recoveries, mark_valid_output_poi_recoveries_authorized,
     new_output_poi_recovery_record, output_poi_recovery_candidates, recover_missing_output_pois,
 };
-#[cfg(test)]
-use pending_output_poi::pending_output_poi_submit_identity;
 use pending_output_poi::{
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
     apply_owned_poi_private_delta_on_actor, apply_poi_private_delta,
@@ -148,21 +138,19 @@ pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
 use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
 
 pub use crate::types::{WalletPendingOverlay, WalletPendingSpent};
-#[cfg(test)]
-pub(crate) use delta::apply_wallet_delta_to_vec;
 pub(crate) use delta::pending_overlay_from_delta;
 pub use handle::WalletHandle;
-#[cfg(test)]
-pub(crate) use pending_output_poi::process_pending_output_poi_observations;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
-#[cfg(test)]
-pub(crate) use poi_refresh::LivePoiTailError;
-#[cfg(test)]
-pub(crate) use poi_refresh::{live_tail_candidate_cache, sync_live_poi_event_tail};
 pub use poi_sources::LocalPoiMerkleProofSource;
-#[cfg(test)]
-pub(crate) use worker::spawn_wallet_worker;
 pub(crate) use worker::{PreparedWalletWorker, prepare_wallet_worker, wallet_cache_store};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use super::poi_refresh::test_support::{
+        LivePoiTailError, live_tail_candidate_cache, sync_live_poi_event_tail,
+    };
+    pub(crate) use super::worker::test_support::spawn_wallet_worker;
+}

@@ -2,9 +2,11 @@ use alloy::hex;
 use redb::{ReadableTable, WriteTransaction};
 
 use super::{
-    DESKTOP_WALLET_VAULT_TABLE, DbError, LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX,
-    PENDING_OUTPUT_POI_CONTEXT_TABLE, PendingOutputPoiContextRecord, WALLET_UTXO_TABLE,
-    WalletCacheKey, decode, prefix_range_end, wallet_utxo_key,
+    APP_SETTINGS_TABLE, DESKTOP_WALLET_VAULT_TABLE, DbError,
+    LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX, PENDING_OUTPUT_POI_CONTEXT_TABLE,
+    POI_ARTIFACT_CACHE_GENERATION_KEY, POI_ARTIFACT_CACHE_TABLE, PendingOutputPoiContextRecord,
+    PoiArtifactCacheRecord, WALLET_UTXO_TABLE, WalletCacheKey, decode, encode, prefix_range_end,
+    wallet_utxo_key,
 };
 
 struct SchemaSevenWalletUtxoRow {
@@ -51,6 +53,37 @@ pub(super) fn migrate_schema_7_to_8(txn: &WriteTransaction) -> Result<(), DbErro
         for row in &wallet_utxos {
             table.remove(row.source_key.as_str())?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn migrate_schema_9_to_10(txn: &WriteTransaction) -> Result<(), DbError> {
+    let generation = {
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
+            Some(value) => decode(value.value())?,
+            None => 0_u64,
+        }
+    };
+    let records = {
+        let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        let mut records = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key = key.value().to_string();
+            let mut record = decode::<PoiArtifactCacheRecord>(value.value())
+                .map_err(|_| DbError::InvalidSchemaNinePpoiCorpusRecord { key: key.clone() })?;
+            if record.key() != key {
+                return Err(DbError::InvalidSchemaNinePpoiCorpusRecord { key });
+            }
+            record.cache_generation = generation;
+            records.push((key, encode(&record)?));
+        }
+        records
+    };
+    let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+    for (key, payload) in records {
+        table.insert(key.as_str(), payload.as_slice())?;
     }
     Ok(())
 }

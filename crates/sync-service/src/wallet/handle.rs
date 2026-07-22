@@ -1,10 +1,6 @@
 pub(super) const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
 pub(super) const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_mins(1);
 pub(super) const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-#[cfg(test)]
-pub(super) const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_mins(1);
-#[cfg(test)]
-pub(super) const WALLET_METADATA_LIVE_FLUSH_BLOCKS: u64 = 25;
 pub(super) const LOCAL_PENDING_SPENT_TTL: Duration = Duration::from_mins(10);
 pub(super) const OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER: Duration = Duration::from_mins(10);
 pub(super) const OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER: Duration = Duration::from_hours(24);
@@ -121,8 +117,6 @@ pub struct WalletHandle {
     pub(super) reset_generation_rx: watch::Receiver<u64>,
     pub(super) next_sync_job_id: Arc<AtomicU64>,
     pub(super) observation: Weak<WalletObservationPublisher>,
-    #[cfg(test)]
-    pub(super) _observation_test_owner: Option<Arc<WalletObservationPublisher>>,
     pub(super) observation_rx: watch::Receiver<WalletObservation>,
     pub rev_rx: watch::Receiver<u64>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
@@ -840,8 +834,6 @@ impl WalletPrivateMutationPermit<'_> {
 }
 
 pub(super) use crate::types::WalletPendingOverlay;
-#[cfg(test)]
-pub(super) use crate::types::WalletPendingSpent;
 
 impl WalletHandle {
     #[must_use]
@@ -931,13 +923,6 @@ impl WalletHandle {
         Ok(guard)
     }
 
-    /// Thin identity fence: does not wait on `authority_lock` (which may be held across remote I/O).
-    #[cfg(test)]
-    pub(crate) fn retire_actor(&self) {
-        let observation = self.observation.upgrade();
-        self.retire_actor_with_observation(observation.as_deref(), WalletInactiveReason::Retired);
-    }
-
     pub(crate) fn retire_actor_with_publisher(&self, observation: &WalletObservationPublisher) {
         self.retire_actor_with_observation(Some(observation), WalletInactiveReason::Retired);
     }
@@ -967,27 +952,6 @@ impl WalletHandle {
                 self.authority_reset_generation(),
             );
         });
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn hold_actor_authority_for_test(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.authority_lock).lock_owned().await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn publish_readiness_for_test(&self, readiness: &WalletReadiness) {
-        self.observation
-            .upgrade()
-            .expect("test observation publisher remains owned")
-            .publish_readiness(readiness.clone());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn publish_view_for_test(&self, view: WalletViewState) {
-        self.observation
-            .upgrade()
-            .expect("test observation publisher remains owned")
-            .publish_view(view);
     }
 
     /// Final validation + synchronous private apply under the lifecycle fence.
@@ -1223,20 +1187,6 @@ impl WalletHandle {
         self.reset_generation.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn advance_reset_generation(&self) -> Option<u64> {
-        let _guard = self.authority_lock.lock().await;
-        if !self.is_current_actor() {
-            return None;
-        }
-        let generation = self
-            .reset_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        self.reset_generation_tx.send_replace(generation);
-        Some(generation)
-    }
-
     pub(crate) fn set_indexed_catch_up(
         &self,
         lease: &WalletIndexedCatchUpLease,
@@ -1308,13 +1258,6 @@ impl WalletHandle {
         if let Some(observation) = self.observation.upgrade() {
             observation.publish_view(view);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn notify_changed(&self) {
-        let utxos = self.utxos.read().await.clone();
-        let overlay = self.pending_overlay.read().await.clone();
-        self.notify_changed_with_projection(&utxos, &overlay);
     }
 
     /// Pending tip overlay only when view is [`WalletViewState::Current`].
@@ -1449,68 +1392,6 @@ impl WalletHandle {
             .unwrap_or(Err(WalletPrivateRequestError::Inactive))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn clear_local_pending_spent_for_test(&self) -> bool {
-        let changed = {
-            let mut overlay = self.pending_overlay.write().await;
-            let changed = !overlay.local_pending_spent.is_empty();
-            overlay.local_pending_spent.clear();
-            changed
-        };
-        if changed {
-            self.notify_changed().await;
-        }
-        changed
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn mark_pending_spent_utxos_for_test(
-        &self,
-        utxos: &[Utxo],
-        tx_hash: Option<FixedBytes<32>>,
-    ) {
-        if utxos.is_empty() {
-            return;
-        }
-        let now = now_epoch_secs();
-        let changed = {
-            let mut overlay = self.pending_overlay.write().await;
-            let before = overlay.local_pending_spent.len();
-            let mut updated_existing = false;
-            for utxo in utxos {
-                let submitted = WalletPendingSpent::submitted(utxo, tx_hash, now);
-                if let Some(existing) = overlay.local_pending_spent.iter_mut().find(|spent| {
-                    spent.key() == submitted.key()
-                        && spent.stable_identity == submitted.stable_identity
-                }) {
-                    if existing != &submitted {
-                        *existing = submitted;
-                        updated_existing = true;
-                    }
-                } else {
-                    overlay.local_pending_spent.push(submitted);
-                }
-            }
-            overlay
-                .local_pending_spent
-                .sort_by_key(WalletPendingSpent::key);
-            overlay.local_pending_spent.len() != before || updated_existing
-        };
-        if changed {
-            self.notify_changed().await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn set_chain_pending_overlay(&self, next: WalletPendingOverlay) {
-        let _ = self
-            .replace_chain_pending_overlay_unchecked(next)
-            .await
-            .expect("test overlay replacement should not require authority");
-        // Always republish: tests may seed local_pending_spent on the live lock first.
-        self.notify_changed().await;
-    }
-
     async fn replace_chain_pending_overlay_authorized(
         &self,
         next: WalletPendingOverlay,
@@ -1548,7 +1429,125 @@ impl WalletHandle {
         })
     }
 
-    #[cfg(test)]
+    pub async fn refresh_poi_statuses(&self) -> bool {
+        self.poi_refresh_tx
+            .send(WalletPoiRefreshRequest {
+                force_output_poi_recovery: true,
+            })
+            .await
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WalletPoiRefreshRequest {
+    pub(super) force_output_poi_recovery: bool,
+}
+
+#[cfg(test)]
+impl WalletHandle {
+    /// Thin identity fence: does not wait on `authority_lock` (which may be held across remote I/O).
+    pub(crate) fn retire_actor(&self) {
+        let observation = self.observation.upgrade();
+        self.retire_actor_with_observation(observation.as_deref(), WalletInactiveReason::Retired);
+    }
+
+    pub(crate) async fn hold_actor_authority_for_test(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.authority_lock).lock_owned().await
+    }
+
+    pub(crate) fn publish_readiness_for_test(&self, readiness: &WalletReadiness) {
+        self.observation
+            .upgrade()
+            .expect("test observation publisher remains owned")
+            .publish_readiness(readiness.clone());
+    }
+
+    pub(crate) fn publish_view_for_test(&self, view: WalletViewState) {
+        self.observation
+            .upgrade()
+            .expect("test observation publisher remains owned")
+            .publish_view(view);
+    }
+
+    pub(crate) async fn advance_reset_generation(&self) -> Option<u64> {
+        let _guard = self.authority_lock.lock().await;
+        if !self.is_current_actor() {
+            return None;
+        }
+        let generation = self
+            .reset_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.reset_generation_tx.send_replace(generation);
+        Some(generation)
+    }
+
+    pub(crate) async fn notify_changed(&self) {
+        let utxos = self.utxos.read().await.clone();
+        let overlay = self.pending_overlay.read().await.clone();
+        self.notify_changed_with_projection(&utxos, &overlay);
+    }
+
+    pub(crate) async fn clear_local_pending_spent_for_test(&self) -> bool {
+        let changed = {
+            let mut overlay = self.pending_overlay.write().await;
+            let changed = !overlay.local_pending_spent.is_empty();
+            overlay.local_pending_spent.clear();
+            changed
+        };
+        if changed {
+            self.notify_changed().await;
+        }
+        changed
+    }
+
+    pub(crate) async fn mark_pending_spent_utxos_for_test(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: Option<FixedBytes<32>>,
+    ) {
+        if utxos.is_empty() {
+            return;
+        }
+        let now = now_epoch_secs();
+        let changed = {
+            let mut overlay = self.pending_overlay.write().await;
+            let before = overlay.local_pending_spent.len();
+            let mut updated_existing = false;
+            for utxo in utxos {
+                let submitted = test_support::WalletPendingSpent::submitted(utxo, tx_hash, now);
+                if let Some(existing) = overlay.local_pending_spent.iter_mut().find(|spent| {
+                    spent.key() == submitted.key()
+                        && spent.stable_identity == submitted.stable_identity
+                }) {
+                    if existing != &submitted {
+                        *existing = submitted;
+                        updated_existing = true;
+                    }
+                } else {
+                    overlay.local_pending_spent.push(submitted);
+                }
+            }
+            overlay
+                .local_pending_spent
+                .sort_by_key(test_support::WalletPendingSpent::key);
+            overlay.local_pending_spent.len() != before || updated_existing
+        };
+        if changed {
+            self.notify_changed().await;
+        }
+    }
+
+    pub(super) async fn set_chain_pending_overlay(&self, next: WalletPendingOverlay) {
+        let _ = self
+            .replace_chain_pending_overlay_unchecked(next)
+            .await
+            .expect("test overlay replacement should not require authority");
+        // Always republish: tests may seed local_pending_spent on the live lock first.
+        self.notify_changed().await;
+    }
+
     async fn replace_chain_pending_overlay_unchecked(
         &self,
         next: WalletPendingOverlay,
@@ -1583,18 +1582,13 @@ impl WalletHandle {
         };
         Ok(changed)
     }
-
-    pub async fn refresh_poi_statuses(&self) -> bool {
-        self.poi_refresh_tx
-            .send(WalletPoiRefreshRequest {
-                force_output_poi_recovery: true,
-            })
-            .await
-            .is_ok()
-    }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct WalletPoiRefreshRequest {
-    pub(super) force_output_poi_recovery: bool,
+#[cfg(test)]
+pub(super) mod test_support {
+    pub(in crate::wallet) const WALLET_METADATA_LIVE_FLUSH_INTERVAL: super::Duration =
+        super::Duration::from_mins(1);
+    pub(in crate::wallet) const WALLET_METADATA_LIVE_FLUSH_BLOCKS: u64 = 25;
+
+    pub(super) use crate::types::WalletPendingSpent;
 }

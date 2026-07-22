@@ -6,14 +6,7 @@ use super::{
     WalletPrivateRemoteStale, WalletUtxo, apply_poi_private_delta, blinded_commitment_type, debug,
     now_epoch_secs, warn,
 };
-#[cfg(test)]
-use super::{
-    Error, POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError, PoiRpcClient, PoiRpcError,
-    SnapshotEvent, U256,
-};
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
-#[cfg(test)]
-use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WalletPoiStatusRefreshOutcome {
@@ -250,117 +243,122 @@ pub(super) async fn refresh_wallet_poi_statuses_remote_authorized(
 }
 
 #[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct LivePoiTailOutcome {
-    pub(crate) events: usize,
-    pub(crate) pages: usize,
-    pub(crate) start_index: u64,
-    pub(crate) next_event_index: u64,
-}
+pub(crate) mod test_support {
+    use alloy::primitives::U256;
+    use broadcaster_core::transact::MERKLE_ZERO_VALUE;
+    use poi::artifacts::SnapshotEvent;
+    use poi::cache::{POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError};
+    use poi::error::PoiRpcError;
+    use poi::poi::PoiRpcClient;
+    use thiserror::Error;
 
-#[cfg(test)]
-#[derive(Debug, Error)]
-pub(crate) enum LivePoiTailError {
-    #[error("live POI tail request failed")]
-    Rpc(#[from] PoiRpcError),
-    #[error("live POI cache update failed")]
-    Cache(#[from] PoiCacheError),
-    #[error("live POI event range overflow")]
-    RangeOverflow,
-    #[error("live POI roots were rejected by the POI RPC")]
-    RootRejected,
-}
-
-#[cfg(test)]
-pub(crate) async fn sync_live_poi_event_tail(
-    client: &PoiRpcClient,
-    cache: &mut PoiCache,
-) -> Result<LivePoiTailOutcome, LivePoiTailError> {
-    let identity = cache.identity().clone();
-    let mut outcome = LivePoiTailOutcome {
-        start_index: cache.progress().next_event_index,
-        next_event_index: cache.progress().next_event_index,
-        ..LivePoiTailOutcome::default()
-    };
-    if outcome.next_event_index == 0 {
-        return Ok(outcome);
+    #[derive(Debug, Default)]
+    pub(crate) struct LivePoiTailOutcome {
+        pub(crate) events: usize,
+        pub(crate) pages: usize,
+        pub(crate) start_index: u64,
+        pub(crate) next_event_index: u64,
     }
 
-    loop {
-        let start_index = outcome.next_event_index;
-        let end_index = start_index
-            .checked_add(POI_MERKLETREE_LEAVES_PAGE_SIZE)
-            .ok_or(LivePoiTailError::RangeOverflow)?;
-        let leaves = client
-            .poi_merkletree_leaves(
-                &identity.txid_version,
-                identity.chain_type,
-                identity.chain_id,
-                &identity.list_key,
-                start_index,
-                end_index,
-            )
-            .await?;
-        let leaves = trim_zero_padding(&leaves);
-        if leaves.is_empty() {
-            break;
+    #[derive(Debug, Error)]
+    pub(crate) enum LivePoiTailError {
+        #[error("live POI tail request failed")]
+        Rpc(#[from] PoiRpcError),
+        #[error("live POI cache update failed")]
+        Cache(#[from] PoiCacheError),
+        #[error("live POI event range overflow")]
+        RangeOverflow,
+        #[error("live POI roots were rejected by the POI RPC")]
+        RootRejected,
+    }
+
+    pub(crate) async fn sync_live_poi_event_tail(
+        client: &PoiRpcClient,
+        cache: &mut PoiCache,
+    ) -> Result<LivePoiTailOutcome, LivePoiTailError> {
+        let identity = cache.identity().clone();
+        let mut outcome = LivePoiTailOutcome {
+            start_index: cache.progress().next_event_index,
+            next_event_index: cache.progress().next_event_index,
+            ..LivePoiTailOutcome::default()
+        };
+        if outcome.next_event_index == 0 {
+            return Ok(outcome);
         }
-        let returned = leaves.len();
-        apply_live_poi_leaves(cache, start_index, leaves)?;
-        outcome.events += returned;
-        outcome.pages += 1;
-        outcome.next_event_index = cache.progress().next_event_index;
-        if returned < POI_MERKLETREE_LEAVES_PAGE_SIZE as usize {
-            break;
+
+        loop {
+            let start_index = outcome.next_event_index;
+            let end_index = start_index
+                .checked_add(POI_MERKLETREE_LEAVES_PAGE_SIZE)
+                .ok_or(LivePoiTailError::RangeOverflow)?;
+            let leaves = client
+                .poi_merkletree_leaves(
+                    &identity.txid_version,
+                    identity.chain_type,
+                    identity.chain_id,
+                    &identity.list_key,
+                    start_index,
+                    end_index,
+                )
+                .await?;
+            let leaves = trim_zero_padding(&leaves);
+            if leaves.is_empty() {
+                break;
+            }
+            let returned = leaves.len();
+            apply_live_poi_leaves(cache, start_index, leaves)?;
+            outcome.events += returned;
+            outcome.pages += 1;
+            outcome.next_event_index = cache.progress().next_event_index;
+            if returned < POI_MERKLETREE_LEAVES_PAGE_SIZE as usize {
+                break;
+            }
         }
-    }
 
-    if outcome.events > 0 && !cache.validate_roots(client).await? {
-        return Err(LivePoiTailError::RootRejected);
-    }
-
-    Ok(outcome)
-}
-
-#[cfg(test)]
-pub(crate) async fn live_tail_candidate_cache(
-    client: &PoiRpcClient,
-    cache: &PoiCache,
-) -> Result<(PoiCache, LivePoiTailOutcome), LivePoiTailError> {
-    let mut tailed_cache = cache.clone();
-    let outcome = sync_live_poi_event_tail(client, &mut tailed_cache).await?;
-    Ok((tailed_cache, outcome))
-}
-
-#[cfg(test)]
-pub(super) fn apply_live_poi_leaves(
-    cache: &mut PoiCache,
-    start_index: u64,
-    leaves: &[U256],
-) -> Result<(), LivePoiTailError> {
-    let mut snapshot_events = Vec::with_capacity(leaves.len());
-    for (offset, leaf) in leaves.iter().enumerate() {
-        let event_index = start_index
-            .checked_add(offset as u64)
-            .ok_or(LivePoiTailError::RangeOverflow)?;
-        snapshot_events.push(SnapshotEvent {
-            event_index,
-            blinded_commitment: leaf.to_be_bytes::<32>(),
-            signature: [0; 64],
-            event_type: poi::poi::PoiEventType::Shield,
-        });
-    }
-    cache.apply_verified_artifact_events(&snapshot_events)?;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn trim_zero_padding(leaves: &[U256]) -> &[U256] {
-    let zero_leaf = MERKLE_ZERO_VALUE;
-    for (index, leaf) in leaves.iter().enumerate() {
-        if *leaf == zero_leaf {
-            return &leaves[..index];
+        if outcome.events > 0 && !cache.validate_roots(client).await? {
+            return Err(LivePoiTailError::RootRejected);
         }
+
+        Ok(outcome)
     }
-    leaves
+
+    pub(crate) async fn live_tail_candidate_cache(
+        client: &PoiRpcClient,
+        cache: &PoiCache,
+    ) -> Result<(PoiCache, LivePoiTailOutcome), LivePoiTailError> {
+        let mut tailed_cache = cache.clone();
+        let outcome = sync_live_poi_event_tail(client, &mut tailed_cache).await?;
+        Ok((tailed_cache, outcome))
+    }
+
+    pub(super) fn apply_live_poi_leaves(
+        cache: &mut PoiCache,
+        start_index: u64,
+        leaves: &[U256],
+    ) -> Result<(), LivePoiTailError> {
+        let mut snapshot_events = Vec::with_capacity(leaves.len());
+        for (offset, leaf) in leaves.iter().enumerate() {
+            let event_index = start_index
+                .checked_add(offset as u64)
+                .ok_or(LivePoiTailError::RangeOverflow)?;
+            snapshot_events.push(SnapshotEvent {
+                event_index,
+                blinded_commitment: leaf.to_be_bytes::<32>(),
+                signature: [0; 64],
+                event_type: poi::poi::PoiEventType::Shield,
+            });
+        }
+        cache.apply_verified_artifact_events(&snapshot_events)?;
+        Ok(())
+    }
+
+    pub(super) fn trim_zero_padding(leaves: &[U256]) -> &[U256] {
+        let zero_leaf = MERKLE_ZERO_VALUE;
+        for (index, leaf) in leaves.iter().enumerate() {
+            if *leaf == zero_leaf {
+                return &leaves[..index];
+            }
+        }
+        leaves
+    }
 }

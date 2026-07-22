@@ -6,9 +6,6 @@ use super::{
     run_quick_sync_into_with_progress, send_sync_progress, warn,
 };
 
-#[cfg(test)]
-use super::{Address, Duration, QueryRpcPool};
-
 #[async_trait]
 pub(super) trait MerkleForestDbExt {
     async fn load_or_initialize_forest(
@@ -435,6 +432,7 @@ const fn commitment_sync_progress_update(
 mod tests {
     use super::*;
 
+    use super::super::{Address, Duration, QueryRpcPool};
     use crate::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
     use alloy::primitives::U256;
     use local_db::DbConfig;

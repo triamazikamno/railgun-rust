@@ -5,11 +5,24 @@ use thiserror::Error;
 use crate::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 
 pub fn verify_poi_event(event: &SignedPoiEvent, list_key: &[u8; 32]) -> Result<(), VerifyError> {
-    verify_signature(
-        list_key,
-        &event.signature,
-        &canonical_poi_event_message(event),
-    )
+    let public_key = VerifyingKey::from_bytes(list_key).map_err(VerifyError::PublicKey)?;
+    let signature_bytes = decode_hex(&event.signature).map_err(VerifyError::SignatureHex)?;
+    if event.event_type == PoiEventType::Shield
+        && signature_bytes.len() == 64
+        && signature_bytes.iter().all(|byte| *byte == 0)
+    {
+        return Ok(());
+    }
+    let signature = Signature::from_slice(&signature_bytes).map_err(VerifyError::Signature)?;
+    if public_key
+        .verify(&canonical_poi_event_message(event), &signature)
+        .is_ok()
+    {
+        return Ok(());
+    }
+    public_key
+        .verify(&legacy_unprefixed_poi_event_message(event), &signature)
+        .map_err(VerifyError::Signature)
 }
 
 pub fn verify_blocked_shield(
@@ -26,6 +39,17 @@ pub fn verify_blocked_shield(
 #[must_use]
 pub fn canonical_poi_event_message(event: &SignedPoiEvent) -> Vec<u8> {
     let blinded_commitment = hex::encode_prefixed(event.blinded_commitment.as_slice());
+    format!(
+        r#"{{"index":{},"blindedCommitment":"{}","type":"{}"}}"#,
+        event.index,
+        blinded_commitment,
+        event_type_str(event.event_type)
+    )
+    .into_bytes()
+}
+
+fn legacy_unprefixed_poi_event_message(event: &SignedPoiEvent) -> Vec<u8> {
+    let blinded_commitment = hex::encode(event.blinded_commitment.as_slice());
     format!(
         r#"{{"index":{},"blindedCommitment":"{}","type":"{}"}}"#,
         event.index,
@@ -216,6 +240,47 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_historical_unsigned_shield_events() {
+        let signing_key = signing_key();
+        let mut unsigned_shield = signed_event(PoiEventType::Shield);
+        unsigned_shield.signature = "00".repeat(64);
+        verify_poi_event(&unsigned_shield, signing_key.verifying_key().as_bytes())
+            .expect("historical unsigned Shield event");
+
+        for event_type in [
+            PoiEventType::Transact,
+            PoiEventType::Unshield,
+            PoiEventType::LegacyTransact,
+        ] {
+            let mut unsigned = signed_event(event_type);
+            unsigned.signature = "00".repeat(64);
+            assert!(verify_poi_event(&unsigned, signing_key.verifying_key().as_bytes()).is_err());
+        }
+
+        unsigned_shield.signature = "00".repeat(63);
+        assert!(
+            verify_poi_event(&unsigned_shield, signing_key.verifying_key().as_bytes()).is_err()
+        );
+        assert!(verify_poi_event(&unsigned_shield, &[0xff; 32]).is_err());
+    }
+
+    #[test]
+    fn verifies_historical_unprefixed_poi_event_signature() {
+        let signing_key = signing_key();
+        let mut event = signed_event(PoiEventType::Unshield);
+        event.signature = hex::encode(
+            signing_key
+                .sign(&legacy_unprefixed_poi_event_message(&event))
+                .to_bytes(),
+        );
+        verify_poi_event(&event, signing_key.verifying_key().as_bytes())
+            .expect("historical unprefixed signature");
+
+        event.blinded_commitment[0] ^= 1;
+        assert!(verify_poi_event(&event, signing_key.verifying_key().as_bytes()).is_err());
+    }
+
+    #[test]
     fn verifies_signed_blocked_shields_with_and_without_reason() {
         let signing_key = signing_key();
 
@@ -257,6 +322,12 @@ mod tests {
                 "0x0cdbe4c20aafe718939c65d56d7a2346d9ed239ed84ce4de08453a8acae08446",
                 "6bc2d333ce7c40cfb28cb6b06a1ce5365919fe40cf6c3448ba19bbc3b1d137880974567186454fb9fb48bc864ff818686bcdaf83e8fbbb9ad18c6dafe2f68600",
                 PoiEventType::LegacyTransact,
+            ),
+            live_event(
+                301_593,
+                "0141bf51df82a72e6bb6bea220cca42a53a246f4ec1b9ef5f36641db86090278",
+                "4fe008b80736f2016adef75aaab699700c227005b80b01ad64a44b692ca2a993db69b4219ebaab9b749049615c4ed55f13ce27043f8961f709506368f6f6c109",
+                PoiEventType::Unshield,
             ),
         ];
 

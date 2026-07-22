@@ -201,29 +201,6 @@ impl WalletActorLifecycleCell {
         self.with_fence(|inner| inner.state)
     }
 
-    /// Prepared/Active → Stopping. Returns true if this call performed the transition.
-    #[cfg(test)]
-    pub(crate) fn mark_stopping(&self) -> bool {
-        self.mark_stopping_with(|| {})
-    }
-
-    /// Prepared/Active → Stopping, publishing terminal session state under the fence.
-    #[cfg(test)]
-    pub(crate) fn mark_stopping_with(&self, publish: impl FnOnce()) -> bool {
-        self.with_fence(|inner| {
-            if matches!(
-                inner.state,
-                WalletActorLifecycle::Prepared | WalletActorLifecycle::Active
-            ) {
-                inner.state = WalletActorLifecycle::Stopping;
-                publish();
-                true
-            } else {
-                false
-            }
-        })
-    }
-
     /// Prepared → Active. Registration must be installed before this transition.
     pub(crate) fn activate(&self) -> bool {
         self.with_fence(|inner| {
@@ -642,14 +619,6 @@ impl WalletActorState {
         Arc::clone(&self.observation)
     }
 
-    #[cfg(test)]
-    pub(super) fn set_observation_publisher_for_test(
-        &mut self,
-        observation: Arc<WalletObservationPublisher>,
-    ) {
-        self.observation = observation;
-    }
-
     /// Lifecycle-authorized synchronous transition. The mutation facade cannot escape this
     /// call, and typed readiness is derived and published before it returns.
     pub(super) fn transition<R>(
@@ -742,11 +711,6 @@ impl WalletActorState {
 
     pub(super) const fn reset_generation(&self) -> u64 {
         self.reset_generation
-    }
-
-    #[cfg(test)]
-    pub(super) const fn last_scanned(&self) -> u64 {
-        self.last_scanned
     }
 
     pub(super) const fn completed_target_block(&self) -> Option<u64> {
@@ -939,93 +903,6 @@ impl WalletActorState {
                 .active_jobs
                 .get(&token.job_id())
                 .is_some_and(|job| job.reset_generation == token.reset_generation())
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_readiness(&self) -> WalletReadiness {
-        self.derived_readiness()
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_active_job_count(&self) -> usize {
-        self.active_jobs.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_job_failure_count(&self) -> usize {
-        self.job_failures.len()
-    }
-
-    #[cfg(test)]
-    pub(super) const fn test_highest_accepted_backfill_job_id(&self) -> u64 {
-        self.highest_accepted_backfill_job_id
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_active_backfill_target_for(&self, token: WalletSyncToken) -> Option<u64> {
-        self.active_jobs
-            .get(&token.job_id())
-            .filter(|job| job.kind == WalletActorJobKind::Backfill)
-            .and_then(|job| job.target_block)
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_persistence_range_for(&self, token: WalletSyncToken) -> Option<(u64, u64)> {
-        self.progress_persistence_requirement
-            .filter(|required| required.reset_generation == token.reset_generation())
-            .map(|required| (required.range.from_block, required.range.to_block))
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_completion_requirement(&self) -> Option<(WalletSyncToken, u64)> {
-        self.completion_persistence_requirement
-            .map(|required| (required.token, required.target_block))
-    }
-
-    #[cfg(test)]
-    pub(super) const fn test_reset_replay_requirement(&self) -> Option<u64> {
-        self.reset_replay_persistence_requirement
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_has_job_failure(&self, token: WalletSyncToken) -> bool {
-        self.job_failures
-            .get(&token.job_id())
-            .is_some_and(|failure| failure.token == token)
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_poi_requirement_count(&self) -> usize {
-        usize::from(self.poi_persistence_requirements.required)
-            + usize::from(self.poi_persistence_requirements.required_or_recoverable)
-            + usize::from(
-                self.poi_persistence_requirements
-                    .recoverable_stale
-                    .is_some(),
-            )
-            + usize::from(self.poi_persistence_requirements.recoverable)
-            + usize::from(self.poi_persistence_requirements.corpus_revision.is_some())
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_indexed_status(
-        &self,
-        token: WalletSyncToken,
-    ) -> Option<&WalletIndexedCatchUpStatus> {
-        self.active_jobs
-            .get(&token.job_id())
-            .and_then(|job| job.indexed_status.as_ref())
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_transition<R>(
-        &mut self,
-        transition: impl for<'a> FnOnce(WalletActorMutation<'a>) -> R,
-    ) -> R {
-        let token = WalletActorApplyToken {
-            _fence: PhantomData,
-        };
-        self.transition(&token, transition)
     }
 }
 
@@ -1226,11 +1103,6 @@ impl WalletActorMutation<'_> {
         }
         self.state.completion_persistence_requirement = None;
         true
-    }
-
-    #[cfg(test)]
-    pub(super) const fn update_cursor(&mut self, last_scanned: u64) {
-        self.state.last_scanned = last_scanned;
     }
 
     pub(super) const fn set_poi_corpus_refresh_pending(&mut self, pending: bool) {
@@ -1501,11 +1373,6 @@ impl WalletActorMutation<'_> {
         self.state.completed_target_block = None;
         indexed_catch_up_was_active
     }
-
-    #[cfg(test)]
-    pub(super) fn test_accept_backfill_job_id(&mut self, token: WalletSyncToken) -> bool {
-        self.accept_job(token, WalletActorJobKind::Backfill)
-    }
 }
 
 /// Credential for remote POI jobs re-entering the actor.
@@ -1560,6 +1427,130 @@ pub(crate) enum WalletRemoteDone {
         verified_pending: usize,
         verified_errors: usize,
     },
+}
+
+#[cfg(test)]
+impl WalletActorLifecycleCell {
+    /// Prepared/Active → Stopping. Returns true if this call performed the transition.
+    pub(crate) fn mark_stopping(&self) -> bool {
+        self.mark_stopping_with(|| {})
+    }
+
+    /// Prepared/Active → Stopping, publishing terminal session state under the fence.
+    pub(crate) fn mark_stopping_with(&self, publish: impl FnOnce()) -> bool {
+        self.with_fence(|inner| {
+            if matches!(
+                inner.state,
+                WalletActorLifecycle::Prepared | WalletActorLifecycle::Active
+            ) {
+                inner.state = WalletActorLifecycle::Stopping;
+                publish();
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+impl WalletActorState {
+    pub(super) fn set_observation_publisher_for_test(
+        &mut self,
+        observation: Arc<WalletObservationPublisher>,
+    ) {
+        self.observation = observation;
+    }
+
+    pub(super) const fn last_scanned(&self) -> u64 {
+        self.last_scanned
+    }
+
+    pub(super) fn test_readiness(&self) -> WalletReadiness {
+        self.derived_readiness()
+    }
+
+    pub(super) fn test_active_job_count(&self) -> usize {
+        self.active_jobs.len()
+    }
+
+    pub(super) fn test_job_failure_count(&self) -> usize {
+        self.job_failures.len()
+    }
+
+    pub(super) const fn test_highest_accepted_backfill_job_id(&self) -> u64 {
+        self.highest_accepted_backfill_job_id
+    }
+
+    pub(super) fn test_active_backfill_target_for(&self, token: WalletSyncToken) -> Option<u64> {
+        self.active_jobs
+            .get(&token.job_id())
+            .filter(|job| job.kind == WalletActorJobKind::Backfill)
+            .and_then(|job| job.target_block)
+    }
+
+    pub(super) fn test_persistence_range_for(&self, token: WalletSyncToken) -> Option<(u64, u64)> {
+        self.progress_persistence_requirement
+            .filter(|required| required.reset_generation == token.reset_generation())
+            .map(|required| (required.range.from_block, required.range.to_block))
+    }
+
+    pub(super) fn test_completion_requirement(&self) -> Option<(WalletSyncToken, u64)> {
+        self.completion_persistence_requirement
+            .map(|required| (required.token, required.target_block))
+    }
+
+    pub(super) const fn test_reset_replay_requirement(&self) -> Option<u64> {
+        self.reset_replay_persistence_requirement
+    }
+
+    pub(super) fn test_has_job_failure(&self, token: WalletSyncToken) -> bool {
+        self.job_failures
+            .get(&token.job_id())
+            .is_some_and(|failure| failure.token == token)
+    }
+
+    pub(super) fn test_poi_requirement_count(&self) -> usize {
+        usize::from(self.poi_persistence_requirements.required)
+            + usize::from(self.poi_persistence_requirements.required_or_recoverable)
+            + usize::from(
+                self.poi_persistence_requirements
+                    .recoverable_stale
+                    .is_some(),
+            )
+            + usize::from(self.poi_persistence_requirements.recoverable)
+            + usize::from(self.poi_persistence_requirements.corpus_revision.is_some())
+    }
+
+    pub(super) fn test_indexed_status(
+        &self,
+        token: WalletSyncToken,
+    ) -> Option<&WalletIndexedCatchUpStatus> {
+        self.active_jobs
+            .get(&token.job_id())
+            .and_then(|job| job.indexed_status.as_ref())
+    }
+
+    pub(super) fn test_transition<R>(
+        &mut self,
+        transition: impl for<'a> FnOnce(WalletActorMutation<'a>) -> R,
+    ) -> R {
+        let token = WalletActorApplyToken {
+            _fence: PhantomData,
+        };
+        self.transition(&token, transition)
+    }
+}
+
+#[cfg(test)]
+impl WalletActorMutation<'_> {
+    pub(super) const fn update_cursor(&mut self, last_scanned: u64) {
+        self.state.last_scanned = last_scanned;
+    }
+
+    pub(super) fn test_accept_backfill_job_id(&mut self, token: WalletSyncToken) -> bool {
+        self.accept_job(token, WalletActorJobKind::Backfill)
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::async_trait;
 use super::{
     Arc, BTreeMap, BlindedCommitmentData, FixedBytes, PendingOutputPoiSubmitter, PoiError,
     PoiMerkleProof, PoiMerkleProofSource, PoiRpcClient, PoiStatus, PoiStatusReader,
@@ -138,51 +136,9 @@ impl WalletPrivatePoiClients {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        authority: WalletPrivateRemoteAuthority,
-        status: Arc<dyn PoiStatusReader>,
-        proofs: Arc<dyn PoiMerkleProofSource>,
-        submit: Arc<dyn PendingOutputPoiSubmitter>,
-    ) -> Self {
-        Self {
-            effects: WalletPrivateRemoteEffects::new(authority),
-            status,
-            proofs,
-            submit,
-        }
-    }
-
     #[must_use]
     pub(crate) fn remote_effects(&self) -> WalletPrivateRemoteEffects {
         self.effects.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_status(
-        authority: WalletPrivateRemoteAuthority,
-        status: Arc<dyn PoiStatusReader>,
-    ) -> Self {
-        let unavailable = Arc::new(UnavailablePrivatePoiTransport);
-        Self::for_test(authority, status, unavailable.clone(), unavailable)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_proofs(
-        authority: WalletPrivateRemoteAuthority,
-        proofs: Arc<dyn PoiMerkleProofSource>,
-    ) -> Self {
-        let unavailable = Arc::new(UnavailablePrivatePoiTransport);
-        Self::for_test(authority, unavailable.clone(), proofs, unavailable)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_submit(
-        authority: WalletPrivateRemoteAuthority,
-        submit: Arc<dyn PendingOutputPoiSubmitter>,
-    ) -> Self {
-        let unavailable = Arc::new(UnavailablePrivatePoiTransport);
-        Self::for_test(authority, unavailable.clone(), unavailable, submit)
     }
 
     pub(crate) async fn pois_per_list<Check, CheckFuture, CheckError>(
@@ -300,64 +256,108 @@ impl WalletPrivatePoiClients {
 }
 
 #[cfg(test)]
-struct UnavailablePrivatePoiTransport;
+impl WalletPrivatePoiClients {
+    pub(crate) fn for_test(
+        authority: WalletPrivateRemoteAuthority,
+        status: Arc<dyn PoiStatusReader>,
+        proofs: Arc<dyn PoiMerkleProofSource>,
+        submit: Arc<dyn PendingOutputPoiSubmitter>,
+    ) -> Self {
+        Self {
+            effects: WalletPrivateRemoteEffects::new(authority),
+            status,
+            proofs,
+            submit,
+        }
+    }
 
-#[cfg(test)]
-#[async_trait]
-impl PoiStatusReader for UnavailablePrivatePoiTransport {
-    async fn pois_per_list(
-        &self,
-        _txid_version: &str,
-        _chain_type: u8,
-        _chain_id: u64,
-        _list_keys: &[FixedBytes<32>],
-        _blinded_commitment_datas: &[BlindedCommitmentData],
-    ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError> {
-        Err(PoiError::MerkleRootsRejected)
+    pub(crate) fn for_status(
+        authority: WalletPrivateRemoteAuthority,
+        status: Arc<dyn PoiStatusReader>,
+    ) -> Self {
+        let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
+        Self::for_test(authority, status, unavailable.clone(), unavailable)
+    }
+
+    pub(crate) fn for_proofs(
+        authority: WalletPrivateRemoteAuthority,
+        proofs: Arc<dyn PoiMerkleProofSource>,
+    ) -> Self {
+        let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
+        Self::for_test(authority, unavailable.clone(), proofs, unavailable)
+    }
+
+    pub(crate) fn for_submit(
+        authority: WalletPrivateRemoteAuthority,
+        submit: Arc<dyn PendingOutputPoiSubmitter>,
+    ) -> Self {
+        let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
+        Self::for_test(authority, unavailable.clone(), unavailable, submit)
     }
 }
 
 #[cfg(test)]
-#[async_trait]
-impl PoiMerkleProofSource for UnavailablePrivatePoiTransport {
-    async fn poi_merkle_proofs(
-        &self,
-        _txid_version: &str,
-        _chain_type: u8,
-        _chain_id: u64,
-        _list_key: &FixedBytes<32>,
-        _blinded_commitments: &[FixedBytes<32>],
-    ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
-        Err(PreTransactionPoiError::ProofSource(
-            "private POI test transport unavailable".to_string(),
-        ))
-    }
-}
+mod test_support {
+    use super::*;
+    use crate::wallet::async_trait;
 
-#[cfg(test)]
-#[async_trait]
-impl PendingOutputPoiSubmitter for UnavailablePrivatePoiTransport {
-    async fn submit_single_commitment_proofs(
-        &self,
-        _txid_version: &str,
-        _chain_type: u8,
-        _chain_id: u64,
-        _context: &SingleCommitmentProofContext,
-        _utxo_tree_out: u64,
-        _utxo_position_out: u64,
-    ) -> Result<(), PoiError> {
-        Err(PoiError::MerkleRootsRejected)
+    pub(super) struct UnavailablePrivatePoiTransport;
+
+    #[async_trait]
+    impl PoiStatusReader for UnavailablePrivatePoiTransport {
+        async fn pois_per_list(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            _list_keys: &[FixedBytes<32>],
+            _blinded_commitment_datas: &[BlindedCommitmentData],
+        ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError>
+        {
+            Err(PoiError::MerkleRootsRejected)
+        }
     }
 
-    async fn submit_transact_proof(
-        &self,
-        _txid_version: &str,
-        _chain_type: u8,
-        _chain_id: u64,
-        _list_key: &FixedBytes<32>,
-        _txid_merkleroot_index: u64,
-        _poi: &broadcaster_core::transact::PreTxPoi,
-    ) -> Result<(), PoiError> {
-        Err(PoiError::MerkleRootsRejected)
+    #[async_trait]
+    impl PoiMerkleProofSource for UnavailablePrivatePoiTransport {
+        async fn poi_merkle_proofs(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            _list_key: &FixedBytes<32>,
+            _blinded_commitments: &[FixedBytes<32>],
+        ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
+            Err(PreTransactionPoiError::ProofSource(
+                "private POI test transport unavailable".to_string(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl PendingOutputPoiSubmitter for UnavailablePrivatePoiTransport {
+        async fn submit_single_commitment_proofs(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            _context: &SingleCommitmentProofContext,
+            _utxo_tree_out: u64,
+            _utxo_position_out: u64,
+        ) -> Result<(), PoiError> {
+            Err(PoiError::MerkleRootsRejected)
+        }
+
+        async fn submit_transact_proof(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            _list_key: &FixedBytes<32>,
+            _txid_merkleroot_index: u64,
+            _poi: &broadcaster_core::transact::PreTxPoi,
+        ) -> Result<(), PoiError> {
+            Err(PoiError::MerkleRootsRejected)
+        }
     }
 }

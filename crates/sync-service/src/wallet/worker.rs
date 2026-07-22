@@ -40,9 +40,6 @@ use crate::types::{PoiCorpusRevision, WalletSyncTargetLease};
 use futures::StreamExt;
 use tokio::task::JoinHandle;
 
-#[cfg(test)]
-use super::WalletResetToken;
-
 const fn wallet_private_request_error(
     reason: &WalletBackfillRejectReason,
 ) -> WalletPrivateRequestError {
@@ -709,10 +706,6 @@ struct WalletPoiStatusRefreshCommitRequest<'a> {
     cancel: &'a CancellationToken,
 }
 
-#[cfg(test)]
-type ResetCurrentPublicationProbe<'a> =
-    dyn Fn(&WalletActorState, u64, &WalletHandle) + Send + Sync + 'a;
-
 struct WalletResetCommitRequest<'a> {
     cache_store: &'a dyn WalletCacheStore,
     cfg: &'a WalletConfig,
@@ -725,8 +718,6 @@ struct WalletResetCommitRequest<'a> {
     last_scanned: &'a mut u64,
     persist_state: &'a mut WalletPersistState,
     live_metadata_flush: &'a mut WalletLiveMetadataFlush,
-    #[cfg(test)]
-    after_publish_current: Option<&'a ResetCurrentPublicationProbe<'a>>,
 }
 
 /// Outcome of `CommitResetRewind` only (pending reset already accepted).
@@ -903,22 +894,6 @@ async fn accepted_indexed_job_owner_dropped(
     token
 }
 
-#[cfg(test)]
-pub(super) enum WalletPoiStatusReaderSource<'a> {
-    Local(LocalPoiStatusReader),
-    Remote(&'a PoiRpcClient),
-}
-
-#[cfg(test)]
-impl WalletPoiStatusReaderSource<'_> {
-    pub(super) fn as_reader(&self) -> &dyn PoiStatusReader {
-        match self {
-            Self::Local(reader) => reader,
-            Self::Remote(reader) => *reader,
-        }
-    }
-}
-
 impl WalletPoiRuntime {
     /// Actor-safe: only a local corpus reader. Never returns remote proxy (no remote RTT).
     pub(super) async fn local_status_reader(
@@ -941,34 +916,6 @@ impl WalletPoiRuntime {
             }
             // PoiProxy has no local corpus for actor-side refresh.
             Self::PoiProxy { .. } => None,
-        }
-    }
-
-    /// Job-only: may return remote proxy / fallback reader.
-    #[cfg(test)]
-    pub(super) async fn status_reader_for_job<'a>(
-        &'a self,
-        public_data_plane: &ChainPublicDataPlane,
-        cfg: &WalletConfig,
-        active_list_keys: &[FixedBytes<32>],
-    ) -> Option<WalletPoiStatusReaderSource<'a>> {
-        match self {
-            Self::IndexedArtifacts { .. } => {
-                let key = PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id);
-                if !public_data_plane
-                    .poi_corpus_ready_for_lists(key.clone(), active_list_keys)
-                    .await
-                {
-                    return self
-                        .wallet_read_fallback_enabled()
-                        .then(|| WalletPoiStatusReaderSource::Remote(self.public_client()));
-                }
-                let corpus = public_data_plane.ensure_poi_corpus(key).await.ok()?;
-                Some(WalletPoiStatusReaderSource::Local(corpus.status_reader()))
-            }
-            Self::PoiProxy { .. } => {
-                Some(WalletPoiStatusReaderSource::Remote(self.public_client()))
-            }
         }
     }
 }
@@ -1128,14 +1075,16 @@ impl WalletResetCommitRequest<'_> {
                 .transition_with_view(&token, view, |mut state| {
                     state.mark_pending_reset_rewind_committed(candidate_last_scanned);
                 });
-            #[cfg(test)]
-            if let Some(probe) = request.after_publish_current {
-                probe(
-                    request.actor_state,
-                    *request.last_scanned,
-                    request.worker_handle,
-                );
-            }
+            debug_assert!(request.actor_state.pending_reset_rewind_committed());
+            debug_assert_eq!(
+                request.worker_handle.last_scanned_raw(),
+                *request.last_scanned
+            );
+            debug_assert!(matches!(
+                request.worker_handle.view_state(),
+                WalletViewState::Current(current)
+                    if current.last_scanned == *request.last_scanned
+            ));
             Ok::<(), WalletCacheError>(())
         });
         drop(overlay_locked);
@@ -1541,7 +1490,8 @@ impl WalletScanCommitRequest<'_> {
                     | crate::chain::PublicDataPlaneError::UnprovenRpcCoverage { .. }
                     | crate::chain::PublicDataPlaneError::PublicCacheReset { .. }
                     | crate::chain::PublicDataPlaneError::PoiCorpusUnavailable { .. }
-                    | crate::chain::PublicDataPlaneError::PoiCorpusRefresh { .. } => {
+                    | crate::chain::PublicDataPlaneError::PoiCorpusRefresh { .. }
+                    | crate::chain::PublicDataPlaneError::PoiArtifactPersistence { .. } => {
                         WalletBackfillRejectReason::ApplyFailed
                     }
                 };
@@ -1909,8 +1859,6 @@ pub(crate) async fn prepare_wallet_worker(
         reset_generation_rx,
         next_sync_job_id,
         observation: Arc::downgrade(&observation),
-        #[cfg(test)]
-        _observation_test_owner: None,
         observation_rx,
         rev_rx,
         poi_refreshing_rx,
@@ -2051,8 +1999,6 @@ pub(crate) async fn prepare_wallet_worker(
                             last_scanned: &mut last_scanned,
                             persist_state: &mut persist_state,
                             live_metadata_flush: &mut live_metadata_flush,
-                            #[cfg(test)]
-                            after_publish_current: None,
                         }
                         .commit()
                         .await
@@ -4025,41 +3971,6 @@ pub(crate) async fn prepare_wallet_worker(
     Ok(prepared)
 }
 
-#[cfg(test)]
-pub(crate) async fn spawn_wallet_worker(
-    services: WalletWorkerServices,
-    cfg: WalletConfig,
-    actor_id: u64,
-    live_rx: broadcast::Receiver<SharedLogBatch>,
-    backfill_rx: mpsc::Receiver<BackfillEvent>,
-    cancel: CancellationToken,
-    initial_utxos: Vec<WalletUtxo>,
-    initial_last_scanned: u64,
-) -> Result<WalletHandle, ChainError> {
-    let mut prepared = prepare_wallet_worker(
-        services,
-        cfg,
-        actor_id,
-        live_rx,
-        backfill_rx,
-        cancel,
-        initial_utxos,
-        initial_last_scanned,
-    )
-    .await?;
-    let worker = prepared.take_worker();
-    match prepared.activate() {
-        Ok(handle) => {
-            drop(worker);
-            Ok(handle)
-        }
-        Err(err) => {
-            let _ = worker.await;
-            Err(err)
-        }
-    }
-}
-
 pub(crate) fn wallet_cache_store(
     db: &Arc<DbStore>,
     cfg: &WalletConfig,
@@ -4080,8 +3991,92 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
+
+    pub(in crate::wallet) enum WalletPoiStatusReaderSource<'a> {
+        Local(LocalPoiStatusReader),
+        Remote(&'a PoiRpcClient),
+    }
+
+    impl WalletPoiStatusReaderSource<'_> {
+        pub(in crate::wallet) fn as_reader(&self) -> &dyn PoiStatusReader {
+            match self {
+                Self::Local(reader) => reader,
+                Self::Remote(reader) => *reader,
+            }
+        }
+    }
+
+    impl WalletPoiRuntime {
+        /// Job-only: may return remote proxy / fallback reader.
+        pub(in crate::wallet) async fn status_reader_for_job<'a>(
+            &'a self,
+            public_data_plane: &ChainPublicDataPlane,
+            cfg: &WalletConfig,
+            active_list_keys: &[FixedBytes<32>],
+        ) -> Option<WalletPoiStatusReaderSource<'a>> {
+            match self {
+                Self::IndexedArtifacts { .. } => {
+                    let key = PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id);
+                    if !public_data_plane
+                        .poi_corpus_ready_for_lists(key.clone(), active_list_keys)
+                        .await
+                    {
+                        return self
+                            .wallet_read_fallback_enabled()
+                            .then(|| WalletPoiStatusReaderSource::Remote(self.public_client()));
+                    }
+                    let corpus = public_data_plane.ensure_poi_corpus(key).await.ok()?;
+                    Some(WalletPoiStatusReaderSource::Local(corpus.status_reader()))
+                }
+                Self::PoiProxy { .. } => {
+                    Some(WalletPoiStatusReaderSource::Remote(self.public_client()))
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn spawn_wallet_worker(
+        services: WalletWorkerServices,
+        cfg: WalletConfig,
+        actor_id: u64,
+        live_rx: broadcast::Receiver<SharedLogBatch>,
+        backfill_rx: mpsc::Receiver<BackfillEvent>,
+        cancel: CancellationToken,
+        initial_utxos: Vec<WalletUtxo>,
+        initial_last_scanned: u64,
+    ) -> Result<WalletHandle, ChainError> {
+        let mut prepared = prepare_wallet_worker(
+            services,
+            cfg,
+            actor_id,
+            live_rx,
+            backfill_rx,
+            cancel,
+            initial_utxos,
+            initial_last_scanned,
+        )
+        .await?;
+        let worker = prepared.take_worker();
+        match prepared.activate() {
+            Ok(handle) => {
+                drop(worker);
+                Ok(handle)
+            }
+            Err(err) => {
+                let _ = worker.await;
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::spawn_wallet_worker;
+    use super::*;
+    use crate::types::WalletResetToken;
 
     #[test]
     fn wallet_scan_progress_retains_configured_baseline_across_pages() {
@@ -7956,7 +7951,6 @@ mod tests {
             last_scanned: &mut last_scanned,
             persist_state: &mut persist_state,
             live_metadata_flush: &mut live_metadata_flush,
-            after_publish_current: None,
         }
         .commit()
         .await;
@@ -7986,41 +7980,21 @@ mod tests {
         );
         assert_eq!(handle.utxos.read().await.len(), 1);
 
-        let probe_called = std::sync::atomic::AtomicBool::new(false);
-        let committed = {
-            let after_publish_current =
-                |canonical: &WalletActorState, local_cursor: u64, worker: &WalletHandle| {
-                    probe_called.store(true, std::sync::atomic::Ordering::Relaxed);
-                    assert_eq!(canonical.last_scanned(), 99);
-                    assert!(canonical.pending_reset_rewind_committed());
-                    assert_eq!(canonical.test_readiness(), WalletReadiness::Syncing);
-                    assert_eq!(readiness_rx.borrow().readiness(), &WalletReadiness::Syncing);
-                    assert_eq!(local_cursor, 99);
-                    assert_eq!(worker.last_scanned_raw(), 99);
-                    assert_eq!(worker.readiness(), WalletReadiness::Syncing);
-                    assert!(matches!(
-                        observation_rx.borrow().view().clone(),
-                        WalletViewState::Current(_)
-                    ));
-                };
-            WalletResetCommitRequest {
-                cache_store: cache_store.as_ref(),
-                cfg: &cfg,
-                utxos: &handle.utxos,
-                worker_handle: &handle,
-                pending,
-                highest_accepted_reset_intent: 1,
-                actor_state: &mut actor_state,
-                cancel: &cancel,
-                last_scanned: &mut last_scanned,
-                persist_state: &mut persist_state,
-                live_metadata_flush: &mut live_metadata_flush,
-                after_publish_current: Some(&after_publish_current),
-            }
-            .commit()
-            .await
-        };
-        assert!(probe_called.load(std::sync::atomic::Ordering::Relaxed));
+        let committed = WalletResetCommitRequest {
+            cache_store: cache_store.as_ref(),
+            cfg: &cfg,
+            utxos: &handle.utxos,
+            worker_handle: &handle,
+            pending,
+            highest_accepted_reset_intent: 1,
+            actor_state: &mut actor_state,
+            cancel: &cancel,
+            last_scanned: &mut last_scanned,
+            persist_state: &mut persist_state,
+            live_metadata_flush: &mut live_metadata_flush,
+        }
+        .commit()
+        .await;
         assert_eq!(
             committed.rewind,
             WalletResetRewindOutcome::Committed { committed_to: 99 }
@@ -8028,7 +8002,10 @@ mod tests {
         assert_eq!(last_scanned, 99);
         assert_eq!(actor_state.last_scanned(), 99);
         assert!(actor_state.pending_reset_rewind_committed());
+        assert_eq!(actor_state.test_readiness(), WalletReadiness::Syncing);
         assert_eq!(handle.last_scanned_raw(), 99);
+        assert_eq!(handle.readiness(), WalletReadiness::Syncing);
+        assert_eq!(readiness_rx.borrow().readiness(), &WalletReadiness::Syncing);
         assert!(!persist_state.needs_full_persist);
         assert_eq!(persist_state.pending_cache_reset, None);
         assert_eq!(live_metadata_flush.last_persisted_block, 99);

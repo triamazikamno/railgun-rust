@@ -18,6 +18,10 @@ tracing = { workspace = true }
 broadcaster-core = { path = "../core" }
 
 [dev-dependencies]
+cid = { workspace = true }
+hmac = { workspace = true }
+libp2p-identity = { workspace = true }
+multibase = "0.9"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -17,8 +17,6 @@ use local_db::{
 };
 use poi::SensitiveUrl;
 use poi::cache::PoiCache;
-#[cfg(test)]
-use railgun_wallet::scan::WalletLogDelta;
 use railgun_wallet::scan::{WalletScanError, WalletScanInputRows, WalletScanKeys};
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError, serialize_wallet_utxo};
 use railgun_wallet::{ProverService, WalletUtxo};
@@ -243,14 +241,16 @@ pub enum PoiArtifactCachePhase {
     Idle,
     LoadingPersisted,
     Resetting,
-    FetchingManifest,
-    DownloadingBase,
-    ApplyingDeltas,
-    SyncingBlockedShields,
+    ResolvingManifest,
+    VerifyingCatalog,
+    Planning,
+    DownloadingChunks,
+    ReplayingRanges,
+    Validating,
+    Persisting,
     LiveTailing,
-    ValidatingRoots,
     Ready,
-    Error,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -288,9 +288,28 @@ pub struct PoiArtifactCacheListProgress {
     pub ready_for_wallet_checks: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoiArtifactCacheGraphProgress {
+    pub verified_chunks: usize,
+    pub total_chunks: usize,
+    pub verified_encoded_bytes: u64,
+    pub total_authenticated_encoded_bytes: Option<u64>,
+    pub replay_start_event_index: Option<u64>,
+    pub replay_end_event_index: Option<u64>,
+    pub replayed_event_count: u64,
+    pub total_replay_event_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoiArtifactCacheFailureKind {
+    RefreshDegraded,
+    ServingCorpusUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoiArtifactCacheProgress {
     pub attempt_id: PoiArtifactCacheAttemptId,
+    pub generation: u64,
     pub chain_id: u64,
     pub phase: PoiArtifactCachePhase,
     pub completed_lists: usize,
@@ -299,6 +318,7 @@ pub struct PoiArtifactCacheProgress {
     pub current_event_index: Option<u64>,
     pub target_event_index: Option<u64>,
     pub list_progress: Vec<PoiArtifactCacheListProgress>,
+    pub graph: PoiArtifactCacheGraphProgress,
     pub ready_for_wallet_checks: bool,
     pub last_error: Option<String>,
 }
@@ -335,12 +355,14 @@ impl PoiArtifactCacheProgress {
             self.phase,
             PoiArtifactCachePhase::LoadingPersisted
                 | PoiArtifactCachePhase::Resetting
-                | PoiArtifactCachePhase::FetchingManifest
-                | PoiArtifactCachePhase::DownloadingBase
-                | PoiArtifactCachePhase::ApplyingDeltas
-                | PoiArtifactCachePhase::SyncingBlockedShields
+                | PoiArtifactCachePhase::ResolvingManifest
+                | PoiArtifactCachePhase::VerifyingCatalog
+                | PoiArtifactCachePhase::Planning
+                | PoiArtifactCachePhase::DownloadingChunks
+                | PoiArtifactCachePhase::ReplayingRanges
+                | PoiArtifactCachePhase::Validating
+                | PoiArtifactCachePhase::Persisting
                 | PoiArtifactCachePhase::LiveTailing
-                | PoiArtifactCachePhase::ValidatingRoots
         )
     }
 
@@ -351,7 +373,19 @@ impl PoiArtifactCacheProgress {
 
     #[must_use]
     pub const fn is_error(&self) -> bool {
-        matches!(self.phase, PoiArtifactCachePhase::Error)
+        matches!(self.phase, PoiArtifactCachePhase::Failed)
+    }
+
+    #[must_use]
+    pub const fn failure_kind(&self) -> Option<PoiArtifactCacheFailureKind> {
+        if self.last_error.is_none() {
+            return None;
+        }
+        Some(if self.ready_for_wallet_checks {
+            PoiArtifactCacheFailureKind::RefreshDegraded
+        } else {
+            PoiArtifactCacheFailureKind::ServingCorpusUnavailable
+        })
     }
 }
 
@@ -424,25 +458,6 @@ impl LocalPoiCaches {
                 caches: RwLock::new(BTreeMap::new()),
                 authority,
                 installed_generation: AtomicU64::new(installed_generation),
-                committed_revision_tx,
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn new_for_test(caches: BTreeMap<FixedBytes<32>, PoiCache>) -> Self {
-        let initial_revision = u64::from(!caches.is_empty());
-        let initial_revision = PoiCorpusRevision {
-            revision: initial_revision,
-            blocked_shields_revision: initial_revision,
-        };
-        let (committed_revision_tx, _) = watch::channel(initial_revision);
-        Self {
-            inner: Arc::new(LocalPoiCachesInner {
-                caches: RwLock::new(caches),
-                authority: Arc::new(PoiCorpusAuthority::new(0)),
-                installed_generation: AtomicU64::new(0),
                 committed_revision_tx,
             }),
         }
@@ -535,11 +550,6 @@ impl LocalPoiCaches {
         caches.clear();
         self.mark_installed_generation(current_generation);
         true
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -1354,233 +1364,6 @@ pub enum WalletPrivateRequestError {
     PersistenceFailed,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{
-        ChainConfigDefaults, GlobalPoiPolicy, LocalPoiCaches, PoiArtifactCachePhase,
-        PoiArtifactCacheProgress, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-        PoiCorpusRevision, PoiProxyFallback, PublicScanSource, SyncProgressStage, SyncProgressUnit,
-        SyncProgressUpdate,
-    };
-    use alloy::primitives::FixedBytes;
-    use poi::SensitiveUrl;
-    use url::Url;
-
-    fn sentinel_url(label: &str) -> SensitiveUrl {
-        Url::parse(&format!(
-            "https://user-{label}:password-{label}@host-{label}.invalid/path-{label}?query={label}#fragment-{label}"
-        ))
-        .expect("sentinel URL")
-        .into()
-    }
-
-    fn assert_no_endpoint_sentinels(formatted: &str) {
-        for sentinel in ["rpc-sentinel", "manifest-sentinel", "gateway-sentinel"] {
-            assert!(
-                !formatted.contains(sentinel),
-                "endpoint leaked {sentinel}: {formatted}"
-            );
-        }
-    }
-
-    #[test]
-    fn poi_policy_and_nested_artifact_debug_are_endpoint_safe() {
-        let artifact_source = PoiArtifactSourceConfig {
-            trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
-            manifest_source: PoiArtifactManifestSource::Url(sentinel_url("manifest-sentinel")),
-            gateway_urls: vec![sentinel_url("gateway-sentinel")],
-            max_manifest_age: Some(std::time::Duration::from_mins(1)),
-        };
-        let indexed = GlobalPoiPolicy::IndexedArtifacts {
-            artifact_source: artifact_source.clone(),
-            rpc_url: sentinel_url("rpc-sentinel"),
-            wallet_read_fallback: PoiProxyFallback::OnCorpusUnavailable,
-        };
-        let proxy = GlobalPoiPolicy::PoiProxy {
-            rpc_url: sentinel_url("rpc-sentinel"),
-        };
-
-        assert_no_endpoint_sentinels(&format!("{artifact_source:?}"));
-        assert_no_endpoint_sentinels(&format!("{indexed:?}"));
-        assert_no_endpoint_sentinels(&format!("{proxy:?}"));
-        assert_eq!(
-            indexed.rpc_url(),
-            match &indexed {
-                GlobalPoiPolicy::IndexedArtifacts { rpc_url, .. } => rpc_url,
-                GlobalPoiPolicy::PoiProxy { .. } => unreachable!(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn poi_corpus_revision_publication_waits_for_readiness_fence() {
-        let caches = LocalPoiCaches::new_for_test(BTreeMap::new());
-        let revision_rx = caches.committed_revision_rx();
-        let readiness_fence = caches.revision_read_fence().await;
-        let write_fence = caches.revision_write_fence();
-        tokio::pin!(write_fence);
-
-        tokio::select! {
-            biased;
-            _ = &mut write_fence => panic!("corpus writer crossed readiness fence"),
-            () = tokio::task::yield_now() => {}
-        }
-        assert_eq!(*revision_rx.borrow(), PoiCorpusRevision::default());
-
-        drop(readiness_fence);
-        let _write_fence = write_fence.await;
-        caches.publish_committed_revision(true);
-
-        assert_eq!(
-            *revision_rx.borrow(),
-            PoiCorpusRevision {
-                revision: 1,
-                blocked_shields_revision: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn default_indexed_wallet_ranges_are_chain_specific() {
-        assert_eq!(
-            ChainConfigDefaults::for_chain(1)
-                .unwrap()
-                .indexed_wallet_block_range,
-            300_000
-        );
-        assert_eq!(
-            ChainConfigDefaults::for_chain(56)
-                .unwrap()
-                .indexed_wallet_block_range,
-            1_000_000
-        );
-        assert_eq!(
-            ChainConfigDefaults::for_chain(137)
-                .unwrap()
-                .indexed_wallet_block_range,
-            1_000_000
-        );
-        assert_eq!(
-            ChainConfigDefaults::for_chain(42161)
-                .unwrap()
-                .indexed_wallet_block_range,
-            5_000_000
-        );
-    }
-
-    #[test]
-    fn default_rpc_urls_include_fallbacks() {
-        assert_eq!(
-            ChainConfigDefaults::for_chain(1).unwrap().rpc_urls[0].as_str(),
-            "https://ethereum-public.nodies.app/"
-        );
-        assert!(ChainConfigDefaults::for_chain(1).unwrap().rpc_urls.len() > 1);
-        assert!(ChainConfigDefaults::for_chain(56).unwrap().rpc_urls.len() > 1);
-        assert!(ChainConfigDefaults::for_chain(137).unwrap().rpc_urls.len() > 1);
-        assert!(
-            ChainConfigDefaults::for_chain(42161)
-                .unwrap()
-                .rpc_urls
-                .len()
-                > 1
-        );
-    }
-
-    #[test]
-    fn sync_progress_percent_uses_block_distance() {
-        let progress =
-            SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
-
-        assert_eq!(progress.percent(), 25);
-        assert_eq!(progress.source, None);
-        assert_eq!(
-            progress.with_source(PublicScanSource::Rpc).source,
-            Some(PublicScanSource::Rpc)
-        );
-    }
-
-    #[test]
-    fn sync_progress_percent_uses_chunk_distance_for_utxo_prep() {
-        let progress = SyncProgressUpdate::artifact_chunk(
-            SyncProgressStage::PreparingUtxoIndex,
-            25,
-            100,
-            3,
-            12,
-        );
-
-        assert_eq!(progress.percent(), 25);
-        assert_eq!(
-            progress.unit,
-            SyncProgressUnit::ArtifactChunk {
-                completed: 3,
-                total: 12
-            }
-        );
-    }
-
-    #[test]
-    fn sync_progress_percent_is_clamped() {
-        let early = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 99, 300);
-        let late = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 400, 300);
-
-        assert_eq!(early.percent(), 0);
-        assert_eq!(late.percent(), 100);
-    }
-
-    #[test]
-    fn poi_artifact_cache_progress_percent_handles_zero_totals() {
-        let progress = PoiArtifactCacheProgress {
-            attempt_id: super::PoiArtifactCacheAttemptId::new(1),
-            chain_id: 1,
-            phase: PoiArtifactCachePhase::LoadingPersisted,
-            completed_lists: 0,
-            total_lists: 0,
-            current_list_key: None,
-            current_event_index: None,
-            target_event_index: None,
-            list_progress: Vec::new(),
-            ready_for_wallet_checks: false,
-            last_error: None,
-        };
-
-        assert_eq!(progress.percent(), 0);
-        assert!(progress.is_active());
-        assert!(!progress.is_ready());
-        assert!(!progress.is_error());
-    }
-
-    #[test]
-    fn poi_artifact_cache_progress_reports_ready_and_error_state() {
-        let ready = PoiArtifactCacheProgress {
-            attempt_id: super::PoiArtifactCacheAttemptId::new(2),
-            chain_id: 1,
-            phase: PoiArtifactCachePhase::Ready,
-            completed_lists: 1,
-            total_lists: 1,
-            current_list_key: None,
-            current_event_index: None,
-            target_event_index: None,
-            list_progress: Vec::new(),
-            ready_for_wallet_checks: true,
-            last_error: None,
-        };
-        let error = PoiArtifactCacheProgress {
-            phase: PoiArtifactCachePhase::Error,
-            ready_for_wallet_checks: false,
-            last_error: Some("failed".to_string()),
-            ..ready.clone()
-        };
-
-        assert_eq!(ready.percent(), 100);
-        assert!(ready.is_ready());
-        assert!(error.is_error());
-        assert!(!error.is_active());
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LogBatch {
     pub from_block: u64,
@@ -1628,7 +1411,7 @@ pub(crate) enum WalletScanRowsPayload {
     EmptyCoverage,
     #[cfg(test)]
     IndexedDeltaForTest {
-        delta: Box<WalletLogDelta>,
+        delta: Box<railgun_wallet::scan::WalletLogDelta>,
     },
 }
 
@@ -1778,31 +1561,6 @@ impl WalletScanApply {
                 source,
                 to_block_hash,
                 WalletScanRowsPayload::EmptyCoverage,
-            ),
-            read_scope,
-        )
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn indexed_delta_for_test(
-        from_block: u64,
-        to_block: u64,
-        delta: WalletLogDelta,
-        read_scope: PublicScanReadScope,
-        source: WalletIndexedCatchUpSource,
-    ) -> Self {
-        Self::new(
-            from_block,
-            to_block,
-            WalletScanRows::new(
-                from_block,
-                to_block,
-                source.into(),
-                None,
-                WalletScanRowsPayload::IndexedDeltaForTest {
-                    delta: Box::new(delta),
-                },
             ),
             read_scope,
         )
@@ -2433,22 +2191,6 @@ impl WalletSyncToken {
         }
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn for_test(
-        chain_id: u64,
-        actor_id: u64,
-        reset_generation: u64,
-        job_id: u64,
-    ) -> Self {
-        Self {
-            chain_id,
-            actor_id,
-            reset_generation,
-            job_id,
-        }
-    }
-
     #[must_use]
     pub(crate) const fn chain_id(self) -> u64 {
         self.chain_id
@@ -2483,16 +2225,6 @@ impl WalletResetToken {
         Self {
             chain_id: authority.chain_id(),
             actor_id: authority.actor_id(),
-            intent_id,
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn for_test(chain_id: u64, actor_id: u64, intent_id: u64) -> Self {
-        Self {
-            chain_id,
-            actor_id,
             intent_id,
         }
     }
@@ -2572,11 +2304,6 @@ impl WalletSyncTargetLease {
             }),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) const fn token(&self) -> WalletSyncToken {
-        self.owner.as_ref().expect("target lease is present").token
-    }
 }
 
 impl Drop for WalletSyncTargetLease {
@@ -2615,12 +2342,6 @@ impl WalletBackfillGrant {
             .as_ref()
             .expect("backfill grant is present")
             .token
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
-        let (liveness, _receiver) = oneshot::channel();
-        Self::for_actor_accepted_job(token, sender, liveness)
     }
 
     #[must_use]
@@ -2673,11 +2394,6 @@ impl WalletResetReplayPlan {
 }
 
 impl WalletBackfillDriver {
-    #[cfg(test)]
-    pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
-        WalletBackfillGrant::from_token(token, sender).activate()
-    }
-
     const fn inner(&self) -> &WalletBackfillOwner {
         self.inner.as_ref().expect("backfill driver is present")
     }
@@ -2910,5 +2626,344 @@ impl BackfillRequest {
             acquisition_range: Some(acquisition_range),
             driver,
         }
+    }
+}
+
+#[cfg(test)]
+impl LocalPoiCaches {
+    #[must_use]
+    pub(crate) fn new_for_test(caches: BTreeMap<FixedBytes<32>, PoiCache>) -> Self {
+        let initial_revision = u64::from(!caches.is_empty());
+        let initial_revision = PoiCorpusRevision {
+            revision: initial_revision,
+            blocked_shields_revision: initial_revision,
+        };
+        let (committed_revision_tx, _) = watch::channel(initial_revision);
+        Self {
+            inner: Arc::new(LocalPoiCachesInner {
+                caches: RwLock::new(caches),
+                authority: Arc::new(PoiCorpusAuthority::new(0)),
+                installed_generation: AtomicU64::new(0),
+                committed_revision_tx,
+            }),
+        }
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+#[cfg(test)]
+impl WalletScanApply {
+    #[must_use]
+    pub(crate) fn indexed_delta_for_test(
+        from_block: u64,
+        to_block: u64,
+        delta: railgun_wallet::scan::WalletLogDelta,
+        read_scope: PublicScanReadScope,
+        source: WalletIndexedCatchUpSource,
+    ) -> Self {
+        Self::new(
+            from_block,
+            to_block,
+            WalletScanRows::new(
+                from_block,
+                to_block,
+                source.into(),
+                None,
+                WalletScanRowsPayload::IndexedDeltaForTest {
+                    delta: Box::new(delta),
+                },
+            ),
+            read_scope,
+        )
+    }
+}
+
+#[cfg(test)]
+impl WalletSyncToken {
+    #[must_use]
+    pub(crate) const fn for_test(
+        chain_id: u64,
+        actor_id: u64,
+        reset_generation: u64,
+        job_id: u64,
+    ) -> Self {
+        Self {
+            chain_id,
+            actor_id,
+            reset_generation,
+            job_id,
+        }
+    }
+}
+
+#[cfg(test)]
+impl WalletResetToken {
+    #[must_use]
+    pub(crate) const fn for_test(chain_id: u64, actor_id: u64, intent_id: u64) -> Self {
+        Self {
+            chain_id,
+            actor_id,
+            intent_id,
+        }
+    }
+}
+
+#[cfg(test)]
+impl WalletSyncTargetLease {
+    pub(crate) const fn token(&self) -> WalletSyncToken {
+        self.owner.as_ref().expect("target lease is present").token
+    }
+}
+
+#[cfg(test)]
+impl WalletBackfillGrant {
+    pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
+        let (liveness, _receiver) = oneshot::channel();
+        Self::for_actor_accepted_job(token, sender, liveness)
+    }
+}
+
+#[cfg(test)]
+impl WalletBackfillDriver {
+    pub(crate) fn from_token(token: WalletSyncToken, sender: mpsc::Sender<BackfillEvent>) -> Self {
+        WalletBackfillGrant::from_token(token, sender).activate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        ChainConfigDefaults, GlobalPoiPolicy, LocalPoiCaches, PoiArtifactCacheFailureKind,
+        PoiArtifactCacheGraphProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+        PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCorpusRevision, PoiProxyFallback,
+        PublicScanSource, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
+    };
+    use alloy::primitives::FixedBytes;
+    use poi::SensitiveUrl;
+    use url::Url;
+
+    fn sentinel_url(label: &str) -> SensitiveUrl {
+        Url::parse(&format!(
+            "https://user-{label}:password-{label}@host-{label}.invalid/path-{label}?query={label}#fragment-{label}"
+        ))
+        .expect("sentinel URL")
+        .into()
+    }
+
+    fn assert_no_endpoint_sentinels(formatted: &str) {
+        for sentinel in ["rpc-sentinel", "manifest-sentinel", "gateway-sentinel"] {
+            assert!(
+                !formatted.contains(sentinel),
+                "endpoint leaked {sentinel}: {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn poi_policy_and_nested_artifact_debug_are_endpoint_safe() {
+        let artifact_source = PoiArtifactSourceConfig {
+            trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+            manifest_source: PoiArtifactManifestSource::Url(sentinel_url("manifest-sentinel")),
+            gateway_urls: vec![sentinel_url("gateway-sentinel")],
+            max_manifest_age: Some(std::time::Duration::from_mins(1)),
+        };
+        let indexed = GlobalPoiPolicy::IndexedArtifacts {
+            artifact_source: artifact_source.clone(),
+            rpc_url: sentinel_url("rpc-sentinel"),
+            wallet_read_fallback: PoiProxyFallback::OnCorpusUnavailable,
+        };
+        let proxy = GlobalPoiPolicy::PoiProxy {
+            rpc_url: sentinel_url("rpc-sentinel"),
+        };
+
+        assert_no_endpoint_sentinels(&format!("{artifact_source:?}"));
+        assert_no_endpoint_sentinels(&format!("{indexed:?}"));
+        assert_no_endpoint_sentinels(&format!("{proxy:?}"));
+        assert_eq!(
+            indexed.rpc_url(),
+            match &indexed {
+                GlobalPoiPolicy::IndexedArtifacts { rpc_url, .. } => rpc_url,
+                GlobalPoiPolicy::PoiProxy { .. } => unreachable!(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn poi_corpus_revision_publication_waits_for_readiness_fence() {
+        let caches = LocalPoiCaches::new_for_test(BTreeMap::new());
+        let revision_rx = caches.committed_revision_rx();
+        let readiness_fence = caches.revision_read_fence().await;
+        let write_fence = caches.revision_write_fence();
+        tokio::pin!(write_fence);
+
+        tokio::select! {
+            biased;
+            _ = &mut write_fence => panic!("corpus writer crossed readiness fence"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(*revision_rx.borrow(), PoiCorpusRevision::default());
+
+        drop(readiness_fence);
+        let _write_fence = write_fence.await;
+        caches.publish_committed_revision(true);
+
+        assert_eq!(
+            *revision_rx.borrow(),
+            PoiCorpusRevision {
+                revision: 1,
+                blocked_shields_revision: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn default_indexed_wallet_ranges_are_chain_specific() {
+        assert_eq!(
+            ChainConfigDefaults::for_chain(1)
+                .unwrap()
+                .indexed_wallet_block_range,
+            300_000
+        );
+        assert_eq!(
+            ChainConfigDefaults::for_chain(56)
+                .unwrap()
+                .indexed_wallet_block_range,
+            1_000_000
+        );
+        assert_eq!(
+            ChainConfigDefaults::for_chain(137)
+                .unwrap()
+                .indexed_wallet_block_range,
+            1_000_000
+        );
+        assert_eq!(
+            ChainConfigDefaults::for_chain(42161)
+                .unwrap()
+                .indexed_wallet_block_range,
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn default_rpc_urls_include_fallbacks() {
+        assert_eq!(
+            ChainConfigDefaults::for_chain(1).unwrap().rpc_urls[0].as_str(),
+            "https://ethereum-public.nodies.app/"
+        );
+        assert!(ChainConfigDefaults::for_chain(1).unwrap().rpc_urls.len() > 1);
+        assert!(ChainConfigDefaults::for_chain(56).unwrap().rpc_urls.len() > 1);
+        assert!(ChainConfigDefaults::for_chain(137).unwrap().rpc_urls.len() > 1);
+        assert!(
+            ChainConfigDefaults::for_chain(42161)
+                .unwrap()
+                .rpc_urls
+                .len()
+                > 1
+        );
+    }
+
+    #[test]
+    fn sync_progress_percent_uses_block_distance() {
+        let progress =
+            SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
+
+        assert_eq!(progress.percent(), 25);
+        assert_eq!(progress.source, None);
+        assert_eq!(
+            progress.with_source(PublicScanSource::Rpc).source,
+            Some(PublicScanSource::Rpc)
+        );
+    }
+
+    #[test]
+    fn sync_progress_percent_uses_chunk_distance_for_utxo_prep() {
+        let progress = SyncProgressUpdate::artifact_chunk(
+            SyncProgressStage::PreparingUtxoIndex,
+            25,
+            100,
+            3,
+            12,
+        );
+
+        assert_eq!(progress.percent(), 25);
+        assert_eq!(
+            progress.unit,
+            SyncProgressUnit::ArtifactChunk {
+                completed: 3,
+                total: 12
+            }
+        );
+    }
+
+    #[test]
+    fn sync_progress_percent_is_clamped() {
+        let early = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 99, 300);
+        let late = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 400, 300);
+
+        assert_eq!(early.percent(), 0);
+        assert_eq!(late.percent(), 100);
+    }
+
+    #[test]
+    fn poi_artifact_cache_progress_percent_handles_zero_totals() {
+        let progress = PoiArtifactCacheProgress {
+            attempt_id: super::PoiArtifactCacheAttemptId::new(1),
+            generation: 7,
+            chain_id: 1,
+            phase: PoiArtifactCachePhase::LoadingPersisted,
+            completed_lists: 0,
+            total_lists: 0,
+            current_list_key: None,
+            current_event_index: None,
+            target_event_index: None,
+            list_progress: Vec::new(),
+            graph: PoiArtifactCacheGraphProgress::default(),
+            ready_for_wallet_checks: false,
+            last_error: None,
+        };
+
+        assert_eq!(progress.percent(), 0);
+        assert!(progress.is_active());
+        assert!(!progress.is_ready());
+        assert!(!progress.is_error());
+    }
+
+    #[test]
+    fn poi_artifact_cache_progress_reports_ready_and_error_state() {
+        let ready = PoiArtifactCacheProgress {
+            attempt_id: super::PoiArtifactCacheAttemptId::new(2),
+            generation: 8,
+            chain_id: 1,
+            phase: PoiArtifactCachePhase::Ready,
+            completed_lists: 1,
+            total_lists: 1,
+            current_list_key: None,
+            current_event_index: None,
+            target_event_index: None,
+            list_progress: Vec::new(),
+            graph: PoiArtifactCacheGraphProgress::default(),
+            ready_for_wallet_checks: true,
+            last_error: None,
+        };
+        let error = PoiArtifactCacheProgress {
+            phase: PoiArtifactCachePhase::Failed,
+            ready_for_wallet_checks: false,
+            last_error: Some("failed".to_string()),
+            ..ready.clone()
+        };
+
+        assert_eq!(ready.percent(), 100);
+        assert!(ready.is_ready());
+        assert!(error.is_error());
+        assert!(!error.is_active());
+        assert_eq!(
+            error.failure_kind(),
+            Some(PoiArtifactCacheFailureKind::ServingCorpusUnavailable)
+        );
     }
 }

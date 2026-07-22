@@ -9,9 +9,6 @@ use super::{
 };
 use std::time::Duration;
 
-#[cfg(test)]
-use super::{Address, Arc, QueryRpcPool, build_provider_with_http_client};
-
 pub(super) struct WalletBackfill {
     pub(super) from_block: u64,
     pub(super) target_block: u64,
@@ -719,6 +716,8 @@ impl ChainConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::{Address, Arc, QueryRpcPool, build_provider_with_http_client};
 
     use std::io::{Read, Write};
     use std::net::TcpListener;

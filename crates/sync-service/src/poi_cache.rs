@@ -15,21 +15,21 @@ use poi::cache::{
     PoiCacheIdentity, PoiCacheSyncOutcome,
 };
 use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
-#[cfg(test)]
-use crate::poi_artifacts::clear_poi_artifact_cache_for_reset;
+use crate::chain::PoiArtifactPersistenceHandle;
 use crate::poi_artifacts::{
-    ExpectedPoiCorpusBase, ObservedPoiManifest, PersistedPoiArtifactCache, PoiArtifactIngestor,
-    PoiArtifactRefresh, PoiCorpusAuthority, PoiCorpusStore, load_persisted_cache_for_publisher,
-    load_poi_rpc_health, poi_corpus_authority, record_poi_rpc_success,
-    with_poi_artifact_cache_generation,
+    ExpectedPoiCorpusBase, ObservedManifest, PersistedPoiArtifactCache, PoiArtifactError,
+    PoiArtifactIngestor, PoiCorpusAuthority, PoiCorpusStore, PreparedIngestion,
+    load_persisted_cache_for_publisher, load_poi_rpc_health, poi_corpus_authority,
+    record_poi_rpc_success, with_poi_artifact_cache_generation,
 };
 use crate::types::{
-    LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
-    PoiArtifactCacheProgress, PoiArtifactSourceConfig,
+    LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheGraphProgress,
+    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+    PoiArtifactSourceConfig,
 };
 use crate::wallet::wallet_poi_status_client;
 
@@ -55,13 +55,13 @@ struct ChainPoiCacheCoordinator {
     progress_tx: watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
     cancel: CancellationToken,
     runtime: Arc<PoiCacheServiceRuntime>,
+    poi_artifact_persistence: PoiArtifactPersistenceHandle,
 }
 
 struct PoiCacheServiceRuntime {
     next_attempt_id: AtomicU64,
     publication_fence: StdMutex<PoiCachePublicationState>,
-    #[cfg(test)]
-    post_durable_pre_apply: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    public_cache_reset_gate: Arc<RwLock<()>>,
 }
 
 #[derive(Default)]
@@ -74,25 +74,12 @@ impl PoiCacheServiceRuntime {
         Self {
             next_attempt_id: AtomicU64::new(1),
             publication_fence: StdMutex::new(PoiCachePublicationState::default()),
-            #[cfg(test)]
-            post_durable_pre_apply: StdMutex::new(None),
+            public_cache_reset_gate: Arc::new(RwLock::new(())),
         }
     }
 
     fn next_attempt_id(&self) -> PoiArtifactCacheAttemptId {
         PoiArtifactCacheAttemptId::new(self.next_attempt_id.fetch_add(1, Ordering::Relaxed))
-    }
-
-    #[cfg(test)]
-    fn run_post_durable_pre_apply_probe(&self) {
-        let probe = self
-            .post_durable_pre_apply
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(probe) = probe {
-            probe();
-        }
     }
 }
 
@@ -112,12 +99,18 @@ enum ChainPoiCacheCommand {
         generation: u64,
         response: oneshot::Sender<Result<(), PoiCacheServiceError>>,
     },
+    QuiesceForPublicCacheReset {
+        lease: CancellationToken,
+        response: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoiCacheServiceError {
     #[error("POI cache coordinator stopped")]
     CoordinatorStopped,
+    #[error("POI corpus or public cache reset is in progress")]
+    CorpusResetInProgress,
     #[error("POI cache attempt {attempt_id} was superseded")]
     AttemptSuperseded {
         attempt_id: PoiArtifactCacheAttemptId,
@@ -150,20 +143,30 @@ pub(crate) struct PoiCacheService {
     cancel: CancellationToken,
     cache_authority: Arc<PoiCorpusAuthority>,
     runtime: Arc<PoiCacheServiceRuntime>,
-    #[cfg(test)]
-    cache_generation: Arc<AtomicU64>,
+    poi_artifact_persistence: PoiArtifactPersistenceHandle,
+}
+
+pub(crate) struct PoiPublicCacheResetLease {
+    admission: Option<OwnedRwLockWriteGuard<()>>,
+    release: CancellationToken,
+}
+
+impl Drop for PoiPublicCacheResetLease {
+    fn drop(&mut self) {
+        self.release.cancel();
+        drop(self.admission.take());
+    }
 }
 
 impl PoiCacheService {
-    pub(crate) fn new(
+    pub(crate) fn new_with_persistence(
         db: Arc<DbStore>,
         artifact_config: PoiArtifactSourceConfig,
         http_client: Option<reqwest::Client>,
+        poi_artifact_persistence: PoiArtifactPersistenceHandle,
     ) -> Result<Self, local_db::DbError> {
         let (progress_tx, _) = watch::channel(BTreeMap::new());
         let cache_authority = poi_corpus_authority(&db)?;
-        #[cfg(test)]
-        let cache_generation = cache_authority.generation_cell();
         Ok(Self {
             db,
             artifact_config,
@@ -176,20 +179,13 @@ impl PoiCacheService {
             cancel: CancellationToken::new(),
             cache_authority,
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
-            #[cfg(test)]
-            cache_generation,
+            poi_artifact_persistence,
         })
     }
 
     #[must_use]
     pub(crate) fn with_poi_rpc_url(mut self, poi_rpc_url: impl Into<SensitiveUrl>) -> Self {
         self.poi_rpc_url = poi_rpc_url.into();
-        self
-    }
-
-    #[cfg(test)]
-    fn with_active_list_keys(mut self, active_list_keys: Vec<FixedBytes<32>>) -> Self {
-        self.active_list_keys = active_list_keys;
         self
     }
 
@@ -205,6 +201,7 @@ impl PoiCacheService {
         if let Some(existing) = self.local_caches(chain_id).await? {
             return Ok(existing);
         }
+        let _public_cache_reset_admission = self.runtime.public_cache_reset_gate.read().await;
 
         let local_caches = {
             let mut chain_caches = self.chain_caches.write().await;
@@ -264,6 +261,7 @@ impl PoiCacheService {
                 progress_tx: self.progress_tx.clone(),
                 cancel: self.cancel.child_token(),
                 runtime: Arc::clone(&self.runtime),
+                poi_artifact_persistence: self.poi_artifact_persistence.clone(),
             },
             initialized_tx,
             stopped_tx,
@@ -282,6 +280,7 @@ impl PoiCacheService {
         if self.local_caches(chain_id).await?.is_none() {
             self.start_chain(chain_id).await?;
         }
+        let public_cache_reset_admission = self.runtime.public_cache_reset_gate.read().await;
         let handle = self
             .chains
             .read()
@@ -299,6 +298,7 @@ impl PoiCacheService {
             self.remove_chain_handle(chain_id, &handle).await;
             return Err(PoiCacheServiceError::CoordinatorStopped);
         }
+        drop(public_cache_reset_admission);
         if let Ok(result) = admitted.await {
             result
         } else {
@@ -372,92 +372,47 @@ impl PoiCacheService {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn reset_poi_artifact_cache(&self) -> Result<u64, PoiCacheServiceError> {
-        let reset = clear_poi_artifact_cache_for_reset(&self.db).await?;
-        debug!(
-            generation = reset.generation,
-            "POI artifact cache generation published after durable reset"
-        );
-        self.synchronize_after_persisted_reset(reset.generation)
-            .await?;
-        info!(
-            persisted_records = reset.removed,
-            generation = reset.generation,
-            "reset local artifact POI cache"
-        );
-        Ok(reset.removed)
-    }
-
-    pub(crate) async fn synchronize_after_persisted_reset(
-        &self,
-        generation: u64,
-    ) -> Result<(), PoiCacheServiceError> {
-        let chains: Vec<_> = self
+    pub(crate) async fn quiesce_for_public_cache_reset(&self) -> PoiPublicCacheResetLease {
+        let admission = Arc::clone(&self.runtime.public_cache_reset_gate)
+            .write_owned()
+            .await;
+        let lease = PoiPublicCacheResetLease {
+            admission: Some(admission),
+            release: CancellationToken::new(),
+        };
+        let release = lease.release.clone();
+        let chains = self
             .chains
             .read()
             .await
             .iter()
             .map(|(chain_id, handle)| (*chain_id, handle.clone()))
-            .collect();
-        let chain_count = chains.len();
-        let mut responses = Vec::with_capacity(chain_count);
-        let mut first_error = None;
-        let sends = join_all(chains.into_iter().map(|(chain_id, handle)| async move {
-            let (response, result) = oneshot::channel();
-            let send_result = handle
-                .command_tx
-                .send(ChainPoiCacheCommand::Reset {
-                    generation,
-                    response,
-                })
-                .await;
-            (chain_id, handle, send_result.map(|()| result))
+            .collect::<Vec<_>>();
+        let responses = join_all(chains.into_iter().map(|(chain_id, handle)| {
+            let release = release.clone();
+            async move {
+                let (response, quiesced) = oneshot::channel();
+                let sent = handle
+                    .command_tx
+                    .send(ChainPoiCacheCommand::QuiesceForPublicCacheReset {
+                        lease: release,
+                        response,
+                    })
+                    .await;
+                (chain_id, handle, sent.map(|()| quiesced))
+            }
         }))
         .await;
-        for (chain_id, handle, send_result) in sends {
-            if let Ok(response) = send_result {
-                responses.push((chain_id, handle, response));
-            } else {
+        for (chain_id, handle, response) in responses {
+            let quiesced = match response {
+                Ok(response) => response.await.is_ok(),
+                Err(_) => false,
+            };
+            if !quiesced {
                 self.remove_chain_handle(chain_id, &handle).await;
-                if first_error.is_none() {
-                    first_error = Some(PoiCacheServiceError::CoordinatorStopped);
-                }
             }
         }
-        let responses =
-            join_all(
-                responses
-                    .into_iter()
-                    .map(|(chain_id, handle, response)| async move {
-                        (chain_id, handle, response.await)
-                    }),
-            )
-            .await;
-        for (chain_id, handle, result) in responses {
-            if let Ok(result) = result {
-                if let Err(err) = result
-                    && first_error.is_none()
-                {
-                    first_error = Some(err);
-                }
-            } else {
-                self.remove_chain_handle(chain_id, &handle).await;
-                if first_error.is_none() {
-                    first_error = Some(PoiCacheServiceError::CoordinatorStopped);
-                }
-            }
-        }
-
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-
-        debug!(
-            generation,
-            chain_count, "synchronized POI cache coordinators after reset"
-        );
-        Ok(())
+        lease
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -526,6 +481,7 @@ fn default_poi_rpc_url() -> SensitiveUrl {
 #[allow(clippy::too_many_arguments)]
 const fn new_poi_artifact_cache_progress(
     attempt_id: PoiArtifactCacheAttemptId,
+    generation: u64,
     chain_id: u64,
     phase: PoiArtifactCachePhase,
     completed_lists: usize,
@@ -534,11 +490,13 @@ const fn new_poi_artifact_cache_progress(
     current_event_index: Option<u64>,
     target_event_index: Option<u64>,
     list_progress: Vec<PoiArtifactCacheListProgress>,
+    graph: PoiArtifactCacheGraphProgress,
     ready_for_wallet_checks: bool,
     last_error: Option<String>,
 ) -> PoiArtifactCacheProgress {
     PoiArtifactCacheProgress {
         attempt_id,
+        generation,
         chain_id,
         phase,
         completed_lists,
@@ -547,6 +505,7 @@ const fn new_poi_artifact_cache_progress(
         current_event_index,
         target_event_index,
         list_progress,
+        graph,
         ready_for_wallet_checks,
         last_error,
     }
@@ -557,6 +516,13 @@ fn send_poi_artifact_cache_progress(
     progress: PoiArtifactCacheProgress,
 ) {
     progress_tx.send_modify(|chains| {
+        if chains.get(&progress.chain_id).is_some_and(|current| {
+            current.attempt_id > progress.attempt_id
+                || (current.attempt_id == progress.attempt_id
+                    && current.generation != progress.generation)
+        }) {
+            return;
+        }
         chains.insert(progress.chain_id, progress);
     });
 }
@@ -567,6 +533,12 @@ fn send_poi_artifact_cache_progress_for_generation(
     generation: u64,
     progress: PoiArtifactCacheProgress,
 ) -> Result<(), PoiCacheServiceError> {
+    if progress.generation != generation {
+        return Err(PoiCacheServiceError::StaleGeneration {
+            expected: generation,
+            actual: progress.generation,
+        });
+    }
     with_poi_artifact_cache_generation(local_caches.shared_generation(), |current_generation| {
         if current_generation != generation {
             return Err(PoiCacheServiceError::StaleGeneration {
@@ -662,6 +634,7 @@ async fn emit_chain_poi_cache_ready_progress(
         generation,
         new_poi_artifact_cache_progress(
             attempt_id,
+            generation,
             chain_id,
             PoiArtifactCachePhase::Ready,
             completed,
@@ -670,6 +643,7 @@ async fn emit_chain_poi_cache_ready_progress(
             current_event_index,
             target_event_index,
             list_progress,
+            PoiArtifactCacheGraphProgress::default(),
             ready,
             None,
         ),
@@ -716,6 +690,7 @@ impl Drop for PoiCacheService {
 struct ActivePoiCacheAttempt {
     id: PoiArtifactCacheAttemptId,
     generation: u64,
+    cancel: CancellationToken,
     job: BoxFuture<'static, PreparedPoiCacheBatch>,
     retry_completion: Option<oneshot::Sender<Result<(), PoiCacheServiceError>>>,
 }
@@ -818,7 +793,7 @@ struct PoiListSourceOutcome {
 
 enum PreparedPoiCachePersistence {
     Artifact {
-        refresh: Box<PoiArtifactRefresh>,
+        prepared: Box<PreparedIngestion>,
     },
     PublicRpc {
         range_start_index: u64,
@@ -829,7 +804,7 @@ enum PreparedPoiCachePersistence {
 impl PreparedPoiCachePersistence {
     const fn artifact_manifest_sequence(&self) -> Option<u64> {
         match self {
-            Self::Artifact { refresh } => Some(refresh.manifest_sequence),
+            Self::Artifact { prepared } => Some(prepared.candidate.manifest_sequence()),
             Self::PublicRpc { .. } => None,
         }
     }
@@ -837,7 +812,7 @@ impl PreparedPoiCachePersistence {
 
 struct PreparedPoiCacheCandidate {
     list_key: FixedBytes<32>,
-    cache: PoiCache,
+    cache: Option<PoiCache>,
     persistence: PreparedPoiCachePersistence,
 }
 
@@ -847,9 +822,11 @@ struct PreparedPoiCacheBatch {
     result: Result<(), String>,
 }
 
+struct FinishedPoiCacheAttempt {
+    result: Result<(), PoiCacheServiceError>,
+}
+
 struct ChainPoiCacheJobEvent {
-    attempt_id: PoiArtifactCacheAttemptId,
-    generation: u64,
     progress: PoiArtifactCacheProgress,
 }
 
@@ -890,6 +867,7 @@ async fn run_chain_poi_cache_coordinator(
             generation,
             new_poi_artifact_cache_progress(
                 startup_attempt_id,
+                generation,
                 chain_id,
                 PoiArtifactCachePhase::LoadingPersisted,
                 0,
@@ -898,6 +876,7 @@ async fn run_chain_poi_cache_coordinator(
                 None,
                 None,
                 poi_cache_list_progress_for_keys(&task.active_list_keys),
+                PoiArtifactCacheGraphProgress::default(),
                 false,
                 None,
             ),
@@ -944,6 +923,7 @@ async fn run_chain_poi_cache_coordinator(
         &task.preloaded_caches,
     );
     let mut active = None;
+    let mut public_cache_reset = None;
     let mut maintenance = tokio::time::interval_at(
         tokio::time::Instant::now() + POI_CACHE_MAINTENANCE_INTERVAL,
         POI_CACHE_MAINTENANCE_INTERVAL,
@@ -974,6 +954,13 @@ async fn run_chain_poi_cache_coordinator(
                 };
                 match command {
                     ChainPoiCacheCommand::Retry { admission } => {
+                        clear_released_public_cache_reset(&mut public_cache_reset);
+                        if public_cache_reset.is_some()
+                            || task.runtime.public_cache_reset_gate.try_read().is_err()
+                        {
+                            let _ = admission.send(Err(PoiCacheServiceError::CorpusResetInProgress));
+                            continue;
+                        }
                         cancel_active_attempt(&mut active, |attempt_id| {
                             PoiCacheServiceError::AttemptSuperseded { attempt_id }
                         });
@@ -1041,16 +1028,26 @@ async fn run_chain_poi_cache_coordinator(
                                 &task.active_list_keys,
                                 &task.preloaded_caches,
                             );
-                            let _ = start_chain_poi_cache_attempt(
-                                &mut task,
-                                &mut active,
-                                generation,
-                                &health,
-                                None,
-                            )
-                            .await;
+                            clear_released_public_cache_reset(&mut public_cache_reset);
+                            if public_cache_reset.is_none() {
+                                let _ = start_chain_poi_cache_attempt(
+                                    &mut task,
+                                    &mut active,
+                                    generation,
+                                    &health,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                         let _ = response.send(reset_result);
+                    }
+                    ChainPoiCacheCommand::QuiesceForPublicCacheReset { lease, response } => {
+                        public_cache_reset = Some(lease);
+                        cancel_active_attempt(&mut active, |attempt_id| {
+                            PoiCacheServiceError::StaleAttempt { attempt_id }
+                        });
+                        let _ = response.send(());
                     }
                 }
             }
@@ -1077,13 +1074,14 @@ async fn run_chain_poi_cache_coordinator(
                     continue;
                 }
                 let source_outcomes = completion.source_outcomes.clone();
-                let attempt_result = finish_chain_poi_cache_attempt(
+                let finished_attempt = finish_chain_poi_cache_attempt(
                     &task,
                     attempt_id,
                     attempt_generation,
                     completion,
                 )
                 .await;
+                let FinishedPoiCacheAttempt { result: attempt_result } = finished_attempt;
                 if !matches!(
                     &attempt_result,
                     Err(PoiCacheServiceError::Shutdown { .. }
@@ -1123,7 +1121,23 @@ async fn run_chain_poi_cache_coordinator(
                     let _ = response.send(attempt_result);
                 }
             }
-            _ = maintenance.tick(), if active.is_none() => {
+            _ = maintenance.tick(), if active.is_none()
+                && public_cache_reset.is_none() => {
+                generation = task.local_caches.current_generation();
+                let _ = start_chain_poi_cache_attempt(
+                    &mut task,
+                    &mut active,
+                    generation,
+                    &health,
+                    None,
+                )
+                .await;
+            }
+            () = wait_for_public_cache_reset_release(&mut public_cache_reset),
+                if active.is_none() => {
+                let public_cache_reset_gate = Arc::clone(&task.runtime.public_cache_reset_gate);
+                let _public_cache_reset_admission = public_cache_reset_gate.read().await;
+                public_cache_reset = None;
                 generation = task.local_caches.current_generation();
                 let _ = start_chain_poi_cache_attempt(
                     &mut task,
@@ -1139,16 +1153,27 @@ async fn run_chain_poi_cache_coordinator(
     info!(chain_id, "chain-owned POI cache coordinator stopped");
 }
 
+fn clear_released_public_cache_reset(reset: &mut Option<CancellationToken>) {
+    if reset.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        *reset = None;
+    }
+}
+
+async fn wait_for_public_cache_reset_release(reset: &mut Option<CancellationToken>) {
+    match reset {
+        Some(reset) => reset.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn publish_active_attempt_progress(
     task: &ChainPoiCacheCoordinator,
     active: Option<&ActivePoiCacheAttempt>,
     event: ChainPoiCacheJobEvent,
 ) {
-    let ChainPoiCacheJobEvent {
-        attempt_id,
-        generation,
-        progress,
-    } = event;
+    let progress = event.progress;
+    let attempt_id = progress.attempt_id;
+    let generation = progress.generation;
     if !active.is_some_and(|attempt| attempt.id == attempt_id && attempt.generation == generation) {
         return;
     }
@@ -1167,6 +1192,35 @@ fn publish_active_attempt_progress(
     }
 }
 
+fn publish_current_attempt_phase(
+    task: &ChainPoiCacheCoordinator,
+    attempt_id: PoiArtifactCacheAttemptId,
+    generation: u64,
+    phase: PoiArtifactCachePhase,
+) {
+    let publication = task
+        .runtime
+        .publication_fence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if publication.shutdown || task.cancel.is_cancelled() {
+        return;
+    }
+    let Some(mut progress) = task.progress_tx.borrow().get(&task.chain_id).cloned() else {
+        return;
+    };
+    if progress.attempt_id != attempt_id || progress.generation != generation {
+        return;
+    }
+    progress.phase = phase;
+    let _ = send_poi_artifact_cache_progress_for_generation(
+        &task.progress_tx,
+        &task.local_caches,
+        generation,
+        progress,
+    );
+}
+
 fn cancel_active_attempt(
     active: &mut Option<ActivePoiCacheAttempt>,
     error: impl FnOnce(PoiArtifactCacheAttemptId) -> PoiCacheServiceError,
@@ -1177,9 +1231,11 @@ fn cancel_active_attempt(
     let ActivePoiCacheAttempt {
         id,
         generation: _,
+        cancel,
         job,
         retry_completion,
     } = attempt;
+    cancel.cancel();
     drop(job);
     if let Some(response) = retry_completion {
         let _ = response.send(Err(error(id)));
@@ -1190,6 +1246,7 @@ fn drop_completed_attempt(
     mut attempt: ActivePoiCacheAttempt,
 ) -> Option<oneshot::Sender<Result<(), PoiCacheServiceError>>> {
     let retry_completion = attempt.retry_completion.take();
+    attempt.cancel.cancel();
     drop(attempt);
     retry_completion
 }
@@ -1234,6 +1291,7 @@ async fn reset_chain_runtime(
         generation,
         new_poi_artifact_cache_progress(
             attempt_id,
+            generation,
             task.chain_id,
             PoiArtifactCachePhase::Resetting,
             0,
@@ -1242,6 +1300,7 @@ async fn reset_chain_runtime(
             None,
             None,
             poi_cache_list_progress_for_keys(&task.active_list_keys),
+            PoiArtifactCacheGraphProgress::default(),
             false,
             None,
         ),
@@ -1319,6 +1378,9 @@ async fn start_chain_poi_cache_attempt(
     health: &BTreeMap<FixedBytes<32>, PoiSourceHealth>,
     retry_completion: Option<oneshot::Sender<Result<(), PoiCacheServiceError>>>,
 ) -> Result<PoiArtifactCacheAttemptId, PoiCacheServiceError> {
+    let Ok(_public_cache_reset_admission) = task.runtime.public_cache_reset_gate.try_read() else {
+        return Err(PoiCacheServiceError::CorpusResetInProgress);
+    };
     let attempt_id = task.runtime.next_attempt_id();
     let baseline = task.local_caches.read().await.clone();
     let ready = cache_map_available_for_lists(task.chain_id, &baseline, &task.active_list_keys);
@@ -1346,9 +1408,10 @@ async fn start_chain_poi_cache_attempt(
         single_list_event_index(&baseline_list_progress);
     let start_progress = new_poi_artifact_cache_progress(
         attempt_id,
+        generation,
         task.chain_id,
         if use_artifact {
-            PoiArtifactCachePhase::FetchingManifest
+            PoiArtifactCachePhase::ResolvingManifest
         } else {
             PoiArtifactCachePhase::LiveTailing
         },
@@ -1358,10 +1421,12 @@ async fn start_chain_poi_cache_attempt(
         current_event_index,
         target_event_index,
         baseline_list_progress,
+        PoiArtifactCacheGraphProgress::default(),
         ready,
         None,
     );
 
+    let attempt_cancel = task.cancel.child_token();
     let job = PoiCacheCandidateJob {
         db: Arc::clone(&task.db),
         http_client: task.http_client.clone(),
@@ -1376,6 +1441,8 @@ async fn start_chain_poi_cache_attempt(
         ready,
         source_plans,
         event_tx: task.job_tx.clone(),
+        cancel: attempt_cancel.clone(),
+        poi_artifact_persistence: task.poi_artifact_persistence.clone(),
     };
     let job = produce_chain_poi_cache_candidates(job)
         .instrument(tracing::info_span!(
@@ -1387,6 +1454,7 @@ async fn start_chain_poi_cache_attempt(
     *active = Some(ActivePoiCacheAttempt {
         id: attempt_id,
         generation,
+        cancel: attempt_cancel,
         job,
         retry_completion,
     });
@@ -1432,6 +1500,8 @@ struct PoiCacheCandidateJob {
     ready: bool,
     source_plans: BTreeMap<FixedBytes<32>, PoiListAttemptPlan>,
     event_tx: mpsc::UnboundedSender<ChainPoiCacheJobEvent>,
+    cancel: CancellationToken,
+    poi_artifact_persistence: PoiArtifactPersistenceHandle,
 }
 
 async fn produce_chain_poi_cache_candidates(
@@ -1487,7 +1557,6 @@ async fn produce_chain_poi_cache_candidates(
                 list_index,
                 list_key,
                 identity,
-                persisted,
                 &mut observed_manifest,
             )
             .await
@@ -1501,6 +1570,13 @@ async fn produce_chain_poi_cache_candidates(
                         rpc: None,
                         artifact_succeeded: true,
                     });
+                }
+                Err(artifact_error)
+                    if matches!(&artifact_error, PoiArtifactError::Cancelled)
+                        || job.cancel.is_cancelled() =>
+                {
+                    errors.push(artifact_error.to_string());
+                    break;
                 }
                 Err(artifact_error) => {
                     warn!(chain_id = job.chain_id, list_key = %hex::encode(list_key), %artifact_error, "artifact candidate failed; trying public range fallback");
@@ -1516,7 +1592,7 @@ async fn produce_chain_poi_cache_candidates(
                             if let Some(cache) = result.candidate {
                                 candidates.push(PreparedPoiCacheCandidate {
                                     list_key,
-                                    cache,
+                                    cache: Some(cache),
                                     persistence: PreparedPoiCachePersistence::PublicRpc {
                                         range_start_index,
                                         expected_base,
@@ -1530,6 +1606,7 @@ async fn produce_chain_poi_cache_candidates(
                                 rpc: Some(PoiRpcAttemptOutcome::Failed),
                                 artifact_succeeded: false,
                             });
+                            let rpc_error = poi_cache_error_diagnostic(&rpc_error);
                             errors.push(format!(
                                 "artifact refresh failed: {artifact_error}; public range catch-up failed: {rpc_error}"
                             ));
@@ -1558,7 +1635,7 @@ async fn produce_chain_poi_cache_candidates(
                     if let Some(cache) = result.candidate {
                         candidates.push(PreparedPoiCacheCandidate {
                             list_key,
-                            cache,
+                            cache: Some(cache),
                             persistence: PreparedPoiCachePersistence::PublicRpc {
                                 range_start_index,
                                 expected_base,
@@ -1573,7 +1650,6 @@ async fn produce_chain_poi_cache_candidates(
                         list_index,
                         list_key,
                         identity,
-                        persisted,
                         &mut observed_manifest,
                     )
                     .await
@@ -1588,12 +1664,20 @@ async fn produce_chain_poi_cache_candidates(
                                 artifact_succeeded: true,
                             });
                         }
+                        Err(artifact_error)
+                            if matches!(&artifact_error, PoiArtifactError::Cancelled)
+                                || job.cancel.is_cancelled() =>
+                        {
+                            errors.push(artifact_error.to_string());
+                            break;
+                        }
                         Err(artifact_error) => {
                             source_outcomes.push(PoiListSourceOutcome {
                                 list_key,
                                 rpc: Some(PoiRpcAttemptOutcome::Failed),
                                 artifact_succeeded: false,
                             });
+                            let rpc_error = poi_cache_error_diagnostic(&rpc_error);
                             errors.push(format!(
                                 "public range catch-up failed: {rpc_error}; artifact refresh failed: {artifact_error}"
                             ));
@@ -1606,7 +1690,10 @@ async fn produce_chain_poi_cache_candidates(
                         rpc: Some(PoiRpcAttemptOutcome::Failed),
                         artifact_succeeded: false,
                     });
-                    errors.push(format!("public range catch-up failed: {rpc_error}"));
+                    errors.push(format!(
+                        "public range catch-up failed: {}",
+                        poi_cache_error_diagnostic(&rpc_error)
+                    ));
                 }
             }
         }
@@ -1629,9 +1716,8 @@ async fn prepare_artifact_candidate(
     list_index: usize,
     list_key: FixedBytes<32>,
     identity: PoiCacheIdentity,
-    persisted: Option<PersistedPoiArtifactCache>,
-    observed_manifest: &mut Option<ObservedPoiManifest>,
-) -> Result<Option<PreparedPoiCacheCandidate>, String> {
+    observed_manifest: &mut Option<ObservedManifest>,
+) -> Result<Option<PreparedPoiCacheCandidate>, PoiArtifactError> {
     let ingestor = PoiArtifactIngestor::new(job.artifact_config.clone(), client.clone())
         .with_progress_observer({
             let event_tx = job.event_tx.clone();
@@ -1650,10 +1736,9 @@ async fn prepare_artifact_candidate(
                     event.target_event_index,
                 );
                 let _ = event_tx.send(ChainPoiCacheJobEvent {
-                    attempt_id,
-                    generation,
                     progress: new_poi_artifact_cache_progress(
                         attempt_id,
+                        generation,
                         chain_id,
                         event.phase,
                         list_index,
@@ -1662,6 +1747,7 @@ async fn prepare_artifact_candidate(
                         event.current_event_index,
                         event.target_event_index,
                         list_progress,
+                        event.graph,
                         ready,
                         None,
                     ),
@@ -1671,30 +1757,25 @@ async fn prepare_artifact_candidate(
     if observed_manifest.is_none() {
         *observed_manifest = Some(
             ingestor
-                .fetch_observed_manifest(job.db.as_ref(), SystemTime::now())
-                .await
-                .map_err(|err| err.to_string())?,
+                .fetch_observed_manifest(&job.poi_artifact_persistence, &job.cancel)
+                .await?,
         );
     }
-    let refresh = ingestor
+    let prepared = ingestor
         .prepare_cache_with_observed_manifest(
-            job.db.as_ref(),
+            &job.poi_artifact_persistence,
             identity,
-            persisted,
             observed_manifest
                 .as_ref()
                 .expect("observed manifest initialized"),
+            &job.cancel,
         )
-        .await
-        .map_err(|err| err.to_string())?;
-    if !refresh.corpus_advanced {
-        return Ok(None);
-    }
-    Ok(Some(PreparedPoiCacheCandidate {
+        .await?;
+    Ok(prepared.map(|prepared| PreparedPoiCacheCandidate {
         list_key,
-        cache: refresh.cache.clone(),
+        cache: None,
         persistence: PreparedPoiCachePersistence::Artifact {
-            refresh: Box::new(refresh),
+            prepared: Box::new(prepared),
         },
     }))
 }
@@ -1716,10 +1797,9 @@ fn emit_candidate_progress(
         target_event_index,
     );
     let _ = job.event_tx.send(ChainPoiCacheJobEvent {
-        attempt_id: job.attempt_id,
-        generation: job.generation,
         progress: new_poi_artifact_cache_progress(
             job.attempt_id,
+            job.generation,
             job.chain_id,
             phase,
             list_index,
@@ -1728,6 +1808,7 @@ fn emit_candidate_progress(
             current_event_index,
             target_event_index,
             list_progress,
+            PoiArtifactCacheGraphProgress::default(),
             job.ready,
             None,
         ),
@@ -1739,7 +1820,7 @@ async fn finish_chain_poi_cache_attempt(
     attempt_id: PoiArtifactCacheAttemptId,
     generation: u64,
     batch: PreparedPoiCacheBatch,
-) -> Result<(), PoiCacheServiceError> {
+) -> FinishedPoiCacheAttempt {
     let PreparedPoiCacheBatch {
         candidates,
         source_outcomes,
@@ -1751,10 +1832,20 @@ async fn finish_chain_poi_cache_attempt(
             .filter_map(|candidate| candidate.persistence.artifact_manifest_sequence()),
     );
     let candidates_valid = commit_result.is_ok();
+    if candidates_valid && !candidates.is_empty() {
+        publish_current_attempt_phase(
+            task,
+            attempt_id,
+            generation,
+            PoiArtifactCachePhase::Persisting,
+        );
+    }
     if candidates_valid {
         for outcome in &source_outcomes {
             if task.cancel.is_cancelled() {
-                return Err(PoiCacheServiceError::Shutdown { attempt_id });
+                return FinishedPoiCacheAttempt {
+                    result: Err(PoiCacheServiceError::Shutdown { attempt_id }),
+                };
             }
             if !matches!(outcome.rpc, Some(PoiRpcAttemptOutcome::Succeeded { .. })) {
                 continue;
@@ -1777,9 +1868,11 @@ async fn finish_chain_poi_cache_attempt(
     if candidates_valid {
         for candidate in candidates {
             if task.cancel.is_cancelled() {
-                return Err(PoiCacheServiceError::Shutdown { attempt_id });
+                return FinishedPoiCacheAttempt {
+                    result: Err(PoiCacheServiceError::Shutdown { attempt_id }),
+                };
             }
-            match stage_poi_cache_candidate(task, generation, &candidate) {
+            match stage_poi_cache_candidate(task, attempt_id, generation, candidate).await {
                 Ok(Some(candidate)) => staged.push(candidate),
                 Ok(None) => {}
                 Err(error) => {
@@ -1789,12 +1882,14 @@ async fn finish_chain_poi_cache_attempt(
             }
         }
     }
-    #[cfg(test)]
-    task.runtime.run_post_durable_pre_apply_probe();
     let result = commit_result
         .and_then(|()| network_result.map_err(|reason| PoiCacheServiceError::Refresh { reason }));
-    apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &result).await?;
-    result
+    if let Err(error) =
+        apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &result).await
+    {
+        return FinishedPoiCacheAttempt { result: Err(error) };
+    }
+    FinishedPoiCacheAttempt { result }
 }
 
 fn validate_artifact_manifest_sequences(
@@ -1817,23 +1912,11 @@ fn validate_artifact_manifest_sequences(
     }
 }
 
-#[cfg(test)]
-async fn commit_poi_cache_candidate(
+async fn stage_poi_cache_candidate(
     task: &ChainPoiCacheCoordinator,
     attempt_id: PoiArtifactCacheAttemptId,
     generation: u64,
     candidate: PreparedPoiCacheCandidate,
-) -> Result<(), PoiCacheServiceError> {
-    let staged = stage_poi_cache_candidate(task, generation, &candidate)?
-        .into_iter()
-        .collect();
-    apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &Ok(())).await
-}
-
-fn stage_poi_cache_candidate(
-    task: &ChainPoiCacheCoordinator,
-    generation: u64,
-    candidate: &PreparedPoiCacheCandidate,
 ) -> Result<Option<StagedPoiCacheCandidate>, PoiCacheServiceError> {
     let actual_generation = task.local_caches.current_generation();
     if actual_generation != generation {
@@ -1847,26 +1930,59 @@ fn stage_poi_cache_candidate(
         generation,
         task.artifact_config.trusted_publisher_pubkey,
     );
-    let persisted = match &candidate.persistence {
-        PreparedPoiCachePersistence::Artifact { refresh } => store
-            .commit_artifact(&candidate.cache, refresh)
-            .map_err(|err| PoiCacheServiceError::Refresh {
-                reason: err.to_string(),
-            })?,
+    let PreparedPoiCacheCandidate {
+        list_key,
+        cache,
+        persistence,
+    } = candidate;
+    let persisted = match persistence {
+        PreparedPoiCachePersistence::Artifact { prepared } => {
+            let PreparedIngestion { candidate } = *prepared;
+            let Some(commit) = (tokio::select! {
+                biased;
+                () = task.cancel.cancelled() => {
+                    return Err(PoiCacheServiceError::Shutdown { attempt_id });
+                }
+                result = task
+                    .poi_artifact_persistence
+                    .commit_candidate_for_attempt(candidate, &task.cancel) => {
+                    result.map_err(|err| PoiCacheServiceError::Refresh {
+                        reason: err.to_string(),
+                    })?
+                }
+            }) else {
+                return Ok(None);
+            };
+            commit.persisted
+        }
         PreparedPoiCachePersistence::PublicRpc {
             range_start_index,
             expected_base,
         } => store
-            .commit_public_rpc(&candidate.cache, *range_start_index, *expected_base)
+            .commit_public_rpc(
+                cache.as_ref().expect("public RPC candidate has a cache"),
+                range_start_index,
+                expected_base,
+            )
             .map_err(|err| PoiCacheServiceError::Refresh {
                 reason: err.to_string(),
             })?,
     };
+    if task.cancel.is_cancelled() {
+        return Err(PoiCacheServiceError::Shutdown { attempt_id });
+    }
+    let actual_generation = task.local_caches.current_generation();
+    if actual_generation != generation {
+        return Err(PoiCacheServiceError::StaleGeneration {
+            expected: generation,
+            actual: actual_generation,
+        });
+    }
     let Some(persisted) = persisted else {
         return Ok(None);
     };
     Ok(Some(StagedPoiCacheCandidate {
-        list_key: candidate.list_key,
+        list_key,
         cache: persisted.cache,
         payload: persisted.record.cache_payload,
     }))
@@ -1934,11 +2050,21 @@ async fn apply_staged_poi_cache_batch(
         task.local_caches
             .publish_committed_revision(blocked_shields_changed);
     }
+    let graph_progress = task
+        .progress_tx
+        .borrow()
+        .get(&task.chain_id)
+        .filter(|progress| progress.attempt_id == attempt_id && progress.generation == generation)
+        .map_or_else(PoiArtifactCacheGraphProgress::default, |progress| {
+            progress.graph
+        });
     let progress = completion_progress_from_caches(
         attempt_id,
+        generation,
         task.chain_id,
         &caches,
         &task.active_list_keys,
+        graph_progress,
         result.as_ref().err().map(ToString::to_string),
     );
     send_poi_artifact_cache_progress(&task.progress_tx, progress);
@@ -1948,9 +2074,11 @@ async fn apply_staged_poi_cache_batch(
 
 fn completion_progress_from_caches(
     attempt_id: PoiArtifactCacheAttemptId,
+    generation: u64,
     chain_id: u64,
     caches: &BTreeMap<FixedBytes<32>, PoiCache>,
     active_list_keys: &[FixedBytes<32>],
+    graph: PoiArtifactCacheGraphProgress,
     last_error: Option<String>,
 ) -> PoiArtifactCacheProgress {
     let ready = cache_map_available_for_lists(chain_id, caches, active_list_keys);
@@ -1962,9 +2090,10 @@ fn completion_progress_from_caches(
     let (current_event_index, target_event_index) = single_list_event_index(&list_progress);
     new_poi_artifact_cache_progress(
         attempt_id,
+        generation,
         chain_id,
         if last_error.is_some() {
-            PoiArtifactCachePhase::Error
+            PoiArtifactCachePhase::Failed
         } else {
             PoiArtifactCachePhase::Ready
         },
@@ -1974,6 +2103,7 @@ fn completion_progress_from_caches(
         current_event_index,
         target_event_index,
         list_progress,
+        graph,
         ready,
         last_error,
     )
@@ -1991,6 +2121,22 @@ fn newest_cache(first: Option<PoiCache>, second: Option<PoiCache>) -> Option<Poi
         (Some(cache), None) | (None, Some(cache)) => Some(cache),
         (None, None) => None,
     }
+}
+
+fn poi_cache_error_diagnostic(error: &PoiCacheError) -> String {
+    let PoiCacheError::Rpc(error) = error else {
+        return error.to_string();
+    };
+    if let Some(code) = error.json_rpc_code() {
+        return format!("POI cache RPC JSON-RPC error {code}");
+    }
+    if let Some(status) = error.status() {
+        return format!("POI cache RPC HTTP {status}");
+    }
+    if let Some(phase) = error.transport_phase() {
+        return format!("POI cache RPC failed during {phase}");
+    }
+    "POI cache RPC failed".to_string()
 }
 
 fn source_health_for_lists(
@@ -2098,445 +2244,6 @@ fn cache_map_list_progress(
         .collect()
 }
 
-#[cfg(test)]
-async fn emit_chain_poi_cache_completion_progress(
-    progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
-    chain_id: u64,
-    local_caches: &LocalPoiCaches,
-    active_list_keys: &[FixedBytes<32>],
-    attempt_id: PoiArtifactCacheAttemptId,
-    generation: u64,
-    last_error: Option<String>,
-) -> Result<(), PoiCacheServiceError> {
-    let caches = local_caches.read().await;
-    let progress = completion_progress_from_caches(
-        attempt_id,
-        chain_id,
-        &caches,
-        active_list_keys,
-        last_error,
-    );
-    drop(caches);
-    send_poi_artifact_cache_progress_for_generation(progress_tx, local_caches, generation, progress)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(any())]
-async fn sync_chain_poi_artifact_caches(
-    db: &DbStore,
-    http_client: Option<&reqwest::Client>,
-    poi_rpc_url: &SensitiveUrl,
-    artifact_config: &PoiArtifactSourceConfig,
-    chain_id: u64,
-    local_caches: &LocalPoiCaches,
-    active_list_keys: &[FixedBytes<32>],
-    mut preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
-    progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
-) -> Result<(), String> {
-    let total_lists = active_list_keys.len();
-    if total_lists == 0 {
-        send_poi_artifact_cache_progress(
-            progress_tx,
-            new_poi_artifact_cache_progress(
-                chain_id,
-                PoiArtifactCachePhase::Ready,
-                0,
-                0,
-                None,
-                None,
-                None,
-                Vec::new(),
-                true,
-                None,
-            ),
-        );
-        return Ok(());
-    }
-
-    synchronize_chain_cache_generation(chain_id, local_caches, Some(&mut preloaded_caches)).await;
-    let initially_ready =
-        chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
-    let client = http_client.cloned().unwrap_or_else(reqwest::Client::new);
-    let live_tail_client = wallet_poi_status_client(poi_rpc_url, http_client);
-    let mut last_error = None;
-    for (list_index, list_key) in active_list_keys.iter().enumerate() {
-        let identity =
-            PoiCacheIdentity::new(EVM_CHAIN_TYPE, chain_id, DEFAULT_TXID_VERSION, *list_key);
-        let baseline_list_progress =
-            chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-        let active_list_keys_for_progress = active_list_keys.to_vec();
-        let ingestor = PoiArtifactIngestor::new(artifact_config.clone(), client.clone())
-            .with_progress_observer({
-                let progress_tx = progress_tx.clone();
-                let list_key = *list_key;
-                let baseline_list_progress = baseline_list_progress.clone();
-                move |event| {
-                    emit_poi_artifact_ingestor_progress(
-                        &progress_tx,
-                        chain_id,
-                        total_lists,
-                        list_index,
-                        list_key,
-                        &active_list_keys_for_progress,
-                        &baseline_list_progress,
-                        initially_ready,
-                        event,
-                    );
-                }
-            });
-        let sync_started = Instant::now();
-        let artifact_refresh_started = Instant::now();
-        let persisted_fallback = preloaded_caches.get(list_key).cloned();
-        let artifact_refresh = ingestor
-            .prepare_cache_with_optional_preloaded(
-                db,
-                identity.clone(),
-                preloaded_caches.remove(list_key),
-                SystemTime::now(),
-            )
-            .await;
-        let artifact_refresh_elapsed_ms = artifact_refresh_started.elapsed().as_millis();
-        match artifact_refresh {
-            Ok(refresh) => {
-                let manifest_sequence = refresh.manifest_sequence;
-                let artifact_tip_index = refresh.entry.current_tip_index;
-                let candidate_generation = refresh.cache_generation;
-                let mut cache = refresh.cache.clone();
-                let live_tail_started = Instant::now();
-                let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
-                let baseline_list_progress =
-                    chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-                let list_progress = list_progress_with_active_event(
-                    active_list_keys,
-                    &baseline_list_progress,
-                    *list_key,
-                    Some(local_tip_index),
-                    None,
-                );
-                send_poi_artifact_cache_progress(
-                    progress_tx,
-                    new_poi_artifact_cache_progress(
-                        chain_id,
-                        PoiArtifactCachePhase::LiveTailing,
-                        list_index,
-                        total_lists,
-                        Some(*list_key),
-                        Some(local_tip_index),
-                        None,
-                        list_progress,
-                        initially_ready,
-                        None,
-                    ),
-                );
-                let live_tail = match live_tail_candidate_cache(&live_tail_client, &cache).await {
-                    Ok((tailed_cache, outcome)) => {
-                        cache = tailed_cache;
-                        let list_progress = list_progress_with_active_event(
-                            active_list_keys,
-                            &baseline_list_progress,
-                            *list_key,
-                            Some(outcome.next_event_index.saturating_sub(1)),
-                            Some(outcome.next_event_index.saturating_sub(1)),
-                        );
-                        send_poi_artifact_cache_progress(
-                            progress_tx,
-                            new_poi_artifact_cache_progress(
-                                chain_id,
-                                PoiArtifactCachePhase::LiveTailing,
-                                list_index,
-                                total_lists,
-                                Some(*list_key),
-                                Some(outcome.next_event_index.saturating_sub(1)),
-                                Some(outcome.next_event_index.saturating_sub(1)),
-                                list_progress,
-                                initially_ready,
-                                None,
-                            ),
-                        );
-                        Some(outcome)
-                    }
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            "live POI event tail failed; using artifact checkpoint"
-                        );
-                        None
-                    }
-                };
-                let live_tail_elapsed_ms = live_tail_started.elapsed().as_millis();
-                let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
-                match persist_prepared_corpus(
-                    db,
-                    &cache,
-                    &refresh,
-                    artifact_config.trusted_publisher_pubkey,
-                ) {
-                    Ok(crate::poi_artifacts::PoiCorpusCommitOutcome::Applied) => {}
-                    Ok(crate::poi_artifacts::PoiCorpusCommitOutcome::Stale) => {
-                        debug!(
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            "prepared POI corpus was stale at commit"
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        last_error = Some(err.to_string());
-                        warn!(
-                            ?err,
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            "prepared POI corpus persistence failed"
-                        );
-                        continue;
-                    }
-                }
-                let install_started = Instant::now();
-                let install_lock_started = Instant::now();
-                let installed = install_generated_cache_if_current(
-                    local_caches,
-                    *list_key,
-                    cache,
-                    candidate_generation,
-                )
-                .await;
-                if !installed && local_caches.current_generation() != candidate_generation {
-                    debug!(
-                        chain_id,
-                        list_key = %hex::encode(list_key),
-                        candidate_generation,
-                        "artifact POI cache install skipped; cache generation advanced"
-                    );
-                }
-                let install_lock_wait_elapsed_ms = install_lock_started.elapsed().as_millis();
-                debug!(
-                    chain_id,
-                    list_key = %hex::encode(list_key),
-                    manifest_sequence,
-                    artifact_tip_index,
-                    local_tip_index,
-                    live_tail_events = live_tail.as_ref().map_or(0, |outcome| outcome.events),
-                    live_tail_pages = live_tail.as_ref().map_or(0, |outcome| outcome.pages),
-                    live_tail_start_index = live_tail.as_ref().map_or_else(
-                        || local_tip_index.saturating_add(1),
-                        |outcome| outcome.start_index,
-                    ),
-                    live_tail_next_event_index = live_tail.as_ref().map_or_else(
-                        || local_tip_index.saturating_add(1),
-                        |outcome| outcome.next_event_index,
-                    ),
-                    base_cid = %refresh.entry.base.cid,
-                    delta_count = refresh.entry.deltas.len(),
-                    blocked_shields_cid = %refresh.entry.blocked_shields.cid,
-                    artifact_refresh_elapsed_ms,
-                    live_tail_elapsed_ms,
-                    installed,
-                    install_lock_wait_elapsed_ms,
-                    install_elapsed_ms = install_started.elapsed().as_millis(),
-                    elapsed_ms = sync_started.elapsed().as_millis(),
-                    "chain-scoped artifact POI cache sync complete"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    chain_id,
-                    list_key = %hex::encode(list_key),
-                    elapsed_ms = sync_started.elapsed().as_millis(),
-                    "chain-scoped artifact POI cache sync failed; using last accepted local cache state if available"
-                );
-                let persisted = match persisted_fallback {
-                    Some(persisted) => Some(persisted),
-                    None => match load_persisted_cache(db, &identity) {
-                        Ok(persisted) => persisted,
-                        Err(load_err) => {
-                            warn!(
-                                ?load_err,
-                                chain_id,
-                                list_key = %hex::encode(list_key),
-                                "failed to load persisted POI cache before public range fallback"
-                            );
-                            None
-                        }
-                    },
-                };
-                let candidate_generation = persisted.as_ref().map_or_else(
-                    || local_caches.current_generation(),
-                    |persisted| persisted.cache_generation,
-                );
-                let expected_base =
-                    persisted
-                        .as_ref()
-                        .map_or(ExpectedPoiCorpusBase::NoValidCorpus, |persisted| {
-                            ExpectedPoiCorpusBase::PayloadHash(alloy::primitives::keccak256(
-                                &persisted.record.cache_payload,
-                            ))
-                        });
-                let candidate = persisted.map_or_else(
-                    || PoiCache::new(identity.clone()),
-                    |persisted| persisted.cache,
-                );
-                let baseline_list_progress =
-                    chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-                let fallback_start_index = candidate.progress().next_event_index;
-                send_poi_artifact_cache_progress(
-                    progress_tx,
-                    new_poi_artifact_cache_progress(
-                        chain_id,
-                        PoiArtifactCachePhase::LiveTailing,
-                        list_index,
-                        total_lists,
-                        Some(*list_key),
-                        fallback_start_index.checked_sub(1),
-                        None,
-                        list_progress_with_active_event(
-                            active_list_keys,
-                            &baseline_list_progress,
-                            *list_key,
-                            fallback_start_index.checked_sub(1),
-                            None,
-                        ),
-                        initially_ready,
-                        None,
-                    ),
-                );
-                let fallback_started = Instant::now();
-                match public_rpc_candidate_cache(&live_tail_client, candidate).await {
-                    Ok(PoiRpcSyncResult {
-                        candidate: Some(cache),
-                        outcome,
-                    }) => {
-                        let fallback_tip_index =
-                            cache.progress().next_event_index.saturating_sub(1);
-                        match persist_public_rpc_cache(
-                            db,
-                            &cache,
-                            candidate_generation,
-                            fallback_start_index,
-                            expected_base,
-                        ) {
-                            Ok(crate::poi_artifacts::PoiCorpusCommitOutcome::Applied) => {
-                                let installed = install_generated_cache_if_current(
-                                    local_caches,
-                                    *list_key,
-                                    cache,
-                                    candidate_generation,
-                                )
-                                .await;
-                                info!(
-                                    chain_id,
-                                    list_key = %hex::encode(list_key),
-                                    start_index = fallback_start_index,
-                                    current_tip_index = fallback_tip_index,
-                                    events = outcome.events,
-                                    leaves = outcome.leaves,
-                                    blocked_shields = outcome.blocked_shields,
-                                    installed,
-                                    elapsed_ms = fallback_started.elapsed().as_millis(),
-                                    "chain-scoped POI corpus recovered through public range RPC"
-                                );
-                            }
-                            Ok(crate::poi_artifacts::PoiCorpusCommitOutcome::Stale) => {
-                                debug!(
-                                    chain_id,
-                                    list_key = %hex::encode(list_key),
-                                    "retained newer durable POI corpus over public range candidate"
-                                );
-                            }
-                            Err(persist_err) => {
-                                last_error = Some(format!(
-                                    "artifact refresh failed: {err}; public range persistence failed: {persist_err}"
-                                ));
-                                warn!(
-                                    ?persist_err,
-                                    chain_id,
-                                    list_key = %hex::encode(list_key),
-                                    "public range POI corpus persistence failed"
-                                );
-                            }
-                        }
-                    }
-                    Ok(PoiRpcSyncResult {
-                        candidate: None, ..
-                    }) => {}
-                    Err(fallback_err) => {
-                        last_error = Some(format!(
-                            "artifact refresh failed: {err}; public range catch-up failed: {fallback_err}"
-                        ));
-                        warn!(
-                            ?fallback_err,
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            elapsed_ms = fallback_started.elapsed().as_millis(),
-                            "public range POI corpus catch-up failed"
-                        );
-                    }
-                }
-                synchronize_chain_cache_generation(chain_id, local_caches, None).await;
-                let ready =
-                    chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys)
-                        .await;
-                let completed =
-                    installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
-                let list_progress =
-                    chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-                let (current_event_index, target_event_index) =
-                    single_list_event_index(&list_progress);
-                if last_error.is_some() {
-                    send_poi_artifact_cache_progress(
-                        progress_tx,
-                        new_poi_artifact_cache_progress(
-                            chain_id,
-                            PoiArtifactCachePhase::Error,
-                            completed,
-                            total_lists,
-                            Some(*list_key),
-                            current_event_index,
-                            target_event_index,
-                            list_progress,
-                            ready,
-                            last_error.clone(),
-                        ),
-                    );
-                }
-            }
-        }
-    }
-    synchronize_chain_cache_generation(chain_id, local_caches, None).await;
-    let ready =
-        chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
-    let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
-    let list_progress =
-        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-    let (current_event_index, target_event_index) = single_list_event_index(&list_progress);
-    let phase = if last_error.is_some() {
-        PoiArtifactCachePhase::Error
-    } else {
-        PoiArtifactCachePhase::Ready
-    };
-    send_poi_artifact_cache_progress(
-        progress_tx,
-        new_poi_artifact_cache_progress(
-            chain_id,
-            phase,
-            completed,
-            total_lists,
-            None,
-            current_event_index,
-            target_event_index,
-            list_progress,
-            ready,
-            last_error.clone(),
-        ),
-    );
-    match last_error {
-        Some(reason) => Err(reason),
-        None => Ok(()),
-    }
-}
-
 fn install_cache_if_not_behind(
     caches: &mut BTreeMap<FixedBytes<32>, PoiCache>,
     list_key: FixedBytes<32>,
@@ -2594,34 +2301,6 @@ async fn synchronize_chain_cache_generation(
         );
     }
     generation_changed || removed_preloaded > 0
-}
-
-#[cfg(test)]
-async fn install_generated_cache_if_current(
-    local_caches: &LocalPoiCaches,
-    list_key: FixedBytes<32>,
-    cache: PoiCache,
-    candidate_generation: u64,
-) -> bool {
-    let _revision_fence = local_caches.revision_write_fence().await;
-    let mut caches = local_caches.write().await;
-    let installed = with_poi_artifact_cache_generation(
-        local_caches.shared_generation(),
-        |current_generation| {
-            if current_generation != candidate_generation {
-                return false;
-            }
-            if local_caches.installed_generation() != candidate_generation {
-                caches.clear();
-                local_caches.mark_installed_generation(candidate_generation);
-            }
-            install_cache_if_not_behind(&mut caches, list_key, cache)
-        },
-    );
-    if installed {
-        local_caches.publish_committed_revision(true);
-    }
-    installed
 }
 
 fn load_persisted_chain_poi_caches(
@@ -2706,59 +2385,6 @@ async fn apply_loaded_persisted_chain_poi_caches(
     loaded
 }
 
-#[cfg(test)]
-async fn install_loaded_persisted_chain_poi_caches(
-    chain_id: u64,
-    local_caches: &LocalPoiCaches,
-    mut loaded: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
-    started: Instant,
-) -> BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache> {
-    let loaded_count = loaded.len();
-    if loaded_count > 0 {
-        let _revision_fence = local_caches.revision_write_fence().await;
-        let lock_started = Instant::now();
-        let mut caches = local_caches.write().await;
-        let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
-        with_poi_artifact_cache_generation(
-            local_caches.shared_generation(),
-            |current_generation| {
-                if local_caches.installed_generation() != current_generation {
-                    caches.clear();
-                    local_caches.mark_installed_generation(current_generation);
-                }
-                loaded.retain(|list_key, persisted| {
-                    if current_generation != persisted.cache_generation {
-                        return false;
-                    }
-                    caches.insert(*list_key, persisted.cache.clone());
-                    true
-                });
-            },
-        );
-        let installed_count = loaded.len();
-        if installed_count > 0 {
-            local_caches.publish_committed_revision(true);
-        }
-        if installed_count != loaded_count {
-            debug!(
-                chain_id,
-                loaded_count,
-                installed_count,
-                "discarded stale persisted chain-scoped artifact POI caches"
-            );
-        }
-        info!(
-            chain_id,
-            loaded_count,
-            installed_count,
-            lock_wait_elapsed_ms,
-            elapsed_ms = started.elapsed().as_millis(),
-            "installed persisted chain-scoped artifact POI cache"
-        );
-    }
-    loaded
-}
-
 async fn chain_poi_caches_available_for_lists(
     chain_id: u64,
     local_caches: &LocalPoiCaches,
@@ -2829,138 +2455,6 @@ async fn chain_poi_cache_list_progress(
         .collect()
 }
 
-#[cfg(any())]
-async fn sync_chain_poi_live_tails(
-    client: &PoiRpcClient,
-    chain_id: u64,
-    local_caches: &LocalPoiCaches,
-    active_list_keys: &[FixedBytes<32>],
-    progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
-) {
-    let total_lists = active_list_keys.len();
-    synchronize_chain_cache_generation(chain_id, local_caches, None).await;
-    let initially_ready =
-        chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
-    let mut last_error = None;
-    for (list_index, list_key) in active_list_keys.iter().enumerate() {
-        let (mut cache, candidate_generation) = {
-            let caches = local_caches.read().await;
-            let Some(cache) = caches.get(list_key).cloned() else {
-                continue;
-            };
-            (cache, local_caches.installed_generation())
-        };
-        let original_next_event_index = cache.progress().next_event_index;
-        if original_next_event_index == 0 {
-            continue;
-        }
-        let baseline_list_progress =
-            chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-        let list_progress = list_progress_with_active_event(
-            active_list_keys,
-            &baseline_list_progress,
-            *list_key,
-            Some(original_next_event_index.saturating_sub(1)),
-            None,
-        );
-        send_poi_artifact_cache_progress(
-            progress_tx,
-            new_poi_artifact_cache_progress(
-                chain_id,
-                PoiArtifactCachePhase::LiveTailing,
-                list_index,
-                total_lists,
-                Some(*list_key),
-                Some(original_next_event_index.saturating_sub(1)),
-                None,
-                list_progress,
-                initially_ready,
-                None,
-            ),
-        );
-        let started = Instant::now();
-        match sync_live_poi_event_tail(client, &mut cache).await {
-            Ok(outcome) => {
-                if outcome.events > 0 {
-                    if install_tailed_poi_cache_if_current(
-                        local_caches,
-                        *list_key,
-                        cache,
-                        original_next_event_index,
-                        candidate_generation,
-                    )
-                    .await
-                    {
-                        info!(
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            events = outcome.events,
-                            pages = outcome.pages,
-                            start_index = outcome.start_index,
-                            next_event_index = outcome.next_event_index,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "chain-scoped live POI event tail applied"
-                        );
-                    } else {
-                        debug!(
-                            chain_id,
-                            list_key = %hex::encode(list_key),
-                            start_index = outcome.start_index,
-                            next_event_index = outcome.next_event_index,
-                            "chain-scoped live POI event tail install skipped; cache already advanced"
-                        );
-                    }
-                } else {
-                    debug!(
-                        chain_id,
-                        list_key = %hex::encode(list_key),
-                        start_index = outcome.start_index,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "chain-scoped live POI event tail already current"
-                    );
-                }
-            }
-            Err(err) => {
-                last_error = Some(err.to_string());
-                warn!(
-                    ?err,
-                    chain_id,
-                    list_key = %hex::encode(list_key),
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "chain-scoped live POI event tail failed"
-                );
-            }
-        }
-    }
-    synchronize_chain_cache_generation(chain_id, local_caches, None).await;
-    let ready =
-        chain_poi_caches_available_for_lists(chain_id, local_caches, active_list_keys).await;
-    let completed = installed_chain_poi_cache_count(chain_id, local_caches, active_list_keys).await;
-    let list_progress =
-        chain_poi_cache_list_progress(chain_id, local_caches, active_list_keys).await;
-    let (current_event_index, target_event_index) = single_list_event_index(&list_progress);
-    let phase = if last_error.is_some() {
-        PoiArtifactCachePhase::Error
-    } else {
-        PoiArtifactCachePhase::Ready
-    };
-    send_poi_artifact_cache_progress(
-        progress_tx,
-        new_poi_artifact_cache_progress(
-            chain_id,
-            phase,
-            completed,
-            total_lists,
-            None,
-            current_event_index,
-            target_event_index,
-            list_progress,
-            ready,
-            last_error,
-        ),
-    );
-}
-
 async fn public_rpc_candidate_cache(
     client: &PoiRpcClient,
     mut cache: PoiCache,
@@ -2987,62 +2481,154 @@ async fn public_rpc_candidate_cache(
 }
 
 #[cfg(test)]
-async fn install_tailed_poi_cache_if_current(
-    local_caches: &LocalPoiCaches,
-    list_key: FixedBytes<32>,
-    cache: PoiCache,
-    expected_next_event_index: u64,
-    candidate_generation: u64,
-) -> bool {
-    let mut caches = local_caches.write().await;
-    with_poi_artifact_cache_generation(local_caches.shared_generation(), |current_generation| {
-        if current_generation != candidate_generation
-            || local_caches.installed_generation() != candidate_generation
-        {
-            return false;
+impl PoiCacheService {
+    pub(crate) fn new(
+        db: Arc<DbStore>,
+        artifact_config: PoiArtifactSourceConfig,
+        http_client: Option<reqwest::Client>,
+    ) -> Result<Self, local_db::DbError> {
+        let poi_artifact_persistence = PoiArtifactPersistenceHandle::new(
+            Arc::clone(&db),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        Self::new_with_persistence(db, artifact_config, http_client, poi_artifact_persistence)
+    }
+
+    fn with_active_list_keys(mut self, active_list_keys: Vec<FixedBytes<32>>) -> Self {
+        self.active_list_keys = active_list_keys;
+        self
+    }
+
+    pub(crate) async fn reset_poi_artifact_cache(&self) -> Result<u64, PoiCacheServiceError> {
+        self.db
+            .ensure_blob_kind_purge_supported(crate::poi_artifacts::POI_V4_RAW_CHUNK_BLOB_KIND)
+            .map_err(|error| PoiCacheServiceError::Refresh {
+                reason: error.to_string(),
+            })?;
+        let reset = crate::poi_artifacts::clear_poi_artifact_cache_for_reset(&self.db).await?;
+        crate::poi_artifacts::reset_raw_chunk_cache(&self.db)
+            .await
+            .map_err(|error| PoiCacheServiceError::Refresh {
+                reason: error.to_string(),
+            })?;
+        debug!(
+            generation = reset.generation,
+            "POI artifact cache generation published after durable reset"
+        );
+        self.synchronize_after_persisted_reset(reset.generation)
+            .await?;
+        info!(
+            persisted_records = reset.removed,
+            generation = reset.generation,
+            "reset local artifact POI cache"
+        );
+        Ok(reset.removed)
+    }
+
+    pub(crate) async fn synchronize_after_persisted_reset(
+        &self,
+        generation: u64,
+    ) -> Result<(), PoiCacheServiceError> {
+        let chains: Vec<_> = self
+            .chains
+            .read()
+            .await
+            .iter()
+            .map(|(chain_id, handle)| (*chain_id, handle.clone()))
+            .collect();
+        let chain_count = chains.len();
+        let mut responses = Vec::with_capacity(chain_count);
+        let mut first_error = None;
+        let sends = join_all(chains.into_iter().map(|(chain_id, handle)| async move {
+            let (response, result) = oneshot::channel();
+            let send_result = handle
+                .command_tx
+                .send(ChainPoiCacheCommand::Reset {
+                    generation,
+                    response,
+                })
+                .await;
+            (chain_id, handle, send_result.map(|()| result))
+        }))
+        .await;
+        for (chain_id, handle, send_result) in sends {
+            if let Ok(response) = send_result {
+                responses.push((chain_id, handle, response));
+            } else {
+                self.remove_chain_handle(chain_id, &handle).await;
+                if first_error.is_none() {
+                    first_error = Some(PoiCacheServiceError::CoordinatorStopped);
+                }
+            }
         }
-        let Some(current) = caches.get(&list_key) else {
-            return false;
-        };
-        if current.progress().next_event_index != expected_next_event_index {
-            return false;
+        let responses =
+            join_all(
+                responses
+                    .into_iter()
+                    .map(|(chain_id, handle, response)| async move {
+                        (chain_id, handle, response.await)
+                    }),
+            )
+            .await;
+        for (chain_id, handle, result) in responses {
+            if let Ok(result) = result {
+                if let Err(err) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(err);
+                }
+            } else {
+                self.remove_chain_handle(chain_id, &handle).await;
+                if first_error.is_none() {
+                    first_error = Some(PoiCacheServiceError::CoordinatorStopped);
+                }
+            }
         }
-        caches.insert(list_key, cache);
-        true
-    })
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        debug!(
+            generation,
+            chain_count, "synchronized POI cache coordinators after reset"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ActivePoiCacheAttempt, ChainPoiCacheCommand, ChainPoiCacheCoordinator, EVM_CHAIN_TYPE,
-        PoiCacheService, PoiCacheServiceError, PoiCacheServiceRuntime, PoiListSourceOutcome,
-        PoiRpcAttemptOutcome, PoiSourceHealth, PreparedPoiCacheBatch, PreparedPoiCacheCandidate,
-        PreparedPoiCachePersistence, cancel_active_attempt, chain_poi_cache_list_progress,
-        chain_poi_caches_available_for_lists, commit_poi_cache_candidate, drop_completed_attempt,
-        emit_chain_poi_cache_completion_progress, emit_chain_poi_cache_ready_progress,
+        PersistedPoiArtifactCache, PoiCacheService, PoiCacheServiceError, PoiCacheServiceRuntime,
+        PoiListSourceOutcome, PoiRpcAttemptOutcome, PoiSourceHealth, PreparedPoiCacheBatch,
+        PreparedPoiCacheCandidate, PreparedPoiCachePersistence, StagedPoiCacheCandidate,
+        apply_staged_poi_cache_batch, cancel_active_attempt, chain_poi_cache_list_progress,
+        chain_poi_caches_available_for_lists, completion_progress_from_caches,
+        drop_completed_attempt, emit_chain_poi_cache_ready_progress,
         finish_chain_poi_cache_attempt, install_cache_if_not_behind,
-        install_generated_cache_if_current, install_loaded_persisted_chain_poi_caches,
-        install_tailed_poi_cache_if_current, new_poi_artifact_cache_progress,
-        public_rpc_candidate_cache, publish_active_attempt_progress,
+        new_poi_artifact_cache_progress, poi_cache_error_diagnostic, public_rpc_candidate_cache,
+        publish_active_attempt_progress,
         publish_chain_poi_cache_ready_and_acknowledge_initialization, record_list_source_outcomes,
-        recover_chain_after_stale_attempt, single_list_event_index, source_health_for_lists,
-        validate_artifact_manifest_sequences,
+        recover_chain_after_stale_attempt, send_poi_artifact_cache_progress_for_generation,
+        single_list_event_index, source_health_for_lists, stage_poi_cache_candidate,
+        validate_artifact_manifest_sequences, with_poi_artifact_cache_generation,
     };
+    use crate::chain::PoiArtifactPersistenceHandle;
+    use crate::poi_artifacts::test_support::{load_persisted_cache, persist_public_rpc_cache};
     use crate::poi_artifacts::{
-        ExpectedPoiCorpusBase, PoiArtifactRefresh, clear_poi_artifact_cache_for_reset,
-        load_persisted_cache, persist_public_rpc_cache, poi_artifact_cache_generation_cell,
-        poi_corpus_authority, record_poi_rpc_success,
+        ExpectedPoiCorpusBase, clear_poi_artifact_cache_for_reset,
+        poi_artifact_cache_generation_cell, poi_corpus_authority, record_poi_rpc_success,
     };
     use crate::types::PoiCorpusRevision;
     use crate::types::{
-        LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+        LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind,
+        PoiArtifactCacheGraphProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
         PoiArtifactManifestSource, PoiArtifactSourceConfig,
     };
-    use crate::wallet::{
-        LivePoiTailError, LocalPoiMerkleProofSource, LocalPoiStatusReader, PoiStatusReader,
-        live_tail_candidate_cache,
-    };
+    use crate::wallet::test_support::{LivePoiTailError, live_tail_candidate_cache};
+    use crate::wallet::{LocalPoiMerkleProofSource, LocalPoiStatusReader, PoiStatusReader};
     use alloy::primitives::{FixedBytes, U256};
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
     use ed25519_dalek::{Signer, SigningKey};
@@ -3050,12 +2636,13 @@ mod tests {
         DbConfig, DbStore, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
         PoiCacheRecordSource, PoiCorpusValidationRecord,
     };
+    use poi::artifacts::SnapshotEvent;
     use poi::artifacts::verify::canonical_poi_event_message;
-    use poi::artifacts::{ArtifactDescriptor, ManifestEntry, SnapshotEvent};
-    use poi::cache::{PoiCache, PoiCacheIdentity};
+    use poi::cache::{PoiCache, PoiCacheError, PoiCacheIdentity};
+    use poi::error::PoiRpcError;
     use poi::poi::{
-        BlindedCommitmentData, PoiEventType, PoiRpcClient, PoiSyncedListEvent, SignedPoiEvent,
-        default_active_poi_list_key,
+        BlindedCommitmentData, BlockedShield, PoiEventType, PoiRpcClient, PoiSyncedListEvent,
+        SignedPoiEvent, default_active_poi_list_key,
     };
     use railgun_wallet::PoiStatus;
     use railgun_wallet::tx::PoiMerkleProofSource;
@@ -3068,6 +2655,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+    use tracing::{debug, info};
     use url::Url;
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3076,8 +2666,157 @@ mod tests {
         PoiArtifactCacheAttemptId::new(value)
     }
 
+    fn test_persistence(db: &Arc<DbStore>) -> PoiArtifactPersistenceHandle {
+        PoiArtifactPersistenceHandle::new(Arc::clone(db), Arc::new(tokio::sync::Mutex::new(())))
+    }
+
+    async fn commit_poi_cache_candidate(
+        task: &ChainPoiCacheCoordinator,
+        attempt_id: PoiArtifactCacheAttemptId,
+        generation: u64,
+        candidate: PreparedPoiCacheCandidate,
+    ) -> Result<(), PoiCacheServiceError> {
+        let staged = stage_poi_cache_candidate(task, attempt_id, generation, candidate)
+            .await?
+            .into_iter()
+            .collect();
+        apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &Ok(())).await
+    }
+
+    async fn emit_chain_poi_cache_completion_progress(
+        progress_tx: &watch::Sender<BTreeMap<u64, PoiArtifactCacheProgress>>,
+        chain_id: u64,
+        local_caches: &LocalPoiCaches,
+        active_list_keys: &[FixedBytes<32>],
+        attempt_id: PoiArtifactCacheAttemptId,
+        generation: u64,
+        last_error: Option<String>,
+    ) -> Result<(), PoiCacheServiceError> {
+        let caches = local_caches.read().await;
+        let progress = completion_progress_from_caches(
+            attempt_id,
+            generation,
+            chain_id,
+            &caches,
+            active_list_keys,
+            PoiArtifactCacheGraphProgress::default(),
+            last_error,
+        );
+        drop(caches);
+        send_poi_artifact_cache_progress_for_generation(
+            progress_tx,
+            local_caches,
+            generation,
+            progress,
+        )
+    }
+
+    async fn install_generated_cache_if_current(
+        local_caches: &LocalPoiCaches,
+        list_key: FixedBytes<32>,
+        cache: PoiCache,
+        candidate_generation: u64,
+    ) -> bool {
+        let _revision_fence = local_caches.revision_write_fence().await;
+        let mut caches = local_caches.write().await;
+        let installed = with_poi_artifact_cache_generation(
+            local_caches.shared_generation(),
+            |current_generation| {
+                if current_generation != candidate_generation {
+                    return false;
+                }
+                if local_caches.installed_generation() != candidate_generation {
+                    caches.clear();
+                    local_caches.mark_installed_generation(candidate_generation);
+                }
+                install_cache_if_not_behind(&mut caches, list_key, cache)
+            },
+        );
+        if installed {
+            local_caches.publish_committed_revision(true);
+        }
+        installed
+    }
+
+    async fn install_loaded_persisted_chain_poi_caches(
+        chain_id: u64,
+        local_caches: &LocalPoiCaches,
+        mut loaded: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
+        started: Instant,
+    ) -> BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache> {
+        let loaded_count = loaded.len();
+        if loaded_count > 0 {
+            let _revision_fence = local_caches.revision_write_fence().await;
+            let lock_started = Instant::now();
+            let mut caches = local_caches.write().await;
+            let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
+            with_poi_artifact_cache_generation(
+                local_caches.shared_generation(),
+                |current_generation| {
+                    if local_caches.installed_generation() != current_generation {
+                        caches.clear();
+                        local_caches.mark_installed_generation(current_generation);
+                    }
+                    loaded.retain(|list_key, persisted| {
+                        if current_generation != persisted.cache_generation {
+                            return false;
+                        }
+                        caches.insert(*list_key, persisted.cache.clone());
+                        true
+                    });
+                },
+            );
+            let installed_count = loaded.len();
+            if installed_count > 0 {
+                local_caches.publish_committed_revision(true);
+            }
+            if installed_count != loaded_count {
+                debug!(
+                    chain_id,
+                    loaded_count,
+                    installed_count,
+                    "discarded stale persisted chain-scoped artifact POI caches"
+                );
+            }
+            info!(
+                chain_id,
+                loaded_count,
+                installed_count,
+                lock_wait_elapsed_ms,
+                elapsed_ms = started.elapsed().as_millis(),
+                "installed persisted chain-scoped artifact POI cache"
+            );
+        }
+        loaded
+    }
+
+    async fn install_tailed_poi_cache_if_current(
+        local_caches: &LocalPoiCaches,
+        list_key: FixedBytes<32>,
+        cache: PoiCache,
+        expected_next_event_index: u64,
+        candidate_generation: u64,
+    ) -> bool {
+        let mut caches = local_caches.write().await;
+        with_poi_artifact_cache_generation(local_caches.shared_generation(), |current_generation| {
+            if current_generation != candidate_generation
+                || local_caches.installed_generation() != candidate_generation
+            {
+                return false;
+            }
+            let Some(current) = caches.get(&list_key) else {
+                return false;
+            };
+            if current.progress().next_event_index != expected_next_event_index {
+                return false;
+            }
+            caches.insert(list_key, cache);
+            true
+        })
+    }
+
     #[test]
-    fn artifact_candidate_batch_requires_one_global_manifest_sequence() {
+    fn v4_candidate_batch_requires_one_global_manifest_sequence() {
         validate_artifact_manifest_sequences([10, 10].into_iter())
             .expect("matching manifest sequences");
         assert!(matches!(
@@ -3231,6 +2970,7 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
         finish_chain_poi_cache_attempt(
             &coordinator,
@@ -3249,6 +2989,7 @@ mod tests {
             },
         )
         .await
+        .result
         .expect("persist empty RPC source health");
 
         assert!(local_caches.read().await.is_empty());
@@ -3424,6 +3165,7 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
         finish_chain_poi_cache_attempt(
             &coordinator,
@@ -3442,6 +3184,7 @@ mod tests {
             },
         )
         .await
+        .result
         .expect("commit empty RPC health update");
         let corpus_after = db
             .get_poi_artifact_cache(
@@ -3591,6 +3334,9 @@ mod tests {
 
     fn persist_cache(db: &DbStore, cache: &PoiCache) {
         let identity = cache.identity();
+        let cache_generation = db
+            .poi_artifact_cache_generation()
+            .expect("load cache generation");
         let current_tip_index = cache.progress().next_event_index.saturating_sub(1);
         let current_tip_root = *cache
             .clone()
@@ -3602,6 +3348,7 @@ mod tests {
             chain_id: identity.chain_id,
             txid_version: identity.txid_version.clone(),
             list_key: identity.list_key,
+            cache_generation,
             source: PoiCacheRecordSource::IndexedArtifacts,
             validation: PoiCorpusValidationRecord::PublisherAttested {
                 publisher_pubkey: FixedBytes::from([0x22; 32]),
@@ -4253,8 +4000,12 @@ mod tests {
         let progress =
             wait_for_progress(&mut progress_rx, 1, PoiArtifactCacheProgress::is_error).await;
 
-        assert_eq!(progress.phase, PoiArtifactCachePhase::Error);
+        assert_eq!(progress.phase, PoiArtifactCachePhase::Failed);
         assert!(progress.ready_for_wallet_checks);
+        assert_eq!(
+            progress.failure_kind(),
+            Some(PoiArtifactCacheFailureKind::RefreshDegraded)
+        );
         assert_eq!(progress.completed_lists, 1);
         assert_eq!(progress.current_event_index, Some(0));
         assert_eq!(progress.target_event_index, Some(0));
@@ -4291,13 +4042,90 @@ mod tests {
         let progress =
             wait_for_progress(&mut progress_rx, 1, PoiArtifactCacheProgress::is_error).await;
 
-        assert_eq!(progress.phase, PoiArtifactCachePhase::Error);
+        assert_eq!(progress.phase, PoiArtifactCachePhase::Failed);
         assert!(!progress.ready_for_wallet_checks);
+        assert_eq!(
+            progress.failure_kind(),
+            Some(PoiArtifactCacheFailureKind::ServingCorpusUnavailable)
+        );
         assert_eq!(progress.completed_lists, 0);
         assert!(progress.last_error.is_some());
         start.await.expect("start chain task");
         service.shutdown().await;
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn v4_warm_refresh_and_cold_startup_keep_readiness_independent_from_phase() {
+        let warm_attempt_id = attempt_id(41);
+        let warm = new_poi_artifact_cache_progress(
+            warm_attempt_id,
+            9,
+            1,
+            PoiArtifactCachePhase::ResolvingManifest,
+            1,
+            1,
+            None,
+            Some(7),
+            Some(7),
+            Vec::new(),
+            PoiArtifactCacheGraphProgress::default(),
+            true,
+            None,
+        );
+        let cold = new_poi_artifact_cache_progress(
+            attempt_id(42),
+            10,
+            1,
+            PoiArtifactCachePhase::DownloadingChunks,
+            0,
+            1,
+            None,
+            None,
+            Some(7),
+            Vec::new(),
+            PoiArtifactCacheGraphProgress {
+                total_chunks: 2,
+                total_authenticated_encoded_bytes: Some(1024),
+                replay_start_event_index: Some(0),
+                replay_end_event_index: Some(7),
+                total_replay_event_count: 8,
+                ..PoiArtifactCacheGraphProgress::default()
+            },
+            false,
+            None,
+        );
+
+        assert!(warm.is_active());
+        assert!(warm.ready_for_wallet_checks);
+        assert_eq!(warm.attempt_id, warm_attempt_id);
+        assert_eq!(warm.generation, 9);
+        assert!(cold.is_active());
+        assert!(!cold.ready_for_wallet_checks);
+        assert!(!cold.is_ready());
+    }
+
+    #[test]
+    fn shared_failure_diagnostic_redacts_rpc_message_and_response_data() {
+        let error = PoiCacheError::Rpc(PoiRpcError::JsonRpc {
+            code: -32_000,
+            message: "raw-response-message-sentinel".to_string(),
+            data: Some(serde_json::json!({
+                "url": "https://user-sentinel:password-sentinel@host.invalid/path?token=sentinel"
+            })),
+        });
+
+        let diagnostic = poi_cache_error_diagnostic(&error);
+
+        assert_eq!(diagnostic, "POI cache RPC JSON-RPC error -32000");
+        for sentinel in [
+            "raw-response-message-sentinel",
+            "user-sentinel",
+            "password-sentinel",
+            "token=sentinel",
+        ] {
+            assert!(!diagnostic.contains(sentinel), "leaked {sentinel}");
+        }
     }
 
     #[test]
@@ -4377,6 +4205,100 @@ mod tests {
         assert!(current.position(&live_tail_commitment).is_some());
     }
 
+    #[tokio::test]
+    async fn blocked_only_staged_install_preserves_events_and_publishes_blocked_revision() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let event_commitment = FixedBytes::from([0x2a; 32]);
+        let current = cache_with_events(identity, &[snapshot_event(0, event_commitment)]);
+        let mut replacement = current.clone();
+        replacement
+            .replace_blocked_shields(&[BlockedShield {
+                commitment_hash: alloy::hex::encode_prefixed([0x2b; 32]),
+                blinded_commitment: alloy::hex::encode_prefixed([0x2c; 32]),
+                block_reason: Some("replacement".to_string()),
+                signature: alloy::hex::encode_prefixed([0x2d; 64]),
+            }])
+            .expect("replace blocked shields");
+        let payload = replacement.to_bytes().expect("encode replacement");
+        let local_caches = LocalPoiCaches::new_for_test(BTreeMap::from([(list_key, current)]));
+        let mut revision_rx = local_caches.committed_revision_rx();
+        assert_eq!(
+            *revision_rx.borrow(),
+            PoiCorpusRevision {
+                revision: 1,
+                blocked_shields_revision: 1,
+            }
+        );
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, _) = tokio::sync::watch::channel(BTreeMap::new());
+        let coordinator = ChainPoiCacheCoordinator {
+            db: Arc::clone(&db),
+            http_client: None,
+            poi_rpc_url: Url::parse("http://127.0.0.1:1")
+                .expect("POI RPC URL")
+                .into(),
+            artifact_config: artifact_config(),
+            chain_id: 1,
+            local_caches: local_caches.clone(),
+            active_list_keys: vec![list_key],
+            preloaded_caches: BTreeMap::new(),
+            command_rx,
+            job_tx,
+            job_rx,
+            progress_tx,
+            cancel: CancellationToken::new(),
+            runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
+        };
+
+        apply_staged_poi_cache_batch(
+            &coordinator,
+            attempt_id(61),
+            local_caches.current_generation(),
+            vec![StagedPoiCacheCandidate {
+                list_key,
+                cache: replacement,
+                payload,
+            }],
+            &Ok(()),
+        )
+        .await
+        .expect("publish blocked-only replacement");
+
+        revision_rx.changed().await.expect("blocked revision");
+        assert_eq!(
+            *revision_rx.borrow_and_update(),
+            PoiCorpusRevision {
+                revision: 2,
+                blocked_shields_revision: 2,
+            }
+        );
+        let installed = local_caches.read().await[&list_key].clone();
+        assert_eq!(installed.progress().next_event_index, 1);
+        assert_eq!(
+            installed.commitment_at_global_index(0),
+            Some(event_commitment)
+        );
+        assert_eq!(
+            installed.status(&FixedBytes::from([0x2c; 32])),
+            PoiStatus::ShieldBlocked
+        );
+
+        drop(coordinator);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reset_waits_for_admitted_refresh_then_clears_it() {
         let root_dir = temp_db_root();
@@ -4441,7 +4363,10 @@ mod tests {
         let service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
             .expect("initialize service from persistent generation");
         assert_eq!(
-            service.cache_generation.load(Ordering::Acquire),
+            service
+                .cache_authority
+                .generation_cell()
+                .load(Ordering::Acquire),
             reset.generation
         );
         service.shutdown().await;
@@ -4536,10 +4461,9 @@ mod tests {
         let serving_service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
             .expect("initialize serving service")
             .with_poi_rpc_url(unavailable_rpc);
-        assert!(Arc::ptr_eq(
-            &reset_service.cache_generation,
-            &serving_service.cache_generation
-        ));
+        let reset_generation = reset_service.cache_authority.generation_cell();
+        let serving_generation = serving_service.cache_authority.generation_cell();
+        assert!(Arc::ptr_eq(&reset_generation, &serving_generation));
 
         let local_caches = serving_service
             .start_chain(1)
@@ -4574,7 +4498,7 @@ mod tests {
             )
             .await
             .expect("read old-generation proof before reset");
-        let old_generation = serving_service.cache_generation.load(Ordering::Acquire);
+        let old_generation = serving_generation.load(Ordering::Acquire);
         let old_refresh = cache_with_events(
             identity.clone(),
             &[
@@ -4600,10 +4524,10 @@ mod tests {
             .await
             .expect("reset task")
             .expect("reset shared POI cache");
-        let current_generation = reset_service.cache_generation.load(Ordering::Acquire);
+        let current_generation = reset_generation.load(Ordering::Acquire);
         assert_eq!(current_generation, old_generation + 1);
         assert_eq!(
-            serving_service.cache_generation.load(Ordering::Acquire),
+            serving_generation.load(Ordering::Acquire),
             current_generation
         );
 
@@ -4875,157 +4799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newer_durable_rpc_corpus_is_not_regressed_by_older_artifact() {
-        let root_dir = temp_db_root();
-        fs::create_dir_all(&root_dir).expect("create temp db root");
-        let db = Arc::new(
-            DbStore::open(DbConfig {
-                root_dir: root_dir.clone(),
-            })
-            .expect("open temp db"),
-        );
-        let list_key = default_active_poi_list_key();
-        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
-        let first = FixedBytes::from([0x36_u8; 32]);
-        let second = FixedBytes::from([0x37_u8; 32]);
-        let artifact_cache = cache_with_events(identity.clone(), &[snapshot_event(0, first)]);
-        let rpc_cache = cache_with_events(
-            identity,
-            &[snapshot_event(0, first), snapshot_event(1, second)],
-        );
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
-        persist_public_rpc_cache(
-            &db,
-            &rpc_cache,
-            generation,
-            0,
-            ExpectedPoiCorpusBase::NoValidCorpus,
-        )
-        .expect("persist newer public RPC corpus");
-        let local_caches =
-            LocalPoiCaches::new(poi_corpus_authority(&db).expect("corpus authority"));
-        let mut revision_rx = local_caches.committed_revision_rx();
-        assert!(
-            install_generated_cache_if_current(&local_caches, list_key, rpc_cache, generation,)
-                .await
-        );
-        revision_rx
-            .changed()
-            .await
-            .expect("newer RPC install revision");
-        assert_eq!(
-            *revision_rx.borrow_and_update(),
-            PoiCorpusRevision {
-                revision: 1,
-                blocked_shields_revision: 1,
-            }
-        );
-        let artifact_root = *artifact_cache
-            .clone()
-            .current_roots()
-            .get(&0)
-            .expect("artifact root");
-        let descriptor = ArtifactDescriptor {
-            cid: "bafy-test".to_string(),
-            sha256: FixedBytes::ZERO,
-            byte_size: 0,
-        };
-        let refresh = PoiArtifactRefresh {
-            manifest_sequence: 8,
-            cache: artifact_cache.clone(),
-            entry: ManifestEntry {
-                list_key,
-                chain_id: 1,
-                base: descriptor.clone(),
-                deltas: Vec::new(),
-                retained_deltas: Vec::new(),
-                blocked_shields: descriptor,
-                current_tip_index: 0,
-                current_tip_merkleroot: artifact_root,
-            },
-            cache_generation: generation,
-            corpus_advanced: true,
-            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-        };
-        db.advance_poi_publisher_manifest_watermark(
-            artifact_config().trusted_publisher_pubkey,
-            refresh.manifest_sequence,
-        )
-        .expect("observe artifact manifest");
-        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
-        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (progress_tx, _) = tokio::sync::watch::channel(BTreeMap::new());
-        let coordinator = ChainPoiCacheCoordinator {
-            db: Arc::clone(&db),
-            http_client: None,
-            poi_rpc_url: Url::parse("http://127.0.0.1:1")
-                .expect("POI RPC URL")
-                .into(),
-            artifact_config: artifact_config(),
-            chain_id: 1,
-            local_caches: local_caches.clone(),
-            active_list_keys: vec![list_key],
-            preloaded_caches: BTreeMap::new(),
-            command_rx,
-            job_tx,
-            job_rx,
-            progress_tx,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            runtime: Arc::new(PoiCacheServiceRuntime::new()),
-        };
-
-        commit_poi_cache_candidate(
-            &coordinator,
-            attempt_id(1),
-            generation,
-            PreparedPoiCacheCandidate {
-                list_key,
-                cache: artifact_cache,
-                persistence: PreparedPoiCachePersistence::Artifact {
-                    refresh: Box::new(refresh),
-                },
-            },
-        )
-        .await
-        .expect("older artifact retains newer durable corpus");
-        assert!(!revision_rx.has_changed().expect("revision state"));
-
-        assert_eq!(
-            local_caches
-                .read()
-                .await
-                .get(&list_key)
-                .expect("runtime corpus")
-                .progress()
-                .next_event_index,
-            2
-        );
-        let persisted_identity = local_caches.read().await[&list_key].identity().clone();
-        let persisted = load_persisted_cache(&db, &persisted_identity)
-            .expect("load durable corpus")
-            .expect("durable corpus");
-        assert_eq!(persisted.record.source, PoiCacheRecordSource::PublicRpc);
-        assert_eq!(persisted.record.current_tip_index, 1);
-
-        drop(coordinator);
-        drop(db);
-        let reopened = DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("reopen durable corpus DB");
-        let restarted = load_persisted_cache(&reopened, &persisted_identity)
-            .expect("reload corpus after restart")
-            .expect("durable corpus survives restart");
-        assert_eq!(restarted.cache.progress().next_event_index, 2);
-        assert_eq!(restarted.cache.status(&second), PoiStatus::Valid);
-        drop(reopened);
-        fs::remove_dir_all(root_dir).expect("remove temp db dir");
-    }
-
-    #[tokio::test]
-    async fn stale_coordinator_commit_reconciles_to_winning_durable_corpus() {
+    async fn stale_coordinator_commit_reloads_winning_durable_corpus() {
         let root_dir = temp_db_root();
         fs::create_dir_all(&root_dir).expect("create temp db root");
         let db = Arc::new(
@@ -5050,7 +4824,7 @@ mod tests {
                 ExpectedPoiCorpusBase::NoValidCorpus,
             )
             .expect("persist old durable corpus"),
-            crate::poi_artifacts::PoiCorpusCommitOutcome::Applied
+            crate::poi_artifacts::CorpusCommitOutcome::Applied
         );
         let expected_old_base = ExpectedPoiCorpusBase::PayloadHash(alloy::primitives::keccak256(
             old_cache.to_bytes().expect("encode old corpus"),
@@ -5096,6 +4870,7 @@ mod tests {
                 progress_tx,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 runtime: Arc::new(PoiCacheServiceRuntime::new()),
+                poi_artifact_persistence: test_persistence(&db),
             }
         };
 
@@ -5106,7 +4881,7 @@ mod tests {
             generation,
             PreparedPoiCacheCandidate {
                 list_key,
-                cache: winning_cache.clone(),
+                cache: Some(winning_cache.clone()),
                 persistence: PreparedPoiCachePersistence::PublicRpc {
                     range_start_index: 1,
                     expected_base: expected_old_base,
@@ -5129,7 +4904,7 @@ mod tests {
             generation,
             PreparedPoiCacheCandidate {
                 list_key,
-                cache: rejected_candidate.clone(),
+                cache: Some(rejected_candidate.clone()),
                 persistence: PreparedPoiCachePersistence::PublicRpc {
                     range_start_index: 1,
                     expected_base: expected_old_base,
@@ -5137,12 +4912,12 @@ mod tests {
             },
         )
         .await
-        .expect("coordinator A reconciles stale commit");
+        .expect("coordinator A reloads after stale commit");
 
         revision_a
             .changed()
             .await
-            .expect("reconciled corpus revision");
+            .expect("reloaded corpus revision");
         assert_eq!(
             *revision_a.borrow_and_update(),
             PoiCorpusRevision {
@@ -5150,18 +4925,18 @@ mod tests {
                 blocked_shields_revision: 0,
             }
         );
-        let reconciled = local_a
+        let reloaded = local_a
             .read()
             .await
             .get(&list_key)
             .cloned()
-            .expect("coordinator A reconciled corpus");
+            .expect("coordinator A reloaded corpus");
         assert_eq!(
-            reconciled.to_bytes().expect("encode reconciled corpus"),
+            reloaded.to_bytes().expect("encode reloaded corpus"),
             winning_cache.to_bytes().expect("encode winning corpus")
         );
         assert_ne!(
-            reconciled.to_bytes().expect("encode reconciled corpus"),
+            reloaded.to_bytes().expect("encode reloaded corpus"),
             rejected_candidate
                 .to_bytes()
                 .expect("encode rejected candidate")
@@ -5221,6 +4996,7 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
         let local_guard = local_caches.write().await;
         let mut commit = Box::pin(commit_poi_cache_candidate(
@@ -5229,7 +5005,7 @@ mod tests {
             generation,
             PreparedPoiCacheCandidate {
                 list_key,
-                cache: candidate_cache,
+                cache: Some(candidate_cache),
                 persistence: PreparedPoiCachePersistence::PublicRpc {
                     range_start_index: 0,
                     expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
@@ -5324,6 +5100,7 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
 
         let result = finish_chain_poi_cache_attempt(
@@ -5333,10 +5110,10 @@ mod tests {
             PreparedPoiCacheBatch {
                 candidates: vec![PreparedPoiCacheCandidate {
                     list_key,
-                    cache: cache_with_events(
+                    cache: Some(cache_with_events(
                         identity.clone(),
                         &[snapshot_event(0, FixedBytes::from([0x92; 32]))],
-                    ),
+                    )),
                     persistence: PreparedPoiCachePersistence::PublicRpc {
                         range_start_index: 0,
                         expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
@@ -5348,7 +5125,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(PoiCacheServiceError::Refresh { .. })));
+        assert!(matches!(
+            result.result,
+            Err(PoiCacheServiceError::Refresh { .. })
+        ));
         revision_rx
             .changed()
             .await
@@ -5378,7 +5158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_after_durable_batch_keeps_corpus_without_runtime_publication() {
+    async fn cancelled_apply_after_durable_stage_keeps_corpus_without_runtime_publication() {
         let root_dir = temp_db_root();
         fs::create_dir_all(&root_dir).expect("create temp db root");
         let db = Arc::new(
@@ -5422,44 +5202,66 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
-        let cancel = coordinator.cancel.clone();
-        *coordinator
-            .runtime
-            .post_durable_pre_apply
-            .lock()
-            .expect("post-durable probe") = Some(Box::new(move || cancel.cancel()));
-        let result = finish_chain_poi_cache_attempt(
-            &coordinator,
-            attempt_id(12),
-            generation,
-            PreparedPoiCacheBatch {
-                candidates: vec![
-                    PreparedPoiCacheCandidate {
-                        list_key,
-                        cache: candidate_cache,
-                        persistence: PreparedPoiCachePersistence::PublicRpc {
-                            range_start_index: 0,
-                            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-                        },
-                    },
-                    PreparedPoiCacheCandidate {
-                        list_key: second_list_key,
-                        cache: cache_with_events(
-                            second_identity.clone(),
-                            &[snapshot_event(0, FixedBytes::from([0x76; 32]))],
-                        ),
-                        persistence: PreparedPoiCachePersistence::PublicRpc {
-                            range_start_index: 0,
-                            expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-                        },
-                    },
-                ],
-                source_outcomes: Vec::new(),
-                result: Ok(()),
+        let candidates = vec![
+            PreparedPoiCacheCandidate {
+                list_key,
+                cache: Some(candidate_cache),
+                persistence: PreparedPoiCachePersistence::PublicRpc {
+                    range_start_index: 0,
+                    expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
+                },
             },
-        )
-        .await;
+            PreparedPoiCacheCandidate {
+                list_key: second_list_key,
+                cache: Some(cache_with_events(
+                    second_identity.clone(),
+                    &[snapshot_event(0, FixedBytes::from([0x76; 32]))],
+                )),
+                persistence: PreparedPoiCachePersistence::PublicRpc {
+                    range_start_index: 0,
+                    expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
+                },
+            },
+        ];
+        assert!(!coordinator.cancel.is_cancelled());
+        let mut staged = Vec::new();
+        for candidate in candidates {
+            if let Some(candidate) =
+                stage_poi_cache_candidate(&coordinator, attempt_id(12), generation, candidate)
+                    .await
+                    .expect("stage durable POI cache candidate")
+            {
+                staged.push(candidate);
+            }
+        }
+        assert_eq!(staged.len(), 2);
+        assert!(
+            db.get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("read first corpus after durable stage")
+            .is_some()
+        );
+        assert!(
+            db.get_poi_artifact_cache(
+                second_identity.chain_type,
+                second_identity.chain_id,
+                &second_identity.txid_version,
+                &second_identity.list_key,
+            )
+            .expect("read second corpus after durable stage")
+            .is_some()
+        );
+
+        coordinator.cancel.cancel();
+        let result =
+            apply_staged_poi_cache_batch(&coordinator, attempt_id(12), generation, staged, &Ok(()))
+                .await;
 
         assert!(matches!(
             result,
@@ -5541,7 +5343,10 @@ mod tests {
             .expect("chain coordinator")
             .command_tx
             .clone();
-        let current_generation = service.cache_generation.load(Ordering::Acquire);
+        let current_generation = service
+            .cache_authority
+            .generation_cell()
+            .load(Ordering::Acquire);
         let stale_generation = current_generation.saturating_add(1);
         let (response, result) = tokio::sync::oneshot::channel();
         command_tx
@@ -5678,6 +5483,7 @@ mod tests {
         let mut active = Some(ActivePoiCacheAttempt {
             id: attempt_id(44),
             generation: 0,
+            cancel: CancellationToken::new(),
             job: Box::pin(PendingCandidate {
                 dropped: Arc::clone(&dropped),
             }),
@@ -5709,6 +5515,7 @@ mod tests {
         let replacement_id = attempt_id(2);
         let replacement_progress = new_poi_artifact_cache_progress(
             replacement_id,
+            0,
             1,
             PoiArtifactCachePhase::LiveTailing,
             0,
@@ -5717,6 +5524,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            PoiArtifactCacheGraphProgress::default(),
             false,
             None,
         );
@@ -5739,10 +5547,12 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
         let active = ActivePoiCacheAttempt {
             id: replacement_id,
             generation: 0,
+            cancel: CancellationToken::new(),
             job: Box::pin(std::future::pending()),
             retry_completion: None,
         };
@@ -5750,18 +5560,18 @@ mod tests {
             &coordinator,
             Some(&active),
             super::ChainPoiCacheJobEvent {
-                attempt_id: attempt_id(1),
-                generation: 0,
                 progress: new_poi_artifact_cache_progress(
                     attempt_id(1),
+                    0,
                     1,
-                    PoiArtifactCachePhase::Error,
+                    PoiArtifactCachePhase::Failed,
                     0,
                     1,
                     None,
                     None,
                     None,
                     Vec::new(),
+                    PoiArtifactCacheGraphProgress::default(),
                     false,
                     Some("stale".to_string()),
                 ),
@@ -5769,6 +5579,7 @@ mod tests {
         );
 
         assert_eq!(progress_rx.borrow()[&1].attempt_id, replacement_id);
+        assert_eq!(progress_rx.borrow()[&1].generation, 0);
         assert_eq!(
             progress_rx.borrow()[&1].phase,
             PoiArtifactCachePhase::LiveTailing
@@ -5811,6 +5622,7 @@ mod tests {
         let response = drop_completed_attempt(ActivePoiCacheAttempt {
             id: attempt_id(45),
             generation: 0,
+            cancel: CancellationToken::new(),
             job: Box::pin(ReadyCandidate {
                 dropped: Arc::clone(&dropped),
             }),
@@ -5910,6 +5722,7 @@ mod tests {
             progress_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
         };
         let mut active = None;
         let mut health = BTreeMap::new();
@@ -6017,7 +5830,7 @@ mod tests {
         service.start_chain(1).await.expect("start chain");
         stalled
             .accepted
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("startup attempt reached network");
 
         let first = service.retry_chain(1).await.expect("admit first retry");
@@ -6026,7 +5839,7 @@ mod tests {
         let first_wait = tokio::spawn(first.wait());
         stalled
             .accepted
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("first retry reached network");
 
         let second = service.retry_chain(1).await.expect("admit second retry");

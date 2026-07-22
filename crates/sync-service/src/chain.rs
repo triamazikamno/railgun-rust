@@ -35,8 +35,6 @@ use merkletree::slow::types::{
 };
 use merkletree::tree::MerkleForest;
 use railgun_wallet::UtxoSource;
-#[cfg(test)]
-use railgun_wallet::scan::parse_indexed_wallet_delta;
 use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
@@ -93,22 +91,11 @@ use workers::{
     wallet_finish_result_removes_cursor, wallet_finish_retry_request,
 };
 
-#[cfg(test)]
-use backfill::wallet_tail_fallback_lag_threshold_blocks;
-#[cfg(test)]
-use indexed_wallet::{complete_stream_checkpoint, wallet_startup_hedge_block_count};
-#[cfg(test)]
-use logs::combined_log_event_signatures_for_range;
-#[cfg(test)]
-use workers::{
-    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
-};
-
 pub use data_plane::{
-    ChainPublicSyncCacheReset, PoiArtifactCacheRetry, PublicCoverageAnswer,
-    PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind, PublicDataPlaneDiagnostics,
-    PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange, PublicScanRows,
-    PublicScanRowsAnswer, PublicSyncCacheReset,
+    ChainPublicSyncCacheReset, PoiArtifactCacheRetry, PoiArtifactPersistenceHandle,
+    PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,
+    PublicDataPlaneDiagnostics, PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange,
+    PublicScanRows, PublicScanRowsAnswer, PublicSyncCacheReset,
 };
 pub use types::{ChainError, ChainHandle, ChainService};
 

@@ -8,7 +8,7 @@ use chrono::Utc;
 use cid::{Cid, Version};
 use futures::{StreamExt, io::Cursor, stream::FuturesUnordered};
 use ipld_core::{codec::Codec, ipld::Ipld};
-use ipld_dagpb::PbNode;
+use ipld_dagpb::{PbLink, PbNode};
 use libp2p_identity::{PeerId, PublicKey};
 use poi::SensitiveUrl;
 use quick_protobuf::BytesReader;
@@ -34,6 +34,7 @@ const ARTIFACT_CAR_MAX_BLOCKS: usize = 16_384;
 const ARTIFACT_CAR_MIN_OVERHEAD_BYTES: usize = 1024 * 1024;
 const ARTIFACT_CAR_FIXED_OVERHEAD_BYTES: usize = 64 * 1024;
 const ARTIFACT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
+const ARTIFACT_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS: usize = 8;
 const CARV2_PRAGMA: [u8; 11] = [
     0x0a, 0xa1, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x02,
@@ -49,6 +50,7 @@ const CAR_BLOCK_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) struct IpnsManifestCandidate {
     pub(crate) sequence: u64,
     pub(crate) cid: Cid,
+    eol: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +58,21 @@ struct RetrievalLimits {
     response_bytes: usize,
     block_count: usize,
     reconstructed_bytes: usize,
+    unixfs_max_depth: usize,
+    unixfs_max_link_visits: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HttpAttemptTimeouts {
+    idle: Duration,
+    total: Duration,
+}
+
+impl HttpAttemptTimeouts {
+    const PRODUCTION: Self = Self {
+        idle: ARTIFACT_HTTP_IDLE_TIMEOUT,
+        total: ARTIFACT_HTTP_TOTAL_TIMEOUT,
+    };
 }
 
 impl RetrievalLimits {
@@ -64,6 +81,8 @@ impl RetrievalLimits {
             response_bytes: MANIFEST_CAR_MAX_BYTES,
             block_count: MANIFEST_CAR_MAX_BLOCKS,
             reconstructed_bytes: MANIFEST_JSON_MAX_BYTES,
+            unixfs_max_depth: MANIFEST_CAR_MAX_BLOCKS,
+            unixfs_max_link_visits: MANIFEST_CAR_MAX_BLOCKS,
         }
     }
 
@@ -82,6 +101,8 @@ impl RetrievalLimits {
             response_bytes,
             block_count: ARTIFACT_CAR_MAX_BLOCKS,
             reconstructed_bytes,
+            unixfs_max_depth: ARTIFACT_CAR_MAX_BLOCKS,
+            unixfs_max_link_visits: ARTIFACT_CAR_MAX_BLOCKS,
         })
     }
 }
@@ -89,6 +110,7 @@ impl RetrievalLimits {
 pub(crate) struct TrustlessArtifactFetcher<'a> {
     client: &'a reqwest::Client,
     gateways: GatewayUrls<'a>,
+    timeouts: HttpAttemptTimeouts,
 }
 
 enum GatewayUrls<'a> {
@@ -116,10 +138,34 @@ impl GatewayUrls<'_> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct TrustlessArtifactFetchResult {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) gateway_index: usize,
-    pub(crate) gateway_count: usize,
+    verified_cid: String,
+    bytes: Vec<u8>,
+    gateway_index: usize,
+    gateway_count: usize,
+}
+
+impl TrustlessArtifactFetchResult {
+    pub(crate) fn verified_cid(&self) -> &str {
+        &self.verified_cid
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) const fn gateway_index(&self) -> usize {
+        self.gateway_index
+    }
+
+    pub(crate) const fn gateway_count(&self) -> usize {
+        self.gateway_count
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 impl<'a> TrustlessArtifactFetcher<'a> {
@@ -127,6 +173,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         Self {
             client,
             gateways: GatewayUrls::Public(gateways),
+            timeouts: HttpAttemptTimeouts::PRODUCTION,
         }
     }
 
@@ -134,6 +181,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         Self {
             client,
             gateways: GatewayUrls::Poi(gateways),
+            timeouts: HttpAttemptTimeouts::PRODUCTION,
         }
     }
 
@@ -144,7 +192,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         let cid = parse_cid(cid)?;
         self.fetch_cid_bytes(cid, RetrievalLimits::manifest(), "manifest")
             .await
-            .map(|result| result.bytes)
+            .map(TrustlessArtifactFetchResult::into_bytes)
     }
 
     pub(crate) async fn fetch_artifact_cid(
@@ -155,7 +203,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         let cid = parse_cid(cid)?;
         self.fetch_cid_bytes(cid, RetrievalLimits::artifact(byte_size)?, "artifact")
             .await
-            .map(|result| result.bytes)
+            .map(TrustlessArtifactFetchResult::into_bytes)
     }
 
     pub(crate) async fn fetch_artifact_cid_with_metadata_from_gateway(
@@ -164,12 +212,29 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         byte_size: u64,
         preferred_gateway_index: usize,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
+        self.fetch_artifact_cid_with_metadata_from_gateway_bounded(
+            cid,
+            byte_size,
+            preferred_gateway_index,
+            self.gateways.len(),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_artifact_cid_with_metadata_from_gateway_bounded(
+        &self,
+        cid: &str,
+        byte_size: u64,
+        preferred_gateway_index: usize,
+        max_gateway_attempts: usize,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         let cid = parse_cid(cid)?;
         self.fetch_cid_bytes_from_gateway(
             cid,
             RetrievalLimits::artifact(byte_size)?,
             "artifact",
             preferred_gateway_index,
+            max_gateway_attempts,
         )
         .await
     }
@@ -177,8 +242,19 @@ impl<'a> TrustlessArtifactFetcher<'a> {
     pub(crate) async fn resolve_ipns_manifest_candidates(
         &self,
         name: &str,
-        now: SystemTime,
     ) -> Result<Vec<IpnsManifestCandidate>, TrustlessArtifactError> {
+        self.resolve_ipns_manifest_candidates_with_clock(name, &SystemTime::now)
+            .await
+    }
+
+    pub(crate) async fn resolve_ipns_manifest_candidates_with_clock<F>(
+        &self,
+        name: &str,
+        acceptance_time: &F,
+    ) -> Result<Vec<IpnsManifestCandidate>, TrustlessArtifactError>
+    where
+        F: Fn() -> SystemTime + Sync + ?Sized,
+    {
         if self.gateways.is_empty() {
             return Err(TrustlessArtifactError::NoGateways);
         }
@@ -204,7 +280,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 requests.push(async move {
                     let attempt_started = Instant::now();
                     let result = self
-                        .fetch_ipns_record_candidate(&url, source, peer_id, now)
+                        .fetch_ipns_record_candidate(&url, source, peer_id)
                         .await;
                     (gateway_index, attempt_started.elapsed().as_millis(), result)
                 });
@@ -239,6 +315,27 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             }
         }
 
+        // This single post-settlement sample is authoritative; keep filtering and return synchronous.
+        let accepted_at = chrono::DateTime::<Utc>::from(acceptance_time());
+        candidates.retain(|(gateway_index, candidate)| {
+            if candidate.eol <= accepted_at {
+                debug!(
+                    gateway_index,
+                    gateway_count,
+                    ipns_name = name,
+                    ipns_sequence = candidate.sequence,
+                    eol = %candidate.eol,
+                    "POI artifact IPNS gateway record expired before aggregate acceptance"
+                );
+                errors.push((
+                    *gateway_index,
+                    TrustlessArtifactError::ExpiredIpnsRecord { eol: candidate.eol },
+                ));
+                false
+            } else {
+                true
+            }
+        });
         if candidates.is_empty() {
             return Err(errors
                 .into_iter()
@@ -265,7 +362,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         limits: RetrievalLimits,
         resource: &'static str,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
-        self.fetch_cid_bytes_from_gateway(cid, limits, resource, 0)
+        self.fetch_cid_bytes_from_gateway(cid, limits, resource, 0, self.gateways.len())
             .await
     }
 
@@ -275,6 +372,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         limits: RetrievalLimits,
         resource: &'static str,
         preferred_gateway_index: usize,
+        max_gateway_attempts: usize,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         if self.gateways.is_empty() {
             return Err(TrustlessArtifactError::NoGateways);
@@ -283,7 +381,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         let mut last_error = None;
         let gateway_count = self.gateways.len();
         let preferred_gateway_index = preferred_gateway_index % gateway_count;
-        for attempt in 0..gateway_count {
+        for attempt in 0..gateway_count.min(max_gateway_attempts.max(1)) {
             let gateway_index = (preferred_gateway_index + attempt) % gateway_count;
             let gateway = self.gateways.expose(gateway_index);
             let attempt_started = Instant::now();
@@ -310,6 +408,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                         );
                     }
                     return Ok(TrustlessArtifactFetchResult {
+                        verified_cid: cid.to_string(),
                         bytes,
                         gateway_index,
                         gateway_count,
@@ -340,16 +439,17 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         source: TrustlessHttpSource,
         limits: RetrievalLimits,
     ) -> Result<Vec<u8>, TrustlessArtifactError> {
-        let car_bytes = fetch_response_bytes(
+        let car_bytes = fetch_response_bytes_with_timeouts(
             self.client,
             url,
             source,
             Some(CAR_ACCEPT),
             limits.response_bytes,
+            self.timeouts,
         )
         .await?;
         let blocks = decode_car_blocks(&car_bytes, cid, limits.block_count).await?;
-        reconstruct_file(cid, &blocks, limits.reconstructed_bytes)
+        reconstruct_file(cid, &blocks, limits)
     }
 
     async fn fetch_ipns_record_candidate(
@@ -357,17 +457,17 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         url: &Url,
         source: TrustlessHttpSource,
         peer_id: PeerId,
-        now: SystemTime,
     ) -> Result<IpnsManifestCandidate, TrustlessArtifactError> {
-        let bytes = fetch_response_bytes(
+        let bytes = fetch_response_bytes_with_timeouts(
             self.client,
             url,
             source,
             Some(IPNS_RECORD_ACCEPT),
             IPNS_RECORD_MAX_BYTES,
+            self.timeouts,
         )
         .await?;
-        verify_ipns_record_candidate(&bytes, peer_id, now)
+        verify_ipns_record_candidate(&bytes, peer_id)
     }
 }
 
@@ -385,20 +485,6 @@ pub(crate) async fn fetch_manifest_url(
     .await
 }
 
-pub(crate) async fn fetch_sensitive_manifest_url(
-    client: &reqwest::Client,
-    url: &SensitiveUrl,
-) -> Result<Vec<u8>, TrustlessArtifactError> {
-    fetch_response_bytes(
-        client,
-        url.expose_url(),
-        TrustlessHttpSource::ExplicitManifest,
-        None,
-        MANIFEST_JSON_MAX_BYTES,
-    )
-    .await
-}
-
 async fn fetch_response_bytes(
     client: &reqwest::Client,
     url: &Url,
@@ -406,18 +492,35 @@ async fn fetch_response_bytes(
     accept: Option<HeaderValue>,
     limit: usize,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
-    fetch_response_bytes_with_timeout(
+    fetch_response_bytes_with_timeouts(
         client,
         url,
         source,
         accept,
         limit,
-        ARTIFACT_HTTP_IDLE_TIMEOUT,
+        HttpAttemptTimeouts::PRODUCTION,
     )
     .await
 }
 
-async fn fetch_response_bytes_with_timeout(
+async fn fetch_response_bytes_with_timeouts(
+    client: &reqwest::Client,
+    url: &Url,
+    source: TrustlessHttpSource,
+    accept: Option<HeaderValue>,
+    limit: usize,
+    timeouts: HttpAttemptTimeouts,
+) -> Result<Vec<u8>, TrustlessArtifactError> {
+    let deadline = tokio::time::Instant::now() + timeouts.total;
+    tokio::time::timeout_at(
+        deadline,
+        fetch_response_bytes_with_idle_timeout(client, url, source, accept, limit, timeouts.idle),
+    )
+    .await
+    .map_err(|_| TrustlessArtifactError::HttpAttemptDeadline { origin: source })?
+}
+
+async fn fetch_response_bytes_with_idle_timeout(
     client: &reqwest::Client,
     url: &Url,
     source: TrustlessHttpSource,
@@ -506,113 +609,194 @@ async fn decode_car_blocks(
 fn reconstruct_file(
     root: Cid,
     blocks: &HashMap<Cid, Vec<u8>>,
-    limit: usize,
+    limits: RetrievalLimits,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
     let mut out = Vec::new();
-    let mut visiting = HashSet::new();
-    append_cid(root, blocks, limit, &mut visiting, &mut out)?;
-    Ok(out)
-}
-
-fn append_cid(
-    cid: Cid,
-    blocks: &HashMap<Cid, Vec<u8>>,
-    limit: usize,
-    visiting: &mut HashSet<Cid>,
-    out: &mut Vec<u8>,
-) -> Result<usize, TrustlessArtifactError> {
-    let block = blocks
-        .get(&cid)
-        .ok_or(TrustlessArtifactError::MissingBlock { cid })?;
-    match cid.codec() {
-        RAW_CODEC => append_bytes(out, block, limit),
-        DAG_PB_CODEC => append_dag_pb(cid, block, blocks, limit, visiting, out),
-        codec => Err(TrustlessArtifactError::UnsupportedCodec { cid, codec }),
-    }
-}
-
-fn append_dag_pb(
-    cid: Cid,
-    block: &[u8],
-    blocks: &HashMap<Cid, Vec<u8>>,
-    limit: usize,
-    visiting: &mut HashSet<Cid>,
-    out: &mut Vec<u8>,
-) -> Result<usize, TrustlessArtifactError> {
-    if !visiting.insert(cid) {
-        return Err(TrustlessArtifactError::Cycle { cid });
-    }
-
-    let result = append_dag_pb_inner(block, blocks, limit, visiting, out);
-    visiting.remove(&cid);
-    result
-}
-
-fn append_dag_pb_inner(
-    block: &[u8],
-    blocks: &HashMap<Cid, Vec<u8>>,
-    limit: usize,
-    visiting: &mut HashSet<Cid>,
-    out: &mut Vec<u8>,
-) -> Result<usize, TrustlessArtifactError> {
-    let start_len = out.len();
-    let node = PbNode::from_bytes(Bytes::copy_from_slice(block))?;
-    let data = node
-        .data
-        .as_deref()
-        .ok_or(TrustlessArtifactError::MalformedUnixFsFile(
-            "missing UnixFS Data",
-        ))?;
-    let unixfs = UnixFsData::decode(data)?;
-
-    match unixfs.data_type {
-        UnixFsDataType::Raw => {
-            if !node.links.is_empty() || !unixfs.blocksizes.is_empty() {
-                return Err(TrustlessArtifactError::MalformedUnixFsFile(
-                    "raw UnixFS node must not contain links or block sizes",
-                ));
+    let mut active_ancestry = HashSet::new();
+    let mut frames = Vec::<UnixFsFrame>::new();
+    let mut next = Some((root, 1_usize));
+    let mut link_visits = 0_usize;
+    loop {
+        if let Some((cid, depth)) = next.take() {
+            if depth > limits.unixfs_max_depth {
+                return Err(TrustlessArtifactError::UnixFsDepthLimitExceeded {
+                    limit: limits.unixfs_max_depth,
+                });
             }
-            if let Some(data) = unixfs.data {
-                append_bytes(out, data, limit)?;
-            }
-        }
-        UnixFsDataType::File => {
-            if !unixfs.blocksizes.is_empty() && unixfs.blocksizes.len() != node.links.len() {
-                return Err(TrustlessArtifactError::MalformedUnixFsFile(
-                    "UnixFS block sizes must match link count",
-                ));
-            }
-            if let Some(data) = unixfs.data {
-                append_bytes(out, data, limit)?;
-            }
-            for (index, link) in node.links.iter().enumerate() {
-                let before_child = out.len();
-                append_cid(link.cid, blocks, limit, visiting, out)?;
-                if let Some(expected) = unixfs.blocksizes.get(index) {
-                    let actual = u64::try_from(out.len() - before_child)
-                        .map_err(|_| TrustlessArtifactError::ReconstructedTooLarge { limit })?;
-                    if actual != *expected {
-                        return Err(TrustlessArtifactError::MalformedUnixFsFile(
-                            "UnixFS child size does not match declared block size",
-                        ));
+            let block = blocks
+                .get(&cid)
+                .ok_or(TrustlessArtifactError::MissingBlock { cid })?;
+            match cid.codec() {
+                RAW_CODEC => {
+                    append_bytes(&mut out, block, limits.reconstructed_bytes)?;
+                    validate_completed_child(&mut frames, out.len(), limits.reconstructed_bytes)?;
+                    if frames.is_empty() {
+                        return Ok(out);
                     }
                 }
+                DAG_PB_CODEC => {
+                    if !active_ancestry.insert(cid) {
+                        return Err(TrustlessArtifactError::Cycle { cid });
+                    }
+                    let node = PbNode::from_bytes(Bytes::copy_from_slice(block))?;
+                    let data =
+                        node.data
+                            .as_deref()
+                            .ok_or(TrustlessArtifactError::MalformedUnixFsFile(
+                                "missing UnixFS Data",
+                            ))?;
+                    let unixfs = UnixFsData::decode(data)?;
+                    match unixfs.data_type {
+                        UnixFsDataType::Raw => {
+                            if !node.links.is_empty() || !unixfs.blocksizes.is_empty() {
+                                return Err(TrustlessArtifactError::MalformedUnixFsFile(
+                                    "raw UnixFS node must not contain links or block sizes",
+                                ));
+                            }
+                            let start = out.len();
+                            if let Some(data) = unixfs.data {
+                                append_bytes(&mut out, data, limits.reconstructed_bytes)?;
+                            }
+                            if let Some(filesize) = unixfs.filesize {
+                                validate_unixfs_size(
+                                    out.len() - start,
+                                    filesize,
+                                    limits.reconstructed_bytes,
+                                )?;
+                            }
+                            active_ancestry.remove(&cid);
+                            validate_completed_child(
+                                &mut frames,
+                                out.len(),
+                                limits.reconstructed_bytes,
+                            )?;
+                            if frames.is_empty() {
+                                return Ok(out);
+                            }
+                        }
+                        UnixFsDataType::File => {
+                            if !unixfs.blocksizes.is_empty()
+                                && unixfs.blocksizes.len() != node.links.len()
+                            {
+                                return Err(TrustlessArtifactError::MalformedUnixFsFile(
+                                    "UnixFS block sizes must match link count",
+                                ));
+                            }
+                            let output_start = out.len();
+                            if let Some(data) = unixfs.data {
+                                append_bytes(&mut out, data, limits.reconstructed_bytes)?;
+                            }
+                            frames.push(UnixFsFrame {
+                                cid,
+                                depth,
+                                output_start,
+                                links: node.links,
+                                blocksizes: unixfs.blocksizes,
+                                filesize: unixfs.filesize,
+                                next_link: 0,
+                                pending_child: None,
+                            });
+                        }
+                        other => {
+                            return Err(TrustlessArtifactError::UnsupportedUnixFsType {
+                                data_type: other,
+                            });
+                        }
+                    }
+                }
+                codec => return Err(TrustlessArtifactError::UnsupportedCodec { cid, codec }),
             }
+            continue;
         }
-        other => return Err(TrustlessArtifactError::UnsupportedUnixFsType { data_type: other }),
-    }
 
-    let appended = out.len() - start_len;
-    if let Some(filesize) = unixfs.filesize {
-        let actual = u64::try_from(appended)
+        let frame = frames
+            .last_mut()
+            .expect("UnixFS traversal has active frame");
+        if frame.next_link < frame.links.len() {
+            link_visits = link_visits.checked_add(1).ok_or(
+                TrustlessArtifactError::UnixFsLinkVisitLimitExceeded {
+                    limit: limits.unixfs_max_link_visits,
+                },
+            )?;
+            if link_visits > limits.unixfs_max_link_visits {
+                return Err(TrustlessArtifactError::UnixFsLinkVisitLimitExceeded {
+                    limit: limits.unixfs_max_link_visits,
+                });
+            }
+            let link_index = frame.next_link;
+            let child = frame.links[link_index].cid;
+            let child_depth = frame.depth.checked_add(1).ok_or(
+                TrustlessArtifactError::UnixFsDepthLimitExceeded {
+                    limit: limits.unixfs_max_depth,
+                },
+            )?;
+            frame.next_link += 1;
+            frame.pending_child = Some((out.len(), frame.blocksizes.get(link_index).copied()));
+            next = Some((child, child_depth));
+            continue;
+        }
+
+        let frame = frames.pop().expect("UnixFS traversal frame exists");
+        let appended = out.len() - frame.output_start;
+        if let Some(filesize) = frame.filesize {
+            validate_unixfs_size(appended, filesize, limits.reconstructed_bytes)?;
+        }
+        active_ancestry.remove(&frame.cid);
+        validate_completed_child(&mut frames, out.len(), limits.reconstructed_bytes)?;
+        if frames.is_empty() {
+            return Ok(out);
+        }
+    }
+}
+
+struct UnixFsFrame {
+    cid: Cid,
+    depth: usize,
+    output_start: usize,
+    links: Vec<PbLink>,
+    blocksizes: Vec<u64>,
+    filesize: Option<u64>,
+    next_link: usize,
+    pending_child: Option<(usize, Option<u64>)>,
+}
+
+fn validate_completed_child(
+    frames: &mut [UnixFsFrame],
+    output_len: usize,
+    limit: usize,
+) -> Result<(), TrustlessArtifactError> {
+    let Some(parent) = frames.last_mut() else {
+        return Ok(());
+    };
+    let (child_start, expected) = parent
+        .pending_child
+        .take()
+        .expect("completed UnixFS child belongs to parent frame");
+    if let Some(expected) = expected {
+        let actual = u64::try_from(output_len - child_start)
             .map_err(|_| TrustlessArtifactError::ReconstructedTooLarge { limit })?;
-        if actual != filesize {
+        if actual != expected {
             return Err(TrustlessArtifactError::MalformedUnixFsFile(
-                "UnixFS file size does not match reconstructed bytes",
+                "UnixFS child size does not match declared block size",
             ));
         }
     }
-    Ok(appended)
+    Ok(())
+}
+
+fn validate_unixfs_size(
+    actual: usize,
+    expected: u64,
+    limit: usize,
+) -> Result<(), TrustlessArtifactError> {
+    let actual = u64::try_from(actual)
+        .map_err(|_| TrustlessArtifactError::ReconstructedTooLarge { limit })?;
+    if actual != expected {
+        return Err(TrustlessArtifactError::MalformedUnixFsFile(
+            "UnixFS file size does not match reconstructed bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn append_bytes(
@@ -830,7 +1014,6 @@ fn read_car_varint(bytes: &[u8], offset: usize) -> Result<(u64, usize), Trustles
 fn verify_ipns_record_candidate(
     bytes: &[u8],
     peer_id: PeerId,
-    now: SystemTime,
 ) -> Result<IpnsManifestCandidate, TrustlessArtifactError> {
     if bytes.len() > IPNS_RECORD_MAX_BYTES {
         return Err(TrustlessArtifactError::IpnsRecordTooLarge {
@@ -851,10 +1034,6 @@ fn verify_ipns_record_candidate(
         .validity()
         .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord { source })?
         .with_timezone(&Utc);
-    let now = chrono::DateTime::<Utc>::from(now);
-    if eol <= now {
-        return Err(TrustlessArtifactError::ExpiredIpnsRecord { eol });
-    }
     let data = record
         .data()
         .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord { source })?;
@@ -862,6 +1041,7 @@ fn verify_ipns_record_candidate(
     Ok(IpnsManifestCandidate {
         sequence: data.sequence(),
         cid,
+        eol,
     })
 }
 
@@ -1090,6 +1270,8 @@ pub(crate) enum TrustlessArtifactError {
         origin: TrustlessHttpSource,
         phase: TrustlessHttpPhase,
     },
+    #[error("POI artifact HTTP {origin} exceeded the total attempt deadline")]
+    HttpAttemptDeadline { origin: TrustlessHttpSource },
     #[error("POI artifact HTTP {origin} returned {status}")]
     HttpStatus {
         origin: TrustlessHttpSource,
@@ -1127,6 +1309,10 @@ pub(crate) enum TrustlessArtifactError {
     MalformedUnixFsFile(&'static str),
     #[error("cycle detected while reconstructing UnixFS CID {cid}")]
     Cycle { cid: Cid },
+    #[error("UnixFS reconstruction exceeds depth limit {limit}")]
+    UnixFsDepthLimitExceeded { limit: usize },
+    #[error("UnixFS reconstruction exceeds followed-link limit {limit}")]
+    UnixFsLinkVisitLimitExceeded { limit: usize },
     #[error("reconstructed POI artifact bytes exceed {limit} bytes")]
     ReconstructedTooLarge { limit: usize },
     #[error("artifact descriptor byte_size {byte_size} is too large for this platform")]
@@ -1170,6 +1356,26 @@ pub(crate) enum TrustlessArtifactError {
     },
     #[error("no valid IPNS records were returned by configured gateways")]
     NoValidIpnsRecords,
+}
+
+#[cfg(test)]
+impl TrustlessArtifactFetchResult {
+    pub(crate) fn verified_for_test(cid: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            verified_cid: cid.into(),
+            bytes,
+            gateway_index: 0,
+            gateway_count: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+impl TrustlessArtifactFetcher<'_> {
+    const fn with_http_timeouts_for_test(mut self, idle: Duration, total: Duration) -> Self {
+        self.timeouts = HttpAttemptTimeouts { idle, total };
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1229,37 +1435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sensitive_manifest_and_gateway_errors_are_url_free() {
-        let unavailable_url = sensitive_server_url(
-            Url::parse("http://127.0.0.1:0").expect("unavailable manifest URL"),
-        );
-        let send_error = fetch_sensitive_manifest_url(&reqwest::Client::new(), &unavailable_url)
-            .await
-            .expect_err("manifest send error");
-        assert!(matches!(
-            &send_error,
-            TrustlessArtifactError::Http {
-                origin: TrustlessHttpSource::ExplicitManifest,
-                phase: TrustlessHttpPhase::ResponseHeaders,
-                ..
-            }
-        ));
-        assert_artifact_error_safe(&send_error);
-
-        let status_server = spawn_once_server(503, b"body-sentinel".to_vec());
-        let manifest_url = sensitive_server_url(status_server.url.clone());
-        let status_error = fetch_sensitive_manifest_url(&reqwest::Client::new(), &manifest_url)
-            .await
-            .expect_err("manifest status error");
-        assert!(matches!(
-            &status_error,
-            TrustlessArtifactError::HttpStatus {
-                origin: TrustlessHttpSource::ExplicitManifest,
-                status,
-            } if *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        ));
-        assert_artifact_error_safe(&status_error);
-
+    async fn sensitive_gateway_errors_are_url_free() {
         let oversized_server = spawn_once_server(200, b"oversized".to_vec());
         let oversized_url = sensitive_server_url(oversized_server.url.clone());
         let oversized_error = fetch_response_bytes(
@@ -1281,13 +1457,16 @@ mod tests {
         assert_artifact_error_safe(&oversized_error);
 
         let stalled_url = spawn_stalled_server();
-        let timeout_error = fetch_response_bytes_with_timeout(
+        let timeout_error = fetch_response_bytes_with_timeouts(
             &reqwest::Client::new(),
             stalled_url.expose_url(),
             TrustlessHttpSource::Gateway { index: 1, count: 2 },
             None,
             1024,
-            Duration::from_millis(20),
+            HttpAttemptTimeouts {
+                idle: Duration::from_millis(20),
+                total: Duration::from_secs(1),
+            },
         )
         .await
         .expect_err("gateway timeout");
@@ -1337,6 +1516,274 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn slow_drip_hits_total_deadline_despite_remaining_under_idle_timeout() {
+        let server = spawn_controlled_chunk_server();
+        let url = sensitive_server_url(server.url.clone());
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            fetch_response_bytes_with_timeouts(
+                &client,
+                url.expose_url(),
+                TrustlessHttpSource::Gateway { index: 1, count: 3 },
+                None,
+                1024,
+                HttpAttemptTimeouts {
+                    idle: Duration::from_secs(5),
+                    total: Duration::from_secs(12),
+                },
+            )
+            .await
+        });
+        server.wait_for_request().await;
+        server.send_headers(200);
+        server.send_chunk(b"body-sentinel-0".to_vec());
+        tokio::task::yield_now().await;
+        for chunk in [b"body-sentinel-1".as_slice(), b"body-sentinel-2".as_slice()] {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            server.send_chunk(chunk.to_vec());
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(4)).await;
+
+        let error = task
+            .await
+            .expect("join slow-drip request")
+            .expect_err("absolute deadline expires");
+        assert_eq!(started.elapsed(), Duration::from_secs(12));
+        assert!(matches!(
+            &error,
+            TrustlessArtifactError::HttpAttemptDeadline {
+                origin: TrustlessHttpSource::Gateway { index: 1, count: 3 }
+            }
+        ));
+        assert_artifact_error_safe(&error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_body_idle_stall_keeps_phase_specific_timeout() {
+        let server = spawn_controlled_chunk_server();
+        let url = server.url.clone();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            fetch_response_bytes_with_timeouts(
+                &client,
+                &url,
+                TrustlessHttpSource::ExplicitManifest,
+                None,
+                1024,
+                HttpAttemptTimeouts {
+                    idle: Duration::from_secs(3),
+                    total: Duration::from_secs(20),
+                },
+            )
+            .await
+        });
+        server.wait_for_request().await;
+        server.send_headers(200);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        assert!(matches!(
+            task.await.expect("join idle-stall request"),
+            Err(TrustlessArtifactError::HttpTimeout {
+                origin: TrustlessHttpSource::ExplicitManifest,
+                phase: TrustlessHttpPhase::ResponseBody,
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_header_idle_stall_keeps_phase_specific_timeout() {
+        let server = spawn_controlled_chunk_server();
+        let url = server.url.clone();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            fetch_response_bytes_with_timeouts(
+                &client,
+                &url,
+                TrustlessHttpSource::ExplicitManifest,
+                None,
+                1024,
+                HttpAttemptTimeouts {
+                    idle: Duration::from_secs(3),
+                    total: Duration::from_secs(20),
+                },
+            )
+            .await
+        });
+        server.wait_for_request().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        assert!(matches!(
+            task.await.expect("join header-stall request"),
+            Err(TrustlessArtifactError::HttpTimeout {
+                origin: TrustlessHttpSource::ExplicitManifest,
+                phase: TrustlessHttpPhase::ResponseHeaders,
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_completed_before_total_deadline_succeeds() {
+        let server = spawn_controlled_chunk_server();
+        let url = server.url.clone();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            fetch_response_bytes_with_timeouts(
+                &client,
+                &url,
+                TrustlessHttpSource::ExplicitManifest,
+                None,
+                1024,
+                HttpAttemptTimeouts {
+                    idle: Duration::from_secs(5),
+                    total: Duration::from_secs(20),
+                },
+            )
+            .await
+        });
+        server.wait_for_request().await;
+        server.send_headers(200);
+        server.send_chunk(b"complete".to_vec());
+        server.finish();
+
+        assert_eq!(
+            task.await
+                .expect("join completed request")
+                .expect("completed response"),
+            b"complete"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_first_gateway_deadline_falls_back_to_healthy_gateway() {
+        let artifact_bytes = b"deadline fallback artifact".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let slow = spawn_controlled_chunk_server();
+        let healthy = spawn_controlled_chunk_server();
+        let healthy_body = car_bytes(cid, &[(cid, artifact_bytes.clone())]);
+        let gateways = vec![
+            sensitive_server_url(slow.url.clone()),
+            sensitive_server_url(healthy.url.clone()),
+        ];
+        let expected = artifact_bytes.clone();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            TrustlessArtifactFetcher::new_poi(&client, &gateways)
+                .with_http_timeouts_for_test(Duration::from_secs(5), Duration::from_secs(12))
+                .fetch_artifact_cid(&cid.to_string(), expected.len() as u64)
+                .await
+        });
+        slow.wait_for_request().await;
+        slow.send_headers(200);
+        slow.send_chunk(b"slow-0".to_vec());
+        tokio::task::yield_now().await;
+        for chunk in [b"slow-1".as_slice(), b"slow-2".as_slice()] {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            slow.send_chunk(chunk.to_vec());
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let healthy_path = healthy.wait_for_request().await;
+        healthy.send_headers(200);
+        healthy.send_chunk(healthy_body);
+        healthy.finish();
+
+        assert_eq!(
+            task.await
+                .expect("join fallback request")
+                .expect("healthy fallback succeeds"),
+            artifact_bytes
+        );
+        assert!(healthy_path.contains(&cid.to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_gateway_fetch_uses_three_deadline_windows_and_never_contacts_fourth() {
+        let artifact_bytes = b"three-attempt artifact".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let servers = (0..4)
+            .map(|_| spawn_controlled_chunk_server())
+            .collect::<Vec<_>>();
+        let gateways = servers
+            .iter()
+            .map(|server| sensitive_server_url(server.url.clone()))
+            .collect::<Vec<_>>();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            TrustlessArtifactFetcher::new_poi(&client, &gateways)
+                .with_http_timeouts_for_test(Duration::from_secs(10), Duration::from_secs(5))
+                .fetch_artifact_cid_with_metadata_from_gateway_bounded(
+                    &cid.to_string(),
+                    artifact_bytes.len() as u64,
+                    0,
+                    3,
+                )
+                .await
+        });
+        for server in &servers[..3] {
+            server.wait_for_request().await;
+            server.send_headers(200);
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+
+        let error = task
+            .await
+            .expect("join bounded gateway request")
+            .expect_err("three deadlines exhaust bounded attempts");
+        assert_eq!(started.elapsed(), Duration::from_secs(15));
+        assert!(matches!(
+            error,
+            TrustlessArtifactError::HttpAttemptDeadline {
+                origin: TrustlessHttpSource::Gateway { index: 2, count: 4 }
+            }
+        ));
+        servers[3].assert_no_request();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_ipns_slow_peer_consumes_only_one_deadline_window() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let cid = raw_cid(b"concurrent IPNS candidate");
+        let record = ipns_record(&keypair, format!("/ipfs/{cid}"), 7);
+        let slow = spawn_controlled_chunk_server();
+        let healthy = spawn_controlled_chunk_server();
+        let gateways = vec![
+            sensitive_server_url(slow.url.clone()),
+            sensitive_server_url(healthy.url.clone()),
+        ];
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            TrustlessArtifactFetcher::new_poi(&client, &gateways)
+                .with_http_timeouts_for_test(Duration::from_secs(10), Duration::from_secs(5))
+                .resolve_ipns_manifest_candidates(&name)
+                .await
+        });
+        slow.wait_for_request().await;
+        healthy.wait_for_request().await;
+        healthy.send_headers(200);
+        healthy.send_chunk(record);
+        healthy.finish();
+        slow.send_headers(200);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let candidates = task
+            .await
+            .expect("join concurrent IPNS request")
+            .expect("healthy IPNS candidate survives slow peer");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sequence, 7);
+        assert_eq!(candidates[0].cid, cid);
+    }
+
     #[test]
     fn car_gateway_url_adds_trustless_query_parameters() {
         let gateway = Url::parse("https://gateway.example/base/ipfs?existing=1").expect("URL");
@@ -1364,13 +1811,13 @@ mod tests {
         let car = car_bytes(root, &[(root, b"hello raw".to_vec())]);
 
         let blocks = decode_car_blocks(&car, root, 8).await.expect("CAR blocks");
-        let bytes = reconstruct_file(root, &blocks, 1024).expect("raw root");
+        let bytes = reconstruct_for_test(root, &blocks, 1024, 8, 8).expect("raw root");
 
         assert_eq!(bytes, b"hello raw");
     }
 
     #[tokio::test]
-    async fn duplicate_car_blocks_count_toward_limit() {
+    async fn car_duplicate_blocks_continue_to_count_toward_car_block_limit() {
         let root = raw_cid(b"duplicate raw");
         let car = car_bytes(
             root,
@@ -1398,7 +1845,7 @@ mod tests {
         let car = car_bytes(root, &[(root, block)]);
 
         let blocks = decode_car_blocks(&car, root, 8).await.expect("CAR blocks");
-        let bytes = reconstruct_file(root, &blocks, 1024).expect("DAG-PB file");
+        let bytes = reconstruct_for_test(root, &blocks, 1024, 8, 8).expect("DAG-PB file");
 
         assert_eq!(bytes, b"inline");
     }
@@ -1423,7 +1870,7 @@ mod tests {
         );
 
         let blocks = decode_car_blocks(&car, root, 8).await.expect("CAR blocks");
-        let bytes = reconstruct_file(root, &blocks, 1024).expect("DAG-PB leaves");
+        let bytes = reconstruct_for_test(root, &blocks, 1024, 8, 8).expect("DAG-PB leaves");
 
         assert_eq!(bytes, b"root-leftright");
     }
@@ -1436,7 +1883,8 @@ mod tests {
         let car = car_bytes(root, &[(root, root_block)]);
 
         let blocks = decode_car_blocks(&car, root, 8).await.expect("CAR blocks");
-        let error = reconstruct_file(root, &blocks, 1024).expect_err("missing child block");
+        let error =
+            reconstruct_for_test(root, &blocks, 1024, 8, 8).expect_err("missing child block");
 
         assert!(matches!(error, TrustlessArtifactError::MissingBlock { cid } if cid == child));
     }
@@ -1515,7 +1963,8 @@ mod tests {
         let car = car_bytes(root, &[(root, block)]);
 
         let blocks = decode_car_blocks(&car, root, 8).await.expect("CAR blocks");
-        let error = reconstruct_file(root, &blocks, 1024).expect_err("directory rejected");
+        let error =
+            reconstruct_for_test(root, &blocks, 1024, 8, 8).expect_err("directory rejected");
 
         assert!(matches!(
             error,
@@ -1531,11 +1980,118 @@ mod tests {
         let car = car_bytes(root, &[(root, b"too large".to_vec())]);
 
         let blocks = decode_car_blocks(&car, root, 8).await.expect("CAR blocks");
-        let error = reconstruct_file(root, &blocks, 3).expect_err("limit exceeded");
+        let error = reconstruct_for_test(root, &blocks, 3, 8, 8).expect_err("limit exceeded");
 
         assert!(matches!(
             error,
             TrustlessArtifactError::ReconstructedTooLarge { limit: 3 }
+        ));
+    }
+
+    #[test]
+    fn unixfs_depth_accepts_exact_limit() {
+        let (root, blocks) = unixfs_chain(8);
+        assert_eq!(
+            reconstruct_for_test(root, &blocks, 1, 8, 7).expect("exact depth accepted"),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn unixfs_budgets_are_derived_from_applicable_car_block_caps() {
+        let manifest = RetrievalLimits::manifest();
+        assert_eq!(manifest.unixfs_max_depth, MANIFEST_CAR_MAX_BLOCKS);
+        assert_eq!(manifest.unixfs_max_link_visits, MANIFEST_CAR_MAX_BLOCKS);
+        let artifact = RetrievalLimits::artifact(1).expect("artifact limits");
+        assert_eq!(artifact.unixfs_max_depth, ARTIFACT_CAR_MAX_BLOCKS);
+        assert_eq!(artifact.unixfs_max_link_visits, ARTIFACT_CAR_MAX_BLOCKS);
+    }
+
+    #[test]
+    fn unixfs_depth_rejects_limit_plus_one() {
+        let (root, blocks) = unixfs_chain(9);
+        assert!(matches!(
+            reconstruct_for_test(root, &blocks, 1, 8, 8),
+            Err(TrustlessArtifactError::UnixFsDepthLimitExceeded { limit: 8 })
+        ));
+    }
+
+    #[test]
+    fn unixfs_link_visits_accept_exact_limit() {
+        let (root, blocks) = repeated_link_graph(8);
+        assert_eq!(
+            reconstruct_for_test(root, &blocks, 8, 2, 8).expect("exact visits accepted"),
+            vec![b'x'; 8]
+        );
+    }
+
+    #[test]
+    fn unixfs_link_visits_reject_limit_plus_one() {
+        let (root, blocks) = repeated_link_graph(9);
+        assert!(matches!(
+            reconstruct_for_test(root, &blocks, 9, 2, 8),
+            Err(TrustlessArtifactError::UnixFsLinkVisitLimitExceeded { limit: 8 })
+        ));
+    }
+
+    #[test]
+    fn unixfs_repeated_link_visits_are_charged_individually() {
+        let (root, blocks) = repeated_link_graph(3);
+        assert!(matches!(
+            reconstruct_for_test(root, &blocks, 3, 2, 2),
+            Err(TrustlessArtifactError::UnixFsLinkVisitLimitExceeded { limit: 2 })
+        ));
+    }
+
+    #[test]
+    fn unixfs_diamond_dag_emits_shared_child_for_each_reference() {
+        let shared = raw_cid(b"x");
+        let left_block = dag_pb_file_node(b"", &[(shared, "left-shared", 1)], Some(1));
+        let left = dag_pb_cid(&left_block);
+        let right_block = dag_pb_file_node(b"", &[(shared, "right-shared", 1)], Some(1));
+        let right = dag_pb_cid(&right_block);
+        let root_block = dag_pb_file_node(b"", &[(left, "left", 1), (right, "right", 1)], Some(2));
+        let root = dag_pb_cid(&root_block);
+        let blocks = HashMap::from([
+            (root, root_block),
+            (left, left_block),
+            (right, right_block),
+            (shared, b"x".to_vec()),
+        ]);
+
+        assert_eq!(
+            reconstruct_for_test(root, &blocks, 2, 3, 4).expect("diamond DAG"),
+            b"xx"
+        );
+    }
+
+    #[test]
+    fn unixfs_active_path_cycle_is_still_rejected() {
+        let root = dag_pb_cid(b"cycle-key");
+        let root_block = dag_pb_file_node(b"", &[(root, "cycle", 0)], Some(0));
+        let blocks = HashMap::from([(root, root_block)]);
+
+        assert!(matches!(
+            reconstruct_for_test(root, &blocks, 1, 2, 1),
+            Err(TrustlessArtifactError::Cycle { cid }) if cid == root
+        ));
+    }
+
+    #[test]
+    fn unixfs_deep_chain_is_iterative_and_does_not_use_call_stack() {
+        let (root, blocks) = unixfs_chain(2_048);
+        assert_eq!(
+            reconstruct_for_test(root, &blocks, 1, 2_048, 2_047).expect("deep iterative chain"),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn unixfs_output_limit_remains_independent() {
+        let (root, blocks) = repeated_link_graph(2);
+        assert!(matches!(
+            reconstruct_for_test(root, &blocks, 1, 2, 2),
+            Err(TrustlessArtifactError::ReconstructedTooLarge { limit: 1 })
         ));
     }
 
@@ -1555,12 +2111,11 @@ mod tests {
         let keypair = test_ipns_keypair();
         let peer_id = keypair.public().to_peer_id();
         let manifest_cid = raw_cid(b"manifest");
-        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let prefixed = ipns_record(&keypair, format!("/ipfs/{manifest_cid}"), 3);
         let bare = ipns_record(&keypair, manifest_cid.to_string(), 2);
 
-        let prefixed = verify_ipns_record_candidate(&prefixed, peer_id, now).expect("prefixed");
-        let bare = verify_ipns_record_candidate(&bare, peer_id, now).expect("bare");
+        let prefixed = verify_ipns_record_candidate(&prefixed, peer_id).expect("prefixed");
+        let bare = verify_ipns_record_candidate(&bare, peer_id).expect("bare");
 
         assert_eq!(prefixed.sequence, 3);
         assert_eq!(prefixed.cid, manifest_cid);
@@ -1575,12 +2130,7 @@ mod tests {
         let peer_id = good_keypair.public().to_peer_id();
         let record = ipns_record(&bad_keypair, raw_cid(b"manifest").to_string(), 1);
 
-        let error = verify_ipns_record_candidate(
-            &record,
-            peer_id,
-            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        )
-        .expect_err("invalid signature");
+        let error = verify_ipns_record_candidate(&record, peer_id).expect_err("invalid signature");
 
         assert!(matches!(
             error,
@@ -1596,12 +2146,8 @@ mod tests {
         let record =
             ipns_record_with_embedded_public_key(&bad_keypair, raw_cid(b"manifest").to_string(), 1);
 
-        let error = verify_ipns_record_candidate(
-            &record,
-            peer_id,
-            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        )
-        .expect_err("wrong embedded public key");
+        let error =
+            verify_ipns_record_candidate(&record, peer_id).expect_err("wrong embedded public key");
 
         assert!(matches!(
             error,
@@ -1610,22 +2156,14 @@ mod tests {
     }
 
     #[test]
-    fn expired_ipns_record_is_rejected() {
+    fn authenticated_ipns_record_retains_mandatory_eol() {
         let keypair = test_ipns_keypair();
         let peer_id = keypair.public().to_peer_id();
         let record = ipns_record(&keypair, raw_cid(b"manifest").to_string(), 1);
 
-        let error = verify_ipns_record_candidate(
-            &record,
-            peer_id,
-            UNIX_EPOCH + Duration::from_secs(4_000_000_000),
-        )
-        .expect_err("expired");
+        let candidate = verify_ipns_record_candidate(&record, peer_id).expect("authenticated EOL");
 
-        assert!(matches!(
-            error,
-            TrustlessArtifactError::ExpiredIpnsRecord { .. }
-        ));
+        assert!(candidate.eol > chrono::DateTime::<Utc>::from(UNIX_EPOCH));
     }
 
     #[test]
@@ -1634,12 +2172,7 @@ mod tests {
         let peer_id = keypair.public().to_peer_id();
         let record = ipns_record(&keypair, "/ipns/not-supported".to_string(), 1);
 
-        let error = verify_ipns_record_candidate(
-            &record,
-            peer_id,
-            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        )
-        .expect_err("unsupported value");
+        let error = verify_ipns_record_candidate(&record, peer_id).expect_err("unsupported value");
 
         assert!(matches!(
             error,
@@ -1653,12 +2186,7 @@ mod tests {
         let peer_id = keypair.public().to_peer_id();
         let bytes = vec![0_u8; IPNS_RECORD_MAX_BYTES + 1];
 
-        let error = verify_ipns_record_candidate(
-            &bytes,
-            peer_id,
-            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        )
-        .expect_err("oversized");
+        let error = verify_ipns_record_candidate(&bytes, peer_id).expect_err("oversized");
 
         assert!(matches!(
             error,
@@ -1667,20 +2195,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipns_candidates_are_sorted_by_descending_sequence() {
+    async fn ipns_candidates_are_sorted_and_exact_pairs_are_deduplicated() {
         let keypair = test_ipns_keypair();
         let name = ipns_name(&keypair);
+        let high_cid = raw_cid(b"high");
         let low = spawn_once_server(200, ipns_record(&keypair, raw_cid(b"low").to_string(), 1));
-        let high = spawn_once_server(200, ipns_record(&keypair, raw_cid(b"high").to_string(), 5));
+        let high = spawn_once_server(200, ipns_record(&keypair, high_cid.to_string(), 5));
+        let duplicate_high = spawn_once_server(200, ipns_record(&keypair, high_cid.to_string(), 5));
         let client = reqwest::Client::new();
-        let gateways = [low.url.clone(), high.url.clone()];
+        let gateways = [
+            low.url.clone(),
+            high.url.clone(),
+            duplicate_high.url.clone(),
+        ];
         let fetcher = TrustlessArtifactFetcher::new(&client, &gateways);
 
         let candidates = fetcher
-            .resolve_ipns_manifest_candidates(
-                &name,
-                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            )
+            .resolve_ipns_manifest_candidates(&name)
             .await
             .expect("IPNS candidates");
 
@@ -1697,6 +2228,10 @@ mod tests {
         );
         assert_eq!(
             high.request_path(),
+            format!("/ipns/{name}?format=ipns-record")
+        );
+        assert_eq!(
+            duplicate_high.request_path(),
             format!("/ipns/{name}?format=ipns-record")
         );
     }
@@ -1717,10 +2252,7 @@ mod tests {
             let client = reqwest::Client::new();
             let gateways = [blocked_url, fast_url];
             TrustlessArtifactFetcher::new(&client, &gateways)
-                .resolve_ipns_manifest_candidates(
-                    &name,
-                    UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                )
+                .resolve_ipns_manifest_candidates(&name)
                 .await
         });
 
@@ -1747,6 +2279,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_ipns_response_crossing_eol_is_rejected_at_acceptance() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let record = ipns_record_with_validity(
+            &keypair,
+            raw_cid(b"delayed expired IPNS").to_string(),
+            3,
+            chrono::Duration::seconds(1),
+        );
+        let (server, release) = spawn_blocked_once_server(200, record);
+        let MockServer { url, requests } = server;
+        let acceptance_time = std::sync::Arc::new(std::sync::Mutex::new(SystemTime::now()));
+        let task_clock = std::sync::Arc::clone(&acceptance_time);
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let gateways = [url];
+            let now = || *task_clock.lock().expect("acceptance clock lock");
+            TrustlessArtifactFetcher::new(&client, &gateways)
+                .resolve_ipns_manifest_candidates_with_clock(&name, &now)
+                .await
+        });
+        tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("join delayed IPNS request wait")
+            .expect("delayed IPNS request");
+        *acceptance_time.lock().expect("acceptance clock lock") =
+            SystemTime::now() + Duration::from_mins(1);
+        release.send(()).expect("release delayed IPNS response");
+
+        assert!(matches!(
+            task.await.expect("join delayed IPNS resolution"),
+            Err(TrustlessArtifactError::ExpiredIpnsRecord { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn early_ipns_candidate_expiring_while_delayed_peer_settles_is_filtered() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let expired_cid = raw_cid(b"early expiring IPNS candidate");
+        let current_cid = raw_cid(b"delayed current IPNS candidate");
+        let early = spawn_once_server(
+            200,
+            ipns_record_with_validity(
+                &keypair,
+                expired_cid.to_string(),
+                9,
+                chrono::Duration::seconds(1),
+            ),
+        );
+        let (delayed, release) = spawn_blocked_once_server(
+            200,
+            ipns_record_with_validity(
+                &keypair,
+                current_cid.to_string(),
+                7,
+                chrono::Duration::seconds(60 * 60 * 24 * 365),
+            ),
+        );
+        let MockServer {
+            url: early_url,
+            requests: early_requests,
+        } = early;
+        let MockServer {
+            url: delayed_url,
+            requests: delayed_requests,
+        } = delayed;
+        let acceptance_time = std::sync::Arc::new(std::sync::Mutex::new(SystemTime::now()));
+        let task_clock = std::sync::Arc::clone(&acceptance_time);
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let gateways = [early_url, delayed_url];
+            let now = || *task_clock.lock().expect("acceptance clock lock");
+            TrustlessArtifactFetcher::new(&client, &gateways)
+                .resolve_ipns_manifest_candidates_with_clock(&name, &now)
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            early_requests.recv_timeout(Duration::from_secs(1))?;
+            delayed_requests.recv_timeout(Duration::from_secs(1))?;
+            Ok::<_, std::sync::mpsc::RecvTimeoutError>(())
+        })
+        .await
+        .expect("join IPNS peer request wait")
+        .expect("both IPNS peers received requests");
+        *acceptance_time.lock().expect("acceptance clock lock") =
+            SystemTime::now() + Duration::from_mins(1);
+        release.send(()).expect("release delayed IPNS peer");
+
+        let candidates = task
+            .await
+            .expect("join aggregate IPNS resolution")
+            .expect("delayed current candidate survives");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sequence, 7);
+        assert_eq!(candidates[0].cid, current_cid);
+    }
+
+    #[tokio::test]
+    async fn all_expired_ipns_candidates_return_redacted_expiry() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let first = spawn_once_server(
+            200,
+            ipns_record_with_validity(
+                &keypair,
+                raw_cid(b"expired first").to_string(),
+                5,
+                chrono::Duration::seconds(1),
+            ),
+        );
+        let second = spawn_once_server(
+            200,
+            ipns_record_with_validity(
+                &keypair,
+                raw_cid(b"expired second").to_string(),
+                6,
+                chrono::Duration::seconds(1),
+            ),
+        );
+        let gateways = [
+            sensitive_server_url(first.url.clone()),
+            sensitive_server_url(second.url.clone()),
+        ];
+        let client = reqwest::Client::new();
+        let accepted_at = SystemTime::now() + Duration::from_mins(1);
+
+        let error = TrustlessArtifactFetcher::new_poi(&client, &gateways)
+            .resolve_ipns_manifest_candidates_with_clock(&name, &|| accepted_at)
+            .await
+            .expect_err("all authenticated candidates expired before acceptance");
+
+        assert!(matches!(
+            &error,
+            TrustlessArtifactError::ExpiredIpnsRecord { .. }
+        ));
+        assert_artifact_error_safe(&error);
+    }
+
+    #[tokio::test]
+    async fn mixed_expired_and_current_ipns_candidates_keep_only_current_records() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let expired_cid = raw_cid(b"expired high-sequence candidate");
+        let current_cid = raw_cid(b"current lower-sequence candidate");
+        let expired = spawn_once_server(
+            200,
+            ipns_record_with_validity(
+                &keypair,
+                expired_cid.to_string(),
+                20,
+                chrono::Duration::seconds(1),
+            ),
+        );
+        let current = spawn_once_server(
+            200,
+            ipns_record_with_validity(
+                &keypair,
+                current_cid.to_string(),
+                10,
+                chrono::Duration::seconds(60 * 60 * 24 * 365),
+            ),
+        );
+        let gateways = [expired.url.clone(), current.url.clone()];
+        let client = reqwest::Client::new();
+        let accepted_at = SystemTime::now() + Duration::from_mins(1);
+        let samples = std::sync::atomic::AtomicUsize::new(0);
+
+        let candidates = TrustlessArtifactFetcher::new(&client, &gateways)
+            .resolve_ipns_manifest_candidates_with_clock(&name, &|| {
+                samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                accepted_at
+            })
+            .await
+            .expect("current candidate remains after aggregate expiry filtering");
+
+        assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sequence, 10);
+        assert_eq!(candidates[0].cid, current_cid);
+    }
+
+    #[tokio::test]
     async fn ipns_resolution_uses_valid_gateway_when_one_fails() {
         let keypair = test_ipns_keypair();
         let name = ipns_name(&keypair);
@@ -1757,10 +2472,7 @@ mod tests {
         let fetcher = TrustlessArtifactFetcher::new(&client, &gateways);
 
         let candidates = fetcher
-            .resolve_ipns_manifest_candidates(
-                &name,
-                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            )
+            .resolve_ipns_manifest_candidates(&name)
             .await
             .expect("valid second gateway");
 
@@ -1803,6 +2515,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_gateway_fallback_honors_bounded_attempt_count() {
+        let cid = raw_cid(b"bounded gateway artifact");
+        let skipped_before = spawn_once_server(503, Vec::new());
+        let first = spawn_once_server(503, Vec::new());
+        let second = spawn_once_server(503, Vec::new());
+        let skipped_after = spawn_once_server(503, Vec::new());
+        let client = reqwest::Client::new();
+        let gateways = [
+            skipped_before.url.clone(),
+            first.url.clone(),
+            second.url.clone(),
+            skipped_after.url.clone(),
+        ];
+
+        TrustlessArtifactFetcher::new(&client, &gateways)
+            .fetch_artifact_cid_with_metadata_from_gateway_bounded(&cid.to_string(), 24, 1, 2)
+            .await
+            .expect_err("two failed attempts exhaust the bound");
+
+        let expected = format!("/ipfs/{cid}?format=car&dag-scope=entity");
+        assert_eq!(first.request_path(), expected);
+        assert_eq!(second.request_path(), expected);
+        assert!(
+            skipped_before
+                .requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(
+            skipped_after
+                .requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn no_valid_ipns_records_is_reported() {
         let keypair = test_ipns_keypair();
         let name = ipns_name(&keypair);
@@ -1812,10 +2561,7 @@ mod tests {
         let fetcher = TrustlessArtifactFetcher::new(&client, &gateways);
 
         let error = fetcher
-            .resolve_ipns_manifest_candidates(
-                &name,
-                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            )
+            .resolve_ipns_manifest_candidates(&name)
             .await
             .expect_err("no valid records");
 
@@ -1824,6 +2570,51 @@ mod tests {
 
     fn raw_cid(bytes: &[u8]) -> Cid {
         Cid::new_v1(RAW_CODEC, Code::Sha2_256.digest(bytes))
+    }
+
+    fn reconstruct_for_test(
+        root: Cid,
+        blocks: &HashMap<Cid, Vec<u8>>,
+        reconstructed_bytes: usize,
+        unixfs_max_depth: usize,
+        unixfs_max_link_visits: usize,
+    ) -> Result<Vec<u8>, TrustlessArtifactError> {
+        reconstruct_file(
+            root,
+            blocks,
+            RetrievalLimits {
+                response_bytes: usize::MAX,
+                block_count: usize::MAX,
+                reconstructed_bytes,
+                unixfs_max_depth,
+                unixfs_max_link_visits,
+            },
+        )
+    }
+
+    fn unixfs_chain(depth: usize) -> (Cid, HashMap<Cid, Vec<u8>>) {
+        assert!(depth > 0);
+        let mut blocks = HashMap::new();
+        let mut root = raw_cid(b"x");
+        blocks.insert(root, b"x".to_vec());
+        for index in 1..depth {
+            let name = format!("depth-{index}");
+            let block = dag_pb_file_node(b"", &[(root, name.as_str(), 1)], Some(1));
+            root = dag_pb_cid(&block);
+            blocks.insert(root, block);
+        }
+        (root, blocks)
+    }
+
+    fn repeated_link_graph(count: usize) -> (Cid, HashMap<Cid, Vec<u8>>) {
+        let child = raw_cid(b"x");
+        let links = vec![(child, "repeated", 1); count];
+        let root_block = dag_pb_file_node(b"", &links, Some(count as u64));
+        let root = dag_pb_cid(&root_block);
+        (
+            root,
+            HashMap::from([(root, root_block), (child, b"x".to_vec())]),
+        )
     }
 
     fn dag_pb_cid(bytes: &[u8]) -> Cid {
@@ -2011,16 +2802,24 @@ mod tests {
     }
 
     fn ipns_record(keypair: &Keypair, value: String, sequence: u64) -> Vec<u8> {
-        rust_ipns::Record::new(
+        ipns_record_with_validity(
             keypair,
             value,
-            chrono::Duration::seconds(60 * 60 * 24 * 365),
             sequence,
-            60,
+            chrono::Duration::seconds(60 * 60 * 24 * 365),
         )
-        .expect("IPNS record")
-        .encode()
-        .expect("encoded IPNS record")
+    }
+
+    fn ipns_record_with_validity(
+        keypair: &Keypair,
+        value: String,
+        sequence: u64,
+        validity: chrono::Duration,
+    ) -> Vec<u8> {
+        rust_ipns::Record::new(keypair, value, validity, sequence, 60)
+            .expect("IPNS record")
+            .encode()
+            .expect("encoded IPNS record")
     }
 
     fn ipns_record_with_embedded_public_key(
@@ -2034,6 +2833,128 @@ mod tests {
             .write_with_tag(58, |writer| writer.write_bytes(&public_key))
             .expect("embedded public key");
         record
+    }
+
+    enum ControlledResponseCommand {
+        Headers(u16),
+        Chunk(Vec<u8>),
+        Finish,
+    }
+
+    struct ControlledChunkServer {
+        url: Url,
+        requests: std::sync::mpsc::Receiver<String>,
+        commands: std::sync::mpsc::Sender<(ControlledResponseCommand, std::sync::mpsc::Sender<()>)>,
+    }
+
+    impl ControlledChunkServer {
+        async fn wait_for_request(&self) -> String {
+            loop {
+                match self.requests.try_recv() {
+                    Ok(path) => return path,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("controlled server stopped before receiving request")
+                    }
+                }
+            }
+        }
+
+        fn send(&self, command: ControlledResponseCommand) {
+            let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+            self.commands
+                .send((command, acknowledge))
+                .expect("send controlled response command");
+            acknowledged
+                .recv_timeout(Duration::from_secs(2))
+                .expect("controlled response command acknowledged");
+        }
+
+        fn send_headers(&self, status: u16) {
+            self.send(ControlledResponseCommand::Headers(status));
+        }
+
+        fn send_chunk(&self, chunk: impl Into<Vec<u8>>) {
+            self.send(ControlledResponseCommand::Chunk(chunk.into()));
+        }
+
+        fn finish(&self) {
+            self.send(ControlledResponseCommand::Finish);
+        }
+
+        fn assert_no_request(&self) {
+            assert!(matches!(
+                self.requests.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    fn spawn_controlled_chunk_server() -> ControlledChunkServer {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind controlled chunk server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("controlled server address")
+        ))
+        .expect("controlled server URL");
+        let (request_tx, requests) = std::sync::mpsc::channel();
+        let (commands, command_rx) =
+            std::sync::mpsc::channel::<(ControlledResponseCommand, std::sync::mpsc::Sender<()>)>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept controlled request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read =
+                    std::io::Read::read(&mut stream, &mut buffer).expect("read controlled request");
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            let path = request_text
+                .split_whitespace()
+                .nth(1)
+                .expect("controlled request path")
+                .to_string();
+            request_tx.send(path).expect("record controlled request");
+
+            while let Ok((command, acknowledge)) = command_rx.recv() {
+                let finish = matches!(&command, ControlledResponseCommand::Finish);
+                let write_result = match command {
+                    ControlledResponseCommand::Headers(status) => {
+                        let reason = if status == 200 { "OK" } else { "ERROR" };
+                        let headers = format!(
+                            "HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        );
+                        std::io::Write::write_all(&mut stream, headers.as_bytes())
+                    }
+                    ControlledResponseCommand::Chunk(chunk) => {
+                        let frame = format!("{:x}\r\n", chunk.len());
+                        std::io::Write::write_all(&mut stream, frame.as_bytes())
+                            .and_then(|()| std::io::Write::write_all(&mut stream, &chunk))
+                            .and_then(|()| std::io::Write::write_all(&mut stream, b"\r\n"))
+                    }
+                    ControlledResponseCommand::Finish => {
+                        std::io::Write::write_all(&mut stream, b"0\r\n\r\n")
+                    }
+                };
+                let _ = acknowledge.send(());
+                if write_result.is_err() || finish {
+                    break;
+                }
+            }
+        });
+        ControlledChunkServer {
+            url,
+            requests,
+            commands,
+        }
     }
 
     struct MockServer {

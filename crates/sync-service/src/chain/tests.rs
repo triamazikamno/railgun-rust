@@ -31,10 +31,18 @@ fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
     WalletCacheKey::from_opaque_bytes(value.as_ref()).expect("non-empty test wallet cache key")
 }
 
+use super::backfill::{
+    WalletBackfill, WalletTailFallbackState, wallet_tail_fallback_lag_threshold_blocks,
+};
 use super::data_plane::{PublicScanCoverageWrite, PublicScanRows};
+use super::indexed_wallet::{complete_stream_checkpoint, wallet_startup_hedge_block_count};
+use super::logs::combined_log_event_signatures_for_range;
 use super::service::{
-    WalletShortStartupPlan, await_live_log_task_shutdown, send_wallet_scan_apply,
-    send_wallet_target, wait_for_startup_sync_target, wait_for_wallet_ready,
+    WalletShortStartupPlan, await_live_log_task_shutdown, wait_for_startup_sync_target,
+    wait_for_wallet_ready,
+};
+use super::workers::{
+    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
 };
 use super::{
     ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
@@ -42,16 +50,12 @@ use super::{
     IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind, Nullified, Nullifiers,
     PublicCoverageAnswer, PublicDataPlaneDiagnosticKind, PublicDataPlaneError, PublicPoiCorpusKey,
     PublicScanRange, PublicScanRowsAnswer, PublicScanSource, RailgunLegacyShieldEvents, Shield,
-    Transact, WalletBackfill, WalletIndexedCatchUpStatusGuard, WalletStartupSyncError,
-    WalletTailFallbackState, WalletWorkerServices, artifact_failure_can_fallback_to_squid,
-    combined_log_event_signatures_for_range, complete_stream_checkpoint,
-    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
-    send_wallet_startup_events, should_hedge_wallet_startup, spawn_backfill_loop,
-    squid_tail_target_after_artifact, wallet_backfill_from_block, wallet_backfill_lag_blocks,
-    wallet_finish_result_removes_cursor, wallet_finish_retry_request,
-    wallet_remote_target_before_cached_suffix, wallet_reorg_backfill_from_block,
-    wallet_startup_hedge_block_count, wallet_startup_warm_from_block, wallet_sync_target,
-    wallet_tail_fallback_lag_threshold_blocks,
+    Transact, WalletIndexedCatchUpStatusGuard, WalletStartupSyncError, WalletWorkerServices,
+    artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
+    should_hedge_wallet_startup, spawn_backfill_loop, squid_tail_target_after_artifact,
+    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
+    wallet_finish_retry_request, wallet_remote_target_before_cached_suffix,
+    wallet_reorg_backfill_from_block, wallet_startup_warm_from_block, wallet_sync_target,
 };
 use crate::SyncManager;
 use crate::indexed_artifacts::{
@@ -72,7 +76,8 @@ use crate::types::{
     WalletReadinessError, WalletScanApply, WalletScanRowsPayload, WalletSyncToken, WalletViewState,
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
-use crate::wallet::{WalletHandle, WalletPoiRuntime, spawn_wallet_worker};
+use crate::wallet::test_support::spawn_wallet_worker;
+use crate::wallet::{WalletHandle, WalletPoiRuntime};
 
 fn test_wallet_backfill(target_block: u64, follow_safe_head: bool) -> WalletBackfill {
     let (sender, _receiver) = mpsc::channel(1);
@@ -150,6 +155,46 @@ fn test_backfill_driver(
     job_id: u64,
 ) -> WalletBackfillDriver {
     WalletBackfillDriver::from_token(test_sync_token(reset_generation, job_id), sender)
+}
+
+async fn send_wallet_scan_apply(
+    cache_key: &str,
+    sender: &mpsc::Sender<BackfillEvent>,
+    apply: WalletScanApply,
+    token: WalletSyncToken,
+) -> WalletBackfillApplyResult {
+    WalletBackfillDriver::from_token(token, sender.clone())
+        .apply(cache_key, apply)
+        .await
+}
+
+async fn send_wallet_target(
+    _cache_key: &str,
+    sender: &mpsc::Sender<BackfillEvent>,
+    target_block: u64,
+    token: WalletSyncToken,
+) -> WalletBackfillStartResult {
+    let (response, result_rx) = oneshot::channel();
+    if sender
+        .send(BackfillEvent::Start {
+            target_block,
+            token,
+            response,
+        })
+        .await
+        .is_err()
+    {
+        return WalletBackfillStartResult::Rejected {
+            committed_to: target_block.saturating_sub(1),
+            reason: WalletBackfillRejectReason::Shutdown,
+        };
+    }
+    result_rx
+        .await
+        .unwrap_or(WalletBackfillStartResult::Rejected {
+            committed_to: target_block.saturating_sub(1),
+            reason: WalletBackfillRejectReason::Shutdown,
+        })
 }
 
 fn test_scope() -> ChainScope {
@@ -667,15 +712,13 @@ async fn manager_resets_persisted_cache_once_and_every_registered_public_data_pl
         .as_ref()
         .expect("persisted manager reset succeeds");
     assert_eq!(persisted.txid_blob_entries_removed, 1);
-    assert_eq!(persisted.txid_files_removed, 1);
-    assert_eq!(persisted.poi_cache_entries_removed, 0);
-    assert_eq!(persisted.total_removed_entries(), 2);
-    assert_eq!(report.total_removed_entries, 2);
+    assert_eq!(persisted.total_removed_entries(), 1);
+    assert_eq!(report.total_removed_entries, 1);
     assert_eq!(
         db.poi_artifact_cache_generation()
             .expect("POI cache generation after manager reset"),
-        1,
-        "a multi-chain manager reset advances the shared POI generation once"
+        0,
+        "raw public cache reset preserves the serving-corpus generation"
     );
     for (key, service) in &registered {
         let reset = report
@@ -1744,81 +1787,6 @@ async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() 
 }
 
 #[tokio::test]
-async fn short_startup_epoch_invalidation_after_selection_delivers_nothing() {
-    let root_dir = temp_db_root("wallet-startup-selection-epoch-invalidation");
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("open db"),
-    );
-    let scope = test_scope();
-    let rpc = JsonRpcServer::spawn(vec![
-        serde_json::json!("0x6e"),
-        serde_json::json!([]),
-        rpc_block(110, 1_700_000_110, 0x22),
-    ]);
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![rpc.url.clone()],
-        Duration::from_secs(1),
-    ));
-    let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
-    chain.finality_depth = 0;
-    chain.quick_sync_endpoint = None;
-    let public_data_plane = ChainPublicDataPlane::new(
-        Arc::clone(&db),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
-    let (winner_selected, release_commit) = public_data_plane
-        .block_before_short_startup_commit_for_test()
-        .await;
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
-    service.safe_head_tx.send_replace(110);
-
-    let mut cfg = test_wallet_config(&scope, rpc.url.clone());
-    cfg.start_block = Some(101);
-    cfg.sync_to_block = Some(110);
-    cfg.use_indexed_wallet_catch_up = false;
-    db.put_wallet_meta(
-        &cfg.cache_key,
-        &WalletMeta {
-            last_scanned_block: 105,
-            updated_at: 1,
-            last_scanned_block_hash: None,
-        },
-    )
-    .expect("seed wallet cursor");
-    let handle = service.register_wallet(cfg).await.expect("register wallet");
-
-    tokio::time::timeout(Duration::from_secs(2), winner_selected)
-        .await
-        .expect("RPC winner selected")
-        .expect("selection signal");
-    public_data_plane
-        .invalidate_public_scan_coverage_from(101)
-        .await;
-    release_commit.send(()).expect("release winner commit");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    assert_eq!(handle.last_scanned(), Some(105));
-    assert!(!handle.readiness().is_ready());
-    assert!(
-        public_data_plane
-            .cached_wallet_scan_suffix(101, 110)
-            .await
-            .is_none(),
-        "stale winner acquisition must not be published",
-    );
-
-    service.unregister_all_wallets().await;
-    service.shutdown().await;
-    drop(service);
-    drop(db);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
 async fn wallet_startup_rpc_candidate_rejects_zero_provider_coverage() {
     let root_dir = temp_db_root("wallet-startup-zero-rpc-coverage");
     let db = Arc::new(
@@ -2209,9 +2177,6 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
-    let (winner_finalizing, release_commit) = public_data_plane
-        .block_before_short_startup_commit_for_test()
-        .await;
     let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
     service.safe_head_tx.send_replace(106);
 
@@ -2246,27 +2211,13 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
     .await
     .expect("RPC loser reached its log request")
     .expect("RPC block wait completed");
-    tokio::time::timeout(Duration::from_secs(2), winner_finalizing)
-        .await
-        .expect("Squid winner reached finalization after draining RPC")
-        .expect("winner finalization signal");
-    assert!(
-        public_data_plane
-            .cached_wallet_scan_suffix(101, 106)
-            .await
-            .is_none(),
-        "neither candidate may publish before arbitration finalization",
-    );
-    rpc_release
-        .send(())
-        .expect("release terminated RPC request");
-    release_commit
-        .send(())
-        .expect("release Squid winner commit");
     tokio::time::timeout(Duration::from_secs(2), first.wait_until_ready())
         .await
-        .expect("Squid winner delivered after commit")
+        .expect("Squid winner delivered while RPC response remained blocked")
         .expect("wallet readiness succeeded");
+    rpc_release
+        .send(())
+        .expect("release terminated RPC request for fixture cleanup");
 
     let replay = public_data_plane
         .cached_wallet_scan_suffix(101, 106)
@@ -2325,7 +2276,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         .expect("register replacement wallet");
     tokio::time::timeout(Duration::from_secs(1), second.wait_until_ready())
         .await
-        .expect("replacement wallet replayed RPC winner acquisition")
+        .expect("replacement wallet replayed Squid winner acquisition")
         .expect("wallet readiness succeeded");
     let replacement_snapshot = second
         .utxos_snapshot()
@@ -2334,222 +2285,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         replacement_snapshot[0]
             .spent
             .as_ref()
-            .expect("leading RPC nullifier marks UTXO spent")
-            .block_number,
-        101,
-    );
-    assert!(rpc.requests.try_recv().is_err());
-    assert!(squid.requests.try_recv().is_err());
-
-    service.unregister_all_wallets().await;
-    service.shutdown().await;
-    drop(service);
-    drop(db);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
-async fn completed_rpc_and_multi_page_squid_candidates_commit_exactly_one_acquisition() {
-    let root_dir = temp_db_root("wallet-startup-completed-hedge-isolation");
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("open db"),
-    );
-    let scope = test_scope();
-    let replacement_wallet_utxo = WalletUtxo::new(Utxo::new(
-        Note {
-            token_hash: U256::from(1),
-            value: U256::from(10),
-            random: [0x44; 16],
-            npk: U256::from(2),
-        },
-        1,
-        11,
-        UtxoSource {
-            tx_hash: FixedBytes::from([0x66; 32]),
-            block_number: 100,
-            block_timestamp: 1_700_000_100,
-        },
-        UtxoCommitmentKind::Transact,
-    ));
-    let replacement_nullifier = replacement_wallet_utxo.utxo.nullifier(U256::ZERO);
-    let rpc = JsonRpcServer::spawn(vec![
-        serde_json::json!("0x6a"),
-        serde_json::json!([rpc_nullifiers_log_with_value(
-            scope.railgun_contract,
-            101,
-            replacement_nullifier,
-        )]),
-        rpc_block(101, 1_700_000_101, 0x11),
-        rpc_block(106, 1_700_000_106, 0x22),
-    ]);
-    let mut squid_responses = vec![
-        r#"{"data":{"squidStatus":{"height":"106"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#
-            .to_string(),
-    ];
-    squid_responses.extend((101..=106).map(|block_number| {
-        let nullifier = if block_number == 101 {
-            replacement_nullifier
-        } else {
-            U256::from(block_number)
-        };
-        indexed_wallet_nullifier_page(block_number, nullifier)
-    }));
-    let squid = GraphqlServer::spawn_owned(squid_responses);
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![rpc.url.clone()],
-        Duration::from_secs(1),
-    ));
-    let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 6;
-    chain.indexed_wallet_block_range = 1;
-    chain.finality_depth = 0;
-    chain.quick_sync_endpoint = Some(squid.url.clone());
-    let public_data_plane = ChainPublicDataPlane::new(
-        Arc::clone(&db),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
-    let (both_candidates_completed, release_arbitration) = public_data_plane
-        .block_before_short_startup_arbitration_for_test(2)
-        .await;
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
-    service.safe_head_tx.send_replace(106);
-
-    let mut first_cfg = test_wallet_config(&scope, squid.url.clone());
-    first_cfg.cache_key = test_cache_key("completed-hedge-wallet-a");
-    first_cfg.start_block = Some(101);
-    first_cfg.sync_to_block = Some(106);
-    db.put_wallet_meta(
-        &first_cfg.cache_key,
-        &WalletMeta {
-            last_scanned_block: 105,
-            updated_at: 1,
-            last_scanned_block_hash: None,
-        },
-    )
-    .expect("seed first wallet cursor");
-    let mut first = service
-        .register_wallet(first_cfg)
-        .await
-        .expect("register first wallet");
-
-    tokio::time::timeout(Duration::from_secs(2), both_candidates_completed)
-        .await
-        .expect("both hedge candidates completed acquisition")
-        .expect("candidate completion signal");
-    assert!(
-        public_data_plane
-            .cached_wallet_scan_suffix(101, 106)
-            .await
-            .is_none(),
-        "completed candidates must remain pure before arbitration",
-    );
-    assert!(
-        public_data_plane
-            .diagnostics()
-            .await
-            .events
-            .iter()
-            .all(|event| event.kind != PublicDataPlaneDiagnosticKind::CoverageRecorded),
-        "neither completed candidate may mutate row or coverage state",
-    );
-    release_arbitration
-        .send(())
-        .expect("release hedge arbitration");
-    tokio::time::timeout(Duration::from_secs(2), first.wait_until_ready())
-        .await
-        .expect("selected completed candidate delivered")
-        .expect("wallet readiness succeeded");
-
-    let rpc_requests = (0..4)
-        .map(|_| {
-            rpc.requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("completed RPC candidate request")
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        rpc_requests
-            .iter()
-            .any(|request| request.contains("eth_getLogs"))
-    );
-    let squid_requests = (0..7)
-        .map(|_| {
-            squid
-                .requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("completed Squid candidate request")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(squid_requests.len(), 7);
-
-    let replay = public_data_plane
-        .cached_wallet_scan_suffix(101, 106)
-        .await
-        .expect("selected acquisition is fully replayable");
-    assert_eq!(
-        replay.len(),
-        1,
-        "only one candidate acquisition is retained"
-    );
-    assert_eq!((replay[0].from_block, replay[0].to_block), (101, 106));
-    let WalletScanRowsPayload::Rows(rows) = &replay[0].rows.payload else {
-        panic!("selected candidate rows expected");
-    };
-    assert!(matches!(rows.nullifiers.len(), 1 | 6));
-    assert_eq!(rows.nullifiers[0].source.block_number, 101);
-    assert_eq!(rows.nullifiers[0].nullifier, replacement_nullifier);
-    let completed_commits = public_data_plane
-        .diagnostics()
-        .await
-        .events
-        .iter()
-        .filter(|event| {
-            event.kind == PublicDataPlaneDiagnosticKind::CoverageRecorded
-                && event.reason.starts_with("committed completed acquisition")
-        })
-        .count();
-    assert_eq!(completed_commits, 1, "exactly one acquisition is committed");
-
-    service.unregister_all_wallets().await;
-    let mut second_cfg = test_wallet_config(&scope, squid.url.clone());
-    second_cfg.cache_key = test_cache_key("completed-hedge-wallet-b");
-    second_cfg.start_block = Some(101);
-    second_cfg.sync_to_block = Some(106);
-    db.put_wallet_meta(
-        &second_cfg.cache_key,
-        &WalletMeta {
-            last_scanned_block: 100,
-            updated_at: 1,
-            last_scanned_block_hash: None,
-        },
-    )
-    .expect("seed earlier replacement cursor");
-    db.put_wallet_utxo(
-        &second_cfg.cache_key,
-        "1:11",
-        &serialize_wallet_utxo(&replacement_wallet_utxo).expect("serialize replacement UTXO"),
-    )
-    .expect("seed replacement wallet UTXO");
-    let mut second = service
-        .register_wallet(second_cfg)
-        .await
-        .expect("register replacement wallet");
-    tokio::time::timeout(Duration::from_secs(1), second.wait_until_ready())
-        .await
-        .expect("replacement wallet replayed selected acquisition")
-        .expect("wallet readiness succeeded");
-    assert_eq!(second.last_scanned(), Some(106));
-    let replacement_snapshot = second
-        .utxos_snapshot()
-        .expect("replacement wallet snapshot");
-    assert_eq!(
-        replacement_snapshot[0]
-            .spent
-            .as_ref()
-            .expect("leading replayed nullifier marks UTXO spent")
+            .expect("leading Squid nullifier marks UTXO spent")
             .block_number,
         101,
     );
@@ -5034,28 +4770,24 @@ async fn indexed_wallet_squid_session_is_not_restamped_between_pages() {
         chain_id: 1,
         railgun_contract: Address::from([0xbb; 20]),
     };
-    let squid = GraphqlServer::spawn(vec![
-        r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
-        r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
-        r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
-    ]);
+    let (squid, block) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+            r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
+            r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
+        ],
+        2,
+    );
     let context = IndexedCatchUpTestContext::new(&scope, squid.url.clone(), None, 100, 50).await;
-    let (page_committed, release_page) = context
-        .public_data_plane
-        .block_after_indexed_wallet_page_for_test(150)
-        .await;
     let catch_up = context.spawn_catch_up(200, IndexedWalletCatchUpSourceOrder::SquidFirst);
 
-    tokio::time::timeout(Duration::from_secs(2), page_committed)
-        .await
-        .expect("first Squid page committed")
-        .expect("page commit hook open");
+    wait_for_std_signal(block.request_started, "second Squid page request started").await;
     assert_eq!(context.handle.last_scanned(), Some(150));
     context
         .public_data_plane
         .invalidate_public_scan_coverage_from(151)
         .await;
-    release_page.send(()).expect("release page boundary");
+    block.release.send(()).expect("release second Squid page");
     let checkpoint = catch_up.await.expect("indexed catch-up task");
 
     assert_eq!(checkpoint, 150);
