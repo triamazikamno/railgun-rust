@@ -1021,22 +1021,29 @@ fn verify_ipns_record_candidate(
         });
     }
 
-    let record = rust_ipns::Record::decode(bytes)
-        .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord { source })?;
-    record
-        .verify(peer_id)
-        .map_err(|source| TrustlessArtifactError::InvalidIpnsSignature { source })?;
+    let record = rust_ipns::Record::decode(bytes).map_err(|source| {
+        TrustlessArtifactError::InvalidIpnsRecord {
+            source: source.into(),
+        }
+    })?;
     verify_ipns_public_key_binding(bytes, peer_id)?;
+    record
+        .verify_signature(peer_id)
+        .map_err(|source| TrustlessArtifactError::InvalidIpnsSignature { source })?;
     if record.validity_type() != rust_ipns::ValidityType::EOL {
         return Err(TrustlessArtifactError::UnsupportedIpnsValidity);
     }
     let eol = record
         .validity()
-        .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord { source })?
+        .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord {
+            source: source.into(),
+        })?
         .with_timezone(&Utc);
     let data = record
         .data()
-        .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord { source })?;
+        .map_err(|source| TrustlessArtifactError::InvalidIpnsRecord {
+            source: source.into(),
+        })?;
     let cid = parse_ipns_value(data.value())?;
     Ok(IpnsManifestCandidate {
         sequence: data.sequence(),
@@ -1329,7 +1336,7 @@ pub(crate) enum TrustlessArtifactError {
     #[error("invalid IPNS record signature")]
     InvalidIpnsSignature {
         #[source]
-        source: std::io::Error,
+        source: rust_ipns::Error,
     },
     #[error("IPNS record uses unsupported validity type")]
     UnsupportedIpnsValidity,
@@ -2387,7 +2394,7 @@ mod tests {
                 &keypair,
                 raw_cid(b"expired first").to_string(),
                 5,
-                chrono::Duration::seconds(1),
+                chrono::Duration::seconds(-1),
             ),
         );
         let second = spawn_once_server(
@@ -2396,7 +2403,7 @@ mod tests {
                 &keypair,
                 raw_cid(b"expired second").to_string(),
                 6,
-                chrono::Duration::seconds(1),
+                chrono::Duration::seconds(-1),
             ),
         );
         let gateways = [
@@ -2816,10 +2823,16 @@ mod tests {
         sequence: u64,
         validity: chrono::Duration,
     ) -> Vec<u8> {
-        rust_ipns::Record::new(keypair, value, validity, sequence, 60)
-            .expect("IPNS record")
-            .encode()
-            .expect("encoded IPNS record")
+        rust_ipns::Record::new(
+            keypair,
+            value,
+            Utc::now() + validity,
+            sequence,
+            Duration::from_nanos(60),
+        )
+        .expect("IPNS record")
+        .encode()
+        .expect("encoded IPNS record")
     }
 
     fn ipns_record_with_embedded_public_key(

@@ -86,3 +86,42 @@ impl Payload {
         Ok((decoded_data, vk.verify(self.data.as_ref(), &sig).is_ok()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_payload_roundtrips_and_rejects_tampering() {
+        let seed = [7_u8; 32];
+        let viewing_public_key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let body = Body {
+            fees: HashMap::new(),
+            fee_expiration: 1_800_000_000,
+            fees_id: "test-fees".to_string(),
+            railgun_address: railgun::Address::try_from_parts(
+                U256::from(1),
+                viewing_public_key,
+                None,
+            )
+            .expect("test Railgun address"),
+            available_wallets: 1,
+            version: "1.0.0".to_string(),
+            relay_adapt: Address::ZERO,
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
+            reliability: 1.0,
+            identifier: None,
+        };
+        let mut payload = body.into_signed_payload(seed).expect("signed payload");
+
+        let (_, verified) = payload.decode_and_verify().expect("decoded payload");
+        assert!(verified);
+
+        payload.signature[0] ^= 1;
+        let (_, verified) = payload
+            .decode_and_verify()
+            .expect("decoded tampered payload");
+        assert!(!verified);
+    }
+}

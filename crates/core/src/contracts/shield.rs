@@ -88,8 +88,7 @@ pub fn derive_shield_private_key(evm_private_key: &[u8; 32]) -> Result<[u8; 32],
     let signing_key = k256::ecdsa::SigningKey::from_bytes(evm_private_key.into())
         .map_err(|_| ShieldError::InvalidPrivateKey)?;
     let (signature, recovery_id) = signing_key
-        .sign_prehash_recoverable(msg_hash.as_ref())
-        .map_err(|_| ShieldError::SigningFailed)?;
+        .sign_prehash_recoverable(msg_hash.as_ref());
 
     // 65-byte signature: r (32) + s (32) + v (1)
     let mut sig_bytes = [0u8; 65];

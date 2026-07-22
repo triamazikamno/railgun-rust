@@ -1694,6 +1694,7 @@ mod tests {
     use std::time::Duration;
 
     use alloy::primitives::FixedBytes;
+    use chrono::Utc;
     use cid::Cid;
     use ed25519_dalek::SigningKey;
     use libp2p_identity::Keypair;
@@ -3273,9 +3274,9 @@ mod tests {
         rust_ipns::Record::new(
             keypair,
             value,
-            chrono::Duration::seconds(60 * 60 * 24 * 365),
+            Utc::now() + chrono::Duration::seconds(60 * 60 * 24 * 365),
             sequence,
-            60,
+            Duration::from_nanos(60),
         )
         .expect("IPNS record")
         .encode()

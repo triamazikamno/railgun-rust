@@ -918,9 +918,9 @@ mod tests {
         let ipns_record = rust_ipns::Record::new(
             &ipns_keypair,
             manifest_cid.to_string(),
-            chrono::Duration::seconds(1),
+            chrono::Utc::now() + chrono::Duration::seconds(1),
             12,
-            60,
+            Duration::from_nanos(60),
         )
         .expect("all-expired IPNS record")
         .encode()
@@ -1366,9 +1366,9 @@ mod tests {
         let ipns_record = rust_ipns::Record::new(
             &ipns_keypair,
             manifest_cid.to_string(),
-            chrono::Duration::seconds(60 * 60 * 24 * 365),
+            chrono::Utc::now() + chrono::Duration::seconds(60 * 60 * 24 * 365),
             manifest.sequence,
-            60,
+            Duration::from_nanos(60),
         )
         .expect("delayed manifest IPNS record")
         .encode()
