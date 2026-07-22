@@ -92,7 +92,8 @@ use workers::{
 };
 
 pub use data_plane::{
-    ChainPublicSyncCacheReset, PoiArtifactCacheRetry, PoiArtifactPersistenceHandle,
+    ChainPublicSyncCacheReset, LocalPoiQueryUnavailable, LocalPoiRootValidation,
+    LocalPoiStatusLookup, PoiArtifactCacheRetry, PoiArtifactPersistenceHandle,
     PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,
     PublicDataPlaneDiagnostics, PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange,
     PublicScanRows, PublicScanRowsAnswer, PublicSyncCacheReset,

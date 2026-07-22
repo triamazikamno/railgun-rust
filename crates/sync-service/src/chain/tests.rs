@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use local_db::{BlobMeta, DbConfig, DbStore, WalletCacheKey, WalletMeta};
 use merkletree::tree::MerkleForest;
 use multihash_codetable::{Code, MultihashDigest};
 use poi::cache::{PoiCache, PoiCacheIdentity};
-use poi::poi::PoiEventType;
+use poi::poi::{PoiEventType, PoiStatus};
 use railgun_wallet::scan::{IndexedNullifierInput, WalletScanInputRows};
 use railgun_wallet::tx::PoiMerkleProofSource;
 use railgun_wallet::wallet_cache::serialize_wallet_utxo;
@@ -57,6 +57,7 @@ use super::{
     wallet_finish_retry_request, wallet_remote_target_before_cached_suffix,
     wallet_reorg_backfill_from_block, wallet_startup_warm_from_block, wallet_sync_target,
 };
+use super::{LocalPoiQueryUnavailable, LocalPoiRootValidation, LocalPoiStatusLookup};
 use crate::SyncManager;
 use crate::indexed_artifacts::{
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
@@ -2472,6 +2473,12 @@ async fn artifact_poi_corpus_survives_wallet_scope_replacement() {
         }])
         .expect("seed public POI corpus event");
     cache.accept_current_roots();
+    let accepted_root = match &cache.progress().root_validation {
+        poi::cache::PoiCacheRootValidation::Validated { roots } => {
+            roots.values().next().copied().expect("accepted POI root")
+        }
+        other => panic!("expected accepted POI roots, got {other:?}"),
+    };
     public_data_plane
         .ensure_poi_corpus(PublicPoiCorpusKey::new(
             0,
@@ -2484,6 +2491,45 @@ async fn artifact_poi_corpus_survives_wallet_scope_replacement() {
         .write()
         .await
         .insert(list_key, cache);
+    let data_plane_handle = service.public_data_plane();
+    assert_eq!(
+        data_plane_handle
+            .validate_local_poi_roots(DEFAULT_TXID_VERSION, list_key, &[accepted_root])
+            .await
+            .expect("validate accepted local POI root"),
+        LocalPoiRootValidation::Accepted
+    );
+    assert_eq!(
+        data_plane_handle
+            .validate_local_poi_roots(
+                DEFAULT_TXID_VERSION,
+                list_key,
+                &[FixedBytes::from([0xff; 32])],
+            )
+            .await
+            .expect("validate absent local POI root"),
+        LocalPoiRootValidation::Unavailable(LocalPoiQueryUnavailable::SubmittedRootAbsent {
+            list_key,
+        })
+    );
+    assert_eq!(
+        data_plane_handle
+            .local_poi_statuses(DEFAULT_TXID_VERSION, &[list_key], &blinded_commitment,)
+            .await
+            .expect("query local POI status"),
+        LocalPoiStatusLookup::Valid(BTreeMap::from([(list_key, PoiStatus::Valid)]))
+    );
+    assert_eq!(
+        data_plane_handle
+            .local_poi_statuses(
+                DEFAULT_TXID_VERSION,
+                &[list_key],
+                &FixedBytes::from([0xfe; 32]),
+            )
+            .await
+            .expect("query unresolved local POI status"),
+        LocalPoiStatusLookup::Unavailable(LocalPoiQueryUnavailable::StatusUnresolved { list_key })
+    );
     let proof_source = service
         .public_data_plane()
         .local_poi_merkle_proof_source(DEFAULT_TXID_VERSION)

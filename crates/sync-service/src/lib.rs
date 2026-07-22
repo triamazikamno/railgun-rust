@@ -21,10 +21,11 @@ pub mod types;
 mod wallet;
 
 pub use chain::{
-    ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, PoiArtifactCacheRetry,
-    PublicCoverageAnswer, PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind,
-    PublicDataPlaneDiagnostics, PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange,
-    PublicScanRows, PublicScanRowsAnswer, PublicSyncCacheReset,
+    ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, LocalPoiQueryUnavailable,
+    LocalPoiRootValidation, LocalPoiStatusLookup, PoiArtifactCacheRetry, PublicCoverageAnswer,
+    PublicDataPlaneDiagnostic, PublicDataPlaneDiagnosticKind, PublicDataPlaneDiagnostics,
+    PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange, PublicScanRows,
+    PublicScanRowsAnswer, PublicSyncCacheReset,
 };
 pub use manager::{
     ChainPublicSyncCacheResetResult, PublicSyncCachesResetReport, SyncManager, SyncManagerError,

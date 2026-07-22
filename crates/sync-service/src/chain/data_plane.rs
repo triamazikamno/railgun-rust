@@ -16,6 +16,8 @@ use alloy::primitives::{FixedBytes, U256};
 use local_db::{BlobMeta, DbStore};
 use merkletree::tree::MerkleProof;
 use poi::artifacts::v4::{Manifest, Scope};
+use poi::cache::PoiCacheRootValidation;
+use poi::poi::PoiStatus;
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedMutexGuard, watch};
 use tokio_util::sync::CancellationToken;
@@ -126,6 +128,29 @@ pub struct PublicScanRows {
     pub to_block_hash: Option<[u8; 32]>,
     pub rows: WalletScanInputRows,
     pub epoch: PublicDataPlaneEpoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalPoiQueryUnavailable {
+    RequiredListsEmpty,
+    SubmittedRootsEmpty,
+    ListUnavailable { list_key: FixedBytes<32> },
+    CacheIdentityMismatch { list_key: FixedBytes<32> },
+    AcceptedRootsUnavailable { list_key: FixedBytes<32> },
+    SubmittedRootAbsent { list_key: FixedBytes<32> },
+    StatusUnresolved { list_key: FixedBytes<32> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalPoiRootValidation {
+    Accepted,
+    Unavailable(LocalPoiQueryUnavailable),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalPoiStatusLookup {
+    Valid(BTreeMap<FixedBytes<32>, PoiStatus>),
+    Unavailable(LocalPoiQueryUnavailable),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -512,6 +537,11 @@ impl PublicDataPlaneHandle {
         Self { service }
     }
 
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.service.chain_id()
+    }
+
     pub async fn public_scan_rows(
         &self,
         range: PublicScanRange,
@@ -544,6 +574,124 @@ impl PublicDataPlaneHandle {
             ))
             .await?;
         Ok(corpus.merkle_proof_source())
+    }
+
+    pub async fn validate_local_poi_roots(
+        &self,
+        txid_version: impl Into<String>,
+        list_key: FixedBytes<32>,
+        submitted_roots: &[FixedBytes<32>],
+    ) -> Result<LocalPoiRootValidation, PublicDataPlaneError> {
+        if submitted_roots.is_empty() {
+            return Ok(LocalPoiRootValidation::Unavailable(
+                LocalPoiQueryUnavailable::SubmittedRootsEmpty,
+            ));
+        }
+        let txid_version = txid_version.into();
+        let corpus = self
+            .service
+            .public_data_plane
+            .ensure_poi_corpus(PublicPoiCorpusKey::new(
+                EVM_CHAIN_TYPE,
+                self.service.chain_id(),
+                txid_version.clone(),
+            ))
+            .await?;
+        let caches = corpus.local_caches.read().await;
+        let Some(cache) = caches.get(&list_key) else {
+            return Ok(LocalPoiRootValidation::Unavailable(
+                LocalPoiQueryUnavailable::ListUnavailable { list_key },
+            ));
+        };
+        let identity = cache.identity();
+        if identity.chain_type != EVM_CHAIN_TYPE
+            || identity.chain_id != self.service.chain_id()
+            || identity.txid_version != txid_version
+            || identity.list_key != list_key
+        {
+            return Ok(LocalPoiRootValidation::Unavailable(
+                LocalPoiQueryUnavailable::CacheIdentityMismatch { list_key },
+            ));
+        }
+        let PoiCacheRootValidation::Validated { roots } = &cache.progress().root_validation else {
+            return Ok(LocalPoiRootValidation::Unavailable(
+                LocalPoiQueryUnavailable::AcceptedRootsUnavailable { list_key },
+            ));
+        };
+        if roots.is_empty() {
+            return Ok(LocalPoiRootValidation::Unavailable(
+                LocalPoiQueryUnavailable::AcceptedRootsUnavailable { list_key },
+            ));
+        }
+        if submitted_roots
+            .iter()
+            .all(|submitted| roots.values().any(|accepted| accepted == submitted))
+        {
+            Ok(LocalPoiRootValidation::Accepted)
+        } else {
+            Ok(LocalPoiRootValidation::Unavailable(
+                LocalPoiQueryUnavailable::SubmittedRootAbsent { list_key },
+            ))
+        }
+    }
+
+    pub async fn local_poi_statuses(
+        &self,
+        txid_version: impl Into<String>,
+        list_keys: &[FixedBytes<32>],
+        blinded_commitment: &FixedBytes<32>,
+    ) -> Result<LocalPoiStatusLookup, PublicDataPlaneError> {
+        if list_keys.is_empty() {
+            return Ok(LocalPoiStatusLookup::Unavailable(
+                LocalPoiQueryUnavailable::RequiredListsEmpty,
+            ));
+        }
+        let txid_version = txid_version.into();
+        let corpus = self
+            .service
+            .public_data_plane
+            .ensure_poi_corpus(PublicPoiCorpusKey::new(
+                EVM_CHAIN_TYPE,
+                self.service.chain_id(),
+                txid_version.clone(),
+            ))
+            .await?;
+        let caches = corpus.local_caches.read().await;
+        let mut statuses = BTreeMap::new();
+        for list_key in list_keys {
+            let Some(cache) = caches.get(list_key) else {
+                return Ok(LocalPoiStatusLookup::Unavailable(
+                    LocalPoiQueryUnavailable::ListUnavailable {
+                        list_key: *list_key,
+                    },
+                ));
+            };
+            let identity = cache.identity();
+            if identity.chain_type != EVM_CHAIN_TYPE
+                || identity.chain_id != self.service.chain_id()
+                || identity.txid_version != txid_version
+                || identity.list_key != *list_key
+            {
+                return Ok(LocalPoiStatusLookup::Unavailable(
+                    LocalPoiQueryUnavailable::CacheIdentityMismatch {
+                        list_key: *list_key,
+                    },
+                ));
+            }
+            let has_accepted_roots = matches!(
+                &cache.progress().root_validation,
+                PoiCacheRootValidation::Validated { roots } if !roots.is_empty()
+            );
+            if !has_accepted_roots || cache.status(blinded_commitment) != PoiStatus::Valid {
+                return Ok(LocalPoiStatusLookup::Unavailable(
+                    LocalPoiQueryUnavailable::StatusUnresolved {
+                        list_key: *list_key,
+                    },
+                ));
+            }
+            statuses.insert(*list_key, PoiStatus::Valid);
+        }
+        Ok(LocalPoiStatusLookup::Valid(statuses))
     }
 
     #[must_use]

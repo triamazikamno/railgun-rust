@@ -126,14 +126,16 @@ pub(crate) enum TransportEvent {
         peer_id: PeerId,
         result: Result<proto::filter::FilterSubscribeResponse, request_response::OutboundFailure>,
     },
-    FilterPush {
-        peer_id: PeerId,
-        push: Box<proto::filter::MessagePush>,
-    },
     StoreQueryResponse {
         req_id: ReqId,
         result: Result<proto::store::StoreQueryResponse, request_response::OutboundFailure>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct FilterPushEvent {
+    pub(crate) peer_id: PeerId,
+    pub(crate) push: Box<proto::filter::MessagePush>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -206,6 +208,7 @@ impl Transport {
         mut self,
         mut cmd_rx: mpsc::Receiver<TransportCmd>,
         event_tx: mpsc::Sender<TransportEvent>,
+        filter_push_tx: mpsc::Sender<FilterPushEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let mut filter_push_control = self.swarm.behaviour().filter_push.new_control();
@@ -229,7 +232,7 @@ impl Transport {
                         error!("filter push stream acceptor closed, stopping transport loop");
                         break;
                     };
-                    tokio::spawn(handle_filter_push_stream(peer_id, stream, event_tx.clone()));
+                    tokio::spawn(handle_filter_push_stream(peer_id, stream, filter_push_tx.clone()));
                 }
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
@@ -528,7 +531,7 @@ impl Transport {
 async fn handle_filter_push_stream(
     peer_id: PeerId,
     mut stream: libp2p::Stream,
-    event_tx: mpsc::Sender<TransportEvent>,
+    event_tx: mpsc::Sender<FilterPushEvent>,
 ) {
     while let Ok(push) = ProstLengthDelimitedCodec::<
         proto::filter::MessagePush,
@@ -537,7 +540,7 @@ async fn handle_filter_push_stream(
     .await
     {
         if event_tx
-            .send(TransportEvent::FilterPush {
+            .send(FilterPushEvent {
                 peer_id,
                 push: Box::new(push),
             })

@@ -6,7 +6,7 @@ use crate::error::WakuError;
 use crate::proto;
 use crate::proto::HashKey;
 use crate::protocols;
-use crate::transport::{ReqId, TransportCmd, TransportEvent};
+use crate::transport::{FilterPushEvent, ReqId, TransportCmd, TransportEvent};
 use crate::types::OpId;
 use libp2p::request_response::OutboundFailure;
 use libp2p::swarm::DialError;
@@ -60,6 +60,13 @@ pub struct LightPushResult {
     pub status_desc: Option<String>,
     pub relay_peer_count: Option<u32>,
     pub error: Option<OutboundFailure>,
+}
+
+impl LightPushResult {
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.error.is_none() && self.status_code == Some(200)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +230,28 @@ struct ResponseBatch<T> {
 struct LightPushState {
     pending: HashMap<ReqId, (OpId, PeerId)>,
     ops: HashMap<OpId, ResponseBatch<LightPushResult>>,
-    waiters: HashMap<OpId, oneshot::Sender<Vec<LightPushResult>>>,
+    waiters: HashMap<OpId, oneshot::Sender<Result<Vec<LightPushResult>, WakuError>>>,
+}
+
+fn remove_lightpush_operation(
+    state: &mut LightPushState,
+    op_id: OpId,
+) -> Option<oneshot::Sender<Result<Vec<LightPushResult>, WakuError>>> {
+    state.ops.remove(&op_id);
+    state
+        .pending
+        .retain(|_, (pending_op_id, _)| *pending_op_id != op_id);
+    state.waiters.remove(&op_id)
+}
+
+fn record_lightpush_result(
+    batch: &mut ResponseBatch<LightPushResult>,
+    result: LightPushResult,
+) -> bool {
+    batch.finished += 1;
+    let accepted = result.is_success();
+    batch.results.push(result);
+    accepted || batch.finished >= batch.expected
 }
 
 #[derive(Debug)]
@@ -258,6 +286,8 @@ struct Subscription {
     pubsub_topic: String,
     content_topics: Vec<String>,
     sender: mpsc::Sender<proto::WakuMessage>,
+    dropped_since_log: u64,
+    last_drop_log: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -713,7 +743,11 @@ impl NodeInner {
         }
     }
 
-    async fn run_event_loop(self: Arc<Self>, mut transport_rx: mpsc::Receiver<TransportEvent>) {
+    async fn run_event_loop(
+        self: Arc<Self>,
+        mut transport_rx: mpsc::Receiver<TransportEvent>,
+        mut filter_push_rx: mpsc::Receiver<FilterPushEvent>,
+    ) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut shutdown = self.shutdown_tx.subscribe();
 
@@ -732,6 +766,10 @@ impl NodeInner {
                     let Some(ev) = ev else { break };
                     self.handle_transport_event(ev).await;
                 }
+                push = filter_push_rx.recv() => {
+                    let Some(push) = push else { break };
+                    self.handle_filter_push(push.peer_id, *push.push).await;
+                }
             }
         }
     }
@@ -742,12 +780,13 @@ impl NodeInner {
             let mut lp = self.ops.lightpush.lock().await;
             let expired = lp
                 .ops
-                .extract_if(|_, op| op.deadline <= now)
+                .iter()
+                .filter_map(|(op_id, op)| (op.deadline <= now).then_some(*op_id))
                 .collect::<Vec<_>>();
 
-            for (op_id, op) in expired {
-                if let Some(tx) = lp.waiters.remove(&op_id)
-                    && tx.send(op.results).is_err()
+            for op_id in expired {
+                if let Some(tx) = remove_lightpush_operation(&mut lp, op_id)
+                    && tx.send(Err(WakuError::RequestTimeout)).is_err()
                 {
                     debug!(?op_id, "lightpush results receiver dropped");
                 }
@@ -779,6 +818,28 @@ impl NodeInner {
         for (req_id, pending) in expired_store_queries {
             if let Err(error) = pending.waiter.send(Err(WakuError::StoreRequestFailed)) {
                 debug!(?req_id, ?error, "store query receiver dropped");
+            }
+        }
+
+        {
+            let mut filter = self.ops.filter.lock().await;
+            for (sub_id, subscription) in &mut filter.subscriptions {
+                if subscription.dropped_since_log == 0
+                    || subscription
+                        .last_drop_log
+                        .is_none_or(|last| now.duration_since(last) < Duration::from_secs(30))
+                {
+                    continue;
+                }
+                debug!(
+                    ?sub_id,
+                    pubsub_topic = subscription.pubsub_topic,
+                    content_topics = ?subscription.content_topics,
+                    dropped = subscription.dropped_since_log,
+                    "filter subscription dropped messages since last capacity warning"
+                );
+                subscription.dropped_since_log = 0;
+                subscription.last_drop_log = Some(now);
             }
         }
 
@@ -953,9 +1014,6 @@ impl NodeInner {
                 self.handle_filter_subscribe_response(req_id, peer_id, result)
                     .await;
             }
-            TransportEvent::FilterPush { peer_id, push } => {
-                self.handle_filter_push(peer_id, *push).await;
-            }
             TransportEvent::StoreQueryResponse { req_id, result } => {
                 self.handle_store_query_response(req_id, result).await;
             }
@@ -972,38 +1030,40 @@ impl NodeInner {
         let Some((op_id, _)) = lp.pending.remove(&req_id) else {
             return;
         };
+        let result = match result {
+            Ok(response) => LightPushResult {
+                peer_id,
+                status_code: Some(response.status_code),
+                status_desc: response.status_desc,
+                relay_peer_count: response.relay_peer_count,
+                error: None,
+            },
+            Err(error) => LightPushResult {
+                peer_id,
+                status_code: None,
+                status_desc: None,
+                relay_peer_count: None,
+                error: Some(error),
+            },
+        };
         let Some(op) = lp.ops.get_mut(&op_id) else {
             return;
         };
+        let should_finish = record_lightpush_result(op, result);
 
-        op.finished += 1;
-        match result {
-            Ok(response) => {
-                op.results.push(LightPushResult {
-                    peer_id,
-                    status_code: Some(response.status_code),
-                    status_desc: response.status_desc,
-                    relay_peer_count: response.relay_peer_count,
-                    error: None,
-                });
+        if should_finish {
+            let results = lp
+                .ops
+                .remove(&op_id)
+                .map(|finished_op| finished_op.results)
+                .unwrap_or_default();
+            lp.pending
+                .retain(|_, (pending_op_id, _)| *pending_op_id != op_id);
+            if let Some(tx) = lp.waiters.remove(&op_id)
+                && tx.send(Ok(results)).is_err()
+            {
+                debug!(?op_id, "lightpush response receiver dropped");
             }
-            Err(e) => {
-                op.results.push(LightPushResult {
-                    peer_id,
-                    status_code: None,
-                    status_desc: None,
-                    relay_peer_count: None,
-                    error: Some(e),
-                });
-            }
-        }
-
-        if op.finished >= op.expected
-            && let Some(finished_op) = lp.ops.remove(&op_id)
-            && let Some(tx) = lp.waiters.remove(&op_id)
-            && tx.send(finished_op.results).is_err()
-        {
-            debug!(?op_id, "lightpush response receiver dropped");
         }
     }
 
@@ -1341,7 +1401,8 @@ impl NodeInner {
         };
         let content_topic = &message.content_topic;
 
-        for sub in filter.subscriptions.values() {
+        let mut closed = Vec::new();
+        for (sub_id, sub) in &mut filter.subscriptions {
             if sub.pubsub_topic != pubsub_topic {
                 continue;
             }
@@ -1350,9 +1411,35 @@ impl NodeInner {
                 continue;
             }
 
-            if let Err(error) = sub.sender.try_send(message.clone()) {
-                debug!(%error, "failed to deliver filter push to subscriber");
+            match sub.sender.try_send(message.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    sub.dropped_since_log = sub.dropped_since_log.saturating_add(1);
+                    let now = Instant::now();
+                    if sub
+                        .last_drop_log
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30))
+                    {
+                        debug!(
+                            %peer_id,
+                            ?sub_id,
+                            pubsub_topic,
+                            content_topic,
+                            dropped = sub.dropped_since_log,
+                            "filter subscription capacity exhausted; dropping messages"
+                        );
+                        sub.dropped_since_log = 0;
+                        sub.last_drop_log = Some(now);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    closed.push(*sub_id);
+                }
             }
+        }
+        for sub_id in closed {
+            filter.subscriptions.remove(&sub_id);
+            debug!(?sub_id, "removed closed filter subscription");
         }
     }
 
@@ -1436,6 +1523,7 @@ mod api;
 mod tests {
     use super::*;
     use crate::config::WakuConfig;
+    use libp2p::request_response::OutboundFailure;
 
     fn addr(value: &str) -> Multiaddr {
         value.parse().expect("valid multiaddr")
@@ -1448,6 +1536,81 @@ mod tests {
         assert_eq!(tor_discovery_retry_delay(2), Duration::from_mins(1));
         assert_eq!(tor_discovery_retry_delay(3), Duration::from_mins(5));
         assert_eq!(tor_discovery_retry_delay(u32::MAX), Duration::from_mins(5));
+    }
+
+    #[test]
+    fn lightpush_result_requires_success_status_without_transport_error() {
+        let peer_id = PeerId::random();
+        let accepted = LightPushResult {
+            peer_id,
+            status_code: Some(200),
+            status_desc: None,
+            relay_peer_count: Some(1),
+            error: None,
+        };
+        assert!(accepted.is_success());
+
+        let rejected = LightPushResult {
+            status_code: Some(503),
+            ..accepted
+        };
+        assert!(!rejected.is_success());
+
+        let undefined_success = LightPushResult {
+            status_code: Some(201),
+            ..rejected
+        };
+        assert!(!undefined_success.is_success());
+
+        let failed = LightPushResult {
+            status_code: None,
+            error: Some(OutboundFailure::Timeout),
+            ..undefined_success
+        };
+        assert!(!failed.is_success());
+    }
+
+    #[test]
+    fn lightpush_batch_finishes_on_first_accepted_response() {
+        let mut batch = ResponseBatch {
+            expected: 3,
+            finished: 0,
+            results: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+
+        assert!(record_lightpush_result(
+            &mut batch,
+            LightPushResult {
+                peer_id: PeerId::random(),
+                status_code: Some(200),
+                status_desc: None,
+                relay_peer_count: Some(1),
+                error: None,
+            },
+        ));
+        assert_eq!(batch.finished, 1);
+    }
+
+    #[test]
+    fn lightpush_batch_waits_for_all_rejected_responses() {
+        let mut batch = ResponseBatch {
+            expected: 2,
+            finished: 0,
+            results: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let rejected = || LightPushResult {
+            peer_id: PeerId::random(),
+            status_code: Some(503),
+            status_desc: None,
+            relay_peer_count: None,
+            error: None,
+        };
+
+        assert!(!record_lightpush_result(&mut batch, rejected()));
+        assert!(record_lightpush_result(&mut batch, rejected()));
+        assert_eq!(batch.finished, 2);
     }
 
     #[test]

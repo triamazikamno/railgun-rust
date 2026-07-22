@@ -14,6 +14,8 @@ pub enum WakuError {
     InvalidArgument(String),
     #[error("no peers available")]
     NoPeersAvailable,
+    #[error("request timed out")]
+    RequestTimeout,
     #[error("channel full")]
     ChannelFull,
     #[error("subscription not found")]

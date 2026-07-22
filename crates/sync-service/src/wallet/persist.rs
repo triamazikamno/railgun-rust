@@ -131,12 +131,37 @@ impl WalletHandle {
     pub async fn wait_until_ready(&mut self) -> Result<(), WalletReadinessWaitError> {
         wait_until_ready(self.subscribe_observation()).await
     }
+
+    pub async fn wait_until_ready_or_shutdown(&self) -> Result<(), WalletReadinessWaitError> {
+        wait_until_ready_or_shutdown(self.subscribe_observation()).await
+    }
 }
 
 async fn wait_until_ready(
     observation_rx: watch::Receiver<WalletObservation>,
 ) -> Result<(), WalletReadinessWaitError> {
     wait_until_ready_with_observer(observation_rx, |_| {}).await
+}
+
+async fn wait_until_ready_or_shutdown(
+    mut observation_rx: watch::Receiver<WalletObservation>,
+) -> Result<(), WalletReadinessWaitError> {
+    loop {
+        let readiness = observation_rx.borrow_and_update().readiness().clone();
+        match readiness {
+            WalletReadiness::Ready => match observation_rx.has_changed() {
+                Ok(false) => return Ok(()),
+                Ok(true) => continue,
+                Err(_) => return Err(WalletReadinessWaitError::ChannelClosed),
+            },
+            WalletReadiness::Shutdown => return Err(WalletReadinessWaitError::Shutdown),
+            WalletReadiness::Syncing | WalletReadiness::Failed(_) => {}
+        }
+        observation_rx
+            .changed()
+            .await
+            .map_err(|_| WalletReadinessWaitError::ChannelClosed)?;
+    }
 }
 
 async fn wait_until_ready_with_observer(
@@ -467,6 +492,16 @@ mod readiness_wait_tests {
             wait_until_ready(closed_ready_rx).await,
             Err(WalletReadinessWaitError::ChannelClosed)
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_wait_continues_from_failed_to_ready() {
+        let reason = WalletReadinessError::ApplyFailed;
+        let (tx, rx) = watch::channel(observation(WalletReadiness::Failed(reason)));
+        let waiter = tokio::spawn(wait_until_ready_or_shutdown(rx));
+        tx.send(observation(WalletReadiness::Ready))
+            .expect("readiness receiver remains active");
+        assert_eq!(waiter.await.expect("readiness waiter"), Ok(()));
     }
 
     #[tokio::test]

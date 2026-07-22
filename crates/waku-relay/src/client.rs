@@ -577,7 +577,7 @@ impl Client {
                 .unwrap_or("Waku is unavailable for the selected network mode");
             return Err(ClientError::Disabled(reason.to_string()));
         };
-        if let Err(error) = waku_fleet
+        match waku_fleet
             .lightpush_all(
                 self.pubsub_path.clone(),
                 content_topic.to_string(),
@@ -585,13 +585,28 @@ impl Client {
             )
             .await
         {
-            tracing::warn!(%error, pubsub_path, content_topic, "failed to publish message to waku fleet");
-        } else {
-            tracing::debug!(
-                pubsub_path,
-                content_topic,
-                "published Waku message to fleet"
-            );
+            Ok(results) => {
+                let accepted = results.iter().filter(|result| result.is_success()).count();
+                if accepted == 0 {
+                    tracing::warn!(
+                        pubsub_path,
+                        content_topic,
+                        responses = results.len(),
+                        "no Waku fleet peer accepted published message"
+                    );
+                } else {
+                    tracing::debug!(
+                        pubsub_path,
+                        content_topic,
+                        accepted,
+                        responses = results.len(),
+                        "published Waku message to fleet"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, pubsub_path, content_topic, "failed to publish message to waku fleet");
+            }
         }
         if let Some(nwaku_url) = &self.nwaku_url {
             #[derive(Debug, serde::Serialize)]

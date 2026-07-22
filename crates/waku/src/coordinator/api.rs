@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
 use crate::config::{WakuConfig, WakuTransportProfile};
@@ -19,7 +19,8 @@ use crate::types::OpId;
 use super::{
     FilterBatch, FilterOp, FilterState, LightPushResult, NodeInner, OpTracker, PeerBook,
     PeerSnapshot, PeerStats, ResponseBatch, STORE_PEER_EVENT_CAPACITY, StorePending,
-    StoreQueryOptions, SubId, Subscription, WakuNode, build_filter_request, store_status_ok,
+    StoreQueryOptions, SubId, Subscription, WakuNode, build_filter_request,
+    remove_lightpush_operation, store_status_ok,
 };
 
 impl WakuNode {
@@ -28,10 +29,16 @@ impl WakuNode {
         let transport = Transport::new(&config.node, &config.network)?;
         let (transport_tx, transport_cmd_rx) = mpsc::channel(64);
         let (transport_event_tx, transport_event_rx) = mpsc::channel(64);
+        let (filter_push_tx, filter_push_rx) = mpsc::channel(64);
         let (dial_tx, dial_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        tokio::spawn(transport.run(transport_cmd_rx, transport_event_tx, shutdown_rx));
+        tokio::spawn(transport.run(
+            transport_cmd_rx,
+            transport_event_tx,
+            filter_push_tx,
+            shutdown_rx,
+        ));
 
         let metadata_response = proto::metadata::WakuMetadataResponse {
             cluster_id: Some(config.cluster_id),
@@ -68,7 +75,9 @@ impl WakuNode {
         {
             let inner = inner.clone();
             tokio::spawn(async move {
-                inner.run_event_loop(transport_event_rx).await;
+                inner
+                    .run_event_loop(transport_event_rx, filter_push_rx)
+                    .await;
             });
         }
 
@@ -142,6 +151,7 @@ impl WakuNode {
     }
 
     /// `LightPush` a message to all currently connected peers supporting `LightPush` v3.
+    /// Returns when one peer accepts the message or every attempted peer responds.
     pub async fn lightpush_all(
         &self,
         pubsub_topic: String,
@@ -166,7 +176,7 @@ impl WakuNode {
 
             if candidates.is_empty() {
                 lp.waiters.remove(&op_id);
-                return Ok(Vec::new());
+                return Err(WakuError::NoPeersAvailable);
             }
 
             let mut expected = 0;
@@ -207,7 +217,7 @@ impl WakuNode {
 
             if expected == 0 {
                 lp.waiters.remove(&op_id);
-                return Ok(Vec::new());
+                return Err(WakuError::ChannelFull);
             }
 
             let op = ResponseBatch {
@@ -219,7 +229,12 @@ impl WakuNode {
             lp.ops.insert(op_id, op);
         }
 
-        rx.await.map_err(|_| WakuError::Cancelled)
+        if let Ok(result) = timeout(self.inner.config.request_timeout, rx).await {
+            return result.map_err(|_| WakuError::Cancelled)?;
+        }
+        let mut lp = self.inner.ops.lightpush.lock().await;
+        remove_lightpush_operation(&mut lp, op_id);
+        Err(WakuError::RequestTimeout)
     }
 
     #[must_use]
@@ -469,6 +484,8 @@ impl WakuNode {
                 pubsub_topic: sub_pubsub_topic,
                 content_topics: sub_content_topics,
                 sender: msg_tx,
+                dropped_since_log: 0,
+                last_drop_log: None,
             };
             filter.subscriptions.insert(sub_id, subscription);
             sub_id
