@@ -66,8 +66,8 @@ bytes = { version = "1.11" }
 byteorder = "1"
 rayon = { version = "1.11" }
 async-trait = "0.1"
-arti-client = "0.44"
-tor-rtcompat = "0.44"
+arti-client = "0.43"
+tor-rtcompat = "0.43"
 zstd = "0.13"
 
 [profile.release]
