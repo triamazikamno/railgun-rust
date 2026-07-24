@@ -391,16 +391,17 @@ impl Client {
                     } else {
                         VecDeque::new()
                     };
-                    let mut queried_store_peers = HashSet::new();
+                    let mut successfully_queried_store_peers = HashSet::new();
                     loop {
                         if relay_sink_is_closed(&sink_tx) {
+                            tracing::debug!("relay sink is closed, breaking...");
                             return;
                         }
 
                         if let Some(lookback) = history_lookback
                             && let Some(peer_id) = pending_store_peers.pop_front()
                         {
-                            if !queried_store_peers.insert(peer_id) {
+                            if successfully_queried_store_peers.contains(&peer_id) {
                                 continue;
                             }
 
@@ -421,6 +422,7 @@ impl Client {
 
                             match query_result {
                                 Ok(messages) => {
+                                    successfully_queried_store_peers.insert(peer_id);
                                     let returned = messages.len();
                                     let mut matching_topics = 0usize;
                                     let mut delivered = 0usize;
