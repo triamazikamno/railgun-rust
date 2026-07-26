@@ -1325,6 +1325,17 @@ pub struct AppSettingsRecord {
 
 impl DbStore {
     pub fn open(config: DbConfig) -> Result<Self, DbError> {
+        Self::open_inner(config, None)
+    }
+
+    pub fn open_with_cache_size_bytes(
+        config: DbConfig,
+        cache_size_bytes: usize,
+    ) -> Result<Self, DbError> {
+        Self::open_inner(config, Some(cache_size_bytes))
+    }
+
+    fn open_inner(config: DbConfig, cache_size_bytes: Option<usize>) -> Result<Self, DbError> {
         let root_dir = config.root_dir;
         let railgun_dir = railgun_dir(&root_dir);
         std::fs::create_dir_all(&root_dir)?;
@@ -1343,7 +1354,15 @@ impl DbStore {
 
         loop {
             validate_database_path(&db_path)?;
-            let db = if db_path.exists() {
+            let db = if let Some(cache_size_bytes) = cache_size_bytes {
+                let mut builder = Database::builder();
+                builder.set_cache_size(cache_size_bytes);
+                if db_path.exists() {
+                    builder.open(&db_path)?
+                } else {
+                    builder.create(&db_path)?
+                }
+            } else if db_path.exists() {
                 Database::open(&db_path)?
             } else {
                 Database::create(&db_path)?

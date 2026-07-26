@@ -104,6 +104,29 @@ fn database_directory_lock_releases_after_store_drop() {
 }
 
 #[test]
+fn database_opens_and_reopens_with_explicit_cache_size() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open_with_cache_size_bytes(
+        DbConfig {
+            root_dir: root_dir.clone(),
+        },
+        64 * 1024,
+    )
+    .expect("open db with explicit cache size");
+    drop(store);
+
+    let reopened = DbStore::open_with_cache_size_bytes(
+        DbConfig {
+            root_dir: root_dir.clone(),
+        },
+        64 * 1024,
+    )
+    .expect("reopen db with explicit cache size");
+    drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
 fn database_directory_locks_are_scoped_by_root() {
     let first_root = temp_db_root();
     let second_root = temp_db_root();
