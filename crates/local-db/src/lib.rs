@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt::{self, Display};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -18,8 +18,9 @@ use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table,
     TableDefinition, TableHandle, WriteTransaction,
 };
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod migrations;
@@ -46,6 +47,7 @@ const PENDING_OUTPUT_POI_CONTEXT_V2_TABLE: ByteTableDefinition =
 const OUTPUT_POI_RECOVERY_V2_TABLE: ByteTableDefinition =
     TableDefinition::new("output_poi_recovery_v2");
 const POI_ARTIFACT_CACHE_TABLE: ByteTableDefinition = TableDefinition::new("poi_artifact_cache");
+const POI_CORPUS_JOURNAL_TABLE: ByteTableDefinition = TableDefinition::new("poi_corpus_journal_v1");
 const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
 const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
 const POI_PUBLISHER_MANIFEST_WATERMARK_KEY_PREFIX: &str =
@@ -75,6 +77,7 @@ pub enum LocalDbTable {
     PendingOutputPoiContextV2,
     OutputPoiRecoveryV2,
     PoiArtifactCache,
+    PoiCorpusJournal,
     AppSettings,
     DesktopWalletVault,
 }
@@ -94,6 +97,7 @@ pub enum LocalDbTableDecodeKind {
     OutputPoiRecoveryV1,
     OpaqueBytes,
     PoiArtifactCache,
+    PoiCorpusJournal,
     AppSettings,
     DesktopWalletVault,
 }
@@ -177,6 +181,11 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::PoiArtifactCache,
     },
     LocalDbTableInfo {
+        table: LocalDbTable::PoiCorpusJournal,
+        name: "poi_corpus_journal_v1",
+        decode_kind: LocalDbTableDecodeKind::PoiCorpusJournal,
+    },
+    LocalDbTableInfo {
         table: LocalDbTable::AppSettings,
         name: "app_settings_v1",
         decode_kind: LocalDbTableDecodeKind::AppSettings,
@@ -206,6 +215,7 @@ impl LocalDbTable {
             Self::PendingOutputPoiContextV2 => PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
             Self::OutputPoiRecoveryV2 => OUTPUT_POI_RECOVERY_V2_TABLE,
             Self::PoiArtifactCache => POI_ARTIFACT_CACHE_TABLE,
+            Self::PoiCorpusJournal => POI_CORPUS_JOURNAL_TABLE,
             Self::AppSettings => APP_SETTINGS_TABLE,
             Self::DesktopWalletVault => DESKTOP_WALLET_VAULT_TABLE,
         }
@@ -421,6 +431,8 @@ pub enum DbError {
     InvalidPpoiSidecarRecord { kind: &'static str, key: String },
     #[error("invalid PPOI corpus record {key}")]
     InvalidPpoiCorpusRecord { key: String },
+    #[error("invalid {kind} PPOI corpus journal record {key}")]
+    InvalidPpoiCorpusJournalRecord { kind: &'static str, key: String },
     #[error("invalid schema-9 PPOI corpus record {key}")]
     InvalidSchemaNinePpoiCorpusRecord { key: String },
     #[error("invalid blob relative path for kind {kind}")]
@@ -819,28 +831,398 @@ pub struct PoiArtifactCacheRecord {
     pub artifact_tip_root: Option<FixedBytes<32>>,
     pub current_tip_index: u64,
     pub current_tip_root: FixedBytes<32>,
+    #[serde(with = "serde_bytes")]
     pub cache_payload: Vec<u8>,
     // Compatibility metadata only. The RPC-health sidecar owns current source health.
     #[serde(default, rename = "last_successful_rpc_sync_at_ms")]
     pub legacy_last_successful_rpc_sync_at_ms: Option<u64>,
+    /// Unix timestamp in seconds, overwritten by `DbStore` corpus persistence methods.
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoiArtifactCacheCommitCondition {
-    pub expected_generation: u64,
-    pub expected_publisher: Option<(FixedBytes<32>, u64)>,
-    pub expected_manifest_hash: Option<FixedBytes<32>>,
-    pub expected_payload_hash: Option<FixedBytes<32>>,
+pub const POI_CORPUS_JOURNAL_FORMAT_VERSION: u16 = 1;
+pub const POI_CORPUS_JOURNAL_SOFT_DELTA_COUNT: u32 = 128;
+pub const POI_CORPUS_JOURNAL_SOFT_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
+pub const POI_CORPUS_JOURNAL_MAX_DELTA_COUNT: u32 = 512;
+pub const POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+pub const POI_CORPUS_JOURNAL_MAX_BLOCKED_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
+const POI_CORPUS_JOURNAL_MAX_HEAD_ROW_BYTES: usize = 1024 * 1024;
+const POI_CORPUS_JOURNAL_ROW_OVERHEAD_BYTES: usize = 64 * 1024;
+const POI_CORPUS_JOURNAL_MAX_DELTA_ROW_BYTES: usize =
+    POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES as usize + POI_CORPUS_JOURNAL_ROW_OVERHEAD_BYTES;
+const POI_CORPUS_JOURNAL_MAX_BLOCKED_ROW_BYTES: usize =
+    POI_CORPUS_JOURNAL_MAX_BLOCKED_PAYLOAD_BYTES as usize + POI_CORPUS_JOURNAL_ROW_OVERHEAD_BYTES;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiCorpusJournalHeadRecord {
+    pub format_version: u16,
+    pub revision: u64,
+    pub base_revision: u64,
+    pub base_payload_hash: FixedBytes<32>,
+    pub event_cursor: u64,
+    pub leaf_cursor: u64,
+    pub blocked_revision: Option<u64>,
+    pub blocked_payload_hash: Option<FixedBytes<32>>,
+    pub delta_count: u32,
+    pub delta_payload_bytes: u64,
+    /// Current corpus metadata. `cache_payload` is always empty in a journal head.
+    pub corpus: PoiArtifactCacheRecord,
+}
+
+impl PoiCorpusJournalHeadRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(
+            self.corpus.chain_type,
+            self.corpus.chain_id,
+            &self.corpus.txid_version,
+            &self.corpus.list_key,
+        )
+    }
+
+    #[must_use]
+    pub fn key_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> String {
+        format!(
+            "{}|head",
+            PoiArtifactCacheRecord::key_for(chain_type, chain_id, txid_version, list_key)
+        )
+    }
+
+    #[must_use]
+    pub fn identity_prefix_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> String {
+        format!(
+            "{}|",
+            PoiArtifactCacheRecord::key_for(chain_type, chain_id, txid_version, list_key)
+        )
+    }
+
+    #[must_use]
+    pub fn delta_prefix_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> String {
+        format!(
+            "{}delta|",
+            Self::identity_prefix_for(chain_type, chain_id, txid_version, list_key)
+        )
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiCorpusJournalDeltaRecord {
+    pub format_version: u16,
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: String,
+    pub list_key: FixedBytes<32>,
+    pub cache_generation: u64,
+    pub revision: u64,
+    pub previous_revision: u64,
+    pub base_revision: u64,
+    pub event_start_cursor: u64,
+    pub event_end_cursor: u64,
+    pub leaf_start_cursor: u64,
+    pub leaf_end_cursor: u64,
+    pub start_tip_root: FixedBytes<32>,
+    pub end_tip_root: FixedBytes<32>,
+    #[serde(with = "serde_bytes")]
+    pub payload: Vec<u8>,
+    pub updated_at: u64,
+}
+
+impl fmt::Debug for PoiCorpusJournalDeltaRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoiCorpusJournalDeltaRecord")
+            .field("key", &self.key())
+            .field("cache_generation", &self.cache_generation)
+            .field("revision", &self.revision)
+            .field("previous_revision", &self.previous_revision)
+            .field("base_revision", &self.base_revision)
+            .field("event_start_cursor", &self.event_start_cursor)
+            .field("event_end_cursor", &self.event_end_cursor)
+            .field("leaf_start_cursor", &self.leaf_start_cursor)
+            .field("leaf_end_cursor", &self.leaf_end_cursor)
+            .field("payload_bytes", &self.payload.len())
+            .field("updated_at", &self.updated_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoiCorpusJournalDeltaRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(
+            self.chain_type,
+            self.chain_id,
+            &self.txid_version,
+            &self.list_key,
+            self.revision,
+        )
+    }
+
+    #[must_use]
+    pub fn key_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+        revision: u64,
+    ) -> String {
+        format!(
+            "{}{revision:020}",
+            PoiCorpusJournalHeadRecord::delta_prefix_for(
+                chain_type,
+                chain_id,
+                txid_version,
+                list_key
+            )
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct PoiCorpusJournalDeltaRecordWire<'a> {
+    format_version: u16,
+    chain_type: u8,
+    chain_id: u64,
+    #[serde(borrow)]
+    txid_version: &'a str,
+    list_key: FixedBytes<32>,
+    cache_generation: u64,
+    revision: u64,
+    previous_revision: u64,
+    base_revision: u64,
+    event_start_cursor: u64,
+    event_end_cursor: u64,
+    leaf_start_cursor: u64,
+    leaf_end_cursor: u64,
+    start_tip_root: FixedBytes<32>,
+    end_tip_root: FixedBytes<32>,
+    #[serde(borrow, with = "serde_bytes")]
+    payload: &'a [u8],
+    updated_at: u64,
+}
+
+impl PoiCorpusJournalDeltaRecordWire<'_> {
+    fn into_owned(self) -> PoiCorpusJournalDeltaRecord {
+        PoiCorpusJournalDeltaRecord {
+            format_version: self.format_version,
+            chain_type: self.chain_type,
+            chain_id: self.chain_id,
+            txid_version: self.txid_version.to_owned(),
+            list_key: self.list_key,
+            cache_generation: self.cache_generation,
+            revision: self.revision,
+            previous_revision: self.previous_revision,
+            base_revision: self.base_revision,
+            event_start_cursor: self.event_start_cursor,
+            event_end_cursor: self.event_end_cursor,
+            leaf_start_cursor: self.leaf_start_cursor,
+            leaf_end_cursor: self.leaf_end_cursor,
+            start_tip_root: self.start_tip_root,
+            end_tip_root: self.end_tip_root,
+            payload: self.payload.to_vec(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiCorpusBlockedSnapshotRecord {
+    pub format_version: u16,
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: String,
+    pub list_key: FixedBytes<32>,
+    pub cache_generation: u64,
+    pub revision: u64,
+    pub payload_hash: FixedBytes<32>,
+    #[serde(with = "serde_bytes")]
+    pub payload: Vec<u8>,
+    pub updated_at: u64,
+}
+
+impl fmt::Debug for PoiCorpusBlockedSnapshotRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoiCorpusBlockedSnapshotRecord")
+            .field("key", &self.key())
+            .field("cache_generation", &self.cache_generation)
+            .field("revision", &self.revision)
+            .field("payload_bytes", &self.payload.len())
+            .field("updated_at", &self.updated_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoiCorpusBlockedSnapshotRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(
+            self.chain_type,
+            self.chain_id,
+            &self.txid_version,
+            &self.list_key,
+        )
+    }
+
+    #[must_use]
+    pub fn key_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> String {
+        format!(
+            "{}blocked",
+            PoiCorpusJournalHeadRecord::identity_prefix_for(
+                chain_type,
+                chain_id,
+                txid_version,
+                list_key
+            )
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct PoiCorpusBlockedSnapshotRecordWire<'a> {
+    format_version: u16,
+    chain_type: u8,
+    chain_id: u64,
+    #[serde(borrow)]
+    txid_version: &'a str,
+    list_key: FixedBytes<32>,
+    cache_generation: u64,
+    revision: u64,
+    payload_hash: FixedBytes<32>,
+    #[serde(borrow, with = "serde_bytes")]
+    payload: &'a [u8],
+    updated_at: u64,
+}
+
+impl PoiCorpusBlockedSnapshotRecordWire<'_> {
+    fn into_owned(self) -> PoiCorpusBlockedSnapshotRecord {
+        PoiCorpusBlockedSnapshotRecord {
+            format_version: self.format_version,
+            chain_type: self.chain_type,
+            chain_id: self.chain_id,
+            txid_version: self.txid_version.to_owned(),
+            list_key: self.list_key,
+            cache_generation: self.cache_generation,
+            revision: self.revision,
+            payload_hash: self.payload_hash,
+            payload: self.payload.to_vec(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoiCorpusJournalBundle {
+    pub base: PoiArtifactCacheRecord,
+    pub head: Option<PoiCorpusJournalHeadRecord>,
+    pub deltas: Vec<PoiCorpusJournalDeltaRecord>,
+    pub blocked: Option<PoiCorpusBlockedSnapshotRecord>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PoiCorpusJournalCorruptionToken {
+    fingerprint: FixedBytes<32>,
+    replacement_revision: u64,
+    retired_delta_count: u32,
+    retired_delta_payload_bytes: u64,
+}
+
+impl fmt::Debug for PoiCorpusJournalCorruptionToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoiCorpusJournalCorruptionToken")
+            .field("replacement_revision", &self.replacement_revision)
+            .field("retired_delta_count", &self.retired_delta_count)
+            .field(
+                "retired_delta_payload_bytes",
+                &self.retired_delta_payload_bytes,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum PoiCorpusJournalInspection {
+    Missing,
+    Valid {
+        bundle: Box<PoiCorpusJournalBundle>,
+        replacement_token: PoiCorpusJournalCorruptionToken,
+    },
+    Corrupt {
+        key: String,
+        replacement_token: PoiCorpusJournalCorruptionToken,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PoiArtifactCacheCommitOutcome {
-    Applied,
+pub enum ExpectedPoiCorpusJournalState {
+    NoValidBase,
+    ImplicitBase {
+        base_payload_hash: FixedBytes<32>,
+        event_cursor: u64,
+        leaf_cursor: u64,
+        current_tip_root: FixedBytes<32>,
+    },
+    Head {
+        revision: u64,
+        base_revision: u64,
+        base_payload_hash: FixedBytes<32>,
+        event_cursor: u64,
+        leaf_cursor: u64,
+        current_tip_root: FixedBytes<32>,
+    },
+    Corrupt {
+        replacement_token: PoiCorpusJournalCorruptionToken,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoiCorpusJournalCommitCondition {
+    pub expected_generation: u64,
+    pub expected_publisher: Option<(FixedBytes<32>, u64)>,
+    pub expected_manifest_hash: Option<FixedBytes<32>>,
+    pub expected_state: ExpectedPoiCorpusJournalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoiCorpusJournalCommit {
+    pub head: PoiCorpusJournalHeadRecord,
+    pub delta: Option<PoiCorpusJournalDeltaRecord>,
+    pub blocked: Option<PoiCorpusBlockedSnapshotRecord>,
+    pub base: Option<Box<PoiArtifactCacheRecord>>,
+    pub retired_delta_count: u32,
+    pub retired_delta_payload_bytes: u64,
+    pub compaction_recommended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoiCorpusJournalCommitOutcome {
+    Applied(Box<PoiCorpusJournalCommit>),
     GenerationConflict { actual: u64 },
     PublisherSequenceConflict { actual: Option<u64> },
     PublisherManifestConflict { actual: Option<FixedBytes<32>> },
     CorpusConflict,
+    CompactionRequired,
 }
 
 #[derive(Debug)]
@@ -878,6 +1260,30 @@ impl PoiArtifactCacheRecord {
             "{chain_type}|{chain_id}|{txid_version}|{}",
             hex::encode(list_key)
         )
+    }
+
+    #[must_use]
+    pub fn metadata_only(&self) -> Self {
+        Self {
+            chain_type: self.chain_type,
+            chain_id: self.chain_id,
+            txid_version: self.txid_version.clone(),
+            list_key: self.list_key,
+            cache_generation: self.cache_generation,
+            source: self.source,
+            validation: self.validation.clone(),
+            legacy_observed_manifest_sequence: self.legacy_observed_manifest_sequence,
+            base_descriptor: self.base_descriptor.clone(),
+            applied_delta_descriptors: self.applied_delta_descriptors.clone(),
+            blocked_shields_descriptor: self.blocked_shields_descriptor.clone(),
+            artifact_tip_index: self.artifact_tip_index,
+            artifact_tip_root: self.artifact_tip_root,
+            current_tip_index: self.current_tip_index,
+            current_tip_root: self.current_tip_root,
+            cache_payload: Vec::new(),
+            legacy_last_successful_rpc_sync_at_ms: self.legacy_last_successful_rpc_sync_at_ms,
+            updated_at: self.updated_at,
+        }
     }
 }
 
@@ -2200,6 +2606,325 @@ impl DbStore {
         }
     }
 
+    pub fn inspect_poi_corpus_journal(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<StoredRecord<PoiCorpusJournalBundle>, DbError> {
+        match self.inspect_poi_corpus_journal_detailed(
+            chain_type,
+            chain_id,
+            txid_version,
+            list_key,
+        )? {
+            PoiCorpusJournalInspection::Missing => Ok(StoredRecord::Missing),
+            PoiCorpusJournalInspection::Valid { bundle, .. } => Ok(StoredRecord::Valid(*bundle)),
+            PoiCorpusJournalInspection::Corrupt { key, .. } => Ok(StoredRecord::Corrupt { key }),
+        }
+    }
+
+    pub fn inspect_poi_corpus_journal_head(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<StoredRecord<PoiCorpusJournalHeadRecord>, DbError> {
+        let head_key =
+            PoiCorpusJournalHeadRecord::key_for(chain_type, chain_id, txid_version, list_key);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+        let Some(value) = table.get(head_key.as_str())? else {
+            return Ok(StoredRecord::Missing);
+        };
+        let data = value.value();
+        if data.len() > POI_CORPUS_JOURNAL_MAX_HEAD_ROW_BYTES {
+            return Ok(StoredRecord::Corrupt { key: head_key });
+        }
+        match decode::<PoiCorpusJournalHeadRecord>(data) {
+            Ok(head) if head.key() == head_key && valid_poi_corpus_journal_head(&head) => {
+                Ok(StoredRecord::Valid(head))
+            }
+            Ok(_) | Err(DbError::Decode(_)) => Ok(StoredRecord::Corrupt { key: head_key }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn inspect_poi_corpus_journal_detailed(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<PoiCorpusJournalInspection, DbError> {
+        let base_key =
+            PoiArtifactCacheRecord::key_for(chain_type, chain_id, txid_version, list_key);
+        let head_key =
+            PoiCorpusJournalHeadRecord::key_for(chain_type, chain_id, txid_version, list_key);
+        let blocked_key =
+            PoiCorpusBlockedSnapshotRecord::key_for(chain_type, chain_id, txid_version, list_key);
+        let identity_prefix = PoiCorpusJournalHeadRecord::identity_prefix_for(
+            chain_type,
+            chain_id,
+            txid_version,
+            list_key,
+        );
+        let delta_prefix = PoiCorpusJournalHeadRecord::delta_prefix_for(
+            chain_type,
+            chain_id,
+            txid_version,
+            list_key,
+        );
+        let txn = self.db.begin_read()?;
+        let base_table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        let journal_table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+        let replacement_token = poi_corpus_journal_replacement_token(
+            &base_table,
+            &journal_table,
+            &base_key,
+            &head_key,
+            &identity_prefix,
+            &delta_prefix,
+        )?;
+
+        let base = match base_table.get(base_key.as_str())? {
+            Some(value) => match decode::<PoiArtifactCacheRecord>(value.value()) {
+                Ok(record) if record.key() == base_key => Some(record),
+                Ok(_) | Err(DbError::Decode(_)) => {
+                    return Ok(PoiCorpusJournalInspection::Corrupt {
+                        key: base_key,
+                        replacement_token,
+                    });
+                }
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let head = match journal_table.get(head_key.as_str())? {
+            Some(value) => {
+                let data = value.value();
+                if data.len() > POI_CORPUS_JOURNAL_MAX_HEAD_ROW_BYTES {
+                    return Ok(PoiCorpusJournalInspection::Corrupt {
+                        key: head_key,
+                        replacement_token,
+                    });
+                }
+                match decode::<PoiCorpusJournalHeadRecord>(data) {
+                    Ok(head)
+                        if head.key() == head_key
+                            && valid_poi_corpus_journal_head(&head)
+                            && base.as_ref().is_some_and(|base| {
+                                base.cache_generation == head.corpus.cache_generation
+                                    && keccak256(&base.cache_payload) == head.base_payload_hash
+                            }) =>
+                    {
+                        Some(head)
+                    }
+                    Ok(_) | Err(DbError::Decode(_)) => {
+                        return Ok(PoiCorpusJournalInspection::Corrupt {
+                            key: head_key,
+                            replacement_token,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            None => None,
+        };
+
+        let Some(base) = base else {
+            let has_journal_rows = table_prefix_has_rows(&journal_table, identity_prefix.as_str())?;
+            if has_journal_rows {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key: identity_prefix,
+                    replacement_token,
+                });
+            }
+            return Ok(PoiCorpusJournalInspection::Missing);
+        };
+        let Some(head) = head else {
+            let has_journal_rows = table_prefix_has_rows(&journal_table, identity_prefix.as_str())?;
+            if has_journal_rows {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key: identity_prefix,
+                    replacement_token,
+                });
+            }
+            return Ok(PoiCorpusJournalInspection::Valid {
+                bundle: Box::new(PoiCorpusJournalBundle {
+                    base,
+                    head: None,
+                    deltas: Vec::new(),
+                    blocked: None,
+                }),
+                replacement_token,
+            });
+        };
+
+        let mut deltas = Vec::new();
+        let mut delta_payload_bytes = 0_u64;
+        let mut previous_delta_revision = None;
+        let mut expected_event_cursor = base.current_tip_index.saturating_add(1);
+        let mut expected_leaf_cursor = None;
+        let mut expected_tip_root = base.current_tip_root;
+        let coverage_after_revision = head.blocked_revision.unwrap_or(head.base_revision);
+        let mut last_required_delta_revision = None;
+        let delta_range_end = prefix_range_end(&delta_prefix);
+        let mut range = match delta_range_end.as_deref() {
+            Some(end) => journal_table.range(delta_prefix.as_str()..end)?,
+            None => journal_table.range(delta_prefix.as_str()..)?,
+        };
+        for entry in &mut range {
+            let (key, value) = entry?;
+            let key = key.value().to_string();
+            if deltas.len() >= head.delta_count as usize
+                || deltas.len() >= POI_CORPUS_JOURNAL_MAX_DELTA_COUNT as usize
+            {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key,
+                    replacement_token,
+                });
+            }
+            let data = value.value();
+            let Some(remaining_payload_bytes) =
+                head.delta_payload_bytes.checked_sub(delta_payload_bytes)
+            else {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key,
+                    replacement_token,
+                });
+            };
+            let delta = match decode_poi_corpus_journal_delta_bounded(data, remaining_payload_bytes)
+            {
+                Ok(Some(delta)) => delta,
+                Ok(None) | Err(DbError::Decode(_)) => {
+                    return Ok(PoiCorpusJournalInspection::Corrupt {
+                        key,
+                        replacement_token,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let valid_revision_order =
+                previous_delta_revision.is_none_or(|previous| delta.revision > previous);
+            let valid_required_coverage = if delta.revision > coverage_after_revision {
+                let expected_revision = last_required_delta_revision.map_or_else(
+                    || coverage_after_revision.checked_add(1),
+                    |previous: u64| previous.checked_add(1),
+                );
+                if expected_revision == Some(delta.revision) {
+                    last_required_delta_revision = Some(delta.revision);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+            if delta.key() != key
+                || !valid_poi_corpus_journal_delta(&delta, &head)
+                || !valid_revision_order
+                || !valid_required_coverage
+                || delta.event_start_cursor != expected_event_cursor
+                || expected_leaf_cursor.is_some_and(|cursor| delta.leaf_start_cursor != cursor)
+                || delta.start_tip_root != expected_tip_root
+            {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key,
+                    replacement_token,
+                });
+            }
+            previous_delta_revision = Some(delta.revision);
+            expected_event_cursor = delta.event_end_cursor;
+            expected_leaf_cursor = Some(delta.leaf_end_cursor);
+            expected_tip_root = delta.end_tip_root;
+            let Some(next_delta_payload_bytes) = delta_payload_bytes
+                .checked_add(u64::try_from(delta.payload.len()).unwrap_or(u64::MAX))
+            else {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key,
+                    replacement_token,
+                });
+            };
+            delta_payload_bytes = next_delta_payload_bytes;
+            deltas.push(delta);
+        }
+        drop(range);
+        let required_suffix_complete = head.revision == coverage_after_revision
+            || last_required_delta_revision == Some(head.revision);
+        if !required_suffix_complete
+            || deltas.len() != head.delta_count as usize
+            || delta_payload_bytes != head.delta_payload_bytes
+            || expected_event_cursor != head.event_cursor
+            || expected_leaf_cursor.is_some_and(|cursor| cursor != head.leaf_cursor)
+            || expected_tip_root != head.corpus.current_tip_root
+        {
+            return Ok(PoiCorpusJournalInspection::Corrupt {
+                key: head_key,
+                replacement_token,
+            });
+        }
+
+        let blocked = match (head.blocked_revision, head.blocked_payload_hash) {
+            (Some(expected_revision), Some(expected_hash)) => {
+                match journal_table.get(blocked_key.as_str())? {
+                    Some(value) => {
+                        match decode_poi_corpus_blocked_snapshot_bounded(value.value()) {
+                            Ok(Some(blocked))
+                                if blocked.key() == blocked_key
+                                    && valid_poi_corpus_blocked_snapshot(&blocked, &head)
+                                    && blocked.revision == expected_revision
+                                    && blocked.payload_hash == expected_hash =>
+                            {
+                                Some(blocked)
+                            }
+                            Ok(_) | Err(DbError::Decode(_)) => {
+                                return Ok(PoiCorpusJournalInspection::Corrupt {
+                                    key: blocked_key,
+                                    replacement_token,
+                                });
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    None => {
+                        return Ok(PoiCorpusJournalInspection::Corrupt {
+                            key: blocked_key,
+                            replacement_token,
+                        });
+                    }
+                }
+            }
+            (None, None) => {
+                if journal_table.get(blocked_key.as_str())?.is_some() {
+                    return Ok(PoiCorpusJournalInspection::Corrupt {
+                        key: blocked_key,
+                        replacement_token,
+                    });
+                }
+                None
+            }
+            _ => {
+                return Ok(PoiCorpusJournalInspection::Corrupt {
+                    key: head_key,
+                    replacement_token,
+                });
+            }
+        };
+
+        Ok(PoiCorpusJournalInspection::Valid {
+            bundle: Box::new(PoiCorpusJournalBundle {
+                base,
+                head: Some(head),
+                deltas,
+                blocked,
+            }),
+            replacement_token,
+        })
+    }
+
     pub fn put_poi_artifact_cache(&self, record: &PoiArtifactCacheRecord) -> Result<(), DbError> {
         let mut record = record.clone();
         record.updated_at = now_epoch_secs()?;
@@ -2214,87 +2939,256 @@ impl DbStore {
         Ok(())
     }
 
-    pub fn commit_poi_artifact_cache_if_current(
+    pub fn append_poi_corpus_journal_if_current(
         &self,
-        record: &PoiArtifactCacheRecord,
-        condition: PoiArtifactCacheCommitCondition,
-    ) -> Result<PoiArtifactCacheCommitOutcome, DbError> {
-        let mut record = record.clone();
-        record.cache_generation = condition.expected_generation;
-        record.updated_at = now_epoch_secs()?;
-        let key = record.key();
-        let data = encode(&record)?;
+        mut head: PoiCorpusJournalHeadRecord,
+        mut delta: Option<PoiCorpusJournalDeltaRecord>,
+        mut blocked: Option<PoiCorpusBlockedSnapshotRecord>,
+        condition: PoiCorpusJournalCommitCondition,
+    ) -> Result<PoiCorpusJournalCommitOutcome, DbError> {
+        let key = head.corpus.key();
+        let head_key = head.key();
+        if !head.corpus.cache_payload.is_empty() {
+            return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                kind: "head",
+                key: head_key,
+            });
+        }
+        if matches!(
+            condition.expected_state,
+            ExpectedPoiCorpusJournalState::Corrupt { .. }
+        ) {
+            return Ok(PoiCorpusJournalCommitOutcome::CorpusConflict);
+        }
         let txn = self.db.begin_write()?;
-
-        let generation = {
-            let table = txn.open_table(APP_SETTINGS_TABLE)?;
-            match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
-                Some(value) => decode(value.value())?,
-                None => 0_u64,
-            }
+        if let Some(conflict) = poi_commit_context_conflict(
+            &txn,
+            condition.expected_generation,
+            condition.expected_publisher,
+            condition.expected_manifest_hash,
+        )? {
+            return Ok(conflict.into_journal_outcome());
+        }
+        let Some(observed) =
+            observe_expected_poi_journal_state(&txn, &key, &head_key, condition.expected_state)?
+        else {
+            return Ok(PoiCorpusJournalCommitOutcome::CorpusConflict);
         };
-        if generation != condition.expected_generation {
-            return Ok(PoiArtifactCacheCommitOutcome::GenerationConflict { actual: generation });
+        if matches!(
+            condition.expected_state,
+            ExpectedPoiCorpusJournalState::NoValidBase
+        ) {
+            return Ok(PoiCorpusJournalCommitOutcome::CorpusConflict);
         }
 
-        if let Some((publisher_pubkey, expected_sequence)) = condition.expected_publisher {
-            let watermark_key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
-            let actual = {
-                let table = txn.open_table(APP_SETTINGS_TABLE)?;
-                match table.get(watermark_key.as_str())? {
-                    Some(value) => {
-                        let watermark: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
-                        if watermark.publisher_pubkey != publisher_pubkey {
-                            return Err(DbError::InvalidPpoiSidecarRecord {
-                                kind: "publisher manifest watermark",
-                                key: watermark_key,
-                            });
-                        }
-                        Some((
-                            watermark.accepted_sequence,
-                            watermark.accepted_manifest_hash,
-                        ))
-                    }
-                    None => None,
-                }
-            };
-            if actual.map(|(sequence, _)| sequence) != Some(expected_sequence) {
-                return Ok(PoiArtifactCacheCommitOutcome::PublisherSequenceConflict {
-                    actual: actual.map(|(sequence, _)| sequence),
-                });
-            }
-            if let Some(expected_hash) = condition.expected_manifest_hash
-                && actual.and_then(|(_, hash)| hash) != Some(expected_hash)
-            {
-                return Ok(PoiArtifactCacheCommitOutcome::PublisherManifestConflict {
-                    actual: actual.and_then(|(_, hash)| hash),
-                });
-            }
-        }
+        let revision = observed
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("POI corpus journal revision overflow"))?;
+        let now = now_epoch_secs()?;
+        head.format_version = POI_CORPUS_JOURNAL_FORMAT_VERSION;
+        head.revision = revision;
+        head.base_revision = observed.base_revision;
+        head.base_payload_hash = observed.base_payload_hash;
+        head.corpus.cache_generation = condition.expected_generation;
+        head.corpus.updated_at = now;
 
-        let observed_payload_hash = {
-            let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
-            match table.get(key.as_str())? {
-                None => None,
-                Some(value) => match decode::<PoiArtifactCacheRecord>(value.value()) {
-                    Ok(existing) if existing.key() == key => {
-                        Some(keccak256(&existing.cache_payload))
-                    }
-                    Ok(_) | Err(DbError::Decode(_)) => None,
-                    Err(error) => return Err(error),
-                },
-            }
-        };
-        if observed_payload_hash != condition.expected_payload_hash {
-            return Ok(PoiArtifactCacheCommitOutcome::CorpusConflict);
-        }
-
+        let delta_payload_bytes = delta.as_ref().map_or(0_u64, |delta| {
+            u64::try_from(delta.payload.len()).unwrap_or(u64::MAX)
+        });
+        let new_delta_count = observed
+            .delta_count
+            .checked_add(u32::from(delta.is_some()))
+            .ok_or_else(|| std::io::Error::other("POI corpus journal delta count overflow"))?;
+        let new_delta_payload_bytes = observed
+            .delta_payload_bytes
+            .checked_add(delta_payload_bytes)
+            .ok_or_else(|| std::io::Error::other("POI corpus journal byte count overflow"))?;
+        if new_delta_count > POI_CORPUS_JOURNAL_MAX_DELTA_COUNT
+            || new_delta_payload_bytes > POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES
         {
-            let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
-            table.insert(key.as_str(), data.as_slice())?;
+            return Ok(PoiCorpusJournalCommitOutcome::CompactionRequired);
+        }
+        head.delta_count = new_delta_count;
+        head.delta_payload_bytes = new_delta_payload_bytes;
+
+        if let Some(delta) = delta.as_mut() {
+            if !poi_journal_delta_identity_matches(delta, &head.corpus)
+                || delta.event_start_cursor != observed.event_cursor
+                || delta.leaf_start_cursor != observed.leaf_cursor
+                || delta.start_tip_root != observed.current_tip_root
+                || delta.event_end_cursor != head.event_cursor
+                || delta.leaf_end_cursor != head.leaf_cursor
+                || delta.end_tip_root != head.corpus.current_tip_root
+            {
+                return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                    kind: "delta",
+                    key: delta.key(),
+                });
+            }
+            delta.format_version = POI_CORPUS_JOURNAL_FORMAT_VERSION;
+            delta.cache_generation = condition.expected_generation;
+            delta.revision = revision;
+            delta.previous_revision = observed.revision;
+            delta.base_revision = observed.base_revision;
+            delta.updated_at = now;
+        } else if head.event_cursor != observed.event_cursor
+            || head.leaf_cursor != observed.leaf_cursor
+            || head.corpus.current_tip_root != observed.current_tip_root
+        {
+            return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                kind: "head",
+                key: head_key,
+            });
+        }
+
+        if head.event_cursor == 0
+            || head.corpus.current_tip_index != head.event_cursor.saturating_sub(1)
+        {
+            return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                kind: "head",
+                key: head_key,
+            });
+        }
+
+        if let Some(blocked) = blocked.as_mut() {
+            if !poi_journal_blocked_identity_matches(blocked, &head.corpus)
+                || u64::try_from(blocked.payload.len()).unwrap_or(u64::MAX)
+                    > POI_CORPUS_JOURNAL_MAX_BLOCKED_PAYLOAD_BYTES
+            {
+                return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                    kind: "blocked snapshot",
+                    key: blocked.key(),
+                });
+            }
+            blocked.format_version = POI_CORPUS_JOURNAL_FORMAT_VERSION;
+            blocked.cache_generation = condition.expected_generation;
+            blocked.revision = revision;
+            blocked.payload_hash = keccak256(&blocked.payload);
+            blocked.updated_at = now;
+            head.blocked_revision = Some(revision);
+            head.blocked_payload_hash = Some(blocked.payload_hash);
+        } else {
+            head.blocked_revision = observed.blocked_revision;
+            head.blocked_payload_hash = observed.blocked_payload_hash;
+        }
+
+        let head_data = encode(&head)?;
+        let delta_data = delta.as_ref().map(encode).transpose()?;
+        let blocked_data = blocked.as_ref().map(encode).transpose()?;
+        {
+            let mut table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+            if let (Some(delta), Some(data)) = (delta.as_ref(), delta_data.as_ref()) {
+                let delta_key = delta.key();
+                if table.get(delta_key.as_str())?.is_some() {
+                    return Ok(PoiCorpusJournalCommitOutcome::CorpusConflict);
+                }
+                table.insert(delta_key.as_str(), data.as_slice())?;
+            }
+            if let (Some(blocked), Some(data)) = (blocked.as_ref(), blocked_data.as_ref()) {
+                table.insert(blocked.key().as_str(), data.as_slice())?;
+            }
+            table.insert(head_key.as_str(), head_data.as_slice())?;
         }
         txn.commit()?;
-        Ok(PoiArtifactCacheCommitOutcome::Applied)
+        let compaction_recommended = new_delta_count >= POI_CORPUS_JOURNAL_SOFT_DELTA_COUNT
+            || new_delta_payload_bytes >= POI_CORPUS_JOURNAL_SOFT_PAYLOAD_BYTES;
+        Ok(PoiCorpusJournalCommitOutcome::Applied(Box::new(
+            PoiCorpusJournalCommit {
+                head,
+                delta,
+                blocked,
+                base: None,
+                retired_delta_count: 0,
+                retired_delta_payload_bytes: 0,
+                compaction_recommended,
+            },
+        )))
+    }
+
+    pub fn rebase_poi_corpus_journal_if_current(
+        &self,
+        mut base: PoiArtifactCacheRecord,
+        event_cursor: u64,
+        leaf_cursor: u64,
+        condition: PoiCorpusJournalCommitCondition,
+    ) -> Result<PoiCorpusJournalCommitOutcome, DbError> {
+        let key = base.key();
+        let head_key = PoiCorpusJournalHeadRecord::key_for(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        );
+        if event_cursor == 0 || base.current_tip_index != event_cursor.saturating_sub(1) {
+            return Err(DbError::InvalidPpoiCorpusRecord { key });
+        }
+        let txn = self.db.begin_write()?;
+        if let Some(conflict) = poi_commit_context_conflict(
+            &txn,
+            condition.expected_generation,
+            condition.expected_publisher,
+            condition.expected_manifest_hash,
+        )? {
+            return Ok(conflict.into_journal_outcome());
+        }
+        let Some(observed) =
+            observe_expected_poi_journal_state(&txn, &key, &head_key, condition.expected_state)?
+        else {
+            return Ok(PoiCorpusJournalCommitOutcome::CorpusConflict);
+        };
+        let revision = observed
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("POI corpus journal revision overflow"))?;
+        let now = now_epoch_secs()?;
+        base.cache_generation = condition.expected_generation;
+        base.updated_at = now;
+        let base_payload_hash = keccak256(&base.cache_payload);
+        let mut head_corpus = base.clone();
+        head_corpus.cache_payload.clear();
+        let head = PoiCorpusJournalHeadRecord {
+            format_version: POI_CORPUS_JOURNAL_FORMAT_VERSION,
+            revision,
+            base_revision: revision,
+            base_payload_hash,
+            event_cursor,
+            leaf_cursor,
+            blocked_revision: None,
+            blocked_payload_hash: None,
+            delta_count: 0,
+            delta_payload_bytes: 0,
+            corpus: head_corpus,
+        };
+        let base_data = encode(&base)?;
+        let head_data = encode(&head)?;
+        let identity_prefix = PoiCorpusJournalHeadRecord::identity_prefix_for(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        );
+        {
+            let mut base_table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+            base_table.insert(key.as_str(), base_data.as_slice())?;
+        }
+        {
+            let mut journal_table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+            remove_table_prefix(&mut journal_table, &identity_prefix)?;
+            journal_table.insert(head_key.as_str(), head_data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(PoiCorpusJournalCommitOutcome::Applied(Box::new(
+            PoiCorpusJournalCommit {
+                head,
+                delta: None,
+                blocked: None,
+                base: Some(Box::new(base)),
+                retired_delta_count: observed.delta_count,
+                retired_delta_payload_bytes: observed.delta_payload_bytes,
+                compaction_recommended: false,
+            },
+        )))
     }
 
     pub fn scan_poi_artifact_caches(&self) -> Result<PoiArtifactCacheRecordScan, DbError> {
@@ -2352,6 +3246,10 @@ impl DbStore {
             table.retain(|_, _| false)?;
             removed
         };
+        {
+            let mut table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+            table.retain(|_, _| false)?;
+        }
         txn.commit()?;
         Ok((removed, generation))
     }
@@ -3730,6 +4628,7 @@ impl DbStore {
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE)?;
         txn.open_table(OUTPUT_POI_RECOVERY_V2_TABLE)?;
         txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
         txn.open_table(APP_SETTINGS_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         Ok(())
@@ -3977,6 +4876,462 @@ fn backup_db(db_path: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ObservedPoiJournalState {
+    revision: u64,
+    base_revision: u64,
+    base_payload_hash: FixedBytes<32>,
+    event_cursor: u64,
+    leaf_cursor: u64,
+    current_tip_root: FixedBytes<32>,
+    blocked_revision: Option<u64>,
+    blocked_payload_hash: Option<FixedBytes<32>>,
+    delta_count: u32,
+    delta_payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PoiCommitContextConflict {
+    Generation(u64),
+    PublisherSequence(Option<u64>),
+    PublisherManifest(Option<FixedBytes<32>>),
+}
+
+impl PoiCommitContextConflict {
+    const fn into_journal_outcome(self) -> PoiCorpusJournalCommitOutcome {
+        match self {
+            Self::Generation(actual) => {
+                PoiCorpusJournalCommitOutcome::GenerationConflict { actual }
+            }
+            Self::PublisherSequence(actual) => {
+                PoiCorpusJournalCommitOutcome::PublisherSequenceConflict { actual }
+            }
+            Self::PublisherManifest(actual) => {
+                PoiCorpusJournalCommitOutcome::PublisherManifestConflict { actual }
+            }
+        }
+    }
+}
+
+fn poi_commit_context_conflict(
+    txn: &WriteTransaction,
+    expected_generation: u64,
+    expected_publisher: Option<(FixedBytes<32>, u64)>,
+    expected_manifest_hash: Option<FixedBytes<32>>,
+) -> Result<Option<PoiCommitContextConflict>, DbError> {
+    let generation = {
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
+            Some(value) => decode(value.value())?,
+            None => 0_u64,
+        }
+    };
+    if generation != expected_generation {
+        return Ok(Some(PoiCommitContextConflict::Generation(generation)));
+    }
+    let Some((publisher_pubkey, expected_sequence)) = expected_publisher else {
+        return Ok(None);
+    };
+    let watermark_key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
+    let actual = {
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        match table.get(watermark_key.as_str())? {
+            Some(value) => {
+                let watermark: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
+                if watermark.publisher_pubkey != publisher_pubkey {
+                    return Err(DbError::InvalidPpoiSidecarRecord {
+                        kind: "publisher manifest watermark",
+                        key: watermark_key,
+                    });
+                }
+                Some((
+                    watermark.accepted_sequence,
+                    watermark.accepted_manifest_hash,
+                ))
+            }
+            None => None,
+        }
+    };
+    if actual.map(|(sequence, _)| sequence) != Some(expected_sequence) {
+        return Ok(Some(PoiCommitContextConflict::PublisherSequence(
+            actual.map(|(sequence, _)| sequence),
+        )));
+    }
+    if let Some(expected_hash) = expected_manifest_hash
+        && actual.and_then(|(_, hash)| hash) != Some(expected_hash)
+    {
+        return Ok(Some(PoiCommitContextConflict::PublisherManifest(
+            actual.and_then(|(_, hash)| hash),
+        )));
+    }
+    Ok(None)
+}
+
+fn observe_expected_poi_journal_state(
+    txn: &WriteTransaction,
+    base_key: &str,
+    head_key: &str,
+    expected: ExpectedPoiCorpusJournalState,
+) -> Result<Option<ObservedPoiJournalState>, DbError> {
+    if let ExpectedPoiCorpusJournalState::Corrupt { replacement_token } = expected {
+        let identity_prefix = head_key.strip_suffix("head").ok_or_else(|| {
+            DbError::InvalidPpoiCorpusJournalRecord {
+                kind: "head",
+                key: head_key.to_string(),
+            }
+        })?;
+        let delta_prefix = format!("{identity_prefix}delta|");
+        let base_table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        let journal_table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+        let observed = poi_corpus_journal_replacement_token(
+            &base_table,
+            &journal_table,
+            base_key,
+            head_key,
+            identity_prefix,
+            &delta_prefix,
+        )?;
+        if observed != replacement_token {
+            return Ok(None);
+        }
+        return Ok(Some(ObservedPoiJournalState {
+            revision: replacement_token.replacement_revision,
+            base_revision: replacement_token.replacement_revision,
+            base_payload_hash: FixedBytes::ZERO,
+            event_cursor: 0,
+            leaf_cursor: 0,
+            current_tip_root: FixedBytes::ZERO,
+            blocked_revision: None,
+            blocked_payload_hash: None,
+            delta_count: replacement_token.retired_delta_count,
+            delta_payload_bytes: replacement_token.retired_delta_payload_bytes,
+        }));
+    }
+    let head = {
+        let table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+        match table.get(head_key)? {
+            Some(value) => {
+                let data = value.value();
+                if data.len() > POI_CORPUS_JOURNAL_MAX_HEAD_ROW_BYTES {
+                    return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                        kind: "head",
+                        key: head_key.to_string(),
+                    });
+                }
+                let head: PoiCorpusJournalHeadRecord = decode(data).map_err(|error| {
+                    if matches!(error, DbError::Decode(_)) {
+                        DbError::InvalidPpoiCorpusJournalRecord {
+                            kind: "head",
+                            key: head_key.to_string(),
+                        }
+                    } else {
+                        error
+                    }
+                })?;
+                if head.key() != head_key || !valid_poi_corpus_journal_head(&head) {
+                    return Err(DbError::InvalidPpoiCorpusJournalRecord {
+                        kind: "head",
+                        key: head_key.to_string(),
+                    });
+                }
+                Some(head)
+            }
+            None => None,
+        }
+    };
+    match expected {
+        ExpectedPoiCorpusJournalState::NoValidBase => {
+            if head.is_some() {
+                return Ok(None);
+            }
+            let base_exists = {
+                let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+                table.get(base_key)?.is_some()
+            };
+            let identity_prefix = head_key.strip_suffix("head").ok_or_else(|| {
+                DbError::InvalidPpoiCorpusJournalRecord {
+                    kind: "head",
+                    key: head_key.to_string(),
+                }
+            })?;
+            let journal_rows_exist = {
+                let table = txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
+                table_prefix_has_rows(&table, identity_prefix)?
+            };
+            if base_exists || journal_rows_exist {
+                return Ok(None);
+            }
+            Ok(Some(ObservedPoiJournalState {
+                revision: 0,
+                base_revision: 0,
+                base_payload_hash: FixedBytes::ZERO,
+                event_cursor: 0,
+                leaf_cursor: 0,
+                current_tip_root: FixedBytes::ZERO,
+                blocked_revision: None,
+                blocked_payload_hash: None,
+                delta_count: 0,
+                delta_payload_bytes: 0,
+            }))
+        }
+        ExpectedPoiCorpusJournalState::ImplicitBase {
+            base_payload_hash,
+            event_cursor,
+            leaf_cursor,
+            current_tip_root,
+        } => {
+            if head.is_some() {
+                return Ok(None);
+            }
+            let observed_hash = {
+                let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+                match table.get(base_key)? {
+                    Some(value) => match decode::<PoiArtifactCacheRecord>(value.value()) {
+                        Ok(record) if record.key() == base_key => {
+                            Some(keccak256(&record.cache_payload))
+                        }
+                        Ok(_) | Err(DbError::Decode(_)) => None,
+                        Err(error) => return Err(error),
+                    },
+                    None => None,
+                }
+            };
+            if observed_hash != Some(base_payload_hash) {
+                return Ok(None);
+            }
+            Ok(Some(ObservedPoiJournalState {
+                revision: 0,
+                base_revision: 0,
+                base_payload_hash,
+                event_cursor,
+                leaf_cursor,
+                current_tip_root,
+                blocked_revision: None,
+                blocked_payload_hash: None,
+                delta_count: 0,
+                delta_payload_bytes: 0,
+            }))
+        }
+        ExpectedPoiCorpusJournalState::Head {
+            revision,
+            base_revision,
+            base_payload_hash,
+            event_cursor,
+            leaf_cursor,
+            current_tip_root,
+        } => {
+            let Some(head) = head else {
+                return Ok(None);
+            };
+            if head.revision != revision
+                || head.base_revision != base_revision
+                || head.base_payload_hash != base_payload_hash
+                || head.event_cursor != event_cursor
+                || head.leaf_cursor != leaf_cursor
+                || head.corpus.current_tip_root != current_tip_root
+            {
+                return Ok(None);
+            }
+            Ok(Some(ObservedPoiJournalState {
+                revision: head.revision,
+                base_revision: head.base_revision,
+                base_payload_hash: head.base_payload_hash,
+                event_cursor: head.event_cursor,
+                leaf_cursor: head.leaf_cursor,
+                current_tip_root: head.corpus.current_tip_root,
+                blocked_revision: head.blocked_revision,
+                blocked_payload_hash: head.blocked_payload_hash,
+                delta_count: head.delta_count,
+                delta_payload_bytes: head.delta_payload_bytes,
+            }))
+        }
+        ExpectedPoiCorpusJournalState::Corrupt { .. } => {
+            unreachable!("corrupt expected state handled before head decoding")
+        }
+    }
+}
+
+fn poi_corpus_journal_replacement_token<BaseTable, JournalTable>(
+    base_table: &BaseTable,
+    journal_table: &JournalTable,
+    base_key: &str,
+    head_key: &str,
+    identity_prefix: &str,
+    delta_prefix: &str,
+) -> Result<PoiCorpusJournalCorruptionToken, DbError>
+where
+    BaseTable: ReadableTable<&'static str, &'static [u8]>,
+    JournalTable: ReadableTable<&'static str, &'static [u8]>,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"railgun-poi-corpus-journal-replacement-token-v1");
+    hasher.update((base_key.len() as u64).to_be_bytes());
+    hasher.update(base_key.as_bytes());
+    match base_table.get(base_key)? {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update((value.value().len() as u64).to_be_bytes());
+            hasher.update(value.value());
+        }
+        None => hasher.update([0]),
+    }
+
+    let mut replacement_revision = 0_u64;
+    let mut retired_delta_count = 0_u32;
+    let mut retired_delta_payload_bytes = 0_u64;
+    if let Some(value) = journal_table.get(head_key)? {
+        let data = value.value();
+        if data.len() <= POI_CORPUS_JOURNAL_MAX_HEAD_ROW_BYTES
+            && let Ok(head) = decode::<PoiCorpusJournalHeadRecord>(data)
+            && head.key() == head_key
+            && valid_poi_corpus_journal_head(&head)
+        {
+            replacement_revision = head.revision;
+            retired_delta_count = head.delta_count;
+            retired_delta_payload_bytes = head.delta_payload_bytes;
+        }
+    }
+
+    let mut journal_row_count = 0_u64;
+    let journal_range_end = prefix_range_end(identity_prefix);
+    let mut range = match journal_range_end.as_deref() {
+        Some(end) => journal_table.range(identity_prefix..end)?,
+        None => journal_table.range(identity_prefix..)?,
+    };
+    for entry in &mut range {
+        let (key, value) = entry?;
+        let key = key.value();
+        let value = value.value();
+        hasher.update([2]);
+        hasher.update((key.len() as u64).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+        journal_row_count = journal_row_count
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("POI corpus journal row count overflow"))?;
+    }
+    drop(range);
+    hasher.update([3]);
+    hasher.update(journal_row_count.to_be_bytes());
+    hasher.update((delta_prefix.len() as u64).to_be_bytes());
+    hasher.update(delta_prefix.as_bytes());
+
+    Ok(PoiCorpusJournalCorruptionToken {
+        fingerprint: FixedBytes::from(<[u8; 32]>::from(hasher.finalize())),
+        replacement_revision,
+        retired_delta_count,
+        retired_delta_payload_bytes,
+    })
+}
+
+fn table_prefix_has_rows<TableType>(table: &TableType, prefix: &str) -> Result<bool, DbError>
+where
+    TableType: ReadableTable<&'static str, &'static [u8]>,
+{
+    let range_end = prefix_range_end(prefix);
+    let mut range = match range_end.as_deref() {
+        Some(end) => table.range(prefix..end)?,
+        None => table.range(prefix..)?,
+    };
+    Ok(range.next().transpose()?.is_some())
+}
+
+fn decode_poi_corpus_journal_delta_bounded(
+    data: &[u8],
+    remaining_payload_bytes: u64,
+) -> Result<Option<PoiCorpusJournalDeltaRecord>, DbError> {
+    if data.len() > POI_CORPUS_JOURNAL_MAX_DELTA_ROW_BYTES {
+        return Ok(None);
+    }
+    let _: IgnoredAny = decode(data)?;
+    let wire: PoiCorpusJournalDeltaRecordWire<'_> = rmp_serde::from_slice(data)?;
+    let payload_bytes = u64::try_from(wire.payload.len()).unwrap_or(u64::MAX);
+    if payload_bytes > remaining_payload_bytes
+        || payload_bytes > POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES
+    {
+        return Ok(None);
+    }
+    Ok(Some(wire.into_owned()))
+}
+
+fn decode_poi_corpus_blocked_snapshot_bounded(
+    data: &[u8],
+) -> Result<Option<PoiCorpusBlockedSnapshotRecord>, DbError> {
+    if data.len() > POI_CORPUS_JOURNAL_MAX_BLOCKED_ROW_BYTES {
+        return Ok(None);
+    }
+    let _: IgnoredAny = decode(data)?;
+    let wire: PoiCorpusBlockedSnapshotRecordWire<'_> = rmp_serde::from_slice(data)?;
+    if u64::try_from(wire.payload.len()).unwrap_or(u64::MAX)
+        > POI_CORPUS_JOURNAL_MAX_BLOCKED_PAYLOAD_BYTES
+    {
+        return Ok(None);
+    }
+    Ok(Some(wire.into_owned()))
+}
+
+fn valid_poi_corpus_journal_head(head: &PoiCorpusJournalHeadRecord) -> bool {
+    head.format_version == POI_CORPUS_JOURNAL_FORMAT_VERSION
+        && head.corpus.cache_payload.is_empty()
+        && head.base_revision <= head.revision
+        && head.event_cursor > 0
+        && head.corpus.current_tip_index == head.event_cursor.saturating_sub(1)
+        && head.delta_count <= POI_CORPUS_JOURNAL_MAX_DELTA_COUNT
+        && head.delta_payload_bytes <= POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES
+        && head.blocked_revision.is_some() == head.blocked_payload_hash.is_some()
+        && head
+            .blocked_revision
+            .is_none_or(|revision| revision > head.base_revision && revision <= head.revision)
+}
+
+fn valid_poi_corpus_journal_delta(
+    delta: &PoiCorpusJournalDeltaRecord,
+    head: &PoiCorpusJournalHeadRecord,
+) -> bool {
+    delta.format_version == POI_CORPUS_JOURNAL_FORMAT_VERSION
+        && poi_journal_delta_identity_matches(delta, &head.corpus)
+        && delta.cache_generation == head.corpus.cache_generation
+        && delta.base_revision == head.base_revision
+        && delta.revision > head.base_revision
+        && delta.revision <= head.revision
+        && delta.previous_revision.checked_add(1) == Some(delta.revision)
+        && delta.event_start_cursor <= delta.event_end_cursor
+        && delta.leaf_start_cursor <= delta.leaf_end_cursor
+}
+
+fn valid_poi_corpus_blocked_snapshot(
+    blocked: &PoiCorpusBlockedSnapshotRecord,
+    head: &PoiCorpusJournalHeadRecord,
+) -> bool {
+    blocked.format_version == POI_CORPUS_JOURNAL_FORMAT_VERSION
+        && poi_journal_blocked_identity_matches(blocked, &head.corpus)
+        && blocked.cache_generation == head.corpus.cache_generation
+        && blocked.revision > head.base_revision
+        && blocked.revision <= head.revision
+        && blocked.payload_hash == keccak256(&blocked.payload)
+}
+
+fn poi_journal_delta_identity_matches(
+    delta: &PoiCorpusJournalDeltaRecord,
+    corpus: &PoiArtifactCacheRecord,
+) -> bool {
+    delta.chain_type == corpus.chain_type
+        && delta.chain_id == corpus.chain_id
+        && delta.txid_version == corpus.txid_version
+        && delta.list_key == corpus.list_key
+}
+
+fn poi_journal_blocked_identity_matches(
+    blocked: &PoiCorpusBlockedSnapshotRecord,
+    corpus: &PoiArtifactCacheRecord,
+) -> bool {
+    blocked.chain_type == corpus.chain_type
+        && blocked.chain_id == corpus.chain_id
+        && blocked.txid_version == corpus.txid_version
+        && blocked.list_key == corpus.list_key
+}
+
 fn now_epoch_secs() -> Result<u64, DbError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3989,7 +5344,15 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, DbError> {
 }
 
 fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T, DbError> {
-    Ok(rmp_serde::from_slice(data)?)
+    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(data));
+    let value = T::deserialize(&mut deserializer)?;
+    if deserializer.get_ref().position() != u64::try_from(data.len()).unwrap_or(u64::MAX) {
+        return Err(rmp_serde::decode::Error::Syntax(
+            "trailing bytes after MessagePack value".to_string(),
+        )
+        .into());
+    }
+    Ok(value)
 }
 
 fn remove_table_prefix(table: &mut Table<'_, &str, &[u8]>, prefix: &str) -> Result<u64, DbError> {

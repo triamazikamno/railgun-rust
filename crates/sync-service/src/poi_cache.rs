@@ -8,13 +8,15 @@ use alloy::primitives::FixedBytes;
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use futures::FutureExt;
 use futures::future::{BoxFuture, join_all};
-use local_db::DbStore;
+use local_db::{DbStore, PoiArtifactCacheRecord, PoiCorpusJournalHeadRecord};
 use poi::SensitiveUrl;
 use poi::cache::{
     POI_EVENTS_PAGE_SIZE, POI_MERKLETREE_LEAVES_PAGE_SIZE, PoiCache, PoiCacheError,
-    PoiCacheIdentity, PoiCacheSyncOutcome,
+    PoiCacheIdentity, PoiCacheJournalDelta, PoiCacheSyncOutcome,
 };
-use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
+use poi::poi::{
+    BlockedShield, DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys,
+};
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
@@ -22,9 +24,10 @@ use tracing::{Instrument, debug, info, warn};
 use crate::chain::PoiArtifactPersistenceHandle;
 use crate::poi_artifacts::{
     ExpectedPoiCorpusBase, ObservedManifest, PersistedPoiArtifactCache, PoiArtifactError,
-    PoiArtifactIngestor, PoiCorpusAuthority, PoiCorpusStore, PreparedIngestion,
-    load_persisted_cache_for_publisher, load_poi_rpc_health, poi_corpus_authority,
-    record_poi_rpc_success, with_poi_artifact_cache_generation,
+    PoiArtifactIngestor, PoiCorpusAuthority, PoiCorpusCompactionResult, PreparedIngestion,
+    load_persisted_cache_candidate_for_publisher, load_persisted_cache_for_publisher,
+    load_poi_rpc_health, poi_corpus_authority, record_poi_rpc_success,
+    with_poi_artifact_cache_generation,
 };
 use crate::types::{
     LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheGraphProgress,
@@ -38,7 +41,6 @@ const POI_CACHE_MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
 const POI_ARTIFACT_RPC_FAILURE_THRESHOLD: u32 = 3;
 const POI_ARTIFACT_RPC_STALE_AFTER: Duration = Duration::from_mins(5);
 const POI_CACHE_COMMAND_CAPACITY: usize = 16;
-const POI_RPC_RANGE_PAGE_BUDGET: usize = 8;
 
 struct ChainPoiCacheCoordinator {
     db: Arc<DbStore>,
@@ -49,6 +51,7 @@ struct ChainPoiCacheCoordinator {
     local_caches: LocalPoiCaches,
     active_list_keys: Vec<FixedBytes<32>>,
     preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
+    installed_head_anchors: StdMutex<BTreeMap<FixedBytes<32>, PoiCorpusJournalHeadRecord>>,
     command_rx: mpsc::Receiver<ChainPoiCacheCommand>,
     job_tx: mpsc::UnboundedSender<ChainPoiCacheJobEvent>,
     job_rx: mpsc::UnboundedReceiver<ChainPoiCacheJobEvent>,
@@ -255,6 +258,7 @@ impl PoiCacheService {
                 local_caches: local_caches.clone(),
                 active_list_keys,
                 preloaded_caches: BTreeMap::new(),
+                installed_head_anchors: StdMutex::new(BTreeMap::new()),
                 command_rx,
                 job_tx,
                 job_rx,
@@ -781,7 +785,13 @@ enum PoiRpcAttemptOutcome {
 
 struct PoiRpcSyncResult {
     outcome: PoiCacheSyncOutcome,
-    candidate: Option<PoiCache>,
+    candidate: Option<PoiRpcCandidate>,
+}
+
+struct PoiRpcCandidate {
+    cache: PoiCache,
+    delta: PoiCacheJournalDelta,
+    blocked_shields: Option<Vec<BlockedShield>>,
 }
 
 #[derive(Clone, Copy)]
@@ -796,9 +806,17 @@ enum PreparedPoiCachePersistence {
         prepared: Box<PreparedIngestion>,
     },
     PublicRpc {
-        range_start_index: u64,
-        expected_base: ExpectedPoiCorpusBase,
+        prepared: Box<PreparedPublicRpcPersistence>,
     },
+}
+
+struct PreparedPublicRpcPersistence {
+    range_start_index: u64,
+    expected_base: ExpectedPoiCorpusBase,
+    starting_record: Option<PoiArtifactCacheRecord>,
+    starting_head: Option<PoiCorpusJournalHeadRecord>,
+    delta: PoiCacheJournalDelta,
+    blocked_shields: Option<Vec<BlockedShield>>,
 }
 
 impl PreparedPoiCachePersistence {
@@ -892,12 +910,31 @@ async fn run_chain_poi_cache_coordinator(
     task.preloaded_caches =
         apply_loaded_persisted_chain_poi_caches(&task, loaded, preload_started, startup_attempt_id)
             .await;
-    synchronize_chain_cache_generation(
+    {
+        let mut anchors = task
+            .installed_head_anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *anchors = task
+            .preloaded_caches
+            .iter()
+            .filter_map(|(list_key, persisted)| {
+                persisted.journal_head.clone().map(|head| (*list_key, head))
+            })
+            .collect();
+    }
+    if synchronize_chain_cache_generation(
         chain_id,
         &task.local_caches,
         Some(&mut task.preloaded_caches),
     )
-    .await;
+    .await
+    {
+        task.installed_head_anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
     generation = task.local_caches.current_generation();
     if publish_chain_poi_cache_ready_and_acknowledge_initialization(
         &task.progress_tx,
@@ -1014,6 +1051,10 @@ async fn run_chain_poi_cache_coordinator(
                         });
                         generation = reset_generation;
                         task.preloaded_caches.clear();
+                        task.installed_head_anchors
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
                         let reset_result = reset_chain_runtime(
                             &task,
                             reset_generation,
@@ -1063,6 +1104,10 @@ async fn run_chain_poi_cache_coordinator(
                 if current_generation != attempt_generation {
                     let retry_completion = drop_completed_attempt(finished);
                     task.preloaded_caches.clear();
+                    task.installed_head_anchors
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
                     let _ = recover_chain_after_stale_attempt(
                         &mut task,
                         &mut active,
@@ -1096,6 +1141,10 @@ async fn run_chain_poi_cache_coordinator(
                 let retry_completion = drop_completed_attempt(finished);
                 if restart_after_stale {
                     task.preloaded_caches.clear();
+                    task.installed_head_anchors
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
                     let Err(stale_error) = attempt_result else {
                         unreachable!("stale recovery requires a stale-generation error");
                     };
@@ -1435,6 +1484,11 @@ async fn start_chain_poi_cache_attempt(
         chain_id: task.chain_id,
         active_list_keys: task.active_list_keys.clone(),
         baseline,
+        installed_head_anchors: task
+            .installed_head_anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
         preloaded_caches: std::mem::take(&mut task.preloaded_caches),
         attempt_id,
         generation,
@@ -1494,6 +1548,7 @@ struct PoiCacheCandidateJob {
     chain_id: u64,
     active_list_keys: Vec<FixedBytes<32>>,
     baseline: BTreeMap<FixedBytes<32>, PoiCache>,
+    installed_head_anchors: BTreeMap<FixedBytes<32>, PoiCorpusJournalHeadRecord>,
     preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
     attempt_id: PoiArtifactCacheAttemptId,
     generation: u64,
@@ -1521,44 +1576,61 @@ async fn produce_chain_poi_cache_candidates(
             .expect("active POI list has a source plan");
         let identity =
             PoiCacheIdentity::new(EVM_CHAIN_TYPE, job.chain_id, DEFAULT_TXID_VERSION, list_key);
-        let persisted = match job.preloaded_caches.remove(&list_key) {
-            Some(persisted) => Some(persisted),
-            None => match load_persisted_cache_for_publisher(
+        let installed_cache = job.baseline.remove(&list_key);
+        let (persisted, expected_base) = match job.preloaded_caches.remove(&list_key) {
+            Some(persisted) => {
+                let expected = persisted.expected_base();
+                (Some(persisted), expected)
+            }
+            None => match load_persisted_cache_candidate_for_publisher(
                 job.db.as_ref(),
                 &identity,
                 job.artifact_config.trusted_publisher_pubkey,
+                installed_cache,
+                job.installed_head_anchors.get(&list_key),
             ) {
-                Ok(persisted) => persisted,
+                Ok(observed) => observed,
                 Err(err) => {
                     errors.push(err.to_string());
-                    None
+                    (None, ExpectedPoiCorpusBase::NoValidCorpus)
                 }
             },
         };
-        let expected_base =
-            persisted
-                .as_ref()
-                .map_or(ExpectedPoiCorpusBase::NoValidCorpus, |persisted| {
-                    ExpectedPoiCorpusBase::PayloadHash(alloy::primitives::keccak256(
-                        &persisted.record.cache_payload,
-                    ))
-                });
-        let baseline_cache = newest_cache(
-            job.baseline.get(&list_key).cloned(),
-            persisted.as_ref().map(|persisted| persisted.cache.clone()),
-        )
-        .unwrap_or_else(|| PoiCache::new(identity.clone()));
+        let starting_record = persisted
+            .as_ref()
+            .map(PersistedPoiArtifactCache::metadata_only);
+        let starting_head = persisted
+            .as_ref()
+            .and_then(|persisted| persisted.journal_head.clone());
+        let (artifact_starting, baseline_cache) =
+            if plan.use_artifact || plan.artifact_after_rpc_failure {
+                let baseline_cache = persisted.as_ref().map_or_else(
+                    || PoiCache::new(identity.clone()),
+                    |persisted| persisted.cache.clone(),
+                );
+                (persisted, baseline_cache)
+            } else {
+                (
+                    None,
+                    persisted.map_or_else(
+                        || PoiCache::new(identity.clone()),
+                        |persisted| persisted.cache,
+                    ),
+                )
+            };
         let range_start_index = baseline_cache.progress().next_event_index;
 
         if plan.use_artifact {
-            match prepare_artifact_candidate(
+            match Box::pin(prepare_artifact_candidate(
                 &job,
                 &client,
                 list_index,
                 list_key,
                 identity,
+                artifact_starting,
+                expected_base,
                 &mut observed_manifest,
-            )
+            ))
             .await
             {
                 Ok(candidate) => {
@@ -1589,13 +1661,19 @@ async fn produce_chain_poi_cache_candidates(
                                 }),
                                 artifact_succeeded: false,
                             });
-                            if let Some(cache) = result.candidate {
+                            if let Some(candidate) = result.candidate {
                                 candidates.push(PreparedPoiCacheCandidate {
                                     list_key,
-                                    cache: Some(cache),
+                                    cache: Some(candidate.cache),
                                     persistence: PreparedPoiCachePersistence::PublicRpc {
-                                        range_start_index,
-                                        expected_base,
+                                        prepared: Box::new(PreparedPublicRpcPersistence {
+                                            range_start_index,
+                                            expected_base,
+                                            starting_record: starting_record.clone(),
+                                            starting_head: starting_head.clone(),
+                                            delta: candidate.delta,
+                                            blocked_shields: candidate.blocked_shields,
+                                        }),
                                     },
                                 });
                             }
@@ -1632,26 +1710,34 @@ async fn produce_chain_poi_cache_candidates(
                         }),
                         artifact_succeeded: false,
                     });
-                    if let Some(cache) = result.candidate {
+                    if let Some(candidate) = result.candidate {
                         candidates.push(PreparedPoiCacheCandidate {
                             list_key,
-                            cache: Some(cache),
+                            cache: Some(candidate.cache),
                             persistence: PreparedPoiCachePersistence::PublicRpc {
-                                range_start_index,
-                                expected_base,
+                                prepared: Box::new(PreparedPublicRpcPersistence {
+                                    range_start_index,
+                                    expected_base,
+                                    starting_record: starting_record.clone(),
+                                    starting_head: starting_head.clone(),
+                                    delta: candidate.delta,
+                                    blocked_shields: candidate.blocked_shields,
+                                }),
                             },
                         });
                     }
                 }
                 Err(rpc_error) if plan.artifact_after_rpc_failure => {
-                    match prepare_artifact_candidate(
+                    match Box::pin(prepare_artifact_candidate(
                         &job,
                         &client,
                         list_index,
                         list_key,
                         identity,
+                        artifact_starting,
+                        expected_base,
                         &mut observed_manifest,
-                    )
+                    ))
                     .await
                     {
                         Ok(candidate) => {
@@ -1716,6 +1802,8 @@ async fn prepare_artifact_candidate(
     list_index: usize,
     list_key: FixedBytes<32>,
     identity: PoiCacheIdentity,
+    persisted: Option<PersistedPoiArtifactCache>,
+    expected_base: ExpectedPoiCorpusBase,
     observed_manifest: &mut Option<ObservedManifest>,
 ) -> Result<Option<PreparedPoiCacheCandidate>, PoiArtifactError> {
     let ingestor = PoiArtifactIngestor::new(job.artifact_config.clone(), client.clone())
@@ -1768,6 +1856,8 @@ async fn prepare_artifact_candidate(
             observed_manifest
                 .as_ref()
                 .expect("observed manifest initialized"),
+            persisted,
+            expected_base,
             &job.cancel,
         )
         .await?;
@@ -1884,12 +1974,100 @@ async fn finish_chain_poi_cache_attempt(
     }
     let result = commit_result
         .and_then(|()| network_result.map_err(|reason| PoiCacheServiceError::Refresh { reason }));
-    if let Err(error) =
-        apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &result).await
-    {
-        return FinishedPoiCacheAttempt { result: Err(error) };
+    let compactions =
+        match apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &result).await {
+            Ok(compactions) => compactions,
+            Err(error) => return FinishedPoiCacheAttempt { result: Err(error) },
+        };
+    for compaction in compactions {
+        if !run_background_poi_corpus_compaction(task, generation, compaction).await {
+            break;
+        }
     }
     FinishedPoiCacheAttempt { result }
+}
+
+async fn run_background_poi_corpus_compaction(
+    task: &ChainPoiCacheCoordinator,
+    generation: u64,
+    compaction: PoiCorpusCompactionRequest,
+) -> bool {
+    if task.cancel.is_cancelled() {
+        return false;
+    }
+    let list_key = compaction.identity.list_key;
+    match task
+        .poi_artifact_persistence
+        .compact_poi_corpus_for_attempt(
+            compaction.identity,
+            generation,
+            task.artifact_config.trusted_publisher_pubkey,
+            compaction.expected_base,
+            &task.cancel,
+        )
+        .await
+    {
+        Ok(Some(result)) => {
+            reconcile_background_compaction_anchor(
+                task,
+                generation,
+                list_key,
+                compaction.expected_base,
+                &result,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(%error, "PPOI corpus journal compaction deferred after failure");
+        }
+    }
+    !task.cancel.is_cancelled()
+}
+
+async fn reconcile_background_compaction_anchor(
+    task: &ChainPoiCacheCoordinator,
+    generation: u64,
+    list_key: FixedBytes<32>,
+    expected_base: ExpectedPoiCorpusBase,
+    result: &PoiCorpusCompactionResult,
+) -> bool {
+    let PoiCorpusCompactionResult::Applied(persisted) = result else {
+        return false;
+    };
+    let Some(compacted_head) = persisted.journal_head.as_ref() else {
+        return false;
+    };
+    if persisted.cache_generation != generation || persisted.cache.identity().list_key != list_key {
+        return false;
+    }
+
+    let _revision_fence = task.local_caches.revision_write_fence().await;
+    let publication = task
+        .runtime
+        .publication_fence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if publication.shutdown
+        || task.cancel.is_cancelled()
+        || task.local_caches.current_generation() != generation
+        || task.local_caches.installed_generation() != generation
+    {
+        return false;
+    }
+    let mut anchors = task
+        .installed_head_anchors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(installed) = anchors.get_mut(&list_key) else {
+        return false;
+    };
+    if ExpectedPoiCorpusBase::from_journal_head(installed) != expected_base {
+        return false;
+    }
+    *installed = compacted_head.clone();
+    drop(publication);
+    true
 }
 
 fn validate_artifact_manifest_sequences(
@@ -1925,11 +2103,6 @@ async fn stage_poi_cache_candidate(
             actual: actual_generation,
         });
     }
-    let store = PoiCorpusStore::new(
-        task.db.as_ref(),
-        generation,
-        task.artifact_config.trusted_publisher_pubkey,
-    );
     let PreparedPoiCacheCandidate {
         list_key,
         cache,
@@ -1938,35 +2111,50 @@ async fn stage_poi_cache_candidate(
     let persisted = match persistence {
         PreparedPoiCachePersistence::Artifact { prepared } => {
             let PreparedIngestion { candidate } = *prepared;
-            let Some(commit) = (tokio::select! {
-                biased;
-                () = task.cancel.cancelled() => {
-                    return Err(PoiCacheServiceError::Shutdown { attempt_id });
-                }
-                result = task
-                    .poi_artifact_persistence
-                    .commit_candidate_for_attempt(candidate, &task.cancel) => {
-                    result.map_err(|err| PoiCacheServiceError::Refresh {
-                        reason: err.to_string(),
-                    })?
-                }
-            }) else {
+            let Some(commit) = task
+                .poi_artifact_persistence
+                .commit_candidate_for_attempt(candidate, &task.cancel)
+                .await
+                .map_err(|err| PoiCacheServiceError::Refresh {
+                    reason: err.to_string(),
+                })?
+            else {
                 return Ok(None);
             };
             commit.persisted
         }
-        PreparedPoiCachePersistence::PublicRpc {
-            range_start_index,
-            expected_base,
-        } => store
-            .commit_public_rpc(
-                cache.as_ref().expect("public RPC candidate has a cache"),
+        PreparedPoiCachePersistence::PublicRpc { prepared } => {
+            let PreparedPublicRpcPersistence {
                 range_start_index,
                 expected_base,
-            )
-            .map_err(|err| PoiCacheServiceError::Refresh {
-                reason: err.to_string(),
-            })?,
+                starting_record,
+                starting_head,
+                delta,
+                blocked_shields,
+            } = *prepared;
+            let Some(commit) = task
+                .poi_artifact_persistence
+                .commit_public_rpc_for_attempt(
+                    cache.expect("public RPC candidate has a cache"),
+                    generation,
+                    task.artifact_config.trusted_publisher_pubkey,
+                    range_start_index,
+                    expected_base,
+                    starting_record,
+                    starting_head,
+                    delta,
+                    blocked_shields,
+                    &task.cancel,
+                )
+                .await
+                .map_err(|err| PoiCacheServiceError::Refresh {
+                    reason: err.to_string(),
+                })?
+            else {
+                return Ok(None);
+            };
+            commit.persisted
+        }
     };
     if task.cancel.is_cancelled() {
         return Err(PoiCacheServiceError::Shutdown { attempt_id });
@@ -1981,17 +2169,30 @@ async fn stage_poi_cache_candidate(
     let Some(persisted) = persisted else {
         return Ok(None);
     };
+    let compaction = persisted
+        .compaction_recommended
+        .then(|| PoiCorpusCompactionRequest {
+            identity: persisted.cache.identity().clone(),
+            expected_base: persisted.expected_base(),
+        });
     Ok(Some(StagedPoiCacheCandidate {
         list_key,
         cache: persisted.cache,
-        payload: persisted.record.cache_payload,
+        journal_head: persisted.journal_head,
+        compaction,
     }))
+}
+
+struct PoiCorpusCompactionRequest {
+    identity: PoiCacheIdentity,
+    expected_base: ExpectedPoiCorpusBase,
 }
 
 struct StagedPoiCacheCandidate {
     list_key: FixedBytes<32>,
     cache: PoiCache,
-    payload: Vec<u8>,
+    journal_head: Option<PoiCorpusJournalHeadRecord>,
+    compaction: Option<PoiCorpusCompactionRequest>,
 }
 
 async fn apply_staged_poi_cache_batch(
@@ -2000,7 +2201,7 @@ async fn apply_staged_poi_cache_batch(
     generation: u64,
     staged: Vec<StagedPoiCacheCandidate>,
     result: &Result<(), PoiCacheServiceError>,
-) -> Result<(), PoiCacheServiceError> {
+) -> Result<Vec<PoiCorpusCompactionRequest>, PoiCacheServiceError> {
     let _revision_fence = task.local_caches.revision_write_fence().await;
     let mut caches = task.local_caches.write().await;
     let publication = task
@@ -2019,25 +2220,38 @@ async fn apply_staged_poi_cache_batch(
         });
     }
 
-    let mut next_caches = caches.clone();
+    let mut installed_head_anchors = task
+        .installed_head_anchors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if task.local_caches.installed_generation() != generation {
-        next_caches.clear();
+        caches.clear();
+        installed_head_anchors.clear();
     }
     let mut installed_any = false;
     let mut blocked_shields_changed = false;
+    let mut compactions = Vec::new();
     for candidate in staged {
-        let changed = next_caches.get(&candidate.list_key).is_none_or(|current| {
-            !current
-                .to_bytes()
-                .is_ok_and(|payload| payload.as_slice() == candidate.payload.as_slice())
+        let changed = caches.get(&candidate.list_key).is_none_or(|current| {
+            current.progress() != candidate.cache.progress()
+                || !current.blocked_shields_match(&candidate.cache)
         });
+        if let Some(compaction) = candidate.compaction {
+            compactions.push(compaction);
+        }
         if !changed {
+            if let Some(head) = candidate.journal_head {
+                installed_head_anchors.insert(candidate.list_key, head);
+            }
             continue;
         }
-        let blocked_changed = next_caches
+        let blocked_changed = caches
             .get(&candidate.list_key)
             .is_none_or(|current| !current.blocked_shields_match(&candidate.cache));
-        if install_cache_if_not_behind(&mut next_caches, candidate.list_key, candidate.cache) {
+        if install_cache_if_not_behind(&mut caches, candidate.list_key, candidate.cache) {
+            if let Some(head) = candidate.journal_head {
+                installed_head_anchors.insert(candidate.list_key, head);
+            }
             installed_any = true;
             blocked_shields_changed |= blocked_changed;
         }
@@ -2045,7 +2259,6 @@ async fn apply_staged_poi_cache_batch(
     if task.local_caches.installed_generation() != generation {
         task.local_caches.mark_installed_generation(generation);
     }
-    *caches = next_caches;
     if installed_any {
         task.local_caches
             .publish_committed_revision(blocked_shields_changed);
@@ -2069,7 +2282,7 @@ async fn apply_staged_poi_cache_batch(
     );
     send_poi_artifact_cache_progress(&task.progress_tx, progress);
     drop(publication);
-    Ok(())
+    Ok(compactions)
 }
 
 fn completion_progress_from_caches(
@@ -2107,20 +2320,6 @@ fn completion_progress_from_caches(
         ready,
         last_error,
     )
-}
-
-fn newest_cache(first: Option<PoiCache>, second: Option<PoiCache>) -> Option<PoiCache> {
-    match (first, second) {
-        (Some(first), Some(second)) => {
-            if first.progress().next_event_index >= second.progress().next_event_index {
-                Some(first)
-            } else {
-                Some(second)
-            }
-        }
-        (Some(cache), None) | (None, Some(cache)) => Some(cache),
-        (None, None) => None,
-    }
 }
 
 fn poi_cache_error_diagnostic(error: &PoiCacheError) -> String {
@@ -2457,27 +2656,34 @@ async fn chain_poi_cache_list_progress(
 
 async fn public_rpc_candidate_cache(
     client: &PoiRpcClient,
-    mut cache: PoiCache,
+    cache: PoiCache,
 ) -> Result<PoiRpcSyncResult, PoiCacheError> {
-    let outcome = cache
-        .sync_bounded(
+    let (mut cache, result) = cache
+        .sync_bounded_with_journal(
             client,
             POI_EVENTS_PAGE_SIZE,
             POI_MERKLETREE_LEAVES_PAGE_SIZE,
-            POI_RPC_RANGE_PAGE_BUDGET,
+            crate::poi_limits::POI_RPC_EVENT_PAGE_LIMIT,
         )
         .await?;
     if cache.progress().next_event_index == 0 {
         return Ok(PoiRpcSyncResult {
-            outcome,
+            outcome: result.outcome,
             candidate: None,
         });
     }
     if !cache.validate_roots(client).await? {
         return Err(PoiCacheError::InvalidRoots);
     }
-    let candidate = outcome.changed.then_some(cache);
-    Ok(PoiRpcSyncResult { outcome, candidate })
+    let candidate = result.outcome.changed.then_some(PoiRpcCandidate {
+        cache,
+        delta: result.delta,
+        blocked_shields: result.blocked_shields,
+    });
+    Ok(PoiRpcSyncResult {
+        outcome: result.outcome,
+        candidate,
+    })
 }
 
 #[cfg(test)]
@@ -2602,24 +2808,26 @@ mod tests {
     use super::{
         ActivePoiCacheAttempt, ChainPoiCacheCommand, ChainPoiCacheCoordinator, EVM_CHAIN_TYPE,
         PersistedPoiArtifactCache, PoiCacheService, PoiCacheServiceError, PoiCacheServiceRuntime,
-        PoiListSourceOutcome, PoiRpcAttemptOutcome, PoiSourceHealth, PreparedPoiCacheBatch,
-        PreparedPoiCacheCandidate, PreparedPoiCachePersistence, StagedPoiCacheCandidate,
-        apply_staged_poi_cache_batch, cancel_active_attempt, chain_poi_cache_list_progress,
-        chain_poi_caches_available_for_lists, completion_progress_from_caches,
-        drop_completed_attempt, emit_chain_poi_cache_ready_progress,
-        finish_chain_poi_cache_attempt, install_cache_if_not_behind,
-        new_poi_artifact_cache_progress, poi_cache_error_diagnostic, public_rpc_candidate_cache,
-        publish_active_attempt_progress,
+        PoiCorpusCompactionRequest, PoiListSourceOutcome, PoiRpcAttemptOutcome, PoiSourceHealth,
+        PreparedPoiCacheBatch, PreparedPoiCacheCandidate, PreparedPoiCachePersistence,
+        PreparedPublicRpcPersistence, StagedPoiCacheCandidate, apply_staged_poi_cache_batch,
+        cancel_active_attempt, chain_poi_cache_list_progress, chain_poi_caches_available_for_lists,
+        completion_progress_from_caches, drop_completed_attempt,
+        emit_chain_poi_cache_ready_progress, finish_chain_poi_cache_attempt,
+        install_cache_if_not_behind, new_poi_artifact_cache_progress, poi_cache_error_diagnostic,
+        public_rpc_candidate_cache, publish_active_attempt_progress,
         publish_chain_poi_cache_ready_and_acknowledge_initialization, record_list_source_outcomes,
-        recover_chain_after_stale_attempt, send_poi_artifact_cache_progress_for_generation,
-        single_list_event_index, source_health_for_lists, stage_poi_cache_candidate,
-        validate_artifact_manifest_sequences, with_poi_artifact_cache_generation,
+        recover_chain_after_stale_attempt, run_background_poi_corpus_compaction,
+        send_poi_artifact_cache_progress_for_generation, single_list_event_index,
+        source_health_for_lists, stage_poi_cache_candidate, validate_artifact_manifest_sequences,
+        with_poi_artifact_cache_generation,
     };
     use crate::chain::PoiArtifactPersistenceHandle;
     use crate::poi_artifacts::test_support::{load_persisted_cache, persist_public_rpc_cache};
     use crate::poi_artifacts::{
         ExpectedPoiCorpusBase, clear_poi_artifact_cache_for_reset,
-        poi_artifact_cache_generation_cell, poi_corpus_authority, record_poi_rpc_success,
+        load_persisted_cache_candidate_for_publisher, poi_artifact_cache_generation_cell,
+        poi_corpus_authority, record_poi_rpc_success,
     };
     use crate::types::PoiCorpusRevision;
     use crate::types::{
@@ -2633,12 +2841,13 @@ mod tests {
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
     use ed25519_dalek::{Signer, SigningKey};
     use local_db::{
-        DbConfig, DbStore, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
-        PoiCacheRecordSource, PoiCorpusValidationRecord,
+        DbConfig, DbStore, POI_CORPUS_JOURNAL_SOFT_DELTA_COUNT, PoiArtifactCacheRecord,
+        PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusJournalHeadRecord,
+        PoiCorpusValidationRecord,
     };
     use poi::artifacts::SnapshotEvent;
     use poi::artifacts::verify::canonical_poi_event_message;
-    use poi::cache::{PoiCache, PoiCacheError, PoiCacheIdentity};
+    use poi::cache::{PoiCache, PoiCacheError, PoiCacheIdentity, PoiCacheJournalDelta};
     use poi::error::PoiRpcError;
     use poi::poi::{
         BlindedCommitmentData, BlockedShield, PoiEventType, PoiRpcClient, PoiSyncedListEvent,
@@ -2651,9 +2860,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
@@ -2680,7 +2889,9 @@ mod tests {
             .await?
             .into_iter()
             .collect();
-        apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &Ok(())).await
+        apply_staged_poi_cache_batch(task, attempt_id, generation, staged, &Ok(()))
+            .await
+            .map(|_| ())
     }
 
     async fn emit_chain_poi_cache_completion_progress(
@@ -2964,6 +3175,7 @@ mod tests {
             local_caches: local_caches.clone(),
             active_list_keys: vec![list_key],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -3159,6 +3371,7 @@ mod tests {
             local_caches,
             active_list_keys: vec![list_key],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -3290,6 +3503,123 @@ mod tests {
             .expect("apply cache events");
         cache.accept_current_roots();
         cache
+    }
+
+    fn persisted_public_rpc_journal_with_delta_count(
+        db: &DbStore,
+        identity: &PoiCacheIdentity,
+        generation: u64,
+        delta_count: u32,
+    ) -> PersistedPoiArtifactCache {
+        let mut cache = PoiCache::new(identity.clone());
+        for event_index in 0..=u64::from(delta_count) {
+            let mut commitment = [0_u8; 32];
+            commitment[24..].copy_from_slice(&event_index.to_be_bytes());
+            cache
+                .apply_verified_artifact_events(&[snapshot_event(
+                    event_index,
+                    FixedBytes::from(commitment),
+                )])
+                .expect("append test journal event");
+            cache.accept_current_roots();
+            let expected_base = if event_index == 0 {
+                ExpectedPoiCorpusBase::NoValidCorpus
+            } else {
+                load_persisted_cache(db, identity)
+                    .expect("load prior test journal state")
+                    .expect("prior test journal state")
+                    .expected_base()
+            };
+            persist_public_rpc_cache(db, &cache, generation, event_index, expected_base)
+                .expect("persist test journal revision");
+        }
+        load_persisted_cache(db, identity)
+            .expect("load completed test journal")
+            .expect("completed test journal")
+    }
+
+    fn compaction_test_coordinator(
+        db: &Arc<DbStore>,
+        local_caches: LocalPoiCaches,
+        list_key: FixedBytes<32>,
+        anchor: PoiCorpusJournalHeadRecord,
+    ) -> (
+        ChainPoiCacheCoordinator,
+        watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>>,
+    ) {
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(BTreeMap::new());
+        (
+            ChainPoiCacheCoordinator {
+                db: Arc::clone(db),
+                http_client: None,
+                poi_rpc_url: Url::parse("http://127.0.0.1:1")
+                    .expect("POI RPC URL")
+                    .into(),
+                artifact_config: artifact_config(),
+                chain_id: 1,
+                local_caches,
+                active_list_keys: vec![list_key],
+                preloaded_caches: BTreeMap::new(),
+                installed_head_anchors: StdMutex::new(BTreeMap::from([(list_key, anchor)])),
+                command_rx,
+                job_tx,
+                job_rx,
+                progress_tx,
+                cancel: CancellationToken::new(),
+                runtime: Arc::new(PoiCacheServiceRuntime::new()),
+                poi_artifact_persistence: test_persistence(db),
+            },
+            progress_rx,
+        )
+    }
+
+    fn public_rpc_candidate_for_test(
+        list_key: FixedBytes<32>,
+        cache: PoiCache,
+        range_start_index: u64,
+        expected_base: ExpectedPoiCorpusBase,
+        starting_record: Option<PoiArtifactCacheRecord>,
+        starting_head: Option<PoiCorpusJournalHeadRecord>,
+    ) -> PreparedPoiCacheCandidate {
+        let event_end_cursor = cache.progress().next_event_index;
+        let mut events = Vec::new();
+        let mut leaves = Vec::new();
+        for event_index in range_start_index..event_end_cursor {
+            let blinded_commitment = cache
+                .commitment_at_global_index(event_index)
+                .expect("test journal delta commitment");
+            events.push(poi::cache::PoiCacheJournalEvent {
+                event_index,
+                blinded_commitment,
+            });
+            leaves.push(blinded_commitment);
+        }
+        let delta = PoiCacheJournalDelta {
+            version: poi::cache::POI_CACHE_JOURNAL_DELTA_VERSION,
+            identity: cache.identity().clone(),
+            event_start_cursor: range_start_index,
+            event_end_cursor,
+            leaf_start_cursor: range_start_index,
+            leaf_end_cursor: cache.progress().next_leaf_index,
+            events,
+            leaves,
+        };
+        PreparedPoiCacheCandidate {
+            list_key,
+            cache: Some(cache),
+            persistence: PreparedPoiCachePersistence::PublicRpc {
+                prepared: Box::new(PreparedPublicRpcPersistence {
+                    range_start_index,
+                    expected_base,
+                    starting_record,
+                    starting_head,
+                    delta,
+                    blocked_shields: None,
+                }),
+            },
+        }
     }
 
     #[tokio::test]
@@ -4228,7 +4558,6 @@ mod tests {
                 signature: alloy::hex::encode_prefixed([0x2d; 64]),
             }])
             .expect("replace blocked shields");
-        let payload = replacement.to_bytes().expect("encode replacement");
         let local_caches = LocalPoiCaches::new_for_test(BTreeMap::from([(list_key, current)]));
         let mut revision_rx = local_caches.committed_revision_rx();
         assert_eq!(
@@ -4252,6 +4581,7 @@ mod tests {
             local_caches: local_caches.clone(),
             active_list_keys: vec![list_key],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -4261,19 +4591,21 @@ mod tests {
             poi_artifact_persistence: test_persistence(&db),
         };
 
-        apply_staged_poi_cache_batch(
+        let compactions = apply_staged_poi_cache_batch(
             &coordinator,
             attempt_id(61),
             local_caches.current_generation(),
             vec![StagedPoiCacheCandidate {
                 list_key,
                 cache: replacement,
-                payload,
+                journal_head: None,
+                compaction: None,
             }],
             &Ok(()),
         )
         .await
         .expect("publish blocked-only replacement");
+        assert!(compactions.is_empty());
 
         revision_rx.changed().await.expect("blocked revision");
         assert_eq!(
@@ -4319,15 +4651,14 @@ mod tests {
             LocalPoiCaches::new(poi_corpus_authority(&db).expect("corpus authority"));
         let mut revision_rx = local_caches.committed_revision_rx();
         let local_guard = local_caches.write().await;
-        let install = tokio::spawn({
-            let local_caches = local_caches.clone();
-            async move {
-                install_generated_cache_if_current(&local_caches, list_key, candidate, 0).await
-            }
-        });
-        tokio::task::yield_now().await;
+        let mut install = Box::pin(install_generated_cache_if_current(
+            &local_caches,
+            list_key,
+            candidate,
+            0,
+        ));
         assert!(
-            !install.is_finished(),
+            futures::poll!(&mut install).is_pending(),
             "old refresh must wait for cache lock"
         );
 
@@ -4343,7 +4674,7 @@ mod tests {
         );
         drop(local_guard);
 
-        assert!(install.await.expect("refresh install task"));
+        assert!(install.as_mut().await);
         revision_rx
             .changed()
             .await
@@ -4826,9 +5157,12 @@ mod tests {
             .expect("persist old durable corpus"),
             crate::poi_artifacts::CorpusCommitOutcome::Applied
         );
-        let expected_old_base = ExpectedPoiCorpusBase::PayloadHash(alloy::primitives::keccak256(
-            old_cache.to_bytes().expect("encode old corpus"),
-        ));
+        let old_persisted = load_persisted_cache(&db, &identity)
+            .expect("load old durable corpus")
+            .expect("old durable corpus");
+        let expected_old_base = old_persisted.expected_base();
+        let old_starting_record = old_persisted.metadata_only();
+        let old_starting_head = old_persisted.journal_head;
         let rejected_candidate = cache_with_events(
             identity.clone(),
             &[
@@ -4864,6 +5198,7 @@ mod tests {
                 local_caches,
                 active_list_keys: vec![list_key],
                 preloaded_caches: BTreeMap::new(),
+                installed_head_anchors: StdMutex::new(BTreeMap::new()),
                 command_rx,
                 job_tx,
                 job_rx,
@@ -4879,14 +5214,14 @@ mod tests {
             &coordinator_b,
             attempt_id(1),
             generation,
-            PreparedPoiCacheCandidate {
+            public_rpc_candidate_for_test(
                 list_key,
-                cache: Some(winning_cache.clone()),
-                persistence: PreparedPoiCachePersistence::PublicRpc {
-                    range_start_index: 1,
-                    expected_base: expected_old_base,
-                },
-            },
+                winning_cache.clone(),
+                1,
+                expected_old_base,
+                Some(old_starting_record.clone()),
+                old_starting_head.clone(),
+            ),
         )
         .await
         .expect("coordinator B commits winning corpus");
@@ -4902,14 +5237,14 @@ mod tests {
             &coordinator_a,
             attempt_id(2),
             generation,
-            PreparedPoiCacheCandidate {
+            public_rpc_candidate_for_test(
                 list_key,
-                cache: Some(rejected_candidate.clone()),
-                persistence: PreparedPoiCachePersistence::PublicRpc {
-                    range_start_index: 1,
-                    expected_base: expected_old_base,
-                },
-            },
+                rejected_candidate.clone(),
+                1,
+                expected_old_base,
+                Some(old_starting_record),
+                old_starting_head,
+            ),
         )
         .await
         .expect("coordinator A reloads after stale commit");
@@ -4955,7 +5290,323 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_waits_for_admitted_commit_then_removes_persistence() {
+    async fn stale_coordinator_commit_reloads_implicit_legacy_winner() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let rejected_candidate = cache_with_events(
+            identity.clone(),
+            &[snapshot_event(0, FixedBytes::from([0x44; 32]))],
+        );
+        let winning_cache = cache_with_events(
+            identity.clone(),
+            &[snapshot_event(0, FixedBytes::from([0x45; 32]))],
+        );
+        persist_cache(db.as_ref(), &winning_cache);
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+        let authority = poi_corpus_authority(&db).expect("corpus authority");
+        let local_caches = LocalPoiCaches::new(authority);
+        let mut revision_rx = local_caches.committed_revision_rx();
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, _) = tokio::sync::watch::channel(BTreeMap::new());
+        let coordinator = ChainPoiCacheCoordinator {
+            db: Arc::clone(&db),
+            http_client: None,
+            poi_rpc_url: Url::parse("http://127.0.0.1:1")
+                .expect("POI RPC URL")
+                .into(),
+            artifact_config: artifact_config(),
+            chain_id: 1,
+            local_caches: local_caches.clone(),
+            active_list_keys: vec![list_key],
+            preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
+            command_rx,
+            job_tx,
+            job_rx,
+            progress_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: test_persistence(&db),
+        };
+
+        commit_poi_cache_candidate(
+            &coordinator,
+            attempt_id(3),
+            generation,
+            public_rpc_candidate_for_test(
+                list_key,
+                rejected_candidate.clone(),
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("reload implicit legacy winner after stale commit");
+
+        revision_rx
+            .changed()
+            .await
+            .expect("implicit winner revision");
+        let reloaded = local_caches
+            .read()
+            .await
+            .get(&list_key)
+            .cloned()
+            .expect("implicit winner installed");
+        assert_eq!(
+            reloaded.to_bytes().expect("encode reloaded corpus"),
+            winning_cache.to_bytes().expect("encode winning corpus")
+        );
+        assert_ne!(
+            reloaded.to_bytes().expect("encode reloaded corpus"),
+            rejected_candidate
+                .to_bytes()
+                .expect("encode rejected candidate")
+        );
+        assert!(
+            coordinator
+                .installed_head_anchors
+                .lock()
+                .expect("installed head anchors")
+                .is_empty(),
+            "implicit winner must not synthesize an explicit journal anchor"
+        );
+        let durable = load_persisted_cache(&db, &identity)
+            .expect("load durable implicit winner")
+            .expect("durable implicit winner");
+        assert!(durable.journal_head.is_none());
+        assert_eq!(
+            durable.cache.to_bytes().expect("encode durable corpus"),
+            winning_cache.to_bytes().expect("encode winning corpus")
+        );
+
+        drop(coordinator);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn soft_compaction_updates_only_durable_head_anchor() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+        let persisted = persisted_public_rpc_journal_with_delta_count(
+            db.as_ref(),
+            &identity,
+            generation,
+            POI_CORPUS_JOURNAL_SOFT_DELTA_COUNT,
+        );
+        assert!(persisted.compaction_recommended);
+        let old_head = persisted
+            .journal_head
+            .clone()
+            .expect("journal head before soft compaction");
+        let expected_base = persisted.expected_base();
+        let runtime_before = persisted.cache.clone();
+        let runtime_bytes = runtime_before.to_bytes().expect("encode runtime cache");
+        let local_caches =
+            LocalPoiCaches::new(poi_corpus_authority(&db).expect("corpus authority"));
+        local_caches.write().await.insert(list_key, runtime_before);
+        local_caches.mark_installed_generation(generation);
+        let revision_rx = local_caches.committed_revision_rx();
+        let (coordinator, progress_rx) =
+            compaction_test_coordinator(&db, local_caches.clone(), list_key, old_head.clone());
+
+        assert!(
+            run_background_poi_corpus_compaction(
+                &coordinator,
+                generation,
+                PoiCorpusCompactionRequest {
+                    identity: identity.clone(),
+                    expected_base,
+                },
+            )
+            .await
+        );
+
+        let durable = load_persisted_cache(&db, &identity)
+            .expect("load compacted corpus")
+            .expect("compacted corpus");
+        let compacted_head = durable
+            .journal_head
+            .clone()
+            .expect("compacted journal head");
+        assert!(compacted_head.revision > old_head.revision);
+        assert_eq!(compacted_head.base_revision, compacted_head.revision);
+        assert_eq!(compacted_head.delta_count, 0);
+        assert_eq!(
+            coordinator
+                .installed_head_anchors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&list_key),
+            Some(&compacted_head)
+        );
+        assert_eq!(
+            local_caches
+                .read()
+                .await
+                .get(&list_key)
+                .expect("runtime cache after compaction")
+                .to_bytes()
+                .expect("encode runtime cache after compaction"),
+            runtime_bytes
+        );
+        assert!(!revision_rx.has_changed().expect("revision stream"));
+        assert!(!progress_rx.has_changed().expect("progress stream"));
+
+        let mut corrupt_base = db
+            .get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("load compacted base")
+            .expect("compacted base");
+        corrupt_base.cache_payload = vec![0xc1];
+        db.put_poi_artifact_cache(&corrupt_base)
+            .expect("corrupt compacted historical base");
+        assert!(load_persisted_cache(&db, &identity).is_err());
+        let installed_cache = local_caches
+            .read()
+            .await
+            .get(&list_key)
+            .cloned()
+            .expect("installed cache for anchored selection");
+        let (selected, selected_base) = load_persisted_cache_candidate_for_publisher(
+            &db,
+            &identity,
+            coordinator.artifact_config.trusted_publisher_pubkey,
+            Some(installed_cache),
+            Some(&compacted_head),
+        )
+        .expect("select exact compacted installed anchor");
+        assert!(selected.is_some());
+        assert_eq!(
+            selected_base,
+            ExpectedPoiCorpusBase::from_journal_head(&compacted_head)
+        );
+
+        drop(coordinator);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn background_compaction_stale_cancel_and_generation_mismatch_preserve_anchor() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+        let persisted =
+            persisted_public_rpc_journal_with_delta_count(db.as_ref(), &identity, generation, 1);
+        let original_head = persisted
+            .journal_head
+            .clone()
+            .expect("journal head before rejected compactions");
+        let expected_base = persisted.expected_base();
+        let local_caches =
+            LocalPoiCaches::new(poi_corpus_authority(&db).expect("corpus authority"));
+        local_caches.write().await.insert(list_key, persisted.cache);
+        local_caches.mark_installed_generation(generation);
+        let revision_rx = local_caches.committed_revision_rx();
+        let (coordinator, progress_rx) =
+            compaction_test_coordinator(&db, local_caches, list_key, original_head.clone());
+
+        assert!(
+            run_background_poi_corpus_compaction(
+                &coordinator,
+                generation,
+                PoiCorpusCompactionRequest {
+                    identity: identity.clone(),
+                    expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
+                },
+            )
+            .await
+        );
+        assert!(
+            run_background_poi_corpus_compaction(
+                &coordinator,
+                generation.saturating_add(1),
+                PoiCorpusCompactionRequest {
+                    identity: identity.clone(),
+                    expected_base,
+                },
+            )
+            .await
+        );
+        coordinator.cancel.cancel();
+        assert!(
+            !run_background_poi_corpus_compaction(
+                &coordinator,
+                generation,
+                PoiCorpusCompactionRequest {
+                    identity: identity.clone(),
+                    expected_base,
+                },
+            )
+            .await
+        );
+
+        assert_eq!(
+            coordinator
+                .installed_head_anchors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&list_key),
+            Some(&original_head)
+        );
+        assert_eq!(
+            load_persisted_cache(&db, &identity)
+                .expect("load unchanged durable corpus")
+                .expect("unchanged durable corpus")
+                .journal_head
+                .as_ref(),
+            Some(&original_head)
+        );
+        assert!(!revision_rx.has_changed().expect("revision stream"));
+        assert!(!progress_rx.has_changed().expect("progress stream"));
+
+        drop(coordinator);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn reset_between_durable_stage_and_apply_rejects_old_generation_publication() {
         let root_dir = temp_db_root();
         fs::create_dir_all(&root_dir).expect("create temp db root");
         let db = Arc::new(
@@ -4975,7 +5626,7 @@ mod tests {
             .load(Ordering::Acquire);
         let local_caches =
             LocalPoiCaches::new(poi_corpus_authority(&db).expect("corpus authority"));
-        let mut revision_rx = local_caches.committed_revision_rx();
+        let revision_rx = local_caches.committed_revision_rx();
         let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
         let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
         let (progress_tx, _) = tokio::sync::watch::channel(BTreeMap::new());
@@ -4990,6 +5641,7 @@ mod tests {
             local_caches: local_caches.clone(),
             active_list_keys: vec![list_key],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -4998,54 +5650,54 @@ mod tests {
             runtime: Arc::new(PoiCacheServiceRuntime::new()),
             poi_artifact_persistence: test_persistence(&db),
         };
-        let local_guard = local_caches.write().await;
-        let mut commit = Box::pin(commit_poi_cache_candidate(
+        let staged = stage_poi_cache_candidate(
             &coordinator,
             attempt_id(9),
             generation,
-            PreparedPoiCacheCandidate {
+            public_rpc_candidate_for_test(
                 list_key,
-                cache: Some(candidate_cache),
-                persistence: PreparedPoiCachePersistence::PublicRpc {
-                    range_start_index: 0,
-                    expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-                },
-            },
-        ));
+                candidate_cache,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("durably stage old-generation candidate")
+        .expect("staged candidate");
         assert!(
-            futures::poll!(&mut commit).is_pending(),
-            "commit should wait for the held cache guard"
+            db.get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("read durably staged corpus")
+            .is_some()
         );
-        let mut reset_task = {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move { clear_poi_artifact_cache_for_reset(&db).await })
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut reset_task)
-                .await
-                .is_err(),
-            "reset completed while an admitted commit was still active"
-        );
-        drop(local_guard);
 
-        commit.as_mut().await.expect("commit before reset");
-        revision_rx
-            .changed()
+        let reset = clear_poi_artifact_cache_for_reset(&db)
             .await
-            .expect("candidate commit revision");
-        assert_eq!(
-            *revision_rx.borrow_and_update(),
-            PoiCorpusRevision {
-                revision: 1,
-                blocked_shields_revision: 1,
-            }
-        );
-        drop(commit);
-        reset_task
-            .await
-            .expect("reset task")
-            .expect("reset after commit");
+            .expect("reset after durable stage");
+        assert!(reset.generation > generation);
+        let result = apply_staged_poi_cache_batch(
+            &coordinator,
+            attempt_id(9),
+            generation,
+            vec![staged],
+            &Ok(()),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PoiCacheServiceError::StaleGeneration { expected, actual })
+                if expected == generation && actual == reset.generation
+        ));
         assert!(local_caches.read().await.is_empty());
+        assert!(!revision_rx.has_changed().expect("revision stream"));
+        assert!(coordinator.progress_tx.borrow().is_empty());
         assert!(
             db.get_poi_artifact_cache(
                 identity.chain_type,
@@ -5057,6 +5709,131 @@ mod tests {
             .is_none()
         );
 
+        drop(coordinator);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn final_public_rpc_candidate_cancelled_at_commit_fence_returns_shutdown() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let generation = poi_artifact_cache_generation_cell(&db)
+            .expect("cache generation")
+            .load(Ordering::Acquire);
+        let local_caches =
+            LocalPoiCaches::new(poi_corpus_authority(&db).expect("corpus authority"));
+        let revision_rx = local_caches.committed_revision_rx();
+        let attempt_id = attempt_id(13);
+        let initial_progress = new_poi_artifact_cache_progress(
+            attempt_id,
+            generation,
+            1,
+            PoiArtifactCachePhase::Validating,
+            0,
+            1,
+            Some(list_key),
+            None,
+            Some(0),
+            Vec::new(),
+            PoiArtifactCacheGraphProgress::default(),
+            false,
+            None,
+        );
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) =
+            tokio::sync::watch::channel(BTreeMap::from([(1, initial_progress)]));
+        let commit_fence = Arc::new(tokio::sync::Mutex::new(()));
+        let commit_guard = Arc::clone(&commit_fence).lock_owned().await;
+        let coordinator = ChainPoiCacheCoordinator {
+            db: Arc::clone(&db),
+            http_client: None,
+            poi_rpc_url: Url::parse("http://127.0.0.1:1")
+                .expect("POI RPC URL")
+                .into(),
+            artifact_config: artifact_config(),
+            chain_id: 1,
+            local_caches: local_caches.clone(),
+            active_list_keys: vec![list_key],
+            preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
+            command_rx,
+            job_tx,
+            job_rx,
+            progress_tx,
+            cancel: CancellationToken::new(),
+            runtime: Arc::new(PoiCacheServiceRuntime::new()),
+            poi_artifact_persistence: PoiArtifactPersistenceHandle::new(
+                Arc::clone(&db),
+                commit_fence,
+            ),
+        };
+        let mut finish = Box::pin(finish_chain_poi_cache_attempt(
+            &coordinator,
+            attempt_id,
+            generation,
+            PreparedPoiCacheBatch {
+                candidates: vec![public_rpc_candidate_for_test(
+                    list_key,
+                    cache_with_events(
+                        identity.clone(),
+                        &[snapshot_event(0, FixedBytes::from([0x77; 32]))],
+                    ),
+                    0,
+                    ExpectedPoiCorpusBase::NoValidCorpus,
+                    None,
+                    None,
+                )],
+                source_outcomes: Vec::new(),
+                result: Ok(()),
+            },
+        ));
+        assert!(
+            futures::poll!(&mut finish).is_pending(),
+            "public RPC candidate must wait for the held commit fence"
+        );
+        assert_eq!(
+            progress_rx.borrow().get(&1).map(|progress| progress.phase),
+            Some(PoiArtifactCachePhase::Persisting)
+        );
+
+        coordinator.cancel.cancel();
+        let finished = tokio::time::timeout(Duration::from_secs(2), finish.as_mut())
+            .await
+            .expect("cancelled final candidate returned promptly");
+
+        assert!(matches!(
+            finished.result,
+            Err(PoiCacheServiceError::Shutdown { attempt_id: id }) if id == attempt_id
+        ));
+        assert!(local_caches.read().await.is_empty());
+        assert!(!revision_rx.has_changed().expect("revision stream"));
+        assert_eq!(
+            progress_rx.borrow().get(&1).map(|progress| progress.phase),
+            Some(PoiArtifactCachePhase::Persisting)
+        );
+        assert!(
+            db.get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("read corpus after pre-admission cancellation")
+            .is_none()
+        );
+
+        drop(finish);
+        drop(commit_guard);
         drop(coordinator);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -5094,6 +5871,7 @@ mod tests {
             local_caches: local_caches.clone(),
             active_list_keys: vec![list_key, FixedBytes::from([0x91; 32])],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -5108,17 +5886,17 @@ mod tests {
             attempt_id(1),
             generation,
             PreparedPoiCacheBatch {
-                candidates: vec![PreparedPoiCacheCandidate {
+                candidates: vec![public_rpc_candidate_for_test(
                     list_key,
-                    cache: Some(cache_with_events(
+                    cache_with_events(
                         identity.clone(),
                         &[snapshot_event(0, FixedBytes::from([0x92; 32]))],
-                    )),
-                    persistence: PreparedPoiCachePersistence::PublicRpc {
-                        range_start_index: 0,
-                        expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-                    },
-                }],
+                    ),
+                    0,
+                    ExpectedPoiCorpusBase::NoValidCorpus,
+                    None,
+                    None,
+                )],
                 source_outcomes: Vec::new(),
                 result: Err("second list failed".to_string()),
             },
@@ -5196,6 +5974,7 @@ mod tests {
             local_caches: local_caches.clone(),
             active_list_keys: vec![list_key, second_list_key],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -5205,25 +5984,25 @@ mod tests {
             poi_artifact_persistence: test_persistence(&db),
         };
         let candidates = vec![
-            PreparedPoiCacheCandidate {
+            public_rpc_candidate_for_test(
                 list_key,
-                cache: Some(candidate_cache),
-                persistence: PreparedPoiCachePersistence::PublicRpc {
-                    range_start_index: 0,
-                    expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-                },
-            },
-            PreparedPoiCacheCandidate {
-                list_key: second_list_key,
-                cache: Some(cache_with_events(
+                candidate_cache,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+                None,
+                None,
+            ),
+            public_rpc_candidate_for_test(
+                second_list_key,
+                cache_with_events(
                     second_identity.clone(),
                     &[snapshot_event(0, FixedBytes::from([0x76; 32]))],
-                )),
-                persistence: PreparedPoiCachePersistence::PublicRpc {
-                    range_start_index: 0,
-                    expected_base: ExpectedPoiCorpusBase::NoValidCorpus,
-                },
-            },
+                ),
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+                None,
+                None,
+            ),
         ];
         assert!(!coordinator.cancel.is_cancelled());
         let mut staged = Vec::new();
@@ -5541,6 +6320,7 @@ mod tests {
             local_caches,
             active_list_keys: vec![default_active_poi_list_key()],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,
@@ -5716,6 +6496,7 @@ mod tests {
             local_caches: local_caches.clone(),
             active_list_keys: vec![default_active_poi_list_key()],
             preloaded_caches: BTreeMap::new(),
+            installed_head_anchors: StdMutex::new(BTreeMap::new()),
             command_rx,
             job_tx,
             job_rx,

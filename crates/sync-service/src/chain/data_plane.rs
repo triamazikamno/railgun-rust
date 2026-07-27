@@ -10,14 +10,14 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{FixedBytes, U256};
-use local_db::{BlobMeta, DbStore};
+use local_db::{BlobMeta, DbStore, PoiArtifactCacheRecord, PoiCorpusJournalHeadRecord};
 use merkletree::tree::MerkleProof;
 use poi::artifacts::v4::{Manifest, Scope};
-use poi::cache::PoiCacheRootValidation;
-use poi::poi::PoiStatus;
+use poi::cache::{PoiCache, PoiCacheIdentity, PoiCacheJournalDelta, PoiCacheRootValidation};
+use poi::poi::{BlockedShield, PoiStatus};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedMutexGuard, watch};
 use tokio_util::sync::CancellationToken;
@@ -29,11 +29,12 @@ use crate::indexed_artifacts::{
     IndexedDatasetKind, VerifiedIndexedArtifactChunk, format_scope, verify_chunk_bytes,
 };
 use crate::poi_artifacts::{
-    CorpusCandidate, CorpusCommitOutcome, CurrentChunk, FetchedArtifact, ObservedManifest,
-    PersistedPoiArtifactCache, PoiCorpusStore, RawChunkCache, RawChunkRetainOutcome,
-    SemanticVerifiedChunk, TransportVerifiedChunk, VerifiedBlockedShields, VerifiedCatalog,
-    VerifiedCorpusCandidate, observe_manifest_with_clock, persist_prepared_corpus,
-    prepare_candidate,
+    CorpusCandidate, CorpusCommitOutcome, CurrentChunk, ExpectedPoiCorpusBase, FetchedArtifact,
+    ObservedManifest, PersistCorpusResult, PersistedPoiArtifactCache, PoiArtifactError,
+    PoiCorpusCompactionResult, PoiCorpusStore, PublicRpcPersistResult, RawChunkCache,
+    RawChunkRetainOutcome, SemanticVerifiedChunk, TransportVerifiedChunk, VerifiedBlockedShields,
+    VerifiedCatalog, VerifiedCorpusCandidate, observe_manifest_with_clock, persist_prepared_corpus,
+    prepare_candidate, prepare_candidate_from_starting,
 };
 use crate::poi_cache::{PoiCacheRetryHandle, PoiCacheService, PoiPublicCacheResetLease};
 use crate::public_cache::{
@@ -383,6 +384,24 @@ impl PoiArtifactPersistenceHandle {
             .map_err(poi_artifact_persistence_error)
     }
 
+    pub(crate) async fn begin_candidate_from_starting(
+        &self,
+        observed: &ObservedManifest,
+        catalog: &VerifiedCatalog,
+        persisted: Option<PersistedPoiArtifactCache>,
+        expected_base: ExpectedPoiCorpusBase,
+    ) -> Result<CorpusCandidate, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        prepare_candidate_from_starting(
+            self.db.as_ref(),
+            observed,
+            catalog,
+            persisted,
+            expected_base,
+        )
+        .map_err(poi_artifact_persistence_error)
+    }
+
     pub fn verify_checkpoint_catalog(
         &self,
         observed: &ObservedManifest,
@@ -463,8 +482,15 @@ impl PoiArtifactPersistenceHandle {
         &self,
         candidate: VerifiedCorpusCandidate,
     ) -> Result<CorpusCommitOutcome, PublicDataPlaneError> {
-        let _commit_guard = self.commit_fence.lock().await;
-        persist_prepared_corpus(self.db.as_ref(), candidate).map_err(poi_artifact_persistence_error)
+        let result = self
+            .run_blocking_commit(None, "artifact candidate", move |db| {
+                persist_prepared_corpus(db, candidate)
+            })
+            .await?
+            .ok_or_else(|| {
+                poi_artifact_persistence_error("uncancelled blocking commit returned no result")
+            })?;
+        Ok(result.outcome())
     }
 
     pub(crate) async fn retain_chunk_for_attempt(
@@ -484,28 +510,187 @@ impl PoiArtifactPersistenceHandle {
         candidate: VerifiedCorpusCandidate,
         cancel: &CancellationToken,
     ) -> Result<Option<PoiArtifactAttemptCommit>, PublicDataPlaneError> {
-        let _commit_guard = self.commit_fence.lock().await;
-        if cancel.is_cancelled() {
+        self.run_blocking_commit(Some(cancel), "artifact candidate", move |db| {
+            commit_artifact_after_admission(db, candidate)
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_public_rpc_for_attempt(
+        &self,
+        cache: PoiCache,
+        cache_generation: u64,
+        publisher_pubkey: FixedBytes<32>,
+        range_start_index: u64,
+        expected_base: ExpectedPoiCorpusBase,
+        starting_record: Option<PoiArtifactCacheRecord>,
+        starting_head: Option<PoiCorpusJournalHeadRecord>,
+        delta: PoiCacheJournalDelta,
+        blocked_shields: Option<Vec<BlockedShield>>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<PoiArtifactAttemptCommit>, PublicDataPlaneError> {
+        let post_compaction_cancel = cancel.clone();
+        self.run_blocking_commit(Some(cancel), "public RPC candidate", move |db| {
+            commit_public_rpc_after_admission(
+                db,
+                cache,
+                cache_generation,
+                publisher_pubkey,
+                range_start_index,
+                expected_base,
+                starting_record.as_ref(),
+                starting_head.as_ref(),
+                &delta,
+                blocked_shields,
+                || post_compaction_cancel.is_cancelled(),
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn compact_poi_corpus_for_attempt(
+        &self,
+        identity: PoiCacheIdentity,
+        cache_generation: u64,
+        publisher_pubkey: FixedBytes<32>,
+        expected_base: ExpectedPoiCorpusBase,
+        cancel: &CancellationToken,
+    ) -> Result<Option<PoiCorpusCompactionResult>, PublicDataPlaneError> {
+        self.run_blocking_commit(Some(cancel), "journal compaction", move |db| {
+            PoiCorpusStore::new(db, cache_generation, publisher_pubkey)
+                .compact(&identity, expected_base)
+        })
+        .await
+    }
+
+    async fn run_blocking_commit<T, F>(
+        &self,
+        cancel: Option<&CancellationToken>,
+        operation_name: &'static str,
+        operation: F,
+    ) -> Result<Option<T>, PublicDataPlaneError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&DbStore) -> Result<T, PoiArtifactError> + Send + 'static,
+    {
+        let admission_started = Instant::now();
+        let commit_guard = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(None),
+                guard = Arc::clone(&self.commit_fence).lock_owned() => guard,
+            }
+        } else {
+            Arc::clone(&self.commit_fence).lock_owned().await
+        };
+        let admission_elapsed = admission_started.elapsed();
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Ok(None);
         }
-        let store = PoiCorpusStore::new(
-            self.db.as_ref(),
-            candidate.cache_generation(),
-            candidate.publisher_pubkey(),
+
+        let db = Arc::clone(&self.db);
+        let blocking_submitted = Instant::now();
+        let (result, blocking_start_elapsed, execution_elapsed) =
+            tokio::task::spawn_blocking(move || {
+                let blocking_start_elapsed = blocking_submitted.elapsed();
+                let execution_started = Instant::now();
+                let result = operation(db.as_ref());
+                drop(commit_guard);
+                (result, blocking_start_elapsed, execution_started.elapsed())
+            })
+            .await
+            .map_err(|error| {
+                poi_artifact_persistence_error(format!(
+                    "{operation_name} blocking task failed: {error}"
+                ))
+            })?;
+        tracing::debug!(
+            operation = operation_name,
+            admission_elapsed_ms = admission_elapsed.as_millis(),
+            blocking_start_elapsed_ms = blocking_start_elapsed.as_millis(),
+            execution_elapsed_ms = execution_elapsed.as_millis(),
+            "PPOI persistence blocking operation complete"
         );
-        let identity = candidate.cache().identity().clone();
-        let outcome = persist_prepared_corpus(self.db.as_ref(), candidate)
-            .map_err(poi_artifact_persistence_error)?;
-        let persisted = store
-            .load(&identity)
-            .map_err(poi_artifact_persistence_error)?;
-        if outcome == CorpusCommitOutcome::Applied && persisted.is_none() {
-            return Err(poi_artifact_persistence_error(
-                "committed POI corpus is missing",
-            ));
-        }
-        Ok(Some(PoiArtifactAttemptCommit { persisted }))
+        result.map(Some).map_err(poi_artifact_persistence_error)
     }
+}
+
+pub(crate) fn commit_artifact_after_admission(
+    db: &DbStore,
+    candidate: VerifiedCorpusCandidate,
+) -> Result<PoiArtifactAttemptCommit, PoiArtifactError> {
+    let generation = candidate.cache_generation();
+    let publisher_pubkey = candidate.publisher_pubkey();
+    let identity = candidate.cache().identity().clone();
+    let store = PoiCorpusStore::new(db, generation, publisher_pubkey);
+    let persisted = match persist_prepared_corpus(db, candidate)? {
+        PersistCorpusResult::Applied(persisted) => Some(*persisted),
+        PersistCorpusResult::Stale => store.load_current_if_valid(&identity)?,
+    };
+    Ok(PoiArtifactAttemptCommit { persisted })
+}
+
+fn commit_public_rpc_after_admission(
+    db: &DbStore,
+    cache: PoiCache,
+    cache_generation: u64,
+    publisher_pubkey: FixedBytes<32>,
+    range_start_index: u64,
+    expected_base: ExpectedPoiCorpusBase,
+    starting_record: Option<&PoiArtifactCacheRecord>,
+    starting_head: Option<&PoiCorpusJournalHeadRecord>,
+    delta: &PoiCacheJournalDelta,
+    blocked_shields: Option<Vec<BlockedShield>>,
+    cancelled_after_compaction: impl FnOnce() -> bool,
+) -> Result<PoiArtifactAttemptCommit, PoiArtifactError> {
+    let identity = cache.identity().clone();
+    let store = PoiCorpusStore::new(db, cache_generation, publisher_pubkey);
+    let initial = store.commit_public_rpc(
+        cache,
+        range_start_index,
+        expected_base,
+        starting_record,
+        starting_head,
+        delta,
+        blocked_shields,
+    )?;
+    let persisted = match initial {
+        PublicRpcPersistResult::Applied(persisted) => Some(*persisted),
+        PublicRpcPersistResult::Stale => store.load_current_if_valid(&identity)?,
+        PublicRpcPersistResult::CompactionRequired(pending) => {
+            if !matches!(expected_base, ExpectedPoiCorpusBase::JournalHead { .. }) {
+                return Err(PoiArtifactError::JournalHardLimitExceeded);
+            }
+            let compacted = match store.compact(&identity, expected_base)? {
+                PoiCorpusCompactionResult::Applied(compacted) => *compacted,
+                PoiCorpusCompactionResult::Stale => {
+                    return Ok(PoiArtifactAttemptCommit { persisted: None });
+                }
+            };
+            if cancelled_after_compaction() {
+                return Ok(PoiArtifactAttemptCommit { persisted: None });
+            }
+            let retry_expected_base = compacted.expected_base();
+            let retry_starting_record = Some(compacted.metadata_only());
+            let retry_starting_head = compacted.journal_head;
+            match store.commit_public_rpc(
+                pending.cache,
+                range_start_index,
+                retry_expected_base,
+                retry_starting_record.as_ref(),
+                retry_starting_head.as_ref(),
+                delta,
+                pending.blocked_shields,
+            )? {
+                PublicRpcPersistResult::Applied(persisted) => Some(*persisted),
+                PublicRpcPersistResult::Stale => None,
+                PublicRpcPersistResult::CompactionRequired(_) => {
+                    return Err(PoiArtifactError::JournalHardLimitExceeded);
+                }
+            }
+        }
+    };
+    Ok(PoiArtifactAttemptCommit { persisted })
 }
 
 fn poi_artifact_persistence_error(error: impl std::fmt::Display) -> PublicDataPlaneError {
@@ -2511,10 +2696,14 @@ mod tests {
     use broadcaster_core::utxo::UtxoSource;
     use ed25519_dalek::SigningKey;
     use local_db::{
-        BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
-        PoiCacheRecordSource, PoiCorpusValidationRecord,
+        BlobMeta, DbConfig, POI_CORPUS_JOURNAL_MAX_DELTA_COUNT, PoiArtifactCacheRecord,
+        PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusJournalInspection,
+        PoiCorpusValidationRecord,
     };
-    use poi::cache::{PoiCache, PoiCacheIdentity};
+    use poi::artifacts::SnapshotEvent;
+    use poi::cache::{
+        POI_CACHE_JOURNAL_DELTA_VERSION, PoiCache, PoiCacheIdentity, PoiCacheJournalEvent,
+    };
     use poi::poi::PoiEventType;
     use railgun_wallet::scan::IndexedNullifierInput;
     use sha2::{Digest, Sha256};
@@ -2545,6 +2734,442 @@ mod tests {
         );
 
         drop(persistence);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn blocking_commit_returns_success_after_post_admission_cancellation() {
+        let (db, data_plane, root_dir) = test_data_plane_with_db("blocking-commit-success-cancel");
+        let persistence = data_plane.poi_artifact_persistence();
+        let cancel = CancellationToken::new();
+        let operation_cancel = cancel.clone();
+
+        let result = persistence
+            .run_blocking_commit(Some(&cancel), "test success", move |_| {
+                operation_cancel.cancel();
+                Ok(17_u64)
+            })
+            .await
+            .expect("started blocking commit succeeds");
+
+        assert_eq!(result, Some(17));
+        drop(persistence);
+        drop(data_plane);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn blocking_commit_propagates_error_after_post_admission_cancellation() {
+        let (db, data_plane, root_dir) = test_data_plane_with_db("blocking-commit-error-cancel");
+        let persistence = data_plane.poi_artifact_persistence();
+        let cancel = CancellationToken::new();
+        let operation_cancel = cancel.clone();
+
+        let error = persistence
+            .run_blocking_commit(Some(&cancel), "test error", move |_| {
+                operation_cancel.cancel();
+                Err::<(), _>(PoiArtifactError::Persistence {
+                    reason: "operation-error-sentinel".to_string(),
+                })
+            })
+            .await
+            .expect_err("started blocking commit error is propagated");
+
+        assert!(matches!(
+            error,
+            PublicDataPlaneError::PoiArtifactPersistence { reason }
+                if reason.contains("operation-error-sentinel")
+        ));
+        drop(persistence);
+        drop(data_plane);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_rpc_hard_limit_compacts_and_retries_append_once() {
+        let (db, root_dir) = test_db("public-rpc-hard-limit-retry");
+        let publisher = FixedBytes::from([0x43; 32]);
+        let persisted = fill_public_rpc_journal_to_hard_limit(db.as_ref(), publisher);
+        let before = persisted
+            .journal_head
+            .clone()
+            .expect("explicit journal head at hard limit");
+        assert_eq!(before.delta_count, POI_CORPUS_JOURNAL_MAX_DELTA_COUNT);
+        let range_start_index = persisted.cache.progress().next_event_index;
+        let expected_base = persisted.expected_base();
+        let starting_record = Some(persisted.metadata_only());
+        let (candidate, delta) = append_public_rpc_test_event(persisted.cache);
+
+        let committed = commit_public_rpc_after_admission(
+            db.as_ref(),
+            candidate,
+            before.corpus.cache_generation,
+            publisher,
+            range_start_index,
+            expected_base,
+            starting_record.as_ref(),
+            Some(&before),
+            &delta,
+            None,
+            || false,
+        )
+        .expect("compact and retry public RPC append")
+        .persisted
+        .expect("retried append published");
+        let after = committed
+            .journal_head
+            .as_ref()
+            .expect("explicit journal head after retry");
+        assert_eq!(after.delta_count, 1);
+        assert_eq!(after.base_revision + 1, after.revision);
+        assert!(after.revision > before.revision);
+        assert_eq!(
+            committed.cache.progress().next_event_index,
+            range_start_index + 1
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_rpc_post_compaction_cancellation_does_not_publish_candidate() {
+        let (db, root_dir) = test_db("public-rpc-hard-limit-cancel");
+        let publisher = FixedBytes::from([0x44; 32]);
+        let persisted = fill_public_rpc_journal_to_hard_limit(db.as_ref(), publisher);
+        let before = persisted
+            .journal_head
+            .clone()
+            .expect("explicit journal head at hard limit");
+        let range_start_index = persisted.cache.progress().next_event_index;
+        let expected_base = persisted.expected_base();
+        let starting_record = Some(persisted.metadata_only());
+        let identity = persisted.cache.identity().clone();
+        let (candidate, delta) = append_public_rpc_test_event(persisted.cache);
+        let cancellation_checked = AtomicBool::new(false);
+
+        let committed = commit_public_rpc_after_admission(
+            db.as_ref(),
+            candidate,
+            before.corpus.cache_generation,
+            publisher,
+            range_start_index,
+            expected_base,
+            starting_record.as_ref(),
+            Some(&before),
+            &delta,
+            None,
+            || {
+                cancellation_checked.store(true, Ordering::Release);
+                true
+            },
+        )
+        .expect("cancel after compaction");
+        assert!(cancellation_checked.load(Ordering::Acquire));
+        assert!(committed.persisted.is_none());
+        let retained = PoiCorpusStore::new(db.as_ref(), before.corpus.cache_generation, publisher)
+            .load(&identity)
+            .expect("load compacted corpus")
+            .expect("compacted corpus remains");
+        let retained_head = retained
+            .journal_head
+            .expect("explicit compacted journal head");
+        assert_eq!(retained_head.delta_count, 0);
+        assert_eq!(retained_head.base_revision, retained_head.revision);
+        assert_eq!(
+            retained.cache.progress().next_event_index,
+            range_start_index,
+            "cancelled candidate must not be appended"
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_rpc_reset_between_compaction_and_retry_cannot_stage_candidate() {
+        let (db, root_dir) = test_db("public-rpc-hard-limit-reset-race");
+        let publisher = FixedBytes::from([0x45; 32]);
+        let persisted = fill_public_rpc_journal_to_hard_limit(db.as_ref(), publisher);
+        let generation = persisted.cache_generation;
+        let range_start_index = persisted.cache.progress().next_event_index;
+        let expected_base = persisted.expected_base();
+        let starting_record = Some(persisted.metadata_only());
+        let starting_head = persisted.journal_head.clone();
+        let (candidate, delta) = append_public_rpc_test_event(persisted.cache);
+
+        let Err(error) = commit_public_rpc_after_admission(
+            db.as_ref(),
+            candidate,
+            generation,
+            publisher,
+            range_start_index,
+            expected_base,
+            starting_record.as_ref(),
+            starting_head.as_ref(),
+            &delta,
+            None,
+            || {
+                db.clear_poi_artifact_cache()
+                    .expect("reset corpus after compaction");
+                false
+            },
+        ) else {
+            panic!("stale retry must reject the reset generation");
+        };
+        assert!(matches!(
+            error,
+            PoiArtifactError::StalePublicCacheGeneration { .. }
+        ));
+        assert!(matches!(
+            db.inspect_poi_corpus_journal_head(
+                EVM_CHAIN_TYPE,
+                1,
+                DEFAULT_TXID_VERSION,
+                &FixedBytes::from([0x46; 32]),
+            )
+            .expect("inspect reset corpus"),
+            local_db::StoredRecord::Missing
+        ));
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_rpc_stale_reconciliation_ignores_changed_corrupt_winner() {
+        let (db, root_dir) = test_db("public-rpc-stale-corrupt-winner");
+        let publisher = FixedBytes::from([0x47; 32]);
+        let persisted = persist_public_rpc_test_base(db.as_ref(), publisher);
+        let identity = persisted.cache.identity().clone();
+        let generation = persisted.cache_generation;
+        let range_start_index = persisted.cache.progress().next_event_index;
+        let expected_base = persisted.expected_base();
+        let starting_record = persisted.metadata_only();
+        let starting_head = persisted
+            .journal_head
+            .clone()
+            .expect("public RPC starting head");
+        let (stale_candidate, stale_delta) = append_public_rpc_test_event(persisted.cache.clone());
+        let (winner_candidate, winner_delta) = append_public_rpc_test_event(persisted.cache);
+        let store = PoiCorpusStore::new(db.as_ref(), generation, publisher);
+        assert!(matches!(
+            store
+                .commit_public_rpc(
+                    winner_candidate,
+                    range_start_index,
+                    expected_base,
+                    Some(&starting_record),
+                    Some(&starting_head),
+                    &winner_delta,
+                    None,
+                )
+                .expect("commit public RPC winner"),
+            PublicRpcPersistResult::Applied(_)
+        ));
+
+        let mut corrupt_base = db
+            .get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("load public RPC winner base")
+            .expect("public RPC winner base");
+        corrupt_base.cache_payload = vec![0xc2];
+        db.put_poi_artifact_cache(&corrupt_base)
+            .expect("corrupt public RPC winner base");
+        let corruption_token = match db
+            .inspect_poi_corpus_journal_detailed(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("inspect corrupt public RPC winner")
+        {
+            PoiCorpusJournalInspection::Corrupt {
+                replacement_token, ..
+            } => replacement_token,
+            other => panic!("expected corrupt public RPC winner, got {other:?}"),
+        };
+
+        let reconciled = commit_public_rpc_after_admission(
+            db.as_ref(),
+            stale_candidate,
+            generation,
+            publisher,
+            range_start_index,
+            expected_base,
+            Some(&starting_record),
+            Some(&starting_head),
+            &stale_delta,
+            None,
+            || false,
+        )
+        .expect("stale corrupt public RPC winner reconciles without error");
+        assert!(
+            reconciled.persisted.is_none(),
+            "corrupt stale winner must not be published"
+        );
+        let after_token = match db
+            .inspect_poi_corpus_journal_detailed(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("inspect unchanged corrupt public RPC winner")
+        {
+            PoiCorpusJournalInspection::Corrupt {
+                replacement_token, ..
+            } => replacement_token,
+            other => panic!("expected corrupt public RPC winner to remain, got {other:?}"),
+        };
+        assert_eq!(
+            after_token, corruption_token,
+            "stale candidate overwrote state"
+        );
+        assert!(
+            store.load(&identity).is_err(),
+            "direct strict store load must remain fail-closed"
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_rpc_stale_reconciliation_loads_valid_winner() {
+        let (db, root_dir) = test_db("public-rpc-stale-valid-winner");
+        let publisher = FixedBytes::from([0x48; 32]);
+        let persisted = persist_public_rpc_test_base(db.as_ref(), publisher);
+        let generation = persisted.cache_generation;
+        let range_start_index = persisted.cache.progress().next_event_index;
+        let expected_base = persisted.expected_base();
+        let starting_record = persisted.metadata_only();
+        let starting_head = persisted
+            .journal_head
+            .clone()
+            .expect("public RPC starting head");
+        let (stale_candidate, stale_delta) = append_public_rpc_test_event(persisted.cache.clone());
+        let (winner_candidate, winner_delta) = append_public_rpc_test_event(persisted.cache);
+        let store = PoiCorpusStore::new(db.as_ref(), generation, publisher);
+        let winner = match store
+            .commit_public_rpc(
+                winner_candidate,
+                range_start_index,
+                expected_base,
+                Some(&starting_record),
+                Some(&starting_head),
+                &winner_delta,
+                None,
+            )
+            .expect("commit valid public RPC winner")
+        {
+            PublicRpcPersistResult::Applied(persisted) => *persisted,
+            PublicRpcPersistResult::Stale => panic!("valid winner was stale"),
+            PublicRpcPersistResult::CompactionRequired(_) => {
+                panic!("valid winner unexpectedly required compaction")
+            }
+        };
+
+        let reconciled = commit_public_rpc_after_admission(
+            db.as_ref(),
+            stale_candidate,
+            generation,
+            publisher,
+            range_start_index,
+            expected_base,
+            Some(&starting_record),
+            Some(&starting_head),
+            &stale_delta,
+            None,
+            || false,
+        )
+        .expect("reconcile valid public RPC winner")
+        .persisted
+        .expect("valid winner must be staged");
+        assert_eq!(reconciled.journal_head, winner.journal_head);
+        assert_eq!(
+            reconciled
+                .cache
+                .to_bytes()
+                .expect("encode reconciled cache"),
+            winner.cache.to_bytes().expect("encode winner cache")
+        );
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn blocking_commit_cancels_waiter_before_admission_while_first_commit_holds_fence() {
+        let (db, data_plane, root_dir) = test_data_plane_with_db("blocking-commit-wait-cancel");
+        let persistence = data_plane.poi_artifact_persistence();
+        let first_persistence = persistence.clone();
+        let (first_started_tx, first_started_rx) = std_mpsc::channel();
+        let (release_first_tx, release_first_rx) = std_mpsc::channel();
+        let first = tokio::spawn(async move {
+            first_persistence
+                .run_blocking_commit(None, "test fence holder", move |_| {
+                    first_started_tx.send(()).expect("signal first commit");
+                    release_first_rx.recv().expect("release first commit");
+                    Ok(11_u64)
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match first_started_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std_mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std_mpsc::TryRecvError::Disconnected) => {
+                        panic!("first commit stopped before acquiring fence")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("first commit acquired fence");
+
+        let cancel = CancellationToken::new();
+        let second_executed = Arc::new(AtomicBool::new(false));
+        let operation_executed = Arc::clone(&second_executed);
+        let mut second = Box::pin(persistence.run_blocking_commit(
+            Some(&cancel),
+            "test cancelled waiter",
+            move |_| {
+                operation_executed.store(true, Ordering::SeqCst);
+                Ok(22_u64)
+            },
+        ));
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "second commit must wait for the held fence"
+        );
+
+        cancel.cancel();
+        let second_result = tokio::time::timeout(Duration::from_secs(2), &mut second)
+            .await
+            .expect("cancelled waiter returned promptly")
+            .expect("cancelled waiter does not fail");
+        assert_eq!(second_result, None);
+        assert!(!second_executed.load(Ordering::SeqCst));
+
+        release_first_tx.send(()).expect("release first commit");
+        let first_result = first
+            .await
+            .expect("join first commit")
+            .expect("first commit succeeds");
+        assert_eq!(first_result, Some(11));
+        drop(second);
+        drop(persistence);
+        drop(data_plane);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
@@ -4628,6 +5253,108 @@ mod tests {
         let (db, root_dir) = test_db(name);
         let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
         (db, data_plane, root_dir)
+    }
+
+    fn append_public_rpc_test_event(mut cache: PoiCache) -> (PoiCache, PoiCacheJournalDelta) {
+        let event_index = cache.progress().next_event_index;
+        assert_eq!(event_index, cache.progress().next_leaf_index);
+        let mut commitment = [0_u8; 32];
+        commitment[24..].copy_from_slice(&event_index.to_be_bytes());
+        let event = SnapshotEvent {
+            event_index,
+            blinded_commitment: commitment,
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        };
+        cache
+            .apply_verified_artifact_events(&[event])
+            .expect("append test event");
+        cache.accept_current_roots();
+        let blinded_commitment = FixedBytes::from(commitment);
+        let delta = PoiCacheJournalDelta {
+            version: POI_CACHE_JOURNAL_DELTA_VERSION,
+            identity: cache.identity().clone(),
+            event_start_cursor: event_index,
+            event_end_cursor: event_index + 1,
+            leaf_start_cursor: event_index,
+            leaf_end_cursor: event_index + 1,
+            events: vec![PoiCacheJournalEvent {
+                event_index,
+                blinded_commitment,
+            }],
+            leaves: vec![blinded_commitment],
+        };
+        (cache, delta)
+    }
+
+    fn persist_public_rpc_test_base(
+        db: &DbStore,
+        publisher: FixedBytes<32>,
+    ) -> PersistedPoiArtifactCache {
+        let identity = PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            1,
+            DEFAULT_TXID_VERSION,
+            FixedBytes::from([0x46; 32]),
+        );
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("load test corpus generation");
+        let store = PoiCorpusStore::new(db, generation, publisher);
+        let (base, base_delta) = append_public_rpc_test_event(PoiCache::new(identity));
+        match store
+            .commit_public_rpc(
+                base,
+                0,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+                None,
+                None,
+                &base_delta,
+                None,
+            )
+            .expect("persist test corpus base")
+        {
+            PublicRpcPersistResult::Applied(persisted) => *persisted,
+            PublicRpcPersistResult::Stale => panic!("test corpus base was stale"),
+            PublicRpcPersistResult::CompactionRequired(_) => {
+                panic!("empty test corpus unexpectedly required compaction")
+            }
+        }
+    }
+
+    fn fill_public_rpc_journal_to_hard_limit(
+        db: &DbStore,
+        publisher: FixedBytes<32>,
+    ) -> PersistedPoiArtifactCache {
+        let mut persisted = persist_public_rpc_test_base(db, publisher);
+        let generation = persisted.cache_generation;
+        let store = PoiCorpusStore::new(db, generation, publisher);
+        for _ in 0..POI_CORPUS_JOURNAL_MAX_DELTA_COUNT {
+            let range_start_index = persisted.cache.progress().next_event_index;
+            let expected_base = persisted.expected_base();
+            let starting_record = Some(persisted.metadata_only());
+            let starting_head = persisted.journal_head.clone();
+            let (candidate, delta) = append_public_rpc_test_event(persisted.cache);
+            persisted = match store
+                .commit_public_rpc(
+                    candidate,
+                    range_start_index,
+                    expected_base,
+                    starting_record.as_ref(),
+                    starting_head.as_ref(),
+                    &delta,
+                    None,
+                )
+                .expect("append test journal delta")
+            {
+                PublicRpcPersistResult::Applied(persisted) => *persisted,
+                PublicRpcPersistResult::Stale => panic!("test journal append was stale"),
+                PublicRpcPersistResult::CompactionRequired(_) => {
+                    panic!("test journal reached hard limit before the declared maximum")
+                }
+            };
+        }
+        persisted
     }
 
     fn test_db(name: &str) -> (Arc<DbStore>, PathBuf) {

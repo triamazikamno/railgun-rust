@@ -13,6 +13,7 @@ pub mod indexed_artifacts;
 mod manager;
 pub(crate) mod poi_artifacts;
 mod poi_cache;
+mod poi_limits;
 pub mod poi_v4;
 mod public_cache;
 mod trustless_artifacts;

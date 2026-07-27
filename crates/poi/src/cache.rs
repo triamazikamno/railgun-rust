@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,8 @@ use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleProof, MerkleTreeUpdate};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
@@ -96,6 +98,308 @@ pub struct PoiCacheSyncOutcome {
     pub changed: bool,
 }
 
+pub const POI_CACHE_JOURNAL_DELTA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiCacheJournalEvent {
+    pub event_index: u64,
+    pub blinded_commitment: FixedBytes<32>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiCacheJournalDelta {
+    pub version: u16,
+    pub identity: PoiCacheIdentity,
+    pub event_start_cursor: u64,
+    pub event_end_cursor: u64,
+    pub leaf_start_cursor: u64,
+    pub leaf_end_cursor: u64,
+    pub events: Vec<PoiCacheJournalEvent>,
+    pub leaves: Vec<FixedBytes<32>>,
+}
+
+impl std::fmt::Debug for PoiCacheJournalDelta {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PoiCacheJournalDelta")
+            .field("version", &self.version)
+            .field("identity", &self.identity)
+            .field("event_start_cursor", &self.event_start_cursor)
+            .field("event_end_cursor", &self.event_end_cursor)
+            .field("leaf_start_cursor", &self.leaf_start_cursor)
+            .field("leaf_end_cursor", &self.leaf_end_cursor)
+            .field("event_count", &self.events.len())
+            .field("leaf_count", &self.leaves.len())
+            .finish()
+    }
+}
+
+impl PoiCacheJournalDelta {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.leaves.is_empty()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PoiCacheError> {
+        Ok(rmp_serde::to_vec_named(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PoiCacheError> {
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(bytes));
+        let delta = Self::deserialize(&mut deserializer)?;
+        require_exact_messagepack_consumption(deserializer.get_ref().position(), bytes.len())?;
+        Self::validate_version(delta)
+    }
+
+    pub fn from_bytes_bounded(
+        bytes: &[u8],
+        max_events: usize,
+        max_leaves: usize,
+    ) -> Result<Self, PoiCacheError> {
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(bytes));
+        let delta = PoiCacheJournalDeltaSeed {
+            max_events,
+            max_leaves,
+        }
+        .deserialize(&mut deserializer)?;
+        require_exact_messagepack_consumption(deserializer.get_ref().position(), bytes.len())?;
+        Self::validate_version(delta)
+    }
+
+    fn validate_version(delta: Self) -> Result<Self, PoiCacheError> {
+        if delta.version != POI_CACHE_JOURNAL_DELTA_VERSION {
+            return Err(PoiCacheError::UnsupportedJournalDeltaVersion {
+                version: delta.version,
+            });
+        }
+        Ok(delta)
+    }
+}
+
+struct BoundedVecSeed<T> {
+    limit: usize,
+    field: &'static str,
+    marker: PhantomData<T>,
+}
+
+impl<T> BoundedVecSeed<T> {
+    const fn new(limit: usize, field: &'static str) -> Self {
+        Self {
+            limit,
+            field,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'de, T> DeserializeSeed<'de> for BoundedVecSeed<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedVecVisitor {
+            limit: self.limit,
+            field: self.field,
+            marker: PhantomData,
+        })
+    }
+}
+
+struct BoundedVecVisitor<T> {
+    limit: usize,
+    field: &'static str,
+    marker: PhantomData<T>,
+}
+
+impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {} {} entries", self.limit, self.field)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence
+            .size_hint()
+            .is_some_and(|length| length > self.limit)
+        {
+            return Err(de::Error::custom(format_args!(
+                "{} entry count exceeds limit {}",
+                self.field, self.limit
+            )));
+        }
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(self.limit));
+        while values.len() < self.limit {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
+            values.push(value);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom(format_args!(
+                "{} entry count exceeds limit {}",
+                self.field, self.limit
+            )));
+        }
+        Ok(values)
+    }
+}
+
+struct PoiCacheJournalDeltaSeed {
+    max_events: usize,
+    max_leaves: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum PoiCacheJournalDeltaField {
+    Version,
+    Identity,
+    EventStartCursor,
+    EventEndCursor,
+    LeafStartCursor,
+    LeafEndCursor,
+    Events,
+    Leaves,
+}
+
+impl<'de> DeserializeSeed<'de> for PoiCacheJournalDeltaSeed {
+    type Value = PoiCacheJournalDelta;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "version",
+            "identity",
+            "event_start_cursor",
+            "event_end_cursor",
+            "leaf_start_cursor",
+            "leaf_end_cursor",
+            "events",
+            "leaves",
+        ];
+        deserializer.deserialize_struct(
+            "PoiCacheJournalDelta",
+            FIELDS,
+            PoiCacheJournalDeltaVisitor {
+                max_events: self.max_events,
+                max_leaves: self.max_leaves,
+            },
+        )
+    }
+}
+
+struct PoiCacheJournalDeltaVisitor {
+    max_events: usize,
+    max_leaves: usize,
+}
+
+impl<'de> Visitor<'de> for PoiCacheJournalDeltaVisitor {
+    type Value = PoiCacheJournalDelta;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a named POI cache journal delta")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut version = None;
+        let mut identity = None;
+        let mut event_start_cursor = None;
+        let mut event_end_cursor = None;
+        let mut leaf_start_cursor = None;
+        let mut leaf_end_cursor = None;
+        let mut events = None;
+        let mut leaves = None;
+        while let Some(field) = map.next_key()? {
+            match field {
+                PoiCacheJournalDeltaField::Version => {
+                    if version.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("version"));
+                    }
+                }
+                PoiCacheJournalDeltaField::Identity => {
+                    if identity.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("identity"));
+                    }
+                }
+                PoiCacheJournalDeltaField::EventStartCursor => {
+                    if event_start_cursor.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("event_start_cursor"));
+                    }
+                }
+                PoiCacheJournalDeltaField::EventEndCursor => {
+                    if event_end_cursor.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("event_end_cursor"));
+                    }
+                }
+                PoiCacheJournalDeltaField::LeafStartCursor => {
+                    if leaf_start_cursor.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("leaf_start_cursor"));
+                    }
+                }
+                PoiCacheJournalDeltaField::LeafEndCursor => {
+                    if leaf_end_cursor.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field("leaf_end_cursor"));
+                    }
+                }
+                PoiCacheJournalDeltaField::Events => {
+                    if events.is_some() {
+                        return Err(de::Error::duplicate_field("events"));
+                    }
+                    events = Some(
+                        map.next_value_seed(BoundedVecSeed::new(self.max_events, "journal event"))?,
+                    );
+                }
+                PoiCacheJournalDeltaField::Leaves => {
+                    if leaves.is_some() {
+                        return Err(de::Error::duplicate_field("leaves"));
+                    }
+                    leaves = Some(
+                        map.next_value_seed(BoundedVecSeed::new(self.max_leaves, "journal leaf"))?,
+                    );
+                }
+            }
+        }
+        Ok(PoiCacheJournalDelta {
+            version: version.ok_or_else(|| de::Error::missing_field("version"))?,
+            identity: identity.ok_or_else(|| de::Error::missing_field("identity"))?,
+            event_start_cursor: event_start_cursor
+                .ok_or_else(|| de::Error::missing_field("event_start_cursor"))?,
+            event_end_cursor: event_end_cursor
+                .ok_or_else(|| de::Error::missing_field("event_end_cursor"))?,
+            leaf_start_cursor: leaf_start_cursor
+                .ok_or_else(|| de::Error::missing_field("leaf_start_cursor"))?,
+            leaf_end_cursor: leaf_end_cursor
+                .ok_or_else(|| de::Error::missing_field("leaf_end_cursor"))?,
+            events: events.ok_or_else(|| de::Error::missing_field("events"))?,
+            leaves: leaves.ok_or_else(|| de::Error::missing_field("leaves"))?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoiCacheJournalSyncResult {
+    pub outcome: PoiCacheSyncOutcome,
+    pub delta: PoiCacheJournalDelta,
+    pub blocked_shields: Option<Vec<BlockedShield>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PoiCacheSnapshot {
     version: u32,
@@ -110,6 +414,11 @@ struct PoiCacheSnapshot {
 #[derive(Debug, Clone)]
 pub struct PoiCache {
     snapshot: PoiCacheSnapshot,
+}
+
+pub struct PoiCacheJournalReplay {
+    cache: PoiCache,
+    current_tree: Option<(u32, DenseMerkleTree)>,
 }
 
 #[derive(Debug, Error)]
@@ -128,6 +437,8 @@ pub enum PoiCacheError {
     Verify(#[from] VerifyError),
     #[error("POI cache snapshot version unsupported: {version}")]
     UnsupportedVersion { version: u32 },
+    #[error("POI cache journal delta version unsupported: {version}")]
+    UnsupportedJournalDeltaVersion { version: u16 },
     #[error("POI cache metadata mismatch: {reason}")]
     MetadataMismatch { reason: String },
     #[error("invalid POI cache hex field {field}: {value}")]
@@ -169,12 +480,34 @@ pub enum PoiCacheError {
     EventLeafMismatch { index: u64 },
     #[error("POI cache event at index {index} has no corresponding merkle leaf")]
     MissingEventLeaf { index: u64 },
+    #[error("POI cache journal delta identity does not match the target cache")]
+    JournalDeltaIdentityMismatch,
+    #[error(
+        "POI cache journal delta starts at event/leaf cursors {event_start_cursor}/{leaf_start_cursor}, current cursors are {next_event_index}/{next_leaf_index}"
+    )]
+    JournalDeltaCursorMismatch {
+        event_start_cursor: u64,
+        leaf_start_cursor: u64,
+        next_event_index: u64,
+        next_leaf_index: u64,
+    },
+    #[error(
+        "POI cache journal delta ends at event/leaf cursors {event_end_cursor}/{leaf_end_cursor}, replay reached {next_event_index}/{next_leaf_index}"
+    )]
+    JournalDeltaEndCursorMismatch {
+        event_end_cursor: u64,
+        leaf_end_cursor: u64,
+        next_event_index: u64,
+        next_leaf_index: u64,
+    },
     #[error("POI cache root validation required before proof generation")]
     RootValidationRequired,
     #[error("POI cache roots were rejected by the POI node")]
     InvalidRoots,
     #[error("missing POI cache proof data for blinded commitment {blinded_commitment}")]
     MissingCommitment { blinded_commitment: FixedBytes<32> },
+    #[error("missing POI cache journal replay root for tree {tree_number}")]
+    MissingJournalReplayRoot { tree_number: u32 },
     #[error(
         "POI cache proof leaf mismatch for blinded commitment {blinded_commitment}: got {leaf}"
     )]
@@ -221,7 +554,9 @@ impl PoiCache {
     }
 
     pub fn from_bytes(bytes: &[u8], identity: &PoiCacheIdentity) -> Result<Self, PoiCacheError> {
-        let mut snapshot: PoiCacheSnapshot = rmp_serde::from_slice(bytes)?;
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(bytes));
+        let mut snapshot = PoiCacheSnapshot::deserialize(&mut deserializer)?;
+        require_exact_messagepack_consumption(deserializer.get_ref().position(), bytes.len())?;
         if snapshot.version != POI_CACHE_SNAPSHOT_VERSION {
             return Err(PoiCacheError::UnsupportedVersion {
                 version: snapshot.version,
@@ -238,6 +573,14 @@ impl PoiCache {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, PoiCacheError> {
         Ok(rmp_serde::to_vec_named(&self.snapshot)?)
+    }
+
+    #[must_use]
+    pub const fn into_journal_replay(self) -> PoiCacheJournalReplay {
+        PoiCacheJournalReplay {
+            cache: self,
+            current_tree: None,
+        }
     }
 
     #[must_use]
@@ -302,6 +645,34 @@ impl PoiCache {
         fixed_roots(self.snapshot.forest.roots())
     }
 
+    /// Returns current roots without updating cached roots.
+    ///
+    /// Existing cached roots are reused, but dirty roots are computed on demand and remain
+    /// uncached. Prefer [`Self::current_roots`] when mutable access is available and subsequent
+    /// calls should reuse the computed roots or benefit from mutable cross-tree computation.
+    #[must_use]
+    pub fn current_roots_readonly(&self) -> BTreeMap<u32, FixedBytes<32>> {
+        fixed_roots(self.snapshot.forest.computed_roots())
+    }
+
+    /// Returns the roots accepted for the current forest state, if any.
+    ///
+    /// Every method that may mutate the forest must invalidate `root_validation`
+    /// before its first possible insertion, including when the mutation later fails.
+    #[must_use]
+    pub const fn validated_roots(&self) -> Option<&BTreeMap<u32, FixedBytes<32>>> {
+        match &self.snapshot.progress.root_validation {
+            PoiCacheRootValidation::Validated { roots } => Some(roots),
+            PoiCacheRootValidation::Pending | PoiCacheRootValidation::Invalid { .. } => None,
+        }
+    }
+
+    fn insert_leaf(&mut self, update: MerkleTreeUpdate) -> Result<(), PoiCacheError> {
+        self.snapshot.progress.root_validation = PoiCacheRootValidation::Pending;
+        self.snapshot.forest.insert_leaf(update)?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn root_at_global_index(&self, global_index: u64) -> Option<FixedBytes<32>> {
         let (tree_number, tree_position) = normalize_tree_position(0, global_index);
@@ -323,8 +694,13 @@ impl PoiCache {
                 == other.snapshot.progress.blocked_shields_synced
     }
 
-    fn current_roots_readonly(&self) -> BTreeMap<u32, FixedBytes<32>> {
-        fixed_roots(self.snapshot.forest.computed_roots())
+    #[must_use]
+    pub fn blocked_shields_snapshot(&self) -> Vec<BlockedShield> {
+        self.snapshot
+            .blocked_shields_by_blinded_commitment
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn apply_poi_events(
@@ -332,17 +708,28 @@ impl PoiCache {
         events: &[PoiSyncedListEvent],
     ) -> Result<usize, PoiCacheError> {
         for event in events {
-            let blinded_commitment = event.signed_poi_event.blinded_commitment;
-            self.snapshot
-                .status_by_blinded_commitment
-                .insert(blinded_commitment, PoiStatus::Valid);
-            self.snapshot.progress.next_event_index = self
-                .snapshot
-                .progress
-                .next_event_index
-                .max(next_index(event.signed_poi_event.index)?);
+            self.apply_event_commitment(
+                event.signed_poi_event.index,
+                event.signed_poi_event.blinded_commitment,
+            )?;
         }
         Ok(events.len())
+    }
+
+    fn apply_event_commitment(
+        &mut self,
+        event_index: u64,
+        blinded_commitment: FixedBytes<32>,
+    ) -> Result<(), PoiCacheError> {
+        self.snapshot
+            .status_by_blinded_commitment
+            .insert(blinded_commitment, PoiStatus::Valid);
+        self.snapshot.progress.next_event_index = self
+            .snapshot
+            .progress
+            .next_event_index
+            .max(next_index(event_index)?);
+        Ok(())
     }
 
     pub fn apply_poi_leaves(
@@ -357,7 +744,7 @@ impl PoiCache {
                 .ok_or(PoiCacheError::RangeOverflow)?;
             if *leaf != U256::ZERO {
                 let (tree_number, tree_position) = normalize_tree_position(0, global_index);
-                self.snapshot.forest.insert_leaf(MerkleTreeUpdate {
+                self.insert_leaf(MerkleTreeUpdate {
                     tree_number,
                     tree_position,
                     hash: *leaf,
@@ -382,10 +769,98 @@ impl PoiCache {
                 .next_leaf_index
                 .max(next_index(global_index)?);
         }
-        if inserted > 0 {
-            self.snapshot.progress.root_validation = PoiCacheRootValidation::Pending;
-        }
         Ok(inserted)
+    }
+
+    pub fn apply_journal_delta(
+        &mut self,
+        delta: &PoiCacheJournalDelta,
+    ) -> Result<(), PoiCacheError> {
+        if delta.version != POI_CACHE_JOURNAL_DELTA_VERSION {
+            return Err(PoiCacheError::UnsupportedJournalDeltaVersion {
+                version: delta.version,
+            });
+        }
+        if delta.identity != self.snapshot.identity {
+            return Err(PoiCacheError::JournalDeltaIdentityMismatch);
+        }
+        if delta.event_start_cursor != self.snapshot.progress.next_event_index
+            || delta.leaf_start_cursor != self.snapshot.progress.next_leaf_index
+        {
+            return Err(PoiCacheError::JournalDeltaCursorMismatch {
+                event_start_cursor: delta.event_start_cursor,
+                leaf_start_cursor: delta.leaf_start_cursor,
+                next_event_index: self.snapshot.progress.next_event_index,
+                next_leaf_index: self.snapshot.progress.next_leaf_index,
+            });
+        }
+        let expected_event_end = delta
+            .event_start_cursor
+            .checked_add(delta.events.len() as u64)
+            .ok_or(PoiCacheError::RangeOverflow)?;
+        let expected_leaf_end = delta
+            .leaf_start_cursor
+            .checked_add(delta.leaves.len() as u64)
+            .ok_or(PoiCacheError::RangeOverflow)?;
+        if expected_event_end != delta.event_end_cursor
+            || expected_leaf_end != delta.leaf_end_cursor
+        {
+            return Err(PoiCacheError::JournalDeltaEndCursorMismatch {
+                event_end_cursor: delta.event_end_cursor,
+                leaf_end_cursor: delta.leaf_end_cursor,
+                next_event_index: expected_event_end,
+                next_leaf_index: expected_leaf_end,
+            });
+        }
+
+        let mut event_commitments = BTreeMap::new();
+        let mut expected_index = delta.event_start_cursor;
+        for event in &delta.events {
+            if event.event_index != expected_index {
+                return Err(PoiCacheError::NonContiguousEvent {
+                    expected: expected_index,
+                    actual: event.event_index,
+                });
+            }
+            event_commitments.insert(event.event_index, event.blinded_commitment);
+            expected_index = next_index(expected_index)?;
+        }
+        for (offset, leaf) in delta.leaves.iter().enumerate() {
+            let index = delta
+                .leaf_start_cursor
+                .checked_add(offset as u64)
+                .ok_or(PoiCacheError::RangeOverflow)?;
+            let expected = event_commitments
+                .remove(&index)
+                .ok_or(PoiCacheError::LeafWithoutEvent { index })?;
+            if *leaf != expected {
+                return Err(PoiCacheError::EventLeafMismatch { index });
+            }
+        }
+        if let Some(index) = event_commitments.keys().next().copied() {
+            return Err(PoiCacheError::MissingEventLeaf { index });
+        }
+
+        for event in &delta.events {
+            self.apply_event_commitment(event.event_index, event.blinded_commitment)?;
+        }
+        let leaves = delta
+            .leaves
+            .iter()
+            .map(|leaf| U256::from_be_bytes(leaf.0))
+            .collect::<Vec<_>>();
+        self.apply_poi_leaves(delta.leaf_start_cursor, &leaves)?;
+        if self.snapshot.progress.next_event_index != delta.event_end_cursor
+            || self.snapshot.progress.next_leaf_index != delta.leaf_end_cursor
+        {
+            return Err(PoiCacheError::JournalDeltaEndCursorMismatch {
+                event_end_cursor: delta.event_end_cursor,
+                leaf_end_cursor: delta.leaf_end_cursor,
+                next_event_index: self.snapshot.progress.next_event_index,
+                next_leaf_index: self.snapshot.progress.next_leaf_index,
+            });
+        }
+        Ok(())
     }
 
     pub fn apply_blocked_shields(
@@ -440,7 +915,7 @@ impl PoiCache {
             let global_index = event.event_index;
             let leaf = U256::from_be_bytes(event.blinded_commitment);
             let (tree_number, tree_position) = normalize_tree_position(0, global_index);
-            self.snapshot.forest.insert_leaf(MerkleTreeUpdate {
+            self.insert_leaf(MerkleTreeUpdate {
                 tree_number,
                 tree_position,
                 hash: leaf,
@@ -468,9 +943,6 @@ impl PoiCache {
                 .next_leaf_index
                 .max(next_index(global_index)?);
             inserted += 1;
-        }
-        if inserted > 0 {
-            self.snapshot.progress.root_validation = PoiCacheRootValidation::Pending;
         }
         Ok(inserted)
     }
@@ -513,11 +985,24 @@ impl PoiCache {
         max_event_pages: usize,
     ) -> Result<PoiCacheSyncOutcome, PoiCacheError> {
         let mut candidate = self.clone();
-        let outcome = candidate
+        let result = candidate
             .sync_bounded_candidate(client, event_page_size, leaf_page_size, max_event_pages)
             .await?;
         *self = candidate;
-        Ok(outcome)
+        Ok(result.outcome)
+    }
+
+    pub async fn sync_bounded_with_journal(
+        mut self,
+        client: &PoiRpcClient,
+        event_page_size: u64,
+        leaf_page_size: u64,
+        max_event_pages: usize,
+    ) -> Result<(Self, PoiCacheJournalSyncResult), PoiCacheError> {
+        let result = self
+            .sync_bounded_candidate(client, event_page_size, leaf_page_size, max_event_pages)
+            .await?;
+        Ok((self, result))
     }
 
     async fn sync_bounded_candidate(
@@ -526,7 +1011,7 @@ impl PoiCache {
         event_page_size: u64,
         leaf_page_size: u64,
         max_event_pages: usize,
-    ) -> Result<PoiCacheSyncOutcome, PoiCacheError> {
+    ) -> Result<PoiCacheJournalSyncResult, PoiCacheError> {
         if event_page_size == 0 || leaf_page_size == 0 || max_event_pages == 0 {
             return Err(PoiCacheError::InvalidPageSize);
         }
@@ -538,6 +1023,8 @@ impl PoiCache {
         }
 
         let sync_started = Instant::now();
+        let event_start_cursor = self.snapshot.progress.next_event_index;
+        let leaf_start_cursor = self.snapshot.progress.next_leaf_index;
         debug!(
             chain_type = self.snapshot.identity.chain_type,
             chain_id = self.snapshot.identity.chain_id,
@@ -553,6 +1040,8 @@ impl PoiCache {
 
         let mut outcome = PoiCacheSyncOutcome::default();
         let mut event_commitments = BTreeMap::new();
+        let mut journal_events = Vec::new();
+        let mut journal_leaves = Vec::new();
         let mut event_pages = 0_usize;
         loop {
             let start_index = self.snapshot.progress.next_event_index;
@@ -600,6 +1089,10 @@ impl PoiCache {
                 }
                 verify_poi_event(&event.signed_poi_event, &self.snapshot.identity.list_key.0)?;
                 event_commitments.insert(expected_index, event.signed_poi_event.blinded_commitment);
+                journal_events.push(PoiCacheJournalEvent {
+                    event_index: expected_index,
+                    blinded_commitment: event.signed_poi_event.blinded_commitment,
+                });
                 expected_index = expected_index
                     .checked_add(1)
                     .ok_or(PoiCacheError::RangeOverflow)?;
@@ -672,6 +1165,11 @@ impl PoiCache {
                     .ok_or(PoiCacheError::RangeOverflow)?;
                 event_commitments.remove(&index);
             }
+            journal_leaves.extend(
+                leaves
+                    .iter()
+                    .map(|leaf| FixedBytes::from(leaf.to_be_bytes::<32>())),
+            );
             let returned = leaves.len();
             let applied = self.apply_poi_leaves(start_index, &leaves)?;
             outcome.leaves += applied;
@@ -694,6 +1192,7 @@ impl PoiCache {
         }
 
         let blocked_started = Instant::now();
+        let previous_blocked_shields_synced = self.snapshot.progress.blocked_shields_synced;
         let previous_blocked_shields = self.snapshot.blocked_shields_by_blinded_commitment.clone();
         let blocked_shields = client
             .filtered_blocked_shields(
@@ -708,9 +1207,10 @@ impl PoiCache {
             verify_blocked_shield(blocked_shield, &self.snapshot.identity.list_key.0)?;
         }
         outcome.blocked_shields = self.replace_blocked_shields(&blocked_shields)?;
-        outcome.changed = outcome.events > 0
-            || outcome.leaves > 0
+        let blocked_shields_changed = (!previous_blocked_shields_synced
+            && self.snapshot.progress.next_event_index > 0)
             || self.snapshot.blocked_shields_by_blinded_commitment != previous_blocked_shields;
+        outcome.changed = outcome.events > 0 || outcome.leaves > 0 || blocked_shields_changed;
         debug!(
             chain_id = self.snapshot.identity.chain_id,
             list_key = %hex::encode(self.snapshot.identity.list_key),
@@ -731,7 +1231,20 @@ impl PoiCache {
             "local POI cache sync finished"
         );
 
-        Ok(outcome)
+        Ok(PoiCacheJournalSyncResult {
+            outcome,
+            delta: PoiCacheJournalDelta {
+                version: POI_CACHE_JOURNAL_DELTA_VERSION,
+                identity: self.snapshot.identity.clone(),
+                event_start_cursor,
+                event_end_cursor: self.snapshot.progress.next_event_index,
+                leaf_start_cursor,
+                leaf_end_cursor: self.snapshot.progress.next_leaf_index,
+                events: journal_events,
+                leaves: journal_leaves,
+            },
+            blocked_shields: blocked_shields_changed.then_some(blocked_shields),
+        })
     }
 
     pub async fn validate_roots(&mut self, client: &PoiRpcClient) -> Result<bool, PoiCacheError> {
@@ -846,6 +1359,19 @@ impl PoiCache {
     }
 }
 
+fn require_exact_messagepack_consumption(
+    position: u64,
+    input_len: usize,
+) -> Result<(), PoiCacheError> {
+    if position != u64::try_from(input_len).unwrap_or(u64::MAX) {
+        return Err(rmp_serde::decode::Error::Syntax(
+            "trailing bytes after MessagePack value".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_poi_merkle_proof_leaf(
     proof: &MerkleProof,
     blinded_commitment: &FixedBytes<32>,
@@ -874,6 +1400,72 @@ fn poi_merkle_proof_from_cache(proof: &MerkleProof) -> PoiMerkleProof {
         elements: proof.path_elements.to_vec(),
         indices: U256::from(proof.leaf_index),
         root: proof.root,
+    }
+}
+
+impl PoiCacheJournalReplay {
+    pub fn apply_delta(
+        &mut self,
+        delta: &PoiCacheJournalDelta,
+    ) -> Result<FixedBytes<32>, PoiCacheError> {
+        let tip_index = delta.event_end_cursor.checked_sub(1).ok_or(
+            PoiCacheError::JournalDeltaEndCursorMismatch {
+                event_end_cursor: delta.event_end_cursor,
+                leaf_end_cursor: delta.leaf_end_cursor,
+                next_event_index: self.cache.progress().next_event_index,
+                next_leaf_index: self.cache.progress().next_leaf_index,
+            },
+        )?;
+        let (tree_number, tree_position) = normalize_tree_position(0, tip_index);
+        let increment_current_tree = !delta.leaves.is_empty()
+            && self
+                .current_tree
+                .as_ref()
+                .is_some_and(|(current, _)| *current == tree_number)
+            && normalize_tree_position(0, delta.leaf_start_cursor).0 == tree_number;
+
+        self.cache.apply_journal_delta(delta)?;
+
+        if increment_current_tree {
+            let Some((_, dense)) = self.current_tree.as_mut() else {
+                return Err(PoiCacheError::MissingJournalReplayRoot { tree_number });
+            };
+            for (offset, leaf) in delta.leaves.iter().enumerate() {
+                let global_index = delta
+                    .leaf_start_cursor
+                    .checked_add(offset as u64)
+                    .ok_or(PoiCacheError::RangeOverflow)?;
+                let (leaf_tree, leaf_position) = normalize_tree_position(0, global_index);
+                debug_assert_eq!(leaf_tree, tree_number);
+                dense.set_leaf(leaf_position, U256::from_be_bytes(leaf.0));
+            }
+        } else if !delta.leaves.is_empty() {
+            self.current_tree = Some((
+                tree_number,
+                DenseMerkleTree::from_forest_prefix(
+                    &self.cache.snapshot.forest,
+                    tree_number,
+                    tree_position + 1,
+                ),
+            ));
+        }
+
+        if let Some((current, dense)) = self.current_tree.as_ref()
+            && *current == tree_number
+        {
+            return Ok(FixedBytes::from(dense.root().to_be_bytes::<32>()));
+        }
+        self.cache
+            .current_roots_readonly()
+            .get(&tree_number)
+            .copied()
+            .ok_or(PoiCacheError::MissingJournalReplayRoot { tree_number })
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> PoiCache {
+        self.cache.accept_current_roots();
+        self.cache
     }
 }
 
@@ -1106,6 +1698,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_snapshot_requires_exact_messagepack_input_and_accepts_legacy_sequence_encoding() {
+        let cache = PoiCache::new(identity());
+        let named = cache.to_bytes().expect("encode named cache snapshot");
+        let legacy_sequence =
+            rmp_serde::to_vec(&cache.snapshot).expect("encode legacy sequence cache snapshot");
+
+        PoiCache::from_bytes(&named, &identity()).expect("decode named cache snapshot");
+        PoiCache::from_bytes(&legacy_sequence, &identity())
+            .expect("decode legacy sequence cache snapshot");
+        for suffix in [&[0xc0_u8][..], &[0xc1_u8][..]] {
+            let mut tainted = named.clone();
+            tainted.extend_from_slice(suffix);
+            assert!(PoiCache::from_bytes(&tainted, &identity()).is_err());
+        }
+    }
+
+    #[test]
     fn cache_derives_roots_at_historical_global_indexes() {
         let mut prefix = PoiCache::new(identity());
         prefix
@@ -1180,6 +1789,50 @@ mod tests {
             .poi_merkle_proofs(&[blinded_commitment])
             .expect_err("rejected roots should fail closed");
         assert!(matches!(invalid_roots, PoiCacheError::InvalidRoots));
+    }
+
+    #[test]
+    fn poi_leaf_error_after_possible_insertion_invalidates_validated_roots() {
+        let mut cache = PoiCache::new(identity());
+        cache
+            .apply_poi_leaves(0, &[U256::from(1)])
+            .expect("seed POI leaf");
+        cache.accept_current_roots();
+        assert!(cache.validated_roots().is_some());
+
+        let error = cache
+            .apply_poi_leaves(u64::MAX, &[U256::from(2)])
+            .expect_err("overflowing POI leaf must fail");
+
+        assert!(matches!(error, PoiCacheError::RangeOverflow));
+        assert!(cache.validated_roots().is_none());
+    }
+
+    #[test]
+    fn artifact_event_error_after_possible_insertion_invalidates_validated_roots() {
+        let mut cache = PoiCache::new(identity());
+        cache
+            .apply_verified_artifact_events(&[SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x21; 32],
+                signature: [0; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("seed artifact event");
+        cache.accept_current_roots();
+        assert!(cache.validated_roots().is_some());
+
+        let error = cache
+            .apply_verified_artifact_events(&[SnapshotEvent {
+                event_index: u64::MAX,
+                blinded_commitment: [0x22; 32],
+                signature: [0; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect_err("overflowing artifact event must fail");
+
+        assert!(matches!(error, PoiCacheError::RangeOverflow));
+        assert!(cache.validated_roots().is_none());
     }
 
     #[test]
@@ -1315,6 +1968,158 @@ mod tests {
         assert_eq!(requests[2]["params"]["startIndex"], 0);
         assert_eq!(requests[2]["params"]["endIndex"], 2);
         assert!(requests[3]["params"].get("bloomFilterSerialized").is_none());
+    }
+
+    #[tokio::test]
+    async fn captured_journal_delta_replays_to_the_public_rpc_candidate() {
+        let commitment_0 = FixedBytes::from([0x24; 32]);
+        let commitment_1 = FixedBytes::from([0x35; 32]);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, commitment_0), event(1, commitment_1)])),
+            json_rpc_result(&json!([])),
+            json_rpc_result(&json!([
+                hex::encode_prefixed(commitment_0),
+                hex::encode_prefixed(commitment_1),
+            ])),
+            json_rpc_result(&json!([])),
+        ]);
+        let base = PoiCache::new(identity());
+
+        let (mut candidate, result) = base
+            .clone()
+            .sync_bounded_with_journal(&PoiRpcClient::new(mock.url), 2, 2, usize::MAX)
+            .await
+            .expect("sync candidate with journal capture");
+        let encoded = result.delta.to_bytes().expect("encode journal delta");
+        let decoded = PoiCacheJournalDelta::from_bytes(&encoded).expect("decode journal delta");
+        assert_eq!(decoded, result.delta);
+        assert_eq!(
+            PoiCacheJournalDelta::from_bytes_bounded(&encoded, 2, 2)
+                .expect("decode bounded journal delta"),
+            result.delta
+        );
+        assert!(PoiCacheJournalDelta::from_bytes_bounded(&encoded, 1, 2).is_err());
+        assert!(PoiCacheJournalDelta::from_bytes_bounded(&encoded, 2, 1).is_err());
+        for suffix in [&[0xc0_u8][..], &[0xc1_u8][..]] {
+            let mut tainted = encoded.clone();
+            tainted.extend_from_slice(suffix);
+            assert!(PoiCacheJournalDelta::from_bytes(&tainted).is_err());
+            assert!(PoiCacheJournalDelta::from_bytes_bounded(&tainted, 2, 2).is_err());
+        }
+        assert_eq!(decoded.events.len(), 2);
+        assert_eq!(decoded.leaves.len(), 2);
+        assert_eq!(result.blocked_shields, Some(Vec::new()));
+
+        let mut replayed = base;
+        replayed
+            .apply_journal_delta(&decoded)
+            .expect("replay captured delta");
+        replayed
+            .replace_blocked_shields(
+                result
+                    .blocked_shields
+                    .as_deref()
+                    .expect("captured blocked snapshot"),
+            )
+            .expect("replay blocked snapshot");
+        replayed.accept_current_roots();
+        candidate.accept_current_roots();
+
+        assert_eq!(
+            replayed.to_bytes().expect("serialize replayed cache"),
+            candidate.to_bytes().expect("serialize direct candidate")
+        );
+        assert_eq!(replayed.status(&commitment_0), PoiStatus::Valid);
+        assert_eq!(
+            replayed
+                .position(&commitment_1)
+                .expect("replayed commitment position")
+                .global_index,
+            1
+        );
+    }
+
+    #[test]
+    fn incremental_journal_replay_matches_each_committed_root() {
+        let identity = identity();
+        let base = PoiCache::new(identity.clone());
+        let mut direct = base.clone();
+        let mut replay = base.into_journal_replay();
+
+        for event_index in 0..4 {
+            let commitment = FixedBytes::from([0x60 + event_index as u8; 32]);
+            let delta = PoiCacheJournalDelta {
+                version: POI_CACHE_JOURNAL_DELTA_VERSION,
+                identity: identity.clone(),
+                event_start_cursor: event_index,
+                event_end_cursor: event_index + 1,
+                leaf_start_cursor: event_index,
+                leaf_end_cursor: event_index + 1,
+                events: vec![PoiCacheJournalEvent {
+                    event_index,
+                    blinded_commitment: commitment,
+                }],
+                leaves: vec![commitment],
+            };
+            direct
+                .apply_journal_delta(&delta)
+                .expect("apply direct journal delta");
+            let expected_root = direct
+                .current_roots()
+                .get(&0)
+                .copied()
+                .expect("direct replay root");
+            assert_eq!(
+                replay
+                    .apply_delta(&delta)
+                    .expect("apply incremental journal delta"),
+                expected_root
+            );
+        }
+
+        direct.accept_current_roots();
+        let replayed = replay.finish();
+        assert_eq!(
+            replayed.to_bytes().expect("serialize incremental replay"),
+            direct.to_bytes().expect("serialize direct replay")
+        );
+    }
+
+    #[test]
+    fn journal_delta_rejects_cursor_and_leaf_conflicts_before_mutation() {
+        let commitment = FixedBytes::from([0x46; 32]);
+        let base = PoiCache::new(identity());
+        let delta = PoiCacheJournalDelta {
+            version: POI_CACHE_JOURNAL_DELTA_VERSION,
+            identity: identity(),
+            event_start_cursor: 0,
+            event_end_cursor: 1,
+            leaf_start_cursor: 0,
+            leaf_end_cursor: 1,
+            events: vec![PoiCacheJournalEvent {
+                event_index: 0,
+                blinded_commitment: commitment,
+            }],
+            leaves: vec![FixedBytes::from([0x47; 32])],
+        };
+        let mut mismatched_leaf = base.clone();
+        assert!(matches!(
+            mismatched_leaf.apply_journal_delta(&delta),
+            Err(PoiCacheError::EventLeafMismatch { index: 0 })
+        ));
+        assert_eq!(mismatched_leaf.progress().next_event_index, 0);
+        assert_eq!(mismatched_leaf.progress().next_leaf_index, 0);
+
+        let mut wrong_cursor = base;
+        let mut delta = delta;
+        delta.leaves[0] = commitment;
+        delta.event_start_cursor = 1;
+        assert!(matches!(
+            wrong_cursor.apply_journal_delta(&delta),
+            Err(PoiCacheError::JournalDeltaCursorMismatch { .. })
+        ));
+        assert_eq!(wrong_cursor.progress().next_event_index, 0);
+        assert_eq!(wrong_cursor.progress().next_leaf_index, 0);
     }
 
     #[tokio::test]

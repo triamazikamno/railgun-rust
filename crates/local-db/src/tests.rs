@@ -1,18 +1,22 @@
 use super::{
     APP_SETTINGS_TABLE, BLOB_INDEX_TABLE, CURRENT_SCHEMA_VERSION, CanonicalBlobMetaIdentity,
     DESKTOP_WALLET_VAULT_TABLE, DbConfig, DbError, DbStore, DesktopWalletVaultRecord,
-    MERKLE_FOREST_INDEX_TABLE, META_TABLE, Meta, OUTPUT_POI_RECOVERY_TABLE,
-    OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow, OpaqueWalletPrivateRowMutation,
-    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, PENDING_FEE_NOTE_ASSURANCE_TABLE,
-    PENDING_OUTPUT_POI_CONTEXT_TABLE, PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
-    POI_ARTIFACT_CACHE_GENERATION_KEY, POI_ARTIFACT_CACHE_TABLE, PendingFeeNoteAssuranceRecord,
-    PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheCommitCondition,
-    PoiArtifactCacheCommitOutcome, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
-    PoiCacheRecordSource, PoiCorpusRpcHealthRecord, PoiCorpusValidationRecord,
-    PoiPublisherManifestObservation, PoiPublisherManifestWatermarkRecord, StoredRecord,
-    TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE,
-    WALLET_UTXO_TABLE, WalletCacheKey, WalletDeletionBatch, WalletDeletionReport, WalletMeta,
-    WalletMetaMutation, WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
+    ExpectedPoiCorpusJournalState, MERKLE_FOREST_INDEX_TABLE, META_TABLE, Meta,
+    OUTPUT_POI_RECOVERY_TABLE, OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow,
+    OpaqueWalletPrivateRowMutation, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+    PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE,
+    PENDING_OUTPUT_POI_CONTEXT_V2_TABLE, POI_ARTIFACT_CACHE_GENERATION_KEY,
+    POI_ARTIFACT_CACHE_TABLE, POI_CORPUS_JOURNAL_FORMAT_VERSION,
+    POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES, POI_CORPUS_JOURNAL_TABLE, PendingFeeNoteAssuranceRecord,
+    PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheRecord,
+    PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusBlockedSnapshotRecord,
+    PoiCorpusJournalCommitCondition, PoiCorpusJournalCommitOutcome, PoiCorpusJournalDeltaRecord,
+    PoiCorpusJournalHeadRecord, PoiCorpusJournalInspection, PoiCorpusRpcHealthRecord,
+    PoiCorpusValidationRecord, PoiPublisherManifestObservation,
+    PoiPublisherManifestWatermarkRecord, StoredRecord, TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
+    WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE, WALLET_UTXO_TABLE, WalletCacheKey,
+    WalletDeletionBatch, WalletDeletionReport, WalletMeta, WalletMetaMutation,
+    WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
     WalletPrivateCanonicalizationKindBatch, WalletPrivateCanonicalizationReport,
     WalletPrivateNamespaceDeletionReport, WalletPrivateNamespaceId, WalletPrivateRecordKind,
     WalletPrivateStateBatch, WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport,
@@ -737,6 +741,115 @@ fn sample_poi_artifact_cache_record(
     }
 }
 
+fn sample_journal_head(
+    base: &PoiArtifactCacheRecord,
+    event_cursor: u64,
+    leaf_cursor: u64,
+    current_tip_root: FixedBytes<32>,
+) -> PoiCorpusJournalHeadRecord {
+    let mut corpus = base.clone();
+    corpus.current_tip_index = event_cursor.saturating_sub(1);
+    corpus.current_tip_root = current_tip_root;
+    corpus.cache_payload.clear();
+    PoiCorpusJournalHeadRecord {
+        format_version: POI_CORPUS_JOURNAL_FORMAT_VERSION,
+        revision: 0,
+        base_revision: 0,
+        base_payload_hash: FixedBytes::ZERO,
+        event_cursor,
+        leaf_cursor,
+        blocked_revision: None,
+        blocked_payload_hash: None,
+        delta_count: 0,
+        delta_payload_bytes: 0,
+        corpus,
+    }
+}
+
+fn sample_journal_delta(
+    base: &PoiArtifactCacheRecord,
+    event_start_cursor: u64,
+    event_end_cursor: u64,
+    start_tip_root: FixedBytes<32>,
+    end_tip_root: FixedBytes<32>,
+) -> PoiCorpusJournalDeltaRecord {
+    PoiCorpusJournalDeltaRecord {
+        format_version: 0,
+        chain_type: base.chain_type,
+        chain_id: base.chain_id,
+        txid_version: base.txid_version.clone(),
+        list_key: base.list_key,
+        cache_generation: 0,
+        revision: 0,
+        previous_revision: 0,
+        base_revision: 0,
+        event_start_cursor,
+        event_end_cursor,
+        leaf_start_cursor: event_start_cursor,
+        leaf_end_cursor: event_end_cursor,
+        start_tip_root,
+        end_tip_root,
+        payload: vec![0x81, 0x82, 0x83],
+        updated_at: 0,
+    }
+}
+
+fn implicit_journal_condition(base: &PoiArtifactCacheRecord) -> PoiCorpusJournalCommitCondition {
+    PoiCorpusJournalCommitCondition {
+        expected_generation: base.cache_generation,
+        expected_publisher: None,
+        expected_manifest_hash: None,
+        expected_state: ExpectedPoiCorpusJournalState::ImplicitBase {
+            base_payload_hash: keccak256(&base.cache_payload),
+            event_cursor: base.current_tip_index.saturating_add(1),
+            leaf_cursor: base.current_tip_index.saturating_add(1),
+            current_tip_root: base.current_tip_root,
+        },
+    }
+}
+
+fn explicit_journal_condition(
+    head: &PoiCorpusJournalHeadRecord,
+) -> PoiCorpusJournalCommitCondition {
+    PoiCorpusJournalCommitCondition {
+        expected_generation: head.corpus.cache_generation,
+        expected_publisher: None,
+        expected_manifest_hash: None,
+        expected_state: ExpectedPoiCorpusJournalState::Head {
+            revision: head.revision,
+            base_revision: head.base_revision,
+            base_payload_hash: head.base_payload_hash,
+            event_cursor: head.event_cursor,
+            leaf_cursor: head.leaf_cursor,
+            current_tip_root: head.corpus.current_tip_root,
+        },
+    }
+}
+
+fn insert_raw_poi_journal_row(store: &DbStore, key: &str, payload: &[u8]) {
+    let txn = store.db.begin_write().expect("start raw journal write");
+    {
+        let mut table = txn
+            .open_table(POI_CORPUS_JOURNAL_TABLE)
+            .expect("open POI journal table");
+        table
+            .insert(key, payload)
+            .expect("insert raw POI journal row");
+    }
+    txn.commit().expect("commit raw POI journal write");
+}
+
+fn remove_raw_poi_journal_row(store: &DbStore, key: &str) {
+    let txn = store.db.begin_write().expect("start raw journal delete");
+    {
+        let mut table = txn
+            .open_table(POI_CORPUS_JOURNAL_TABLE)
+            .expect("open POI journal table");
+        table.remove(key).expect("remove raw POI journal row");
+    }
+    txn.commit().expect("commit raw POI journal delete");
+}
+
 #[test]
 fn legacy_poi_artifact_cache_record_defaults_to_indexed_artifact_source() {
     #[derive(serde::Serialize)]
@@ -785,99 +898,1004 @@ fn legacy_poi_artifact_cache_record_defaults_to_indexed_artifact_source() {
 }
 
 #[test]
-fn poi_corpus_candidate_commit_rechecks_generation_watermark_and_base_atomically() {
+fn poi_artifact_cache_payload_encoding_is_bidirectionally_compatible() {
+    #[derive(serde::Deserialize)]
+    struct PlainPayloadRecord {
+        cache_payload: Vec<u8>,
+    }
+
+    let record = sample_poi_artifact_cache_record(1, FixedBytes::from([0x72; 32]));
+    let encoded = encode(&record).expect("encode byte-specialized POI cache record");
+    let decoded: PlainPayloadRecord =
+        decode(&encoded).expect("decode byte-specialized payload through plain Vec");
+
+    assert_eq!(decoded.cache_payload, record.cache_payload);
+}
+
+#[test]
+fn poi_corpus_journal_adopts_legacy_base_and_appends_atomically() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
     })
     .expect("open db");
-    let publisher = FixedBytes::from([0x41; 32]);
-    let existing = sample_poi_artifact_cache_record(1, FixedBytes::from([0x42; 32]));
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x73; 32]));
     store
-        .put_poi_artifact_cache(&existing)
-        .expect("seed corpus");
-    store
-        .advance_poi_publisher_manifest_watermark(publisher, 5)
-        .expect("observe publisher sequence");
-    let mut candidate = existing.clone();
-    candidate.current_tip_root = FixedBytes::from([0x43; 32]);
-    let expected_payload_hash = Some(keccak256(&existing.cache_payload));
-
-    assert_eq!(
-        store
-            .commit_poi_artifact_cache_if_current(
-                &candidate,
-                PoiArtifactCacheCommitCondition {
-                    expected_generation: 0,
-                    expected_publisher: Some((publisher, 5)),
-                    expected_manifest_hash: None,
-                    expected_payload_hash,
-                },
-            )
-            .expect("commit current candidate"),
-        PoiArtifactCacheCommitOutcome::Applied
-    );
-    assert_eq!(
-        store
-            .get_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &candidate.list_key)
-            .expect("read committed candidate")
-            .expect("candidate present")
-            .cache_generation,
-        0
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    drop(store);
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen db with implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let end_root = FixedBytes::from([0x74; 32]);
+    let head = sample_journal_head(&persisted_base, 101, 101, end_root);
+    let delta = sample_journal_delta(
+        &persisted_base,
+        100,
+        101,
+        persisted_base.current_tip_root,
+        end_root,
     );
 
-    store
-        .advance_poi_publisher_manifest_watermark(publisher, 6)
-        .expect("advance publisher concurrently");
-    assert_eq!(
-        store
-            .commit_poi_artifact_cache_if_current(
-                &existing,
-                PoiArtifactCacheCommitCondition {
-                    expected_generation: 0,
-                    expected_publisher: Some((publisher, 5)),
-                    expected_manifest_hash: None,
-                    expected_payload_hash: Some(keccak256(&candidate.cache_payload)),
-                },
-            )
-            .expect("reject stale candidate"),
-        PoiArtifactCacheCommitOutcome::PublisherSequenceConflict { actual: Some(6) }
-    );
+    let applied = match store
+        .append_poi_corpus_journal_if_current(
+            head,
+            Some(delta),
+            None,
+            implicit_journal_condition(&persisted_base),
+        )
+        .expect("append journal delta")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected journal append outcome: {outcome:?}"),
+    };
+
+    assert_eq!(applied.head.revision, 1);
+    assert_eq!(applied.head.base_revision, 0);
+    assert_eq!(applied.head.delta_count, 1);
+    assert_eq!(applied.head.delta_payload_bytes, 3);
+    assert_eq!(applied.delta.as_ref().map(|delta| delta.revision), Some(1));
+    assert!(applied.base.is_none());
+    let bundle = match store
+        .inspect_poi_corpus_journal(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect explicit journal")
+    {
+        StoredRecord::Valid(bundle) => bundle,
+        other => panic!("unexpected stored journal: {other:?}"),
+    };
+    assert_eq!(bundle.base.cache_payload, base.cache_payload);
+    assert_eq!(bundle.head, Some(applied.head.clone()));
+    assert_eq!(bundle.deltas, applied.delta.into_iter().collect::<Vec<_>>());
+    assert!(bundle.blocked.is_none());
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[test]
-fn poi_corpus_candidate_commit_rechecks_exact_manifest_hash() {
+fn poi_corpus_journal_blocked_only_revision_does_not_add_delta() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
     })
     .expect("open db");
-    let publisher = FixedBytes::from([0x44; 32]);
-    let accepted_hash = FixedBytes::from([0x45; 32]);
-    let candidate = sample_poi_artifact_cache_record(1, FixedBytes::from([0x46; 32]));
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x75; 32]));
     store
-        .observe_poi_v4_publisher_manifest(publisher, 5, accepted_hash)
-        .expect("observe exact publication");
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let first = match store
+        .append_poi_corpus_journal_if_current(
+            sample_journal_head(&persisted_base, 100, 100, persisted_base.current_tip_root),
+            None,
+            Some(PoiCorpusBlockedSnapshotRecord {
+                format_version: 0,
+                chain_type: base.chain_type,
+                chain_id: base.chain_id,
+                txid_version: base.txid_version.clone(),
+                list_key: base.list_key,
+                cache_generation: 0,
+                revision: 0,
+                payload_hash: FixedBytes::ZERO,
+                payload: vec![0x91, 0x92],
+                updated_at: 0,
+            }),
+            implicit_journal_condition(&persisted_base),
+        )
+        .expect("commit blocked-only revision")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected blocked-only outcome: {outcome:?}"),
+    };
 
+    assert_eq!(first.head.revision, 1);
+    assert_eq!(first.head.delta_count, 0);
+    assert_eq!(first.head.delta_payload_bytes, 0);
+    assert!(first.delta.is_none());
+    assert_eq!(first.head.blocked_revision, Some(1));
+    assert_eq!(
+        first.blocked.as_ref().map(|blocked| blocked.revision),
+        Some(1)
+    );
+    let bundle = match store
+        .inspect_poi_corpus_journal(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect blocked-only journal")
+    {
+        StoredRecord::Valid(bundle) => bundle,
+        other => panic!("unexpected stored journal: {other:?}"),
+    };
+    assert!(bundle.deltas.is_empty());
+    assert_eq!(bundle.blocked, first.blocked);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn stale_poi_corpus_journal_append_leaves_no_partial_delta() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x76; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let condition = implicit_journal_condition(&persisted_base);
+    let first_root = FixedBytes::from([0x77; 32]);
+    let first = store
+        .append_poi_corpus_journal_if_current(
+            sample_journal_head(&persisted_base, 101, 101, first_root),
+            Some(sample_journal_delta(
+                &persisted_base,
+                100,
+                101,
+                persisted_base.current_tip_root,
+                first_root,
+            )),
+            None,
+            condition,
+        )
+        .expect("commit first journal winner");
+    assert!(matches!(first, PoiCorpusJournalCommitOutcome::Applied(_)));
+
+    let stale_root = FixedBytes::from([0x78; 32]);
     assert_eq!(
         store
-            .commit_poi_artifact_cache_if_current(
-                &candidate,
-                PoiArtifactCacheCommitCondition {
-                    expected_generation: 0,
-                    expected_publisher: Some((publisher, 5)),
-                    expected_manifest_hash: Some(FixedBytes::from([0x47; 32])),
-                    expected_payload_hash: None,
-                },
+            .append_poi_corpus_journal_if_current(
+                sample_journal_head(&persisted_base, 101, 101, stale_root),
+                Some(sample_journal_delta(
+                    &persisted_base,
+                    100,
+                    101,
+                    persisted_base.current_tip_root,
+                    stale_root,
+                )),
+                None,
+                condition,
             )
-            .expect("reject wrong publication hash"),
-        PoiArtifactCacheCommitOutcome::PublisherManifestConflict {
-            actual: Some(accepted_hash)
-        }
+            .expect("reject stale journal append"),
+        PoiCorpusJournalCommitOutcome::CorpusConflict
     );
+    let bundle = match store
+        .inspect_poi_corpus_journal(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect winning journal")
+    {
+        StoredRecord::Valid(bundle) => bundle,
+        other => panic!("unexpected stored journal: {other:?}"),
+    };
+    assert_eq!(bundle.deltas.len(), 1);
+    assert_eq!(bundle.head.expect("journal head").revision, 1);
+
+    let winning_bundle = match store
+        .inspect_poi_corpus_journal(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect winning journal before stale rebase")
+    {
+        StoredRecord::Valid(bundle) => bundle,
+        other => panic!("unexpected stored journal: {other:?}"),
+    };
+    let mut stale_rebase = persisted_base;
+    stale_rebase.current_tip_index = 100;
+    stale_rebase.current_tip_root = first_root;
+    stale_rebase.cache_payload = vec![9, 8, 7, 6];
+    assert_eq!(
+        store
+            .rebase_poi_corpus_journal_if_current(stale_rebase, 101, 101, condition)
+            .expect("reject stale journal rebase"),
+        PoiCorpusJournalCommitOutcome::CorpusConflict
+    );
+    let after_stale_rebase = match store
+        .inspect_poi_corpus_journal(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect journal after stale rebase")
+    {
+        StoredRecord::Valid(bundle) => bundle,
+        other => panic!("unexpected stored journal: {other:?}"),
+    };
+    assert_eq!(after_stale_rebase, winning_bundle);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_corpus_journal_rebase_retires_deltas_and_reset_clears_all_state() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x79; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let append_root = FixedBytes::from([0x7a; 32]);
+    let appended = match store
+        .append_poi_corpus_journal_if_current(
+            sample_journal_head(&persisted_base, 101, 101, append_root),
+            Some(sample_journal_delta(
+                &persisted_base,
+                100,
+                101,
+                persisted_base.current_tip_root,
+                append_root,
+            )),
+            None,
+            implicit_journal_condition(&persisted_base),
+        )
+        .expect("append before rebase")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected append outcome: {outcome:?}"),
+    };
+    let mut replacement = persisted_base;
+    replacement.current_tip_index = 100;
+    replacement.current_tip_root = append_root;
+    replacement.cache_payload = vec![9, 8, 7, 6];
+    let rebased = match store
+        .rebase_poi_corpus_journal_if_current(
+            replacement.clone(),
+            101,
+            101,
+            explicit_journal_condition(&appended.head),
+        )
+        .expect("rebase journal")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected rebase outcome: {outcome:?}"),
+    };
+    assert_eq!(rebased.head.revision, 2);
+    assert_eq!(rebased.head.base_revision, 2);
+    assert_eq!(rebased.head.delta_count, 0);
+    assert_eq!(rebased.retired_delta_count, 1);
+    let bundle = match store
+        .inspect_poi_corpus_journal(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect rebased journal")
+    {
+        StoredRecord::Valid(bundle) => bundle,
+        other => panic!("unexpected rebased journal: {other:?}"),
+    };
+    assert_eq!(bundle.base.cache_payload, replacement.cache_payload);
+    assert!(bundle.deltas.is_empty());
+    assert!(bundle.blocked.is_none());
+
+    let (removed, generation) = store
+        .clear_poi_artifact_cache_with_generation()
+        .expect("clear rebased journal");
+    assert_eq!(removed, 1);
+    assert_eq!(generation, 1);
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect cleared journal"),
+        StoredRecord::Missing
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_corpus_journal_rejects_generation_race_and_corrupt_or_unbounded_head() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x7b; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let condition = implicit_journal_condition(&persisted_base);
+    store
+        .clear_poi_artifact_cache_with_generation()
+        .expect("advance generation");
+    assert_eq!(
+        store
+            .append_poi_corpus_journal_if_current(
+                sample_journal_head(&persisted_base, 100, 100, persisted_base.current_tip_root,),
+                None,
+                None,
+                condition,
+            )
+            .expect("reject old-generation append"),
+        PoiCorpusJournalCommitOutcome::GenerationConflict { actual: 1 }
+    );
+
+    let mut corrupt =
+        sample_journal_head(&persisted_base, 100, 100, persisted_base.current_tip_root);
+    corrupt.format_version = POI_CORPUS_JOURNAL_FORMAT_VERSION;
+    corrupt.base_payload_hash = keccak256(&persisted_base.cache_payload);
+    corrupt.delta_payload_bytes = POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES.saturating_add(1);
+    put_raw_poi_artifact_record(
+        &store,
+        &persisted_base.key(),
+        &encode(&persisted_base).expect("encode restored base"),
+    );
+    insert_raw_poi_journal_row(
+        &store,
+        &corrupt.key(),
+        &encode(&corrupt).expect("encode corrupt journal head"),
+    );
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect corrupt journal"),
+        StoredRecord::Corrupt { .. }
+    ));
+
+    corrupt.delta_payload_bytes = 0;
+    corrupt.delta_count = super::POI_CORPUS_JOURNAL_MAX_DELTA_COUNT.saturating_add(1);
+    insert_raw_poi_journal_row(
+        &store,
+        &corrupt.key(),
+        &encode(&corrupt).expect("encode count-unbounded journal head"),
+    );
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect count-unbounded journal"),
+        StoredRecord::Corrupt { .. }
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_corpus_journal_inspection_rejects_discontinuous_or_corrupt_rows() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x7c; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let end_root = FixedBytes::from([0x7d; 32]);
+    let applied = match store
+        .append_poi_corpus_journal_if_current(
+            sample_journal_head(&persisted_base, 101, 101, end_root),
+            Some(sample_journal_delta(
+                &persisted_base,
+                100,
+                101,
+                persisted_base.current_tip_root,
+                end_root,
+            )),
+            Some(PoiCorpusBlockedSnapshotRecord {
+                format_version: 0,
+                chain_type: base.chain_type,
+                chain_id: base.chain_id,
+                txid_version: base.txid_version.clone(),
+                list_key: base.list_key,
+                cache_generation: 0,
+                revision: 0,
+                payload_hash: FixedBytes::ZERO,
+                payload: vec![0x91, 0x92],
+                updated_at: 0,
+            }),
+            implicit_journal_condition(&persisted_base),
+        )
+        .expect("append valid journal revision")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected journal append outcome: {outcome:?}"),
+    };
+    let head = applied.head;
+    let delta = applied.delta.expect("stored delta");
+    let blocked = applied.blocked.expect("stored blocked snapshot");
+    let assert_corrupt = || {
+        assert!(matches!(
+            store
+                .inspect_poi_corpus_journal(
+                    base.chain_type,
+                    base.chain_id,
+                    &base.txid_version,
+                    &base.list_key,
+                )
+                .expect("inspect corrupted journal"),
+            StoredRecord::Corrupt { .. }
+        ));
+    };
+
+    let mut malformed_delta = delta.clone();
+    malformed_delta.cache_generation = 1;
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&malformed_delta).expect("encode wrong-generation delta"),
+    );
+    assert_corrupt();
+
+    malformed_delta = delta.clone();
+    malformed_delta.base_revision = malformed_delta.base_revision.saturating_add(1);
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&malformed_delta).expect("encode wrong-base delta"),
+    );
+    assert_corrupt();
+
+    malformed_delta = delta.clone();
+    malformed_delta.list_key = FixedBytes::from([0x7f; 32]);
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&malformed_delta).expect("encode wrong-identity delta"),
+    );
+    assert_corrupt();
+
+    malformed_delta = delta.clone();
+    malformed_delta.start_tip_root = FixedBytes::from([0x7e; 32]);
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&malformed_delta).expect("encode root-discontinuous delta"),
+    );
+    assert_corrupt();
+
+    remove_raw_poi_journal_row(&store, &delta.key());
+    assert_corrupt();
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&delta).expect("restore valid delta"),
+    );
+
+    let mut malformed_blocked = blocked.clone();
+    malformed_blocked.payload_hash = FixedBytes::ZERO;
+    insert_raw_poi_journal_row(
+        &store,
+        &blocked.key(),
+        &encode(&malformed_blocked).expect("encode corrupt blocked snapshot"),
+    );
+    assert_corrupt();
+
+    remove_raw_poi_journal_row(&store, &blocked.key());
+    assert_corrupt();
+    insert_raw_poi_journal_row(
+        &store,
+        &blocked.key(),
+        &encode(&blocked).expect("restore valid blocked snapshot"),
+    );
+
+    let duplicate_key = format!("{}-duplicate", delta.key());
+    insert_raw_poi_journal_row(
+        &store,
+        &duplicate_key,
+        &encode(&delta).expect("encode duplicate logical delta"),
+    );
+    assert_corrupt();
+    remove_raw_poi_journal_row(&store, &duplicate_key);
+
+    let mut malformed_head = head.clone();
+    malformed_head.base_payload_hash = FixedBytes::from([0x80; 32]);
+    insert_raw_poi_journal_row(
+        &store,
+        &head.key(),
+        &encode(&malformed_head).expect("encode wrong-base journal head"),
+    );
+    assert_corrupt();
+
+    insert_raw_poi_journal_row(&store, &head.key(), &[0xc1]);
+    assert_corrupt();
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn poi_corpus_journal_inspection_rejects_trailing_messagepack_values_and_suffixes() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x83; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let end_root = FixedBytes::from([0x84; 32]);
+    let applied = match store
+        .append_poi_corpus_journal_if_current(
+            sample_journal_head(&persisted_base, 101, 101, end_root),
+            Some(sample_journal_delta(
+                &persisted_base,
+                100,
+                101,
+                persisted_base.current_tip_root,
+                end_root,
+            )),
+            Some(PoiCorpusBlockedSnapshotRecord {
+                format_version: 0,
+                chain_type: base.chain_type,
+                chain_id: base.chain_id,
+                txid_version: base.txid_version.clone(),
+                list_key: base.list_key,
+                cache_generation: 0,
+                revision: 0,
+                payload_hash: FixedBytes::ZERO,
+                payload: vec![0x90],
+                updated_at: 0,
+            }),
+            implicit_journal_condition(&persisted_base),
+        )
+        .expect("append valid journal revision")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected journal append outcome: {outcome:?}"),
+    };
+    let head = applied.head;
+    let delta = applied.delta.expect("stored delta");
+    let blocked = applied.blocked.expect("stored blocked snapshot");
+    let trailing_suffixes = [[0xc0_u8].as_slice(), [0xc1_u8].as_slice()];
+    let with_suffix = |mut bytes: Vec<u8>, suffix: &[u8]| {
+        bytes.extend_from_slice(suffix);
+        bytes
+    };
+
+    for suffix in trailing_suffixes {
+        insert_raw_poi_journal_row(
+            &store,
+            &head.key(),
+            &with_suffix(encode(&head).expect("encode head"), suffix),
+        );
+        assert!(matches!(
+            store
+                .inspect_poi_corpus_journal_head(
+                    base.chain_type,
+                    base.chain_id,
+                    &base.txid_version,
+                    &base.list_key,
+                )
+                .expect("inspect head with trailing bytes"),
+            StoredRecord::Corrupt { .. }
+        ));
+        assert!(matches!(
+            store
+                .inspect_poi_corpus_journal_detailed(
+                    base.chain_type,
+                    base.chain_id,
+                    &base.txid_version,
+                    &base.list_key,
+                )
+                .expect("inspect journal with trailing head bytes"),
+            PoiCorpusJournalInspection::Corrupt { .. }
+        ));
+        insert_raw_poi_journal_row(&store, &head.key(), &encode(&head).expect("restore head"));
+
+        insert_raw_poi_journal_row(
+            &store,
+            &delta.key(),
+            &with_suffix(encode(&delta).expect("encode delta"), suffix),
+        );
+        assert!(matches!(
+            store
+                .inspect_poi_corpus_journal_detailed(
+                    base.chain_type,
+                    base.chain_id,
+                    &base.txid_version,
+                    &base.list_key,
+                )
+                .expect("inspect journal with trailing delta bytes"),
+            PoiCorpusJournalInspection::Corrupt { .. }
+        ));
+        insert_raw_poi_journal_row(
+            &store,
+            &delta.key(),
+            &encode(&delta).expect("restore delta"),
+        );
+
+        insert_raw_poi_journal_row(
+            &store,
+            &blocked.key(),
+            &with_suffix(encode(&blocked).expect("encode blocked snapshot"), suffix),
+        );
+        assert!(matches!(
+            store
+                .inspect_poi_corpus_journal_detailed(
+                    base.chain_type,
+                    base.chain_id,
+                    &base.txid_version,
+                    &base.list_key,
+                )
+                .expect("inspect journal with trailing blocked bytes"),
+            PoiCorpusJournalInspection::Corrupt { .. }
+        ));
+        insert_raw_poi_journal_row(
+            &store,
+            &blocked.key(),
+            &encode(&blocked).expect("restore blocked snapshot"),
+        );
+    }
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal_detailed(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect restored journal"),
+        PoiCorpusJournalInspection::Valid { .. }
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn corrupt_poi_corpus_replacement_requires_the_exact_observed_bytes() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x81; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let end_root = FixedBytes::from([0x82; 32]);
+    let applied = match store
+        .append_poi_corpus_journal_if_current(
+            sample_journal_head(&persisted_base, 101, 101, end_root),
+            Some(sample_journal_delta(
+                &persisted_base,
+                100,
+                101,
+                persisted_base.current_tip_root,
+                end_root,
+            )),
+            None,
+            implicit_journal_condition(&persisted_base),
+        )
+        .expect("append journal delta")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(applied) => applied,
+        outcome => panic!("unexpected journal append outcome: {outcome:?}"),
+    };
+    let delta_key = applied.delta.as_ref().expect("stored delta").key();
+    insert_raw_poi_journal_row(&store, &delta_key, &[0xc1]);
+    let first_token = match store
+        .inspect_poi_corpus_journal_detailed(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect first corruption")
+    {
+        PoiCorpusJournalInspection::Corrupt {
+            replacement_token, ..
+        } => replacement_token,
+        other => panic!("unexpected first corruption inspection: {other:?}"),
+    };
+
+    insert_raw_poi_journal_row(&store, &delta_key, &[0xc2]);
+    let mut replacement = persisted_base;
+    replacement.current_tip_index = 100;
+    replacement.current_tip_root = end_root;
+    replacement.cache_payload = vec![9, 8, 7, 6];
+    let replacement_generation = replacement.cache_generation;
+    let condition = |replacement_token| PoiCorpusJournalCommitCondition {
+        expected_generation: replacement_generation,
+        expected_publisher: None,
+        expected_manifest_hash: None,
+        expected_state: ExpectedPoiCorpusJournalState::Corrupt { replacement_token },
+    };
+    assert_eq!(
+        store
+            .rebase_poi_corpus_journal_if_current(
+                replacement.clone(),
+                101,
+                101,
+                condition(first_token),
+            )
+            .expect("reject stale corrupt replacement token"),
+        PoiCorpusJournalCommitOutcome::CorpusConflict
+    );
+    let current_token = match store
+        .inspect_poi_corpus_journal_detailed(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("inspect current corruption")
+    {
+        PoiCorpusJournalInspection::Corrupt {
+            replacement_token, ..
+        } => replacement_token,
+        other => panic!("unexpected current corruption inspection: {other:?}"),
+    };
+    assert_ne!(current_token, first_token);
+    let rebased = match store
+        .rebase_poi_corpus_journal_if_current(replacement, 101, 101, condition(current_token))
+        .expect("replace exactly observed corruption")
+    {
+        PoiCorpusJournalCommitOutcome::Applied(commit) => commit,
+        outcome => panic!("unexpected corrupt replacement outcome: {outcome:?}"),
+    };
+    assert_eq!(rebased.head.revision, 2);
+    assert_eq!(rebased.retired_delta_count, 1);
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect replacement"),
+        StoredRecord::Valid(_)
+    ));
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn blocked_snapshot_only_justifies_revision_holes_through_its_revision() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let base = sample_poi_artifact_cache_record(1, FixedBytes::from([0x83; 32]));
+    store
+        .put_poi_artifact_cache(&base)
+        .expect("store implicit journal base");
+    let persisted_base = store
+        .get_poi_artifact_cache(
+            base.chain_type,
+            base.chain_id,
+            &base.txid_version,
+            &base.list_key,
+        )
+        .expect("load implicit journal base")
+        .expect("implicit journal base");
+    let end_root = FixedBytes::from([0x84; 32]);
+    let mut delta = sample_journal_delta(
+        &persisted_base,
+        100,
+        101,
+        persisted_base.current_tip_root,
+        end_root,
+    );
+    delta.format_version = POI_CORPUS_JOURNAL_FORMAT_VERSION;
+    delta.revision = 3;
+    delta.previous_revision = 2;
+    delta.base_revision = 0;
+    let blocked_payload = vec![0x91, 0x92];
+    let blocked = PoiCorpusBlockedSnapshotRecord {
+        format_version: POI_CORPUS_JOURNAL_FORMAT_VERSION,
+        chain_type: base.chain_type,
+        chain_id: base.chain_id,
+        txid_version: base.txid_version.clone(),
+        list_key: base.list_key,
+        cache_generation: 0,
+        revision: 2,
+        payload_hash: keccak256(&blocked_payload),
+        payload: blocked_payload,
+        updated_at: 0,
+    };
+    let mut head = sample_journal_head(&persisted_base, 101, 101, end_root);
+    head.revision = 3;
+    head.base_revision = 0;
+    head.base_payload_hash = keccak256(&persisted_base.cache_payload);
+    head.delta_count = 1;
+    head.delta_payload_bytes = delta.payload.len() as u64;
+    head.blocked_revision = Some(2);
+    head.blocked_payload_hash = Some(blocked.payload_hash);
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&delta).expect("encode revision-three delta"),
+    );
+    insert_raw_poi_journal_row(
+        &store,
+        &blocked.key(),
+        &encode(&blocked).expect("encode revision-two blocked snapshot"),
+    );
+    insert_raw_poi_journal_row(
+        &store,
+        &head.key(),
+        &encode(&head).expect("encode revision-three head"),
+    );
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect blocked-covered revision hole"),
+        StoredRecord::Valid(_)
+    ));
+
+    delta.previous_revision = 1;
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&delta).expect("encode skipped predecessor delta"),
+    );
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect skipped predecessor"),
+        StoredRecord::Corrupt { .. }
+    ));
+
+    delta.previous_revision = 2;
+    insert_raw_poi_journal_row(
+        &store,
+        &delta.key(),
+        &encode(&delta).expect("restore immediate predecessor"),
+    );
+    remove_raw_poi_journal_row(&store, &blocked.key());
+    head.blocked_revision = None;
+    head.blocked_payload_hash = None;
+    insert_raw_poi_journal_row(
+        &store,
+        &head.key(),
+        &encode(&head).expect("encode head without blocked coverage"),
+    );
+    assert!(matches!(
+        store
+            .inspect_poi_corpus_journal(
+                base.chain_type,
+                base.chain_id,
+                &base.txid_version,
+                &base.list_key,
+            )
+            .expect("inspect uncovered revision hole"),
+        StoredRecord::Corrupt { .. }
+    ));
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -4620,6 +5638,7 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
     expected_tables.insert(WALLET_SYNC_ACTOR_STATE_TABLE.name().to_string());
     expected_tables.insert(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE.name().to_string());
     expected_tables.insert(OUTPUT_POI_RECOVERY_V2_TABLE.name().to_string());
+    expected_tables.insert(POI_CORPUS_JOURNAL_TABLE.name().to_string());
     assert_eq!(migrated_tables, expected_tables);
     drop(read_txn);
     assert_eq!(

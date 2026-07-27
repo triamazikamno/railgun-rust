@@ -598,10 +598,13 @@ fn now_epoch_secs() -> Result<u64, std::time::SystemTimeError> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use alloy::primitives::FixedBytes;
+    use alloy::primitives::{FixedBytes, keccak256};
     use broadcaster_core::tree::TREE_LEAF_COUNT;
     use ed25519_dalek::{Signer, SigningKey};
-    use local_db::DbConfig;
+    use local_db::{
+        DbConfig, ExpectedPoiCorpusJournalState, PoiCorpusJournalCommitCondition,
+        PoiCorpusJournalCommitOutcome, PoiCorpusJournalInspection,
+    };
     use poi::artifacts::v4::{
         ArtifactEncoding, BlockedShieldsArtifact, BlockedShieldsDescriptor, CheckpointCatalog,
         Compression, EventArtifact, EventArtifactKind, FORMAT_VERSION, Manifest, ManifestEntry,
@@ -613,9 +616,11 @@ mod tests {
     use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 
     use super::*;
+    use crate::chain::commit_artifact_after_admission;
     use crate::poi_artifacts::{
-        CorpusCommitOutcome, load_persisted_cache_for_publisher, persist_prepared_corpus,
-        prepare_candidate,
+        PersistCorpusResult, load_persisted_cache_candidate_for_publisher,
+        load_persisted_cache_for_publisher, persist_prepared_corpus, prepare_candidate,
+        prepare_candidate_from_starting,
         test_support::{observe_manifest, poi_v4_manifest_envelope_signing_message},
     };
 
@@ -1576,13 +1581,53 @@ mod tests {
             .expect("install blocked shields");
         let candidate = candidate.finish().expect("finish candidate");
 
+        let committed = persist_prepared_corpus(&db, candidate).expect("commit corpus");
+        let returned = match committed {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => panic!("expected applied corpus, got stale corpus"),
+        };
+        let returned_payload = returned
+            .cache
+            .to_bytes()
+            .expect("serialize returned artifact cache");
+        assert!(returned.record.cache_payload.is_empty());
+        let bundle = match db
+            .inspect_poi_corpus_journal(0, 1, "V2_PoseidonMerkle", &publisher)
+            .expect("inspect committed artifact journal")
+        {
+            local_db::StoredRecord::Valid(bundle) => bundle,
+            other => panic!("unexpected committed artifact journal: {other:?}"),
+        };
+        assert_eq!(returned_payload, bundle.base.cache_payload);
+        let head = bundle.head.as_ref().expect("committed artifact head");
+        assert_eq!(head.base_revision, head.revision);
         assert_eq!(
-            persist_prepared_corpus(&db, candidate).expect("commit corpus"),
-            CorpusCommitOutcome::Applied
+            head.base_payload_hash,
+            keccak256(&bundle.base.cache_payload)
+        );
+        assert_eq!(
+            head.event_cursor,
+            returned.cache.progress().next_event_index
+        );
+        assert_eq!(head.leaf_cursor, returned.cache.progress().next_leaf_index);
+        assert_eq!(
+            head.corpus.current_tip_root,
+            returned.record.current_tip_root
+        );
+        assert_eq!(head.delta_count, 0);
+        assert_eq!(head.delta_payload_bytes, 0);
+        assert!(head.blocked_revision.is_none());
+        assert!(bundle.deltas.is_empty());
+        let decoded = PoiCache::from_bytes(&bundle.base.cache_payload, returned.cache.identity())
+            .expect("decode returned artifact payload");
+        assert_eq!(
+            decoded.to_bytes().expect("re-encode artifact payload"),
+            bundle.base.cache_payload
         );
         let persisted = load_persisted_cache_for_publisher(&db, &identity, publisher)
             .expect("load corpus")
             .expect("corpus present");
+        assert_eq!(persisted.record, returned.record);
         assert_eq!(persisted.cache_generation, generation);
         assert!(matches!(
             persisted.record.validation,
@@ -1605,17 +1650,309 @@ mod tests {
             .expect("sign newer manifest");
         observe_manifest(&db, publisher, newer, None, SystemTime::now())
             .expect("observe newer manifest");
+        let journal_before_stale = match db
+            .inspect_poi_corpus_journal(0, 1, "V2_PoseidonMerkle", &publisher)
+            .expect("inspect journal before stale artifact commit")
+        {
+            local_db::StoredRecord::Valid(bundle) => bundle,
+            other => panic!("unexpected journal before stale artifact commit: {other:?}"),
+        };
         let stale_candidate =
             prepare_candidate(&db, &observed, &catalog).expect("prepare stale candidate");
         let stale_candidate = stale_candidate
             .install_blocked_shields(&blocked)
             .expect("install stale blocked shields");
         let stale_candidate = stale_candidate.finish().expect("finish stale candidate");
-        assert_eq!(
-            persist_prepared_corpus(&db, stale_candidate).expect("reject stale corpus candidate"),
-            CorpusCommitOutcome::Stale
+        let stale_result =
+            persist_prepared_corpus(&db, stale_candidate).expect("reject stale corpus candidate");
+        assert!(
+            matches!(&stale_result, PersistCorpusResult::Stale),
+            "expected stale corpus result, got {stale_result:?}"
+        );
+        let journal_after_stale = match db
+            .inspect_poi_corpus_journal(0, 1, "V2_PoseidonMerkle", &publisher)
+            .expect("inspect journal after stale artifact commit")
+        {
+            local_db::StoredRecord::Valid(bundle) => bundle,
+            other => panic!("unexpected journal after stale artifact commit: {other:?}"),
+        };
+        assert_eq!(journal_after_stale, journal_before_stale);
+
+        drop(db);
+        fs::remove_dir_all(root).expect("remove test db");
+    }
+
+    #[test]
+    fn anchored_artifact_candidate_repairs_corrupt_historical_base() {
+        let (db, root) = test_db("anchored-artifact-corrupt-base-repair");
+        let signing_key = SigningKey::from_bytes(&[0x57; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let initial = graph_with_commitments(
+            &signing_key,
+            1,
+            &[0x58],
+            "bafy-anchored-repair-initial",
+            true,
+            None,
+        );
+        let (initial_observed, initial_catalog, initial_chunk, initial_blocked) =
+            verified_graph(&db, &signing_key, initial);
+        let initial_candidate = prepare_candidate(&db, &initial_observed, &initial_catalog)
+            .expect("prepare initial candidate")
+            .replay_chunk(&initial_chunk)
+            .expect("replay initial chunk")
+            .install_blocked_shields(&initial_blocked)
+            .expect("install initial blocked shields")
+            .finish()
+            .expect("finish initial candidate");
+        let persisted = match persist_prepared_corpus(&db, initial_candidate)
+            .expect("persist initial candidate")
+        {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => panic!("initial artifact candidate was stale"),
+        };
+        let identity = persisted.cache.identity().clone();
+        let expected_base = persisted.expected_base();
+        let starting_head = persisted
+            .journal_head
+            .clone()
+            .expect("initial explicit journal head");
+
+        let mut corrupt_base = db
+            .get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("load initial base")
+            .expect("initial base");
+        corrupt_base.cache_payload = vec![0xc1];
+        db.put_poi_artifact_cache(&corrupt_base)
+            .expect("corrupt historical base payload");
+        assert!(
+            load_persisted_cache_for_publisher(&db, &identity, publisher).is_err(),
+            "strict replay must reject the corrupt base before repair"
         );
 
+        let replacement = graph_with_commitments(
+            &signing_key,
+            2,
+            &[0x58, 0x59],
+            "bafy-anchored-repair-replacement",
+            true,
+            None,
+        );
+        let (observed, catalog, chunk, blocked) = verified_graph(&db, &signing_key, replacement);
+        let (starting, observed_base) = load_persisted_cache_candidate_for_publisher(
+            &db,
+            &identity,
+            publisher,
+            Some(persisted.cache),
+            Some(&starting_head),
+        )
+        .expect("select exact installed starting corpus");
+        assert_eq!(observed_base, expected_base);
+        let candidate =
+            prepare_candidate_from_starting(&db, &observed, &catalog, starting, observed_base)
+                .expect("prepare anchored replacement")
+                .replay_chunk(&chunk)
+                .expect("replay replacement chunk")
+                .install_blocked_shields(&blocked)
+                .expect("install replacement blocked shields")
+                .finish()
+                .expect("finish replacement candidate");
+        let repaired = match persist_prepared_corpus(&db, candidate)
+            .expect("repair corrupt historical base")
+        {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => panic!("anchored repair unexpectedly became stale"),
+        };
+        assert!(repaired.journal_head.as_ref().is_some_and(|head| {
+            head.revision > starting_head.revision && head.base_revision == head.revision
+        }));
+        let strict = load_persisted_cache_for_publisher(&db, &identity, publisher)
+            .expect("strictly reload repaired corpus")
+            .expect("repaired corpus");
+        assert_eq!(strict.cache.progress().next_event_index, 2);
+        assert_eq!(
+            strict.cache.root_at_global_index(0),
+            Some(starting_head.corpus.current_tip_root)
+        );
+
+        drop(db);
+        fs::remove_dir_all(root).expect("remove test db");
+    }
+
+    #[test]
+    fn artifact_stale_reconciliation_ignores_changed_corrupt_winner() {
+        let (db, root) = test_db("artifact-stale-changed-corrupt-winner");
+        let signing_key = SigningKey::from_bytes(&[0x5a; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let initial = graph_with_commitments(
+            &signing_key,
+            1,
+            &[0x5b],
+            "bafy-artifact-stale-initial",
+            true,
+            None,
+        );
+        let (observed, catalog, chunk, blocked) = verified_graph(&db, &signing_key, initial);
+        let initial_candidate = prepare_candidate(&db, &observed, &catalog)
+            .expect("prepare initial candidate")
+            .replay_chunk(&chunk)
+            .expect("replay initial chunk")
+            .install_blocked_shields(&blocked)
+            .expect("install initial blocked shields")
+            .finish()
+            .expect("finish initial candidate");
+        let initial = match persist_prepared_corpus(&db, initial_candidate)
+            .expect("persist initial candidate")
+        {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => panic!("initial artifact candidate was stale"),
+        };
+        let identity = initial.cache.identity().clone();
+
+        let stale_graph = graph_with_commitments(
+            &signing_key,
+            2,
+            &[0x5b, 0x5c],
+            "bafy-artifact-stale-candidate",
+            true,
+            None,
+        );
+        let (stale_observed, stale_catalog, stale_chunk, stale_blocked) =
+            verified_graph(&db, &signing_key, stale_graph);
+        let stale_candidate = prepare_candidate(&db, &stale_observed, &stale_catalog)
+            .expect("prepare stale candidate")
+            .replay_chunk(&stale_chunk)
+            .expect("replay stale chunk")
+            .install_blocked_shields(&stale_blocked)
+            .expect("install stale blocked shields")
+            .finish()
+            .expect("finish stale candidate");
+
+        let winner_graph = graph_with_commitments(
+            &signing_key,
+            3,
+            &[0x5b, 0x5d],
+            "bafy-artifact-stale-winner",
+            true,
+            None,
+        );
+        let (winner_observed, winner_catalog, winner_chunk, winner_blocked) =
+            verified_graph(&db, &signing_key, winner_graph);
+        let winner_candidate = prepare_candidate(&db, &winner_observed, &winner_catalog)
+            .expect("prepare winner candidate")
+            .replay_chunk(&winner_chunk)
+            .expect("replay winner chunk")
+            .install_blocked_shields(&winner_blocked)
+            .expect("install winner blocked shields")
+            .finish()
+            .expect("finish winner candidate");
+        let winner = match persist_prepared_corpus(&db, winner_candidate)
+            .expect("persist winner candidate")
+        {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => panic!("winner artifact candidate was stale"),
+        };
+
+        let mut corrupt_base = db
+            .get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("load winner base")
+            .expect("winner base");
+        corrupt_base.cache_payload = vec![0xc1];
+        db.put_poi_artifact_cache(&corrupt_base)
+            .expect("corrupt changed winner base");
+        let first_corruption_token = match db
+            .inspect_poi_corpus_journal_detailed(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("inspect changed corrupt winner")
+        {
+            PoiCorpusJournalInspection::Corrupt {
+                replacement_token, ..
+            } => replacement_token,
+            other => panic!("expected changed corrupt winner, got {other:?}"),
+        };
+        corrupt_base.cache_payload = vec![0xc2];
+        db.put_poi_artifact_cache(&corrupt_base)
+            .expect("change corrupt winner bytes");
+        let changed_corruption_token = match db
+            .inspect_poi_corpus_journal_detailed(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("inspect changed corruption token")
+        {
+            PoiCorpusJournalInspection::Corrupt {
+                replacement_token, ..
+            } => replacement_token,
+            other => panic!("expected changed corruption, got {other:?}"),
+        };
+        assert_ne!(first_corruption_token, changed_corruption_token);
+
+        let mut replacement = winner.record.clone();
+        replacement.cache_payload = winner.cache.to_bytes().expect("encode artifact winner");
+        assert_eq!(
+            db.rebase_poi_corpus_journal_if_current(
+                replacement,
+                winner.cache.progress().next_event_index,
+                winner.cache.progress().next_leaf_index,
+                PoiCorpusJournalCommitCondition {
+                    expected_generation: winner.cache_generation,
+                    expected_publisher: None,
+                    expected_manifest_hash: None,
+                    expected_state: ExpectedPoiCorpusJournalState::Corrupt {
+                        replacement_token: first_corruption_token,
+                    },
+                },
+            )
+            .expect("reject stale artifact corruption token"),
+            PoiCorpusJournalCommitOutcome::CorpusConflict
+        );
+
+        let reconciled = commit_artifact_after_admission(&db, stale_candidate)
+            .expect("stale corrupt winner reconciles without error");
+        assert!(
+            reconciled.persisted.is_none(),
+            "corrupt stale winner must not become a staged candidate"
+        );
+        let after_token = match db
+            .inspect_poi_corpus_journal_detailed(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("inspect unchanged corrupt winner")
+        {
+            PoiCorpusJournalInspection::Corrupt {
+                replacement_token, ..
+            } => replacement_token,
+            other => panic!("expected corrupt winner to remain, got {other:?}"),
+        };
+        assert_eq!(
+            after_token, changed_corruption_token,
+            "stale candidate overwrote state"
+        );
+        assert!(
+            load_persisted_cache_for_publisher(&db, &identity, publisher).is_err(),
+            "direct strict loads must remain fail-closed"
+        );
+
+        drop(initial);
         drop(db);
         fs::remove_dir_all(root).expect("remove test db");
     }
@@ -1722,10 +2059,18 @@ mod tests {
             ),
         ];
         for (source, validation) in variants {
-            let mut before = db
-                .get_poi_artifact_cache(0, 1, "V2_PoseidonMerkle", &publisher)
-                .expect("load durable row before variant")
-                .expect("durable row before variant");
+            let persisted_before = load_persisted_cache_for_publisher(&db, &identity, publisher)
+                .expect("load durable corpus before variant")
+                .expect("durable corpus before variant");
+            let expected_state = persisted_before.expected_base().into_db_state();
+            let cache_generation = persisted_before.cache_generation;
+            let event_cursor = persisted_before.cache.progress().next_event_index;
+            let leaf_cursor = persisted_before.cache.progress().next_leaf_index;
+            let mut before = persisted_before.record;
+            before.cache_payload = persisted_before
+                .cache
+                .to_bytes()
+                .expect("serialize durable corpus before variant");
             before.source = source;
             before.validation = validation;
             before.artifact_tip_index = match &before.validation {
@@ -1770,8 +2115,21 @@ mod tests {
                 sha256: "preserved-hash".to_string(),
                 byte_size: 17,
             }];
-            db.put_poi_artifact_cache(&before)
-                .expect("install provenance variant");
+            assert!(matches!(
+                db.rebase_poi_corpus_journal_if_current(
+                    before.clone(),
+                    event_cursor,
+                    leaf_cursor,
+                    local_db::PoiCorpusJournalCommitCondition {
+                        expected_generation: cache_generation,
+                        expected_publisher: None,
+                        expected_manifest_hash: None,
+                        expected_state,
+                    },
+                )
+                .expect("install provenance variant"),
+                local_db::PoiCorpusJournalCommitOutcome::Applied(_)
+            ));
 
             let mut candidate =
                 prepare_candidate(&db, &observed, &catalog).expect("prepare ahead corpus");
@@ -1787,9 +2145,10 @@ mod tests {
                 candidate.cache().commitment_at_global_index(1),
                 Some(FixedBytes::from([0x62; 32]))
             );
-            assert_eq!(
-                persist_prepared_corpus(&db, candidate).expect("persist ahead candidate"),
-                CorpusCommitOutcome::Applied
+            let result = persist_prepared_corpus(&db, candidate).expect("persist ahead candidate");
+            assert!(
+                matches!(&result, PersistCorpusResult::Applied(_)),
+                "expected applied ahead corpus, got {result:?}"
             );
             let after = load_persisted_cache_for_publisher(&db, &identity, publisher)
                 .expect("reload preserved provenance")
@@ -1842,9 +2201,11 @@ mod tests {
             graph_with_commitments(&signing_key, 3, &[0x7f], "bafy-ahead-conflict", true, None);
         let (conflicting_observed, conflicting_catalog, _, conflicting_blocked) =
             verified_graph(&db, &signing_key, conflicting);
-        assert_eq!(
-            persist_prepared_corpus(&db, stale).expect("reject stale ahead candidate"),
-            CorpusCommitOutcome::Stale
+        let stale_result =
+            persist_prepared_corpus(&db, stale).expect("reject stale ahead candidate");
+        assert!(
+            matches!(&stale_result, PersistCorpusResult::Stale),
+            "expected stale ahead corpus, got {stale_result:?}"
         );
         let mut conflicting_candidate =
             prepare_candidate(&db, &conflicting_observed, &conflicting_catalog)

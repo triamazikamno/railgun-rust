@@ -64,6 +64,8 @@ mod types;
 mod workers;
 
 use backfill::{WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks};
+#[cfg(test)]
+pub(crate) use data_plane::commit_artifact_after_admission;
 pub(crate) use data_plane::{
     ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey, PublicTxidCacheKey,
     PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,

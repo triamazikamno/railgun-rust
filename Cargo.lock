@@ -5636,6 +5636,8 @@ dependencies = [
  "redb",
  "rmp-serde",
  "serde",
+ "serde_bytes",
+ "sha2 0.11.0",
  "thiserror 2.0.19",
 ]
 

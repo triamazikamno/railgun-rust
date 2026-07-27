@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::{
-    CandidateError, CorpusCandidate, FetchedArtifact, ObservedManifest, PoiArtifactError,
-    PoiArtifactIngestor, VerifiedCatalog, VerifiedCorpusCandidate,
+    CandidateError, CorpusCandidate, ExpectedPoiCorpusBase, FetchedArtifact, ObservedManifest,
+    PersistedPoiArtifactCache, PoiArtifactError, PoiArtifactIngestor, VerifiedCatalog,
+    VerifiedCorpusCandidate,
 };
 use crate::chain::PoiArtifactPersistenceHandle;
 use crate::trustless_artifacts::TrustlessArtifactFetcher;
@@ -131,6 +132,8 @@ impl PoiArtifactIngestor {
         persistence: &PoiArtifactPersistenceHandle,
         identity: PoiCacheIdentity,
         observed: &ObservedManifest,
+        persisted: Option<PersistedPoiArtifactCache>,
+        expected_base: ExpectedPoiCorpusBase,
         cancel: &CancellationToken,
     ) -> Result<Option<PreparedIngestion>, PoiArtifactError> {
         ensure_not_cancelled(cancel)?;
@@ -171,7 +174,12 @@ impl PoiArtifactIngestor {
         let mut candidate = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
-            result = persistence.begin_candidate(observed, &catalog) => {
+            result = persistence.begin_candidate_from_starting(
+                observed,
+                &catalog,
+                persisted,
+                expected_base,
+            ) => {
                 result.map_err(persistence_error)?
             }
         };

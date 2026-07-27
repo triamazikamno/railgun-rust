@@ -362,11 +362,15 @@ impl DenseMerkleTree {
     }
 
     pub fn remove_leaf(&mut self, position: u64) {
+        self.set_leaf(position, MERKLE_ZERO_VALUE);
+    }
+
+    pub fn set_leaf(&mut self, position: u64, leaf: U256) {
         let mut index = position as usize;
         if index >= self.layers[0].len() {
             return;
         }
-        self.layers[0][index] = MERKLE_ZERO_VALUE;
+        self.layers[0][index] = leaf;
         for level in 0..TREE_DEPTH {
             let parent_index = index / 2;
             let left = self.layers[level][parent_index * 2];
@@ -578,6 +582,21 @@ mod tests {
                 assert_eq!(forest_proof.path_indices, dense_proof.path_indices);
             }
         }
+    }
+
+    #[test]
+    fn dense_leaf_update_matches_rebuilt_tree() {
+        let leaves = vec![uint!(11_U256), uint!(12_U256), uint!(13_U256)];
+        let mut updated = DenseMerkleTree::from_ordered_leaves(leaves.clone(), 3);
+        updated.set_leaf(1, uint!(42_U256));
+        let rebuilt =
+            DenseMerkleTree::from_ordered_leaves(vec![leaves[0], uint!(42_U256), leaves[2]], 3);
+
+        assert_eq!(updated.root(), rebuilt.root());
+        assert_eq!(
+            updated.prove(1).path_elements,
+            rebuilt.prove(1).path_elements
+        );
     }
 
     #[test]

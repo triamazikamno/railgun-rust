@@ -51,12 +51,60 @@ pub(crate) fn persist_public_rpc_cache(
     range_start_index: u64,
     expected_base: ExpectedPoiCorpusBase,
 ) -> Result<CorpusCommitOutcome, PoiArtifactError> {
-    persist_public_rpc_cache_with_publisher(
+    let identity = cache.identity();
+    let starting = if matches!(
+        expected_base,
+        ExpectedPoiCorpusBase::NoValidCorpus | ExpectedPoiCorpusBase::Corrupt { .. }
+    ) {
+        None
+    } else {
+        load_persisted_cache(db, identity)?
+    };
+    let starting_record = starting
+        .as_ref()
+        .map(PersistedPoiArtifactCache::metadata_only);
+    let starting_head = starting.and_then(|persisted| persisted.journal_head);
+    let event_end_cursor = cache.progress().next_event_index;
+    let mut events = Vec::new();
+    let mut leaves = Vec::new();
+    for event_index in range_start_index..event_end_cursor {
+        let blinded_commitment = cache.commitment_at_global_index(event_index).ok_or(
+            PoiArtifactError::PersistedArtifactMetadata {
+                reason: "test cache has no commitment for journal delta",
+            },
+        )?;
+        events.push(poi::cache::PoiCacheJournalEvent {
+            event_index,
+            blinded_commitment,
+        });
+        leaves.push(blinded_commitment);
+    }
+    let delta = PoiCacheJournalDelta {
+        version: poi::cache::POI_CACHE_JOURNAL_DELTA_VERSION,
+        identity: identity.clone(),
+        event_start_cursor: range_start_index,
+        event_end_cursor,
+        leaf_start_cursor: range_start_index,
+        leaf_end_cursor: cache.progress().next_leaf_index,
+        events,
+        leaves,
+    };
+    match persist_public_rpc_cache_with_publisher(
         db,
-        cache,
+        cache.clone(),
         cache_generation,
         range_start_index,
         None,
         expected_base,
-    )
+        starting_record.as_ref(),
+        starting_head.as_ref(),
+        &delta,
+        None,
+    )? {
+        PublicRpcPersistResult::Applied(_) => Ok(CorpusCommitOutcome::Applied),
+        PublicRpcPersistResult::Stale => Ok(CorpusCommitOutcome::Stale),
+        PublicRpcPersistResult::CompactionRequired(_) => {
+            Err(PoiArtifactError::JournalHardLimitExceeded)
+        }
+    }
 }
