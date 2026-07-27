@@ -67,9 +67,8 @@ use backfill::{WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_bloc
 #[cfg(test)]
 pub(crate) use data_plane::commit_artifact_after_admission;
 pub(crate) use data_plane::{
-    ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey, PublicTxidCacheKey,
-    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest,
+    ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated,
+    PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest,
 };
 use forest_db::MerkleForestDbExt;
 use indexed_wallet::{
@@ -81,6 +80,7 @@ use indexed_wallet::{
 };
 use logs::{anchor_file_name, fetch_logs_for_range_with_provider, parse_anchor_block, sort_logs};
 use merkle_artifacts::run_merkle_artifact_catch_up_into;
+pub(crate) use service::PreparedChainService;
 use types::{
     EVM_CHAIN_TYPE, ForestReorgDecision, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind,
     PendingTipWalletRegistration, TXID_PUBLIC_CACHE_SYNC_INTERVAL, WalletIndexedCatchUpStatusGuard,

@@ -1,13 +1,3 @@
-//! Chain-owned POI corpus internals are intentionally not public construction APIs.
-//!
-//! ```compile_fail
-//! use sync_service::PoiCacheService;
-//! ```
-//!
-//! ```compile_fail
-//! use sync_service::types::LocalPoiCaches;
-//! ```
-
 mod chain;
 pub mod indexed_artifacts;
 mod manager;
@@ -16,6 +6,7 @@ mod poi_cache;
 mod poi_limits;
 pub mod poi_v4;
 mod public_cache;
+mod runtime_admission;
 mod trustless_artifacts;
 pub(crate) mod txid_cache;
 pub mod types;

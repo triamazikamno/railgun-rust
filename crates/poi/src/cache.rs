@@ -1431,6 +1431,9 @@ impl PoiCacheJournalReplay {
                 return Err(PoiCacheError::MissingJournalReplayRoot { tree_number });
             };
             for (offset, leaf) in delta.leaves.iter().enumerate() {
+                if *leaf == FixedBytes::ZERO {
+                    continue;
+                }
                 let global_index = delta
                     .leaf_start_cursor
                     .checked_add(offset as u64)
@@ -2040,14 +2043,18 @@ mod tests {
     }
 
     #[test]
-    fn incremental_journal_replay_matches_each_committed_root() {
+    fn incremental_journal_replay_matches_each_committed_root_with_zero_leaf() {
         let identity = identity();
         let base = PoiCache::new(identity.clone());
         let mut direct = base.clone();
         let mut replay = base.into_journal_replay();
 
         for event_index in 0..4 {
-            let commitment = FixedBytes::from([0x60 + event_index as u8; 32]);
+            let commitment = if event_index == 1 {
+                FixedBytes::ZERO
+            } else {
+                FixedBytes::from([0x60 + event_index as u8; 32])
+            };
             let delta = PoiCacheJournalDelta {
                 version: POI_CACHE_JOURNAL_DELTA_VERSION,
                 identity: identity.clone(),

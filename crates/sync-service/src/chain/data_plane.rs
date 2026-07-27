@@ -34,7 +34,7 @@ use crate::poi_artifacts::{
     PoiCorpusCompactionResult, PoiCorpusStore, PublicRpcPersistResult, RawChunkCache,
     RawChunkRetainOutcome, SemanticVerifiedChunk, TransportVerifiedChunk, VerifiedBlockedShields,
     VerifiedCatalog, VerifiedCorpusCandidate, observe_manifest_with_clock, persist_prepared_corpus,
-    prepare_candidate, prepare_candidate_from_starting,
+    prepare_candidate, prepare_candidate_from_starting_for_generation,
 };
 use crate::poi_cache::{PoiCacheRetryHandle, PoiCacheService, PoiPublicCacheResetLease};
 use crate::public_cache::{
@@ -42,6 +42,7 @@ use crate::public_cache::{
     wallet_scan_artifact_cache_commit_access, wallet_scan_artifact_cache_generation,
     wallet_scan_artifact_transient_commit_access,
 };
+use crate::runtime_admission::DbRuntimeLease;
 use crate::txid_cache::{
     TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
@@ -199,11 +200,6 @@ impl PublicPoiCorpusHandle {
     pub(crate) async fn revision_read_fence(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.local_caches.revision_read_fence().await
     }
-
-    #[must_use]
-    pub(crate) fn installed_generation_is_current(&self) -> bool {
-        self.local_caches.installed_generation() == self.local_caches.current_generation()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,19 +319,26 @@ pub struct PoiArtifactCacheRetry {
     retry: PoiCacheRetryHandle,
 }
 
-pub(crate) struct PoiArtifactAttemptCommit {
-    pub(crate) persisted: Option<PersistedPoiArtifactCache>,
-}
-
 #[derive(Clone)]
 pub struct PoiArtifactPersistenceHandle {
     db: Arc<DbStore>,
     commit_fence: Arc<Mutex<()>>,
+    runtime_lease: Option<DbRuntimeLease>,
 }
 
 impl PoiArtifactPersistenceHandle {
     pub(crate) const fn new(db: Arc<DbStore>, commit_fence: Arc<Mutex<()>>) -> Self {
-        Self { db, commit_fence }
+        Self {
+            db,
+            commit_fence,
+            runtime_lease: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_lease(mut self, runtime_lease: DbRuntimeLease) -> Self {
+        self.runtime_lease = Some(runtime_lease);
+        self
     }
 
     pub async fn observe_manifest(
@@ -379,9 +382,15 @@ impl PoiArtifactPersistenceHandle {
         observed: &ObservedManifest,
         catalog: &VerifiedCatalog,
     ) -> Result<CorpusCandidate, PublicDataPlaneError> {
-        let _commit_guard = self.commit_fence.lock().await;
-        prepare_candidate(self.db.as_ref(), observed, catalog)
-            .map_err(poi_artifact_persistence_error)
+        let observed = observed.clone();
+        let catalog = catalog.clone();
+        self.run_blocking_commit(None, "artifact candidate preparation", move |db| {
+            prepare_candidate(db, &observed, &catalog)
+        })
+        .await?
+        .ok_or_else(|| {
+            poi_artifact_persistence_error("uncancelled candidate preparation returned no result")
+        })
     }
 
     pub(crate) async fn begin_candidate_from_starting(
@@ -390,14 +399,16 @@ impl PoiArtifactPersistenceHandle {
         catalog: &VerifiedCatalog,
         persisted: Option<PersistedPoiArtifactCache>,
         expected_base: ExpectedPoiCorpusBase,
+        expected_generation: u64,
     ) -> Result<CorpusCandidate, PublicDataPlaneError> {
         let _commit_guard = self.commit_fence.lock().await;
-        prepare_candidate_from_starting(
+        prepare_candidate_from_starting_for_generation(
             self.db.as_ref(),
             observed,
             catalog,
             persisted,
             expected_base,
+            expected_generation,
         )
         .map_err(poi_artifact_persistence_error)
     }
@@ -509,11 +520,13 @@ impl PoiArtifactPersistenceHandle {
         &self,
         candidate: VerifiedCorpusCandidate,
         cancel: &CancellationToken,
-    ) -> Result<Option<PoiArtifactAttemptCommit>, PublicDataPlaneError> {
-        self.run_blocking_commit(Some(cancel), "artifact candidate", move |db| {
-            commit_artifact_after_admission(db, candidate)
-        })
-        .await
+    ) -> Result<Option<PersistedPoiArtifactCache>, PublicDataPlaneError> {
+        Ok(self
+            .run_blocking_commit(Some(cancel), "artifact candidate", move |db| {
+                commit_artifact_after_admission(db, candidate)
+            })
+            .await?
+            .flatten())
     }
 
     pub(crate) async fn commit_public_rpc_for_attempt(
@@ -528,24 +541,26 @@ impl PoiArtifactPersistenceHandle {
         delta: PoiCacheJournalDelta,
         blocked_shields: Option<Vec<BlockedShield>>,
         cancel: &CancellationToken,
-    ) -> Result<Option<PoiArtifactAttemptCommit>, PublicDataPlaneError> {
+    ) -> Result<Option<PersistedPoiArtifactCache>, PublicDataPlaneError> {
         let post_compaction_cancel = cancel.clone();
-        self.run_blocking_commit(Some(cancel), "public RPC candidate", move |db| {
-            commit_public_rpc_after_admission(
-                db,
-                cache,
-                cache_generation,
-                publisher_pubkey,
-                range_start_index,
-                expected_base,
-                starting_record.as_ref(),
-                starting_head.as_ref(),
-                &delta,
-                blocked_shields,
-                || post_compaction_cancel.is_cancelled(),
-            )
-        })
-        .await
+        Ok(self
+            .run_blocking_commit(Some(cancel), "public RPC candidate", move |db| {
+                commit_public_rpc_after_admission(
+                    db,
+                    cache,
+                    cache_generation,
+                    publisher_pubkey,
+                    range_start_index,
+                    expected_base,
+                    starting_record.as_ref(),
+                    starting_head.as_ref(),
+                    &delta,
+                    blocked_shields,
+                    || post_compaction_cancel.is_cancelled(),
+                )
+            })
+            .await?
+            .flatten())
     }
 
     pub(crate) async fn compact_poi_corpus_for_attempt(
@@ -589,12 +604,14 @@ impl PoiArtifactPersistenceHandle {
         }
 
         let db = Arc::clone(&self.db);
+        let runtime_lease = self.runtime_lease.clone();
         let blocking_submitted = Instant::now();
         let (result, blocking_start_elapsed, execution_elapsed) =
             tokio::task::spawn_blocking(move || {
                 let blocking_start_elapsed = blocking_submitted.elapsed();
                 let execution_started = Instant::now();
                 let result = operation(db.as_ref());
+                drop(runtime_lease);
                 drop(commit_guard);
                 (result, blocking_start_elapsed, execution_started.elapsed())
             })
@@ -618,16 +635,11 @@ impl PoiArtifactPersistenceHandle {
 pub(crate) fn commit_artifact_after_admission(
     db: &DbStore,
     candidate: VerifiedCorpusCandidate,
-) -> Result<PoiArtifactAttemptCommit, PoiArtifactError> {
-    let generation = candidate.cache_generation();
-    let publisher_pubkey = candidate.publisher_pubkey();
-    let identity = candidate.cache().identity().clone();
-    let store = PoiCorpusStore::new(db, generation, publisher_pubkey);
-    let persisted = match persist_prepared_corpus(db, candidate)? {
+) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
+    Ok(match persist_prepared_corpus(db, candidate)? {
         PersistCorpusResult::Applied(persisted) => Some(*persisted),
-        PersistCorpusResult::Stale => store.load_current_if_valid(&identity)?,
-    };
-    Ok(PoiArtifactAttemptCommit { persisted })
+        PersistCorpusResult::Stale => None,
+    })
 }
 
 fn commit_public_rpc_after_admission(
@@ -642,7 +654,7 @@ fn commit_public_rpc_after_admission(
     delta: &PoiCacheJournalDelta,
     blocked_shields: Option<Vec<BlockedShield>>,
     cancelled_after_compaction: impl FnOnce() -> bool,
-) -> Result<PoiArtifactAttemptCommit, PoiArtifactError> {
+) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
     let identity = cache.identity().clone();
     let store = PoiCorpusStore::new(db, cache_generation, publisher_pubkey);
     let initial = store.commit_public_rpc(
@@ -656,7 +668,7 @@ fn commit_public_rpc_after_admission(
     )?;
     let persisted = match initial {
         PublicRpcPersistResult::Applied(persisted) => Some(*persisted),
-        PublicRpcPersistResult::Stale => store.load_current_if_valid(&identity)?,
+        PublicRpcPersistResult::Stale => None,
         PublicRpcPersistResult::CompactionRequired(pending) => {
             if !matches!(expected_base, ExpectedPoiCorpusBase::JournalHead { .. }) {
                 return Err(PoiArtifactError::JournalHardLimitExceeded);
@@ -664,11 +676,11 @@ fn commit_public_rpc_after_admission(
             let compacted = match store.compact(&identity, expected_base)? {
                 PoiCorpusCompactionResult::Applied(compacted) => *compacted,
                 PoiCorpusCompactionResult::Stale => {
-                    return Ok(PoiArtifactAttemptCommit { persisted: None });
+                    return Ok(None);
                 }
             };
             if cancelled_after_compaction() {
-                return Ok(PoiArtifactAttemptCommit { persisted: None });
+                return Ok(None);
             }
             let retry_expected_base = compacted.expected_base();
             let retry_starting_record = Some(compacted.metadata_only());
@@ -690,7 +702,7 @@ fn commit_public_rpc_after_admission(
             }
         }
     };
-    Ok(PoiArtifactAttemptCommit { persisted })
+    Ok(persisted)
 }
 
 fn poi_artifact_persistence_error(error: impl std::fmt::Display) -> PublicDataPlaneError {
@@ -745,6 +757,10 @@ impl PublicDataPlaneHandle {
         self.service.public_data_plane.diagnostics().await
     }
 
+    /// Returns a proof source derived from this data-plane lifetime.
+    ///
+    /// Like other handles from a chain service, the returned source must not be used after the
+    /// owning sync manager or chain service has shut down.
     pub async fn local_poi_merkle_proof_source(
         &self,
         txid_version: impl Into<String>,
@@ -1442,6 +1458,7 @@ pub(crate) struct ChainPublicDataPlane {
     commit_fence: Arc<Mutex<()>>,
     indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler,
     poi_cache_service: Option<Arc<PoiCacheService>>,
+    runtime_lease: Option<DbRuntimeLease>,
 }
 
 pub(crate) struct PublicCacheResetPermit {
@@ -1479,11 +1496,23 @@ impl ChainPublicDataPlane {
             commit_fence: Arc::new(Mutex::new(())),
             indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler::new(),
             poi_cache_service: None,
+            runtime_lease: None,
         }
     }
 
+    #[must_use]
+    pub(crate) fn with_runtime_lease(mut self, runtime_lease: DbRuntimeLease) -> Self {
+        self.runtime_lease = Some(runtime_lease);
+        self
+    }
+
     pub(crate) fn poi_artifact_persistence(&self) -> PoiArtifactPersistenceHandle {
-        PoiArtifactPersistenceHandle::new(Arc::clone(&self.db), Arc::clone(&self.commit_fence))
+        let persistence =
+            PoiArtifactPersistenceHandle::new(Arc::clone(&self.db), Arc::clone(&self.commit_fence));
+        match self.runtime_lease.as_ref() {
+            Some(runtime_lease) => persistence.with_runtime_lease(runtime_lease.clone()),
+            None => persistence,
+        }
     }
 
     #[must_use]
@@ -1493,9 +1522,18 @@ impl ChainPublicDataPlane {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.begin_shutdown();
         self.indexed_artifact_maintenance.shutdown().await;
         if let Some(service) = self.poi_cache_service.as_ref() {
             service.shutdown().await;
+        }
+        let _commit_drain = self.commit_fence.lock().await;
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.indexed_artifact_maintenance.begin_shutdown();
+        if let Some(service) = self.poi_cache_service.as_ref() {
+            service.begin_shutdown();
         }
     }
 
@@ -1508,8 +1546,12 @@ impl ChainPublicDataPlane {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let runtime_lease = self.runtime_lease.clone();
         self.indexed_artifact_maintenance
-            .try_schedule(key, retained_payload_bytes, job)
+            .try_schedule(key, retained_payload_bytes, async move {
+                job.await;
+                drop(runtime_lease);
+            })
     }
 
     pub(crate) fn indexed_artifact_maintenance(&self) -> IndexedArtifactMaintenanceScheduler {
@@ -2697,8 +2739,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use local_db::{
         BlobMeta, DbConfig, POI_CORPUS_JOURNAL_MAX_DELTA_COUNT, PoiArtifactCacheRecord,
-        PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusJournalInspection,
-        PoiCorpusValidationRecord,
+        PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusValidationRecord,
     };
     use poi::artifacts::SnapshotEvent;
     use poi::cache::{
@@ -2788,6 +2829,47 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn data_plane_shutdown_waits_for_detached_blocking_commit() {
+        let (db, data_plane, root_dir) = test_data_plane_with_db("shutdown-drains-blocking-commit");
+        let persistence = data_plane.poi_artifact_persistence();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let commit = tokio::spawn(async move {
+            persistence
+                .run_blocking_commit(None, "test shutdown drain", move |_| {
+                    let _ = started_tx.send(());
+                    release_rx.recv().expect("release detached commit");
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.expect("blocking commit started");
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("commit waiter aborted")
+                .is_cancelled()
+        );
+
+        let shutdown = tokio::spawn({
+            let data_plane = data_plane.clone();
+            async move { data_plane.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release_tx.send(()).expect("release blocking commit");
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("data-plane shutdown completes")
+            .expect("shutdown task");
+
+        drop(data_plane);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
     #[test]
     fn public_rpc_hard_limit_compacts_and_retries_append_once() {
         let (db, root_dir) = test_db("public-rpc-hard-limit-retry");
@@ -2817,7 +2899,6 @@ mod tests {
             || false,
         )
         .expect("compact and retry public RPC append")
-        .persisted
         .expect("retried append published");
         let after = committed
             .journal_head
@@ -2869,7 +2950,7 @@ mod tests {
         )
         .expect("cancel after compaction");
         assert!(cancellation_checked.load(Ordering::Acquire));
-        assert!(committed.persisted.is_none());
+        assert!(committed.is_none());
         let retained = PoiCorpusStore::new(db.as_ref(), before.corpus.cache_generation, publisher)
             .load(&identity)
             .expect("load compacted corpus")
@@ -2940,111 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn public_rpc_stale_reconciliation_ignores_changed_corrupt_winner() {
-        let (db, root_dir) = test_db("public-rpc-stale-corrupt-winner");
-        let publisher = FixedBytes::from([0x47; 32]);
-        let persisted = persist_public_rpc_test_base(db.as_ref(), publisher);
-        let identity = persisted.cache.identity().clone();
-        let generation = persisted.cache_generation;
-        let range_start_index = persisted.cache.progress().next_event_index;
-        let expected_base = persisted.expected_base();
-        let starting_record = persisted.metadata_only();
-        let starting_head = persisted
-            .journal_head
-            .clone()
-            .expect("public RPC starting head");
-        let (stale_candidate, stale_delta) = append_public_rpc_test_event(persisted.cache.clone());
-        let (winner_candidate, winner_delta) = append_public_rpc_test_event(persisted.cache);
-        let store = PoiCorpusStore::new(db.as_ref(), generation, publisher);
-        assert!(matches!(
-            store
-                .commit_public_rpc(
-                    winner_candidate,
-                    range_start_index,
-                    expected_base,
-                    Some(&starting_record),
-                    Some(&starting_head),
-                    &winner_delta,
-                    None,
-                )
-                .expect("commit public RPC winner"),
-            PublicRpcPersistResult::Applied(_)
-        ));
-
-        let mut corrupt_base = db
-            .get_poi_artifact_cache(
-                identity.chain_type,
-                identity.chain_id,
-                &identity.txid_version,
-                &identity.list_key,
-            )
-            .expect("load public RPC winner base")
-            .expect("public RPC winner base");
-        corrupt_base.cache_payload = vec![0xc2];
-        db.put_poi_artifact_cache(&corrupt_base)
-            .expect("corrupt public RPC winner base");
-        let corruption_token = match db
-            .inspect_poi_corpus_journal_detailed(
-                identity.chain_type,
-                identity.chain_id,
-                &identity.txid_version,
-                &identity.list_key,
-            )
-            .expect("inspect corrupt public RPC winner")
-        {
-            PoiCorpusJournalInspection::Corrupt {
-                replacement_token, ..
-            } => replacement_token,
-            other => panic!("expected corrupt public RPC winner, got {other:?}"),
-        };
-
-        let reconciled = commit_public_rpc_after_admission(
-            db.as_ref(),
-            stale_candidate,
-            generation,
-            publisher,
-            range_start_index,
-            expected_base,
-            Some(&starting_record),
-            Some(&starting_head),
-            &stale_delta,
-            None,
-            || false,
-        )
-        .expect("stale corrupt public RPC winner reconciles without error");
-        assert!(
-            reconciled.persisted.is_none(),
-            "corrupt stale winner must not be published"
-        );
-        let after_token = match db
-            .inspect_poi_corpus_journal_detailed(
-                identity.chain_type,
-                identity.chain_id,
-                &identity.txid_version,
-                &identity.list_key,
-            )
-            .expect("inspect unchanged corrupt public RPC winner")
-        {
-            PoiCorpusJournalInspection::Corrupt {
-                replacement_token, ..
-            } => replacement_token,
-            other => panic!("expected corrupt public RPC winner to remain, got {other:?}"),
-        };
-        assert_eq!(
-            after_token, corruption_token,
-            "stale candidate overwrote state"
-        );
-        assert!(
-            store.load(&identity).is_err(),
-            "direct strict store load must remain fail-closed"
-        );
-
-        drop(db);
-        fs::remove_dir_all(root_dir).expect("remove temp db dir");
-    }
-
-    #[test]
-    fn public_rpc_stale_reconciliation_loads_valid_winner() {
+    fn public_rpc_stale_commit_does_not_stage_valid_winner() {
         let (db, root_dir) = test_db("public-rpc-stale-valid-winner");
         let publisher = FixedBytes::from([0x48; 32]);
         let persisted = persist_public_rpc_test_base(db.as_ref(), publisher);
@@ -3078,7 +3055,7 @@ mod tests {
             }
         };
 
-        let reconciled = commit_public_rpc_after_admission(
+        let stale = commit_public_rpc_after_admission(
             db.as_ref(),
             stale_candidate,
             generation,
@@ -3091,15 +3068,18 @@ mod tests {
             None,
             || false,
         )
-        .expect("reconcile valid public RPC winner")
-        .persisted
-        .expect("valid winner must be staged");
-        assert_eq!(reconciled.journal_head, winner.journal_head);
+        .expect("reject stale public RPC candidate");
+        assert!(
+            stale.is_none(),
+            "stale candidate must not stage another writer's winner"
+        );
+        let durable = store
+            .load(&winner.cache.identity().clone())
+            .expect("load durable winner")
+            .expect("durable winner remains present");
+        assert_eq!(durable.journal_head, winner.journal_head);
         assert_eq!(
-            reconciled
-                .cache
-                .to_bytes()
-                .expect("encode reconciled cache"),
+            durable.cache.to_bytes().expect("encode durable cache"),
             winner.cache.to_bytes().expect("encode winner cache")
         );
 
@@ -3175,7 +3155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poi_corpus_registry_reuses_chain_scoped_handle() {
+    async fn poi_corpus_registry_reuses_fixed_chain_handle_and_rejects_mismatch() {
         let (data_plane, root_dir) = test_data_plane_with_poi_service("poi-corpus-reuse");
         let key = PublicPoiCorpusKey::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION);
         let first = data_plane
@@ -3188,6 +3168,21 @@ mod tests {
             .await
             .expect("second POI corpus");
         assert!(first.local_caches().ptr_eq(&second.local_caches()));
+        let Err(error) = data_plane
+            .ensure_poi_corpus(PublicPoiCorpusKey::new(
+                EVM_CHAIN_TYPE,
+                137,
+                DEFAULT_TXID_VERSION,
+            ))
+            .await
+        else {
+            panic!("mismatched chain must be rejected");
+        };
+        assert!(matches!(
+            error,
+            PublicDataPlaneError::PoiCorpusRefresh { chain_id: 137, reason }
+                if reason.contains("owns chain 1")
+        ));
         assert_eq!(data_plane.state.lock().await.poi_corpora.len(), 1);
         let list_key = FixedBytes::from([0x11; 32]);
         let mut cache = PoiCache::new(PoiCacheIdentity::new(
@@ -3219,73 +3214,8 @@ mod tests {
                 .poi_corpus_ready_for_lists(key, &[list_key])
                 .await
         );
-        drop(data_plane);
-        fs::remove_dir_all(root_dir).expect("remove temp db dir");
-    }
-
-    #[tokio::test]
-    async fn poi_corpus_fast_path_synchronizes_reset_from_another_service() {
-        let (db, root_dir) = test_db("poi-corpus-cross-service-generation");
-        let artifact_config = || PoiArtifactSourceConfig {
-            trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
-            manifest_source: PoiArtifactManifestSource::Url(
-                Url::parse("http://127.0.0.1:1/poi-manifest.json")
-                    .expect("POI manifest URL")
-                    .into(),
-            ),
-            gateway_urls: Vec::new(),
-            max_manifest_age: None,
-        };
-        let reset_service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
-            .expect("initialize reset service");
-        let serving_service = Arc::new(
-            PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
-                .expect("initialize serving service"),
-        );
-        let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)))
-            .with_poi_cache_service(serving_service);
-        let key = PublicPoiCorpusKey::wallet_default(1);
-        let list_key = FixedBytes::from([0x31; 32]);
-        let mut cache = PoiCache::new(PoiCacheIdentity::new(
-            key.chain_type,
-            key.chain_id,
-            &key.txid_version,
-            list_key,
-        ));
-        cache
-            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
-                event_index: 0,
-                blinded_commitment: [0x32; 32],
-                signature: [0_u8; 64],
-                event_type: PoiEventType::Transact,
-            }])
-            .expect("apply old-generation POI event");
-        let first = data_plane
-            .ensure_poi_corpus(key.clone())
-            .await
-            .expect("initial POI corpus");
-        first.local_caches().write().await.insert(list_key, cache);
-
-        reset_service
-            .reset_poi_artifact_cache()
-            .await
-            .expect("cross-service reset");
-        let second = data_plane
-            .ensure_poi_corpus(key)
-            .await
-            .expect("generation-synchronized POI corpus");
-
-        assert!(first.local_caches().ptr_eq(&second.local_caches()));
-        assert!(
-            second.local_caches().read().await.is_empty(),
-            "the registry fast path must not expose the old-generation corpus"
-        );
-
         data_plane.shutdown().await;
-        reset_service.shutdown().await;
         drop(data_plane);
-        drop(reset_service);
-        drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
@@ -4635,7 +4565,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("old attempt reached network");
         assert!(service.progress_rx().borrow()[&1].ready_for_wallet_checks);
-        let serving_generation = local_caches.current_generation();
 
         let raw_kind = crate::poi_artifacts::POI_V4_RAW_CHUNK_BLOB_KIND;
         db.ensure_blob_dir(raw_kind)
@@ -4675,8 +4604,6 @@ mod tests {
         let replacement = service.progress_rx().borrow()[&1].clone();
         assert!(replacement.attempt_id > old_attempt_id);
         assert!(replacement.ready_for_wallet_checks);
-        assert_eq!(local_caches.current_generation(), serving_generation);
-        assert_eq!(local_caches.installed_generation(), serving_generation);
         assert!(
             db.get_blob_meta(raw_kind, "stale")
                 .expect("read reset raw metadata")
@@ -5155,6 +5082,7 @@ mod tests {
         let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
         let poi_cache_service = PoiCacheService::new_with_persistence(
             Arc::clone(&db),
+            1,
             PoiArtifactSourceConfig {
                 trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
                 manifest_source: PoiArtifactManifestSource::Url(
@@ -5199,6 +5127,7 @@ mod tests {
         let data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
         let poi_cache_service = PoiCacheService::new_with_persistence(
             Arc::clone(&db),
+            1,
             PoiArtifactSourceConfig {
                 trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
                 manifest_source: PoiArtifactManifestSource::Url(stalled.url.clone().into()),

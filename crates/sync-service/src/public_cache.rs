@@ -11,6 +11,7 @@ use crate::poi_artifacts::{
     POI_V4_RAW_CHUNK_BLOB_KIND, RawChunkCacheResetFailure, clear_poi_artifact_cache_for_reset,
     reset_raw_chunk_cache,
 };
+use crate::runtime_admission::{DbRuntimeLease, DbRuntimeOwnerKind};
 use crate::txid_cache::reset_txid_public_cache;
 
 pub(crate) const WALLET_SCAN_ARTIFACT_CHUNK_BLOB_KIND: &str = "wallet_scan_artifact_chunks";
@@ -175,6 +176,14 @@ pub struct OfflinePoiCorpusReset {
 pub async fn reset_offline_poi_corpus(
     db: &DbStore,
 ) -> Result<OfflinePoiCorpusReset, PersistedPublicSyncCacheResetError> {
+    let _runtime_lease =
+        DbRuntimeLease::acquire(db, DbRuntimeOwnerKind::OfflinePoiReset).map_err(|error| {
+            PersistedPublicSyncCacheResetError::new(
+                PersistedPublicSyncCacheKind::PoiCorpus,
+                error,
+                PersistedPublicSyncCacheResetReport::default(),
+            )
+        })?;
     db.ensure_blob_kind_purge_supported(POI_V4_RAW_CHUNK_BLOB_KIND)
         .map_err(|error| {
             PersistedPublicSyncCacheResetError::new(
@@ -184,15 +193,13 @@ pub async fn reset_offline_poi_corpus(
             )
         })?;
     let _reset_guard = PERSISTED_PUBLIC_SYNC_CACHE_RESET_LOCK.lock().await;
-    let corpus = clear_poi_artifact_cache_for_reset(db)
-        .await
-        .map_err(|error| {
-            PersistedPublicSyncCacheResetError::new(
-                PersistedPublicSyncCacheKind::PoiCorpus,
-                error,
-                PersistedPublicSyncCacheResetReport::default(),
-            )
-        })?;
+    let corpus = clear_poi_artifact_cache_for_reset(db).map_err(|error| {
+        PersistedPublicSyncCacheResetError::new(
+            PersistedPublicSyncCacheKind::PoiCorpus,
+            error,
+            PersistedPublicSyncCacheResetReport::default(),
+        )
+    })?;
     let raw = reset_raw_chunk_cache(db).await.map_err(|failure| {
         let mut error =
             poi_chunk_reset_error(failure, PersistedPublicSyncCacheResetReport::default());
@@ -306,7 +313,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::manager::SyncManager;
     use crate::txid_cache::TXID_CACHE_BLOB_KIND;
+    use crate::types::GlobalPoiPolicy;
+    use url::Url;
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -528,6 +538,58 @@ mod tests {
             b"encrypted-key"
         );
 
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove reset test db");
+    }
+
+    #[tokio::test]
+    async fn destructive_poi_reset_rejects_live_manager_and_succeeds_after_shutdown() {
+        let root_dir = temp_db_root();
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open reset test db"),
+        );
+        let list_key = FixedBytes::from([0x89; 32]);
+        db.put_poi_artifact_cache(&poi_record(list_key))
+            .expect("seed POI corpus");
+        let manager = SyncManager::new(
+            Arc::clone(&db),
+            GlobalPoiPolicy::PoiProxy {
+                rpc_url: Url::parse("http://127.0.0.1:1").expect("proxy URL").into(),
+            },
+        )
+        .expect("acquire manager");
+
+        let error = reset_offline_poi_corpus(db.as_ref())
+            .await
+            .expect_err("live manager rejects destructive reset");
+        assert_eq!(error.kind, PersistedPublicSyncCacheKind::PoiCorpus);
+        assert!(error.reason.contains("active sync manager"));
+        assert_eq!(error.poi_corpus_entries_removed, 0);
+        assert!(
+            db.get_poi_artifact_cache(0, 1, "V3_PoseidonMerkle", &list_key)
+                .expect("read retained corpus")
+                .is_some()
+        );
+
+        manager.shutdown().await;
+        let reset = reset_offline_poi_corpus(db.as_ref())
+            .await
+            .expect("reset after manager shutdown");
+        assert_eq!(reset.corpus_entries_removed, 1);
+        let replacement = SyncManager::new(
+            Arc::clone(&db),
+            GlobalPoiPolicy::PoiProxy {
+                rpc_url: Url::parse("http://127.0.0.1:1").expect("proxy URL").into(),
+            },
+        )
+        .expect("manager admission released after reset");
+        replacement.shutdown().await;
+
+        drop(replacement);
+        drop(manager);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove reset test db");
     }

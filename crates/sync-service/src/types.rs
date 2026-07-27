@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, FixedBytes, U256, address};
@@ -28,7 +27,6 @@ use tracing::warn;
 use url::Url;
 
 use crate::indexed_artifacts::{ChainScope, ChainType};
-use crate::poi_artifacts::PoiCorpusAuthority;
 use crate::wallet::WalletActorTokenAuthority;
 
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
@@ -400,14 +398,12 @@ pub(crate) struct PoiCorpusRevision {
 #[derive(Debug)]
 struct LocalPoiCachesInner {
     caches: RwLock<LocalPoiCacheMap>,
-    authority: Arc<PoiCorpusAuthority>,
-    installed_generation: AtomicU64,
+    revision_access: Arc<RwLock<()>>,
     committed_revision_tx: watch::Sender<PoiCorpusRevision>,
 }
 
 pub(crate) struct LocalPoiCachesReadGuard<'a> {
     caches: RwLockReadGuard<'a, LocalPoiCacheMap>,
-    _access: OwnedRwLockReadGuard<()>,
 }
 
 impl Deref for LocalPoiCachesReadGuard<'_> {
@@ -420,7 +416,6 @@ impl Deref for LocalPoiCachesReadGuard<'_> {
 
 pub(crate) struct LocalPoiCachesWriteGuard<'a> {
     caches: RwLockWriteGuard<'a, LocalPoiCacheMap>,
-    _access: OwnedRwLockReadGuard<()>,
 }
 
 impl Deref for LocalPoiCachesWriteGuard<'_> {
@@ -437,12 +432,7 @@ impl DerefMut for LocalPoiCachesWriteGuard<'_> {
     }
 }
 
-/// A generation-fenced handle to chain-local POI caches.
-///
-/// Clones share the cache map, its installed generation, and a monotonic
-/// revision published only after a committed corpus install. Every guard
-/// acquisition clears the map before exposing it if the database generation
-/// has advanced.
+/// A shared handle to chain-local POI caches and committed corpus revisions.
 #[derive(Debug, Clone)]
 pub(crate) struct LocalPoiCaches {
     inner: Arc<LocalPoiCachesInner>,
@@ -450,73 +440,27 @@ pub(crate) struct LocalPoiCaches {
 
 impl LocalPoiCaches {
     #[must_use]
-    pub(crate) fn new(authority: Arc<PoiCorpusAuthority>) -> Self {
-        let installed_generation = authority.generation().load(Ordering::Acquire);
+    pub(crate) fn new() -> Self {
         let (committed_revision_tx, _) = watch::channel(PoiCorpusRevision::default());
         Self {
             inner: Arc::new(LocalPoiCachesInner {
                 caches: RwLock::new(BTreeMap::new()),
-                authority,
-                installed_generation: AtomicU64::new(installed_generation),
+                revision_access: Arc::new(RwLock::new(())),
                 committed_revision_tx,
             }),
         }
     }
 
     pub(crate) async fn read(&self) -> LocalPoiCachesReadGuard<'_> {
-        let access = self.inner.authority.read_access().await;
-        let guard = self.inner.caches.read().await;
-        if self.installed_generation() == self.current_generation() {
-            return LocalPoiCachesReadGuard {
-                caches: guard,
-                _access: access,
-            };
-        }
-        drop(guard);
-
-        let mut guard = self.inner.caches.write().await;
-        self.synchronize_locked(&mut guard);
         LocalPoiCachesReadGuard {
-            caches: RwLockWriteGuard::downgrade(guard),
-            _access: access,
+            caches: self.inner.caches.read().await,
         }
     }
 
     pub(crate) async fn write(&self) -> LocalPoiCachesWriteGuard<'_> {
-        let access = self.inner.authority.read_access().await;
-        let mut guard = self.inner.caches.write().await;
-        self.synchronize_locked(&mut guard);
         LocalPoiCachesWriteGuard {
-            caches: guard,
-            _access: access,
+            caches: self.inner.caches.write().await,
         }
-    }
-
-    pub(crate) async fn synchronize_generation(&self) -> bool {
-        let _access = self.inner.authority.read_access().await;
-        if self.installed_generation() == self.current_generation() {
-            return false;
-        }
-        let mut guard = self.inner.caches.write().await;
-        self.synchronize_locked(&mut guard)
-    }
-
-    pub(crate) fn shared_generation(&self) -> &AtomicU64 {
-        self.inner.authority.generation()
-    }
-
-    pub(crate) fn current_generation(&self) -> u64 {
-        self.inner.authority.generation().load(Ordering::Acquire)
-    }
-
-    pub(crate) fn installed_generation(&self) -> u64 {
-        self.inner.installed_generation.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn mark_installed_generation(&self, generation: u64) {
-        self.inner
-            .installed_generation
-            .store(generation, Ordering::Release);
     }
 
     #[must_use]
@@ -535,21 +479,11 @@ impl LocalPoiCaches {
     }
 
     pub(crate) async fn revision_read_fence(&self) -> OwnedRwLockReadGuard<()> {
-        self.inner.authority.revision_read_access().await
+        Arc::clone(&self.inner.revision_access).read_owned().await
     }
 
     pub(crate) async fn revision_write_fence(&self) -> OwnedRwLockWriteGuard<()> {
-        self.inner.authority.revision_write_access().await
-    }
-
-    fn synchronize_locked(&self, caches: &mut LocalPoiCacheMap) -> bool {
-        let current_generation = self.current_generation();
-        if self.installed_generation() == current_generation {
-            return false;
-        }
-        caches.clear();
-        self.mark_installed_generation(current_generation);
-        true
+        Arc::clone(&self.inner.revision_access).write_owned().await
     }
 }
 
@@ -2642,8 +2576,7 @@ impl LocalPoiCaches {
         Self {
             inner: Arc::new(LocalPoiCachesInner {
                 caches: RwLock::new(caches),
-                authority: Arc::new(PoiCorpusAuthority::new(0)),
-                installed_generation: AtomicU64::new(0),
+                revision_access: Arc::new(RwLock::new(())),
                 committed_revision_tx,
             }),
         }

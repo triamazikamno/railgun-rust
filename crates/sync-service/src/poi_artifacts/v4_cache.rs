@@ -313,7 +313,7 @@ impl<'a> RawChunkCache<'a> {
         let authority = self.validate_admission_owner(&current.admission)?;
         let _access = Arc::clone(&authority.access).read_owned().await;
         Self::validate_admission_generation(&current.admission)?;
-        let _publisher_fence = super::lock_poi_artifact_cache_sync();
+        let _publisher_fence = super::lock_poi_artifact_publication();
         self.require_current_publication(current.admission.publication)?;
         self.get_unfenced(current)
     }
@@ -388,7 +388,7 @@ impl<'a> RawChunkCache<'a> {
         let authority = self.validate_admission_owner(&chunk.admission)?;
         let _access = Arc::clone(&authority.access).read_owned().await;
         Self::validate_admission_generation(&chunk.admission)?;
-        let _publisher_fence = super::lock_poi_artifact_cache_sync();
+        let _publisher_fence = super::lock_poi_artifact_publication();
         self.require_current_publication(chunk.admission.publication)?;
         if !is_current() {
             return Ok(None);
@@ -618,9 +618,9 @@ mod tests {
     use super::*;
     use crate::chain::commit_artifact_after_admission;
     use crate::poi_artifacts::{
-        PersistCorpusResult, load_persisted_cache_candidate_for_publisher,
+        ExpectedPoiCorpusBase, PersistCorpusResult, load_persisted_cache_candidate_for_publisher,
         load_persisted_cache_for_publisher, persist_prepared_corpus, prepare_candidate,
-        prepare_candidate_from_starting,
+        prepare_candidate_from_starting, prepare_candidate_from_starting_for_generation,
         test_support::{observe_manifest, poi_v4_manifest_envelope_signing_message},
     };
 
@@ -1785,6 +1785,126 @@ mod tests {
     }
 
     #[test]
+    fn artifact_candidate_rejects_generation_adopted_after_service_start() {
+        let (db, root) = test_db("artifact-service-generation");
+        let service_generation = db
+            .poi_artifact_cache_generation()
+            .expect("load service generation");
+        let (_, current_generation) = db
+            .clear_poi_artifact_cache_with_generation()
+            .expect("advance durable generation");
+        assert_eq!(current_generation, service_generation + 1);
+
+        let signing_key = SigningKey::from_bytes(&[0x5d; 32]);
+        let graph = graph_with_commitments(
+            &signing_key,
+            1,
+            &[0x5e],
+            "bafy-service-generation",
+            true,
+            None,
+        );
+        let (observed, catalog, _, _) = verified_graph(&db, &signing_key, graph);
+        let Err(error) = prepare_candidate_from_starting_for_generation(
+            &db,
+            &observed,
+            &catalog,
+            None,
+            ExpectedPoiCorpusBase::NoValidCorpus,
+            service_generation,
+        ) else {
+            panic!("old service generation unexpectedly prepared an artifact candidate");
+        };
+        assert!(matches!(
+            error,
+            PoiArtifactError::StalePublicCacheGeneration { expected, actual }
+                if expected == service_generation && actual == current_generation
+        ));
+
+        drop(db);
+        fs::remove_dir_all(root).expect("remove test db");
+    }
+
+    #[test]
+    fn artifact_candidate_prepared_from_corrupt_journal_repairs_unchanged_state() {
+        let (db, root) = test_db("artifact-prepared-corrupt-repair");
+        let signing_key = SigningKey::from_bytes(&[0x5a; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let initial = graph_with_commitments(
+            &signing_key,
+            1,
+            &[0x5b],
+            "bafy-prepared-corrupt-initial",
+            true,
+            None,
+        );
+        let (initial_observed, initial_catalog, initial_chunk, initial_blocked) =
+            verified_graph(&db, &signing_key, initial);
+        let initial_candidate = prepare_candidate(&db, &initial_observed, &initial_catalog)
+            .expect("prepare initial candidate")
+            .replay_chunk(&initial_chunk)
+            .expect("replay initial chunk")
+            .install_blocked_shields(&initial_blocked)
+            .expect("install initial blocked shields")
+            .finish()
+            .expect("finish initial candidate");
+        let persisted = match persist_prepared_corpus(&db, initial_candidate)
+            .expect("persist initial candidate")
+        {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => panic!("initial artifact candidate was stale"),
+        };
+        let identity = persisted.cache.identity().clone();
+
+        let mut corrupt_base = db
+            .get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("load initial base")
+            .expect("initial base");
+        corrupt_base.cache_payload = vec![0xc1];
+        db.put_poi_artifact_cache(&corrupt_base)
+            .expect("corrupt historical base payload");
+
+        let replacement = graph_with_commitments(
+            &signing_key,
+            2,
+            &[0x5b, 0x5c],
+            "bafy-prepared-corrupt-replacement",
+            true,
+            None,
+        );
+        let (observed, catalog, chunk, blocked) = verified_graph(&db, &signing_key, replacement);
+        let candidate = prepare_candidate(&db, &observed, &catalog)
+            .expect("prepare replacement from corrupt journal")
+            .replay_chunk(&chunk)
+            .expect("replay replacement chunk")
+            .install_blocked_shields(&blocked)
+            .expect("install replacement blocked shields")
+            .finish()
+            .expect("finish replacement candidate");
+        let repaired = match persist_prepared_corpus(&db, candidate)
+            .expect("repair unchanged corrupt journal")
+        {
+            PersistCorpusResult::Applied(persisted) => persisted,
+            PersistCorpusResult::Stale => {
+                panic!("corrupt journal repair unexpectedly became stale")
+            }
+        };
+        assert_eq!(repaired.cache.progress().next_event_index, 2);
+        let strict = load_persisted_cache_for_publisher(&db, &identity, publisher)
+            .expect("strictly reload repaired corpus")
+            .expect("repaired corpus");
+        assert_eq!(strict.cache.progress().next_event_index, 2);
+
+        drop(db);
+        fs::remove_dir_all(root).expect("remove test db");
+    }
+
+    #[test]
     fn artifact_stale_reconciliation_ignores_changed_corrupt_winner() {
         let (db, root) = test_db("artifact-stale-changed-corrupt-winner");
         let signing_key = SigningKey::from_bytes(&[0x5a; 32]);
@@ -1923,10 +2043,10 @@ mod tests {
             PoiCorpusJournalCommitOutcome::CorpusConflict
         );
 
-        let reconciled = commit_artifact_after_admission(&db, stale_candidate)
+        let stale = commit_artifact_after_admission(&db, stale_candidate)
             .expect("stale corrupt winner reconciles without error");
         assert!(
-            reconciled.persisted.is_none(),
+            stale.is_none(),
             "corrupt stale winner must not become a staged candidate"
         );
         let after_token = match db

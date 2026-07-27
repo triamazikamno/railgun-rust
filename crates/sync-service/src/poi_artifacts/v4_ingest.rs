@@ -134,6 +134,7 @@ impl PoiArtifactIngestor {
         observed: &ObservedManifest,
         persisted: Option<PersistedPoiArtifactCache>,
         expected_base: ExpectedPoiCorpusBase,
+        expected_generation: u64,
         cancel: &CancellationToken,
     ) -> Result<Option<PreparedIngestion>, PoiArtifactError> {
         ensure_not_cancelled(cancel)?;
@@ -179,6 +180,7 @@ impl PoiArtifactIngestor {
                 &catalog,
                 persisted,
                 expected_base,
+                expected_generation,
             ) => {
                 result.map_err(persistence_error)?
             }

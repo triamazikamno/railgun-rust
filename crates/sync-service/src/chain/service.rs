@@ -22,6 +22,8 @@ use super::{
     wallet_startup_warm_from_block, wallet_sync_target, warn, watch,
 };
 
+use crate::runtime_admission::DbRuntimeLease;
+
 pub(in crate::chain) async fn send_wallet_reset(
     cache_key: &str,
     sender: &mpsc::Sender<BackfillEvent>,
@@ -76,6 +78,64 @@ pub(super) struct WalletShortStartupPlan {
 struct WalletRpcBackfillEvents {
     acquisition_applies: Vec<WalletScanApply>,
     delivery_applies: Vec<WalletScanApply>,
+}
+
+pub(crate) struct PreparedChainService {
+    service: Arc<ChainService>,
+    rpcs: Arc<QueryRpcPool>,
+    archive_provider: Option<alloy_provider::DynProvider>,
+    forest_last_rx: watch::Receiver<u64>,
+    safe_head_rx: watch::Receiver<u64>,
+    snapshot_path: std::path::PathBuf,
+    backfill_rx: mpsc::Receiver<BackfillRequest>,
+    cancel: CancellationToken,
+}
+
+impl PreparedChainService {
+    pub(crate) fn activate(self) -> Arc<ChainService> {
+        let Self {
+            service,
+            rpcs,
+            archive_provider,
+            forest_last_rx,
+            safe_head_rx,
+            snapshot_path,
+            backfill_rx,
+            cancel,
+        } = self;
+        spawn_head_poller(Arc::clone(&service), Arc::clone(&rpcs));
+        let live_log_task = spawn_live_log_loop(
+            Arc::clone(&service),
+            Arc::clone(&rpcs),
+            archive_provider.clone(),
+            forest_last_rx,
+            safe_head_rx.clone(),
+            snapshot_path,
+            cancel.clone(),
+        );
+        *service
+            .live_log_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(live_log_task);
+        spawn_pending_tip_loop(
+            Arc::clone(&service),
+            Arc::clone(&rpcs),
+            archive_provider.clone(),
+            service.head_tx.subscribe(),
+            safe_head_rx.clone(),
+            cancel.clone(),
+        );
+        spawn_wallet_lag_fallback_loop(Arc::clone(&service), safe_head_rx.clone(), cancel.clone());
+        spawn_backfill_loop(
+            Arc::clone(&service),
+            backfill_rx,
+            rpcs,
+            archive_provider,
+            safe_head_rx,
+            cancel,
+        );
+        service
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,11 +764,12 @@ impl ChainService {
         }
     }
 
-    pub async fn start(
+    pub(crate) async fn prepare(
         db: Arc<DbStore>,
         chain: ChainConfig,
         poi_policy: GlobalPoiPolicy,
-    ) -> Result<Arc<Self>, ChainError> {
+        runtime_lease: DbRuntimeLease,
+    ) -> Result<PreparedChainService, ChainError> {
         if chain.archive_until_block > 0
             && chain.archive_rpc_url.is_none()
             && chain.deployment_block <= chain.archive_until_block
@@ -752,7 +813,8 @@ impl ChainService {
         let (backfill_tx, backfill_rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
         let mut public_data_plane =
-            ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+            ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)))
+                .with_runtime_lease(runtime_lease);
         if let GlobalPoiPolicy::IndexedArtifacts {
             artifact_source,
             rpc_url,
@@ -762,6 +824,7 @@ impl ChainService {
             let poi_artifact_persistence = public_data_plane.poi_artifact_persistence();
             let poi_cache_service = crate::poi_cache::PoiCacheService::new_with_persistence(
                 Arc::clone(&db),
+                chain.chain_id,
                 artifact_source.clone(),
                 chain.http_client.clone(),
                 poi_artifact_persistence,
@@ -784,7 +847,7 @@ impl ChainService {
             wallets: RwLock::new(HashMap::new()),
             wallet_registration_gates: Mutex::new(HashMap::new()),
             cancel: cancel.clone(),
-            live_log_task: Mutex::new(None),
+            live_log_task: std::sync::Mutex::new(None),
             anchor_last: AtomicU64::new(last_anchor),
             txid_public_cache_started: AtomicBool::new(false),
             wallet_actor_next: AtomicU64::new(1),
@@ -792,36 +855,16 @@ impl ChainService {
             public_data_plane,
         });
 
-        spawn_head_poller(service.clone(), rpcs.clone());
-        let live_log_task = spawn_live_log_loop(
-            service.clone(),
-            rpcs.clone(),
-            archive_provider.clone(),
-            forest_last_rx,
-            safe_head_rx.clone(),
-            snapshot_path,
-            cancel.clone(),
-        );
-        *service.live_log_task.lock().await = Some(live_log_task);
-        spawn_pending_tip_loop(
-            service.clone(),
-            rpcs.clone(),
-            archive_provider.clone(),
-            service.head_tx.subscribe(),
-            safe_head_rx.clone(),
-            cancel.clone(),
-        );
-        spawn_wallet_lag_fallback_loop(service.clone(), safe_head_rx.clone(), cancel.clone());
-        spawn_backfill_loop(
-            service.clone(),
-            backfill_rx,
+        Ok(PreparedChainService {
+            service,
             rpcs,
             archive_provider,
+            forest_last_rx,
             safe_head_rx,
+            snapshot_path,
+            backfill_rx,
             cancel,
-        );
-
-        Ok(service)
+        })
     }
 
     #[must_use]
@@ -2697,7 +2740,7 @@ impl ChainService {
     }
 
     pub async fn shutdown(&self) {
-        self.cancel.cancel();
+        self.begin_shutdown();
         let registrations = self.wallets.write().await.drain().collect::<Vec<_>>();
         for (_, registration) in &registrations {
             Self::begin_wallet_shutdown(registration);
@@ -2708,6 +2751,16 @@ impl ChainService {
         }
         self.public_data_plane.shutdown().await;
         await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.cancel.cancel();
+        self.public_data_plane.begin_shutdown();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_started(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     pub(super) async fn indexed_wallet_catch_up(
@@ -3293,10 +3346,13 @@ impl ChainService {
 }
 
 pub(super) async fn await_live_log_task_shutdown(
-    live_log_task: &Mutex<Option<JoinHandle<()>>>,
+    live_log_task: &std::sync::Mutex<Option<JoinHandle<()>>>,
     chain_id: u64,
 ) {
-    let live_log_task = live_log_task.lock().await.take();
+    let live_log_task = live_log_task
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     if let Some(task) = live_log_task
         && let Err(err) = task.await
         && !err.is_cancelled()

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +25,6 @@ use poi::cache::{PoiCache, PoiCacheError, PoiCacheIdentity, PoiCacheJournalDelta
 use poi::poi::BlockedShield;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tracing::{debug, warn};
 
 use crate::poi_limits::{
@@ -48,111 +46,12 @@ pub(crate) use v4_cache::{
 };
 pub(crate) use v4_ingest::PreparedIngestion;
 
-static POI_ARTIFACT_CACHE_SYNC_STATE: LazyLock<Mutex<PoiArtifactCacheSyncState>> =
-    LazyLock::new(|| Mutex::new(PoiArtifactCacheSyncState::default()));
+static POI_ARTIFACT_PUBLICATION_FENCE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-#[derive(Default)]
-struct PoiArtifactCacheSyncState {
-    authorities: BTreeMap<PathBuf, Arc<PoiCorpusAuthority>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct PoiCorpusAuthority {
-    generation: Arc<AtomicU64>,
-    access: Arc<RwLock<()>>,
-    revision_access: Arc<RwLock<()>>,
-}
-
-impl PoiCorpusAuthority {
-    pub(crate) fn new(generation: u64) -> Self {
-        Self {
-            generation: Arc::new(AtomicU64::new(generation)),
-            access: Arc::new(RwLock::new(())),
-            revision_access: Arc::new(RwLock::new(())),
-        }
-    }
-
-    pub(crate) async fn read_access(&self) -> OwnedRwLockReadGuard<()> {
-        Arc::clone(&self.access).read_owned().await
-    }
-
-    async fn reset_access(&self) -> OwnedRwLockWriteGuard<()> {
-        Arc::clone(&self.access).write_owned().await
-    }
-
-    pub(crate) async fn revision_read_access(&self) -> OwnedRwLockReadGuard<()> {
-        Arc::clone(&self.revision_access).read_owned().await
-    }
-
-    pub(crate) async fn revision_write_access(&self) -> OwnedRwLockWriteGuard<()> {
-        Arc::clone(&self.revision_access).write_owned().await
-    }
-
-    pub(crate) fn generation(&self) -> &AtomicU64 {
-        self.generation.as_ref()
-    }
-
-    pub(crate) fn generation_cell(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.generation)
-    }
-}
-
-impl PoiArtifactCacheSyncState {
-    fn lock() -> MutexGuard<'static, Self> {
-        POI_ARTIFACT_CACHE_SYNC_STATE
-            .lock()
-            .expect("POI artifact cache sync state lock poisoned")
-    }
-
-    fn authority(&mut self, db: &DbStore) -> Result<Arc<PoiCorpusAuthority>, local_db::DbError> {
-        if let Some(authority) = self.authorities.get(db.root_dir()) {
-            return Ok(Arc::clone(authority));
-        }
-        let authority = Arc::new(PoiCorpusAuthority::new(db.poi_artifact_cache_generation()?));
-        self.authorities
-            .insert(db.root_dir().to_path_buf(), Arc::clone(&authority));
-        Ok(authority)
-    }
-
-    fn generation_cell(&mut self, db: &DbStore) -> Result<Arc<AtomicU64>, local_db::DbError> {
-        Ok(self.authority(db)?.generation_cell())
-    }
-
-    fn publish_generation(&mut self, db: &DbStore, generation: u64) {
-        let authority = self
-            .authorities
-            .entry(db.root_dir().to_path_buf())
-            .or_insert_with(|| Arc::new(PoiCorpusAuthority::new(generation)));
-        authority.generation.store(generation, Ordering::Release);
-    }
-}
-
-pub(crate) fn with_poi_artifact_cache_generation<R>(
-    generation: &AtomicU64,
-    operation: impl FnOnce(u64) -> R,
-) -> R {
-    let _sync_guard = PoiArtifactCacheSyncState::lock();
-    operation(generation.load(Ordering::Acquire))
-}
-
-pub(crate) fn poi_artifact_cache_generation_cell(
-    db: &DbStore,
-) -> Result<Arc<AtomicU64>, local_db::DbError> {
-    Ok(PoiArtifactCacheSyncState::lock()
-        .authority(db)?
-        .generation_cell())
-}
-
-pub(crate) fn poi_corpus_authority(
-    db: &DbStore,
-) -> Result<Arc<PoiCorpusAuthority>, local_db::DbError> {
-    PoiArtifactCacheSyncState::lock().authority(db)
-}
-
-fn lock_poi_artifact_cache_sync() -> MutexGuard<'static, PoiArtifactCacheSyncState> {
-    POI_ARTIFACT_CACHE_SYNC_STATE
+fn lock_poi_artifact_publication() -> MutexGuard<'static, ()> {
+    POI_ARTIFACT_PUBLICATION_FENCE
         .lock()
-        .expect("POI artifact cache sync state lock poisoned")
+        .expect("POI artifact publication fence poisoned")
 }
 
 #[derive(Clone, Copy)]
@@ -332,7 +231,7 @@ where
 {
     manifest.verify_trusted_signature_envelope(&trusted_publisher_pubkey.0)?;
     let publication_id = manifest.publication_id_envelope()?;
-    let _sync_state = lock_poi_artifact_cache_sync();
+    let _publication_fence = lock_poi_artifact_publication();
     let previous = publisher_manifest_watermark(db, trusted_publisher_pubkey)?;
     let exact_replay = validate_manifest_order(&publication_id, previous.as_ref())?;
     if !exact_replay {
@@ -745,20 +644,13 @@ pub struct VerifiedCorpusCandidate {
 }
 
 impl VerifiedCorpusCandidate {
+    #[cfg(test)]
     pub(crate) const fn cache(&self) -> &PoiCache {
         &self.cache
     }
 
     pub(crate) const fn manifest_sequence(&self) -> u64 {
         self.publication.sequence
-    }
-
-    pub(crate) const fn cache_generation(&self) -> u64 {
-        self.cache_generation
-    }
-
-    pub(crate) const fn publisher_pubkey(&self) -> FixedBytes<32> {
-        self.publication.publisher_pubkey
     }
 }
 
@@ -890,8 +782,7 @@ pub(crate) fn prepare_candidate_from_starting(
     let publisher_pubkey = observed.manifest.publisher_pubkey;
     let cache_generation = persisted.as_ref().map_or_else(
         || {
-            poi_artifact_cache_generation_cell(db)
-                .map(|generation| generation.load(Ordering::Acquire))
+            db.poi_artifact_cache_generation()
                 .map_err(PoiArtifactError::from)
         },
         |persisted| Ok(persisted.cache_generation),
@@ -926,6 +817,25 @@ pub(crate) fn prepare_candidate_from_starting(
     })
 }
 
+pub(crate) fn prepare_candidate_from_starting_for_generation(
+    db: &DbStore,
+    observed: &ObservedManifest,
+    catalog: &VerifiedCatalog,
+    persisted: Option<PersistedPoiArtifactCache>,
+    expected_base: ExpectedPoiCorpusBase,
+    expected_generation: u64,
+) -> Result<CorpusCandidate, PoiArtifactError> {
+    let candidate =
+        prepare_candidate_from_starting(db, observed, catalog, persisted, expected_base)?;
+    if candidate.cache_generation != expected_generation {
+        return Err(PoiArtifactError::StalePublicCacheGeneration {
+            expected: expected_generation,
+            actual: candidate.cache_generation,
+        });
+    }
+    Ok(candidate)
+}
+
 pub(crate) struct PoiCorpusStore<'a> {
     db: &'a DbStore,
     generation: u64,
@@ -950,21 +860,6 @@ impl<'a> PoiCorpusStore<'a> {
         identity: &PoiCacheIdentity,
     ) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
         load_persisted_cache_for_publisher(self.db, identity, self.publisher_pubkey)
-    }
-
-    pub(crate) fn load_current_if_valid(
-        &self,
-        identity: &PoiCacheIdentity,
-    ) -> Result<Option<PersistedPoiArtifactCache>, PoiArtifactError> {
-        match inspect_persisted_cache_with_publisher(
-            self.db,
-            identity,
-            Some(self.publisher_pubkey),
-        )? {
-            PersistedPoiCorpusInspection::Missing
-            | PersistedPoiCorpusInspection::Corrupt { .. } => Ok(None),
-            PersistedPoiCorpusInspection::Valid(persisted) => Ok(Some(*persisted)),
-        }
     }
 
     pub(crate) fn commit_public_rpc(
@@ -1072,8 +967,7 @@ pub(crate) fn load_poi_rpc_health(
     generation: u64,
     legacy_last_successful_rpc_sync_at_ms: Option<u64>,
 ) -> Result<Option<u64>, PoiArtifactError> {
-    let mut sync_state = lock_poi_artifact_cache_sync();
-    let current_generation = sync_state.generation_cell(db)?.load(Ordering::Acquire);
+    let current_generation = db.poi_artifact_cache_generation()?;
     if current_generation != generation {
         return Err(PoiArtifactError::StalePublicCacheGeneration {
             expected: current_generation,
@@ -1116,8 +1010,7 @@ pub(crate) fn record_poi_rpc_success(
     identity: &PoiCacheIdentity,
     generation: u64,
 ) -> Result<(), PoiArtifactError> {
-    let mut sync_state = lock_poi_artifact_cache_sync();
-    let current_generation = sync_state.generation_cell(db)?.load(Ordering::Acquire);
+    let current_generation = db.poi_artifact_cache_generation()?;
     if current_generation != generation {
         return Err(PoiArtifactError::StalePublicCacheGeneration {
             expected: current_generation,
@@ -1321,18 +1214,7 @@ const fn normalize_legacy_artifact_metadata(record: &mut PoiArtifactCacheRecord)
     }
 }
 
-fn validate_persisted_corpus_payload(
-    record: &PoiArtifactCacheRecord,
-    cache: &PoiCache,
-) -> Result<(), PoiArtifactError> {
-    let roots = cache.current_roots_readonly();
-    if cache.validated_roots() != Some(&roots) {
-        return Err(PoiArtifactError::PersistedRootsNotValidated);
-    }
-    validate_corpus_payload_with_roots(record, cache, &roots)
-}
-
-fn validate_prepared_corpus_payload(
+fn validate_materialized_corpus_payload(
     record: &PoiArtifactCacheRecord,
     cache: &PoiCache,
 ) -> Result<(), PoiArtifactError> {
@@ -1411,21 +1293,12 @@ fn validate_corpus_payload_metadata_with_roots(
     }
 }
 
-fn validate_persisted_corpus(
+fn validate_materialized_corpus(
     record: &PoiArtifactCacheRecord,
     cache: &PoiCache,
     expected_publisher_pubkey: Option<FixedBytes<32>>,
 ) -> Result<(), PoiArtifactError> {
-    validate_persisted_corpus_payload(record, cache)?;
-    validate_corpus_provenance(record, cache, expected_publisher_pubkey)
-}
-
-fn validate_prepared_corpus(
-    record: &PoiArtifactCacheRecord,
-    cache: &PoiCache,
-    expected_publisher_pubkey: Option<FixedBytes<32>>,
-) -> Result<(), PoiArtifactError> {
-    validate_prepared_corpus_payload(record, cache)?;
+    validate_materialized_corpus_payload(record, cache)?;
     validate_corpus_provenance(record, cache, expected_publisher_pubkey)
 }
 
@@ -1581,7 +1454,7 @@ fn validate_persisted_record(
         return Err(PoiArtifactError::PersistedIdentityMismatch);
     }
     let cache = PoiCache::from_bytes(&record.cache_payload, expected_identity)?;
-    validate_persisted_corpus(record, &cache, expected_publisher_pubkey)?;
+    validate_materialized_corpus(record, &cache, expected_publisher_pubkey)?;
     Ok(cache)
 }
 
@@ -1609,10 +1482,7 @@ pub(crate) fn load_persisted_cache_candidate_for_publisher(
         )?
         && current_head == *installed_head
     {
-        let cache_generation = {
-            let mut sync_state = lock_poi_artifact_cache_sync();
-            sync_state.generation_cell(db)?.load(Ordering::Acquire)
-        };
+        let cache_generation = db.poi_artifact_cache_generation()?;
         let mut record = current_head.corpus.clone();
         normalize_legacy_artifact_metadata(&mut record);
         if cache.identity() == identity
@@ -1679,10 +1549,7 @@ fn inspect_persisted_cache_with_publisher(
     publisher_pubkey: Option<FixedBytes<32>>,
 ) -> Result<PersistedPoiCorpusInspection, PoiArtifactError> {
     let load_started = Instant::now();
-    let cache_generation = {
-        let mut sync_state = lock_poi_artifact_cache_sync();
-        sync_state.generation_cell(db)?.load(Ordering::Acquire)
-    };
+    let cache_generation = db.poi_artifact_cache_generation()?;
     let (bundle, replacement_token) = match db.inspect_poi_corpus_journal_detailed(
         identity.chain_type,
         identity.chain_id,
@@ -1789,7 +1656,7 @@ fn inspect_persisted_cache_with_publisher(
                 reason: "replayed journal does not match its committed head",
             });
         }
-        validate_prepared_corpus(&head.corpus, &cache, publisher_pubkey)?;
+        validate_materialized_corpus(&head.corpus, &cache, publisher_pubkey)?;
         debug!(
             chain_id = identity.chain_id,
             journal_revision = head.revision,
@@ -1833,7 +1700,7 @@ pub(crate) fn persist_prepared_corpus(
         starting_record,
         starting_head,
     } = candidate;
-    let current_generation = poi_artifact_cache_generation_cell(db)?.load(Ordering::Acquire);
+    let current_generation = db.poi_artifact_cache_generation()?;
     if cache_generation != current_generation {
         return Err(PoiArtifactError::StalePublicCacheGeneration {
             expected: current_generation,
@@ -2097,15 +1964,12 @@ fn persist_public_rpc_cache_with_publisher(
     if anchored_append {
         validate_anchored_corpus(&record, &cache, publisher_pubkey)?;
     } else {
-        validate_prepared_corpus(&record, &cache, publisher_pubkey)?;
+        validate_materialized_corpus(&record, &cache, publisher_pubkey)?;
     }
     let validation_elapsed = validation_started.elapsed();
     let delta_event_count = delta.events.len();
     let delta_leaf_count = delta.leaves.len();
-    let current_generation = {
-        let mut sync_state = lock_poi_artifact_cache_sync();
-        sync_state.generation_cell(db)?.load(Ordering::Acquire)
-    };
+    let current_generation = db.poi_artifact_cache_generation()?;
     if cache_generation != current_generation {
         return Err(PoiArtifactError::StalePublicCacheGeneration {
             expected: current_generation,
@@ -2296,7 +2160,7 @@ fn persist_corpus_record_monotonic(
         return Err(PoiArtifactError::PersistedIdentityMismatch);
     }
     let prepared_validation_started = Instant::now();
-    validate_prepared_corpus_payload(&candidate, &candidate_cache)?;
+    validate_materialized_corpus_payload(&candidate, &candidate_cache)?;
     let prepared_validation_elapsed = prepared_validation_started.elapsed();
     let existing_validation_started = Instant::now();
     let (existing, commit_expected_state) = match inspect_persisted_cache_with_publisher(
@@ -2321,14 +2185,20 @@ fn persist_corpus_record_monotonic(
             replacement_token,
             error,
         } => {
-            if !artifact_candidate_can_repair_corrupt_journal(
-                db,
-                &candidate_identity,
-                &candidate_cache,
-                expected_base,
-                starting_head,
-                expected_generation,
-            )? {
+            let can_repair = match expected_base {
+                ExpectedPoiCorpusBase::Corrupt {
+                    replacement_token: expected_token,
+                } => starting_head.is_none() && expected_token == replacement_token,
+                _ => artifact_candidate_can_repair_corrupt_journal(
+                    db,
+                    &candidate_identity,
+                    &candidate_cache,
+                    expected_base,
+                    starting_head,
+                    expected_generation,
+                )?,
+            };
+            if !can_repair {
                 return Ok(PersistCorpusResult::Stale);
             }
             warn!(?error, key = %candidate.key(), "replacing corrupt durable PPOI corpus journal");
@@ -2365,7 +2235,7 @@ fn persist_corpus_record_monotonic(
     }
     let existing_validation_elapsed = existing_validation_started.elapsed();
     let final_validation_started = Instant::now();
-    validate_prepared_corpus(&candidate, &candidate_cache, publisher_pubkey)?;
+    validate_materialized_corpus(&candidate, &candidate_cache, publisher_pubkey)?;
     let final_validation_elapsed = final_validation_started.elapsed();
     let source = candidate.source;
     let chain_id = candidate.chain_id;
@@ -2718,15 +2588,10 @@ fn descriptor_record(descriptor: &ArtifactDescriptor) -> PoiArtifactDescriptorRe
     }
 }
 
-pub(crate) async fn clear_poi_artifact_cache_for_reset(
+pub(crate) fn clear_poi_artifact_cache_for_reset(
     db: &DbStore,
 ) -> Result<PoiArtifactCacheReset, local_db::DbError> {
-    let authority = poi_corpus_authority(db)?;
-    let _revision_access = authority.revision_write_access().await;
-    let _reset_access = authority.reset_access().await;
-    let mut sync_state = lock_poi_artifact_cache_sync();
     let (removed, generation) = db.clear_poi_artifact_cache_with_generation()?;
-    sync_state.publish_generation(db, generation);
     Ok(PoiArtifactCacheReset {
         removed,
         generation,
@@ -3243,9 +3108,9 @@ mod tests {
             }])
             .expect("apply test event");
         cache.accept_current_roots();
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let publisher_pubkey = FixedBytes::from([0x40; 32]);
         db.advance_poi_publisher_manifest_watermark(publisher_pubkey, 7)
             .expect("seed publisher watermark");
@@ -3327,9 +3192,9 @@ mod tests {
         })
         .expect("open temp DB");
         let identity = test_identity();
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let base_cache = test_cache(&identity, &[0x51]);
         assert_eq!(
             persist_public_rpc_cache(
@@ -3408,9 +3273,9 @@ mod tests {
         })
         .expect("open temp DB");
         let identity = test_identity();
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let base_cache = test_cache(&identity, &[0x53]);
         persist_public_rpc_cache(
             &db,
@@ -3499,9 +3364,9 @@ mod tests {
         })
         .expect("open temp DB");
         let identity = test_identity();
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let base_cache = test_cache(&identity, &[0x5b]);
         persist_public_rpc_cache(
             &db,
@@ -3580,9 +3445,9 @@ mod tests {
         })
         .expect("open temp DB");
         let identity = test_identity();
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let base_cache = test_cache(&identity, &[0x57]);
         persist_public_rpc_cache(
             &db,
@@ -3738,9 +3603,9 @@ mod tests {
         })
         .expect("open temp DB");
         let identity = test_identity();
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let publisher = FixedBytes::from([0x58; 32]);
         let base = test_cache(&identity, &[0x57]);
         persist_public_rpc_cache(
@@ -3809,9 +3674,9 @@ mod tests {
         .expect("open temp DB");
         let identity = test_identity();
         let cache = test_cache(&identity, &[0x42]);
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         persist_public_rpc_cache(
             &db,
             &cache,
@@ -3868,9 +3733,9 @@ mod tests {
             })
         ));
 
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let expected_base = observed_corrupt_expected_base(&db, &identity);
         assert_eq!(
             persist_public_rpc_cache(&db, &cache, generation, 0, expected_base,)
@@ -3897,9 +3762,9 @@ mod tests {
         .expect("open temp DB");
         let identity = test_identity();
         let cache = test_cache(&identity, &[0x35]);
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         persist_public_rpc_cache(
             &db,
             &cache,
@@ -4004,9 +3869,9 @@ mod tests {
             Err(PoiArtifactError::PersistedRootMismatch { tip_index: 0 })
         ));
 
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
         let expected_base = observed_corrupt_expected_base(&db, &identity);
         persist_public_rpc_cache(&db, &cache, generation, 0, expected_base)
             .expect("replace root-mismatched corpus");
@@ -4045,7 +3910,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_corpus_rejects_validated_roots_that_do_not_match_forest() {
+    fn materialized_corpus_rejects_validated_roots_that_do_not_match_forest() {
         let identity = test_identity();
         let mut forest = MerkleForest::new();
         forest
@@ -4085,7 +3950,7 @@ mod tests {
         record.current_tip_root = forged_root;
 
         assert!(matches!(
-            validate_prepared_corpus_payload(&record, &cache),
+            validate_materialized_corpus_payload(&record, &cache),
             Err(PoiArtifactError::PersistedRootsNotValidated)
         ));
     }
@@ -4114,9 +3979,7 @@ mod tests {
         })
         .expect("open temp DB");
         let identity = test_identity();
-        let reset = clear_poi_artifact_cache_for_reset(&db)
-            .await
-            .expect("advance generation");
+        let reset = clear_poi_artifact_cache_for_reset(&db).expect("advance generation");
         db.put_poi_corpus_rpc_health(&PoiCorpusRpcHealthRecord {
             chain_type: identity.chain_type,
             chain_id: identity.chain_id,
@@ -4162,9 +4025,9 @@ mod tests {
         let identity = test_identity();
         let first = test_cache(&identity, &[0x61]);
         let stale = test_cache(&identity, &[0x62]);
-        let generation = poi_artifact_cache_generation_cell(&db)
-            .expect("cache generation")
-            .load(Ordering::Acquire);
+        let generation = db
+            .poi_artifact_cache_generation()
+            .expect("cache generation");
 
         assert_eq!(
             persist_public_rpc_cache(

@@ -252,6 +252,10 @@ impl IndexedArtifactMaintenanceScheduler {
         }
     }
 
+    pub(crate) fn begin_shutdown(&self) {
+        self.inner.cancel.cancel();
+    }
+
     fn ensure_worker(
         state: &mut IndexedArtifactMaintenanceWorkerState,
         cancel: &CancellationToken,

@@ -34,7 +34,6 @@ use super::{
     wallet_utxo_stable_identity, warn, watch,
 };
 use crate::PublicScanSource;
-use crate::chain::PublicPoiCorpusHandle;
 use crate::types::BackfillRequest;
 use crate::types::{PoiCorpusRevision, WalletSyncTargetLease};
 use futures::StreamExt;
@@ -2464,9 +2463,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 Some(corpus) => Some(corpus.revision_read_fence().await),
                                 None => None,
                             };
-                            let corpus_generation_is_current = poi_corpus_handle
-                                .as_ref()
-                                .is_none_or(PublicPoiCorpusHandle::installed_generation_is_current);
                             if let Some(revision_rx) = poi_corpus_revision_rx.as_mut() {
                                 let revision = *revision_rx.borrow_and_update();
                                 let blocked_shields_changed = revision.blocked_shields_revision
@@ -2481,9 +2477,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 );
                                 last_poi_corpus_revision = revision;
                                 blocked_shield_refresh_pending |= blocked_shields_changed;
-                                if actor_state.poi_corpus_refresh_pending()
-                                    && corpus_generation_is_current
-                                {
+                                if actor_state.poi_corpus_refresh_pending() {
                                     let selection = WalletPoiRefreshSelection::CorpusRevision {
                                         blocked_shields_changed: blocked_shield_refresh_pending,
                                     };
@@ -2528,13 +2522,6 @@ pub(crate) async fn prepare_wallet_worker(
                                         }
                                     }
                                 }
-                            }
-                            if !corpus_generation_is_current {
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
-                                    |mut state| state.set_poi_corpus_refresh_pending(true),
-                                );
                             }
                         } else if disposition == WalletBackfillOwnerDisposition::DriverLost {
                             backfill_complete_block = None;
@@ -3018,9 +3005,6 @@ pub(crate) async fn prepare_wallet_worker(
                             );
                         },
                     );
-                    let corpus_generation_is_current = poi_corpus_handle
-                        .as_ref()
-                        .is_none_or(PublicPoiCorpusHandle::installed_generation_is_current);
                     debug!(
                         cache_key = %cfg.cache_key,
                         revision = revision.revision,
@@ -3035,7 +3019,6 @@ pub(crate) async fn prepare_wallet_worker(
                     blocked_shield_refresh_pending |= blocked_shields_changed;
                     if backfill_complete_block.is_some()
                         && actor_state.pending_reset().is_none()
-                        && corpus_generation_is_current
                         && let Some(result) = commit_local_poi_status_refresh!(
                             WalletPoiRefreshSelection::CorpusRevision {
                                 blocked_shields_changed: blocked_shield_refresh_pending,
@@ -3065,13 +3048,6 @@ pub(crate) async fn prepare_wallet_worker(
                             ),
                         }
                     }
-                    if !corpus_generation_is_current {
-                        let _ = actor_state.transition_active(
-                            &worker_handle,
-                            &cancel,
-                            |mut state| state.set_poi_corpus_refresh_pending(true),
-                        );
-                    }
                     if actor_state.poi_corpus_refresh_pending() {
                         let selection = WalletPoiRefreshSelection::CorpusRevision {
                             blocked_shields_changed: blocked_shield_refresh_pending,
@@ -3084,7 +3060,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 selection,
                             )
                         };
-                        if !refresh_still_needed && corpus_generation_is_current {
+                        if !refresh_still_needed {
                             blocked_shield_refresh_pending = false;
                             let _ = actor_state.transition_active(
                                 &worker_handle,
@@ -3117,17 +3093,6 @@ pub(crate) async fn prepare_wallet_worker(
                         Some(corpus) => Some(corpus.revision_read_fence().await),
                         None => None,
                     };
-                    let corpus_generation_is_current = poi_corpus_handle
-                        .as_ref()
-                        .is_none_or(PublicPoiCorpusHandle::installed_generation_is_current);
-                    if !corpus_generation_is_current {
-                        let _ = actor_state.transition_active(
-                            &worker_handle,
-                            &cancel,
-                            |mut state| state.set_poi_corpus_refresh_pending(true),
-                        );
-                        continue;
-                    }
                     let now = now_epoch_secs();
                     let selection = if actor_state.poi_corpus_refresh_pending()
                         || blocked_shield_refresh_pending
@@ -3496,11 +3461,7 @@ pub(crate) async fn prepare_wallet_worker(
                                         Some(corpus) => Some(corpus.revision_read_fence().await),
                                         None => None,
                                     };
-                                    let corpus_generation_is_current = poi_corpus_handle
-                                        .as_ref()
-                                        .is_none_or(PublicPoiCorpusHandle::installed_generation_is_current);
-                                    if !corpus_generation_is_current
-                                        || poi_corpus_revision.is_some_and(|applied_revision| {
+                                    if poi_corpus_revision.is_some_and(|applied_revision| {
                                             poi_corpus_revision_rx
                                                 .as_mut()
                                                 .is_some_and(|revision_rx| {

@@ -467,7 +467,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         wallets: RwLock::new(HashMap::new()),
         wallet_registration_gates: Mutex::new(HashMap::new()),
         cancel: CancellationToken::new(),
-        live_log_task: Mutex::new(None),
+        live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -670,7 +670,8 @@ async fn manager_resets_persisted_cache_once_and_every_registered_public_data_pl
         },
     ];
     let mut registered = Vec::new();
-    let manager = SyncManager::new(Arc::clone(&db), test_proxy_poi_policy());
+    let manager = SyncManager::new(Arc::clone(&db), test_proxy_poi_policy())
+        .expect("acquire manager ownership");
     for scope in scopes {
         let chain = test_chain_config(
             &scope,
@@ -690,13 +691,14 @@ async fn manager_resets_persisted_cache_once_and_every_registered_public_data_pl
         );
         let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
         assert!(service.wallets.read().await.is_empty());
-        manager
-            .insert_chain_for_test(key, Arc::clone(&service))
-            .await;
+        manager.insert_chain_for_test(key, Arc::clone(&service));
         registered.push((key, service));
     }
 
-    let report = manager.reset_public_sync_caches().await;
+    let report = manager
+        .reset_public_sync_caches()
+        .await
+        .expect("manager accepts public cache reset");
 
     assert_eq!(report.chains.len(), 2);
     assert_eq!(
@@ -755,13 +757,18 @@ async fn manager_public_cache_reset_reports_empty_inventory() {
         })
         .expect("open empty manager reset db"),
     );
-    let manager = SyncManager::new(Arc::clone(&db), test_proxy_poi_policy());
+    let manager = SyncManager::new(Arc::clone(&db), test_proxy_poi_policy())
+        .expect("acquire manager ownership");
 
-    let report = manager.reset_public_sync_caches().await;
+    let report = manager
+        .reset_public_sync_caches()
+        .await
+        .expect("manager accepts public cache reset");
 
     assert!(report.is_empty());
     assert_eq!(report.total_removed_entries, 0);
     assert_eq!(report.failed_chain_count(), 0);
+    manager.shutdown().await;
     drop(manager);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove empty manager reset db");
@@ -841,13 +848,10 @@ async fn session_removal_routes_by_handle_and_rejects_cross_service_actor_collis
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ),
     );
-    let manager = SyncManager::new(Arc::clone(&db_a), test_proxy_poi_policy());
-    manager
-        .insert_chain_for_test(chain_a_key, Arc::clone(&service_a))
-        .await;
-    manager
-        .insert_chain_for_test(chain_b_key, Arc::clone(&service_b))
-        .await;
+    let manager = SyncManager::new(Arc::clone(&db_a), test_proxy_poi_policy())
+        .expect("acquire manager ownership");
+    manager.insert_chain_for_test(chain_a_key, Arc::clone(&service_a));
+    manager.insert_chain_for_test(chain_b_key, Arc::clone(&service_b));
 
     let shared_cache_key = test_cache_key("shared-session");
     let mut cfg_a = test_wallet_config(&scope_a, rpc_url.clone());
@@ -2164,7 +2168,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         };
         indexed_wallet_nullifier_page(block_number, nullifier)
     }));
-    let squid = GraphqlServer::spawn_owned(squid_responses);
+    let (squid, squid_block) = GraphqlServer::spawn_owned_with_blocked_response(squid_responses, 0);
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![rpc.url.clone()],
         Duration::from_secs(1),
@@ -2200,18 +2204,18 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         .expect("register first wallet");
 
     let PathServerBlockControl {
+        request_started: squid_request_started,
+        release: squid_release,
+    } = squid_block;
+    let PathServerBlockControl {
         request_started: rpc_request_started,
         release: rpc_release,
     } = rpc_block;
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            rpc_request_started.recv().expect("RPC log request blocked");
-        }),
-    )
-    .await
-    .expect("RPC loser reached its log request")
-    .expect("RPC block wait completed");
+    wait_for_std_signal(squid_request_started, "Squid candidate reached its request").await;
+    wait_for_std_signal(rpc_request_started, "RPC loser reached its log request").await;
+    squid_release
+        .send(())
+        .expect("release Squid candidate after RPC loser is blocked");
     tokio::time::timeout(Duration::from_secs(2), first.wait_until_ready())
         .await
         .expect("Squid winner delivered while RPC response remained blocked")
@@ -3243,7 +3247,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         wallets: RwLock::new(HashMap::new()),
         wallet_registration_gates: Mutex::new(HashMap::new()),
         cancel: loop_cancel.clone(),
-        live_log_task: Mutex::new(None),
+        live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -4119,7 +4123,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         wallets: RwLock::new(HashMap::new()),
         wallet_registration_gates: Mutex::new(HashMap::new()),
         cancel: CancellationToken::new(),
-        live_log_task: Mutex::new(None),
+        live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -4269,7 +4273,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         wallets: RwLock::new(HashMap::new()),
         wallet_registration_gates: Mutex::new(HashMap::new()),
         cancel: CancellationToken::new(),
-        live_log_task: Mutex::new(None),
+        live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -5513,7 +5517,7 @@ async fn chain_shutdown_waits_for_live_log_worker() {
     let task = tokio::spawn(async move {
         let _ = release_rx.await;
     });
-    let live_log_task = Arc::new(tokio::sync::Mutex::new(Some(task)));
+    let live_log_task = Arc::new(std::sync::Mutex::new(Some(task)));
     let waiter_task = tokio::spawn({
         let live_log_task = Arc::clone(&live_log_task);
         async move {
@@ -5529,7 +5533,12 @@ async fn chain_shutdown_waits_for_live_log_worker() {
         .await
         .expect("shutdown wait completed")
         .expect("shutdown task completed");
-    assert!(live_log_task.lock().await.is_none());
+    assert!(
+        live_log_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -6234,7 +6243,7 @@ fn test_chain_service_with_policy(
         wallets: RwLock::new(HashMap::new()),
         wallet_registration_gates: Mutex::new(HashMap::new()),
         cancel: CancellationToken::new(),
-        live_log_task: Mutex::new(None),
+        live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -6369,16 +6378,23 @@ impl GraphqlServer {
         responses: Vec<&'static str>,
         blocked_response: usize,
     ) -> (Self, PathServerBlockControl) {
+        Self::spawn_owned_with_blocked_response(
+            responses.into_iter().map(str::to_owned).collect(),
+            blocked_response,
+        )
+    }
+
+    fn spawn_owned_with_blocked_response(
+        responses: Vec<String>,
+        blocked_response: usize,
+    ) -> (Self, PathServerBlockControl) {
         let (request_started_tx, request_started) = std_mpsc::channel();
         let (release, release_rx) = std_mpsc::channel();
         let block = Arc::new(GraphqlServerBlock {
             request_started: request_started_tx,
             release: std::sync::Mutex::new(release_rx),
         });
-        let server = Self::spawn_controlled(
-            responses.into_iter().map(str::to_owned).collect(),
-            Some((blocked_response, block)),
-        );
+        let server = Self::spawn_controlled(responses, Some((blocked_response, block)));
         (
             server,
             PathServerBlockControl {
@@ -6635,8 +6651,22 @@ fn handle_json_rpc_request(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(headers.as_bytes()).expect("write headers");
-    stream.write_all(body.as_bytes()).expect("write body");
+    let result = stream
+        .write_all(headers.as_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()));
+    if let Err(error) = result {
+        // Hedge losers may close their connection before a blocked fixture response is released.
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            ),
+            "write JSON-RPC response: {error}"
+        );
+    }
 }
 
 fn read_request_path(stream: &mut std::net::TcpStream) -> String {
