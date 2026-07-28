@@ -25,6 +25,8 @@ use crate::poi::{
 pub const POI_CACHE_SNAPSHOT_VERSION: u32 = 1;
 pub const POI_EVENTS_PAGE_SIZE: u64 = 500;
 pub const POI_MERKLETREE_LEAVES_PAGE_SIZE: u64 = 100;
+const POI_BLOCKED_SHIELDS_PAGE_SIZE: u64 = 500;
+const POI_BLOCKED_SHIELDS_LIMIT: usize = 100_000;
 const DENSE_POI_PROOF_MIN_COMMITMENTS_PER_TREE: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +465,17 @@ pub enum PoiCacheError {
         requested: u64,
         actual: usize,
     },
+    #[error(
+        "POI cache blocked Shield response exceeds requested page {start_index}..{end_index}: requested at most {requested}, got {actual}"
+    )]
+    BlockedShieldPageTooLarge {
+        start_index: u64,
+        end_index: u64,
+        requested: u64,
+        actual: usize,
+    },
+    #[error("POI cache blocked Shield snapshot exceeds record limit {limit}")]
+    BlockedShieldLimitExceeded { limit: usize },
     #[error("POI cache event index is not contiguous: expected {expected}, got {actual}")]
     NonContiguousEvent { expected: u64, actual: u64 },
     #[error(
@@ -1194,17 +1207,46 @@ impl PoiCache {
         let blocked_started = Instant::now();
         let previous_blocked_shields_synced = self.snapshot.progress.blocked_shields_synced;
         let previous_blocked_shields = self.snapshot.blocked_shields_by_blinded_commitment.clone();
-        let blocked_shields = client
-            .filtered_blocked_shields(
-                &self.snapshot.identity.txid_version,
-                self.snapshot.identity.chain_type,
-                self.snapshot.identity.chain_id,
-                &self.snapshot.identity.list_key,
-                None,
-            )
-            .await?;
-        for blocked_shield in &blocked_shields {
-            verify_blocked_shield(blocked_shield, &self.snapshot.identity.list_key.0)?;
+        let requested_blocked_shield_count =
+            usize::try_from(POI_BLOCKED_SHIELDS_PAGE_SIZE).unwrap_or(usize::MAX);
+        let mut blocked_shields = Vec::new();
+        let mut blocked_start_index = 0_u64;
+        loop {
+            let blocked_end_index = blocked_start_index
+                .checked_add(POI_BLOCKED_SHIELDS_PAGE_SIZE)
+                .ok_or(PoiCacheError::RangeOverflow)?;
+            let page = client
+                .blocked_shields(
+                    &self.snapshot.identity.txid_version,
+                    self.snapshot.identity.chain_type,
+                    self.snapshot.identity.chain_id,
+                    &self.snapshot.identity.list_key,
+                    blocked_start_index,
+                    blocked_end_index,
+                )
+                .await?;
+            if page.len() > requested_blocked_shield_count {
+                return Err(PoiCacheError::BlockedShieldPageTooLarge {
+                    start_index: blocked_start_index,
+                    end_index: blocked_end_index,
+                    requested: POI_BLOCKED_SHIELDS_PAGE_SIZE,
+                    actual: page.len(),
+                });
+            }
+            if blocked_shields.len().saturating_add(page.len()) > POI_BLOCKED_SHIELDS_LIMIT {
+                return Err(PoiCacheError::BlockedShieldLimitExceeded {
+                    limit: POI_BLOCKED_SHIELDS_LIMIT,
+                });
+            }
+            for blocked_shield in &page {
+                verify_blocked_shield(blocked_shield, &self.snapshot.identity.list_key.0)?;
+            }
+            let returned = page.len();
+            blocked_shields.extend(page);
+            if returned < requested_blocked_shield_count {
+                break;
+            }
+            blocked_start_index = blocked_end_index;
         }
         outcome.blocked_shields = self.replace_blocked_shields(&blocked_shields)?;
         let blocked_shields_changed = (!previous_blocked_shields_synced
@@ -1971,6 +2013,46 @@ mod tests {
         assert_eq!(requests[2]["params"]["startIndex"], 0);
         assert_eq!(requests[2]["params"]["endIndex"], 2);
         assert!(requests[3]["params"].get("bloomFilterSerialized").is_none());
+        assert_eq!(requests[3]["params"]["startIndex"], 0);
+        assert_eq!(requests[3]["params"]["endIndex"], 500);
+    }
+
+    #[tokio::test]
+    async fn sync_collects_complete_paginated_blocked_shield_snapshot() {
+        let valid_commitment = FixedBytes::from([0x22; 32]);
+        let blocked_shields = (1_u64..=501)
+            .map(|index| blocked(FixedBytes::from(U256::from(index).to_be_bytes::<32>())))
+            .collect::<Vec<_>>();
+        let target = FixedBytes::from(U256::from(501).to_be_bytes::<32>());
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, valid_commitment)])),
+            json_rpc_result(&json!([hex::encode_prefixed(valid_commitment)])),
+            json_rpc_result(&json!(&blocked_shields[..500])),
+            json_rpc_result(&json!(&blocked_shields[500..])),
+        ]);
+        let mut cache = PoiCache::new(identity());
+
+        let outcome = cache
+            .sync_with_page_sizes(&PoiRpcClient::new(mock.url.clone()), 2, 2)
+            .await
+            .expect("sync paginated blocked Shield snapshot");
+
+        assert_eq!(outcome.blocked_shields, 501);
+        assert_eq!(cache.status(&valid_commitment), PoiStatus::Valid);
+        assert_eq!(cache.status(&target), PoiStatus::ShieldBlocked);
+
+        let requests = [
+            request_json(&mock),
+            request_json(&mock),
+            request_json(&mock),
+            request_json(&mock),
+        ];
+        assert_eq!(requests[2]["method"], "ppoi_blocked_shields");
+        assert_eq!(requests[2]["params"]["startIndex"], 0);
+        assert_eq!(requests[2]["params"]["endIndex"], 500);
+        assert_eq!(requests[3]["method"], "ppoi_blocked_shields");
+        assert_eq!(requests[3]["params"]["startIndex"], 500);
+        assert_eq!(requests[3]["params"]["endIndex"], 1000);
     }
 
     #[tokio::test]
