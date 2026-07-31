@@ -120,6 +120,19 @@ pub struct CompositeUnshieldPlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct MixedPrivateActionPlan {
+    pub call: TransactionCall,
+    pub inputs: Vec<InputWitness>,
+    pub outputs: Vec<Note>,
+    pub chunks: Vec<TransactionPlanChunk>,
+    pub private_outputs: Vec<MixedPrivatePlannedOutput>,
+    pub public_outputs: Vec<MixedPublicPlannedOutput>,
+    pub action_data: Option<ActionData>,
+    pub selected_inputs: Vec<SelectedInputIdentity>,
+    pub shape: CompositePlanShape,
+}
+
+#[derive(Debug, Clone)]
 pub struct SendPlan {
     pub call: TransactionCall,
     pub tree_number: u32,
@@ -332,6 +345,7 @@ pub enum CompositeUnshieldLegRole {
     Primary,
     NativeTopUp,
     WrappedNativeOutput,
+    SponsoredWrappedNative,
     Other,
 }
 
@@ -378,6 +392,53 @@ pub struct CompositeUnshieldRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedPrivateSendRole {
+    Primary,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MixedPrivateSend {
+    pub token_address: Address,
+    pub amount: U256,
+    pub recipient: AddressData,
+    pub role: MixedPrivateSendRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelectedInputIdentity {
+    pub tree: u32,
+    pub position: u64,
+}
+
+impl SelectedInputIdentity {
+    #[must_use]
+    pub const fn from_utxo(utxo: &Utxo) -> Self {
+        Self {
+            tree: utxo.tree,
+            position: utxo.position,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedPrivateActionRebuildConstraint {
+    pub selected_inputs: Vec<SelectedInputIdentity>,
+    pub expected_shape: CompositePlanShape,
+}
+
+#[derive(Debug, Clone)]
+pub struct MixedPrivateActionRequest {
+    pub private_sends: Vec<MixedPrivateSend>,
+    pub public_unshields: Vec<CompositeUnshieldLeg>,
+    pub relay_actions: Option<CompositeRelayActions>,
+    pub min_gas_price: u128,
+    pub verify_proof: bool,
+    pub spend_up_to: bool,
+    pub rebuild: Option<MixedPrivateActionRebuildConstraint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositePlanShape {
     pub transaction_count: usize,
     pub input_count: usize,
@@ -385,6 +446,12 @@ pub struct CompositePlanShape {
     pub public_output_count: usize,
     pub relay_call_count: usize,
     pub uses_relay_adapt: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedPrivateActionPreview {
+    pub selected_inputs: Vec<SelectedInputIdentity>,
+    pub shape: CompositePlanShape,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,6 +474,55 @@ pub struct CompositeUnshieldPlannedOutput {
     pub recipient: CompositeUnshieldRecipient,
     pub role: CompositeUnshieldLegRole,
     pub note: Note,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedPrivateOutputRole {
+    Recipient(MixedPrivateSendRole),
+    Change,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedPrivateOutputSource {
+    Send(usize),
+    PublicUnshield(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct MixedPrivatePlannedOutput {
+    pub source: MixedPrivateOutputSource,
+    pub transaction_index: usize,
+    pub output_index: usize,
+    pub token_address: Address,
+    pub amount: U256,
+    pub role: MixedPrivateOutputRole,
+    pub note: Note,
+}
+
+#[derive(Debug, Clone)]
+pub struct MixedPublicPlannedOutput {
+    pub unshield_index: usize,
+    pub transaction_index: usize,
+    pub output_index: usize,
+    pub token_address: Address,
+    pub amount: U256,
+    pub recipient: CompositeUnshieldRecipient,
+    pub role: CompositeUnshieldLegRole,
+    pub note: Note,
+}
+
+impl MixedPrivatePlannedOutput {
+    #[must_use]
+    pub const fn persist_for_pending_output_poi(&self) -> bool {
+        true
+    }
+}
+
+impl MixedPublicPlannedOutput {
+    #[must_use]
+    pub const fn persist_for_pending_output_poi(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,7 +627,8 @@ impl CompositeRelayActionToken {
 }
 
 impl CompositeRelayActions {
-    pub(super) fn action_data(
+    /// Build canonical require-success action data for these `RelayAdapt` calls.
+    pub fn action_data(
         &self,
         relay_adapt_contract: Address,
         random: FixedBytes<31>,

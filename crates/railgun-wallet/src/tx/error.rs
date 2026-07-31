@@ -4,6 +4,8 @@ use thiserror::Error;
 
 use crate::prover::ProverError;
 
+use super::{CompositePlanShape, SelectedInputIdentity};
+
 #[derive(Debug, Error)]
 pub enum BuildError {
     #[error("no matching utxos for amount. max immediately spendable: {0}")]
@@ -24,6 +26,8 @@ pub enum BuildError {
     MissingActionData,
     #[error("composite unshield request must include at least one leg")]
     EmptyCompositeUnshieldRequest,
+    #[error("mixed private action request must include a private send or public unshield")]
+    EmptyMixedPrivateActionRequest,
     #[error("RelayAdapt composite legs require at least one RelayAdapt action")]
     MissingCompositeRelayActions,
     #[error(
@@ -32,6 +36,22 @@ pub enum BuildError {
     TooManyBatchTransactions { requested: usize, max: usize },
     #[error("RelayAdapt action amount must be non-zero")]
     InvalidRelayAdaptActionAmount,
+    #[error("pinned input is duplicated at tree {tree} position {position}")]
+    DuplicatePinnedInput { tree: u32, position: u64 },
+    #[error("pinned input is unavailable at tree {tree} position {position}")]
+    PinnedInputUnavailable { tree: u32, position: u64 },
+    #[error("pinned inputs cannot fund the mixed action. max immediately spendable: {0}")]
+    PinnedInputsInsufficient(U256),
+    #[error("mixed action selected inputs differ from the pinned identities")]
+    PinnedInputsChanged {
+        expected: Vec<SelectedInputIdentity>,
+        actual: Vec<SelectedInputIdentity>,
+    },
+    #[error("mixed action plan shape changed from {expected:?} to {actual:?}")]
+    CompositePlanShapeChanged {
+        expected: CompositePlanShape,
+        actual: CompositePlanShape,
+    },
     #[error("missing merkle proof for tree {tree} position {position}")]
     MissingProof { tree: u32, position: u64 },
     #[error("min gas price exceeds uint72: {0}")]
