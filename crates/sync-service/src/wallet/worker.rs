@@ -134,6 +134,9 @@ async fn mark_local_pending_spent(
                         existing.tx_hash = tx_hash;
                         existing.block_timestamp = Some(now);
                         marked = true;
+                    } else if tx_hash.is_some() && existing.block_timestamp != Some(now) {
+                        existing.block_timestamp = Some(now);
+                        marked = true;
                     }
                     continue;
                 }
@@ -10577,6 +10580,9 @@ mod tests {
         assert_eq!(marked.utxos.len(), 1);
         assert!(marked.revision > initial_revision);
         assert_eq!(marked.pending_overlay.local_pending_spent.len(), 1);
+        let initial_block_timestamp = marked.pending_overlay.local_pending_spent[0]
+            .block_timestamp
+            .expect("submitted lock timestamp");
         assert_eq!(
             marked.pending_overlay.local_pending_spent[0].tx_hash,
             Some(tx_hash)
@@ -10593,6 +10599,22 @@ mod tests {
                 .expect("duplicate mark view")
                 .revision,
             marked.revision
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            handle
+                .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), Some(tx_hash))
+                .await,
+            Ok(WalletPendingSpentMarkOutcome::Marked),
+            "a submitted same-hash lock renews its expiry timestamp"
+        );
+        let renewed = handle.current_snapshot().expect("renewed mark view");
+        assert!(renewed.revision > marked.revision);
+        assert!(
+            renewed.pending_overlay.local_pending_spent[0]
+                .block_timestamp
+                .is_some_and(|timestamp| timestamp > initial_block_timestamp),
+            "renewal must advance the stored expiry timestamp"
         );
 
         let missing = test_wallet_utxo(106, 99);
