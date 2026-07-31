@@ -562,7 +562,7 @@ async fn wallet_lag_fallback_candidates(
             state.update_last_scanned(last_scanned, now);
 
             if !state.should_try_indexed_tail_fallback(
-                service.chain.chain_id,
+                service.chain.block_time,
                 from_block,
                 target_block,
                 now,
@@ -993,7 +993,7 @@ pub(super) fn spawn_backfill_loop(
                         return None;
                     }
                     if cursor.should_try_indexed_tail_fallback(
-                        service.chain.chain_id,
+                        service.chain.block_time,
                         now,
                         INDEXED_TAIL_FALLBACK_MIN_STALL,
                         INDEXED_TAIL_FALLBACK_COOLDOWN,

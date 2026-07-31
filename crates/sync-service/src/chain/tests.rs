@@ -53,9 +53,9 @@ use super::{
     Transact, WalletIndexedCatchUpStatusGuard, WalletStartupSyncError, WalletWorkerServices,
     artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
     should_hedge_wallet_startup, spawn_backfill_loop, squid_tail_target_after_artifact,
-    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_finish_result_removes_cursor,
-    wallet_finish_retry_request, wallet_remote_target_before_cached_suffix,
-    wallet_reorg_backfill_from_block, wallet_startup_warm_from_block, wallet_sync_target,
+    wallet_backfill_from_block, wallet_finish_result_removes_cursor, wallet_finish_retry_request,
+    wallet_remote_target_before_cached_suffix, wallet_reorg_backfill_from_block,
+    wallet_startup_warm_from_block, wallet_sync_target,
 };
 use super::{LocalPoiQueryUnavailable, LocalPoiRootValidation, LocalPoiStatusLookup};
 use crate::SyncManager;
@@ -435,6 +435,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         legacy_shield_block: 0,
         block_range: 100,
         indexed_wallet_block_range: 100,
+        block_time: Duration::from_secs(12),
         poll_interval: Duration::from_millis(1),
         finality_depth: 0,
         quick_sync_endpoint: None,
@@ -2715,11 +2716,15 @@ async fn active_backfill_ignores_stale_replacement_request() {
 }
 
 #[test]
-fn wallet_tail_fallback_thresholds_are_chain_specific() {
-    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(1), 10);
-    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(56), 15);
-    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(137), 22);
-    assert_eq!(wallet_tail_fallback_lag_threshold_blocks(42161), 45);
+fn wallet_tail_fallback_threshold_uses_ten_blocks_or_45_seconds() {
+    assert_eq!(
+        wallet_tail_fallback_lag_threshold_blocks(Duration::from_secs(12)),
+        10
+    );
+    assert_eq!(
+        wallet_tail_fallback_lag_threshold_blocks(Duration::from_millis(250)),
+        180
+    );
 }
 
 #[test]
@@ -2728,7 +2733,7 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
     let (sender, _receiver) = mpsc::channel(1);
     let mut cursor = WalletBackfill::new(
         100,
-        160,
+        279,
         true,
         100,
         None,
@@ -2737,12 +2742,15 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
             .expect("test instant supports 20 second subtraction"),
     );
 
-    assert_eq!(
-        wallet_backfill_lag_blocks(cursor.from_block, cursor.target_block),
-        61
-    );
+    assert!(!cursor.should_try_indexed_tail_fallback(
+        Duration::from_millis(250),
+        now,
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_mins(1),
+    ));
+    cursor.target_block = 280;
     assert!(cursor.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         now,
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -2750,21 +2758,22 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
 
     cursor.mark_indexed_tail_attempt(now);
     assert!(!cursor.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         now + std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
     ));
     assert!(cursor.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         now + std::time::Duration::from_mins(1),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
     ));
 
     cursor.mark_progress(150, now + std::time::Duration::from_mins(1));
+    cursor.target_block = 331;
     assert!(!cursor.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         now + std::time::Duration::from_secs(70),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -2780,10 +2789,18 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
             .expect("test instant supports 20 second subtraction"),
     );
 
-    assert!(state.should_try_indexed_tail_fallback(
-        42161,
+    assert!(!state.should_try_indexed_tail_fallback(
+        Duration::from_millis(250),
         101,
-        160,
+        280,
+        now,
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_mins(1),
+    ));
+    assert!(state.should_try_indexed_tail_fallback(
+        Duration::from_millis(250),
+        101,
+        281,
         now,
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -2791,9 +2808,9 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
 
     state.mark_indexed_tail_attempt(now);
     assert!(!state.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         101,
-        160,
+        281,
         now + std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -2801,18 +2818,18 @@ fn ready_wallet_tail_fallback_state_tracks_progress_and_cooldown() {
 
     state.update_last_scanned(130, now + std::time::Duration::from_secs(30));
     assert!(!state.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         131,
-        190,
+        311,
         now + std::time::Duration::from_secs(40),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
     ));
 
     assert!(state.should_try_indexed_tail_fallback(
-        42161,
+        Duration::from_millis(250),
         131,
-        190,
+        311,
         now + std::time::Duration::from_secs(90),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -3212,6 +3229,7 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
         legacy_shield_block: 0,
         block_range: 100,
         indexed_wallet_block_range: 100,
+        block_time: Duration::from_secs(12),
         poll_interval: Duration::from_millis(1),
         finality_depth: 0,
         quick_sync_endpoint: None,
@@ -4091,6 +4109,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         legacy_shield_block: 0,
         block_range: 100,
         indexed_wallet_block_range: 100,
+        block_time: Duration::from_secs(12),
         poll_interval: Duration::from_millis(1),
         finality_depth: 0,
         quick_sync_endpoint: Some(squid.url.clone()),
@@ -4241,6 +4260,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         legacy_shield_block: 0,
         block_range: 100,
         indexed_wallet_block_range: 100,
+        block_time: Duration::from_secs(12),
         poll_interval: Duration::from_millis(1),
         finality_depth: 0,
         quick_sync_endpoint: Some(Url::parse("http://127.0.0.1:1").expect("squid url")),
@@ -6010,6 +6030,7 @@ fn test_chain_config(
         legacy_shield_block: 0,
         block_range: 100,
         indexed_wallet_block_range: 100,
+        block_time: Duration::from_secs(12),
         poll_interval: Duration::from_millis(1),
         finality_depth: 0,
         quick_sync_endpoint: None,

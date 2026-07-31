@@ -1418,6 +1418,7 @@ mod tests {
             legacy_shield_block: 0,
             block_range: 100,
             indexed_wallet_block_range: 100,
+            block_time: Duration::from_secs(12),
             poll_interval: Duration::from_mins(1),
             finality_depth: 0,
             quick_sync_endpoint: None,

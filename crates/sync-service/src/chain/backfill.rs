@@ -58,7 +58,7 @@ impl WalletTailFallbackState {
 
     pub(super) fn should_try_indexed_tail_fallback(
         &self,
-        chain_id: u64,
+        block_time: Duration,
         from_block: u64,
         target_block: u64,
         now: Instant,
@@ -69,7 +69,7 @@ impl WalletTailFallbackState {
             return false;
         }
         let lag_blocks = wallet_backfill_lag_blocks(from_block, target_block);
-        if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(chain_id) {
+        if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(block_time) {
             return false;
         }
         if now.duration_since(self.last_advanced_at) < min_stall {
@@ -195,7 +195,7 @@ impl WalletBackfill {
 
     pub(super) fn should_try_indexed_tail_fallback(
         &self,
-        chain_id: u64,
+        block_time: Duration,
         now: Instant,
         min_stall: Duration,
         cooldown: Duration,
@@ -207,7 +207,7 @@ impl WalletBackfill {
             return false;
         }
         let lag_blocks = wallet_backfill_lag_blocks(self.from_block, self.target_block);
-        if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(chain_id) {
+        if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(block_time) {
             return false;
         }
         if now.duration_since(self.last_advanced_at) < min_stall {
@@ -226,24 +226,14 @@ pub(super) const fn wallet_backfill_lag_blocks(from_block: u64, target_block: u6
     }
 }
 
-pub(super) const fn wallet_tail_fallback_block_time_secs(chain_id: u64) -> u64 {
-    match chain_id {
-        56 => 3,
-        137 => 2,
-        42161 => 1,
-        _ => 12,
-    }
+pub(super) fn wallet_tail_fallback_stale_timeout(block_time: Duration) -> Duration {
+    block_time.saturating_mul(10).max(Duration::from_secs(45))
 }
 
-pub(super) const fn wallet_tail_fallback_stale_timeout_secs(chain_id: u64) -> u64 {
-    let timeout = wallet_tail_fallback_block_time_secs(chain_id) * 10;
-    if timeout < 45 { 45 } else { timeout }
-}
-
-pub(super) const fn wallet_tail_fallback_lag_threshold_blocks(chain_id: u64) -> u64 {
-    let block_time = wallet_tail_fallback_block_time_secs(chain_id);
-    let threshold = wallet_tail_fallback_stale_timeout_secs(chain_id) / block_time;
-    if threshold < 2 { 2 } else { threshold }
+pub(super) fn wallet_tail_fallback_lag_threshold_blocks(block_time: Duration) -> u64 {
+    let threshold =
+        wallet_tail_fallback_stale_timeout(block_time).as_nanos() / block_time.as_nanos().max(1);
+    u64::try_from(threshold).unwrap_or(u64::MAX).max(2)
 }
 
 impl ChainService {
@@ -765,6 +755,7 @@ mod tests {
             legacy_shield_block: 1,
             block_range: 100,
             indexed_wallet_block_range: 100,
+            block_time: Duration::from_secs(12),
             poll_interval: Duration::from_secs(1),
             finality_depth: 1,
             quick_sync_endpoint: None,
