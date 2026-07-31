@@ -23,6 +23,7 @@ pub struct QueryRpcPool {
     providers: Vec<ProviderEntry>,
     cooldown: Duration,
     cooldowns: Mutex<HashMap<usize, Instant>>,
+    http_client: Option<reqwest::Client>,
 }
 
 impl QueryRpcPool {
@@ -39,6 +40,7 @@ impl QueryRpcPool {
             providers,
             cooldown,
             cooldowns: Mutex::new(HashMap::new()),
+            http_client: None,
         }
     }
 
@@ -60,6 +62,7 @@ impl QueryRpcPool {
             providers,
             cooldown,
             cooldowns: Mutex::new(HashMap::new()),
+            http_client: Some(client),
         }
     }
 
@@ -91,6 +94,11 @@ impl QueryRpcPool {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.providers.is_empty()
+    }
+
+    #[must_use]
+    pub const fn http_client(&self) -> Option<&reqwest::Client> {
+        self.http_client.as_ref()
     }
 
     #[must_use]

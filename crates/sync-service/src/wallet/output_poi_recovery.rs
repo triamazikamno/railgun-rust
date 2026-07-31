@@ -1414,7 +1414,11 @@ pub(super) async fn fetch_transaction_input(
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     };
-    let client = http_client.cloned().unwrap_or_else(reqwest::Client::new);
+    let client = rpcs
+        .http_client()
+        .or(http_client)
+        .cloned()
+        .unwrap_or_else(reqwest::Client::new);
     let tx_hash_hex = hex::encode_prefixed(tx_hash);
     let response = client
         .post(provider.url.clone())

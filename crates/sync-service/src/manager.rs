@@ -230,6 +230,22 @@ impl SyncManager {
     }
 
     pub async fn add_chain(&self, cfg: ChainConfig) -> Result<Arc<ChainService>, SyncManagerError> {
+        self.add_chain_inner(cfg, None).await
+    }
+
+    pub async fn add_chain_with_rpc_http_client(
+        &self,
+        cfg: ChainConfig,
+        rpc_http_client: reqwest::Client,
+    ) -> Result<Arc<ChainService>, SyncManagerError> {
+        self.add_chain_inner(cfg, Some(rpc_http_client)).await
+    }
+
+    async fn add_chain_inner(
+        &self,
+        cfg: ChainConfig,
+        rpc_http_client: Option<reqwest::Client>,
+    ) -> Result<Arc<ChainService>, SyncManagerError> {
         let key = ChainKey {
             chain_id: cfg.chain_id,
             contract: cfg.contract,
@@ -314,6 +330,7 @@ impl SyncManager {
                         cfg.clone(),
                         self.poi_policy.clone(),
                         lease,
+                        rpc_http_client.clone(),
                     );
                     tokio::pin!(prepare);
                     let prepared = tokio::select! {

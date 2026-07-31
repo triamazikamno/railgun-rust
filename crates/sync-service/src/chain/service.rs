@@ -769,6 +769,7 @@ impl ChainService {
         chain: ChainConfig,
         poi_policy: GlobalPoiPolicy,
         runtime_lease: DbRuntimeLease,
+        rpc_http_client: Option<reqwest::Client>,
     ) -> Result<PreparedChainService, ChainError> {
         if chain.archive_until_block > 0
             && chain.archive_rpc_url.is_none()
@@ -782,9 +783,12 @@ impl ChainService {
         }
         let archive_provider = match chain.archive_rpc_url.as_ref() {
             Some(url) => Some(
-                build_provider_with_http_client(url, chain.http_client.as_ref())
-                    .await
-                    .map_err(ChainError::ProviderBuild)?,
+                build_provider_with_http_client(
+                    url,
+                    rpc_http_client.as_ref().or(chain.http_client.as_ref()),
+                )
+                .await
+                .map_err(ChainError::ProviderBuild)?,
             ),
             None => None,
         };
