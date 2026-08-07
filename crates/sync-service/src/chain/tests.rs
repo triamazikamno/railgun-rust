@@ -3289,7 +3289,6 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     let wallet_a = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs: Arc::clone(&rpcs),
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -3311,7 +3310,6 @@ async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
     let wallet_b = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs: Arc::clone(&rpcs),
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -4156,7 +4154,6 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs,
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -4312,7 +4309,6 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs,
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -4916,7 +4912,6 @@ async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs,
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -5578,10 +5573,6 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs: Arc::new(QueryRpcPool::new(
-                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                Duration::from_secs(1),
-            )),
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -5708,10 +5699,6 @@ async fn wallet_startup_events_treat_leading_ready_as_success() {
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs: Arc::new(QueryRpcPool::new(
-                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                Duration::from_secs(1),
-            )),
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -5818,10 +5805,6 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs: Arc::new(QueryRpcPool::new(
-                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                Duration::from_secs(1),
-            )),
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -5926,10 +5909,6 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
     let handle = spawn_wallet_worker(
         WalletWorkerServices {
             db: Arc::clone(&db),
-            rpcs: Arc::new(QueryRpcPool::new(
-                vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                Duration::from_secs(1),
-            )),
             http_client: None,
             indexed_artifact_source: None,
             poi_runtime: test_wallet_poi_runtime(),
@@ -6098,7 +6077,6 @@ impl IndexedCatchUpTestContext {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs,
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),

@@ -792,17 +792,6 @@ impl WalletPrivateMutationPermit<'_> {
         }
     }
 
-    pub(super) fn apply_publish_poi_refreshing(
-        &self,
-        _token: &WalletActorApplyToken<'_>,
-        sender: &watch::Sender<bool>,
-        value: bool,
-    ) {
-        if let Err(err) = sender.send(value) {
-            debug!(?err, cache_key = %self.handle.cache_key, "failed to send wallet POI refresh state");
-        }
-    }
-
     pub(super) fn apply_set_reset_generation(
         &self,
         _token: &WalletActorApplyToken<'_>,
@@ -854,16 +843,6 @@ impl WalletPrivateMutationPermit<'_> {
     ) -> Result<(), WalletBackfillRejectReason> {
         self.with_active_apply(|token| {
             self.apply_publish_indexed_catch_up(&token, status);
-        })
-    }
-
-    pub(super) fn publish_poi_refreshing(
-        &self,
-        sender: &watch::Sender<bool>,
-        value: bool,
-    ) -> Result<(), WalletBackfillRejectReason> {
-        self.with_active_apply(|token| {
-            self.apply_publish_poi_refreshing(&token, sender, value);
         })
     }
 

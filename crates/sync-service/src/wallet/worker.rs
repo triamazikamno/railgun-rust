@@ -306,28 +306,29 @@ async fn commit_pending_output_contexts(
     }
 }
 
-async fn publish_poi_refreshing(
+fn publish_poi_refreshing(
     sender: &watch::Sender<bool>,
     value: bool,
     worker_handle: &WalletHandle,
     reset_generation: u64,
     cancel: &CancellationToken,
 ) {
-    let authority = WalletPrivateMutationAuthority::new(worker_handle, reset_generation, cancel);
-    match authority.acquire().await {
-        Ok(permit) => {
-            if let Err(reason) = permit.publish_poi_refreshing(sender, value) {
-                debug!(?reason, cache_key = %worker_handle.cache_key, "wallet POI refresh state publication rejected");
+    if let Err(reason) = worker_handle.with_active_apply(cancel, reset_generation, |_token| {
+        sender.send_if_modified(|current| {
+            if *current == value {
+                false
+            } else {
+                *current = value;
+                true
             }
-        }
-        Err(reason) => {
-            debug!(?reason, cache_key = %worker_handle.cache_key, "wallet POI refresh state publication skipped");
-        }
+        });
+    }) {
+        debug!(?reason, cache_key = %worker_handle.cache_key, "wallet POI refresh state publication skipped");
     }
 }
 
 /// `poi_refreshing` is derived from the maintenance controller phase.
-async fn sync_poi_refreshing_from_controller(
+fn sync_poi_refreshing_from_controller(
     controller: &PoiMaintenanceController,
     sender: &watch::Sender<bool>,
     handle: &WalletHandle,
@@ -339,8 +340,7 @@ async fn sync_poi_refreshing_from_controller(
         handle,
         handle.authority_reset_generation(),
         cancel,
-    )
-    .await;
+    );
 }
 
 fn poi_maintenance_can_start(handle: &WalletHandle) -> bool {
@@ -358,7 +358,7 @@ fn poi_maintenance_credential(handle: &WalletHandle) -> Option<WalletActorCreden
 }
 
 /// Actor entry: coalesce force intent and spawn at most one maintenance job.
-async fn request_poi_maintenance(
+fn request_poi_maintenance(
     controller: &mut PoiMaintenanceController,
     remote_done_tx: &mpsc::Sender<WalletRemoteDone>,
     private_apply: &WalletPrivateApplyClient,
@@ -391,7 +391,7 @@ async fn request_poi_maintenance(
                 "poi maintenance already running; follow-up latched"
             );
         }
-        sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel).await;
+        sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
         return false;
     };
 
@@ -424,12 +424,12 @@ async fn request_poi_maintenance(
         ?spec.key,
         "poi maintenance job started"
     );
-    sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel).await;
+    sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
     true
 }
 
 /// Re-enter after remote job completion: clear phase, maybe start forced follow-up.
-async fn on_poi_maintenance_done(
+fn on_poi_maintenance_done(
     controller: &mut PoiMaintenanceController,
     remote_done_tx: &mpsc::Sender<WalletRemoteDone>,
     private_apply: &WalletPrivateApplyClient,
@@ -449,7 +449,7 @@ async fn on_poi_maintenance_done(
     key: PoiRemoteJobKey,
 ) {
     let force_follow_up = controller.on_job_done(key);
-    sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel).await;
+    sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
     if force_follow_up {
         debug!(
             cache_key = %handle.cache_key,
@@ -473,8 +473,7 @@ async fn on_poi_maintenance_done(
             utxos,
             active_poi_list_keys,
             false, // force already latched in controller
-        )
-        .await;
+        );
     }
 }
 
@@ -2469,8 +2468,7 @@ pub(crate) async fn prepare_wallet_worker(
                         &utxos,
                         &active_poi_list_keys,
                         false,
-                    )
-                    .await;
+                    );
                 }
                 WalletBackfillDoneOutcome::Finished {
                     poi_corpus_revision: poi_corpus_revision_rx
@@ -2670,8 +2668,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 &utxos,
                                 &active_poi_list_keys,
                                 key,
-                            )
-                            .await;
+                            );
                             if !credential.is_current(&worker_handle) {
                                 debug!(
                                     cache_key = %cfg.cache_key,
@@ -2841,8 +2838,7 @@ pub(crate) async fn prepare_wallet_worker(
                         &utxos,
                         &active_poi_list_keys,
                         refresh_request.force_output_poi_recovery,
-                    )
-                    .await;
+                    );
                 }
                 Some(command) = indexed_catch_up_status_rx.recv() => {
                     let authority = WalletPrivateMutationAuthority::new(
@@ -3286,8 +3282,7 @@ pub(crate) async fn prepare_wallet_worker(
                         &utxos,
                         &active_poi_list_keys,
                         false,
-                    )
-                    .await;
+                    );
                 }
                 Some(event) = backfill_rx.recv() => {
                     match event {
@@ -3493,8 +3488,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     &utxos,
                                     &active_poi_list_keys,
                                     false,
-                                )
-                                .await;
+                                );
                             }
                             if let Err(err) = response.send(outcome.result) {
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet scan apply result");
@@ -3943,8 +3937,7 @@ pub(crate) async fn prepare_wallet_worker(
                                             &utxos,
                                             &active_poi_list_keys,
                                             false,
-                                        )
-                                        .await;
+                                        );
                                     }
                                 }
                                 WalletBackfillApplyResult::Rejected {
@@ -4285,6 +4278,59 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(70), interval.tick())
             .await
             .expect("persistent refresh interval should retain its original deadline");
+    }
+
+    #[tokio::test]
+    async fn poi_refresh_projection_does_not_wait_for_authority_lock() {
+        let root_dir = temp_db_root("poi-refresh-projection-lock");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx,
+                public_data_plane: test_public_data_plane(&db),
+            },
+            wallet_config(),
+            1,
+            live_rx,
+            backfill_rx,
+            cancel.clone(),
+            Vec::new(),
+            100,
+        )
+        .await
+        .expect("spawn wallet worker");
+        let (poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
+        let mut controller = PoiMaintenanceController::new();
+        controller
+            .request(
+                false,
+                true,
+                Some(WalletActorCredential::current_for(&handle)),
+            )
+            .expect("start maintenance controller");
+
+        let _authority_guard = handle.authority_lock.lock().await;
+        sync_poi_refreshing_from_controller(&controller, &poi_refreshing_tx, &handle, &cancel);
+        assert!(*poi_refreshing_rx.borrow());
+
+        cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     fn test_public_data_plane(db: &Arc<DbStore>) -> ChainPublicDataPlane {
