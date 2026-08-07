@@ -1896,7 +1896,7 @@ impl ChainService {
         let progress = handle.revalidate_schedulable_progress(progress)?;
         if let Err(err) = self
             .public_data_plane
-            .commit_completed_short_startup_acquisition(
+            .commit_completed_wallet_scan_acquisition(
                 plan.acquisition,
                 &candidate.acquisition_applies,
             )

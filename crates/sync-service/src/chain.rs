@@ -69,7 +69,8 @@ pub(crate) use data_plane::commit_artifact_after_admission;
 pub(crate) use data_plane::{
     ChainPublicDataPlane, ChainPublicDataPlaneCommitGuard, PublicPoiCorpusKey, PublicTxidCacheKey,
     PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest, PublicTxidTransaction,
+    PublicTxidSyncRequest, PublicTxidTransaction, WalletScanAcquisitionCandidate,
+    WalletScanAcquisitionOutcome,
 };
 use forest_db::MerkleForestDbExt;
 use indexed_wallet::{

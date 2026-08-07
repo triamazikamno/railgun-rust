@@ -43,6 +43,7 @@ use super::service::{
 };
 use super::workers::{
     drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
+    reconcile_retained_acquisition,
 };
 use super::{
     ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
@@ -1771,7 +1772,7 @@ async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() 
     );
     service
         .public_data_plane
-        .commit_completed_short_startup_acquisition(
+        .commit_completed_wallet_scan_acquisition(
             PublicScanRange::new(101, 110),
             &candidate.acquisition_applies,
         )
@@ -3526,7 +3527,7 @@ async fn wallet_backfill_loop_rebases_non_contiguous_cursor_to_actor_progress() 
 }
 
 #[tokio::test]
-async fn wallet_backfill_loop_acquires_warm_gap_before_delivering_cached_suffix() {
+async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
     let root_dir = temp_db_root("wallet-backfill-cached-suffix");
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -3536,7 +3537,8 @@ async fn wallet_backfill_loop_acquires_warm_gap_before_delivering_cached_suffix(
     );
     let scope = test_scope();
     let rpc = JsonRpcServer::spawn(vec![
-        serde_json::json!([]),
+        serde_json::json!([rpc_nullifiers_log(scope.railgun_contract, 103)]),
+        rpc_block(103, 1_700_000_103, 0x13),
         rpc_block(105, 1_700_000_105, 0x11),
         serde_json::json!([]),
         rpc_block(110, 1_700_000_110, 0x22),
@@ -3573,6 +3575,29 @@ async fn wallet_backfill_loop_acquires_warm_gap_before_delivering_cached_suffix(
         })
         .await
         .expect("seed cached suffix");
+    for block_number in 200..204 {
+        public_data_plane
+            .record_recent_public_scan_rows(PublicScanRows {
+                range: PublicScanRange::new(block_number, block_number),
+                source: PublicScanSource::Rpc,
+                to_block_hash: Some([0x33; 32]),
+                rows: WalletScanInputRows {
+                    nullifiers: vec![IndexedNullifierInput {
+                        tree_number: 1,
+                        nullifier: U256::from(block_number),
+                        source: UtxoSource {
+                            tx_hash: FixedBytes::from([0x33; 32]),
+                            block_number,
+                            block_timestamp: block_number.saturating_add(1_700_000_000),
+                        },
+                    }],
+                    ..WalletScanInputRows::default()
+                },
+                epoch: public_data_plane.current_epoch(),
+            })
+            .await
+            .expect("seed newer row page");
+    }
     let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
     let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
@@ -3592,13 +3617,13 @@ async fn wallet_backfill_loop_acquires_warm_gap_before_delivering_cached_suffix(
             apply, response, ..
         }) = wallet_rx.recv().await
         else {
-            panic!("cached suffix apply expected");
+            panic!("delivery apply expected");
         };
         assert_eq!((apply.from_block, apply.to_block), (106, 110));
-        assert_eq!(apply.rows.source, PublicScanSource::CachedCoverage);
+        assert_eq!(apply.rows.source, PublicScanSource::Rpc);
         response
             .send(WalletBackfillApplyResult::Committed { committed_to: 110 })
-            .expect("commit cached suffix");
+            .expect("commit delivery apply");
 
         let Some(BackfillEvent::Finish {
             target_block,
@@ -3621,7 +3646,7 @@ async fn wallet_backfill_loop_acquires_warm_gap_before_delivering_cached_suffix(
             110,
             false,
             106,
-            (100, 110),
+            (100, 105),
             test_backfill_driver(wallet_tx, 0, 1),
         ))
         .await
@@ -3631,27 +3656,51 @@ async fn wallet_backfill_loop_acquires_warm_gap_before_delivering_cached_suffix(
         .expect("cached suffix backfill completed")
         .expect("actor response task completed");
 
-    let requests = (0..2)
-        .map(|_| {
+    let mut requests: Vec<String> = Vec::new();
+    while requests
+        .iter()
+        .filter(|request| request.contains("eth_getLogs"))
+        .count()
+        < 2
+    {
+        requests.push(
             rpc.requests
                 .recv_timeout(Duration::from_secs(1))
-                .expect("RPC gap request")
-        })
-        .collect::<Vec<_>>();
+                .expect("RPC backfill request"),
+        );
+    }
     let get_logs = requests
         .iter()
-        .find(|request| request.contains("eth_getLogs"))
-        .expect("eth_getLogs request");
-    assert!(get_logs.contains(r#""fromBlock":"0x64""#));
-    assert!(get_logs.contains(r#""toBlock":"0x69""#));
-    assert!(rpc.requests.try_recv().is_err());
+        .filter(|request| request.contains("eth_getLogs"))
+        .collect::<Vec<_>>();
+    assert_eq!(get_logs.len(), 2);
+    assert_eq!(
+        get_logs
+            .iter()
+            .filter(|request| request.contains(r#""fromBlock":"0x64""#))
+            .count(),
+        1,
+        "warm acquisition range must be fetched exactly once"
+    );
+    assert!(
+        get_logs
+            .iter()
+            .any(|request| request.contains(r#""fromBlock":"0x64""#)
+                && request.contains(r#""toBlock":"0x69""#))
+    );
+    assert!(
+        get_logs
+            .iter()
+            .any(|request| request.contains(r#""fromBlock":"0x6a""#)
+                && request.contains(r#""toBlock":"0x6e""#))
+    );
     assert!(
         service
             .public_data_plane
-            .cached_wallet_scan_suffix(100, 110)
+            .cached_wallet_scan_exact(106, 110)
             .await
             .is_some(),
-        "successful scheduler acquisition must retain the full warm window"
+        "successful delivery must remain replayable"
     );
 
     cancel.cancel();
@@ -4066,6 +4115,322 @@ async fn wallet_backfill_loop_reacquires_full_window_after_stale_cached_delivery
             .is_some(),
         "retry must restore the full acquisition window",
     );
+
+    cancel.cancel();
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn retained_acquisition_reconciliation_restores_missing_cache_without_moving_delivery_cursor()
+{
+    let root_dir = temp_db_root("retained-acquisition-reconciliation");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc = JsonRpcServer::spawn(Vec::new());
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+    let (sender, _receiver) = mpsc::channel(1);
+    let mut cursor = WalletBackfill::new(
+        106,
+        110,
+        false,
+        106,
+        Some((100, 105)),
+        test_backfill_driver(sender, 0, 1),
+        std::time::Instant::now(),
+    );
+    let apply = WalletScanApply::rows(
+        100,
+        105,
+        WalletScanInputRows::default(),
+        public_data_plane.begin_public_scan_read(),
+        PublicScanSource::Rpc,
+        Some([0x11; 32]),
+    );
+    public_data_plane
+        .commit_completed_wallet_scan_acquisition(PublicScanRange::new(100, 105), &[apply])
+        .await
+        .expect("commit retained acquisition");
+    cursor.finish_retained_acquisition();
+    let mut cursors = HashMap::from([(String::from("test"), cursor)]);
+
+    public_data_plane
+        .invalidate_public_scan_coverage_from(100)
+        .await;
+    assert!(!reconcile_retained_acquisition(&service, &mut cursors, "test").await);
+
+    let cursor = cursors.get("test").expect("cursor remains active");
+    assert_eq!(cursor.acquisition_range(), Some((100, 105)));
+    assert_eq!(cursor.retained_acquisition_range(), Some((100, 105)));
+    assert_eq!(cursor.from_block, 106);
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn retained_acquisition_reconciliation_consumes_one_restore_budget_per_range() {
+    let root_dir = temp_db_root("retained-acquisition-restoration-budget");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc = JsonRpcServer::spawn(Vec::new());
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+    let (sender, _receiver) = mpsc::channel(1);
+    let ranges = [(100, 105), (200, 205)];
+    let mut cursors = HashMap::from([
+        (
+            String::from("first"),
+            WalletBackfill::new(
+                106,
+                110,
+                false,
+                106,
+                Some(ranges[0]),
+                test_backfill_driver(sender.clone(), 0, 1),
+                std::time::Instant::now(),
+            ),
+        ),
+        (
+            String::from("second"),
+            WalletBackfill::new(
+                206,
+                210,
+                false,
+                206,
+                Some(ranges[1]),
+                test_backfill_driver(sender, 0, 2),
+                std::time::Instant::now(),
+            ),
+        ),
+    ]);
+
+    for (from_block, to_block) in ranges {
+        let apply = WalletScanApply::rows(
+            from_block,
+            to_block,
+            WalletScanInputRows::default(),
+            public_data_plane.begin_public_scan_read(),
+            PublicScanSource::Rpc,
+            Some([0x11; 32]),
+        );
+        public_data_plane
+            .commit_completed_wallet_scan_acquisition(
+                PublicScanRange::new(from_block, to_block),
+                &[apply],
+            )
+            .await
+            .expect("commit retained acquisition");
+    }
+    for cursor in cursors.values_mut() {
+        cursor.finish_retained_acquisition();
+    }
+
+    public_data_plane
+        .invalidate_public_scan_coverage_from(100)
+        .await;
+    assert!(!reconcile_retained_acquisition(&service, &mut cursors, "first").await);
+    assert!(!reconcile_retained_acquisition(&service, &mut cursors, "second").await);
+    assert_eq!(cursors["first"].acquisition_range(), Some(ranges[0]));
+    assert_eq!(cursors["second"].acquisition_range(), Some(ranges[1]));
+    assert_eq!(cursors["first"].from_block, 106);
+    assert_eq!(cursors["second"].from_block, 206);
+
+    for (from_block, to_block) in ranges {
+        let apply = WalletScanApply::rows(
+            from_block,
+            to_block,
+            WalletScanInputRows::default(),
+            public_data_plane.begin_public_scan_read(),
+            PublicScanSource::Rpc,
+            Some([0x22; 32]),
+        );
+        public_data_plane
+            .commit_completed_wallet_scan_acquisition(
+                PublicScanRange::new(from_block, to_block),
+                &[apply],
+            )
+            .await
+            .expect("recommit retained acquisition");
+    }
+    for cursor in cursors.values_mut() {
+        cursor.finish_retained_acquisition();
+    }
+
+    public_data_plane
+        .invalidate_public_scan_coverage_from(100)
+        .await;
+    assert!(reconcile_retained_acquisition(&service, &mut cursors, "first").await);
+    assert!(reconcile_retained_acquisition(&service, &mut cursors, "second").await);
+    for (key, from_block) in [("first", 106), ("second", 206)] {
+        let cursor = &cursors[key];
+        assert_eq!(
+            cursor.acquisition_range(),
+            None,
+            "{key} acquisition abandoned"
+        );
+        assert_eq!(
+            cursor.retained_acquisition_range(),
+            None,
+            "{key} retained provenance abandoned"
+        );
+        assert_eq!(
+            cursor.from_block, from_block,
+            "{key} delivery cursor rewound"
+        );
+    }
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_backfill_loop_abandons_malformed_warm_gap_before_delivering_tail() {
+    let root_dir = temp_db_root("wallet-backfill-malformed-warm-gap");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let mut malformed_log = rpc_nullifiers_log(scope.railgun_contract, 103);
+    malformed_log["data"] = serde_json::json!("0x01");
+    let rpc = JsonRpcServer::spawn(vec![
+        serde_json::json!([malformed_log]),
+        rpc_block(103, 1_700_000_103, 0x13),
+        rpc_block(105, 1_700_000_105, 0x11),
+        serde_json::json!([]),
+        rpc_block(110, 1_700_000_110, 0x22),
+    ]);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.block_range = 100;
+    chain.poll_interval = Duration::from_millis(1);
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (_safe_head_tx, safe_head_rx) = watch::channel(110);
+    let cancel = CancellationToken::new();
+    spawn_backfill_loop(
+        Arc::clone(&service),
+        backfill_request_rx,
+        Arc::clone(&rpcs),
+        None,
+        safe_head_rx,
+        cancel.clone(),
+    );
+
+    let (wallet_tx, mut wallet_rx) = mpsc::channel(4);
+    let actor = tokio::spawn(async move {
+        let Some(BackfillEvent::Apply {
+            apply, response, ..
+        }) = wallet_rx.recv().await
+        else {
+            panic!("delivery apply expected");
+        };
+        assert_eq!((apply.from_block, apply.to_block), (106, 110));
+        response
+            .send(WalletBackfillApplyResult::Committed { committed_to: 110 })
+            .expect("commit delivery apply");
+        let Some(BackfillEvent::Finish {
+            target_block,
+            response,
+            ..
+        }) = wallet_rx.recv().await
+        else {
+            panic!("wallet backfill finish expected");
+        };
+        assert_eq!(target_block, 110);
+        response
+            .send(WalletBackfillFinishResult::Ready { committed_to: 110 })
+            .expect("finish malformed warm backfill");
+    });
+
+    backfill_request_tx
+        .send(BackfillRequest::add_with_acquisition(
+            "test",
+            106,
+            110,
+            false,
+            106,
+            (100, 105),
+            test_backfill_driver(wallet_tx, 0, 1),
+        ))
+        .await
+        .expect("send malformed warm backfill request");
+    tokio::time::timeout(Duration::from_secs(2), actor)
+        .await
+        .expect("malformed warm backfill completed")
+        .expect("actor response task completed");
+
+    let mut requests: Vec<String> = Vec::new();
+    while requests
+        .iter()
+        .filter(|request| request.contains("eth_getLogs"))
+        .count()
+        < 2
+    {
+        requests.push(
+            rpc.requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("RPC backfill request"),
+        );
+    }
+    let get_logs = requests
+        .iter()
+        .filter(|request| request.contains("eth_getLogs"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        get_logs
+            .iter()
+            .filter(|request| request.contains(r#""fromBlock":"0x64""#))
+            .count(),
+        1,
+        "malformed warm acquisition must be fetched at most once"
+    );
+    assert!(get_logs.iter().any(|request| {
+        request.contains(r#""fromBlock":"0x64""#) && request.contains(r#""toBlock":"0x69""#)
+    }));
+    assert!(get_logs.iter().any(|request| {
+        request.contains(r#""fromBlock":"0x6a""#) && request.contains(r#""toBlock":"0x6e""#)
+    }));
 
     cancel.cancel();
     drop(service);

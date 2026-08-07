@@ -15,6 +15,8 @@ pub(super) struct WalletBackfill {
     pub(super) follow_safe_head: bool,
     pub(super) progress_start_block: u64,
     acquisition_range: Option<(u64, u64)>,
+    retained_acquisition_range: Option<(u64, u64)>,
+    retained_acquisition_restoration_used: bool,
     pub(super) driver: WalletBackfillDriver,
     pub(super) last_advanced_at: Instant,
     pub(super) last_indexed_tail_attempt_at: Option<Instant>,
@@ -96,6 +98,8 @@ impl WalletBackfill {
             follow_safe_head,
             progress_start_block,
             acquisition_range,
+            retained_acquisition_range: None,
+            retained_acquisition_restoration_used: false,
             driver,
             last_advanced_at: now,
             last_indexed_tail_attempt_at: None,
@@ -118,6 +122,10 @@ impl WalletBackfill {
         self.acquisition_range
     }
 
+    pub(super) const fn retained_acquisition_range(&self) -> Option<(u64, u64)> {
+        self.retained_acquisition_range
+    }
+
     pub(super) const fn fetch_target_block(&self) -> u64 {
         match self.acquisition_range {
             Some((_, to_block)) => to_block,
@@ -125,8 +133,35 @@ impl WalletBackfill {
         }
     }
 
-    pub(super) const fn finish_acquisition(&mut self) {
+    pub(super) fn finish_retained_acquisition(&mut self) {
+        let range = self.acquisition_range;
+        if range != self.retained_acquisition_range || range.is_none() {
+            self.retained_acquisition_restoration_used = false;
+        }
+        self.retained_acquisition_range = range;
         self.acquisition_range = None;
+    }
+
+    pub(super) const fn abandon_acquisition(&mut self) {
+        self.acquisition_range = None;
+        self.retained_acquisition_range = None;
+        self.retained_acquisition_restoration_used = false;
+    }
+
+    pub(super) fn restore_retained_acquisition(&mut self) -> bool {
+        if let Some(range) = self.retained_acquisition_range {
+            if self.acquisition_range == Some(range) {
+                return true;
+            }
+            if self.retained_acquisition_restoration_used {
+                return false;
+            }
+            self.acquisition_range = Some(range);
+            self.retained_acquisition_restoration_used = true;
+            self.last_advanced_at = Instant::now();
+            return true;
+        }
+        false
     }
 
     pub(super) const fn can_finish(&self) -> bool {
