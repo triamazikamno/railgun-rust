@@ -65,6 +65,10 @@ fn indexed_transact_commitment_decrypts_wallet_utxo() {
         hash: note.commitment(),
         ciphertext: ciphertext.ciphertext,
         blinded_sender_viewing_key: ciphertext.blinded_sender_viewing_key,
+        // Receiver scanning uses the blinded sender key and remains available when a source lacks
+        // sender-recovery fields.
+        blinded_receiver_viewing_key: FixedBytes::ZERO,
+        annotation_data: ciphertext.annotation_data,
         memo: ciphertext.memo,
         source: source(1),
     };
@@ -105,6 +109,8 @@ fn indexed_transact_commitment_ignores_undecryptable_utxo() {
         hash: note.commitment(),
         ciphertext: ciphertext.ciphertext,
         blinded_sender_viewing_key: ciphertext.blinded_sender_viewing_key,
+        blinded_receiver_viewing_key: ciphertext.blinded_receiver_viewing_key,
+        annotation_data: ciphertext.annotation_data,
         memo: ciphertext.memo,
         source: source(1),
     };

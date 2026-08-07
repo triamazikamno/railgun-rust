@@ -6,13 +6,16 @@ use super::{
     Arc, BackfillEvent, BlindedCommitmentType, ChainPublicDataPlane, DbStore, FixedBytes,
     GlobalPoiPolicy, IndexedArtifactSourceConfig, Instant, MerkleForest, OutputPoiRecoveryRecord,
     OutputPoiRecoveryRequest, PendingOutputPoiContextRecord, PoiProxyFallback, PoiRpcClient,
-    PublicPoiCorpusKey, QueryRpcPool, RwLock, SystemTime, UNIX_EPOCH, UtxoCommitmentKind,
-    WalletActorCommitToken, WalletCacheError, WalletCacheStore, WalletCheckpointMutation,
-    WalletConfig, WalletHandle, WalletObservation, WalletPoiRefreshSelection, WalletPrivateCommit,
-    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
-    WalletReadiness, WalletReadinessWaitError, WalletUtxo, WalletUtxoMutation, debug,
+    PublicPoiCorpusKey, RwLock, SenderCandidateRecoveryReport,
+    SenderCandidateRecoveryRequest, SenderTransactionCandidate, SystemTime, UNIX_EPOCH,
+    UtxoCommitmentKind, WalletActorCommitToken, WalletCacheError, WalletCacheStore,
+    WalletCheckpointMutation, WalletConfig, WalletHandle, WalletObservation,
+    WalletPoiRefreshSelection, WalletPrivateCommit, WalletPrivateMutationAuthority,
+    WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletReadiness,
+    WalletReadinessWaitError, WalletUtxo, WalletUtxoMutation, debug,
     log_local_poi_cache_unavailable, mark_valid_output_poi_recoveries,
-    output_poi_recovery_candidates, recover_missing_output_pois,
+    materialize_sender_transaction_candidates, output_poi_recovery_candidates,
+    recover_missing_output_pois,
 };
 use poi::SensitiveUrl;
 use tokio::sync::{mpsc, watch};
@@ -240,8 +243,11 @@ impl WalletPersistState {
         request: WalletProgressPersist<'_>,
         effects: WalletProgressPrivateEffects<'_>,
     ) -> Result<bool, WalletCacheError> {
-        let full_persist =
-            request.changed || self.needs_full_persist || self.pending_cache_reset.is_some();
+        let full_persist = request.changed
+            || self.needs_full_persist
+            || self.pending_cache_reset.is_some()
+            || !effects.sender_transaction_candidate_updates.is_empty()
+            || !effects.sender_transaction_candidate_deletes.is_empty();
         if full_persist {
             let persist_started = Instant::now();
             return match cache_store.commit_wallet_private_state(
@@ -254,7 +260,13 @@ impl WalletPersistState {
                 .with_pending_output_context_updates(effects.pending_output_context_updates)
                 .with_pending_output_context_deletes(effects.pending_output_context_deletes)
                 .with_output_poi_recovery_updates(effects.output_poi_recovery_updates)
-                .with_output_poi_recovery_deletes(effects.output_poi_recovery_deletes),
+                .with_output_poi_recovery_deletes(effects.output_poi_recovery_deletes)
+                .with_sender_transaction_candidate_updates(
+                    effects.sender_transaction_candidate_updates,
+                )
+                .with_sender_transaction_candidate_deletes(
+                    effects.sender_transaction_candidate_deletes,
+                ),
             ) {
                 Ok(()) => {
                     self.needs_full_persist = false;
@@ -296,7 +308,11 @@ impl WalletPersistState {
             .with_pending_output_context_updates(effects.pending_output_context_updates)
             .with_pending_output_context_deletes(effects.pending_output_context_deletes)
             .with_output_poi_recovery_updates(effects.output_poi_recovery_updates)
-            .with_output_poi_recovery_deletes(effects.output_poi_recovery_deletes),
+            .with_output_poi_recovery_deletes(effects.output_poi_recovery_deletes)
+            .with_sender_transaction_candidate_updates(effects.sender_transaction_candidate_updates)
+            .with_sender_transaction_candidate_deletes(
+                effects.sender_transaction_candidate_deletes,
+            ),
         )?;
         debug!(
             cache_key = %request.cache_key,
@@ -342,6 +358,8 @@ pub(super) struct WalletProgressPrivateEffects<'a> {
     pub(super) pending_output_context_deletes: &'a [FixedBytes<32>],
     pub(super) output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
     pub(super) output_poi_recovery_deletes: &'a [FixedBytes<32>],
+    pub(super) sender_transaction_candidate_updates: &'a [SenderTransactionCandidate],
+    pub(super) sender_transaction_candidate_deletes: &'a [FixedBytes<32>],
 }
 
 pub(super) struct OutputPoiRecoveryRun<'a> {

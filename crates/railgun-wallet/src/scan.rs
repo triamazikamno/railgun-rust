@@ -6,8 +6,9 @@ use alloy_rpc_types_eth::Log;
 use thiserror::Error;
 
 use broadcaster_core::contracts::railgun::{
-    CommitmentBatch, CommitmentPreimage, GeneratedCommitmentBatch, LegacyCommitmentPreimage,
-    Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield, ShieldCiphertext, Transact,
+    CommitmentBatch, CommitmentCiphertext, CommitmentPreimage, GeneratedCommitmentBatch,
+    LegacyCommitmentPreimage, Nullified, Nullifiers, RailgunLegacyShieldEvents, Shield,
+    ShieldCiphertext, Transact,
 };
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::crypto::shared_key::{shared_symmetric_key, shared_symmetric_key_legacy};
@@ -37,6 +38,7 @@ pub struct WalletLogDelta {
     pub utxos: Vec<Utxo>,
     pub nullifiers: Vec<SpentNullifier>,
     pub commitment_observations: Vec<CommitmentObservation>,
+    pub sender_scan_outputs: Vec<SenderScanOutput>,
 }
 
 impl WalletLogDelta {
@@ -65,8 +67,10 @@ impl WalletLogDelta {
         let mut utxos = Vec::new();
         let mut nullifiers = HashMap::new();
         let mut commitment_observations = extra_commitment_observations.to_vec();
+        let mut sender_scan_outputs = Vec::with_capacity(transact_commitments.len());
 
         for commitment in transact_commitments {
+            sender_scan_outputs.push(commitment.sender_scan_output());
             commitment_observations.push(commitment_observation(
                 commitment.tree_number,
                 commitment.tree_position,
@@ -138,6 +142,7 @@ impl WalletLogDelta {
                 })
                 .collect(),
             commitment_observations,
+            sender_scan_outputs,
         }
     }
 }
@@ -230,6 +235,8 @@ impl WalletScanInputRows {
                                 hash: expected_hash,
                                 ciphertext: ciphertext.ciphertext,
                                 blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
+                                blinded_receiver_viewing_key: ciphertext.blindedReceiverViewingKey,
+                                annotation_data: ciphertext.annotationData.clone(),
                                 memo: ciphertext.memo.clone(),
                                 source: source.clone(),
                             });
@@ -385,6 +392,28 @@ pub struct SpentNullifier {
     pub source: UtxoSource,
 }
 
+/// Complete output slot retained until the sync boundary can determine whether its outer
+/// transaction spends a wallet input.
+#[derive(Clone)]
+pub struct SenderScanOutput {
+    pub tree: u32,
+    pub position: u64,
+    pub commitment: U256,
+    pub ciphertext: CommitmentCiphertext,
+    pub source: UtxoSource,
+}
+
+impl std::fmt::Debug for SenderScanOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderScanOutput")
+            .field("tree", &self.tree)
+            .field("position", &self.position)
+            .field("commitment", &self.commitment)
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexedTransactCommitmentInput {
     pub tree_number: u32,
@@ -392,6 +421,8 @@ pub struct IndexedTransactCommitmentInput {
     pub hash: U256,
     pub ciphertext: [FixedBytes<32>; 4],
     pub blinded_sender_viewing_key: FixedBytes<32>,
+    pub blinded_receiver_viewing_key: FixedBytes<32>,
+    pub annotation_data: Bytes,
     pub memo: Bytes,
     pub source: UtxoSource,
 }
@@ -404,6 +435,8 @@ impl From<QuickIndexedTransactCommitment> for IndexedTransactCommitmentInput {
             hash: value.hash,
             ciphertext: value.ciphertext.ciphertext,
             blinded_sender_viewing_key: value.ciphertext.blinded_sender_viewing_key,
+            blinded_receiver_viewing_key: value.ciphertext.blinded_receiver_viewing_key,
+            annotation_data: value.ciphertext.annotation_data,
             memo: value.ciphertext.memo,
             source: indexed_source(
                 value.transaction_hash,
@@ -415,6 +448,23 @@ impl From<QuickIndexedTransactCommitment> for IndexedTransactCommitmentInput {
 }
 
 impl IndexedTransactCommitmentInput {
+    fn sender_scan_output(&self) -> SenderScanOutput {
+        let (tree, position) = normalize_tree_position(self.tree_number, self.tree_position);
+        SenderScanOutput {
+            tree,
+            position,
+            commitment: self.hash,
+            ciphertext: CommitmentCiphertext {
+                ciphertext: self.ciphertext,
+                blindedSenderViewingKey: self.blinded_sender_viewing_key,
+                blindedReceiverViewingKey: self.blinded_receiver_viewing_key,
+                annotationData: self.annotation_data.clone(),
+                memo: self.memo.clone(),
+            },
+            source: self.source.clone(),
+        }
+    }
+
     fn scan(&self, keys: &WalletScanKeys) -> Option<Utxo> {
         let (tree, position) = normalize_tree_position(self.tree_number, self.tree_position);
         let shared_key = shared_symmetric_key(
@@ -706,4 +756,73 @@ fn source_from_log(
         block_number,
         block_timestamp,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use alloy::hex;
+    use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+    use alloy::sol_types::SolEvent;
+    use alloy_rpc_types_eth::Log;
+    use broadcaster_core::contracts::railgun::{CommitmentCiphertext, Transact};
+
+    use super::WalletScanInputRows;
+
+    #[test]
+    fn rpc_transact_log_preserves_complete_ciphertext() {
+        let ciphertext = CommitmentCiphertext {
+            ciphertext: std::array::from_fn(|index| FixedBytes::from([index as u8 + 1; 32])),
+            blindedSenderViewingKey: FixedBytes::from([0x11; 32]),
+            blindedReceiverViewingKey: FixedBytes::from([0x22; 32]),
+            annotationData: Bytes::from(vec![0x33, 0x34]),
+            memo: Bytes::from(vec![0x44, 0x45]),
+        };
+        let encoded = Transact {
+            treeNumber: U256::from(7),
+            startPosition: U256::from(9),
+            hash: vec![FixedBytes::from([0x55; 32])],
+            ciphertext: vec![ciphertext.clone()],
+        }
+        .encode_log_data();
+        let topics = encoded
+            .topics()
+            .iter()
+            .map(|topic| format!("{topic:#x}"))
+            .collect::<Vec<_>>();
+        let log: Log = serde_json::from_value(serde_json::json!({
+            "address": format!("{:#x}", Address::from([0xaa; 20])),
+            "topics": topics,
+            "data": format!("0x{}", hex::encode(encoded.data)),
+            "blockHash": format!("{:#x}", FixedBytes::<32>::from([0xbb; 32])),
+            "blockNumber": "0x69",
+            "transactionHash": format!("{:#x}", FixedBytes::<32>::from([0xcc; 32])),
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": false,
+        }))
+        .expect("deserialize transact log");
+        let rows = WalletScanInputRows::from_logs(&[log], &HashMap::from([(105, 1_700_000_105)]))
+            .expect("normalize transact log");
+        let row = &rows.transact_commitments[0];
+
+        assert_eq!(row.tree_number, 7);
+        assert_eq!(row.tree_position, 9);
+        assert_eq!(row.hash, U256::from_be_bytes([0x55; 32]));
+        assert_eq!(row.ciphertext, ciphertext.ciphertext);
+        assert_eq!(
+            row.blinded_sender_viewing_key,
+            ciphertext.blindedSenderViewingKey
+        );
+        assert_eq!(
+            row.blinded_receiver_viewing_key,
+            ciphertext.blindedReceiverViewingKey
+        );
+        assert_eq!(row.annotation_data, ciphertext.annotationData);
+        assert_eq!(row.memo, ciphertext.memo);
+        assert_eq!(row.source.tx_hash, FixedBytes::from([0xcc; 32]));
+        assert_eq!(row.source.block_number, 105);
+        assert_eq!(row.source.block_timestamp, 1_700_000_105);
+    }
 }

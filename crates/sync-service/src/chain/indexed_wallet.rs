@@ -1355,6 +1355,8 @@ impl<'a> WalletScanArtifactCursor<'a> {
                     hash,
                     ciphertext: ciphertext.ciphertext,
                     blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
+                    blinded_receiver_viewing_key: ciphertext.blindedReceiverViewingKey,
+                    annotation_data: ciphertext.annotationData,
                     memo: ciphertext.memo,
                     source,
                 });
@@ -1944,6 +1946,48 @@ mod tests {
         assert_eq!(delta.commitment_observations.len(), 1);
         assert_eq!(delta.commitment_observations[0].tree, 3);
         assert_eq!(delta.commitment_observations[0].position, 9);
+    }
+
+    #[test]
+    fn indexed_wallet_artifact_preserves_complete_transact_ciphertext() {
+        let ciphertext = CommitmentCiphertext {
+            ciphertext: std::array::from_fn(|index| FixedBytes::from([index as u8 + 1; 32])),
+            blindedSenderViewingKey: FixedBytes::from([0x11; 32]),
+            blindedReceiverViewingKey: FixedBytes::from([0x22; 32]),
+            annotationData: vec![0x33, 0x34].into(),
+            memo: vec![0x44, 0x45].into(),
+        };
+        let chunk = wallet_scan_chunk(
+            scope(),
+            100,
+            110,
+            vec![(
+                WALLET_TRANSACT_SECTION_ID,
+                transact_section(105, 7, 9, U256::from(10), &ciphertext),
+            )],
+            1,
+        );
+
+        let page = IndexedWalletPage::try_from(&chunk).expect("decode transact page");
+        let row = &page.transact_commitments[0];
+
+        assert_eq!(row.tree_number, 7);
+        assert_eq!(row.tree_position, 9);
+        assert_eq!(row.hash, U256::from(10));
+        assert_eq!(row.ciphertext, ciphertext.ciphertext);
+        assert_eq!(
+            row.blinded_sender_viewing_key,
+            ciphertext.blindedSenderViewingKey
+        );
+        assert_eq!(
+            row.blinded_receiver_viewing_key,
+            ciphertext.blindedReceiverViewingKey
+        );
+        assert_eq!(row.annotation_data, ciphertext.annotationData);
+        assert_eq!(row.memo, ciphertext.memo);
+        assert_eq!(row.source.block_number, 105);
+        assert_eq!(row.source.block_timestamp, 1_700_000_105);
+        assert_eq!(row.source.tx_hash, FixedBytes::from([1; 32]));
     }
 
     #[test]
@@ -2905,6 +2949,23 @@ mod tests {
         write_source(&mut bytes, block_number, 1);
         write_u32(&mut bytes, tree_number);
         bytes.extend_from_slice(&nullifier);
+        bytes
+    }
+
+    fn transact_section(
+        block_number: u64,
+        tree_number: u32,
+        tree_position: u64,
+        commitment: U256,
+        ciphertext: &CommitmentCiphertext,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_u64(&mut bytes, 1);
+        write_source(&mut bytes, block_number, 1);
+        write_u32(&mut bytes, tree_number);
+        write_u64(&mut bytes, tree_position);
+        bytes.extend_from_slice(&commitment.to_be_bytes::<32>());
+        write_bytes(&mut bytes, &ciphertext.abi_encode());
         bytes
     }
 

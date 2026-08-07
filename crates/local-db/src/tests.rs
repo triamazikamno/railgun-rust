@@ -1,7 +1,7 @@
 use super::{
     APP_SETTINGS_TABLE, BLOB_INDEX_TABLE, CURRENT_SCHEMA_VERSION, CanonicalBlobMetaIdentity,
     DESKTOP_WALLET_VAULT_TABLE, DbConfig, DbError, DbStore, DesktopWalletVaultRecord,
-    ExpectedPoiCorpusJournalState, MERKLE_FOREST_INDEX_TABLE, META_TABLE, Meta,
+    ExpectedPoiCorpusJournalState, MERKLE_FOREST_INDEX_TABLE, META_KEY, META_TABLE, Meta,
     OUTPUT_POI_RECOVERY_TABLE, OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow,
     OpaqueWalletPrivateRowMutation, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE,
@@ -13,10 +13,10 @@ use super::{
     PoiCorpusJournalCommitCondition, PoiCorpusJournalCommitOutcome, PoiCorpusJournalDeltaRecord,
     PoiCorpusJournalHeadRecord, PoiCorpusJournalInspection, PoiCorpusRpcHealthRecord,
     PoiCorpusValidationRecord, PoiPublisherManifestObservation,
-    PoiPublisherManifestWatermarkRecord, StoredRecord, TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
-    WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE, WALLET_UTXO_TABLE, WalletCacheKey,
-    WalletDeletionBatch, WalletDeletionReport, WalletMeta, WalletMetaMutation,
-    WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
+    PoiPublisherManifestWatermarkRecord, SENDER_TRANSACTION_CANDIDATE_V1_TABLE, StoredRecord,
+    TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE,
+    WALLET_UTXO_TABLE, WalletCacheKey, WalletDeletionBatch, WalletDeletionReport, WalletMeta,
+    WalletMetaMutation, WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
     WalletPrivateCanonicalizationKindBatch, WalletPrivateCanonicalizationReport,
     WalletPrivateNamespaceDeletionReport, WalletPrivateNamespaceId, WalletPrivateRecordKind,
     WalletPrivateStateBatch, WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport,
@@ -2803,6 +2803,27 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
             .put_output_poi_recovery(recovery)
             .expect("store output recovery");
     }
+    let candidate_row = OpaqueWalletPrivateRow {
+        row_id: vec![0x61; 32],
+        payload: b"target-candidate".to_vec(),
+    };
+    store
+        .put_opaque_wallet_private_row(
+            &target,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &candidate_row,
+        )
+        .expect("store target candidate");
+    store
+        .put_opaque_wallet_private_row(
+            &other_wallet,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate_row.row_id.clone(),
+                payload: b"other-candidate".to_vec(),
+            },
+        )
+        .expect("store other candidate");
     put_raw_pending_output_record(
         &store,
         &target_v1_pending.key(),
@@ -2828,6 +2849,7 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
             wallet_sync_actor_state_rows: 1,
             pending_output_poi_context_rows: 3,
             output_poi_recovery_rows: 2,
+            sender_transaction_candidate_rows: 1,
         }
     );
     assert!(
@@ -2847,6 +2869,18 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
             .get_wallet_sync_actor_state(target.chain_id, target.wallet_id.as_str())
             .expect("load deleted target actor state")
             .is_none()
+    );
+    assert_eq!(
+        store
+            .get_opaque_wallet_private_row(
+                &other_wallet,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &candidate_row.row_id,
+            )
+            .expect("load isolated candidate")
+            .expect("isolated candidate present")
+            .payload,
+        b"other-candidate"
     );
     assert!(
         store
@@ -3076,6 +3110,7 @@ fn wallet_private_state_and_vault_records_commit_atomically() {
                 sync_actor_state: Some(&actor_state),
                 pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
                 output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+                sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
             },
             &vault_records,
         )
@@ -3174,6 +3209,7 @@ fn wallet_private_state_and_vault_records_roll_back_before_commit_failure() {
             sync_actor_state: Some(&replacement_actor_state),
             pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
             output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+            sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
         },
         &vault_records,
         || {
@@ -3366,6 +3402,7 @@ fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
                 wallet_sync_actor_state_rows: 2,
                 pending_output_poi_context_rows: 2,
                 output_poi_recovery_rows: 2,
+                sender_transaction_candidate_rows: 0,
             },
             desktop_wallet_vault_rows_deleted: 2,
             desktop_wallet_vault_rows_put: 2,
@@ -3527,6 +3564,33 @@ fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
         row_id: vec![0x02],
         payload: b"recovery-ciphertext".to_vec(),
     }];
+    let candidate_delete_id = vec![0x03];
+    let candidate_update_id = vec![0x04];
+    store
+        .put_opaque_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate_delete_id.clone(),
+                payload: b"candidate-delete".to_vec(),
+            },
+        )
+        .expect("seed candidate to delete");
+    store
+        .put_opaque_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate_update_id.clone(),
+                payload: b"candidate-old".to_vec(),
+            },
+        )
+        .expect("seed candidate to update");
+    let candidate_updates = [OpaqueWalletPrivateRow {
+        row_id: candidate_update_id.clone(),
+        payload: b"candidate-new".to_vec(),
+    }];
+    let candidate_deletes = [candidate_delete_id.clone()];
     let batch = WalletPrivateStateBatch {
         namespace: &namespace,
         utxos: WalletUtxoRowMutation::Preserve,
@@ -3539,6 +3603,10 @@ fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
         output_poi_recoveries: OpaqueWalletPrivateRowMutation {
             updates: &recoveries,
             deletes: &[],
+        },
+        sender_transaction_candidates: OpaqueWalletPrivateRowMutation {
+            updates: &candidate_updates,
+            deletes: &candidate_deletes,
         },
     };
 
@@ -3561,6 +3629,28 @@ fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
             )
             .expect("list rolled-back pending rows")
             .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &candidate_update_id,
+            )
+            .expect("load rolled-back candidate update")
+            .expect("rolled-back candidate present")
+            .payload,
+        b"candidate-old"
+    );
+    assert!(
+        store
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &candidate_delete_id,
+            )
+            .expect("load rolled-back candidate delete")
+            .is_some()
     );
 
     store
@@ -3588,6 +3678,28 @@ fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
             )
             .expect("list committed recoveries"),
         recoveries
+    );
+    assert_eq!(
+        store
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &candidate_update_id,
+            )
+            .expect("load committed candidate update")
+            .expect("updated candidate present")
+            .payload,
+        b"candidate-new"
+    );
+    assert!(
+        store
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &candidate_delete_id,
+            )
+            .expect("load committed candidate delete")
+            .is_none()
     );
 
     drop(store);
@@ -5639,6 +5751,7 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
     expected_tables.insert(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE.name().to_string());
     expected_tables.insert(OUTPUT_POI_RECOVERY_V2_TABLE.name().to_string());
     expected_tables.insert(POI_CORPUS_JOURNAL_TABLE.name().to_string());
+    expected_tables.insert(SENDER_TRANSACTION_CANDIDATE_V1_TABLE.name().to_string());
     assert_eq!(migrated_tables, expected_tables);
     drop(read_txn);
     assert_eq!(
@@ -5726,5 +5839,128 @@ fn reopen_older_schema_db_backs_up_and_recreates() {
     );
 
     drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn schema_ten_to_eleven_adds_only_sender_candidate_table() {
+    let root_dir = temp_db_root();
+    let railgun_dir = root_dir.join("railgun");
+    fs::create_dir_all(&railgun_dir).expect("create railgun dir");
+    let database_path = railgun_dir.join("db.redb");
+    let db = Database::create(&database_path).expect("create schema-10 database");
+    let txn = db.begin_write().expect("begin schema-10 fixture write");
+    for table in [
+        META_TABLE,
+        BLOB_INDEX_TABLE,
+        MERKLE_FOREST_INDEX_TABLE,
+        ZKEY_INDEX_TABLE,
+        WALLET_UTXO_TABLE,
+        WALLET_META_TABLE,
+        WALLET_SYNC_ACTOR_STATE_TABLE,
+        PENDING_FEE_NOTE_ASSURANCE_TABLE,
+        TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
+        PENDING_OUTPUT_POI_CONTEXT_TABLE,
+        OUTPUT_POI_RECOVERY_TABLE,
+        PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
+        OUTPUT_POI_RECOVERY_V2_TABLE,
+        POI_ARTIFACT_CACHE_TABLE,
+        POI_CORPUS_JOURNAL_TABLE,
+        APP_SETTINGS_TABLE,
+        DESKTOP_WALLET_VAULT_TABLE,
+    ] {
+        txn.open_table(table).expect("create schema-10 table");
+    }
+    let schema_ten_meta = encode(&Meta {
+        schema_version: 10,
+        app_version: "schema-10".to_string(),
+        created_at: 123,
+    })
+    .expect("encode schema-10 meta");
+    txn.open_table(META_TABLE)
+        .expect("open meta table")
+        .insert(META_KEY, schema_ten_meta.as_slice())
+        .expect("insert schema-10 meta");
+    txn.commit().expect("commit schema-10 fixture");
+    let read_txn = db.begin_read().expect("read schema-10 tables");
+    let before = read_txn
+        .list_tables()
+        .expect("list schema-10 tables")
+        .map(|table| table.name().to_string())
+        .collect::<BTreeSet<_>>();
+    drop(read_txn);
+    drop(db);
+
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("migrate schema 10 to 11");
+    let read_txn = store.db.begin_read().expect("read schema-11 tables");
+    let after = read_txn
+        .list_tables()
+        .expect("list schema-11 tables")
+        .map(|table| table.name().to_string())
+        .collect::<BTreeSet<_>>();
+    drop(read_txn);
+    assert_eq!(
+        after.difference(&before).cloned().collect::<Vec<_>>(),
+        vec![SENDER_TRANSACTION_CANDIDATE_V1_TABLE.name().to_string()]
+    );
+    assert_eq!(
+        store
+            .read_meta()
+            .expect("read meta")
+            .expect("meta present")
+            .schema_version,
+        11
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn newer_schema_is_rejected_without_replacing_database() {
+    let root_dir = temp_db_root();
+    {
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        store
+            .write_meta(&Meta {
+                schema_version: CURRENT_SCHEMA_VERSION + 1,
+                app_version: "future".to_string(),
+                created_at: 456,
+            })
+            .expect("write future meta");
+    }
+
+    assert!(matches!(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        }),
+        Err(DbError::UnsupportedSchemaVersion { version })
+            if version == CURRENT_SCHEMA_VERSION + 1
+    ));
+    let db = Database::open(root_dir.join("railgun").join("db.redb"))
+        .expect("open rejected database directly");
+    let txn = db.begin_read().expect("read rejected database");
+    let table = txn
+        .open_table(META_TABLE)
+        .expect("open rejected meta table");
+    let meta: Meta = decode(
+        table
+            .get(META_KEY)
+            .expect("read rejected meta")
+            .expect("rejected meta present")
+            .value(),
+    )
+    .expect("decode rejected meta");
+    assert_eq!(meta.schema_version, CURRENT_SCHEMA_VERSION + 1);
+
+    drop(table);
+    drop(txn);
+    drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

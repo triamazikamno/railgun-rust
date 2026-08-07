@@ -109,6 +109,13 @@ pub struct IndexedCommitmentCiphertext {
     #[serde(rename = "blindedSenderViewingKey")]
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub blinded_sender_viewing_key: FixedBytes<32>,
+    #[serde(rename = "blindedReceiverViewingKey")]
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
+    pub blinded_receiver_viewing_key: FixedBytes<32>,
+    #[serde(rename = "annotationData")]
+    #[serde(default)]
+    pub annotation_data: Bytes,
     pub memo: Bytes,
 }
 
@@ -508,6 +515,47 @@ mod tests {
     use serde_json::json;
 
     use super::IndexedNullifier;
+    #[test]
+    fn indexed_transact_commitment_preserves_complete_ciphertext() {
+        let item: IndexedTransactCommitment = serde_json::from_value(json!({
+            "id": format!("0x{}", "11".repeat(64)),
+            "transactionHash": format!("0x{}", "22".repeat(32)),
+            "blockNumber": "123",
+            "blockTimestamp": "1700000123",
+            "treeNumber": "4",
+            "treePosition": "5",
+            "hash": "0x06",
+            "ciphertext": {
+                "ciphertext": {
+                    "iv": format!("0x{}", "01".repeat(16)),
+                    "tag": format!("0x{}", "02".repeat(16)),
+                    "data": [
+                        format!("0x{}", "03".repeat(32)),
+                        format!("0x{}", "04".repeat(32)),
+                        format!("0x{}", "05".repeat(32)),
+                    ],
+                },
+                "blindedSenderViewingKey": format!("0x{}", "06".repeat(32)),
+                "blindedReceiverViewingKey": format!("0x{}", "07".repeat(32)),
+                "annotationData": "0x0809",
+                "memo": "0x0a0b",
+            },
+        }))
+        .expect("deserialize complete indexed transact commitment");
+
+        assert_eq!(item.ciphertext.ciphertext[0].0[..16], [1; 16]);
+        assert_eq!(item.ciphertext.ciphertext[0].0[16..], [2; 16]);
+        assert_eq!(
+            item.ciphertext.blinded_sender_viewing_key,
+            FixedBytes::from([6; 32])
+        );
+        assert_eq!(
+            item.ciphertext.blinded_receiver_viewing_key,
+            FixedBytes::from([7; 32])
+        );
+        assert_eq!(item.ciphertext.annotation_data, Bytes::from(vec![8, 9]));
+        assert_eq!(item.ciphertext.memo, Bytes::from(vec![10, 11]));
+    }
 
     #[test]
     fn indexed_nullifier_deserializes_block_timestamp() {

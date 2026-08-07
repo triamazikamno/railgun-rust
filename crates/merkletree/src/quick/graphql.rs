@@ -69,6 +69,8 @@ query WalletProbe($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: Int = 1)
         data
       }
       blindedSenderViewingKey
+      blindedReceiverViewingKey
+      annotationData
       memo
     }
   }
@@ -176,6 +178,8 @@ query IndexedWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
         data
       }
       blindedSenderViewingKey
+      blindedReceiverViewingKey
+      annotationData
       memo
     }
   }
@@ -300,6 +304,8 @@ query TransactCommitments($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: 
         data
       }
       blindedSenderViewingKey
+      blindedReceiverViewingKey
+      annotationData
       memo
     }
   }

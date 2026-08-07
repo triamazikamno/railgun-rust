@@ -11,8 +11,9 @@ use broadcaster_core::transact::PreTxPoi;
 use local_db::{
     DbError, DbStore, OpaqueWalletPrivateRow, OpaqueWalletPrivateRowMutation,
     OutputPoiRecoveryRecord, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey,
-    WalletMeta, WalletMetaMutation, WalletPrivateNamespaceId, WalletPrivateStateBatch,
-    WalletPrivateV1MigrationBatch, WalletSyncActorStateRecord, WalletUtxoRowMutation,
+    WalletMeta, WalletMetaMutation, WalletPrivateNamespaceId, WalletPrivateRecordKind,
+    WalletPrivateStateBatch, WalletPrivateV1MigrationBatch, WalletSyncActorStateRecord,
+    WalletUtxoRowMutation,
 };
 use poi::SensitiveUrl;
 use poi::cache::PoiCache;
@@ -26,6 +27,7 @@ use tokio::sync::{
 use tracing::warn;
 use url::Url;
 
+use crate::SenderTransactionCandidate;
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::wallet::WalletActorTokenAuthority;
 
@@ -782,6 +784,8 @@ pub struct WalletPrivateCommit<'a> {
     pending_output_context_deletes: &'a [FixedBytes<32>],
     output_poi_recovery_updates: &'a [OutputPoiRecoveryRecord],
     output_poi_recovery_deletes: &'a [FixedBytes<32>],
+    sender_transaction_candidate_updates: &'a [SenderTransactionCandidate],
+    sender_transaction_candidate_deletes: &'a [FixedBytes<32>],
 }
 
 pub struct WalletSyncActorStateCommit<'a> {
@@ -822,6 +826,8 @@ impl<'a> WalletPrivateCommit<'a> {
             pending_output_context_deletes: &[],
             output_poi_recovery_updates: &[],
             output_poi_recovery_deletes: &[],
+            sender_transaction_candidate_updates: &[],
+            sender_transaction_candidate_deletes: &[],
         }
     }
 
@@ -879,6 +885,24 @@ impl<'a> WalletPrivateCommit<'a> {
     }
 
     #[must_use]
+    pub const fn with_sender_transaction_candidate_updates(
+        mut self,
+        updates: &'a [SenderTransactionCandidate],
+    ) -> Self {
+        self.sender_transaction_candidate_updates = updates;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_sender_transaction_candidate_deletes(
+        mut self,
+        deletes: &'a [FixedBytes<32>],
+    ) -> Self {
+        self.sender_transaction_candidate_deletes = deletes;
+        self
+    }
+
+    #[must_use]
     pub const fn with_sync_actor_state(
         mut self,
         sync_actor_state: &'a WalletSyncActorStateRecord,
@@ -912,6 +936,16 @@ impl<'a> WalletPrivateCommit<'a> {
         self.output_poi_recovery_deletes
     }
 
+    #[must_use]
+    pub const fn sender_transaction_candidate_updates(&self) -> &[SenderTransactionCandidate] {
+        self.sender_transaction_candidate_updates
+    }
+
+    #[must_use]
+    pub const fn sender_transaction_candidate_deletes(&self) -> &[FixedBytes<32>] {
+        self.sender_transaction_candidate_deletes
+    }
+
     pub fn validate_namespace(&self) -> Result<(), WalletCacheError> {
         for (chain_id, wallet_id) in self
             .pending_output_context_updates
@@ -919,6 +953,11 @@ impl<'a> WalletPrivateCommit<'a> {
             .map(|record| (record.chain_id, record.wallet_id.as_str()))
             .chain(
                 self.output_poi_recovery_updates
+                    .iter()
+                    .map(|record| (record.chain_id, record.wallet_id.as_str())),
+            )
+            .chain(
+                self.sender_transaction_candidate_updates
                     .iter()
                     .map(|record| (record.chain_id, record.wallet_id.as_str())),
             )
@@ -1000,6 +1039,19 @@ pub trait WalletCacheStore: Send + Sync {
         chain_id: u64,
         wallet_id: &WalletCacheKey,
     ) -> Result<Vec<OutputPoiRecoveryRecord>, WalletCacheError>;
+
+    fn get_sender_transaction_candidate(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        outer_transaction_hash: &FixedBytes<32>,
+    ) -> Result<Option<SenderTransactionCandidate>, WalletCacheError>;
+
+    fn list_sender_transaction_candidates(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<SenderTransactionCandidate>, WalletCacheError>;
 }
 
 impl WalletCacheStore for DbStore {
@@ -1046,6 +1098,16 @@ impl WalletCacheStore for DbStore {
             .iter()
             .map(|commitment| commitment.to_vec())
             .collect::<Vec<_>>();
+        let sender_transaction_candidate_updates = commit
+            .sender_transaction_candidate_updates()
+            .iter()
+            .map(sender_transaction_candidate_opaque_row)
+            .collect::<Result<Vec<_>, WalletCacheError>>()?;
+        let sender_transaction_candidate_deletes = commit
+            .sender_transaction_candidate_deletes()
+            .iter()
+            .map(|transaction_hash| transaction_hash.to_vec())
+            .collect::<Vec<_>>();
         self.batch_commit_wallet_private_state(&WalletPrivateStateBatch {
             namespace: &namespace,
             utxos: utxo_entries.as_deref().map_or(
@@ -1063,6 +1125,10 @@ impl WalletCacheStore for DbStore {
             output_poi_recoveries: OpaqueWalletPrivateRowMutation {
                 updates: &output_poi_recovery_updates,
                 deletes: &output_poi_recovery_deletes,
+            },
+            sender_transaction_candidates: OpaqueWalletPrivateRowMutation {
+                updates: &sender_transaction_candidate_updates,
+                deletes: &sender_transaction_candidate_deletes,
             },
         })?;
         Ok(())
@@ -1152,6 +1218,61 @@ impl WalletCacheStore for DbStore {
             wallet_id.as_str(),
         )?)
     }
+
+    fn get_sender_transaction_candidate(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        outer_transaction_hash: &FixedBytes<32>,
+    ) -> Result<Option<SenderTransactionCandidate>, WalletCacheError> {
+        let namespace = WalletPrivateNamespaceId::new(chain_id, wallet_id.clone());
+        self.get_opaque_wallet_private_row(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            outer_transaction_hash.as_slice(),
+        )?
+        .map(|row| sender_transaction_candidate_from_opaque_row(&namespace, &row))
+        .transpose()
+    }
+
+    fn list_sender_transaction_candidates(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<SenderTransactionCandidate>, WalletCacheError> {
+        let namespace = WalletPrivateNamespaceId::new(chain_id, wallet_id.clone());
+        self.list_opaque_wallet_private_rows(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )?
+        .into_iter()
+        .map(|row| sender_transaction_candidate_from_opaque_row(&namespace, &row))
+        .collect()
+    }
+}
+
+fn sender_transaction_candidate_opaque_row(
+    record: &SenderTransactionCandidate,
+) -> Result<OpaqueWalletPrivateRow, WalletCacheError> {
+    Ok(OpaqueWalletPrivateRow {
+        row_id: record.row_identity(),
+        payload: record.encode().map_err(|_| WalletCacheError::Crypto)?,
+    })
+}
+
+fn sender_transaction_candidate_from_opaque_row(
+    namespace: &WalletPrivateNamespaceId,
+    row: &OpaqueWalletPrivateRow,
+) -> Result<SenderTransactionCandidate, WalletCacheError> {
+    let record =
+        SenderTransactionCandidate::decode(&row.payload).map_err(|_| WalletCacheError::Crypto)?;
+    if record.chain_id != namespace.chain_id
+        || record.wallet_id != namespace.wallet_id
+        || record.row_identity() != row.row_id
+    {
+        return Err(WalletCacheError::Crypto);
+    }
+    Ok(record)
 }
 
 fn pending_output_context_opaque_row(

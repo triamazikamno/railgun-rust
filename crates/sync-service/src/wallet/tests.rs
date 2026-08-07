@@ -1377,6 +1377,8 @@ struct RecordingCacheState {
     fail_next_store: bool,
     fail_next_commit: bool,
     fail_pending_output_list_call: Option<usize>,
+    candidate_list_calls: usize,
+    fail_next_candidate_list: bool,
 }
 
 struct RecordingCacheStore {
@@ -1565,6 +1567,40 @@ impl WalletCacheStore for RecordingCacheStore {
             wallet_id,
         )
     }
+
+    fn get_sender_transaction_candidate(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        outer_transaction_hash: &FixedBytes<32>,
+    ) -> Result<Option<crate::SenderTransactionCandidate>, WalletCacheError> {
+        <DbStore as WalletCacheStore>::get_sender_transaction_candidate(
+            self.db.as_ref(),
+            chain_id,
+            wallet_id,
+            outer_transaction_hash,
+        )
+    }
+
+    fn list_sender_transaction_candidates(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<crate::SenderTransactionCandidate>, WalletCacheError> {
+        let mut state = self.state.lock().expect("cache state");
+        state.candidate_list_calls += 1;
+        if state.fail_next_candidate_list {
+            state.fail_next_candidate_list = false;
+            return Err(WalletCacheError::Crypto);
+        }
+        drop(state);
+        <DbStore as WalletCacheStore>::list_sender_transaction_candidates(
+            self.db.as_ref(),
+            chain_id,
+            wallet_id,
+        )
+    }
+}
 }
 
 #[test]
@@ -3084,6 +3120,7 @@ async fn poi_status_refresh_needed_after_indexed_delta_discovers_utxo() {
         utxos: vec![test_wallet_utxo(1).utxo],
         nullifiers: Vec::new(),
         commitment_observations: Vec::new(),
+        sender_scan_outputs: Vec::new(),
     };
 
     assert!(apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta));
@@ -3557,6 +3594,7 @@ async fn pending_output_poi_matches_wallet_owned_observation_and_keeps_utxo() {
         utxos: vec![utxo],
         nullifiers: Vec::new(),
         commitment_observations: vec![observation],
+        sender_scan_outputs: Vec::new(),
     };
 
     process_pending_output_poi_observations(
@@ -8576,6 +8614,7 @@ fn indexed_delta_marks_matching_utxo_spent() {
             source: spent_source.clone(),
         }],
         commitment_observations: Vec::new(),
+        sender_scan_outputs: Vec::new(),
     };
 
     let changed = apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta);
@@ -8611,6 +8650,7 @@ fn indexed_delta_reports_spent_output_commitment() {
             source: source(9),
         }],
         commitment_observations: Vec::new(),
+        sender_scan_outputs: Vec::new(),
     };
 
     let outcome = apply_wallet_delta_to_vec_with_outcome(&cfg, &mut wallet_utxos, delta);
@@ -8634,6 +8674,7 @@ fn pending_overlay_marks_matching_confirmed_utxo_pending_spent() {
             source: spent_source.clone(),
         }],
         commitment_observations: Vec::new(),
+        sender_scan_outputs: Vec::new(),
     };
 
     let overlay = pending_overlay_from_delta(&cfg, &[wallet_utxo], delta);
@@ -8963,6 +9004,7 @@ fn indexed_delta_preserves_unmatched_utxo() {
             source: source(9),
         }],
         commitment_observations: Vec::new(),
+        sender_scan_outputs: Vec::new(),
     };
 
     let changed = apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta);

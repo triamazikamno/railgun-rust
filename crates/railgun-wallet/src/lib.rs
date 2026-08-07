@@ -14,7 +14,7 @@ pub use broadcaster_core::utxo::{
 };
 pub use keys::{RailgunSpendSigner, WalletKeys};
 pub use keys::{bip39_entropy_from_mnemonic, bip39_mnemonic_from_entropy, public_spending_key};
-pub use notes::{Note, NoteCiphertext};
+pub use notes::{Note, NoteCiphertext, decrypt_sender_note};
 pub use prover::{ProverService, RailgunWitnessInputs};
 pub use scan::{WalletLogDelta, WalletScanError, WalletScanKeys};
 pub use tx::{

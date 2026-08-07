@@ -28,10 +28,10 @@ use super::{
     pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,
     pending_overlay_from_delta, process_pending_output_poi_observations_authorized,
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
-    rewind_wallet_utxos, verify_submitted_pending_output_pois_with_config_authorized,
-    wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
-    wallet_ppoi_workflow_status, wallet_ppoi_workflow_status_after_mutations,
-    wallet_utxo_stable_identity, warn, watch,
+    rewind_wallet_utxos, sender_transaction_candidate_rewind_ids,
+    verify_submitted_pending_output_pois_with_config_authorized, wallet_poi_status_refresh_needed,
+    wallet_poi_status_refresh_needed_for_selection, wallet_ppoi_workflow_status,
+    wallet_ppoi_workflow_status_after_mutations, wallet_utxo_stable_identity, warn, watch,
 };
 use crate::PublicScanSource;
 use crate::types::BackfillRequest;
@@ -964,6 +964,41 @@ impl WalletResetCommitRequest<'_> {
                 };
             }
         };
+        let sender_candidate_deletes = match request
+            .cache_store
+            .list_sender_transaction_candidates(request.cfg.chain.chain_id, &request.cfg.cache_key)
+            .and_then(|candidates| {
+                sender_transaction_candidate_rewind_ids(
+                    &candidates,
+                    request.pending.rewind_from_block(),
+                )
+                .map_err(|_| WalletCacheError::Crypto)
+            }) {
+            Ok(deletes) => deletes,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %request.cfg.cache_key,
+                    intent_id = request.pending.intent_id(),
+                    from_block = request.pending.rewind_from_block(),
+                    "failed to prepare sender candidate reset cleanup"
+                );
+                return WalletResetCommitOutcome {
+                    rewind: WalletResetRewindOutcome::Deferred {
+                        committed_to: committed_to_before,
+                        reason: WalletBackfillRejectReason::PersistenceFailed,
+                    },
+                };
+            }
+        };
+        let mut pending_context_deletes = rewind.removed_output_commitments.clone();
+        pending_context_deletes.extend_from_slice(&pending_output_rewind.context_deletes);
+        pending_context_deletes.sort_unstable();
+        pending_context_deletes.dedup();
+        let mut output_recovery_deletes = rewind.removed_output_commitments.clone();
+        output_recovery_deletes.extend_from_slice(&pending_output_rewind.recovery_deletes);
+        output_recovery_deletes.sort_unstable();
+        output_recovery_deletes.dedup();
         let authority = WalletPrivateMutationAuthority::new(
             request.worker_handle,
             request.pending.reset_generation(),
@@ -1037,8 +1072,9 @@ impl WalletResetCommitRequest<'_> {
                     },
                 )
                 .with_pending_output_context_updates(&pending_output_rewind.context_updates)
-                .with_pending_output_context_deletes(&rewind.removed_output_commitments)
-                .with_output_poi_recovery_deletes(&pending_output_rewind.recovery_deletes)
+                .with_pending_output_context_deletes(&pending_context_deletes)
+                .with_output_poi_recovery_deletes(&output_recovery_deletes)
+                .with_sender_transaction_candidate_deletes(&sender_candidate_deletes)
                 .with_sync_actor_state(&sync_actor_state),
             )?;
             permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
@@ -1131,7 +1167,7 @@ impl WalletResetCommitRequest<'_> {
             unspent,
             spent,
             changed = rewind.changed,
-            pending_context_deletes = rewind.removed_output_commitments.len(),
+            pending_context_deletes = pending_context_deletes.len(),
             pending_context_rewinds = pending_output_rewind.context_updates.len(),
             reset_generation = request.pending.reset_generation(),
             persist_elapsed_ms = persist_started.elapsed().as_millis(),
@@ -1388,6 +1424,7 @@ impl WalletScanCommitRequest<'_> {
                     utxos: Vec::new(),
                     nullifiers: Vec::new(),
                     commitment_observations: Vec::new(),
+                    sender_scan_outputs: Vec::new(),
                 };
                 (delta, request.apply.rows.to_block_hash, 0)
             }
@@ -1399,12 +1436,14 @@ impl WalletScanCommitRequest<'_> {
             utxos,
             nullifiers,
             commitment_observations,
+            sender_scan_outputs,
         } = delta;
         let commitment_observation_count = commitment_observations.len();
         let delta = WalletLogDelta {
             utxos,
             nullifiers,
             commitment_observations: Vec::new(),
+            sender_scan_outputs,
         };
 
         let mut candidate = request.utxos.read().await.clone();
@@ -1412,6 +1451,27 @@ impl WalletScanCommitRequest<'_> {
         let apply_started = Instant::now();
         let outcome = apply_wallet_delta_to_vec_with_outcome(request.cfg, &mut candidate, delta);
         let changed = outcome.changed;
+        let Ok(sender_transaction_candidates) = outcome
+            .sender_scan_candidates
+            .into_iter()
+            .map(|candidate| {
+                candidate.into_record(request.cfg.chain.chain_id, request.cfg.cache_key.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            warn!(
+                chain_id = request.cfg.chain.chain_id,
+                from_block, to_block, "failed to prepare sender transaction candidates"
+            );
+            return WalletScanCommitOutcome {
+                result: WalletBackfillApplyResult::Rejected {
+                    committed_to: *request.last_scanned,
+                    reason: WalletBackfillRejectReason::ApplyFailed,
+                },
+                changed: false,
+            };
+        };
+        let sender_scan_candidate_count = sender_transaction_candidates.len();
         // POI status refresh is never done inside scan commit (may be remote).
         // Actor schedules PoiMaintenanceJob after successful commits instead.
 
@@ -1580,6 +1640,8 @@ impl WalletScanCommitRequest<'_> {
                     output_poi_recovery_updates: &[],
                     output_poi_recovery_deletes: &pending_output_observation_updates
                         .recovery_deletes,
+                    sender_transaction_candidate_updates: &sender_transaction_candidates,
+                    sender_transaction_candidate_deletes: &[],
                 },
             )?;
             permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
@@ -1662,6 +1724,7 @@ impl WalletScanCommitRequest<'_> {
             spent,
             changed = projection_changed,
             commitment_observations = commitment_observation_count,
+            sender_scan_candidates = sender_scan_candidate_count,
             persisted_full_snapshot,
             needs_full_persist = request.persist_state.needs_full_persist,
             apply_elapsed_ms = apply_started.elapsed().as_millis(),
@@ -2937,6 +3000,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     utxos: Vec::new(),
                                     nullifiers: Vec::new(),
                                     commitment_observations: Vec::new(),
+                                    sender_scan_outputs: Vec::new(),
                                 },
                                 #[cfg(test)]
                                 WalletScanRowsPayload::IndexedDeltaForTest { delta } => *delta,

@@ -46,6 +46,8 @@ const PENDING_OUTPUT_POI_CONTEXT_V2_TABLE: ByteTableDefinition =
     TableDefinition::new("pending_output_poi_context_v2");
 const OUTPUT_POI_RECOVERY_V2_TABLE: ByteTableDefinition =
     TableDefinition::new("output_poi_recovery_v2");
+const SENDER_TRANSACTION_CANDIDATE_V1_TABLE: ByteTableDefinition =
+    TableDefinition::new("sender_transaction_candidate_v1");
 const POI_ARTIFACT_CACHE_TABLE: ByteTableDefinition = TableDefinition::new("poi_artifact_cache");
 const POI_CORPUS_JOURNAL_TABLE: ByteTableDefinition = TableDefinition::new("poi_corpus_journal_v1");
 const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
@@ -76,6 +78,7 @@ pub enum LocalDbTable {
     OutputPoiRecoveryV1,
     PendingOutputPoiContextV2,
     OutputPoiRecoveryV2,
+    SenderTransactionCandidateV1,
     PoiArtifactCache,
     PoiCorpusJournal,
     AppSettings,
@@ -176,6 +179,11 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::OpaqueBytes,
     },
     LocalDbTableInfo {
+        table: LocalDbTable::SenderTransactionCandidateV1,
+        name: "sender_transaction_candidate_v1",
+        decode_kind: LocalDbTableDecodeKind::OpaqueBytes,
+    },
+    LocalDbTableInfo {
         table: LocalDbTable::PoiArtifactCache,
         name: "poi_artifact_cache",
         decode_kind: LocalDbTableDecodeKind::PoiArtifactCache,
@@ -214,6 +222,7 @@ impl LocalDbTable {
             Self::OutputPoiRecoveryV1 => OUTPUT_POI_RECOVERY_TABLE,
             Self::PendingOutputPoiContextV2 => PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
             Self::OutputPoiRecoveryV2 => OUTPUT_POI_RECOVERY_V2_TABLE,
+            Self::SenderTransactionCandidateV1 => SENDER_TRANSACTION_CANDIDATE_V1_TABLE,
             Self::PoiArtifactCache => POI_ARTIFACT_CACHE_TABLE,
             Self::PoiCorpusJournal => POI_CORPUS_JOURNAL_TABLE,
             Self::AppSettings => APP_SETTINGS_TABLE,
@@ -237,7 +246,7 @@ const WALLET_PRIVATE_COMPACTION_REQUESTED_KEY: &str = "wallet_private_compaction
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WalletCacheKey(String);
@@ -559,6 +568,7 @@ impl WalletPrivateNamespaceId {
 pub enum WalletPrivateRecordKind {
     PendingOutputPoiContext,
     OutputPoiRecovery,
+    SenderTransactionCandidate,
 }
 
 impl WalletPrivateRecordKind {
@@ -566,6 +576,9 @@ impl WalletPrivateRecordKind {
         match self {
             Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
             Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_TABLE,
+            Self::SenderTransactionCandidate => {
+                panic!("sender transaction candidates have no legacy table")
+            }
         }
     }
 
@@ -573,6 +586,7 @@ impl WalletPrivateRecordKind {
         match self {
             Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
             Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_V2_TABLE,
+            Self::SenderTransactionCandidate => SENDER_TRANSACTION_CANDIDATE_V1_TABLE,
         }
     }
 
@@ -580,6 +594,9 @@ impl WalletPrivateRecordKind {
         match self {
             Self::PendingOutputPoiContext => "pending_output_poi_context",
             Self::OutputPoiRecovery => "output_poi_recovery",
+            Self::SenderTransactionCandidate => {
+                panic!("sender transaction candidates have no legacy table")
+            }
         }
     }
 
@@ -587,6 +604,7 @@ impl WalletPrivateRecordKind {
         match self {
             Self::PendingOutputPoiContext => "pending_output_poi_context_v2",
             Self::OutputPoiRecovery => "output_poi_recovery_v2",
+            Self::SenderTransactionCandidate => "sender_transaction_candidate_v1",
         }
     }
 
@@ -594,6 +612,7 @@ impl WalletPrivateRecordKind {
         match self {
             Self::PendingOutputPoiContext => "pending output POI context",
             Self::OutputPoiRecovery => "output POI recovery",
+            Self::SenderTransactionCandidate => "sender transaction candidate",
         }
     }
 }
@@ -667,6 +686,7 @@ pub struct WalletPrivateNamespaceDeletionReport {
     pub wallet_sync_actor_state_rows: u64,
     pub pending_output_poi_context_rows: u64,
     pub output_poi_recovery_rows: u64,
+    pub sender_transaction_candidate_rows: u64,
 }
 
 impl WalletPrivateNamespaceDeletionReport {
@@ -682,6 +702,9 @@ impl WalletPrivateNamespaceDeletionReport {
         self.output_poi_recovery_rows = self
             .output_poi_recovery_rows
             .saturating_add(other.output_poi_recovery_rows);
+        self.sender_transaction_candidate_rows = self
+            .sender_transaction_candidate_rows
+            .saturating_add(other.sender_transaction_candidate_rows);
     }
 }
 
@@ -1715,6 +1738,7 @@ pub struct WalletPrivateStateBatch<'a> {
     pub sync_actor_state: Option<&'a WalletSyncActorStateRecord>,
     pub pending_output_contexts: OpaqueWalletPrivateRowMutation<'a>,
     pub output_poi_recoveries: OpaqueWalletPrivateRowMutation<'a>,
+    pub sender_transaction_candidates: OpaqueWalletPrivateRowMutation<'a>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2261,6 +2285,7 @@ impl DbStore {
         }
         validate_opaque_row_mutation(&batch.pending_output_contexts)?;
         validate_opaque_row_mutation(&batch.output_poi_recoveries)?;
+        validate_opaque_row_mutation(&batch.sender_transaction_candidates)?;
         Ok(())
     }
 
@@ -2303,6 +2328,12 @@ impl DbStore {
             batch.namespace,
             WalletPrivateRecordKind::OutputPoiRecovery,
             batch.output_poi_recoveries,
+        )?;
+        Self::write_opaque_wallet_private_rows(
+            txn,
+            batch.namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            batch.sender_transaction_candidates,
         )?;
         Ok(())
     }
@@ -2411,12 +2442,17 @@ impl DbStore {
                 let mut table = txn.open_table(OUTPUT_POI_RECOVERY_V2_TABLE)?;
                 v1_rows.saturating_add(remove_table_prefix(&mut table, &opaque_prefix)?)
             };
+            let sender_transaction_candidate_rows = {
+                let mut table = txn.open_table(SENDER_TRANSACTION_CANDIDATE_V1_TABLE)?;
+                remove_table_prefix(&mut table, &opaque_prefix)?
+            };
             WalletPrivateNamespaceDeletionReport {
                 wallet_utxo_rows,
                 wallet_meta_rows,
                 wallet_sync_actor_state_rows,
                 pending_output_poi_context_rows,
                 output_poi_recovery_rows,
+                sender_transaction_candidate_rows,
             }
         })
     }
@@ -4627,6 +4663,7 @@ impl DbStore {
         txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE)?;
         txn.open_table(OUTPUT_POI_RECOVERY_V2_TABLE)?;
+        txn.open_table(SENDER_TRANSACTION_CANDIDATE_V1_TABLE)?;
         txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
         txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
         txn.open_table(APP_SETTINGS_TABLE)?;
@@ -4672,8 +4709,8 @@ impl DbStore {
         before_commit: impl FnOnce() -> Result<(), DbError>,
     ) -> Result<(), DbError> {
         let migrate_schema_seven = match (meta.schema_version, to) {
-            (7, 8..=10) => true,
-            (8, 9..=10) | (9, 10) => false,
+            (7, 8..=11) => true,
+            (8, 9..=11) | (9, 10..=11) | (10, 11) => false,
             _ => {
                 return Err(DbError::UnsupportedSchemaVersion {
                     version: meta.schema_version,
@@ -4696,7 +4733,7 @@ impl DbStore {
         if migrate_schema_seven {
             migrations::migrate_schema_7_to_8(&txn)?;
         }
-        if to == 10 {
+        if meta.schema_version <= 9 && to >= 10 {
             migrations::migrate_schema_9_to_10(&txn)?;
         }
         Self::initialize_schema_tables(&txn)?;
@@ -5545,6 +5582,7 @@ fn validate_wallet_private_v1_row(
                 && record.wallet_id == namespace.wallet_id.as_str()
                 && record.key() == row.storage_key
         }
+        WalletPrivateRecordKind::SenderTransactionCandidate => false,
     };
     if valid {
         Ok(())
