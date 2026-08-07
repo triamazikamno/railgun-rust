@@ -74,6 +74,7 @@ mod poi_maintenance;
 mod poi_refresh;
 mod poi_sources;
 mod private_remote;
+mod sender_candidate_recovery;
 mod worker;
 
 use actor::{PendingWalletReset, WalletActorState};
@@ -92,9 +93,10 @@ use handle::{
     OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_VERIFY_PROOF, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiSubject, PendingOutputPoiSubmissionPredicate,
-    PendingOutputPoiValidationEvidence, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
-    WalletIndexedCatchUpCommand, WalletPendingOverlayUpdate, WalletPoiRefreshSelection,
-    WalletPrivateRemoteAuthority, WalletPrivateRequest,
+    PendingOutputPoiValidationEvidence, RecoveredOutgoingSubmissionSibling,
+    WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE, WalletIndexedCatchUpCommand,
+    WalletPendingOverlayUpdate, WalletPoiRefreshSelection, WalletPrivateRemoteAuthority,
+    WalletPrivateRequest,
 };
 pub(crate) use handle::{
     OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,
@@ -120,8 +122,8 @@ use pending_output_poi::{
 };
 pub(crate) use persist::WalletPoiRuntime;
 use persist::{
-    OutputPoiRecoveryRun, WalletLiveMetadataFlush, WalletPersistState, WalletProgressPersist,
-    WalletProgressPrivateEffects, blinded_commitment_type, now_epoch_secs,
+    OutputPoiRecoveryRun, PoiMaintenanceError, WalletLiveMetadataFlush, WalletPersistState,
+    WalletProgressPersist, WalletProgressPrivateEffects, blinded_commitment_type, now_epoch_secs,
     wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
 };
 use poi_maintenance::PoiMaintenanceController;
@@ -131,6 +133,10 @@ use poi_refresh::{
 use poi_sources::PendingOutputPoiSubmitter;
 pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
 use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
+use sender_candidate_recovery::{
+    SenderCandidatePublicDataFence, SenderCandidateRecoveryReport, SenderCandidateRecoveryRequest,
+    materialize_sender_transaction_candidates,
+};
 
 pub use crate::types::{WalletPendingOverlay, WalletPendingSpent};
 pub(crate) use delta::pending_overlay_from_delta;

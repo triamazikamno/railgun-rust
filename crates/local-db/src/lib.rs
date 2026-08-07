@@ -1435,6 +1435,7 @@ pub enum PendingOutputPoiRole {
     BroadcasterFee,
     Recipient,
     Change,
+    RecoveredOutgoing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

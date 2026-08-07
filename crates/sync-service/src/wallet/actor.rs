@@ -1421,6 +1421,8 @@ pub(crate) enum WalletRemoteDone {
         credential: WalletActorCredential,
         key: PoiRemoteJobKey,
         recovered: usize,
+        candidate_report: super::SenderCandidateRecoveryReport,
+        recovery_error: Option<super::PoiMaintenanceError>,
         forced_pending_attempts: usize,
         submitted: usize,
         verified_completed: usize,
@@ -1625,6 +1627,11 @@ mod tests {
             &WalletPpoiWorkflowStatus::default()
         );
         let status = WalletPpoiWorkflowStatus {
+            awaiting_recovery: 5,
+            awaiting_public_txid_data: 0,
+            awaiting_poi_data: 0,
+            retrying_recovery: 0,
+            recovery_needs_attention: 0,
             awaiting_submission: 1,
             awaiting_validation: 2,
             needs_attention: 3,

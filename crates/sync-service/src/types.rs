@@ -2154,9 +2154,14 @@ impl WalletReadiness {
     }
 }
 
-/// Privacy-safe aggregate of sender-created pending-output PPOI work.
+/// Privacy-safe aggregate of external sender-created pending-output PPOI work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalletPpoiWorkflowStatus {
+    pub awaiting_recovery: u64,
+    pub awaiting_public_txid_data: u64,
+    pub awaiting_poi_data: u64,
+    pub retrying_recovery: u64,
+    pub recovery_needs_attention: u64,
     pub awaiting_submission: u64,
     pub awaiting_validation: u64,
     pub needs_attention: u64,
@@ -2166,12 +2171,28 @@ pub struct WalletPpoiWorkflowStatus {
 impl WalletPpoiWorkflowStatus {
     #[must_use]
     pub const fn has_outstanding(&self) -> bool {
-        self.awaiting_submission > 0 || self.awaiting_validation > 0 || self.needs_attention > 0
+        self.awaiting_recovery > 0
+            || self.awaiting_submission > 0
+            || self.awaiting_validation > 0
+            || self.needs_attention > 0
+    }
+
+    #[must_use]
+    pub const fn outstanding_count(&self) -> u64 {
+        self.awaiting_recovery
+            .saturating_add(self.awaiting_submission)
+            .saturating_add(self.awaiting_validation)
+            .saturating_add(self.needs_attention)
     }
 
     #[must_use]
     pub const fn cleared(self) -> Self {
         Self {
+            awaiting_recovery: 0,
+            awaiting_public_txid_data: 0,
+            awaiting_poi_data: 0,
+            retrying_recovery: 0,
+            recovery_needs_attention: 0,
             awaiting_submission: 0,
             awaiting_validation: 0,
             needs_attention: 0,

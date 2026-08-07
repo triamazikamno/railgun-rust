@@ -378,17 +378,31 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) force_retry: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PoiMaintenanceError {
+    #[error("failed to list sender transaction candidates")]
+    SenderCandidateList(#[source] WalletCacheError),
+}
+
+#[derive(Debug)]
+pub(super) struct PoiMaintenanceRecoveryOutcome {
+    pub(super) recovered: usize,
+    pub(super) candidate_report: SenderCandidateRecoveryReport,
+    pub(super) error: Option<PoiMaintenanceError>,
+}
+
 impl OutputPoiRecoveryRun<'_> {
-    pub(super) async fn recover_missing(self) -> usize {
-        if self.cfg.spending_public_key.is_none() || self.cfg.poi_recovery_prover.is_none() {
-            return 0;
-        }
+    pub(super) async fn recover_missing(self) -> PoiMaintenanceRecoveryOutcome {
         if self.authority.revalidate().is_err() {
             debug!(
                 chain_id = self.cfg.chain.chain_id,
                 "output POI recovery skipped"
             );
-            return 0;
+            return PoiMaintenanceRecoveryOutcome {
+                recovered: 0,
+                candidate_report: SenderCandidateRecoveryReport::default(),
+                error: None,
+            };
         }
         let snapshot = self.utxos.read().await.clone();
         mark_valid_output_poi_recoveries(
@@ -400,8 +414,60 @@ impl OutputPoiRecoveryRun<'_> {
             self.active_list_keys,
         )
         .await;
-        if output_poi_recovery_candidates(&snapshot, self.active_list_keys).is_empty() {
-            return 0;
+        let owned_recovery_candidates =
+            !output_poi_recovery_candidates(&snapshot, self.active_list_keys).is_empty();
+        let (sender_candidates, candidate_error) = match self
+            .cache_store
+            .list_sender_transaction_candidates(self.cfg.chain.chain_id, &self.cfg.cache_key)
+        {
+            Ok(candidates) => (candidates, None),
+            Err(error) => (
+                Vec::new(),
+                Some(PoiMaintenanceError::SenderCandidateList(error)),
+            ),
+        };
+        if !owned_recovery_candidates && sender_candidates.is_empty() {
+            return PoiMaintenanceRecoveryOutcome {
+                recovered: 0,
+                candidate_report: SenderCandidateRecoveryReport::default(),
+                error: candidate_error,
+            };
+        }
+        let forest = self.forest.read().await.clone();
+        let candidate_report =
+            materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+                output_recovery: OutputPoiRecoveryRequest {
+                    authority: self.authority,
+                    db: self.db,
+                    cache_store: self.cache_store,
+                    cfg: self.cfg,
+                    public_data_plane: self.public_data_plane,
+                    http_client: self.http_client,
+                    indexed_artifact_source: self.indexed_artifact_source,
+                    forest: &forest,
+                    poi_client: self.client,
+                    private_poi: self.private_poi,
+                    poi_runtime: self.poi_runtime,
+                    active_list_keys: self.active_list_keys,
+                    wallet_utxos: &snapshot,
+                    force_retry: self.force_retry,
+                },
+                candidates: sender_candidates,
+            })
+            .await;
+        if !owned_recovery_candidates {
+            return PoiMaintenanceRecoveryOutcome {
+                recovered: candidate_report.completed(),
+                candidate_report,
+                error: candidate_error,
+            };
+        }
+        if self.cfg.spending_public_key.is_none() || self.cfg.poi_recovery_prover.is_none() {
+            return PoiMaintenanceRecoveryOutcome {
+                recovered: candidate_report.completed(),
+                candidate_report,
+                error: candidate_error,
+            };
         }
         if matches!(self.poi_runtime, WalletPoiRuntime::IndexedArtifacts { .. })
             && !self.poi_runtime.wallet_read_fallback_enabled()
@@ -414,10 +480,13 @@ impl OutputPoiRecoveryRun<'_> {
                 .await
         {
             log_local_poi_cache_unavailable(self.cfg, "output_poi_recovery");
-            return 0;
+            return PoiMaintenanceRecoveryOutcome {
+                recovered: candidate_report.completed(),
+                candidate_report,
+                error: candidate_error,
+            };
         }
-        let forest = self.forest.read().await.clone();
-        recover_missing_output_pois(OutputPoiRecoveryRequest {
+        let recovered = recover_missing_output_pois(OutputPoiRecoveryRequest {
             authority: self.authority,
             db: self.db,
             cache_store: self.cache_store,
@@ -433,7 +502,12 @@ impl OutputPoiRecoveryRun<'_> {
             wallet_utxos: &snapshot,
             force_retry: self.force_retry,
         })
-        .await
+        .await;
+        PoiMaintenanceRecoveryOutcome {
+            recovered: candidate_report.completed() + recovered,
+            candidate_report,
+            error: candidate_error,
+        }
     }
 }
 

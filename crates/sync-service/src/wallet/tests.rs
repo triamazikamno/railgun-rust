@@ -14,9 +14,10 @@ use super::output_poi_recovery::test_support::{
     recovered_output_txid_data_from_public_cache,
 };
 use super::output_poi_recovery::{
-    CalldataRecoveryBuildRequest, MatchingPendingOutputPoiContextDisposition,
-    OutputRecoveryRemoteProofSource, WalletNullifierIndex, build_output_poi_recovery_chunk,
-    build_output_poi_recovery_chunk_from_calldata, decode_railgun_transactions,
+    MatchingPendingOutputPoiContextDisposition, OutputPoiProofSourceResolution,
+    OutputRecoveryRemoteProofSource, PublicTxidRecoveryBuildRequest, WalletNullifierIndex,
+    build_output_poi_recovery_chunk, build_output_poi_recovery_chunk_from_public_cache,
+    build_output_poi_recovery_chunk_from_public_rows, decode_railgun_transactions,
     extend_pending_output_poi_context, matching_pending_output_poi_context_disposition,
     newly_recoverable_output_poi_list_keys, output_poi_recovery_proof_retry_after,
     output_poi_recovery_retry_allowed_for_lists, output_start_global_position,
@@ -31,20 +32,28 @@ use super::pending_output_poi::{
         verify_submitted_pending_output_pois_authorized_with_projection,
         verify_submitted_pending_output_pois_with_config,
     },
+    wallet_ppoi_workflow_status_after_mutations,
+};
+use super::persist::PoiMaintenanceError;
+use super::sender_candidate_recovery::{
+    SenderCandidatePublicDataFence, SenderCandidateRecoveryRequest,
+    materialize_sender_transaction_candidates, sender_recovery_remote_proofs_for_test,
 };
 use super::test_support::sync_live_poi_event_tail;
 use super::{
     DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
     ExpectedRecordState, ExpectedWalletOutput, LocalPoiMerkleProofSource, LocalPoiStatusReader,
     OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OutputPoiRecoveryRequest, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-    PendingOutputPoiSubject, PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter,
+    OutputPoiRecoveryRequest, OutputPoiRecoveryRun, OwnedPoiPrivateDelta,
+    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,
+    PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter,
     PendingOutputPoiValidationEvidence, PoiPrivateApplyOutcome, PoiStatusReader,
-    WALLET_POI_STATUS_BATCH_SIZE, WalletActorLifecycleCell, WalletHandle, WalletLiveMetadataFlush,
-    WalletObservationPublisher, WalletPendingOverlay, WalletPendingSpent, WalletPersistState,
-    WalletPoiRefreshSelection, WalletPoiRuntime, WalletPrivateMutationAuthority,
-    WalletPrivatePoiClients, WalletProgressPersist, WalletViewState,
-    apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec_with_outcome,
+    RecoveredOutgoingSubmissionSibling, WALLET_POI_STATUS_BATCH_SIZE, WalletActorLifecycleCell,
+    WalletHandle, WalletLiveMetadataFlush, WalletObservationPublisher, WalletPendingOverlay,
+    WalletPendingSpent, WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
+    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletProgressPersist,
+    WalletProgressPrivateEffects, WalletViewState, apply_owned_poi_private_delta_on_actor,
+    apply_wallet_delta_to_vec_with_outcome, default_active_poi_list_keys,
     force_resubmit_matching_pending_output_pois_authorized, now_epoch_secs,
     output_poi_recovery_candidates, pending_output_poi_context_fingerprint,
     pending_output_poi_context_matches_wallet_utxo, pending_overlay_from_delta,
@@ -55,12 +64,14 @@ use super::{
     wallet_poi_status_client, wallet_poi_status_refresh_needed,
     wallet_poi_status_refresh_needed_for_selection, wallet_ppoi_workflow_status,
 };
+use crate::chain::PublicTxidTransaction;
 use crate::chain::{
     ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey as DataPlanePublicTxidCacheKey,
     PublicTxidLatestValidated as DataPlanePublicTxidLatestValidated, PublicTxidProofRequest,
     PublicTxidProofTarget, PublicTxidSyncRequest,
 };
 use crate::indexed_artifacts::{ChainScope, ChainType};
+use crate::txid_cache::TxidPublicCacheTransaction;
 use crate::types::{
     ChainKey, GlobalPoiPolicy, PendingOutputPoiContextIntent, PoiArtifactManifestSource,
     PoiArtifactSourceConfig, PoiProxyFallback, WalletCacheStore, WalletCheckpointMutation,
@@ -68,9 +79,12 @@ use crate::types::{
     WalletPpoiWorkflowStatus, WalletPrivateCommit, WalletPrivateRequestError,
     WalletSchedulableProgress, WalletSyncActorStateCommit, WalletUtxoMutation,
 };
+use crate::{
+    SenderTransactionCandidate, SenderTransactionCandidateOutput, SenderTransactionCandidateSpend,
+};
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolValue};
 use alloy::uint;
 use async_trait::async_trait;
 use broadcaster_core::contracts::railgun::{
@@ -79,16 +93,15 @@ use broadcaster_core::contracts::railgun::{
 };
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::notes::Note;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
     MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash,
     railgun_txid_leaf_hash_with_output_start,
 };
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use local_db::{
-    DbConfig, DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey, WalletMeta,
-    WalletSyncActorStateRecord,
+    DbConfig, DbStore, OpaqueWalletPrivateRow, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
+    OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey,
+    WalletMeta, WalletPrivateRecordKind, WalletSyncActorStateRecord,
 };
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleTreeUpdate};
 use poi::SensitiveUrl;
@@ -97,12 +110,14 @@ use poi::error::PoiError;
 use poi::poi::{
     BlindedCommitmentData, PoiEventType, PoiMerkleProof, PoiRpcClient, SingleCommitmentProofContext,
 };
-use railgun_wallet::prover::ProverError;
+use railgun_wallet::artifacts::ArtifactSource;
+use railgun_wallet::prover::{ProverError, ProverService};
 use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
 use railgun_wallet::tx::{PoiMerkleProofSource, PreTransactionPoiError};
 use railgun_wallet::wallet_cache::{WalletCacheError, wallet_utxo_stable_identity};
 use railgun_wallet::{
-    NoteCiphertext, PoiStatus, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletUtxo,
+    NoteCiphertext, PoiStatus, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletKeys,
+    WalletUtxo,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -137,6 +152,101 @@ fn source(byte: u8) -> UtxoSource {
         block_number: u64::from(byte),
         block_timestamp: 1_700_000_000 + u64::from(byte),
     }
+}
+
+fn sender_candidate_for_spent_input(
+    wallet_id: WalletCacheKey,
+    input: &WalletUtxo,
+    spent_source: UtxoSource,
+) -> SenderTransactionCandidate {
+    let note = Note {
+        token_hash: U256::from(7),
+        value: U256::from(9),
+        random: [0x5a; 16],
+        npk: U256::from(11),
+    };
+    SenderTransactionCandidate::new(
+        1,
+        wallet_id,
+        spent_source,
+        vec![SenderTransactionCandidateSpend {
+            tree: input.utxo.tree,
+            position: input.utxo.position,
+            commitment: input.utxo.poi.commitment,
+        }],
+        vec![SenderTransactionCandidateOutput {
+            tree: 3,
+            position: 4,
+            commitment: FixedBytes::from(note.commitment().to_be_bytes::<32>()),
+            note: Some(note),
+        }],
+    )
+    .expect("valid sender candidate")
+}
+
+async fn sender_candidate_public_data_fence(
+    db: &Arc<DbStore>,
+    cfg: &WalletConfig,
+    candidate: &SenderTransactionCandidate,
+    input: &WalletUtxo,
+    output_commitment: FixedBytes<32>,
+    row_timestamp: u64,
+) -> (ChainPublicDataPlane, SenderCandidatePublicDataFence) {
+    let graph_response = serde_json::json!({
+        "data": {
+            "transactions": [{
+                "id": "0x00",
+                "blockNumber": candidate.source.block_number.to_string(),
+                "blockTimestamp": row_timestamp.to_string(),
+                "transactionHash": hex::encode_prefixed(candidate.source.tx_hash),
+                "merkleRoot": "0x01",
+                "nullifiers": [hex::encode_prefixed(FixedBytes::from(
+                    input.utxo.nullifier(cfg.scan_keys.nullifying_key).to_be_bytes::<32>()
+                ))],
+                "commitments": [hex::encode_prefixed(output_commitment)],
+                "boundParamsHash": "0x02",
+                "hasUnshield": false,
+                "utxoTreeIn": input.utxo.tree.to_string(),
+                "utxoTreeOut": "3",
+                "utxoBatchStartPositionOut": "4",
+            }]
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let (endpoint, _requests) = spawn_http_response(graph_response).await;
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(db), Arc::new(AtomicU64::new(0)));
+    let cache_key = DataPlanePublicTxidCacheKey::new(
+        ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: cfg.chain.chain_id,
+            railgun_contract: cfg.chain.contract,
+        },
+        DEFAULT_TXID_VERSION,
+    );
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: cache_key.clone(),
+            endpoint: Some(&endpoint),
+            http_client: None,
+            latest: DataPlanePublicTxidLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+            indexed_artifact_source: None,
+        })
+        .await
+        .expect("seed sender public TXID row");
+    let rows = public_data_plane
+        .txid_transactions_for_outer_hash(&cache_key, candidate.source.tx_hash)
+        .expect("load sender public TXID row");
+    let fence = SenderCandidatePublicDataFence::new(
+        &public_data_plane,
+        cache_key,
+        public_data_plane.current_epoch(),
+        rows,
+    );
+    (public_data_plane, fence)
 }
 
 fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
@@ -687,6 +797,12 @@ struct ResetAfterFirstPendingOutputPoiSubmitter {
     calls: AtomicU64,
 }
 
+struct InvalidateOwnedSubstituteAfterSubmitter {
+    handle: WalletHandle,
+    list_key: FixedBytes<32>,
+    calls: AtomicU64,
+}
+
 impl ResetAfterFirstPendingOutputPoiSubmitter {
     fn new(handle: WalletHandle) -> Self {
         Self {
@@ -729,6 +845,39 @@ impl PendingOutputPoiSubmitter for ResetAfterFirstPendingOutputPoiSubmitter {
         if call == 0 {
             let _ = self.handle.advance_reset_generation().await;
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PendingOutputPoiSubmitter for InvalidateOwnedSubstituteAfterSubmitter {
+    async fn submit_single_commitment_proofs(
+        &self,
+        _txid_version: &str,
+        _chain_type: u8,
+        _chain_id: u64,
+        _context: &SingleCommitmentProofContext,
+        _utxo_tree_out: u64,
+        _utxo_position_out: u64,
+    ) -> Result<(), PoiError> {
+        unreachable!("recovered outgoing group uses transact submission")
+    }
+
+    async fn submit_transact_proof(
+        &self,
+        _txid_version: &str,
+        _chain_type: u8,
+        _chain_id: u64,
+        _list_key: &FixedBytes<32>,
+        _txid_merkleroot_index: u64,
+        _poi: &PreTxPoi,
+    ) -> Result<(), PoiError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.handle.utxos.write().await[0]
+            .utxo
+            .poi
+            .statuses
+            .insert(self.list_key, PoiStatus::Missing);
         Ok(())
     }
 }
@@ -984,6 +1133,239 @@ fn external_pending_output_record(
     record
 }
 
+fn recovered_outgoing_pending_group(
+    cfg: &WalletConfig,
+    list_key: FixedBytes<32>,
+) -> Vec<PendingOutputPoiContextRecord> {
+    let source = source(0xd0);
+    let mut records = [0xd1_u8, 0xd2_u8]
+        .into_iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            let mut record = external_pending_output_record(
+                cfg,
+                byte,
+                list_key,
+                PendingOutputPoiRole::RecoveredOutgoing,
+            );
+            record.txid_merkleroot_index = Some(77);
+            record.source_operation_id = Some("test-recovered-sender-inner-7".to_string());
+            record.observation = Some(local_db::PendingOutputPoiObservation {
+                output_tree: 3,
+                output_position: 40 + u64::try_from(index).expect("bounded index"),
+                tx_hash: source.tx_hash,
+                block_number: source.block_number,
+                block_timestamp: source.block_timestamp,
+            });
+            record
+        })
+        .collect::<Vec<_>>();
+    let blinded_commitments_out = records
+        .iter()
+        .map(|record| {
+            pending_output_poi_submit_identity(
+                record,
+                record.observation.as_ref().expect("group observation"),
+            )
+            .expect("group submit identity")
+            .derived_blinded_commitment
+        })
+        .collect::<Vec<_>>();
+    let txid_leaf = FixedBytes::from([0xd3; 32]);
+    let mut poi = sample_pre_tx_poi(0x20);
+    poi.blinded_commitments_out = blinded_commitments_out;
+    let material = BTreeMap::from([(list_key, BTreeMap::from([(txid_leaf, poi)]))]);
+    for record in &mut records {
+        record.pre_transaction_pois_per_txid_leaf_per_list = material.clone();
+    }
+    records
+}
+
+fn seed_recovered_outgoing_pending_group(
+    store: &DbStore,
+    cfg: &WalletConfig,
+    records: &[PendingOutputPoiContextRecord],
+) {
+    for record in records {
+        store
+            .put_pending_output_poi_context(record)
+            .expect("store recovered outgoing context");
+        let mut recovery = output_poi_recovery_record(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            record.output_commitment,
+            OutputPoiRecoveryStatus::Recoverable,
+            None,
+        );
+        recovery.source_tx_hash = record.observation.as_ref().expect("observation").tx_hash;
+        store
+            .put_output_poi_recovery(&recovery)
+            .expect("store recovered outgoing recovery");
+    }
+}
+
+fn owned_substitute_for_recovered_context(
+    context: &PendingOutputPoiContextRecord,
+    list_key: FixedBytes<32>,
+) -> WalletUtxo {
+    let observation = context.observation.as_ref().expect("group observation");
+    let mut output = test_wallet_utxo(0xee);
+    output.utxo.tree = u32::try_from(observation.output_tree).expect("test tree");
+    output.utxo.position = observation.output_position;
+    output.utxo.source = UtxoSource {
+        tx_hash: observation.tx_hash,
+        block_number: observation.block_number,
+        block_timestamp: observation.block_timestamp,
+    };
+    output.utxo.poi.commitment = context.output_commitment;
+    output.utxo.poi.npk = context.output_npk;
+    output.utxo.poi.blinded_commitment = UtxoPoiMetadata::blinded_commitment_for(
+        context.output_commitment,
+        context.output_npk,
+        output.utxo.tree,
+        output.utxo.position,
+    );
+    output.utxo.poi.statuses = BTreeMap::from([(list_key, PoiStatus::Valid)]);
+    output
+}
+
+struct SenderMaterializationTestFixture {
+    cfg: WalletConfig,
+    candidate: SenderTransactionCandidate,
+    input: WalletUtxo,
+    pending: Vec<PendingOutputPoiContextRecord>,
+    recoveries: Vec<OutputPoiRecoveryRecord>,
+    fence: SenderCandidatePublicDataFence,
+}
+
+fn sender_materialization_proof_outputs(
+    pending: &[PendingOutputPoiContextRecord],
+) -> Vec<FixedBytes<32>> {
+    pending
+        .iter()
+        .map(|context| {
+            pending_output_poi_submit_identity(
+                context,
+                context
+                    .observation
+                    .as_ref()
+                    .expect("materialization observation"),
+            )
+            .expect("materialization submit identity")
+            .derived_blinded_commitment
+        })
+        .collect()
+}
+
+async fn sender_materialization_test_fixture(
+    store: &Arc<DbStore>,
+    wallet_name: &str,
+    output_count: usize,
+) -> SenderMaterializationTestFixture {
+    let mut cfg = wallet_config(U256::from(42));
+    cfg.cache_key = test_cache_key(wallet_name);
+    let list_key = FixedBytes::from([0xa1; 32]);
+    let candidate_source = source(0xa2);
+    let mut input = test_wallet_utxo(7);
+    input.spent = Some(candidate_source.clone());
+    let outputs = (0..output_count)
+        .map(|index| {
+            let byte = 0xa3_u8 + u8::try_from(index).expect("bounded output count");
+            let note = Note {
+                token_hash: U256::from(1),
+                value: U256::from(9 + index),
+                random: [byte; 16],
+                npk: U256::from(4 + index),
+            };
+            SenderTransactionCandidateOutput {
+                tree: 3,
+                position: 4 + u64::try_from(index).expect("bounded output count"),
+                commitment: FixedBytes::from(note.commitment().to_be_bytes::<32>()),
+                note: Some(note),
+            }
+        })
+        .collect::<Vec<_>>();
+    let candidate = SenderTransactionCandidate::new(
+        cfg.chain.chain_id,
+        cfg.cache_key.clone(),
+        candidate_source.clone(),
+        vec![SenderTransactionCandidateSpend {
+            tree: input.utxo.tree,
+            position: input.utxo.position,
+            commitment: input.utxo.poi.commitment,
+        }],
+        outputs,
+    )
+    .expect("candidate");
+    store
+        .put_opaque_wallet_private_row(
+            &candidate.namespace(),
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate.row_identity(),
+                payload: candidate.encode().expect("encode candidate"),
+            },
+        )
+        .expect("store candidate");
+
+    let mut pending = Vec::with_capacity(output_count);
+    let mut recoveries = Vec::with_capacity(output_count);
+    for output in &candidate.outputs {
+        let note = output.note.clone().expect("qualified sender output");
+        let utxo = Utxo::new(
+            note,
+            output.tree,
+            output.position,
+            candidate_source.clone(),
+            UtxoCommitmentKind::Transact,
+        );
+        let mut context = external_pending_output_record(
+            &cfg,
+            0xa4,
+            list_key,
+            PendingOutputPoiRole::RecoveredOutgoing,
+        );
+        context.txid_merkleroot_index = Some(77);
+        context.source_operation_id = Some("test-recovered-sender-inner-7".to_string());
+        context.output_commitment = utxo.poi.commitment;
+        context.output_npk = utxo.poi.npk;
+        context.observation = Some(local_db::PendingOutputPoiObservation {
+            output_tree: u64::from(output.tree),
+            output_position: output.position,
+            tx_hash: candidate_source.tx_hash,
+            block_number: candidate_source.block_number,
+            block_timestamp: candidate_source.block_timestamp,
+        });
+        let mut recovery = output_poi_recovery_record(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            utxo.poi.commitment,
+            OutputPoiRecoveryStatus::Recoverable,
+            None,
+        );
+        recovery.source_tx_hash = candidate_source.tx_hash;
+        pending.push(context);
+        recoveries.push(recovery);
+    }
+    let (_, fence) = sender_candidate_public_data_fence(
+        store,
+        &cfg,
+        &candidate,
+        &input,
+        candidate.outputs[0].commitment,
+        candidate.source.block_timestamp,
+    )
+    .await;
+    SenderMaterializationTestFixture {
+        cfg,
+        candidate,
+        input,
+        pending,
+        recoveries,
+        fence,
+    }
+}
+
 fn output_poi_recovery_record(
     chain_id: u64,
     wallet_id: &str,
@@ -1029,8 +1411,12 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
         PendingOutputPoiRole::BroadcasterFee,
     );
     awaiting_validation.submitted_poi_list_keys = vec![active_list];
-    let mut terminal =
-        external_pending_output_record(&cfg, 0xc4, active_list, PendingOutputPoiRole::Change);
+    let mut terminal = external_pending_output_record(
+        &cfg,
+        0xc4,
+        active_list,
+        PendingOutputPoiRole::RecoveredOutgoing,
+    );
     terminal.terminal_error = Some("test-only terminal error".to_string());
     let failed =
         external_pending_output_record(&cfg, 0xc5, active_list, PendingOutputPoiRole::Recipient);
@@ -1071,6 +1457,84 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
     assert_eq!(status.awaiting_validation, 1);
     assert_eq!(status.needs_attention, 2);
     assert_eq!(status.validation_revision, 9);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_ppoi_workflow_status_transitions_candidate_output_without_double_counting() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let cfg = wallet_config(U256::ZERO);
+    let active_list = FixedBytes::from([0xca; 32]);
+    let input = test_wallet_utxo(0xcb);
+    let mut candidate =
+        sender_candidate_for_spent_input(cfg.cache_key.clone(), &input, source(0xcc));
+    let owned_note = Note {
+        token_hash: U256::from(7),
+        value: U256::from(4),
+        random: [0xce; 16],
+        npk: Note::npk_for(cfg.scan_keys.master_public_key, [0xce; 16]),
+    };
+    candidate.outputs.push(SenderTransactionCandidateOutput {
+        tree: 3,
+        position: 5,
+        commitment: FixedBytes::from(owned_note.commitment().to_be_bytes::<32>()),
+        note: Some(owned_note),
+    });
+    candidate.outputs.push(SenderTransactionCandidateOutput {
+        tree: 3,
+        position: 6,
+        commitment: FixedBytes::from([0xef; 32]),
+        note: None,
+    });
+    candidate
+        .validate()
+        .expect("candidate with owned and unknown outputs");
+
+    let awaiting_recovery = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        0,
+        &[],
+        &[],
+        &[],
+        &[],
+        std::slice::from_ref(&candidate),
+        &[],
+    )
+    .expect("derive candidate workflow status");
+    assert_eq!(awaiting_recovery.awaiting_recovery, 2);
+    assert_eq!(awaiting_recovery.outstanding_count(), 2);
+
+    let mut materialized = external_pending_output_record(
+        &cfg,
+        0xcd,
+        active_list,
+        PendingOutputPoiRole::RecoveredOutgoing,
+    );
+    materialized.output_commitment = candidate.outputs[0].commitment;
+    let after_materialization = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        0,
+        &[materialized],
+        &[],
+        &[],
+        &[],
+        std::slice::from_ref(&candidate),
+        &[],
+    )
+    .expect("derive materialized workflow status");
+    assert_eq!(after_materialization.awaiting_recovery, 1);
+    assert_eq!(after_materialization.awaiting_submission, 1);
+    assert_eq!(after_materialization.outstanding_count(), 2);
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -1420,6 +1884,13 @@ impl RecordingCacheStore {
             .fail_pending_output_list_call = Some(call_index);
     }
 
+    fn fail_next_candidate_list(&self) {
+        self.state
+            .lock()
+            .expect("cache state")
+            .fail_next_candidate_list = true;
+    }
+
     fn state(&self) -> RecordingCacheState {
         *self.state.lock().expect("cache state")
     }
@@ -1601,6 +2072,267 @@ impl WalletCacheStore for RecordingCacheStore {
         )
     }
 }
+
+#[tokio::test]
+async fn candidate_effect_commits_spent_snapshot_and_checkpoint_atomically() {
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cache_store = RecordingCacheStore::new(Arc::clone(&db));
+    let wallet_id = test_cache_key("cache-key");
+    let spent_source = source(0x51);
+    let mut input = test_wallet_utxo(7);
+    input.spent = Some(spent_source.clone());
+    let snapshot = vec![input.clone()];
+    let candidate = sender_candidate_for_spent_input(wallet_id.clone(), &input, spent_source);
+    let handle = test_wallet_handle(snapshot.clone());
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let permit = authority.acquire().await.expect("wallet authority");
+    let mut persist_state = WalletPersistState::default();
+
+    let full = persist_state
+        .persist_progress_with_private_effects(
+            &cache_store,
+            &permit,
+            WalletProgressPersist {
+                cache_key: wallet_id.as_str(),
+                snapshot: &snapshot,
+                last_scanned: 10,
+                checkpoint: WalletCheckpointMutation::Set {
+                    last_scanned_block: 10,
+                    last_scanned_block_hash: Some([0x10; 32]),
+                },
+                changed: false,
+            },
+            WalletProgressPrivateEffects {
+                sender_transaction_candidate_updates: std::slice::from_ref(&candidate),
+                ..WalletProgressPrivateEffects::default()
+            },
+        )
+        .expect("persist candidate effects");
+
+    assert!(full, "candidate effects require a full durable commit");
+    assert_eq!(cache_store.state().store_calls, 1);
+    let persisted = <DbStore as WalletCacheStore>::load_wallet_utxos(db.as_ref(), &wallet_id)
+        .expect("load persisted snapshot");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].spent, input.spent);
+    assert_eq!(
+        <DbStore as WalletCacheStore>::get_wallet_meta(db.as_ref(), &wallet_id)
+            .expect("load checkpoint")
+            .expect("checkpoint present")
+            .last_scanned_block,
+        10
+    );
+    assert!(
+        <DbStore as WalletCacheStore>::get_sender_transaction_candidate(
+            db.as_ref(),
+            1,
+            &wallet_id,
+            &candidate.semantic_id(),
+        )
+        .expect("load candidate")
+        .is_some()
+    );
+
+    let mut replacement_source = candidate.source.clone();
+    replacement_source.block_timestamp += 1;
+    let mut replacement_input = input;
+    replacement_input.spent = Some(replacement_source.clone());
+    let replacement_snapshot = vec![replacement_input.clone()];
+    let replacement =
+        sender_candidate_for_spent_input(wallet_id.clone(), &replacement_input, replacement_source);
+    for expected in [&replacement, &replacement] {
+        persist_state
+            .persist_progress_with_private_effects(
+                &cache_store,
+                &permit,
+                WalletProgressPersist {
+                    cache_key: wallet_id.as_str(),
+                    snapshot: &replacement_snapshot,
+                    last_scanned: 10,
+                    checkpoint: WalletCheckpointMutation::Preserve,
+                    changed: false,
+                },
+                WalletProgressPrivateEffects {
+                    sender_transaction_candidate_updates: std::slice::from_ref(expected),
+                    ..WalletProgressPrivateEffects::default()
+                },
+            )
+            .expect("replace candidate evidence");
+    }
+    let candidates = <DbStore as WalletCacheStore>::list_sender_transaction_candidates(
+        db.as_ref(),
+        1,
+        &wallet_id,
+    )
+    .expect("list replaced candidate");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].encode().expect("encode stored candidate"),
+        replacement.encode().expect("encode replacement")
+    );
+
+    drop(permit);
+    drop(cache_store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn restarted_candidate_maintenance_lists_and_dispatches_poi_proxy_proofs() {
+    let root_dir = temp_db_root();
+    let wallet_id = test_cache_key("candidate-maintenance-wallet");
+    let spent_source = source(0x53);
+    let mut input = test_wallet_utxo(9);
+    input.spent = Some(spent_source.clone());
+    let candidate = sender_candidate_for_spent_input(wallet_id.clone(), &input, spent_source);
+    {
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open seed db");
+        db.put_opaque_wallet_private_row(
+            &candidate.namespace(),
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate.row_identity(),
+                payload: candidate.encode().expect("encode candidate"),
+            },
+        )
+        .expect("persist candidate before restart");
+    }
+
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("reopen db"),
+    );
+    let cache_store = RecordingCacheStore::new(Arc::clone(&db));
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = wallet_id.clone();
+    let mut handle = test_wallet_handle(vec![input.clone()]);
+    handle.cache_key = wallet_id.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("POI RPC URL");
+    let poi_runtime = WalletPoiRuntime::from_policy(
+        &GlobalPoiPolicy::PoiProxy {
+            rpc_url: rpc_url.clone().into(),
+        },
+        None,
+    );
+    let poi_client = poi_runtime.public_client().clone();
+    let proof_transport = Arc::new(RecordingPoiProofSource::default());
+    let private_poi =
+        WalletPrivatePoiClients::for_proofs(authority.remote_authority(), proof_transport.clone());
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let forest = Arc::new(RwLock::new(MerkleForest::new()));
+    let forest_snapshot = forest.read().await.clone();
+    let active_list_keys = default_active_poi_list_keys();
+    let empty_wallet = Vec::new();
+    let proof_source_request = OutputPoiRecoveryRequest {
+        authority: &authority,
+        db: db.as_ref(),
+        cache_store: &cache_store,
+        cfg: &cfg,
+        public_data_plane: &public_data_plane,
+        http_client: None,
+        indexed_artifact_source: None,
+        forest: &forest_snapshot,
+        poi_client: &poi_client,
+        private_poi: &private_poi,
+        poi_runtime: &poi_runtime,
+        active_list_keys: &active_list_keys,
+        wallet_utxos: &empty_wallet,
+        force_retry: false,
+    };
+    assert!(matches!(
+        proof_source_request
+            .resolve_proof_source(&active_list_keys)
+            .await,
+        OutputPoiProofSourceResolution::RemoteFallback
+    ));
+    assert!(
+        sender_recovery_remote_proofs_for_test(
+            &proof_source_request,
+            &candidate,
+            &active_list_keys[0],
+            &[input.utxo.poi.blinded_commitment],
+        )
+        .await
+        .is_err(),
+        "recording source deliberately returns a proof error"
+    );
+    assert_eq!(proof_transport.calls(), 1);
+    assert_eq!(proof_transport.list_keys(), vec![active_list_keys[0]]);
+
+    let recovered = (OutputPoiRecoveryRun {
+        authority: &authority,
+        db: db.as_ref(),
+        cache_store: &cache_store,
+        cfg: &cfg,
+        public_data_plane: &public_data_plane,
+        http_client: None,
+        indexed_artifact_source: None,
+        poi_runtime: &poi_runtime,
+        forest: &forest,
+        utxos: &handle.utxos,
+        client: &poi_client,
+        private_poi: &private_poi,
+        active_list_keys: &active_list_keys,
+        force_retry: false,
+    })
+    .recover_missing()
+    .await;
+
+    assert_eq!(recovered.recovered, 0, "the bounded fixture has no prover");
+    assert!(recovered.error.is_none());
+    assert_eq!(cache_store.state().candidate_list_calls, 1);
+    assert!(
+        cache_store
+            .get_sender_transaction_candidate(1, &wallet_id, &candidate.semantic_id())
+            .expect("reload candidate after maintenance")
+            .is_some()
+    );
+
+    cache_store.fail_next_candidate_list();
+    let failed = (OutputPoiRecoveryRun {
+        authority: &authority,
+        db: db.as_ref(),
+        cache_store: &cache_store,
+        cfg: &cfg,
+        public_data_plane: &public_data_plane,
+        http_client: None,
+        indexed_artifact_source: None,
+        poi_runtime: &poi_runtime,
+        forest: &forest,
+        utxos: &handle.utxos,
+        client: &poi_client,
+        private_poi: &private_poi,
+        active_list_keys: &active_list_keys,
+        force_retry: false,
+    })
+    .recover_missing()
+    .await;
+    assert_eq!(failed.recovered, 0);
+    assert!(matches!(
+        failed.error,
+        Some(PoiMaintenanceError::SenderCandidateList(_))
+    ));
+    assert_eq!(cache_store.state().candidate_list_calls, 2);
+
+    let _ = proof_source_request;
+    drop(public_data_plane);
+    drop(cache_store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[test]
@@ -2808,6 +3540,893 @@ async fn local_poi_merkle_proof_source_reads_cache_without_remote_merkle_proofs(
 
     assert_eq!(proofs.len(), 1);
     assert_eq!(proofs[0].leaf, U256::from_be_bytes(blinded_commitment.0));
+}
+
+#[tokio::test]
+async fn fresh_import_sender_candidate_refreshes_validated_txid_and_materializes() {
+    let wallet = WalletKeys::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        0,
+    )
+    .expect("deterministic wallet keys");
+    let spending_public_key = wallet.spending_public_key;
+    let scan_keys = wallet.viewing;
+    let token_address = Address::ZERO;
+    let list_key = FixedBytes::from([0x11; 32]);
+    let input_note = Note::new_change(
+        scan_keys.master_public_key,
+        token_address,
+        U256::from(10),
+        [0x57; 16],
+    );
+    let mut input = WalletUtxo::new(Utxo::new(
+        input_note,
+        2,
+        0,
+        source(1),
+        UtxoCommitmentKind::Transact,
+    ));
+    let candidate_source = source(8);
+    input.spent = Some(candidate_source.clone());
+    let output_note = Note::new_change(
+        U256::from(11),
+        token_address,
+        input.utxo.note.value,
+        [0x58; 16],
+    );
+    let output = Utxo::new(
+        output_note.clone(),
+        input.utxo.tree,
+        8,
+        candidate_source.clone(),
+        UtxoCommitmentKind::Transact,
+    );
+    let mut forest = MerkleForest::new();
+    forest
+        .insert_leaf(MerkleTreeUpdate {
+            tree_number: input.utxo.tree,
+            tree_position: input.utxo.position,
+            hash: input.utxo.note.commitment(),
+        })
+        .expect("insert input leaf");
+    let merkle_root = forest
+        .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
+        .expect("input proof")
+        .root;
+    let transaction = Transaction {
+        merkleRoot: FixedBytes::from(merkle_root.to_be_bytes::<32>()),
+        boundParams: BoundParams::new_transact(
+            input.utxo.tree,
+            EVM_CHAIN_TYPE,
+            1,
+            Vec::new(),
+            Address::ZERO,
+            FixedBytes::ZERO,
+        ),
+        ..recovery_test_transaction(
+            &input,
+            &WalletUtxo::new(output.clone()),
+            scan_keys.nullifying_key,
+        )
+    };
+    let wallet_utxos = vec![input.clone()];
+    let mut cfg = wallet_config(scan_keys.nullifying_key);
+    cfg.scan_keys = scan_keys;
+    cfg.spending_public_key = Some(spending_public_key);
+    let candidate = SenderTransactionCandidate::new(
+        cfg.chain.chain_id,
+        cfg.cache_key.clone(),
+        candidate_source.clone(),
+        vec![SenderTransactionCandidateSpend {
+            tree: input.utxo.tree,
+            position: input.utxo.position,
+            commitment: input.utxo.poi.commitment,
+        }],
+        vec![SenderTransactionCandidateOutput {
+            tree: output.tree,
+            position: output.position,
+            commitment: output.poi.commitment,
+            note: Some(output_note),
+        }],
+    )
+    .expect("valid sender candidate");
+
+    let mut cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        1,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: *input.utxo.poi.blinded_commitment,
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("apply input POI event");
+    cache.accept_current_roots();
+
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    db.put_opaque_wallet_private_row(
+        &candidate.namespace(),
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &OpaqueWalletPrivateRow {
+            row_id: candidate.row_identity(),
+            payload: candidate.encode().expect("encode sender candidate"),
+        },
+    )
+    .expect("persist sender candidate");
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    seed_data_plane_poi_cache(&public_data_plane, 1, list_key, cache).await;
+    let bound_params_hash = transaction.boundParams.hash();
+    let stale_graph_response = serde_json::json!({
+        "data": {
+            "transactions": [
+                {
+                    "id": "0x00",
+                    "blockNumber": "1",
+                    "blockTimestamp": "1700000001",
+                    "transactionHash": hex::encode_prefixed(FixedBytes::<32>::from([0x99; 32])),
+                    "merkleRoot": hex::encode_prefixed(FixedBytes::<32>::from([0x98; 32])),
+                    "nullifiers": ["0xaa"],
+                    "commitments": ["0xbb"],
+                    "boundParamsHash": "0xcc",
+                    "hasUnshield": false,
+                    "utxoTreeIn": "0",
+                    "utxoTreeOut": "0",
+                    "utxoBatchStartPositionOut": "0",
+                }
+            ]
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let refresh_graph_response = serde_json::json!({
+        "data": {
+            "transactions": [
+                {
+                    "id": "0x01",
+                    "blockNumber": candidate.source.block_number.to_string(),
+                    "blockTimestamp": candidate.source.block_timestamp.to_string(),
+                    "transactionHash": hex::encode_prefixed(candidate.source.tx_hash),
+                    "merkleRoot": hex::encode_prefixed(transaction.merkleRoot),
+                    "nullifiers": [hex::encode_prefixed(transaction.nullifiers[0])],
+                    "commitments": [hex::encode_prefixed(output.poi.commitment)],
+                    "boundParamsHash": hex::encode_prefixed(FixedBytes::from(
+                        bound_params_hash.to_be_bytes::<32>()
+                    )),
+                    "hasUnshield": false,
+                    "utxoTreeIn": input.utxo.tree.to_string(),
+                    "utxoTreeOut": output.tree.to_string(),
+                    "utxoBatchStartPositionOut": output.position.to_string(),
+                }
+            ]
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let (stale_graph_endpoint, _stale_graph_requests) =
+        spawn_http_response(stale_graph_response).await;
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: DataPlanePublicTxidCacheKey::new(
+                ChainScope {
+                    chain_type: ChainType::Evm,
+                    chain_id: cfg.chain.chain_id,
+                    railgun_contract: cfg.chain.contract,
+                },
+                DEFAULT_TXID_VERSION,
+            ),
+            endpoint: Some(&stale_graph_endpoint),
+            http_client: None,
+            latest: DataPlanePublicTxidLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+            indexed_artifact_source: None,
+        })
+        .await
+        .expect("seed stale public TXID coverage");
+
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+    let mut handle = test_wallet_handle(wallet_utxos.clone());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let remote = Arc::new(RecordingPoiProofSource::default());
+    let private_poi =
+        WalletPrivatePoiClients::for_proofs(authority.remote_authority(), remote.clone());
+    let poi_mock = spawn_poi_rpc_sequence(vec![
+        serde_json::json!({
+            "validatedTxidIndex": 1,
+            "validatedMerkleroot": null,
+        }),
+        serde_json::json!(true),
+    ])
+    .await;
+    let poi_runtime = test_artifact_poi_runtime_with_fallback(poi_mock.url);
+    let (graph_endpoint, graph_requests) = spawn_http_response(refresh_graph_response).await;
+    cfg.quick_sync_endpoint = Some(graph_endpoint);
+    let materialized = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: poi_runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &poi_runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![candidate.clone()],
+    })
+    .await;
+
+    assert_eq!(materialized.materialized, 1);
+    assert_eq!(materialized.retired_already_valid, 0);
+    assert_eq!(remote.calls(), 0);
+    assert!(graph_requests.recv_timeout(Duration::from_secs(2)).is_ok());
+    let latest_request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("latest validated TXID request");
+    assert_eq!(latest_request["method"], "ppoi_validated_txid");
+    let validate_request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("validate TXID root request");
+    assert_eq!(validate_request["method"], "ppoi_validate_txid_merkleroot");
+    assert!(
+        db.get_sender_transaction_candidate(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            &candidate.semantic_id(),
+        )
+        .expect("load consumed sender candidate")
+        .is_none()
+    );
+    let pending = db
+        .get_pending_output_poi_context(cfg.chain.chain_id, &cfg.cache_key, &output.poi.commitment)
+        .expect("load materialized pending context")
+        .expect("materialized pending context");
+    assert_eq!(pending.output_role, PendingOutputPoiRole::RecoveredOutgoing);
+    assert_eq!(pending.required_poi_list_keys, vec![list_key]);
+    let recovery = db
+        .get_output_poi_recovery(cfg.chain.chain_id, &cfg.cache_key, &output.poi.commitment)
+        .expect("load materialized recovery")
+        .expect("materialized recovery");
+    assert_eq!(recovery.status, OutputPoiRecoveryStatus::Recoverable);
+    assert_eq!(recovery.source_tx_hash, candidate.source.tx_hash);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
+    let list_key = FixedBytes::from([0x31; 32]);
+    let mut input = test_wallet_utxo(0x32);
+    let candidate = sender_candidate_for_spent_input(
+        WalletCacheKey::from_opaque_bytes(b"batch-refresh-candidate").expect("cache key"),
+        &input,
+        source(0x33),
+    );
+    input.spent = Some(candidate.source.clone());
+    let second_candidate =
+        sender_candidate_for_spent_input(candidate.wallet_id.clone(), &input, source(0x34));
+    let mut cfg = wallet_config(input.utxo.nullifier(U256::ZERO));
+    cfg.cache_key = candidate.wallet_id.clone();
+    cfg.scan_keys.nullifying_key = U256::ZERO;
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    for persisted in [&candidate, &second_candidate] {
+        db.put_opaque_wallet_private_row(
+            &persisted.namespace(),
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: persisted.row_identity(),
+                payload: persisted.encode().expect("encode candidate"),
+            },
+        )
+        .expect("persist candidate");
+    }
+    cfg.spending_public_key = Some([U256::ZERO; 2]);
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+
+    let mut poi_cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        cfg.chain.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    poi_cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: [0x99; 32],
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("apply unrelated output event");
+    poi_cache.accept_current_roots();
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    seed_data_plane_poi_cache(&public_data_plane, cfg.chain.chain_id, list_key, poi_cache).await;
+    let foreign_graph_response = serde_json::json!({
+        "data": {
+            "transactions": [{
+                "id": "0x00",
+                "blockNumber": "1",
+                "blockTimestamp": "1700000001",
+                "transactionHash": hex::encode_prefixed(FixedBytes::<32>::from([0x99; 32])),
+                "merkleRoot": "0x01",
+                "nullifiers": ["0xaa"],
+                "commitments": ["0xbb"],
+                "boundParamsHash": "0xcc",
+                "hasUnshield": false,
+                "utxoTreeIn": "0",
+                "utxoTreeOut": "0",
+                "utxoBatchStartPositionOut": "0",
+            }]
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let (graph_endpoint, _graph_requests) = spawn_http_response(foreign_graph_response).await;
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: DataPlanePublicTxidCacheKey::new(
+                ChainScope {
+                    chain_type: ChainType::Evm,
+                    chain_id: cfg.chain.chain_id,
+                    railgun_contract: cfg.chain.contract,
+                },
+                DEFAULT_TXID_VERSION,
+            ),
+            endpoint: Some(&graph_endpoint),
+            http_client: None,
+            latest: DataPlanePublicTxidLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+            indexed_artifact_source: None,
+        })
+        .await
+        .expect("seed validated foreign TXID row");
+
+    let poi_mock = spawn_poi_rpc(serde_json::json!({
+        "validatedTxidIndex": 0,
+        "validatedMerkleroot": null,
+    }))
+    .await;
+    let runtime = test_artifact_poi_runtime_with_fallback(poi_mock.url);
+    cfg.quick_sync_endpoint =
+        Some(Url::parse("http://127.0.0.1:1").expect("unused configured GraphQL endpoint"));
+    let mut handle = test_wallet_handle(vec![input.clone()]);
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let private_poi = WalletPrivatePoiClients::from_rpc(
+        authority.remote_authority(),
+        PoiRpcClient::new(Url::parse("http://127.0.0.1:1").expect("unused POI endpoint")),
+    );
+    let forest = MerkleForest::new();
+    let wallet_utxos = vec![input];
+    let report = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![candidate, second_candidate],
+    })
+    .await;
+
+    assert_eq!(
+        report.awaiting_public_txid_data, 2,
+        "unexpected batch refresh report: {report:?}"
+    );
+    assert_eq!(report.retrying, 0);
+    let request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("single latest validated TXID request");
+    assert_eq!(request["method"], "ppoi_validated_txid");
+    assert!(poi_mock.requests.try_recv().is_err());
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
+    let list_key = FixedBytes::from([0x41; 32]);
+    let mut first_input = test_wallet_utxo(1);
+    let mut second_input = test_wallet_utxo(2);
+    let candidate_source = source(0x42);
+    first_input.spent = Some(candidate_source.clone());
+    second_input.spent = Some(candidate_source.clone());
+    let first_note = Note {
+        token_hash: U256::from(7),
+        value: U256::from(9),
+        random: [0x43; 16],
+        npk: U256::from(11),
+    };
+    let second_note = Note {
+        token_hash: U256::from(7),
+        value: U256::from(10),
+        random: [0x44; 16],
+        npk: U256::from(12),
+    };
+    let candidate = SenderTransactionCandidate::new(
+        1,
+        WalletCacheKey::from_opaque_bytes(b"partial-outer-txid-candidate").expect("cache key"),
+        candidate_source.clone(),
+        vec![
+            SenderTransactionCandidateSpend {
+                tree: first_input.utxo.tree,
+                position: first_input.utxo.position,
+                commitment: first_input.utxo.poi.commitment,
+            },
+            SenderTransactionCandidateSpend {
+                tree: second_input.utxo.tree,
+                position: second_input.utxo.position,
+                commitment: second_input.utxo.poi.commitment,
+            },
+        ],
+        vec![
+            SenderTransactionCandidateOutput {
+                tree: 3,
+                position: 4,
+                commitment: FixedBytes::from(first_note.commitment().to_be_bytes::<32>()),
+                note: Some(first_note),
+            },
+            SenderTransactionCandidateOutput {
+                tree: 3,
+                position: 5,
+                commitment: FixedBytes::from(second_note.commitment().to_be_bytes::<32>()),
+                note: Some(second_note),
+            },
+        ],
+    )
+    .expect("partial-coverage candidate");
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = candidate.wallet_id.clone();
+    cfg.spending_public_key = Some([U256::ZERO; 2]);
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+    db.put_opaque_wallet_private_row(
+        &candidate.namespace(),
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &OpaqueWalletPrivateRow {
+            row_id: candidate.row_identity(),
+            payload: candidate.encode().expect("encode candidate"),
+        },
+    )
+    .expect("persist candidate");
+
+    let mut poi_cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        cfg.chain.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    poi_cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: [0x99; 32],
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("apply unrelated output event");
+    poi_cache.accept_current_roots();
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    seed_data_plane_poi_cache(&public_data_plane, cfg.chain.chain_id, list_key, poi_cache).await;
+    let txid_row = |id: &str, input: &WalletUtxo, output: &SenderTransactionCandidateOutput| {
+        serde_json::json!({
+            "id": id,
+            "blockNumber": candidate.source.block_number.to_string(),
+            "blockTimestamp": candidate.source.block_timestamp.to_string(),
+            "transactionHash": hex::encode_prefixed(candidate.source.tx_hash),
+            "merkleRoot": "0x01",
+            "nullifiers": [hex::encode_prefixed(FixedBytes::from(
+                input.utxo.nullifier(cfg.scan_keys.nullifying_key).to_be_bytes::<32>()
+            ))],
+            "commitments": [hex::encode_prefixed(output.commitment)],
+            "boundParamsHash": "0x02",
+            "hasUnshield": false,
+            "utxoTreeIn": input.utxo.tree.to_string(),
+            "utxoTreeOut": output.tree.to_string(),
+            "utxoBatchStartPositionOut": output.position.to_string(),
+        })
+    };
+    let stale_graph_response = serde_json::json!({
+        "data": { "transactions": [txid_row("0x00", &first_input, &candidate.outputs[0])] }
+    })
+    .to_string()
+    .into_bytes();
+    let refresh_graph_response = serde_json::json!({
+        "data": { "transactions": [txid_row("0x01", &second_input, &candidate.outputs[1])] }
+    })
+    .to_string()
+    .into_bytes();
+    let (stale_graph_endpoint, _stale_requests) = spawn_http_response(stale_graph_response).await;
+    let cache_key = DataPlanePublicTxidCacheKey::new(
+        ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: cfg.chain.chain_id,
+            railgun_contract: cfg.chain.contract,
+        },
+        DEFAULT_TXID_VERSION,
+    );
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: cache_key,
+            endpoint: Some(&stale_graph_endpoint),
+            http_client: None,
+            latest: DataPlanePublicTxidLatestValidated {
+                txid_index: 0,
+                merkleroot: None,
+            },
+            indexed_artifact_source: None,
+        })
+        .await
+        .expect("seed partial validated TXID coverage");
+    let wallet_utxos = vec![first_input, second_input];
+    let mut handle = test_wallet_handle(wallet_utxos.clone());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let private_poi = WalletPrivatePoiClients::from_rpc(
+        authority.remote_authority(),
+        PoiRpcClient::new(Url::parse("http://127.0.0.1:1").expect("unused POI endpoint")),
+    );
+    let forest = MerkleForest::new();
+    cfg.quick_sync_endpoint =
+        Some(Url::parse("http://127.0.0.1:1").expect("unused configured GraphQL endpoint"));
+    let current_poi_mock = spawn_poi_rpc(serde_json::json!({
+        "validatedTxidIndex": 0,
+        "validatedMerkleroot": null,
+    }))
+    .await;
+    let current_runtime = test_artifact_poi_runtime_with_fallback(current_poi_mock.url);
+    let still_partial = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: current_runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &current_runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![candidate.clone()],
+    })
+    .await;
+    assert_eq!(
+        still_partial.awaiting_public_txid_data, 2,
+        "unexpected current-boundary report: {still_partial:?}"
+    );
+    assert_eq!(still_partial.needs_attention, 0);
+    let current_request = current_poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("current validated TXID request");
+    assert_eq!(current_request["method"], "ppoi_validated_txid");
+
+    let (refresh_endpoint, refresh_requests) = spawn_http_response(refresh_graph_response).await;
+    cfg.quick_sync_endpoint = Some(refresh_endpoint);
+    let poi_mock = spawn_poi_rpc(serde_json::json!({
+        "validatedTxidIndex": 1,
+        "validatedMerkleroot": null,
+    }))
+    .await;
+    let runtime = test_artifact_poi_runtime_with_fallback(poi_mock.url);
+    let report = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![candidate],
+    })
+    .await;
+
+    assert_eq!(report.needs_attention, 0, "unexpected report: {report:?}");
+    assert_eq!(report.retrying, 2, "unexpected report: {report:?}");
+    assert!(
+        refresh_requests
+            .recv_timeout(Duration::from_secs(2))
+            .is_ok()
+    );
+    let request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("latest validated TXID request");
+    assert_eq!(request["method"], "ppoi_validated_txid");
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn already_valid_sender_candidate_is_retired_without_txid_or_proof_requests() {
+    let list_key = FixedBytes::from([0x21; 32]);
+    let mut input = test_wallet_utxo(0x22);
+    let candidate = sender_candidate_for_spent_input(
+        WalletCacheKey::from_opaque_bytes(b"already-valid-candidate").expect("cache key"),
+        &input,
+        source(0x23),
+    );
+    input.spent = Some(candidate.source.clone());
+    let output = candidate.outputs[0].clone();
+    let note = output.note.clone().expect("candidate sender note");
+    let output_utxo = Utxo::new(
+        note,
+        output.tree,
+        output.position,
+        candidate.source.clone(),
+        UtxoCommitmentKind::Transact,
+    );
+    let mut cfg = wallet_config(input.utxo.nullifier(U256::ZERO));
+    cfg.cache_key = candidate.wallet_id.clone();
+    cfg.scan_keys.nullifying_key = U256::ZERO;
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    cfg.spending_public_key = Some([U256::ZERO; 2]);
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+    db.put_opaque_wallet_private_row(
+        &candidate.namespace(),
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &OpaqueWalletPrivateRow {
+            row_id: candidate.row_identity(),
+            payload: candidate.encode().expect("encode candidate"),
+        },
+    )
+    .expect("persist candidate");
+    let mut pending_cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        cfg.chain.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    pending_cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: [0x99; 32],
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("apply unrelated output event");
+    pending_cache.accept_current_roots();
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    seed_data_plane_poi_cache(
+        &public_data_plane,
+        cfg.chain.chain_id,
+        list_key,
+        pending_cache,
+    )
+    .await;
+    let (endpoint, requests) = spawn_http_response(b"not used".to_vec()).await;
+    let mut handle = test_wallet_handle(vec![input.clone()]);
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let private_poi = WalletPrivatePoiClients::from_rpc(
+        authority.remote_authority(),
+        PoiRpcClient::new(endpoint.clone()),
+    );
+    let runtime = test_artifact_poi_runtime();
+    let forest = MerkleForest::new();
+    let wallet_utxos = vec![input];
+    let waiting = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![candidate.clone()],
+    })
+    .await;
+    assert_eq!(waiting.retrying, 1, "unexpected retry report: {waiting:?}");
+    assert_eq!(waiting.completed(), 0);
+    assert!(waiting.matches_candidates(std::slice::from_ref(&candidate)));
+    let added_candidate =
+        sender_candidate_for_spent_input(cfg.cache_key.clone(), &wallet_utxos[0], source(0x24));
+    assert!(!waiting.matches_candidates(&[candidate.clone(), added_candidate]));
+    assert!(
+        db.get_sender_transaction_candidate(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            &candidate.semantic_id(),
+        )
+        .expect("load waiting candidate")
+        .is_some()
+    );
+
+    let mut valid_cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        cfg.chain.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    valid_cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: *output_utxo.poi.blinded_commitment,
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("apply valid output event");
+    valid_cache.accept_current_roots();
+    seed_data_plane_poi_cache(
+        &public_data_plane,
+        cfg.chain.chain_id,
+        list_key,
+        valid_cache,
+    )
+    .await;
+    let mut incomplete_candidate = candidate.clone();
+    incomplete_candidate
+        .outputs
+        .push(SenderTransactionCandidateOutput {
+            tree: output.tree,
+            position: output.position + 1,
+            commitment: FixedBytes::from([0xee; 32]),
+            note: None,
+        });
+    incomplete_candidate
+        .validate()
+        .expect("candidate with unknown output");
+    db.put_opaque_wallet_private_row(
+        &incomplete_candidate.namespace(),
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &OpaqueWalletPrivateRow {
+            row_id: incomplete_candidate.row_identity(),
+            payload: incomplete_candidate
+                .encode()
+                .expect("encode incomplete candidate"),
+        },
+    )
+    .expect("replace candidate with incomplete output knowledge");
+    let incomplete = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![incomplete_candidate],
+    })
+    .await;
+    assert_eq!(incomplete.retired_already_valid, 0);
+    assert_eq!(incomplete.retrying, 2);
+    db.put_opaque_wallet_private_row(
+        &candidate.namespace(),
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &OpaqueWalletPrivateRow {
+            row_id: candidate.row_identity(),
+            payload: candidate.encode().expect("restore complete candidate"),
+        },
+    )
+    .expect("restore complete candidate");
+    let report = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
+        output_recovery: OutputPoiRecoveryRequest {
+            authority: &authority,
+            db: db.as_ref(),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            public_data_plane: &public_data_plane,
+            http_client: None,
+            indexed_artifact_source: None,
+            forest: &forest,
+            poi_client: runtime.public_client(),
+            private_poi: &private_poi,
+            poi_runtime: &runtime,
+            active_list_keys: &[list_key],
+            wallet_utxos: &wallet_utxos,
+            force_retry: false,
+        },
+        candidates: vec![candidate.clone()],
+    })
+    .await;
+
+    assert_eq!(
+        report.retired_already_valid, 1,
+        "unexpected retirement report: {report:?}"
+    );
+    assert_eq!(report.materialized, 0);
+    assert!(requests.try_recv().is_err());
+    assert!(
+        db.get_sender_transaction_candidate(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            &candidate.semantic_id(),
+        )
+        .expect("load candidate")
+        .is_none()
+    );
+    assert!(
+        db.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)
+            .expect("list pending contexts")
+            .is_empty()
+    );
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
@@ -4201,6 +5820,554 @@ async fn verified_valid_rejects_mismatched_recovery_source() {
         Some(&PoiStatus::ProofSubmitted)
     );
     assert!(client.calls().is_empty());
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn recovered_outgoing_siblings_submit_once_and_preserve_ordinary_behavior() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let list_key = FixedBytes::from([0xd4; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = test_cache_key("wallet-recovered-outgoing-group");
+    let group = recovered_outgoing_pending_group(&cfg, list_key);
+    seed_recovered_outgoing_pending_group(&store, &cfg, &group);
+    let ordinary =
+        external_pending_output_record(&cfg, 0xd5, list_key, PendingOutputPoiRole::Recipient);
+    store
+        .put_pending_output_poi_context(&ordinary)
+        .expect("store ordinary context");
+    let mut handle = test_wallet_handle(Vec::new());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let submitter = Arc::new(RecordingPendingOutputPoiSubmitter::default());
+    let private_poi =
+        WalletPrivatePoiClients::for_submit(authority.remote_authority(), submitter.clone());
+
+    let submitted = process_pending_output_poi_observations_authorized(
+        &authority,
+        &store,
+        &store,
+        &cfg,
+        &[list_key],
+        Some(&private_poi),
+        false,
+    )
+    .await;
+
+    assert_eq!(submitted, 3);
+    assert_eq!(
+        submitter.calls().len(),
+        2,
+        "one grouped and one ordinary RPC"
+    );
+    for record in group.iter().chain(std::iter::once(&ordinary)) {
+        let current = store
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &record.output_commitment,
+            )
+            .expect("load submitted context")
+            .expect("context remains pending validation");
+        assert_eq!(current.submitted_poi_list_keys, vec![list_key]);
+        assert_eq!(
+            store
+                .get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &record.output_commitment,
+                )
+                .expect("load submitted recovery")
+                .expect("recovery present")
+                .status,
+            OutputPoiRecoveryStatus::Submitted
+        );
+    }
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn recovered_outgoing_group_uses_only_exact_current_owned_substitute() {
+    for case in ["valid", "missing", "spent", "source", "status", "stale"] {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let list_key = FixedBytes::from([0xdb; 32]);
+        let mut cfg = wallet_config(U256::ZERO);
+        cfg.cache_key = test_cache_key(format!("wallet-owned-substitute-{case}"));
+        let group = recovered_outgoing_pending_group(&cfg, list_key);
+        seed_recovered_outgoing_pending_group(&store, &cfg, &group);
+        store
+            .delete_pending_output_poi_context(
+                cfg.chain.chain_id,
+                cfg.cache_key.as_str(),
+                &group[1].output_commitment,
+            )
+            .expect("retire owned pending context");
+        store
+            .delete_output_poi_recovery(
+                cfg.chain.chain_id,
+                cfg.cache_key.as_str(),
+                &group[1].output_commitment,
+            )
+            .expect("retire owned recovery");
+
+        let mut owned = owned_substitute_for_recovered_context(&group[1], list_key);
+        match case {
+            "missing" => owned.utxo.poi.blinded_commitment = FixedBytes::from([0xfe; 32]),
+            "spent" => owned.spent = Some(source(0xfe)),
+            "source" => owned.utxo.source.block_number += 1,
+            "status" => {
+                owned.utxo.poi.statuses.insert(list_key, PoiStatus::Missing);
+            }
+            "valid" | "stale" => {}
+            _ => unreachable!(),
+        }
+        let mut handle = test_wallet_handle(vec![owned]);
+        handle.cache_key = cfg.cache_key.clone();
+        let cancel = CancellationToken::new();
+        let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+
+        let calls = if case == "stale" {
+            let submitter = Arc::new(InvalidateOwnedSubstituteAfterSubmitter {
+                handle: handle.handle.clone(),
+                list_key,
+                calls: AtomicU64::new(0),
+            });
+            let private_poi = WalletPrivatePoiClients::for_submit(
+                authority.remote_authority(),
+                submitter.clone(),
+            );
+            assert_eq!(
+                process_pending_output_poi_observations_authorized(
+                    &authority,
+                    &store,
+                    &store,
+                    &cfg,
+                    &[list_key],
+                    Some(&private_poi),
+                    false,
+                )
+                .await,
+                0,
+                "case={case}"
+            );
+            submitter.calls.load(Ordering::Acquire)
+        } else {
+            let submitter = Arc::new(RecordingPendingOutputPoiSubmitter::default());
+            let private_poi = WalletPrivatePoiClients::for_submit(
+                authority.remote_authority(),
+                submitter.clone(),
+            );
+            let submitted = process_pending_output_poi_observations_authorized(
+                &authority,
+                &store,
+                &store,
+                &cfg,
+                &[list_key],
+                Some(&private_poi),
+                false,
+            )
+            .await;
+            assert_eq!(submitted, usize::from(case == "valid"), "case={case}");
+            u64::try_from(submitter.calls().len()).expect("bounded calls")
+        };
+
+        assert_eq!(
+            calls,
+            u64::from(matches!(case, "valid" | "stale")),
+            "case={case}"
+        );
+        let external = store
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &group[0].output_commitment,
+            )
+            .expect("load external context")
+            .expect("external context retained");
+        assert_eq!(
+            external.submitted_poi_list_keys,
+            if case == "valid" {
+                vec![list_key]
+            } else {
+                Vec::new()
+            },
+            "case={case}"
+        );
+        assert!(
+            store
+                .get_pending_output_poi_context(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &group[1].output_commitment,
+                )
+                .expect("load retired owned context")
+                .is_none(),
+            "case={case}"
+        );
+        assert!(
+            store
+                .get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &group[1].output_commitment,
+                )
+                .expect("load retired owned recovery")
+                .is_none(),
+            "case={case}"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn recovered_outgoing_group_fails_closed_before_rpc() {
+    for case in ["missing", "mismatched", "stale-predecessor"] {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let list_key = FixedBytes::from([0xd6; 32]);
+        let mut cfg = wallet_config(U256::ZERO);
+        cfg.cache_key = test_cache_key(format!("wallet-recovered-outgoing-{case}"));
+        let mut group = recovered_outgoing_pending_group(&cfg, list_key);
+        if case == "mismatched" {
+            group[1].railgun_txid = U256::from(8);
+        }
+        let seeded = if case == "missing" {
+            &group[..1]
+        } else {
+            group.as_slice()
+        };
+        seed_recovered_outgoing_pending_group(&store, &cfg, seeded);
+        if case == "stale-predecessor" {
+            let mut recovery = store
+                .get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &group[1].output_commitment,
+                )
+                .expect("load recovery")
+                .expect("recovery present");
+            recovery.source_tx_hash = FixedBytes::from([0xff; 32]);
+            store
+                .put_output_poi_recovery(&recovery)
+                .expect("replace recovery predecessor");
+        }
+        let mut handle = test_wallet_handle(Vec::new());
+        handle.cache_key = cfg.cache_key.clone();
+        let cancel = CancellationToken::new();
+        let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+        let submitter = Arc::new(RecordingPendingOutputPoiSubmitter::default());
+        let private_poi =
+            WalletPrivatePoiClients::for_submit(authority.remote_authority(), submitter.clone());
+
+        assert_eq!(
+            process_pending_output_poi_observations_authorized(
+                &authority,
+                &store,
+                &store,
+                &cfg,
+                &[list_key],
+                Some(&private_poi),
+                false,
+            )
+            .await,
+            0,
+            "case={case}"
+        );
+        assert!(submitter.calls().is_empty(), "case={case}");
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn recovered_outgoing_group_final_apply_rechecks_every_predecessor() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let list_key = FixedBytes::from([0xda; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = test_cache_key("wallet-recovered-outgoing-final-fence");
+    let group = recovered_outgoing_pending_group(&cfg, list_key);
+    seed_recovered_outgoing_pending_group(&store, &cfg, &group);
+    let siblings = group
+        .iter()
+        .map(|context| {
+            let observation = context.observation.as_ref().expect("group observation");
+            let identity = pending_output_poi_submit_identity(context, observation)
+                .expect("group submit identity");
+            let recovery = store
+                .get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &context.output_commitment,
+                )
+                .expect("load recovery")
+                .expect("recovery present");
+            RecoveredOutgoingSubmissionSibling {
+                subject: PendingOutputPoiSubject::External {
+                    output_commitment: context.output_commitment,
+                    derived_blinded_commitment: identity.derived_blinded_commitment,
+                },
+                expected_context_fingerprint: pending_output_poi_context_fingerprint(context)
+                    .expect("context fingerprint"),
+                expected_recovery: super::expected_recovery_state(Some(&recovery))
+                    .expect("recovery fingerprint"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut replacement = group[1].clone();
+    replacement.source_operation_id = Some("replacement-after-submit".to_string());
+    store
+        .put_pending_output_poi_context(&replacement)
+        .expect("replace one grouped predecessor");
+    let mut handle = test_wallet_handle(Vec::new());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+
+    let outcome = apply_owned_poi_private_delta_on_actor(
+        &handle,
+        &cancel,
+        0,
+        &store,
+        &store,
+        &cfg,
+        OwnedPoiPrivateDelta::RecoveredOutgoingSubmission {
+            siblings,
+            owned_substitutes: Vec::new(),
+            active_list_keys: vec![list_key],
+            list_keys: vec![list_key],
+            predicate: PendingOutputPoiSubmissionPredicate::Missing,
+            merge_submitted_list_keys: true,
+            action: OutputPoiRecoveryAction::Submitted {
+                retry_after: Duration::from_secs(30),
+            },
+            now: 12,
+        },
+    )
+    .await
+    .expect("reject stale grouped final apply");
+
+    assert_eq!(outcome, PoiPrivateApplyOutcome::Skipped);
+    for context in &group {
+        let current = store
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &context.output_commitment,
+            )
+            .expect("load unchanged group context")
+            .expect("group context present");
+        assert!(current.submitted_poi_list_keys.is_empty());
+        assert_eq!(
+            store
+                .get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &context.output_commitment,
+                )
+                .expect("load unchanged group recovery")
+                .expect("group recovery present")
+                .status,
+            OutputPoiRecoveryStatus::Recoverable
+        );
+    }
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn recovered_outgoing_group_read_error_prevents_rpc() {
+    let root_dir = temp_db_root();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cache_store = RecordingCacheStore::new(Arc::clone(&store));
+    let list_key = FixedBytes::from([0xd9; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = test_cache_key("wallet-recovered-outgoing-read-error");
+    let group = recovered_outgoing_pending_group(&cfg, list_key);
+    seed_recovered_outgoing_pending_group(store.as_ref(), &cfg, &group);
+    cache_store.fail_pending_output_list_call(1);
+    let mut handle = test_wallet_handle(Vec::new());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let submitter = Arc::new(RecordingPendingOutputPoiSubmitter::default());
+    let private_poi =
+        WalletPrivatePoiClients::for_submit(authority.remote_authority(), submitter.clone());
+
+    assert_eq!(
+        process_pending_output_poi_observations_authorized(
+            &authority,
+            store.as_ref(),
+            &cache_store,
+            &cfg,
+            &[list_key],
+            Some(&private_poi),
+            false,
+        )
+        .await,
+        0
+    );
+    assert!(submitter.calls().is_empty());
+
+    drop(cache_store);
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn recovered_outgoing_group_persistence_failure_has_no_partial_apply() {
+    let root_dir = temp_db_root();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let cache_store = RecordingCacheStore::new(Arc::clone(&store));
+    let list_key = FixedBytes::from([0xd7; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = test_cache_key("wallet-recovered-outgoing-persist-failure");
+    let group = recovered_outgoing_pending_group(&cfg, list_key);
+    seed_recovered_outgoing_pending_group(store.as_ref(), &cfg, &group);
+    cache_store.fail_next_commit();
+    let mut handle = test_wallet_handle(Vec::new());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let submitter = Arc::new(RecordingPendingOutputPoiSubmitter::default());
+    let private_poi =
+        WalletPrivatePoiClients::for_submit(authority.remote_authority(), submitter.clone());
+
+    assert_eq!(
+        process_pending_output_poi_observations_authorized(
+            &authority,
+            store.as_ref(),
+            &cache_store,
+            &cfg,
+            &[list_key],
+            Some(&private_poi),
+            false,
+        )
+        .await,
+        0
+    );
+    assert_eq!(submitter.calls().len(), 1);
+    for record in &group {
+        assert!(
+            store
+                .get_pending_output_poi_context(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &record.output_commitment,
+                )
+                .expect("load unchanged context")
+                .expect("context present")
+                .submitted_poi_list_keys
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &record.output_commitment,
+                )
+                .expect("load unchanged recovery")
+                .expect("recovery present")
+                .status,
+            OutputPoiRecoveryStatus::Recoverable
+        );
+    }
+
+    drop(cache_store);
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn recovered_outgoing_ambiguous_remote_failure_stays_coherently_retryable() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let list_key = FixedBytes::from([0xd8; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = test_cache_key("wallet-recovered-outgoing-ambiguous");
+    let group = recovered_outgoing_pending_group(&cfg, list_key);
+    seed_recovered_outgoing_pending_group(&store, &cfg, &group);
+    let mut handle = test_wallet_handle(Vec::new());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let submitter = Arc::new(RecordingPendingOutputPoiSubmitter::default());
+    submitter.fail_next();
+    let private_poi =
+        WalletPrivatePoiClients::for_submit(authority.remote_authority(), submitter.clone());
+
+    assert_eq!(
+        process_pending_output_poi_observations_authorized(
+            &authority,
+            &store,
+            &store,
+            &cfg,
+            &[list_key],
+            Some(&private_poi),
+            false,
+        )
+        .await,
+        0
+    );
+    assert_eq!(submitter.calls().len(), 1);
+    for record in &group {
+        let context = store
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &record.output_commitment,
+            )
+            .expect("load retryable context")
+            .expect("context present");
+        assert!(context.submitted_poi_list_keys.is_empty());
+        let recovery = store
+            .get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &record.output_commitment,
+            )
+            .expect("load retryable recovery")
+            .expect("recovery present");
+        assert_eq!(recovery.status, OutputPoiRecoveryStatus::SubmitFailed);
+        assert!(recovery.next_retry_at.is_some());
+        assert_eq!(recovery.attempt_count, 1);
+    }
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -9159,4 +11326,857 @@ fn indexed_delta_preserves_unmatched_utxo() {
 
     assert!(!changed);
     assert!(wallet_utxos[0].spent.is_none());
+}
+
+#[tokio::test]
+async fn sender_materialization_atomically_installs_standard_records_without_balance_mutation() {
+    let root_dir = temp_db_root();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let mut cfg = wallet_config(U256::from(42));
+    cfg.cache_key = test_cache_key("sender-materialization");
+    let list_key = FixedBytes::from([0xa1; 32]);
+    let candidate_source = source(0xa2);
+    let mut input = test_wallet_utxo(7);
+    input.spent = Some(candidate_source.clone());
+    let output_note = Note {
+        token_hash: U256::from(1),
+        value: U256::from(9),
+        random: [0xa3; 16],
+        npk: U256::from(4),
+    };
+    let output = Utxo::new(
+        output_note.clone(),
+        3,
+        4,
+        candidate_source.clone(),
+        UtxoCommitmentKind::Transact,
+    );
+    let candidate = SenderTransactionCandidate::new(
+        cfg.chain.chain_id,
+        cfg.cache_key.clone(),
+        candidate_source.clone(),
+        vec![SenderTransactionCandidateSpend {
+            tree: input.utxo.tree,
+            position: input.utxo.position,
+            commitment: input.utxo.poi.commitment,
+        }],
+        vec![SenderTransactionCandidateOutput {
+            tree: output.tree,
+            position: output.position,
+            commitment: output.poi.commitment,
+            note: Some(output_note),
+        }],
+    )
+    .expect("candidate");
+    store
+        .put_opaque_wallet_private_row(
+            &candidate.namespace(),
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate.row_identity(),
+                payload: candidate.encode().expect("encode candidate"),
+            },
+        )
+        .expect("store candidate");
+
+    let mut pending = external_pending_output_record(
+        &cfg,
+        0xa4,
+        list_key,
+        PendingOutputPoiRole::RecoveredOutgoing,
+    );
+    pending.txid_merkleroot_index = Some(77);
+    pending.source_operation_id = Some("test-recovered-sender-inner-7".to_string());
+    pending.output_commitment = output.poi.commitment;
+    pending.output_npk = output.poi.npk;
+    pending.observation = Some(local_db::PendingOutputPoiObservation {
+        output_tree: u64::from(output.tree),
+        output_position: output.position,
+        tx_hash: candidate_source.tx_hash,
+        block_number: candidate_source.block_number,
+        block_timestamp: candidate_source.block_timestamp,
+    });
+    let mut recovery = output_poi_recovery_record(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        output.poi.commitment,
+        OutputPoiRecoveryStatus::Recoverable,
+        None,
+    );
+    recovery.source_tx_hash = candidate_source.tx_hash;
+
+    let (public_data_plane, public_data_fence) = sender_candidate_public_data_fence(
+        &store,
+        &cfg,
+        &candidate,
+        &input,
+        output.poi.commitment,
+        candidate.source.block_timestamp,
+    )
+    .await;
+
+    let mut handle = test_wallet_handle(vec![input.clone()]);
+    handle.cache_key = cfg.cache_key.clone();
+    let before = wallet_utxo_stable_identity(&input);
+    let cancel = CancellationToken::new();
+    let delta = || OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+        expected_candidate: candidate.clone(),
+        public_data_fence: public_data_fence.clone(),
+        active_list_keys: vec![list_key],
+        pending_updates: vec![pending.clone()],
+        recovery_updates: vec![recovery.clone()],
+        owned_substitutes: Vec::new(),
+        proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+    };
+
+    assert!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            1,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            delta(),
+        )
+        .await
+        .is_err(),
+        "reset-generation stale work must not enter private apply"
+    );
+    let mut retired_handle = test_wallet_handle(vec![input.clone()]);
+    retired_handle.cache_key = cfg.cache_key.clone();
+    retired_handle.retire_actor();
+    assert!(
+        apply_owned_poi_private_delta_on_actor(
+            &retired_handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            delta(),
+        )
+        .await
+        .is_err(),
+        "replaced actor work must not enter private apply"
+    );
+    handle.utxos.write().await[0].spent = None;
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            delta(),
+        )
+        .await
+        .expect("reject changed spent input"),
+        PoiPrivateApplyOutcome::Skipped
+    );
+    handle.utxos.write().await[0].spent = input.spent.clone();
+
+    let mut replacement_source = candidate.source.clone();
+    replacement_source.block_timestamp += 1;
+    let replacement =
+        sender_candidate_for_spent_input(cfg.cache_key.clone(), &input, replacement_source);
+    store
+        .put_opaque_wallet_private_row(
+            &replacement.namespace(),
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: replacement.row_identity(),
+                payload: replacement.encode().expect("encode replacement candidate"),
+            },
+        )
+        .expect("replace sender candidate");
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            delta(),
+        )
+        .await
+        .expect("reject replaced candidate"),
+        PoiPrivateApplyOutcome::Skipped
+    );
+    store
+        .put_opaque_wallet_private_row(
+            &candidate.namespace(),
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            &OpaqueWalletPrivateRow {
+                row_id: candidate.row_identity(),
+                payload: candidate.encode().expect("restore candidate"),
+            },
+        )
+        .expect("restore sender candidate");
+
+    public_data_plane
+        .reset_public_cache()
+        .await
+        .expect("advance public epoch");
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            delta(),
+        )
+        .await
+        .expect("reject stale public epoch"),
+        PoiPrivateApplyOutcome::Skipped
+    );
+
+    let (current_public_data_plane, current_public_data_fence) =
+        sender_candidate_public_data_fence(
+            &store,
+            &cfg,
+            &candidate,
+            &input,
+            output.poi.commitment,
+            candidate.source.block_timestamp,
+        )
+        .await;
+    let row_reset_plane =
+        ChainPublicDataPlane::new(Arc::clone(&store), Arc::new(AtomicU64::new(0)));
+    row_reset_plane
+        .reset_public_cache()
+        .await
+        .expect("replace persisted public rows without changing captured epoch");
+    let (_replacement_plane, _) = sender_candidate_public_data_fence(
+        &store,
+        &cfg,
+        &candidate,
+        &input,
+        output.poi.commitment,
+        candidate.source.block_timestamp + 1,
+    )
+    .await;
+    let row_delta = || OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+        expected_candidate: candidate.clone(),
+        public_data_fence: current_public_data_fence.clone(),
+        active_list_keys: vec![list_key],
+        pending_updates: vec![pending.clone()],
+        recovery_updates: vec![recovery.clone()],
+        owned_substitutes: Vec::new(),
+        proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+    };
+    assert_eq!(current_public_data_plane.current_epoch().value, 0);
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            row_delta(),
+        )
+        .await
+        .expect("reject replaced public TXID row"),
+        PoiPrivateApplyOutcome::Skipped
+    );
+
+    let (_final_public_data_plane, final_public_data_fence) = sender_candidate_public_data_fence(
+        &store,
+        &cfg,
+        &candidate,
+        &input,
+        output.poi.commitment,
+        candidate.source.block_timestamp + 1,
+    )
+    .await;
+    let final_delta = || OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+        expected_candidate: candidate.clone(),
+        public_data_fence: final_public_data_fence.clone(),
+        active_list_keys: vec![list_key],
+        pending_updates: vec![pending.clone()],
+        recovery_updates: vec![recovery.clone()],
+        owned_substitutes: Vec::new(),
+        proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+    };
+    let outcome = apply_owned_poi_private_delta_on_actor(
+        &handle,
+        &cancel,
+        0,
+        store.as_ref(),
+        store.as_ref(),
+        &cfg,
+        final_delta(),
+    )
+    .await
+    .expect("materialize candidate");
+    assert_eq!(
+        outcome,
+        PoiPrivateApplyOutcome::Applied {
+            utxo_changed: false
+        }
+    );
+    assert!(
+        store
+            .get_sender_transaction_candidate(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &candidate.semantic_id(),
+            )
+            .expect("load consumed candidate")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &output.poi.commitment,
+            )
+            .expect("load pending sibling")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_output_poi_recovery(cfg.chain.chain_id, &cfg.cache_key, &output.poi.commitment,)
+            .expect("load recovery sibling")
+            .is_some()
+    );
+    let after = handle.utxos.read().await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(wallet_utxo_stable_identity(&after[0]), before);
+    assert_eq!(after[0].spent, input.spent);
+    drop(after);
+
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            final_delta(),
+        )
+        .await
+        .expect("restart-style retry"),
+        PoiPrivateApplyOutcome::Skipped
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn sender_materialization_consumes_exact_covered_and_mixed_candidates_without_overwrite() {
+    for covered_count in [1_usize, 2] {
+        let root_dir = temp_db_root();
+        let store = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let fixture = sender_materialization_test_fixture(
+            &store,
+            &format!("sender-materialization-covered-{covered_count}"),
+            2,
+        )
+        .await;
+        for index in 0..covered_count {
+            let mut context = fixture.pending[index].clone();
+            context.submitted_poi_list_keys = context.required_poi_list_keys.clone();
+            context.terminal_error = Some("preserved progress".to_string());
+            let mut recovery = fixture.recoveries[index].clone();
+            recovery.status = OutputPoiRecoveryStatus::Submitted;
+            recovery.attempt_count = 4;
+            recovery.last_error = Some("preserved recovery progress".to_string());
+            store
+                .put_pending_output_poi_context(&context)
+                .expect("seed exact covered context");
+            store
+                .put_output_poi_recovery(&recovery)
+                .expect("seed exact covered recovery");
+        }
+        let covered_before = (0..covered_count)
+            .map(|index| {
+                (
+                    rmp_serde::to_vec(
+                        &store
+                            .get_pending_output_poi_context(
+                                fixture.cfg.chain.chain_id,
+                                &fixture.cfg.cache_key,
+                                &fixture.pending[index].output_commitment,
+                            )
+                            .expect("load covered context")
+                            .expect("covered context present"),
+                    )
+                    .expect("encode covered context"),
+                    rmp_serde::to_vec(
+                        &store
+                            .get_output_poi_recovery(
+                                fixture.cfg.chain.chain_id,
+                                &fixture.cfg.cache_key,
+                                &fixture.pending[index].output_commitment,
+                            )
+                            .expect("load covered recovery")
+                            .expect("covered recovery present"),
+                    )
+                    .expect("encode covered recovery"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut handle = test_wallet_handle(vec![fixture.input.clone()]);
+        handle.cache_key = fixture.cfg.cache_key.clone();
+        let cancel = CancellationToken::new();
+
+        assert_eq!(
+            apply_owned_poi_private_delta_on_actor(
+                &handle,
+                &cancel,
+                0,
+                store.as_ref(),
+                store.as_ref(),
+                &fixture.cfg,
+                OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+                    expected_candidate: fixture.candidate.clone(),
+                    public_data_fence: fixture.fence.clone(),
+                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                    pending_updates: fixture.pending.clone(),
+                    recovery_updates: fixture.recoveries.clone(),
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                },
+            )
+            .await
+            .expect("consume covered candidate"),
+            PoiPrivateApplyOutcome::Applied {
+                utxo_changed: false
+            },
+            "covered_count={covered_count}"
+        );
+        assert!(
+            store
+                .get_sender_transaction_candidate(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.candidate.semantic_id(),
+                )
+                .expect("load consumed candidate")
+                .is_none()
+        );
+        assert_eq!(
+            apply_owned_poi_private_delta_on_actor(
+                &handle,
+                &cancel,
+                0,
+                store.as_ref(),
+                store.as_ref(),
+                &fixture.cfg,
+                OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+                    expected_candidate: fixture.candidate.clone(),
+                    public_data_fence: fixture.fence.clone(),
+                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                    pending_updates: fixture.pending.clone(),
+                    recovery_updates: fixture.recoveries.clone(),
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                },
+            )
+            .await
+            .expect("replay consumed candidate"),
+            PoiPrivateApplyOutcome::Skipped
+        );
+        for (index, before) in covered_before.iter().enumerate() {
+            assert_eq!(
+                rmp_serde::to_vec(
+                    &store
+                        .get_pending_output_poi_context(
+                            fixture.cfg.chain.chain_id,
+                            &fixture.cfg.cache_key,
+                            &fixture.pending[index].output_commitment,
+                        )
+                        .expect("reload covered context")
+                        .expect("covered context retained"),
+                )
+                .expect("encode retained context"),
+                before.0
+            );
+            assert_eq!(
+                rmp_serde::to_vec(
+                    &store
+                        .get_output_poi_recovery(
+                            fixture.cfg.chain.chain_id,
+                            &fixture.cfg.cache_key,
+                            &fixture.pending[index].output_commitment,
+                        )
+                        .expect("reload covered recovery")
+                        .expect("covered recovery retained"),
+                )
+                .expect("encode retained recovery"),
+                before.1
+            );
+        }
+        for index in covered_count..fixture.pending.len() {
+            assert!(
+                store
+                    .get_pending_output_poi_context(
+                        fixture.cfg.chain.chain_id,
+                        &fixture.cfg.cache_key,
+                        &fixture.pending[index].output_commitment,
+                    )
+                    .expect("load absent materialized context")
+                    .is_some()
+            );
+            assert!(
+                store
+                    .get_output_poi_recovery(
+                        fixture.cfg.chain.chain_id,
+                        &fixture.cfg.cache_key,
+                        &fixture.pending[index].output_commitment,
+                    )
+                    .expect("load absent materialized recovery")
+                    .is_some()
+            );
+        }
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn sender_materialization_persists_only_external_output_and_requires_exact_owned_substitute()
+{
+    for case in ["exact", "missing", "duplicate", "changed", "spent"] {
+        let root_dir = temp_db_root();
+        let store = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let fixture = sender_materialization_test_fixture(
+            &store,
+            &format!("sender-materialization-owned-{case}"),
+            2,
+        )
+        .await;
+        let owned_candidate_output = &fixture.candidate.outputs[1];
+        let mut owned = WalletUtxo::new(Utxo::new(
+            owned_candidate_output
+                .note
+                .clone()
+                .expect("owned candidate note"),
+            owned_candidate_output.tree,
+            owned_candidate_output.position,
+            fixture.candidate.source.clone(),
+            UtxoCommitmentKind::Transact,
+        ));
+        let expected_owned = ExpectedWalletOutput::new(&owned);
+        match case {
+            "changed" => owned.utxo.poi.npk = FixedBytes::from([0xee; 32]),
+            "spent" => owned.spent = Some(source(0xef)),
+            _ => {}
+        }
+        let external = fixture.pending[0].clone();
+        let proof_outputs = vec![
+            pending_output_poi_submit_identity(
+                &external,
+                external.observation.as_ref().expect("external observation"),
+            )
+            .expect("external submit identity")
+            .derived_blinded_commitment,
+            expected_owned.blinded_commitment(),
+        ];
+        let mut wallet_outputs = vec![fixture.input.clone()];
+        if case != "missing" {
+            wallet_outputs.push(owned.clone());
+        }
+        if case == "duplicate" {
+            wallet_outputs.push(owned);
+        }
+        let mut handle = test_wallet_handle(wallet_outputs);
+        handle.cache_key = fixture.cfg.cache_key.clone();
+        let outcome = apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &CancellationToken::new(),
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &fixture.cfg,
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+                expected_candidate: fixture.candidate.clone(),
+                public_data_fence: fixture.fence,
+                active_list_keys: external.required_poi_list_keys.clone(),
+                pending_updates: vec![external.clone()],
+                recovery_updates: vec![fixture.recoveries[0].clone()],
+                owned_substitutes: vec![expected_owned],
+                proof_outputs,
+            },
+        )
+        .await
+        .expect("materialization apply result");
+
+        assert_eq!(
+            outcome,
+            if case == "exact" {
+                PoiPrivateApplyOutcome::Applied {
+                    utxo_changed: false,
+                }
+            } else {
+                PoiPrivateApplyOutcome::Skipped
+            }
+        );
+        assert_eq!(
+            store
+                .get_sender_transaction_candidate(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.candidate.semantic_id(),
+                )
+                .expect("load candidate")
+                .is_some(),
+            case != "exact"
+        );
+        assert_eq!(
+            store
+                .get_pending_output_poi_context(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.pending[0].output_commitment,
+                )
+                .expect("load external context")
+                .is_some(),
+            case == "exact"
+        );
+        assert!(
+            store
+                .get_pending_output_poi_context(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.pending[1].output_commitment,
+                )
+                .expect("load owned context")
+                .is_none()
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn public_reset_waits_for_sender_materialization_commit_guard_without_deadlock() {
+    let root_dir = temp_db_root();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let public_data_plane =
+        ChainPublicDataPlane::new(Arc::clone(&store), Arc::new(AtomicU64::new(0)));
+    let commit_guard = public_data_plane.acquire_commit_guard().await;
+    let reset_plane = public_data_plane.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let reset = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        reset_plane.reset_public_cache().await
+    });
+    started_rx.await.expect("reset task started");
+    tokio::task::yield_now().await;
+    assert!(!reset.is_finished());
+    assert_eq!(public_data_plane.current_epoch().value, 0);
+
+    drop(commit_guard);
+    let reset = reset
+        .await
+        .expect("reset task completed")
+        .expect("public reset succeeded");
+    assert_eq!(reset.previous_epoch.value, 0);
+    assert_eq!(reset.new_epoch.value, 1);
+
+    drop(public_data_plane);
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn sender_materialization_partial_or_conflicting_pair_retains_everything() {
+    for case in ["partial", "conflicting"] {
+        let root_dir = temp_db_root();
+        let store = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let fixture = sender_materialization_test_fixture(
+            &store,
+            &format!("sender-materialization-{case}"),
+            2,
+        )
+        .await;
+        let mut existing = fixture.pending[0].clone();
+        if case == "conflicting" {
+            existing.railgun_txid += U256::from(1);
+        }
+        store
+            .put_pending_output_poi_context(&existing)
+            .expect("seed predecessor context");
+        if case == "conflicting" {
+            store
+                .put_output_poi_recovery(&fixture.recoveries[0])
+                .expect("seed conflicting pair recovery");
+        }
+        let mut handle = test_wallet_handle(vec![fixture.input.clone()]);
+        handle.cache_key = fixture.cfg.cache_key.clone();
+        let cancel = CancellationToken::new();
+
+        assert_eq!(
+            apply_owned_poi_private_delta_on_actor(
+                &handle,
+                &cancel,
+                0,
+                store.as_ref(),
+                store.as_ref(),
+                &fixture.cfg,
+                OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+                    expected_candidate: fixture.candidate.clone(),
+                    public_data_fence: fixture.fence.clone(),
+                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                    pending_updates: fixture.pending.clone(),
+                    recovery_updates: fixture.recoveries.clone(),
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                },
+            )
+            .await
+            .expect("reject nonstandard predecessor"),
+            PoiPrivateApplyOutcome::Skipped,
+            "case={case}"
+        );
+        assert!(
+            store
+                .get_sender_transaction_candidate(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.candidate.semantic_id(),
+                )
+                .expect("load retained candidate")
+                .is_some(),
+            "case={case}"
+        );
+        assert!(
+            store
+                .get_pending_output_poi_context(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.pending[1].output_commitment,
+                )
+                .expect("load untouched absent context")
+                .is_none(),
+            "case={case}"
+        );
+        assert!(
+            store
+                .get_output_poi_recovery(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &fixture.pending[1].output_commitment,
+                )
+                .expect("load untouched absent recovery")
+                .is_none(),
+            "case={case}"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn sender_materialization_persistence_failure_retains_candidate_without_derived_rows() {
+    let root_dir = temp_db_root();
+    let store = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let fixture =
+        sender_materialization_test_fixture(&store, "sender-materialization-failure", 2).await;
+    let cache_store = RecordingCacheStore::new(Arc::clone(&store));
+    cache_store.fail_next_commit();
+    let mut handle = test_wallet_handle(vec![fixture.input.clone()]);
+    handle.cache_key = fixture.cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+
+    assert!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            &cache_store,
+            &fixture.cfg,
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+                expected_candidate: fixture.candidate.clone(),
+                public_data_fence: fixture.fence,
+                active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                pending_updates: fixture.pending.clone(),
+                recovery_updates: fixture.recoveries,
+                owned_substitutes: Vec::new(),
+                proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        store
+            .get_sender_transaction_candidate(
+                fixture.cfg.chain.chain_id,
+                &fixture.cfg.cache_key,
+                &fixture.candidate.semantic_id(),
+            )
+            .expect("load retained candidate")
+            .is_some()
+    );
+    for context in &fixture.pending {
+        assert!(
+            store
+                .get_pending_output_poi_context(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &context.output_commitment,
+                )
+                .expect("load absent context")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_output_poi_recovery(
+                    fixture.cfg.chain.chain_id,
+                    &fixture.cfg.cache_key,
+                    &context.output_commitment,
+                )
+                .expect("load absent recovery")
+                .is_none()
+        );
+    }
+
+    drop(cache_store);
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

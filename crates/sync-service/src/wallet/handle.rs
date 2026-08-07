@@ -88,9 +88,10 @@ impl WalletPoiRefreshSelection {
 
 use super::{
     Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, Mutex,
-    Ordering, OutputPoiRecoveryAction, OwnedMutexGuard, PendingOutputPoiContextIntent,
-    PendingOutputPoiContextRecord, PoiStatus, RwLock, SyncProgressUpdate, Utxo, UtxoCommitmentKind,
-    UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
+    Ordering, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OwnedMutexGuard,
+    PendingOutputPoiContextIntent, PendingOutputPoiContextRecord, PoiStatus, RwLock,
+    SenderCandidatePublicDataFence, SenderTransactionCandidate, SyncProgressUpdate, Utxo,
+    UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
     WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCacheKey,
     WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpStatus, WalletObservation,
@@ -293,6 +294,15 @@ impl ExpectedWalletOutput {
     pub(crate) const fn output_commitment(&self) -> FixedBytes<32> {
         self.poi_identity.commitment
     }
+
+    #[cfg(test)]
+    pub(crate) const fn blinded_commitment(&self) -> FixedBytes<32> {
+        self.poi_identity.blinded_commitment
+    }
+
+    pub(crate) const fn candidate_identity(&self) -> (u32, u64, FixedBytes<32>) {
+        (self.tree, self.position, self.poi_identity.commitment)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +398,13 @@ impl PendingOutputPoiSubject {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveredOutgoingSubmissionSibling {
+    pub(crate) subject: PendingOutputPoiSubject,
+    pub(crate) expected_context_fingerprint: Vec<u8>,
+    pub(crate) expected_recovery: ExpectedRecordState,
+}
+
 /// Evidence that authorizes retirement of an exact pending-output POI context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingOutputPoiValidationEvidence {
@@ -400,6 +417,22 @@ pub(crate) enum PendingOutputPoiValidationEvidence {
 /// Owned semantic POI intent for actor re-entry (jobs never write mirrors or stale rows).
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
+    /// Consume a still-current sender candidate whose external outputs are already valid.
+    SenderCandidateAlreadyValid {
+        expected_candidate: SenderTransactionCandidate,
+        active_list_keys: Vec<FixedBytes<32>>,
+    },
+    /// Install standard external pending/recovery siblings, reuse exact wallet-owned substitutes,
+    /// and consume their scan candidate in one actor-owned durable commit.
+    SenderCandidateMaterialization {
+        expected_candidate: SenderTransactionCandidate,
+        public_data_fence: SenderCandidatePublicDataFence,
+        active_list_keys: Vec<FixedBytes<32>>,
+        pending_updates: Vec<PendingOutputPoiContextRecord>,
+        recovery_updates: Vec<OutputPoiRecoveryRecord>,
+        owned_substitutes: Vec<ExpectedWalletOutput>,
+        proof_outputs: Vec<FixedBytes<32>>,
+    },
     /// Fold a recovery action into the exact predecessor, optionally replacing a pending
     /// context whose predecessor is also exact.
     OutputRecovery {
@@ -417,6 +450,17 @@ pub(crate) enum OwnedPoiPrivateDelta {
         subject: PendingOutputPoiSubject,
         expected_context_fingerprint: Vec<u8>,
         expected_recovery: ExpectedRecordState,
+        active_list_keys: Vec<FixedBytes<32>>,
+        list_keys: Vec<FixedBytes<32>>,
+        predicate: PendingOutputPoiSubmissionPredicate,
+        merge_submitted_list_keys: bool,
+        action: OutputPoiRecoveryAction,
+        now: u64,
+    },
+    /// Apply one recovered sender transaction/list result to every exact output sibling.
+    RecoveredOutgoingSubmission {
+        siblings: Vec<RecoveredOutgoingSubmissionSibling>,
+        owned_substitutes: Vec<ExpectedWalletOutput>,
         active_list_keys: Vec<FixedBytes<32>>,
         list_keys: Vec<FixedBytes<32>>,
         predicate: PendingOutputPoiSubmissionPredicate,

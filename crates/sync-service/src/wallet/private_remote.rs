@@ -136,11 +136,6 @@ impl WalletPrivatePoiClients {
         }
     }
 
-    #[must_use]
-    pub(crate) fn remote_effects(&self) -> WalletPrivateRemoteEffects {
-        self.effects.clone()
-    }
-
     pub(crate) async fn pois_per_list<Check, CheckFuture, CheckError>(
         &self,
         check_subject: Check,

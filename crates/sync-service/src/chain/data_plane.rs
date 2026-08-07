@@ -106,6 +106,11 @@ pub(crate) struct PublicCacheCommitPermit {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
+/// Short-lived authority preventing a public cache reset while a derived private commit applies.
+pub(crate) struct ChainPublicDataPlaneCommitGuard {
+    _guard: OwnedMutexGuard<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicCoverageAnswer {
     ReplayableEmpty {
@@ -1568,6 +1573,12 @@ impl ChainPublicDataPlane {
     #[must_use]
     pub(crate) fn current_epoch(&self) -> PublicDataPlaneEpoch {
         PublicDataPlaneEpoch::new(self.epoch.load(Ordering::Acquire))
+    }
+
+    pub(crate) async fn acquire_commit_guard(&self) -> ChainPublicDataPlaneCommitGuard {
+        ChainPublicDataPlaneCommitGuard {
+            _guard: Arc::clone(&self.commit_fence).lock_owned().await,
+        }
     }
 
     #[must_use]
