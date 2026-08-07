@@ -1732,7 +1732,7 @@ fn recovery_input_tree_search_finds_root_before_later_commitments() {
 }
 
 #[test]
-fn output_poi_recovery_chunk_decrypts_missing_unshield_fee_output_from_calldata() {
+fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_notes() {
     let spending_public_key = [uint!(4_U256), uint!(5_U256)];
     let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
     let broadcaster_keys =
@@ -1835,12 +1835,41 @@ fn output_poi_recovery_chunk_decrypts_missing_unshield_fee_output_from_calldata(
     assert_eq!(&calldata[..4], &[0xc6, 0x1e, 0x6b, 0x9d]);
     let decoded_transactions =
         decode_railgun_transactions(&calldata).expect("decode 7702 recovery calldata");
-    let wallet_utxos = vec![input, output.clone()];
+    let wallet_utxos = vec![input.clone(), output.clone()];
     let wallet_nullifiers = WalletNullifierIndex::new(&wallet_utxos, &scan_keys);
 
-    let chunk = build_output_poi_recovery_chunk(
+    let decoded = &decoded_transactions[0];
+    let public_row = PublicTxidTransaction {
+        txid_index: 5,
+        transaction: TxidPublicCacheTransaction {
+            id: "5".to_string(),
+            transaction_hash: output.utxo.source.tx_hash,
+            block_number: output.utxo.source.block_number,
+            block_timestamp: output.utxo.source.block_timestamp,
+            merkle_root,
+            nullifiers: decoded
+                .nullifiers
+                .iter()
+                .map(|nullifier| U256::from_be_bytes(nullifier.0))
+                .collect(),
+            commitments: decoded
+                .commitments
+                .iter()
+                .map(|commitment| U256::from_be_bytes(commitment.0))
+                .collect(),
+            bound_params_hash: decoded.boundParams.hash(),
+            has_unshield: true,
+            unshield_preimage: Some(decoded.unshieldPreimage.abi_encode()),
+            utxo_tree_in: u64::from(input.utxo.tree),
+            utxo_tree_out: u64::from(output.utxo.tree),
+            utxo_batch_start_position_out: 8,
+        },
+    };
+    let chunk = build_output_poi_recovery_chunk_from_public_rows(
         &output,
         &wallet_nullifiers,
+        &[public_row],
+        None,
         &decoded_transactions,
         &forest,
         &[],
@@ -1871,6 +1900,131 @@ fn output_poi_recovery_chunk_decrypts_missing_unshield_fee_output_from_calldata(
             + u128::from(output.utxo.position)
             - 1
     );
+}
+
+#[test]
+fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_calldata() {
+    let spending_public_key = [uint!(4_U256), uint!(5_U256)];
+    let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
+    let mut input = test_wallet_utxo(0);
+    let source = source(44);
+    input.spent = Some(source.clone());
+    let token = input.utxo.token_address();
+    let fee_note = Note::new_change(U256::from(99), token, U256::from(2_u8), [0x51; 16]);
+    let change_note = Note::new_change(
+        scan_keys.master_public_key,
+        token,
+        U256::from(3_u8),
+        [0x52; 16],
+    );
+    let output = WalletUtxo::new(Utxo::new(
+        change_note.clone(),
+        input.utxo.tree,
+        9,
+        source.clone(),
+        UtxoCommitmentKind::Transact,
+    ));
+    let unshield_note = Note::new_unshield(Address::from([0x56; 20]), token, U256::from(7_u8));
+    let unshield_preimage = CommitmentPreimage::new_unshield(&unshield_note, token);
+    let mut forest = MerkleForest::new();
+    forest
+        .insert_leaf(MerkleTreeUpdate {
+            tree_number: input.utxo.tree,
+            tree_position: input.utxo.position,
+            hash: input.utxo.note.commitment(),
+        })
+        .expect("insert input leaf");
+    let merkle_root = forest
+        .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
+        .expect("input proof")
+        .root;
+    let row = PublicTxidTransaction {
+        txid_index: 12,
+        transaction: TxidPublicCacheTransaction {
+            id: "12".to_string(),
+            transaction_hash: source.tx_hash,
+            block_number: source.block_number,
+            block_timestamp: source.block_timestamp,
+            merkle_root,
+            nullifiers: vec![input.utxo.nullifier(scan_keys.nullifying_key)],
+            commitments: vec![
+                fee_note.commitment(),
+                change_note.commitment(),
+                unshield_note.commitment(),
+            ],
+            bound_params_hash: U256::from(88),
+            has_unshield: true,
+            unshield_preimage: Some(unshield_preimage.abi_encode()),
+            utxo_tree_in: u64::from(input.utxo.tree),
+            utxo_tree_out: u64::from(input.utxo.tree),
+            utxo_batch_start_position_out: 8,
+        },
+    };
+    let sender_candidate = SenderTransactionCandidate::new(
+        1,
+        test_cache_key("public-row-output-notes"),
+        source,
+        vec![SenderTransactionCandidateSpend {
+            tree: input.utxo.tree,
+            position: input.utxo.position,
+            commitment: input.utxo.poi.commitment,
+        }],
+        vec![
+            SenderTransactionCandidateOutput {
+                tree: output.utxo.tree,
+                position: 8,
+                commitment: FixedBytes::from(fee_note.commitment().to_be_bytes::<32>()),
+                note: Some(fee_note.clone()),
+            },
+            SenderTransactionCandidateOutput {
+                tree: output.utxo.tree,
+                position: 9,
+                commitment: output.utxo.poi.commitment,
+                note: Some(change_note),
+            },
+        ],
+    )
+    .expect("sender candidate");
+    let wallet_utxos = vec![input, output.clone()];
+    let wallet_nullifiers = WalletNullifierIndex::new(&wallet_utxos, &scan_keys);
+
+    let chunk = build_output_poi_recovery_chunk_from_public_rows(
+        &output,
+        &wallet_nullifiers,
+        std::slice::from_ref(&row),
+        Some(&sender_candidate),
+        &[],
+        &forest,
+        &[],
+        spending_public_key,
+        &scan_keys,
+    )
+    .expect("build recovery chunk from public row");
+
+    assert_eq!(chunk.target_txid_index, Some(12));
+    assert_eq!(chunk.chunk.outputs.len(), 3);
+    assert_eq!(chunk.chunk.outputs[0].commitment(), fee_note.commitment());
+    assert_eq!(
+        chunk.chunk.outputs[2].commitment(),
+        unshield_note.commitment()
+    );
+
+    let mut insufficient_row = row;
+    insufficient_row.transaction.unshield_preimage = None;
+    let failure = build_output_poi_recovery_chunk_from_public_rows(
+        &output,
+        &wallet_nullifiers,
+        &[insufficient_row],
+        Some(&sender_candidate),
+        &[],
+        &forest,
+        &[],
+        spending_public_key,
+        &scan_keys,
+    )
+    .expect_err("missing selected-source unshield preimage must fail closed");
+    assert_eq!(failure.status, OutputPoiRecoveryStatus::UnsupportedShape);
+    assert!(failure.retry_after.is_none());
 }
 
 #[test]
@@ -2792,7 +2946,6 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
         WalletPrivatePoiClients::for_proofs(authority.remote_authority(), proof_transport.clone());
     let (rpc_url, rpc_requests) =
         spawn_http_response(serde_json::json!({}).to_string().into_bytes()).await;
-    let rpcs = QueryRpcPool::new(vec![rpc_url.clone()], Duration::from_secs(1));
     let poi_client = PoiRpcClient::new(rpc_url);
     let public_data_plane =
         ChainPublicDataPlane::new(Arc::clone(&store), Arc::new(AtomicU64::new(0)));
@@ -2805,7 +2958,6 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
         cache_store: store.as_ref(),
         cfg: &cfg,
         public_data_plane: &public_data_plane,
-        rpcs: &rpcs,
         http_client: None,
         indexed_artifact_source: None,
         forest: &forest,
@@ -2816,22 +2968,19 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
         wallet_utxos: &wallet_utxos,
         force_retry: true,
     };
-    let mut fetched_inputs = HashMap::new();
-
-    let failure = build_output_poi_recovery_chunk_from_calldata(CalldataRecoveryBuildRequest {
-        request: &request,
-        candidate: &candidate,
-        source_tx_hash: candidate.utxo.source.tx_hash,
-        output_commitment: candidate.utxo.poi.commitment,
-        fetched_inputs: &mut fetched_inputs,
-        wallet_nullifiers: &wallet_nullifiers,
-        required_poi_list_keys: &required_poi_list_keys,
-        spending_public_key: [uint!(4_U256), uint!(5_U256)],
-        now: now_epoch_secs(),
-        candidate_started: Instant::now(),
-    })
-    .await
-    .expect_err("stale recovery source must be rejected");
+    let failure =
+        build_output_poi_recovery_chunk_from_public_cache(PublicTxidRecoveryBuildRequest {
+            request: &request,
+            candidate: &candidate,
+            source_tx_hash: candidate.utxo.source.tx_hash,
+            output_commitment: candidate.utxo.poi.commitment,
+            wallet_nullifiers: &wallet_nullifiers,
+            required_poi_list_keys: &required_poi_list_keys,
+            spending_public_key: [uint!(4_U256), uint!(5_U256)],
+            candidate_started: Instant::now(),
+        })
+        .await
+        .expect_err("stale recovery source must be rejected");
 
     assert_eq!(failure.status, OutputPoiRecoveryStatus::TxFetchFailed);
     assert!(
@@ -2839,7 +2988,6 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
             .message
             .contains("source transaction does not match")
     );
-    assert!(fetched_inputs.is_empty());
     let remote_proof_source = OutputRecoveryRemoteProofSource {
         private_poi: &private_poi,
         authority: &authority,

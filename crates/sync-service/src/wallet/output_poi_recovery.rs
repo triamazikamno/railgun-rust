@@ -1,35 +1,43 @@
+use alloy::sol_types::{SolCall, SolValue};
+use broadcaster_core::contracts::railgun::{
+    CommitmentPreimage, Transaction, executeCall, relayCall, transactCall,
+};
+
+use crate::txid_cache::TxidPublicCacheTransaction;
+
 use super::{
-    Arc, Bytes, ChainPublicDataPlane, ChainScope, ChainType, CommitmentCiphertext,
-    DEFAULT_TXID_VERSION, DbStore, DenseMerkleTree, Deserialize, Duration, EVM_CHAIN_TYPE,
-    ExpectedPoiStatus, ExpectedWalletOutput, FixedBytes, HashMap, IndexedArtifactSourceConfig,
-    InputWitness, Instant, LocalPoiMerkleProofSource, MerkleForest, Note,
-    OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES,
-    OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
-    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiContextRecord,
-    PendingOutputPoiObservation, PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt,
-    PendingOutputPoiRole, PendingOutputPoiSubmissionPlan, PoiMerkleProof, PoiMerkleProofSource,
-    PoiPrivateApplyOutcome, PoiRpcClient, PoiStatus, PostTransactionPoiData,
-    PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
-    PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusKey, PublicTxidCacheKey,
-    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest, QueryRpcPool, RailgunSpendSigner, RwLock, SolCall, TREE_LEAF_COUNT,
-    Transaction, TransactionPlanChunk, TxidPublicCacheError, U256, Utxo, UtxoCommitmentKind,
-    UtxoPoiMetadata, ValidatedRailgunTxidStatus, WalletCacheStore, WalletConfig, WalletPoiRuntime,
-    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletPrivateRemoteError, WalletUtxo,
-    apply_poi_private_delta, async_trait, current_pending_output_poi_subject, debug,
-    decrypt_in_place_16b_iv, executeCall, expected_pending_context_state, expected_recovery_state,
-    generate_post_transaction_pois, hex, json, log_local_poi_cache_unavailable, now_epoch_secs,
-    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
-    pending_output_poi_submission_plan_current, preflight_and_remote_submit_pending_output_poi,
-    railgun_txid_leaf_hash_with_output_start, relayCall, shared_symmetric_key, split_iv_tag,
-    submit_observed_pending_output_pois_inner, transactCall, warn,
+    Arc, ChainPublicDataPlane, ChainScope, ChainType, DEFAULT_TXID_VERSION, DbStore,
+    DenseMerkleTree, Duration, EVM_CHAIN_TYPE, ExpectedPoiStatus, ExpectedWalletOutput, FixedBytes,
+    HashMap, IndexedArtifactSourceConfig, InputWitness, Instant, LocalPoiMerkleProofSource,
+    MerkleForest, Note, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES, OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER,
+    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_VERIFY_PROOF, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
+    OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+    PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiPreflight,
+    PendingOutputPoiRemoteAttempt, PendingOutputPoiRole, PendingOutputPoiSubmissionPlan,
+    PoiMerkleProof, PoiMerkleProofSource, PoiPrivateApplyOutcome, PoiRpcClient, PoiStatus,
+    PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
+    PreTransactionPoiMap, PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusKey,
+    PublicTxidCacheKey, PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
+    PublicTxidSyncRequest, PublicTxidTransaction, RailgunSpendSigner, RwLock,
+    SenderTransactionCandidate, TREE_LEAF_COUNT, TransactionPlanChunk, TxidPublicCacheError, U256,
+    Utxo, UtxoCommitmentKind, UtxoPoiMetadata, ValidatedRailgunTxidStatus, WalletCacheStore,
+    WalletConfig, WalletPoiRuntime, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletUtxo, apply_poi_private_delta, async_trait,
+    current_pending_output_poi_subject, debug, expected_pending_context_state,
+    expected_recovery_state, generate_post_transaction_pois, hex, log_local_poi_cache_unavailable,
+    now_epoch_secs, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submission_plan_current,
+    preflight_and_remote_submit_pending_output_poi, railgun_txid_leaf_hash_with_output_start,
+    submit_observed_pending_output_pois_inner, warn,
 };
 mod public_cache;
 
-#[cfg(not(test))]
-use public_cache::{PublicCacheTxidRecoveryRequest, recovered_output_txid_data_from_public_cache};
+pub(super) use public_cache::{
+    PublicCacheTxidRecoveryRequest, PublicCacheTxidRefreshRequest, public_txid_rows_for_outer_hash,
+    recovered_output_txid_data_from_public_cache, refresh_public_txid_cache,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct RecoverySpendPublicKey {
@@ -52,7 +60,6 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
     pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
     pub(super) public_data_plane: &'a ChainPublicDataPlane,
-    pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
     pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(super) forest: &'a MerkleForest,
@@ -64,8 +71,11 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
     pub(super) force_retry: bool,
 }
 
-enum OutputPoiProofSourceResolution {
-    Local(LocalPoiMerkleProofSource),
+pub(super) enum OutputPoiProofSourceResolution {
+    Local {
+        source: LocalPoiMerkleProofSource,
+        revision_fence: tokio::sync::OwnedRwLockReadGuard<()>,
+    },
     RemoteFallback,
     Unavailable,
 }
@@ -133,10 +143,13 @@ impl PoiMerkleProofSource for OutputRecoveryRemoteProofSource<'_> {
 }
 
 impl OutputPoiRecoveryRequest<'_> {
-    async fn local_proof_source_if_ready(
+    pub(super) async fn local_proof_source_if_ready(
         &self,
         required_poi_list_keys: &[FixedBytes<32>],
-    ) -> Option<LocalPoiMerkleProofSource> {
+    ) -> Option<(
+        LocalPoiMerkleProofSource,
+        tokio::sync::OwnedRwLockReadGuard<()>,
+    )> {
         match self.poi_runtime {
             WalletPoiRuntime::IndexedArtifacts { .. } => {
                 let corpus = self
@@ -144,27 +157,31 @@ impl OutputPoiRecoveryRequest<'_> {
                     .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id))
                     .await
                     .ok()?;
+                let revision_fence = corpus.revision_read_fence().await;
                 let source = corpus.merkle_proof_source();
                 source
                     .available_for_lists(self.cfg.chain.chain_id, required_poi_list_keys)
                     .await
-                    .then_some(source)
+                    .then_some((source, revision_fence))
             }
             WalletPoiRuntime::PoiProxy { .. } => None,
         }
     }
 
-    async fn resolve_proof_source(
+    pub(super) async fn resolve_proof_source(
         &self,
         required_poi_list_keys: &[FixedBytes<32>],
     ) -> OutputPoiProofSourceResolution {
         match self.poi_runtime {
             WalletPoiRuntime::IndexedArtifacts { .. } => {
-                if let Some(source) = self
+                if let Some((source, revision_fence)) = self
                     .local_proof_source_if_ready(required_poi_list_keys)
                     .await
                 {
-                    OutputPoiProofSourceResolution::Local(source)
+                    OutputPoiProofSourceResolution::Local {
+                        source,
+                        revision_fence,
+                    }
                 } else if self.poi_runtime.wallet_read_fallback_enabled() {
                     OutputPoiProofSourceResolution::RemoteFallback
                 } else {
@@ -383,7 +400,6 @@ impl<'a> WalletNullifierIndex<'a> {
 #[derive(Debug)]
 pub(super) struct RecoveryChunk {
     pub(super) chunk: TransactionPlanChunk,
-    pub(super) output: Utxo,
     pub(super) output_start_global: u128,
     pub(super) target_txid_index: Option<u64>,
 }
@@ -417,23 +433,6 @@ impl RecoveryFailure {
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct JsonRpcResponse<T> {
-    pub(super) result: Option<T>,
-    pub(super) error: Option<JsonRpcError>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct JsonRpcError {
-    pub(super) message: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct JsonRpcTransaction {
-    pub(super) input: Option<String>,
-    pub(super) data: Option<String>,
-}
-
 pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> usize {
     let Some(spending_public_key) = request.cfg.spending_public_key else {
         return 0;
@@ -447,8 +446,6 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
 
     let started = Instant::now();
     let now = now_epoch_secs();
-    let mut fetched_inputs: HashMap<FixedBytes<32>, Result<Bytes, RecoveryFailure>> =
-        HashMap::new();
     let mut recovered = 0usize;
     let candidates = output_poi_recovery_candidates(request.wallet_utxos, request.active_list_keys);
     let wallet_nullifiers = WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys);
@@ -568,44 +565,43 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
         }
 
         let build_chunk_started = Instant::now();
-        let recovery_chunk =
-            match build_output_poi_recovery_chunk_from_calldata(CalldataRecoveryBuildRequest {
+        let recovery_chunk = match build_output_poi_recovery_chunk_from_public_cache(
+            PublicTxidRecoveryBuildRequest {
                 request: &request,
                 candidate,
                 source_tx_hash,
                 output_commitment,
-                fetched_inputs: &mut fetched_inputs,
                 wallet_nullifiers: &wallet_nullifiers,
                 required_poi_list_keys: &recoverable_list_keys,
                 spending_public_key,
-                now,
                 candidate_started,
-            })
-            .await
-            {
-                Ok(recovery_chunk) => recovery_chunk,
-                Err(failure) => {
-                    if !request
-                        .candidate_still_current(candidate, &recoverable_list_keys)
-                        .await
-                    {
-                        continue;
-                    }
-                    record_output_poi_recovery_failure(
-                        request.authority,
-                        request.db,
-                        request.cache_store,
-                        request.cfg,
-                        candidate,
-                        request.active_list_keys,
-                        &recoverable_list_keys,
-                        failure,
-                        now,
-                    )
-                    .await;
+            },
+        )
+        .await
+        {
+            Ok(recovery_chunk) => recovery_chunk,
+            Err(failure) => {
+                if !request
+                    .candidate_still_current(candidate, &recoverable_list_keys)
+                    .await
+                {
                     continue;
                 }
-            };
+                record_output_poi_recovery_failure(
+                    request.authority,
+                    request.db,
+                    request.cache_store,
+                    request.cfg,
+                    candidate,
+                    request.active_list_keys,
+                    &recoverable_list_keys,
+                    failure,
+                    now,
+                )
+                .await;
+                continue;
+            }
+        };
         let build_chunk_elapsed_ms = build_chunk_started.elapsed().as_millis();
         debug!(
             chain_id = request.cfg.chain.chain_id,
@@ -683,7 +679,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
             required_poi_list_keys: &recoverable_list_keys,
         };
         let proof_source: &dyn PoiMerkleProofSource = match &proof_source_resolution {
-            OutputPoiProofSourceResolution::Local(source) => source,
+            OutputPoiProofSourceResolution::Local { source, .. } => source,
             OutputPoiProofSourceResolution::RemoteFallback => &remote_proof_source,
             OutputPoiProofSourceResolution::Unavailable => {
                 if !request
@@ -1161,16 +1157,14 @@ async fn force_resubmit_matching_pending_output_pois_impl(
     attempted_contexts
 }
 
-pub(super) struct CalldataRecoveryBuildRequest<'a> {
+pub(super) struct PublicTxidRecoveryBuildRequest<'a> {
     pub(super) request: &'a OutputPoiRecoveryRequest<'a>,
     pub(super) candidate: &'a WalletUtxo,
     pub(super) source_tx_hash: FixedBytes<32>,
     pub(super) output_commitment: FixedBytes<32>,
-    pub(super) fetched_inputs: &'a mut HashMap<FixedBytes<32>, Result<Bytes, RecoveryFailure>>,
     pub(super) wallet_nullifiers: &'a WalletNullifierIndex<'a>,
     pub(super) required_poi_list_keys: &'a [FixedBytes<32>],
     pub(super) spending_public_key: [U256; 2],
-    pub(super) now: u64,
     pub(super) candidate_started: Instant,
 }
 
@@ -1202,19 +1196,17 @@ pub(super) fn output_poi_recovery_candidates<'a>(
         .collect()
 }
 
-pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
-    input: CalldataRecoveryBuildRequest<'_>,
+pub(super) async fn build_output_poi_recovery_chunk_from_public_cache(
+    input: PublicTxidRecoveryBuildRequest<'_>,
 ) -> Result<RecoveryChunk, RecoveryFailure> {
-    let CalldataRecoveryBuildRequest {
+    let PublicTxidRecoveryBuildRequest {
         request,
         candidate,
         source_tx_hash,
         output_commitment,
-        fetched_inputs,
         wallet_nullifiers,
         required_poi_list_keys,
         spending_public_key,
-        now,
         candidate_started,
     } = input;
     let current_recovery = request
@@ -1227,7 +1219,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
         .map_err(|err| {
             RecoveryFailure::retryable(
                 OutputPoiRecoveryStatus::TxFetchFailed,
-                format!("load cached recovery transaction input failed: {err}"),
+                format!("load cached recovery state failed: {err}"),
                 OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
             )
         })?;
@@ -1238,101 +1230,31 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
-    let tx_input_started = Instant::now();
-    let (tx_input, tx_input_source) = if let Some(cached) = fetched_inputs.get(&source_tx_hash) {
-        (cached.clone(), "memory_cache")
-    } else if let Some(tx_input) = current_recovery
+    let cache_key = PublicTxidCacheKey::new(
+        ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: request.cfg.chain.chain_id,
+            railgun_contract: request.cfg.chain.contract,
+        },
+        DEFAULT_TXID_VERSION,
+    );
+    let rows = public_txid_rows_for_outer_hash(
+        PublicCacheTxidRefreshRequest {
+            public_data_plane: request.public_data_plane,
+            cfg: request.cfg,
+            poi_client: request.poi_client,
+            http_client: request.http_client,
+            indexed_artifact_source: request.indexed_artifact_source,
+            cache_key,
+        },
+        source_tx_hash,
+    )
+    .await?;
+    let cached_transactions = current_recovery
         .as_ref()
-        .and_then(|record| record.tx_input.clone())
-    {
-        (Ok(Bytes::from(tx_input)), "db_cache")
-    } else {
-        let remote_effects = request.private_poi.remote_effects();
-        let fetched = match remote_effects
-            .run(
-                || async {
-                    Ok::<bool, std::convert::Infallible>(
-                        request
-                            .candidate_still_current(candidate, required_poi_list_keys)
-                            .await,
-                    )
-                },
-                || {
-                    fetch_transaction_input(
-                        request.rpcs,
-                        request.http_client,
-                        request.cfg.chain.chain_id,
-                        source_tx_hash,
-                    )
-                },
-            )
-            .await
-        {
-            Ok(tx_input) => Ok(tx_input),
-            Err(WalletPrivateRemoteError::Remote(failure)) => Err(failure),
-            Err(WalletPrivateRemoteError::Stale(reason)) => {
-                return Err(RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::TxFetchFailed,
-                    format!("wallet-associated transaction fetch rejected: {reason:?}"),
-                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                ));
-            }
-            Err(WalletPrivateRemoteError::Check(error)) => match error {},
-        };
-        fetched_inputs.insert(source_tx_hash, fetched.clone());
-        if let Ok(tx_input) = &fetched
-            && request
-                .candidate_still_current(candidate, required_poi_list_keys)
-                .await
-            && let Some(expected_recovery) = expected_recovery_state(current_recovery.as_ref())
-            && apply_poi_private_delta(
-                request.authority,
-                request.db,
-                request.cache_store,
-                request.cfg,
-                OwnedPoiPrivateDelta::OutputRecovery {
-                    expected_output: ExpectedWalletOutput::new(candidate),
-                    active_list_keys: request.active_list_keys.to_vec(),
-                    target_list_keys: required_poi_list_keys.to_vec(),
-                    required_poi_status: ExpectedPoiStatus::Recoverable,
-                    pending_update: Box::new(None),
-                    expected_recovery,
-                    action: OutputPoiRecoveryAction::CacheTxInput {
-                        tx_input: tx_input.to_vec(),
-                    },
-                    now,
-                },
-            )
-            .await
-            .is_err()
-        {
-            warn!(
-                chain_id = request.cfg.chain.chain_id,
-                "failed to persist output POI recovery transaction input"
-            );
-        }
-        (fetched, "rpc")
-    };
-    let tx_input_elapsed_ms = tx_input_started.elapsed().as_millis();
-    debug!(
-        chain_id = request.cfg.chain.chain_id,
-        tx_input_source,
-        tx_input_elapsed_ms,
-        candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
-        "output POI recovery transaction input resolved"
-    );
-
-    let tx_input = tx_input?;
-    let decode_started = Instant::now();
-    let decoded = decode_railgun_transactions(&tx_input)?;
-    let decode_elapsed_ms = decode_started.elapsed().as_millis();
-    debug!(
-        chain_id = request.cfg.chain.chain_id,
-        transactions = decoded.len(),
-        decode_elapsed_ms,
-        candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
-        "output POI recovery transaction input decoded"
-    );
+        .and_then(|record| record.tx_input.as_deref())
+        .and_then(|input| decode_railgun_transactions(input).ok())
+        .unwrap_or_default();
 
     if !request
         .candidate_still_current(candidate, required_poi_list_keys)
@@ -1340,22 +1262,44 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
     {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::TxFetchFailed,
-            "output POI recovery candidate changed while resolving transaction input",
+            "output POI recovery candidate changed while resolving public TXID data",
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
-    if let Some(local_proof_source) = request
+    let sender_candidate = request
+        .cache_store
+        .get_sender_transaction_candidate(
+            request.cfg.chain.chain_id,
+            &request.cfg.cache_key,
+            &source_tx_hash,
+        )
+        .map_err(|err| {
+            RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::TxFetchFailed,
+                format!("load sender output notes failed: {err}"),
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            )
+        })?;
+    let recovery_chunk = build_output_poi_recovery_chunk_from_public_rows(
+        candidate,
+        wallet_nullifiers,
+        &rows,
+        sender_candidate.as_ref(),
+        &cached_transactions,
+        request.forest,
+        required_poi_list_keys,
+        spending_public_key,
+        &request.cfg.scan_keys,
+    )?;
+    if let Some((local_proof_source, _revision_fence)) = request
         .local_proof_source_if_ready(required_poi_list_keys)
         .await
     {
         let preflight_started = Instant::now();
-        match preflight_local_output_poi_input_proofs(
+        match preflight_local_recovery_chunk_input_proofs(
             Some(&local_proof_source),
             request.cfg,
-            candidate,
-            request.wallet_utxos,
-            wallet_nullifiers,
-            &decoded,
+            &recovery_chunk,
             required_poi_list_keys,
         )
         .await
@@ -1385,108 +1329,17 @@ pub(super) async fn build_output_poi_recovery_chunk_from_calldata(
     {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::TxFetchFailed,
-            "output POI recovery candidate changed while resolving transaction input",
+            "output POI recovery candidate changed while resolving public TXID data",
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
 
-    build_output_poi_recovery_chunk(
-        candidate,
-        wallet_nullifiers,
-        &decoded,
-        request.forest,
-        required_poi_list_keys,
-        spending_public_key,
-        &request.cfg.scan_keys,
-    )
-}
-
-pub(super) async fn fetch_transaction_input(
-    rpcs: &QueryRpcPool,
-    http_client: Option<&reqwest::Client>,
-    chain_id: u64,
-    tx_hash: FixedBytes<32>,
-) -> Result<Bytes, RecoveryFailure> {
-    let Some(provider) = rpcs.random_provider() else {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            "no healthy RPC available",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    };
-    let client = rpcs
-        .http_client()
-        .or(http_client)
-        .cloned()
-        .unwrap_or_else(reqwest::Client::new);
-    let tx_hash_hex = hex::encode_prefixed(tx_hash);
-    let response = client
-        .post(provider.url.clone())
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getTransactionByHash",
-            "params": [tx_hash_hex],
-        }))
-        .send()
-        .await
-        .map_err(|err| {
-            rpcs.mark_bad_provider(&provider);
-            RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::TxFetchFailed,
-                format!("fetch transaction RPC failed: {err}"),
-                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-            )
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        rpcs.mark_bad_provider(&provider);
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!("fetch transaction RPC returned HTTP {status}"),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
-    let response: JsonRpcResponse<JsonRpcTransaction> = response.json().await.map_err(|err| {
-        rpcs.mark_bad_provider(&provider);
-        RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!("decode transaction RPC response failed: {err}"),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        )
-    })?;
-    if let Some(error) = response.error {
-        rpcs.mark_bad_provider(&provider);
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!(
-                "fetch transaction RPC error on chain {chain_id}: {}",
-                error.message
-            ),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
-    let Some(tx) = response.result else {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            "transaction not found",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    };
-    let input = tx.input.or(tx.data).ok_or_else(|| {
-        RecoveryFailure::permanent(
-            OutputPoiRecoveryStatus::DecodeFailed,
-            "transaction has no input",
-        )
-    })?;
-    let input = input.strip_prefix("0x").unwrap_or(&input);
-    let bytes = hex::decode(input).map_err(|err| {
-        RecoveryFailure::permanent(
-            OutputPoiRecoveryStatus::DecodeFailed,
-            format!("transaction input is not hex: {err}"),
-        )
-    })?;
-    Ok(Bytes::from(bytes))
+    debug!(
+        chain_id = request.cfg.chain.chain_id,
+        candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+        "output POI recovery public TXID data resolved"
+    );
+    Ok(recovery_chunk)
 }
 
 pub(super) fn decode_railgun_transactions(
@@ -1519,6 +1372,7 @@ pub(super) fn decode_railgun_transactions(
     ))
 }
 
+#[cfg(test)]
 pub(super) async fn preflight_local_output_poi_input_proofs(
     proof_source: Option<&LocalPoiMerkleProofSource>,
     cfg: &WalletConfig,
@@ -1562,6 +1416,54 @@ pub(super) async fn preflight_local_output_poi_input_proofs(
     Ok(())
 }
 
+pub(super) async fn preflight_local_recovery_chunk_input_proofs(
+    proof_source: Option<&LocalPoiMerkleProofSource>,
+    cfg: &WalletConfig,
+    recovery_chunk: &RecoveryChunk,
+    active_list_keys: &[FixedBytes<32>],
+) -> Result<(), RecoveryFailure> {
+    let Some(proof_source) = proof_source else {
+        return Ok(());
+    };
+    if recovery_chunk.chunk.inputs.iter().any(|wallet_input| {
+        active_list_keys.iter().any(|list_key| {
+            wallet_input.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
+        })
+    }) {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::InputPoiNotValid,
+            "one or more transaction inputs are shield-blocked",
+            OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+        ));
+    }
+    let blinded_commitments = recovery_chunk
+        .chunk
+        .inputs
+        .iter()
+        .map(|input| input.utxo.poi.blinded_commitment)
+        .collect::<Vec<_>>();
+    for list_key in active_list_keys {
+        proof_source
+            .check_commitments_available(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                cfg.chain.chain_id,
+                list_key,
+                &blinded_commitments,
+            )
+            .await
+            .map_err(|err| {
+                RecoveryFailure::retryable(
+                    OutputPoiRecoveryStatus::ProofGenerationFailed,
+                    format!("local POI proof preflight failed: {err}"),
+                    output_poi_recovery_proof_retry_after(&err),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn output_poi_recovery_input_blinded_commitments(
     candidate: &WalletUtxo,
     wallet_utxos: &[WalletUtxo],
@@ -1620,6 +1522,7 @@ pub(super) fn output_poi_recovery_input_blinded_commitments(
     None
 }
 
+#[cfg(test)]
 pub(super) fn build_output_poi_recovery_chunk(
     candidate: &WalletUtxo,
     wallet_nullifiers: &WalletNullifierIndex<'_>,
@@ -1653,108 +1556,524 @@ pub(super) fn build_output_poi_recovery_chunk(
                 "matched output is the public unshield output",
             ));
         }
-        let unshield_note = unshield_note_from_transaction(transaction)?;
-
         let output_start_global = output_start_global_position(&candidate.utxo, output_index)?;
-        let output_start_tree = (output_start_global / u128::from(TREE_LEAF_COUNT)) as u32;
-        let output_start_position = (output_start_global % u128::from(TREE_LEAF_COUNT)) as u64;
-        let input_tree = u32::from(transaction.boundParams.treeNumber);
-        let max_leaf_count = match input_tree.cmp(&output_start_tree) {
-            std::cmp::Ordering::Equal => output_start_position,
-            std::cmp::Ordering::Less => TREE_LEAF_COUNT,
-            std::cmp::Ordering::Greater => {
-                return Err(RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::MissingMerkleProof,
-                    "transaction input tree is after output tree",
-                    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-                ));
-            }
-        };
-
-        let mut output_notes = output_notes_for_transaction(
+        let output_notes = output_notes_for_transaction(
             candidate,
             wallet_nullifiers.wallet_utxos,
             transaction,
             scan_keys,
         )?;
-        let inputs = wallet_inputs_for_transaction(candidate, wallet_nullifiers, transaction)?;
-        if inputs.iter().any(|wallet_utxo| {
-            active_list_keys.iter().any(|list_key| {
-                wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
-            })
-        }) {
-            return Err(RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::InputPoiNotValid,
-                "one or more transaction inputs are shield-blocked",
-                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-            ));
-        }
-
-        let merkle_root = U256::from_be_bytes(transaction.merkleRoot.0);
-        let first_input = inputs.first().ok_or_else(|| {
-            RecoveryFailure::permanent(
-                OutputPoiRecoveryStatus::MissingWalletInputs,
-                "transaction has no wallet-owned inputs",
-            )
-        })?;
-        let input_merkle = recovery_input_merkle_tree_for_root(
-            forest,
-            input_tree,
-            first_input,
-            max_leaf_count,
-            merkle_root,
-        )?;
-        let mut input_witnesses = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let proof = input_merkle.tree.prove(input.utxo.position);
-            if proof.root != merkle_root || proof.leaf != input.utxo.note.commitment() {
-                return Err(RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::MissingMerkleProof,
-                    "reconstructed Merkle proof does not match transaction root",
-                    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-                ));
-            }
-            input_witnesses.push(InputWitness {
-                utxo: input.utxo.clone(),
-                merkle_proof: proof,
-            });
-        }
-
-        if let Some(unshield_note) = unshield_note {
-            output_notes.push(unshield_note);
-        }
-        let public_inputs = PublicInputs::from_transaction(merkle_root, transaction, &output_notes);
-        let signer = RecoverySpendPublicKey {
-            spending_public_key,
-        };
-        let private_inputs = PrivateInputs::from_inputs(
-            input_witnesses[0].utxo.token_address(),
-            &input_witnesses,
-            &output_notes,
-            scan_keys,
-            &signer,
-        );
-        return Ok(RecoveryChunk {
-            chunk: TransactionPlanChunk {
-                tree_number: input_tree,
-                merkle_root,
-                inputs: input_witnesses,
-                outputs: output_notes,
-                has_unshield,
-                public_inputs,
-                private_inputs,
-                signature: [U256::ZERO; 3],
-            },
-            output: candidate.utxo.clone(),
+        return build_recovery_chunk_for_transaction(
             output_start_global,
-            target_txid_index: None,
-        });
+            output_notes,
+            candidate.utxo.source.tx_hash,
+            wallet_nullifiers,
+            transaction,
+            forest,
+            active_list_keys,
+            spending_public_key,
+            scan_keys,
+            None,
+        );
     }
 
     Err(RecoveryFailure::permanent(
         OutputPoiRecoveryStatus::NotSelfOriginated,
         "source transaction does not contain the wallet output commitment",
     ))
+}
+
+pub(super) fn build_output_poi_recovery_chunk_from_public_rows(
+    candidate: &WalletUtxo,
+    wallet_nullifiers: &WalletNullifierIndex<'_>,
+    rows: &[PublicTxidTransaction],
+    sender_candidate: Option<&SenderTransactionCandidate>,
+    cached_transactions: &[Transaction],
+    forest: &MerkleForest,
+    active_list_keys: &[FixedBytes<32>],
+    spending_public_key: [U256; 2],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+) -> Result<RecoveryChunk, RecoveryFailure> {
+    let output_commitment = U256::from_be_bytes(candidate.utxo.poi.commitment.0);
+    let matches = rows
+        .iter()
+        .filter_map(|row| {
+            if row.transaction.transaction_hash != candidate.utxo.source.tx_hash
+                || row.transaction.block_number != candidate.utxo.source.block_number
+            {
+                return None;
+            }
+            let output_index = row
+                .transaction
+                .commitments
+                .iter()
+                .position(|commitment| *commitment == output_commitment)?;
+            let private_output_count = private_output_count_for_commitments(
+                row.transaction.commitments.len(),
+                row.transaction.has_unshield,
+            )
+            .ok()?;
+            (output_index < private_output_count).then_some((row, output_index))
+        })
+        .collect::<Vec<_>>();
+    let [(row, output_index)] = matches.as_slice() else {
+        return Err(RecoveryFailure::permanent(
+            if matches.is_empty() {
+                OutputPoiRecoveryStatus::NotSelfOriginated
+            } else {
+                OutputPoiRecoveryStatus::UnsupportedShape
+            },
+            "validated public TXID rows do not uniquely contain the wallet output",
+        ));
+    };
+    let observed_output_start = output_start_global_position(&candidate.utxo, *output_index)?;
+    if observed_output_start != row.transaction.output_start_global() {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "wallet output position does not match the public TXID output range",
+        ));
+    }
+    let output_notes = output_notes_for_public_transaction(
+        candidate,
+        wallet_nullifiers.wallet_utxos,
+        &row.transaction,
+        sender_candidate,
+        cached_transactions,
+        scan_keys,
+    )?;
+    build_recovery_chunk_for_public_transaction(
+        observed_output_start,
+        output_notes,
+        candidate.utxo.source.tx_hash,
+        wallet_nullifiers,
+        &row.transaction,
+        forest,
+        active_list_keys,
+        spending_public_key,
+        scan_keys,
+        Some(row.txid_index),
+    )
+}
+
+fn output_notes_for_public_transaction(
+    candidate: &WalletUtxo,
+    wallet_utxos: &[WalletUtxo],
+    transaction: &TxidPublicCacheTransaction,
+    sender_candidate: Option<&SenderTransactionCandidate>,
+    cached_transactions: &[Transaction],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+) -> Result<Vec<Note>, RecoveryFailure> {
+    let private_output_count = private_output_count_for_commitments(
+        transaction.commitments.len(),
+        transaction.has_unshield,
+    )?;
+    let sender_candidate = sender_candidate
+        .filter(|sender| sender.source == candidate.utxo.source && sender.validate().is_ok());
+    let matching_cached_transactions = cached_transactions
+        .iter()
+        .filter(|cached| cached_transaction_matches_public_row(cached, transaction))
+        .collect::<Vec<_>>();
+    let cached_transaction = match matching_cached_transactions.as_slice() {
+        [cached] => Some(*cached),
+        _ => None,
+    };
+    let mut notes = Vec::with_capacity(private_output_count);
+    for (output_index, commitment) in transaction
+        .commitments
+        .iter()
+        .take(private_output_count)
+        .enumerate()
+    {
+        let commitment = FixedBytes::from(commitment.to_be_bytes::<32>());
+        if let Some(output) = wallet_utxos.iter().find(|wallet_utxo| {
+            wallet_utxo.utxo.source.tx_hash == candidate.utxo.source.tx_hash
+                && wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Transact
+                && wallet_utxo.utxo.poi.commitment == commitment
+        }) {
+            notes.push(output.utxo.note.clone());
+            continue;
+        }
+        let global = transaction
+            .output_start_global()
+            .checked_add(output_index as u128)
+            .ok_or_else(|| {
+                RecoveryFailure::permanent(
+                    OutputPoiRecoveryStatus::UnsupportedShape,
+                    "public TXID output range overflow",
+                )
+            })?;
+        let tree = u32::try_from(global / u128::from(TREE_LEAF_COUNT)).map_err(|_| {
+            RecoveryFailure::permanent(
+                OutputPoiRecoveryStatus::UnsupportedShape,
+                "public TXID output tree is out of range",
+            )
+        })?;
+        let position = (global % u128::from(TREE_LEAF_COUNT)) as u64;
+        let note = sender_candidate.and_then(|sender| {
+            sender.outputs.iter().find_map(|output| {
+                (output.tree == tree
+                    && output.position == position
+                    && output.commitment == commitment)
+                    .then(|| output.note.clone())
+                    .flatten()
+            })
+        });
+        let note = note.or_else(|| {
+            cached_transaction.and_then(|cached| {
+                decrypt_outgoing_transaction_output_note(
+                    cached,
+                    output_index,
+                    commitment,
+                    scan_keys,
+                )
+            })
+        });
+        let Some(note) = note else {
+            return Err(RecoveryFailure::permanent(
+                OutputPoiRecoveryStatus::MissingWalletOutputs,
+                "selected public TXID row requires unavailable sender output notes",
+            ));
+        };
+        notes.push(note);
+    }
+    if notes.is_empty() {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "transaction has no private outputs",
+        ));
+    }
+    Ok(notes)
+}
+
+fn cached_transaction_matches_public_row(
+    transaction: &Transaction,
+    public: &TxidPublicCacheTransaction,
+) -> bool {
+    transaction.merkleRoot == FixedBytes::from(public.merkle_root.to_be_bytes::<32>())
+        && transaction
+            .nullifiers
+            .iter()
+            .map(|nullifier| U256::from_be_bytes(nullifier.0))
+            .eq(public.nullifiers.iter().copied())
+        && transaction
+            .commitments
+            .iter()
+            .map(|commitment| U256::from_be_bytes(commitment.0))
+            .eq(public.commitments.iter().copied())
+        && transaction.boundParams.hash() == public.bound_params_hash
+        && (transaction.boundParams.unshield != 0) == public.has_unshield
+        && u64::from(u32::from(transaction.boundParams.treeNumber)) == public.utxo_tree_in
+}
+
+pub(super) fn build_recovery_chunk_for_public_transaction(
+    output_start_global: u128,
+    mut output_notes: Vec<Note>,
+    source_tx_hash: FixedBytes<32>,
+    wallet_nullifiers: &WalletNullifierIndex<'_>,
+    transaction: &TxidPublicCacheTransaction,
+    forest: &MerkleForest,
+    active_list_keys: &[FixedBytes<32>],
+    spending_public_key: [U256; 2],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+    target_txid_index: Option<u64>,
+) -> Result<RecoveryChunk, RecoveryFailure> {
+    if transaction.transaction_hash != source_tx_hash
+        || transaction.output_start_global() != output_start_global
+    {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "public TXID row does not match the recovery source or output range",
+        ));
+    }
+    let private_output_count = private_output_count_for_commitments(
+        transaction.commitments.len(),
+        transaction.has_unshield,
+    )?;
+    if output_notes.len() != private_output_count
+        || output_notes.iter().map(Note::commitment).ne(transaction
+            .commitments
+            .iter()
+            .take(private_output_count)
+            .copied())
+    {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::MissingWalletOutputs,
+            "private output notes do not match the public TXID commitments",
+        ));
+    }
+    let output_start_tree = u32::try_from(output_start_global / u128::from(TREE_LEAF_COUNT))
+        .map_err(|_| {
+            RecoveryFailure::permanent(
+                OutputPoiRecoveryStatus::UnsupportedShape,
+                "public TXID output tree is out of range",
+            )
+        })?;
+    let output_start_position = (output_start_global % u128::from(TREE_LEAF_COUNT)) as u64;
+    let input_tree = u32::from(u16::try_from(transaction.utxo_tree_in).map_err(|_| {
+        RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "public TXID input tree is out of ABI range",
+        )
+    })?);
+    let max_leaf_count = match input_tree.cmp(&output_start_tree) {
+        std::cmp::Ordering::Equal => output_start_position,
+        std::cmp::Ordering::Less => TREE_LEAF_COUNT,
+        std::cmp::Ordering::Greater => {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::MissingMerkleProof,
+                "transaction input tree is after output tree",
+                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+            ));
+        }
+    };
+    let inputs = wallet_inputs_for_public_transaction(
+        source_tx_hash,
+        wallet_nullifiers,
+        input_tree,
+        &transaction.nullifiers,
+    )?;
+    if inputs.iter().any(|wallet_utxo| {
+        active_list_keys.iter().any(|list_key| {
+            wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
+        })
+    }) {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::InputPoiNotValid,
+            "one or more transaction inputs are shield-blocked",
+            OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+        ));
+    }
+    let first_input = inputs.first().ok_or_else(|| {
+        RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::MissingWalletInputs,
+            "transaction has no wallet-owned inputs",
+        )
+    })?;
+    let input_merkle = recovery_input_merkle_tree_for_root(
+        forest,
+        input_tree,
+        first_input,
+        max_leaf_count,
+        transaction.merkle_root,
+    )?;
+    let mut input_witnesses = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let proof = input_merkle.tree.prove(input.utxo.position);
+        if proof.root != transaction.merkle_root || proof.leaf != input.utxo.note.commitment() {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::MissingMerkleProof,
+                "reconstructed Merkle proof does not match transaction root",
+                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+            ));
+        }
+        input_witnesses.push(InputWitness {
+            utxo: input.utxo.clone(),
+            merkle_proof: proof,
+        });
+    }
+    if let Some(unshield_note) = unshield_note_from_public_transaction(transaction)? {
+        output_notes.push(unshield_note);
+    }
+    let public_inputs = PublicInputs::from_parts(
+        transaction.merkle_root,
+        transaction.bound_params_hash,
+        transaction.nullifiers.clone(),
+        &output_notes,
+    );
+    if public_inputs.commitments_out != transaction.commitments {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "reconstructed outputs do not match public TXID commitments",
+        ));
+    }
+    let signer = RecoverySpendPublicKey {
+        spending_public_key,
+    };
+    let private_inputs = PrivateInputs::from_inputs(
+        input_witnesses[0].utxo.token_address(),
+        &input_witnesses,
+        &output_notes,
+        scan_keys,
+        &signer,
+    );
+    Ok(RecoveryChunk {
+        chunk: TransactionPlanChunk {
+            tree_number: input_tree,
+            merkle_root: transaction.merkle_root,
+            inputs: input_witnesses,
+            outputs: output_notes,
+            has_unshield: transaction.has_unshield,
+            public_inputs,
+            private_inputs,
+            signature: [U256::ZERO; 3],
+        },
+        output_start_global,
+        target_txid_index,
+    })
+}
+
+fn unshield_note_from_public_transaction(
+    transaction: &TxidPublicCacheTransaction,
+) -> Result<Option<Note>, RecoveryFailure> {
+    if !transaction.has_unshield {
+        return Ok(None);
+    }
+    let encoded = transaction.unshield_preimage.as_deref().ok_or_else(|| {
+        RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "selected public TXID source cannot provide the unshield preimage",
+        )
+    })?;
+    let preimage = CommitmentPreimage::abi_decode(encoded).map_err(|err| {
+        RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            format!("public TXID unshield preimage is invalid: {err}"),
+        )
+    })?;
+    let note = preimage.note_with_random([0_u8; 16]);
+    if preimage.abi_encode() != encoded
+        || transaction.commitments.last() != Some(&note.commitment())
+    {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::UnsupportedShape,
+            "public TXID unshield preimage does not match its commitment",
+        ));
+    }
+    Ok(Some(note))
+}
+
+fn wallet_inputs_for_public_transaction<'a>(
+    source_tx_hash: FixedBytes<32>,
+    wallet_nullifiers: &'a WalletNullifierIndex<'a>,
+    input_tree: u32,
+    nullifiers: &[U256],
+) -> Result<Vec<&'a WalletUtxo>, RecoveryFailure> {
+    let mut inputs = Vec::with_capacity(nullifiers.len());
+    for nullifier in nullifiers {
+        let Some(input) = wallet_nullifiers.input_for(input_tree, *nullifier, source_tx_hash)
+        else {
+            return Err(RecoveryFailure::permanent(
+                OutputPoiRecoveryStatus::NotSelfOriginated,
+                "transaction nullifiers do not resolve to wallet-spent inputs",
+            ));
+        };
+        inputs.push(input);
+    }
+    if inputs.is_empty() {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::MissingWalletInputs,
+            "transaction has no wallet-owned inputs",
+        ));
+    }
+    Ok(inputs)
+}
+
+#[cfg(test)]
+fn build_recovery_chunk_for_transaction(
+    output_start_global: u128,
+    mut output_notes: Vec<Note>,
+    source_tx_hash: FixedBytes<32>,
+    wallet_nullifiers: &WalletNullifierIndex<'_>,
+    transaction: &Transaction,
+    forest: &MerkleForest,
+    active_list_keys: &[FixedBytes<32>],
+    spending_public_key: [U256; 2],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+    target_txid_index: Option<u64>,
+) -> Result<RecoveryChunk, RecoveryFailure> {
+    let has_unshield = transaction.boundParams.unshield != 0;
+    if output_notes.len()
+        != private_output_count_for_commitments(transaction.commitments.len(), has_unshield)?
+    {
+        return Err(RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::MissingWalletOutputs,
+            "private output notes do not match the transaction output count",
+        ));
+    }
+    let output_start_tree = (output_start_global / u128::from(TREE_LEAF_COUNT)) as u32;
+    let output_start_position = (output_start_global % u128::from(TREE_LEAF_COUNT)) as u64;
+    let input_tree = u32::from(transaction.boundParams.treeNumber);
+    let max_leaf_count = match input_tree.cmp(&output_start_tree) {
+        std::cmp::Ordering::Equal => output_start_position,
+        std::cmp::Ordering::Less => TREE_LEAF_COUNT,
+        std::cmp::Ordering::Greater => {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::MissingMerkleProof,
+                "transaction input tree is after output tree",
+                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+            ));
+        }
+    };
+    let inputs =
+        wallet_inputs_for_source_transaction(source_tx_hash, wallet_nullifiers, transaction)?;
+    if inputs.iter().any(|wallet_utxo| {
+        active_list_keys.iter().any(|list_key| {
+            wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
+        })
+    }) {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::InputPoiNotValid,
+            "one or more transaction inputs are shield-blocked",
+            OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+        ));
+    }
+    let merkle_root = U256::from_be_bytes(transaction.merkleRoot.0);
+    let first_input = inputs.first().ok_or_else(|| {
+        RecoveryFailure::permanent(
+            OutputPoiRecoveryStatus::MissingWalletInputs,
+            "transaction has no wallet-owned inputs",
+        )
+    })?;
+    let input_merkle = recovery_input_merkle_tree_for_root(
+        forest,
+        input_tree,
+        first_input,
+        max_leaf_count,
+        merkle_root,
+    )?;
+    let mut input_witnesses = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let proof = input_merkle.tree.prove(input.utxo.position);
+        if proof.root != merkle_root || proof.leaf != input.utxo.note.commitment() {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::MissingMerkleProof,
+                "reconstructed Merkle proof does not match transaction root",
+                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+            ));
+        }
+        input_witnesses.push(InputWitness {
+            utxo: input.utxo.clone(),
+            merkle_proof: proof,
+        });
+    }
+    if let Some(unshield_note) = unshield_note_from_transaction(transaction)? {
+        output_notes.push(unshield_note);
+    }
+    let public_inputs = PublicInputs::from_transaction(merkle_root, transaction, &output_notes);
+    let signer = RecoverySpendPublicKey {
+        spending_public_key,
+    };
+    let private_inputs = PrivateInputs::from_inputs(
+        input_witnesses[0].utxo.token_address(),
+        &input_witnesses,
+        &output_notes,
+        scan_keys,
+        &signer,
+    );
+    Ok(RecoveryChunk {
+        chunk: TransactionPlanChunk {
+            tree_number: input_tree,
+            merkle_root,
+            inputs: input_witnesses,
+            outputs: output_notes,
+            has_unshield,
+            public_inputs,
+            private_inputs,
+            signature: [U256::ZERO; 3],
+        },
+        output_start_global,
+        target_txid_index,
+    })
 }
 
 pub(super) fn output_start_global_position(
@@ -1786,6 +2105,7 @@ pub(super) fn private_output_count_for_commitments(
     }
 }
 
+#[cfg(test)]
 pub(super) fn unshield_note_from_transaction(
     transaction: &Transaction,
 ) -> Result<Option<Note>, RecoveryFailure> {
@@ -1857,6 +2177,7 @@ pub(super) fn recovery_input_merkle_tree_for_root(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn output_notes_for_transaction(
     candidate: &WalletUtxo,
     wallet_utxos: &[WalletUtxo],
@@ -1919,53 +2240,10 @@ fn decrypt_outgoing_transaction_output_note(
         .commitmentCiphertext
         .get(output_index)?;
     let expected_commitment = U256::from_be_bytes(expected_commitment.0);
-    decrypt_outgoing_note_ciphertext(ciphertext, expected_commitment, scan_keys)
+    railgun_wallet::decrypt_sender_note(ciphertext, expected_commitment, scan_keys)
 }
 
-fn decrypt_outgoing_note_ciphertext(
-    ciphertext: &CommitmentCiphertext,
-    expected_commitment: U256,
-    scan_keys: &railgun_wallet::scan::WalletScanKeys,
-) -> Option<Note> {
-    if ciphertext.blindedReceiverViewingKey == FixedBytes::ZERO {
-        return None;
-    }
-    let shared_key = shared_symmetric_key(
-        &scan_keys.viewing_private_key,
-        &ciphertext.blindedReceiverViewingKey.0,
-    )
-    .ok()?;
-    let (iv, tag) = split_iv_tag(ciphertext.ciphertext[0].0);
-    let mut plaintext = Vec::with_capacity(96 + ciphertext.memo.len());
-    plaintext.extend_from_slice(&ciphertext.ciphertext[1].0);
-    plaintext.extend_from_slice(&ciphertext.ciphertext[2].0);
-    plaintext.extend_from_slice(&ciphertext.ciphertext[3].0);
-    plaintext.extend_from_slice(ciphertext.memo.as_ref());
-    decrypt_in_place_16b_iv(&shared_key, &iv, &tag, &mut plaintext).ok()?;
-    if plaintext.len() < 96 {
-        return None;
-    }
-
-    let encoded_mpk = U256::from_be_slice(&plaintext[0..32]);
-    let token_hash = U256::from_be_slice(&plaintext[32..64]);
-    let mut random = [0u8; 16];
-    random.copy_from_slice(&plaintext[64..80]);
-    let value = U256::from_be_slice(&plaintext[80..96]);
-    let receiver_mpk_candidates = [encoded_mpk ^ scan_keys.master_public_key, encoded_mpk];
-    for receiver_mpk in receiver_mpk_candidates {
-        let note = Note {
-            token_hash,
-            value,
-            random,
-            npk: Note::npk_for(receiver_mpk, random),
-        };
-        if note.commitment() == expected_commitment {
-            return Some(note);
-        }
-    }
-    None
-}
-
+#[cfg(test)]
 fn missing_wallet_outputs_failure(
     missing: &[(usize, FixedBytes<32>)],
     private_output_count: usize,
@@ -1993,8 +2271,22 @@ fn missing_wallet_outputs_failure(
     )
 }
 
+#[cfg(test)]
 pub(super) fn wallet_inputs_for_transaction<'a>(
     candidate: &WalletUtxo,
+    wallet_nullifiers: &'a WalletNullifierIndex<'a>,
+    transaction: &Transaction,
+) -> Result<Vec<&'a WalletUtxo>, RecoveryFailure> {
+    wallet_inputs_for_source_transaction(
+        candidate.utxo.source.tx_hash,
+        wallet_nullifiers,
+        transaction,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn wallet_inputs_for_source_transaction<'a>(
+    source_tx_hash: FixedBytes<32>,
     wallet_nullifiers: &'a WalletNullifierIndex<'a>,
     transaction: &Transaction,
 ) -> Result<Vec<&'a WalletUtxo>, RecoveryFailure> {
@@ -2002,9 +2294,7 @@ pub(super) fn wallet_inputs_for_transaction<'a>(
     let mut inputs = Vec::with_capacity(transaction.nullifiers.len());
     for nullifier in &transaction.nullifiers {
         let nullifier = U256::from_be_bytes(nullifier.0);
-        let Some(input) =
-            wallet_nullifiers.input_for(input_tree, nullifier, candidate.utxo.source.tx_hash)
-        else {
+        let Some(input) = wallet_nullifiers.input_for(input_tree, nullifier, source_tx_hash) else {
             return Err(RecoveryFailure::permanent(
                 OutputPoiRecoveryStatus::NotSelfOriginated,
                 "transaction nullifiers do not resolve to wallet-spent inputs",
@@ -2030,29 +2320,53 @@ pub(super) fn pending_output_poi_context_from_recovery(
     active_list_keys: &[FixedBytes<32>],
     now: u64,
 ) -> PendingOutputPoiContextRecord {
+    pending_output_poi_context_from_output_recovery(
+        cfg,
+        &candidate.utxo,
+        recovery_chunk,
+        txid_merkleroot_index,
+        pre_transaction_pois,
+        active_list_keys,
+        PendingOutputPoiRole::Change,
+        format!(
+            "recovered-output-poi:{}",
+            hex::encode(candidate.utxo.source.tx_hash)
+        ),
+        now,
+    )
+}
+
+pub(super) fn pending_output_poi_context_from_output_recovery(
+    cfg: &WalletConfig,
+    output: &Utxo,
+    recovery_chunk: &RecoveryChunk,
+    txid_merkleroot_index: u64,
+    pre_transaction_pois: PreTransactionPoiMap,
+    active_list_keys: &[FixedBytes<32>],
+    output_role: PendingOutputPoiRole,
+    source_operation_id: String,
+    now: u64,
+) -> PendingOutputPoiContextRecord {
     PendingOutputPoiContextRecord {
         chain_id: cfg.chain.chain_id,
         wallet_id: cfg.cache_key.to_string(),
         txid_version: DEFAULT_TXID_VERSION.to_string(),
-        output_commitment: recovery_chunk.output.poi.commitment,
-        output_npk: recovery_chunk.output.poi.npk,
+        output_commitment: output.poi.commitment,
+        output_npk: output.poi.npk,
         utxo_tree_in: u64::from(recovery_chunk.chunk.tree_number),
         railgun_txid: recovery_chunk.chunk.railgun_txid(),
         txid_merkleroot_index: Some(txid_merkleroot_index),
         pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
         required_poi_list_keys: active_list_keys.to_vec(),
-        output_role: PendingOutputPoiRole::Change,
+        output_role,
         created_at: now,
-        source_operation_id: Some(format!(
-            "recovered-output-poi:{}",
-            hex::encode(candidate.utxo.source.tx_hash)
-        )),
+        source_operation_id: Some(source_operation_id),
         observation: Some(PendingOutputPoiObservation {
-            output_tree: u64::from(candidate.utxo.tree),
-            output_position: candidate.utxo.position,
-            tx_hash: candidate.utxo.source.tx_hash,
-            block_number: candidate.utxo.source.block_number,
-            block_timestamp: candidate.utxo.source.block_timestamp,
+            output_tree: u64::from(output.tree),
+            output_position: output.position,
+            tx_hash: output.source.tx_hash,
+            block_number: output.source.block_number,
+            block_timestamp: output.source.block_timestamp,
         }),
         submitted_poi_list_keys: Vec::new(),
         terminal_error: None,
@@ -2111,11 +2425,20 @@ pub(super) fn new_output_poi_recovery_record(
     status: OutputPoiRecoveryStatus,
     now: u64,
 ) -> OutputPoiRecoveryRecord {
+    new_output_poi_recovery_record_for_output(cfg, &candidate.utxo, status, now)
+}
+
+pub(super) fn new_output_poi_recovery_record_for_output(
+    cfg: &WalletConfig,
+    output: &Utxo,
+    status: OutputPoiRecoveryStatus,
+    now: u64,
+) -> OutputPoiRecoveryRecord {
     OutputPoiRecoveryRecord {
         chain_id: cfg.chain.chain_id,
         wallet_id: cfg.cache_key.to_string(),
-        output_commitment: candidate.utxo.poi.commitment,
-        source_tx_hash: candidate.utxo.source.tx_hash,
+        output_commitment: output.poi.commitment,
+        source_tx_hash: output.source.tx_hash,
         tx_input: None,
         status,
         created_at: now,
@@ -2267,9 +2590,6 @@ pub(super) async fn mark_valid_output_poi_recoveries_authorized(
     mark_valid_output_poi_recoveries(authority, db, cache_store, cfg, &snapshot, active_list_keys)
         .await;
 }
-
-#[cfg(test)]
-use public_cache::{PublicCacheTxidRecoveryRequest, recovered_output_txid_data_from_public_cache};
 
 #[cfg(test)]
 pub(super) mod test_support {

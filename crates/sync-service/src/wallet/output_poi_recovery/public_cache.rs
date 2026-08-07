@@ -3,14 +3,14 @@ use super::{
     IndexedArtifactSourceConfig, Instant, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OutputPoiRecoveryStatus, PoiRpcClient, PostTransactionPoiData, PublicTxidCacheKey,
     PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest, RecoveryChunk, RecoveryFailure, TREE_LEAF_COUNT, TxidPublicCacheError,
-    U256, ValidatedRailgunTxidStatus, WalletConfig, debug, hex,
+    PublicTxidSyncRequest, PublicTxidTransaction, RecoveryChunk, RecoveryFailure, TREE_LEAF_COUNT,
+    TxidPublicCacheError, U256, ValidatedRailgunTxidStatus, WalletConfig, debug, hex,
     railgun_txid_leaf_hash_with_output_start,
 };
 
 #[derive(Debug)]
 pub(in crate::wallet) struct RecoveredOutputTxidData {
-    pub(super) poi_data: PostTransactionPoiData,
+    pub(in crate::wallet) poi_data: PostTransactionPoiData,
 }
 
 pub(in crate::wallet) struct PublicCacheTxidRecoveryRequest<'a> {
@@ -21,6 +21,88 @@ pub(in crate::wallet) struct PublicCacheTxidRecoveryRequest<'a> {
     pub(in crate::wallet) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(in crate::wallet) recovery_chunk: &'a RecoveryChunk,
     pub(in crate::wallet) started: Instant,
+}
+
+pub(in crate::wallet) struct PublicCacheTxidRefreshRequest<'a> {
+    pub(in crate::wallet) public_data_plane: &'a ChainPublicDataPlane,
+    pub(in crate::wallet) cfg: &'a WalletConfig,
+    pub(in crate::wallet) poi_client: &'a PoiRpcClient,
+    pub(in crate::wallet) http_client: Option<&'a reqwest::Client>,
+    pub(in crate::wallet) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
+    pub(in crate::wallet) cache_key: PublicTxidCacheKey,
+}
+
+pub(in crate::wallet) async fn refresh_public_txid_cache(
+    request: PublicCacheTxidRefreshRequest<'_>,
+) -> Result<(), RecoveryFailure> {
+    let PublicCacheTxidRefreshRequest {
+        public_data_plane,
+        cfg,
+        poi_client,
+        http_client,
+        indexed_artifact_source,
+        cache_key,
+    } = request;
+    let endpoint = cfg.quick_sync_endpoint.as_ref();
+    if endpoint.is_none() && indexed_artifact_source.is_none() {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::TxFetchFailed,
+            "no TXID synchronization source is configured",
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        ));
+    }
+    let latest_validated = poi_client
+        .latest_validated_railgun_txid(DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, cfg.chain.chain_id)
+        .await
+        .map_err(|err| {
+            RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::MissingMerkleProof,
+                format!("fetch latest validated TXID failed: {err}"),
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            )
+        })?;
+    let latest = PublicTxidLatestValidated {
+        txid_index: latest_validated_txid_index(&latest_validated)?,
+        merkleroot: latest_validated_txid_root(&latest_validated)?,
+    };
+    public_data_plane
+        .sync_txid_public_cache(PublicTxidSyncRequest {
+            key: cache_key,
+            endpoint,
+            http_client,
+            latest,
+            indexed_artifact_source,
+        })
+        .await
+        .map_err(|err| txid_public_cache_failure(&err))
+}
+
+pub(in crate::wallet) async fn public_txid_rows_for_outer_hash(
+    request: PublicCacheTxidRefreshRequest<'_>,
+    outer_transaction_hash: FixedBytes<32>,
+) -> Result<Vec<PublicTxidTransaction>, RecoveryFailure> {
+    match request
+        .public_data_plane
+        .txid_transactions_for_outer_hash(&request.cache_key, outer_transaction_hash)
+    {
+        Ok(rows) if !rows.is_empty() => return Ok(rows),
+        Ok(_) | Err(TxidPublicCacheError::CacheNotReady { .. }) => {}
+        Err(err) => return Err(txid_public_cache_failure(&err)),
+    }
+    let public_data_plane = request.public_data_plane;
+    let cache_key = request.cache_key.clone();
+    refresh_public_txid_cache(request).await?;
+    let rows = public_data_plane
+        .txid_transactions_for_outer_hash(&cache_key, outer_transaction_hash)
+        .map_err(|err| txid_public_cache_failure(&err))?;
+    if rows.is_empty() {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::TxFetchFailed,
+            "source transaction is missing from validated public TXID data",
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        ));
+    }
+    Ok(rows)
 }
 
 pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
@@ -35,8 +117,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         recovery_chunk,
         started,
     } = request;
-    let endpoint = cfg.quick_sync_endpoint.as_ref();
-    let has_network_source = endpoint.is_some() || indexed_artifact_source.is_some();
     let cache_key = PublicTxidCacheKey::new(
         ChainScope {
             chain_type: ChainType::Evm,
@@ -87,55 +167,30 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
     } else {
         None
     };
-    let (cached, _latest_validated, latest_validated_source, cache_sync_elapsed_ms) = if let Some(
-        (proof, latest),
-    ) =
-        cached_proof
-    {
-        (proof, latest, "cache", 0)
-    } else {
-        if !has_network_source {
-            return Err(RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::TxFetchFailed,
-                "no TXID synchronization source is configured and the verified local cache does not cover the recovery target",
-                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-            ));
-        }
-        let latest_validated = poi_client
-            .latest_validated_railgun_txid(DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, cfg.chain.chain_id)
-            .await
-            .map_err(|err| {
-                RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::MissingMerkleProof,
-                    format!("fetch latest validated TXID failed: {err}"),
-                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                )
-            })?;
-        let latest = PublicTxidLatestValidated {
-            txid_index: latest_validated_txid_index(&latest_validated)?,
-            merkleroot: latest_validated_txid_root(&latest_validated)?,
-        };
-        let cache_sync_started = Instant::now();
-        public_data_plane
-            .sync_txid_public_cache(PublicTxidSyncRequest {
-                key: cache_key.clone(),
-                endpoint,
+    let (cached, _latest_validated, latest_validated_source, cache_sync_elapsed_ms) =
+        if let Some((proof, latest)) = cached_proof {
+            (proof, latest, "cache", 0)
+        } else {
+            let cache_sync_started = Instant::now();
+            refresh_public_txid_cache(PublicCacheTxidRefreshRequest {
+                public_data_plane,
+                cfg,
+                poi_client,
                 http_client,
-                latest,
                 indexed_artifact_source,
+                cache_key: cache_key.clone(),
             })
-            .await
-            .map_err(|err| txid_public_cache_failure(&err))?;
-        let cache_sync_elapsed_ms = cache_sync_started.elapsed().as_millis();
-        let proof = public_data_plane
-            .txid_public_proof(&PublicTxidProofRequest {
-                key: cache_key,
-                target,
-            })
-            .map_err(|err| txid_public_cache_failure(&err))?;
-        let proof_latest = proof.latest_validated;
-        (proof, proof_latest, "rpc", cache_sync_elapsed_ms)
-    };
+            .await?;
+            let cache_sync_elapsed_ms = cache_sync_started.elapsed().as_millis();
+            let proof = public_data_plane
+                .txid_public_proof(&PublicTxidProofRequest {
+                    key: cache_key,
+                    target,
+                })
+                .map_err(|err| txid_public_cache_failure(&err))?;
+            let proof_latest = proof.latest_validated;
+            (proof, proof_latest, "rpc", cache_sync_elapsed_ms)
+        };
     let latest_validated_elapsed_ms = latest_validated_started.elapsed().as_millis();
     let proof_elapsed_ms = proof_started.elapsed().as_millis();
     let target_tree = cached.target_txid_index / TREE_LEAF_COUNT;

@@ -7,7 +7,7 @@ use super::{
 use crate::indexed_artifacts::{ChainScope, ChainType};
 
 pub(crate) const TXID_CACHE_BLOB_KIND: &str = "txid_public_cache";
-pub(super) const TXID_CACHE_FORMAT_VERSION: u32 = 3;
+pub(super) const TXID_CACHE_FORMAT_VERSION: u32 = 4;
 pub(super) const TXID_CACHE_PAGE_SIZE: NonZeroUsize =
     NonZeroUsize::new(10_000).expect("txid cache page size is non-zero");
 pub(super) static TXID_CACHE_SYNC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -357,7 +357,22 @@ pub(super) struct TxidPublicCacheRow {
     pub(super) transaction: TxidPublicCacheTransaction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+pub(crate) struct TxidPublicCacheEntry {
+    pub txid_index: u64,
+    pub transaction: TxidPublicCacheTransaction,
+}
+
+impl From<TxidPublicCacheRow> for TxidPublicCacheEntry {
+    fn from(row: TxidPublicCacheRow) -> Self {
+        Self {
+            txid_index: row.txid_index,
+            transaction: row.transaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TxidPublicCacheTransaction {
     pub id: String,
     pub transaction_hash: FixedBytes<32>,
@@ -368,6 +383,8 @@ pub(crate) struct TxidPublicCacheTransaction {
     pub commitments: Vec<U256>,
     pub bound_params_hash: U256,
     pub has_unshield: bool,
+    #[serde(default)]
+    pub unshield_preimage: Option<Vec<u8>>,
     pub utxo_tree_in: u64,
     pub utxo_tree_out: u64,
     pub utxo_batch_start_position_out: u64,
@@ -375,6 +392,7 @@ pub(crate) struct TxidPublicCacheTransaction {
 
 impl From<IndexedRailgunTransaction> for TxidPublicCacheTransaction {
     fn from(transaction: IndexedRailgunTransaction) -> Self {
+        let unshield_preimage = transaction.verified_unshield_preimage();
         Self {
             id: transaction.id,
             transaction_hash: transaction.transaction_hash,
@@ -385,6 +403,7 @@ impl From<IndexedRailgunTransaction> for TxidPublicCacheTransaction {
             commitments: transaction.commitments,
             bound_params_hash: transaction.bound_params_hash,
             has_unshield: transaction.has_unshield,
+            unshield_preimage,
             utxo_tree_in: transaction.utxo_tree_in.to(),
             utxo_tree_out: transaction.utxo_tree_out.to(),
             utxo_batch_start_position_out: transaction.utxo_batch_start_position_out.to(),

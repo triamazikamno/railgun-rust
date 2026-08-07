@@ -15,6 +15,8 @@ use crate::indexed_artifacts::{
     decode_indexed_artifact_chunk, verify_chunk_bytes,
 };
 
+use alloy::sol_types::SolValue;
+use broadcaster_core::contracts::railgun::CommitmentPreimage;
 use broadcaster_core::transact::{
     DEFAULT_TXID_VERSION, compute_railgun_txid_parts, railgun_txid_leaf_hash_with_output_start,
 };
@@ -22,6 +24,7 @@ use merkletree::tree::DenseMerkleTree;
 use tracing::debug;
 
 const PUBLIC_TXID_RECORD_SECTION_ID: u16 = 1;
+const PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID: u16 = 2;
 
 pub(crate) struct TxidPublicArtifactSource {
     client: IndexedArtifactManifestClient,
@@ -498,11 +501,22 @@ fn materialize_artifact_pages(
     let payload = envelope
         .section_payload(PUBLIC_TXID_RECORD_SECTION_ID)
         .map_err(crate::indexed_artifacts::IndexedArtifactManifestError::from)?;
-    let rows = PublicTxidCursor::new(payload).read_rows(
+    let mut rows = PublicTxidCursor::new(payload).read_rows(
         envelope.header.range.start,
         envelope.header.range.end,
         envelope.header.row_count,
     )?;
+    if envelope
+        .header
+        .sections
+        .iter()
+        .any(|section| section.section_id == PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID)
+    {
+        let payload = envelope
+            .section_payload(PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID)
+            .map_err(crate::indexed_artifacts::IndexedArtifactManifestError::from)?;
+        attach_unshield_preimages(payload, &mut rows)?;
+    }
     if chunk.descriptor.metadata.stream_partition.is_some() {
         return Err(TxidPublicCacheError::MetadataMismatch(
             "format-v1 public_txid artifact has unsupported stream partition metadata".to_string(),
@@ -670,6 +684,7 @@ impl<'a> PublicTxidCursor<'a> {
                 commitments,
                 bound_params_hash,
                 has_unshield,
+                unshield_preimage: None,
                 utxo_tree_in,
                 utxo_tree_out,
                 utxo_batch_start_position_out,
@@ -808,6 +823,87 @@ impl<'a> PublicTxidCursor<'a> {
         self.position = end;
         Ok(value)
     }
+}
+
+fn attach_unshield_preimages(
+    payload: &[u8],
+    rows: &mut [TxidPublicCacheRow],
+) -> Result<(), TxidPublicCacheError> {
+    let mut cursor = PublicTxidCursor::new(payload);
+    let entry_count = cursor.read_u32("unshield_preimage_count")? as usize;
+    if entry_count > rows.len() {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "public_txid unshield preimage count exceeds row count".to_string(),
+        ));
+    }
+    let first_index = rows.first().map(|row| row.txid_index).ok_or_else(|| {
+        TxidPublicCacheError::MetadataMismatch(
+            "public_txid unshield sidecar cannot target an empty chunk".to_string(),
+        )
+    })?;
+    let mut previous_index = None;
+    for _ in 0..entry_count {
+        let txid_index = cursor.read_u64("unshield_preimage_txid_index")?;
+        if previous_index.is_some_and(|previous| txid_index <= previous) {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "public_txid unshield preimage indexes are not strictly increasing".to_string(),
+            ));
+        }
+        previous_index = Some(txid_index);
+        let row_offset = txid_index
+            .checked_sub(first_index)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "public_txid unshield preimage index is outside the chunk".to_string(),
+                )
+            })?;
+        let row = rows
+            .get_mut(row_offset)
+            .filter(|row| row.txid_index == txid_index)
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "public_txid unshield preimage index is outside the chunk".to_string(),
+                )
+            })?;
+        if !row.transaction.has_unshield {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "public_txid unshield preimage targets a non-unshield row".to_string(),
+            ));
+        }
+        let length = cursor.read_u16("unshield_preimage_length")? as usize;
+        let encoded = cursor.read_exact(length, "unshield_preimage")?;
+        let preimage = CommitmentPreimage::abi_decode(encoded).map_err(|err| {
+            TxidPublicCacheError::MetadataMismatch(format!(
+                "invalid public_txid unshield preimage: {err}"
+            ))
+        })?;
+        if preimage.abi_encode() != encoded {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "public_txid unshield preimage is not canonically encoded".to_string(),
+            ));
+        }
+        if row.transaction.commitments.last() != Some(&preimage.hash()) {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "public_txid unshield preimage does not match its commitment".to_string(),
+            ));
+        }
+        row.transaction.unshield_preimage = Some(encoded.to_vec());
+    }
+    if !cursor.is_eof() {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "public_txid unshield sidecar has trailing bytes".to_string(),
+        ));
+    }
+    if rows
+        .iter()
+        .any(|row| row.transaction.has_unshield && row.transaction.unshield_preimage.is_none())
+    {
+        return Err(TxidPublicCacheError::MetadataMismatch(
+            "public_txid unshield sidecar is missing an unshield row".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

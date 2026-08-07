@@ -41,17 +41,17 @@ use types::{
     TXID_CACHE_FORMAT_VERSION, TXID_CACHE_PAGE_SIZE, TXID_CACHE_SYNC_LOCK, TXID_CACHE_TEMP_COUNTER,
     TxidPublicCacheIndexEntry, TxidPublicCacheIndexShard, TxidPublicCacheManifest,
     TxidPublicCachePage, TxidPublicCachePageRef, TxidPublicCacheReadScope, TxidPublicCacheRefresh,
-    TxidPublicCacheRow, TxidPublicCacheSyncState, TxidPublicCacheTransaction,
-    TxidPublicCacheWritePermit,
+    TxidPublicCacheRow, TxidPublicCacheSyncState, TxidPublicCacheWritePermit,
 };
 
+pub(crate) use lookup::validated_transactions_for_outer_hash;
 pub(crate) use proof::{
     txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
 };
 pub(crate) use sync::reset_txid_public_cache;
 pub(crate) use types::{
-    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheReset,
-    TxidPublicLatestValidated, TxidPublicProof,
+    TxidPublicCache, TxidPublicCacheEntry, TxidPublicCacheError, TxidPublicCacheKey,
+    TxidPublicCacheReset, TxidPublicCacheTransaction, TxidPublicLatestValidated, TxidPublicProof,
 };
 
 #[cfg(test)]

@@ -1153,7 +1153,6 @@ impl ChainService {
             crate::wallet::prepare_wallet_worker(
                 WalletWorkerServices {
                     db: self.db.clone(),
-                    rpcs: self.chain.rpcs.clone(),
                     http_client: self.chain.http_client.clone(),
                     indexed_artifact_source: self.chain.indexed_artifact_source.clone(),
                     poi_runtime: WalletPoiRuntime::from_policy(

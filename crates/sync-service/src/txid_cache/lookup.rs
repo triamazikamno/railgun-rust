@@ -1,7 +1,94 @@
 use super::{
-    DbStore, FixedBytes, TREE_LEAF_COUNT, TxidPublicCacheError, TxidPublicCacheManifest,
-    TxidPublicCacheRow, U256,
+    DbStore, FixedBytes, TREE_LEAF_COUNT, TxidPublicCacheEntry, TxidPublicCacheError,
+    TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCacheRow, U256,
 };
+
+pub(crate) fn validated_transactions_for_outer_hash(
+    db: &DbStore,
+    key: TxidPublicCacheKey<'_>,
+    transaction_hash: FixedBytes<32>,
+) -> Result<Vec<TxidPublicCacheEntry>, TxidPublicCacheError> {
+    let cache = super::TxidPublicCache::new(db, key);
+    let manifest = cache
+        .load_manifest()?
+        .ok_or(TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        })?;
+    manifest.validate_for(key)?;
+    let latest_validated_txid_index =
+        manifest
+            .latest_validated_txid_index
+            .ok_or(TxidPublicCacheError::CacheNotReady {
+                next_index: 0,
+                required_index: 0,
+            })?;
+    if manifest
+        .validated_cached_txid_index
+        .is_none_or(|index| index < latest_validated_txid_index)
+    {
+        return Err(TxidPublicCacheError::CacheNotReady {
+            next_index: manifest
+                .validated_cached_txid_index
+                .map_or(0, |index| index.saturating_add(1)),
+            required_index: latest_validated_txid_index,
+        });
+    }
+
+    let mut matches = Vec::new();
+    let mut expected_index = 0_u64;
+    for page_ref in &manifest.pages {
+        if expected_index > latest_validated_txid_index {
+            break;
+        }
+        let page_end = page_ref
+            .start_index
+            .checked_add(page_ref.row_count)
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "validated TXID page range overflows".to_string(),
+                )
+            })?;
+        if page_ref.start_index < expected_index || page_end <= expected_index {
+            return Err(TxidPublicCacheError::MetadataMismatch(format!(
+                "validated TXID page coverage overlaps at index {expected_index}"
+            )));
+        }
+        if page_ref.start_index > expected_index {
+            return Err(TxidPublicCacheError::MissingLeaf {
+                index: expected_index,
+            });
+        }
+
+        let page = page_ref.read(db, manifest.cache_key())?;
+        for row in page.rows {
+            if row.txid_index != expected_index {
+                return if row.txid_index < expected_index {
+                    Err(TxidPublicCacheError::MetadataMismatch(format!(
+                        "validated TXID rows overlap at index {expected_index}"
+                    )))
+                } else {
+                    Err(TxidPublicCacheError::MissingLeaf {
+                        index: expected_index,
+                    })
+                };
+            }
+            let is_latest = row.txid_index == latest_validated_txid_index;
+            if row.transaction.transaction_hash == transaction_hash {
+                matches.push(row.into());
+            }
+            if is_latest {
+                return Ok(matches);
+            }
+            expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch("txid index overflow".to_string())
+            })?;
+        }
+    }
+    Err(TxidPublicCacheError::MissingLeaf {
+        index: expected_index,
+    })
+}
 
 pub(super) fn find_target_row(
     manifest: &TxidPublicCacheManifest,

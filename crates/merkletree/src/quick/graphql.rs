@@ -369,6 +369,13 @@ query PublicTxidPage($offset: Int!, $limit: Int!) {
     commitments
     boundParamsHash
     hasUnshield
+    unshieldToken {
+      tokenType
+      tokenAddress
+      tokenSubID
+    }
+    unshieldToAddress
+    unshieldValue
     utxoTreeIn
     utxoTreeOut
     utxoBatchStartPositionOut

@@ -1,8 +1,9 @@
 use std::fmt;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U64, U256, Uint};
+use alloy::sol_types::SolValue;
 use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use broadcaster_core::contracts::railgun::{
     CommitmentPreimage, LegacyCommitmentPreimage, ShieldCiphertext, TokenData,
@@ -193,7 +194,7 @@ impl From<IndexedCommitmentPreimage> for CommitmentPreimage {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexedTokenData {
     #[serde(rename = "tokenType", deserialize_with = "deserialize_token_type")]
     pub token_type: u8,
@@ -236,6 +237,17 @@ where
     D: Deserializer<'de>,
 {
     deserialize_indexed_fixed_bytes(deserializer)
+}
+
+fn deserialize_optional_indexed_fixed_bytes_32<'de, D>(
+    deserializer: D,
+) -> Result<Option<FixedBytes<32>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| parse_left_padded_hex(&value))
+        .transpose()
 }
 
 fn deserialize_indexed_fixed_bytes_64<'de, D>(deserializer: D) -> Result<FixedBytes<64>, D::Error>
@@ -478,6 +490,16 @@ pub struct IndexedRailgunTransaction {
     pub bound_params_hash: U256,
     #[serde(rename = "hasUnshield")]
     pub has_unshield: bool,
+    #[serde(rename = "unshieldToken", default)]
+    pub unshield_token: Option<IndexedTokenData>,
+    #[serde(
+        rename = "unshieldToAddress",
+        default,
+        deserialize_with = "deserialize_optional_indexed_fixed_bytes_32"
+    )]
+    pub unshield_to_address: Option<FixedBytes<32>>,
+    #[serde(rename = "unshieldValue", default)]
+    pub unshield_value: Option<U256>,
     #[serde(rename = "utxoTreeIn")]
     pub utxo_tree_in: U64,
     #[serde(rename = "utxoTreeOut")]
@@ -487,6 +509,23 @@ pub struct IndexedRailgunTransaction {
 }
 
 impl IndexedRailgunTransaction {
+    #[must_use]
+    pub fn verified_unshield_preimage(&self) -> Option<Vec<u8>> {
+        if !self.has_unshield {
+            return None;
+        }
+        let value = self.unshield_value?;
+        if value > U256::from((1_u128 << 120) - 1) {
+            return None;
+        }
+        let preimage = CommitmentPreimage {
+            npk: self.unshield_to_address?,
+            token: self.unshield_token.clone()?.into(),
+            value: Uint::<120, 2>::from(value.to::<u128>()),
+        };
+        (self.commitments.last() == Some(&preimage.hash())).then(|| preimage.abi_encode())
+    }
+
     #[must_use]
     pub fn railgun_txid(&self) -> U256 {
         compute_railgun_txid_parts(&self.nullifiers, &self.commitments, self.bound_params_hash)
@@ -511,10 +550,69 @@ impl IndexedRailgunTransaction {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
+    use alloy::sol_types::SolValue;
     use alloy::uint;
     use serde_json::json;
 
-    use super::IndexedNullifier;
+    use broadcaster_core::contracts::railgun::{CommitmentPreimage, TokenData};
+
+    use super::{IndexedNullifier, IndexedRailgunTransaction, IndexedTransactCommitment};
+
+    #[test]
+    fn indexed_unshield_fields_normalize_only_when_commitment_verifies() {
+        let destination = Address::from([0x11; 20]);
+        let mut npk = [0_u8; 32];
+        npk[12..].copy_from_slice(destination.as_slice());
+        let preimage = CommitmentPreimage {
+            npk: FixedBytes::from(npk),
+            token: TokenData {
+                tokenType: 0,
+                tokenAddress: Address::from([0x22; 20]),
+                tokenSubID: U256::ZERO,
+            },
+            value: Uint::<120, 2>::from(42_u64),
+        };
+        let mut item: IndexedRailgunTransaction = serde_json::from_value(json!({
+            "id": "1",
+            "blockNumber": "123",
+            "blockTimestamp": "1700000123",
+            "transactionHash": format!("0x{}", "33".repeat(32)),
+            "merkleRoot": format!("0x{}", "44".repeat(32)),
+            "nullifiers": ["0x01"],
+            "commitments": [format!("0x{:064x}", preimage.hash())],
+            "boundParamsHash": "0x02",
+            "hasUnshield": true,
+            "unshieldToken": {
+                "tokenType": "ERC20",
+                "tokenAddress": preimage.token.tokenAddress,
+                "tokenSubID": "0",
+            },
+            "unshieldToAddress": destination,
+            "unshieldValue": "42",
+            "utxoTreeIn": "0",
+            "utxoTreeOut": "1",
+            "utxoBatchStartPositionOut": "2",
+        }))
+        .expect("deserialize Squid unshield row");
+
+        assert_eq!(item.unshield_to_address, Some(preimage.npk));
+        assert_eq!(
+            item.verified_unshield_preimage(),
+            Some(preimage.abi_encode())
+        );
+
+        item.commitments[0] = U256::from(7);
+        assert_eq!(item.verified_unshield_preimage(), None);
+
+        let full_npk_preimage = CommitmentPreimage {
+            npk: FixedBytes::from([0x77; 32]),
+            ..preimage
+        };
+        item.commitments[0] = full_npk_preimage.hash();
+        assert_eq!(item.verified_unshield_preimage(), None);
+    }
+
     #[test]
     fn indexed_transact_commitment_preserves_complete_ciphertext() {
         let item: IndexedTransactCommitment = serde_json::from_value(json!({

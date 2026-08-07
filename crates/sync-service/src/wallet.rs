@@ -4,15 +4,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
-use alloy::primitives::{Bytes, FixedBytes, U256};
-use alloy::sol_types::SolCall;
+use alloy::primitives::{FixedBytes, U256};
 use async_trait::async_trait;
-use broadcaster_core::contracts::railgun::{
-    CommitmentCiphertext, Transaction, executeCall, relayCall, transactCall,
-};
-use broadcaster_core::crypto::aes_gcm::{decrypt_in_place_16b_iv, split_iv_tag};
-use broadcaster_core::crypto::shared_key::shared_symmetric_key;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{DEFAULT_TXID_VERSION, railgun_txid_leaf_hash_with_output_start};
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use futures::stream::FuturesUnordered;
@@ -23,8 +16,6 @@ use railgun_wallet::tx::{
     PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
     PrivateInputs, PublicInputs, TransactionPlanChunk, generate_post_transaction_pois,
 };
-use serde::Deserialize;
-use serde_json::json;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
@@ -49,7 +40,7 @@ use railgun_wallet::{
 use crate::chain::{
     ChainError, ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey,
     PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest,
+    PublicTxidSyncRequest, PublicTxidTransaction,
 };
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::txid_cache::TxidPublicCacheError;

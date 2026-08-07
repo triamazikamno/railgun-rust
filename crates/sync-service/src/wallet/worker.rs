@@ -369,7 +369,6 @@ async fn request_poi_maintenance(
     cache_store: &Arc<dyn WalletCacheStore>,
     cfg: &WalletConfig,
     public_data_plane: &ChainPublicDataPlane,
-    rpcs: &Arc<QueryRpcPool>,
     http_client: Option<&reqwest::Client>,
     indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     poi_runtime: &WalletPoiRuntime,
@@ -408,7 +407,6 @@ async fn request_poi_maintenance(
         cache_store: Arc::clone(cache_store),
         cfg: cfg.clone(),
         public_data_plane: public_data_plane.clone(),
-        rpcs: Arc::clone(rpcs),
         http_client: http_client.cloned(),
         indexed_artifact_source: indexed_artifact_source.cloned(),
         poi_client: client,
@@ -442,7 +440,6 @@ async fn on_poi_maintenance_done(
     cache_store: &Arc<dyn WalletCacheStore>,
     cfg: &WalletConfig,
     public_data_plane: &ChainPublicDataPlane,
-    rpcs: &Arc<QueryRpcPool>,
     http_client: Option<&reqwest::Client>,
     indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     poi_runtime: &WalletPoiRuntime,
@@ -469,7 +466,6 @@ async fn on_poi_maintenance_done(
             cache_store,
             cfg,
             public_data_plane,
-            rpcs,
             http_client,
             indexed_artifact_source,
             poi_runtime,
@@ -495,7 +491,6 @@ struct PoiMaintenanceJob {
     cache_store: Arc<dyn WalletCacheStore>,
     cfg: WalletConfig,
     public_data_plane: ChainPublicDataPlane,
-    rpcs: Arc<QueryRpcPool>,
     http_client: Option<reqwest::Client>,
     indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     /// Shared POI runtime (client + policy); not held across actor turns as a permit.
@@ -612,7 +607,6 @@ impl PoiMaintenanceJob {
             cache_store: self.cache_store.as_ref(),
             cfg: &self.cfg,
             public_data_plane: &self.public_data_plane,
-            rpcs: self.rpcs.as_ref(),
             http_client: self.http_client.as_ref(),
             indexed_artifact_source: self.indexed_artifact_source.as_ref(),
             poi_runtime: &poi_runtime,
@@ -1817,7 +1811,6 @@ pub(crate) async fn prepare_wallet_worker(
     let authority_lock = Arc::new(Mutex::new(()));
     let WalletWorkerServices {
         db,
-        rpcs,
         http_client,
         indexed_artifact_source,
         poi_runtime,
@@ -2458,7 +2451,6 @@ pub(crate) async fn prepare_wallet_worker(
                         &cache_store,
                         &cfg,
                         &public_data_plane,
-                        &rpcs,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &poi_runtime,
@@ -2658,7 +2650,6 @@ pub(crate) async fn prepare_wallet_worker(
                                 &cache_store,
                                 &cfg,
                                 &public_data_plane,
-                                &rpcs,
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
                                 &poi_runtime,
@@ -2779,7 +2770,6 @@ pub(crate) async fn prepare_wallet_worker(
                         &cache_store,
                         &cfg,
                         &public_data_plane,
-                        &rpcs,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &poi_runtime,
@@ -3225,7 +3215,6 @@ pub(crate) async fn prepare_wallet_worker(
                         &cache_store,
                         &cfg,
                         &public_data_plane,
-                        &rpcs,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &poi_runtime,
@@ -3433,7 +3422,6 @@ pub(crate) async fn prepare_wallet_worker(
                                     &cache_store,
                                     &cfg,
                                     &public_data_plane,
-                                    &rpcs,
                                     http_client.as_ref(),
                                     indexed_artifact_source.as_ref(),
                                     &poi_runtime,
@@ -3828,7 +3816,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 expected_from_block,
                                 batch.to_block,
                                 &batch,
-                                crate::types::PublicScanSource::Rpc,
+                                PublicScanSource::Rpc,
                             ) {
                                 Ok(apply) => apply,
                                 Err(err) => {
@@ -3884,7 +3872,6 @@ pub(crate) async fn prepare_wallet_worker(
                                             &cache_store,
                                             &cfg,
                                             &public_data_plane,
-                                            &rpcs,
                                             http_client.as_ref(),
                                             indexed_artifact_source.as_ref(),
                                             &poi_runtime,
@@ -4156,7 +4143,6 @@ mod tests {
     use async_trait::async_trait;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
     use broadcaster_core::notes::Note;
-    use broadcaster_core::query_rpc_pool::QueryRpcPool;
     use broadcaster_core::transact::DEFAULT_TXID_VERSION;
     use local_db::{
         DbConfig, DbStore, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
@@ -4342,10 +4328,6 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_artifact_poi_runtime(),
@@ -4442,10 +4424,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -4504,10 +4483,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -4596,10 +4572,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5368,7 +5341,7 @@ mod tests {
             from_block,
             to_block,
             &logs_payload(from_block, to_block),
-            crate::types::PublicScanSource::Rpc,
+            PublicScanSource::Rpc,
         )
         .expect("normalize empty log payload")
     }
@@ -5431,10 +5404,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5504,10 +5474,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5621,10 +5588,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5694,10 +5658,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5806,10 +5767,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5893,10 +5851,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -5987,10 +5942,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6076,10 +6028,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6166,10 +6115,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6298,10 +6244,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6376,10 +6319,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6440,10 +6380,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6520,10 +6457,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6583,10 +6517,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6655,10 +6586,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6719,10 +6647,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6819,10 +6744,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -6915,10 +6837,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7015,10 +6934,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7114,10 +7030,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7219,10 +7132,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7276,10 +7186,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7348,10 +7255,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7429,10 +7333,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7542,10 +7443,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7614,10 +7512,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7725,10 +7620,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -7906,10 +7798,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8084,10 +7973,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8184,10 +8070,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8385,10 +8268,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8469,10 +8349,6 @@ mod tests {
             spawn_wallet_worker(
                 WalletWorkerServices {
                     db: Arc::clone(&db),
-                    rpcs: Arc::new(QueryRpcPool::new(
-                        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                        Duration::from_secs(1),
-                    )),
                     http_client: None,
                     indexed_artifact_source: None,
                     poi_runtime: test_wallet_poi_runtime(),
@@ -8584,10 +8460,6 @@ mod tests {
             let result = spawn_wallet_worker(
                 WalletWorkerServices {
                     db: Arc::clone(&db),
-                    rpcs: Arc::new(QueryRpcPool::new(
-                        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                        Duration::from_secs(1),
-                    )),
                     http_client: None,
                     indexed_artifact_source: None,
                     poi_runtime: test_wallet_poi_runtime(),
@@ -8678,10 +8550,7 @@ mod tests {
         let result = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8725,10 +8594,7 @@ mod tests {
         let prepared = prepare_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8797,10 +8663,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8863,10 +8726,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8932,10 +8792,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -8993,10 +8850,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9091,10 +8945,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9250,10 +9101,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9449,10 +9297,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9560,10 +9405,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9768,10 +9610,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9883,10 +9722,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -9954,10 +9790,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -10012,10 +9845,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -10043,7 +9873,7 @@ mod tests {
                     120,
                     130,
                     &logs_payload(100, 199),
-                    crate::types::PublicScanSource::Rpc,
+                    PublicScanSource::Rpc,
                 )
                 .expect("normalize shared log payload"),
                 0,
@@ -10060,7 +9890,7 @@ mod tests {
                     131,
                     199,
                     &logs_payload(100, 199),
-                    crate::types::PublicScanSource::Rpc,
+                    PublicScanSource::Rpc,
                 )
                 .expect("normalize shared log payload"),
                 0,
@@ -10097,10 +9927,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -10195,10 +10022,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -10311,10 +10135,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -10399,10 +10220,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -10534,10 +10352,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),
@@ -11631,10 +11446,7 @@ mod tests {
         let handle = spawn_wallet_worker(
             WalletWorkerServices {
                 db: Arc::clone(&db),
-                rpcs: Arc::new(QueryRpcPool::new(
-                    vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
-                    Duration::from_secs(1),
-                )),
+
                 http_client: None,
                 indexed_artifact_source: None,
                 poi_runtime: test_wallet_poi_runtime(),

@@ -44,8 +44,9 @@ use crate::public_cache::{
 };
 use crate::runtime_admission::DbRuntimeLease;
 use crate::txid_cache::{
-    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicLatestValidated,
-    txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
+    TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheTransaction,
+    TxidPublicLatestValidated, txid_public_proof_for_recovered_output,
+    txid_public_proof_for_recovered_output_at_index, validated_transactions_for_outer_hash,
 };
 use crate::types::{
     IndexedArtifactSourceConfig, LocalPoiCaches, PoiArtifactCacheAttemptId,
@@ -232,6 +233,12 @@ impl PublicTxidCacheKey {
 pub(crate) struct PublicTxidLatestValidated {
     pub txid_index: u64,
     pub merkleroot: Option<FixedBytes<32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicTxidTransaction {
+    pub txid_index: u64,
+    pub transaction: TxidPublicCacheTransaction,
 }
 
 impl From<TxidPublicLatestValidated> for PublicTxidLatestValidated {
@@ -1759,6 +1766,27 @@ impl ChainPublicDataPlane {
         cache
             .cached_latest_validated()
             .map(|latest| latest.map(Into::into))
+    }
+
+    pub(crate) fn txid_transactions_for_outer_hash(
+        &self,
+        key: &PublicTxidCacheKey,
+        transaction_hash: FixedBytes<32>,
+    ) -> Result<Vec<PublicTxidTransaction>, TxidPublicCacheError> {
+        validated_transactions_for_outer_hash(
+            self.db.as_ref(),
+            key.as_cache_key(),
+            transaction_hash,
+        )
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| PublicTxidTransaction {
+                    txid_index: entry.txid_index,
+                    transaction: entry.transaction,
+                })
+                .collect()
+        })
     }
 
     pub(crate) async fn sync_txid_public_cache(

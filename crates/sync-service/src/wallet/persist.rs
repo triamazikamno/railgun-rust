@@ -114,7 +114,6 @@ impl WalletPoiRuntime {
 
 pub(crate) struct WalletWorkerServices {
     pub db: Arc<DbStore>,
-    pub rpcs: Arc<QueryRpcPool>,
     pub http_client: Option<reqwest::Client>,
     pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     pub poi_runtime: WalletPoiRuntime,
@@ -368,7 +367,6 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) cache_store: &'a dyn WalletCacheStore,
     pub(super) cfg: &'a WalletConfig,
     pub(super) public_data_plane: &'a ChainPublicDataPlane,
-    pub(super) rpcs: &'a QueryRpcPool,
     pub(super) http_client: Option<&'a reqwest::Client>,
     pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
     pub(super) poi_runtime: &'a WalletPoiRuntime,
@@ -425,7 +423,6 @@ impl OutputPoiRecoveryRun<'_> {
             cache_store: self.cache_store,
             cfg: self.cfg,
             public_data_plane: self.public_data_plane,
-            rpcs: self.rpcs,
             http_client: self.http_client,
             indexed_artifact_source: self.indexed_artifact_source,
             forest: &forest,
