@@ -1820,8 +1820,9 @@ impl DbStore {
                     return store.finish_open();
                 }
                 Some(meta) if meta.schema_version > CURRENT_SCHEMA_VERSION => {
-                    drop(store);
-                    backup_db(&db_path)?;
+                    return Err(DbError::UnsupportedSchemaVersion {
+                        version: meta.schema_version,
+                    });
                 }
                 Some(meta) if meta.schema_version < CURRENT_SCHEMA_VERSION => {
                     if let Err(err) = store.run_migrations(&meta, CURRENT_SCHEMA_VERSION) {
