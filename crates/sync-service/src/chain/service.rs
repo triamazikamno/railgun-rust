@@ -1,7 +1,7 @@
 use super::{
     Arc, AtomicBool, AtomicU64, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig,
     ChainError, ChainHandle, ChainPublicDataPlane, ChainService, DbStore, Duration,
-    GlobalPoiPolicy, HashMap, IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
+    GlobalPoiPolicy, IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
     IndexedWalletCatchUpSourceOrder, IndexedWalletPage, IndexedWalletPageKind, Instant, JoinHandle,
     JoinSet, LogBatch, MerkleForestDbExt, Mutex, Ordering, Provider, ProviderHandle,
     PublicCoverageAnswer, PublicDataPlaneDiagnosticKind, PublicDataPlaneEpoch,
@@ -237,15 +237,6 @@ impl PublicScanPagePlan {
 impl ChainService {
     pub(super) const fn chain_id(&self) -> u64 {
         self.chain.chain_id
-    }
-
-    async fn wallet_registration_gate(&self, cache_key: &str) -> Arc<Mutex<()>> {
-        let mut gates = self.wallet_registration_gates.lock().await;
-        Arc::clone(
-            gates
-                .entry(cache_key.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
     }
 
     pub(super) fn next_wallet_reset_intent(&self) -> u64 {
@@ -848,8 +839,8 @@ impl ChainService {
             live_log_tx,
             backfill_tx,
             archive_provider: archive_provider.clone(),
-            wallets: RwLock::new(HashMap::new()),
-            wallet_registration_gates: Mutex::new(HashMap::new()),
+            wallet: RwLock::new(None),
+            wallet_registration_gate: Mutex::new(()),
             cancel: cancel.clone(),
             live_log_task: std::sync::Mutex::new(None),
             anchor_last: AtomicU64::new(last_anchor),
@@ -883,10 +874,11 @@ impl ChainService {
     }
 
     pub async fn wallet_handle(&self, cache_key: &str) -> Option<WalletHandle> {
-        self.wallets
+        self.wallet
             .read()
             .await
-            .get(cache_key)
+            .as_ref()
+            .filter(|registration| registration.cfg.cache_key.as_str() == cache_key)
             .filter(|registration| !Self::wallet_registration_is_terminal(registration))
             .map(|registration| registration.handle.clone())
     }
@@ -918,24 +910,23 @@ impl ChainService {
 
     async fn reap_terminal_wallet_registration(&self, handle: &WalletHandle) {
         let cache_key = handle.cache_key.as_str();
-        let registration_gate = self.wallet_registration_gate(cache_key).await;
-        let registration_guard = registration_gate.lock().await;
+        let _registration_guard = self.wallet_registration_gate.lock().await;
         let registration = {
-            let mut wallets = self.wallets.write().await;
-            let is_exact_terminal = wallets.get(cache_key).is_some_and(|registration| {
+            let mut wallet = self.wallet.write().await;
+            let is_exact_terminal = wallet.as_ref().is_some_and(|registration| {
                 registration.handle.same_actor_as(handle)
                     && Self::wallet_registration_is_terminal(registration)
             });
-            is_exact_terminal
-                .then(|| wallets.remove(cache_key))
-                .flatten()
+            is_exact_terminal.then(|| wallet.take()).flatten()
         };
         let Some(registration) = registration else {
             return;
         };
         Self::begin_wallet_shutdown(&registration);
-        drop(registration_guard);
-        self.finish_wallet_retirement(cache_key, registration).await;
+        if let Err(err) = self.finish_wallet_retirement(cache_key, registration).await {
+            warn!(?err, cache_key = %cache_key, "terminal wallet cleanup failed");
+            self.begin_shutdown();
+        }
     }
 
     fn spawn_txid_public_cache_loop_once(self: &Arc<Self>) {
@@ -963,9 +954,13 @@ impl ChainService {
         cache_key: &str,
         from_block: Option<u64>,
     ) -> Result<(), ChainError> {
+        let _registration_guard = self.wallet_registration_gate.lock().await;
         let (handle, backfill_sender, start_block, sync_to_block) = {
-            let wallets = self.wallets.read().await;
-            let registration = wallets.get(cache_key).ok_or(ChainError::WalletNotFound)?;
+            let wallet = self.wallet.read().await;
+            let registration = wallet
+                .as_ref()
+                .filter(|registration| registration.cfg.cache_key.as_str() == cache_key)
+                .ok_or(ChainError::WalletNotFound)?;
             (
                 registration.handle.clone(),
                 registration.backfill_sender.clone(),
@@ -1014,8 +1009,10 @@ impl ChainService {
             return None;
         }
         let (cfg, start_block, handle, cancel) = {
-            let wallets = self.wallets.read().await;
-            let registration = wallets.get(cache_key)?;
+            let wallet = self.wallet.read().await;
+            let registration = wallet
+                .as_ref()
+                .filter(|registration| registration.cfg.cache_key.as_str() == cache_key)?;
             if !registration.cfg.use_indexed_wallet_catch_up {
                 debug!(cache_key = %cache_key, "indexed wallet tail fallback disabled");
                 return None;
@@ -1075,28 +1072,68 @@ impl ChainService {
         self: &Arc<Self>,
         cfg: WalletConfig,
     ) -> Result<WalletHandle, ChainError> {
+        let _registration_guard = self.wallet_registration_gate.lock().await;
+        self.register_wallet_locked(cfg).await
+    }
+
+    /// Retires the current wallet, if any, before installing the successor.
+    pub async fn replace_wallet(
+        self: &Arc<Self>,
+        cfg: WalletConfig,
+    ) -> Result<WalletHandle, ChainError> {
+        let service = Arc::clone(self);
+        tokio::spawn(async move { service.replace_wallet_owned(cfg).await })
+            .await
+            .map_err(|_| ChainError::WalletReplacementTaskFailed)?
+    }
+
+    async fn replace_wallet_owned(
+        self: &Arc<Self>,
+        cfg: WalletConfig,
+    ) -> Result<WalletHandle, ChainError> {
+        let _registration_guard = self.wallet_registration_gate.lock().await;
+        if self.cancel.is_cancelled() {
+            return Err(ChainError::Shutdown);
+        }
+        let registration = self.wallet.write().await.take();
+        if let Some(registration) = registration {
+            let cache_key = registration.cfg.cache_key.clone();
+            Self::begin_wallet_retirement(&registration);
+            self.finish_wallet_retirement(cache_key.as_str(), registration)
+                .await?;
+        }
+        self.register_wallet_locked(cfg).await
+    }
+
+    async fn register_wallet_locked(
+        self: &Arc<Self>,
+        cfg: WalletConfig,
+    ) -> Result<WalletHandle, ChainError> {
         let cache_key = cfg.cache_key.clone();
-        let registration_gate = self.wallet_registration_gate(&cache_key).await;
-        let registration_guard = registration_gate.lock().await;
         if self.cancel.is_cancelled() {
             return Err(ChainError::Shutdown);
         }
         let terminal_registration = {
-            let mut wallets = self.wallets.write().await;
-            if let Some(existing) = wallets.get(cache_key.as_str())
-                && !Self::wallet_registration_is_terminal(existing)
+            let mut wallet = self.wallet.write().await;
+            if let Some(existing) = wallet
+                .as_ref()
+                .filter(|existing| !Self::wallet_registration_is_terminal(existing))
             {
+                if existing.cfg.cache_key != cache_key {
+                    return Err(ChainError::WalletAlreadyRegistered);
+                }
                 if existing.handle.readiness().is_ready() {
                     self.spawn_txid_public_cache_loop_once();
                 }
                 return Ok(existing.handle.clone());
             }
-            wallets.remove(cache_key.as_str())
+            wallet.take()
         };
         if let Some(registration) = terminal_registration {
+            let retired_cache_key = registration.cfg.cache_key.clone();
             Self::begin_wallet_shutdown(&registration);
-            self.finish_wallet_retirement(cache_key.as_str(), registration)
-                .await;
+            self.finish_wallet_retirement(retired_cache_key.as_str(), registration)
+                .await?;
         }
 
         let mut cfg = cfg;
@@ -1175,49 +1212,63 @@ impl ChainService {
             .await?;
 
         let worker = prepared.take_worker();
-        let mut activation_failure = None;
-        let handle = {
-            let mut wallets = self.wallets.write().await;
+        if self.cancel.is_cancelled() {
+            cancel.cancel();
+            drop(prepared);
+            let _ = worker.await;
+            return Err(ChainError::Shutdown);
+        }
+        let handle = prepared.handle().clone();
+        let restored_pending_reset = prepared.has_restored_pending_reset();
+        let registration = WalletRegistration {
+            handle: handle.clone(),
+            cfg: cfg.clone(),
+            cancel: cancel.clone(),
+            worker,
+            observation: prepared.observation_publisher(),
+            backfill_sender: backfill_sender.clone(),
+            start_block,
+            sync_to_block: cfg.sync_to_block,
+        };
+        {
+            let mut wallet = self.wallet.write().await;
             if self.cancel.is_cancelled() {
-                drop(wallets);
-                drop(registration_guard);
+                drop(wallet);
                 cancel.cancel();
-                let _ = worker.await;
+                drop(prepared);
+                let registration = registration;
+                if let Err(err) = self
+                    .finish_wallet_retirement(cache_key.as_str(), registration)
+                    .await
+                {
+                    warn!(?err, cache_key = %cache_key, "wallet shutdown cleanup failed");
+                }
                 return Err(ChainError::Shutdown);
             }
-            let handle = prepared.handle().clone();
-            wallets.insert(
-                cache_key.to_string(),
-                WalletRegistration {
-                    handle,
-                    cfg: cfg.clone(),
-                    cancel: cancel.clone(),
-                    worker,
-                    observation: prepared.observation_publisher(),
-                    backfill_sender: backfill_sender.clone(),
-                    start_block,
-                    sync_to_block: cfg.sync_to_block,
-                },
-            );
-            match prepared.activate() {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    let registration = wallets
-                        .remove(cache_key.as_str())
-                        .expect("failed activation registration must remain installed");
-                    activation_failure = Some((err, registration));
-                    None
+            *wallet = Some(registration);
+        }
+        let activation_result = prepared.activate();
+        if let Err(err) = activation_result {
+            let registration = {
+                let mut wallet = self.wallet.write().await;
+                wallet.take()
+            };
+            if let Some(registration) = registration {
+                let cache_key = registration.cfg.cache_key.clone();
+                Self::begin_wallet_retirement(&registration);
+                if let Err(cleanup_err) = self
+                    .finish_wallet_retirement(cache_key.as_str(), registration)
+                    .await
+                {
+                    warn!(
+                        ?cleanup_err,
+                        cache_key = %cache_key,
+                        "wallet activation cleanup failed"
+                    );
                 }
             }
-        };
-        if let Some((err, registration)) = activation_failure {
-            Self::begin_wallet_retirement(&registration);
-            drop(registration_guard);
-            self.finish_wallet_retirement(cache_key.as_str(), registration)
-                .await;
             return Err(err);
         }
-        let handle = handle.expect("successful activation returns a wallet handle");
 
         self.spawn_wallet_terminal_reaper(handle.clone());
         self.spawn_txid_public_cache_loop_when_ready(
@@ -1229,11 +1280,26 @@ impl ChainService {
         let catch_up_cfg = cfg.clone();
         let catch_up_handle = handle.clone();
         let catch_up_cancel = cancel;
+        let catch_up_restored_pending_reset = restored_pending_reset;
         tokio::spawn(async move {
+            if catch_up_restored_pending_reset
+                && !wait_for_wallet_ready(
+                    catch_up_handle.subscribe_observation(),
+                    catch_up_cancel.clone(),
+                )
+                .await
+            {
+                return;
+            }
+            let startup_target = if catch_up_restored_pending_reset {
+                wallet_sync_target(*service.safe_head_tx.borrow(), catch_up_cfg.sync_to_block)
+            } else {
+                sync_target
+            };
             let Some(sync_target) = wait_for_startup_sync_target(
                 service.safe_head_tx.subscribe(),
                 catch_up_cfg.sync_to_block,
-                sync_target,
+                startup_target,
                 &catch_up_cancel,
             )
             .await
@@ -2683,21 +2749,22 @@ impl ChainService {
 
     pub async fn unregister_wallet(&self, handle: &WalletHandle) {
         let cache_key = handle.cache_key.as_str();
-        let registration_gate = self.wallet_registration_gate(cache_key).await;
-        let registration_guard = registration_gate.lock().await;
+        let _registration_guard = self.wallet_registration_gate.lock().await;
         let registration = {
-            let mut wallets = self.wallets.write().await;
-            let is_current = wallets
-                .get(cache_key)
-                .is_some_and(|registration| registration.handle.same_actor_as(handle));
-            is_current.then(|| wallets.remove(cache_key)).flatten()
+            let mut wallet = self.wallet.write().await;
+            let is_current = wallet.as_ref().is_some_and(|registration| {
+                registration.cfg.cache_key.as_str() == cache_key
+                    && registration.handle.same_actor_as(handle)
+            });
+            is_current.then(|| wallet.take()).flatten()
         };
         let Some(registration) = registration else {
             return;
         };
         Self::begin_wallet_retirement(&registration);
-        drop(registration_guard);
-        self.finish_wallet_retirement(cache_key, registration).await;
+        if let Err(err) = self.finish_wallet_retirement(cache_key, registration).await {
+            warn!(?err, cache_key = %cache_key, "wallet retirement cleanup failed");
+        }
     }
 
     fn begin_wallet_retirement(registration: &WalletRegistration) {
@@ -2714,43 +2781,65 @@ impl ChainService {
         registration.cancel.cancel();
     }
 
-    async fn finish_wallet_retirement(&self, cache_key: &str, registration: WalletRegistration) {
-        if self
+    async fn finish_wallet_retirement(
+        &self,
+        cache_key: &str,
+        registration: WalletRegistration,
+    ) -> Result<(), ChainError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let backfill_result = match self
             .backfill_tx
             .send(BackfillRequest::Remove {
                 cache_key: cache_key.to_string(),
                 actor_id: registration.handle.actor_id(),
+                response: response_tx,
             })
             .await
-            .is_err()
         {
-            warn!(cache_key = %cache_key, "failed to remove backfill cursor");
-        }
-        if let Err(err) = registration.worker.await {
-            warn!(?err, cache_key = %cache_key, "wallet worker failed during retirement");
+            Ok(()) => response_rx
+                .await
+                .map_err(|_| ChainError::WalletBackfillRetirementFailed),
+            Err(_) => Err(ChainError::WalletBackfillRetirementFailed),
+        };
+        let worker_result = registration
+            .worker
+            .await
+            .map_err(|_| ChainError::WalletWorkerRetirementFailed);
+        match (backfill_result, worker_result) {
+            (Err(backfill_err), _) => Err(backfill_err),
+            (Ok(()), Err(worker_err)) => Err(worker_err),
+            (Ok(()), Ok(())) => Ok(()),
         }
     }
 
     pub async fn unregister_all_wallets(&self) {
-        let registrations = self.wallets.write().await.drain().collect::<Vec<_>>();
-        for (_, registration) in &registrations {
-            Self::begin_wallet_retirement(registration);
-        }
-        for (cache_key, registration) in registrations {
-            self.finish_wallet_retirement(&cache_key, registration)
-                .await;
+        let _registration_guard = self.wallet_registration_gate.lock().await;
+        let registration = self.wallet.write().await.take();
+        if let Some(registration) = registration {
+            let cache_key = registration.cfg.cache_key.clone();
+            Self::begin_wallet_retirement(&registration);
+            if let Err(err) = self
+                .finish_wallet_retirement(cache_key.as_str(), registration)
+                .await
+            {
+                warn!(?err, cache_key = %cache_key, "wallet cleanup failed");
+            }
         }
     }
 
     pub async fn shutdown(&self) {
         self.begin_shutdown();
-        let registrations = self.wallets.write().await.drain().collect::<Vec<_>>();
-        for (_, registration) in &registrations {
-            Self::begin_wallet_shutdown(registration);
-        }
-        for (cache_key, registration) in registrations {
-            self.finish_wallet_retirement(&cache_key, registration)
-                .await;
+        let _registration_guard = self.wallet_registration_gate.lock().await;
+        let registration = self.wallet.write().await.take();
+        if let Some(registration) = registration {
+            let cache_key = registration.cfg.cache_key.clone();
+            Self::begin_wallet_shutdown(&registration);
+            if let Err(err) = self
+                .finish_wallet_retirement(cache_key.as_str(), registration)
+                .await
+            {
+                warn!(?err, cache_key = %cache_key, "wallet shutdown cleanup failed");
+            }
         }
         self.public_data_plane.shutdown().await;
         await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;

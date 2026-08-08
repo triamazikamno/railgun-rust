@@ -439,6 +439,21 @@ impl SyncManager {
         Ok(chain.register_wallet(cfg).await?)
     }
 
+    pub async fn replace_wallet(
+        &self,
+        cfg: WalletConfig,
+    ) -> Result<WalletHandle, SyncManagerError> {
+        let chain = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .chains
+            .get(&cfg.chain)
+            .cloned()
+            .ok_or(SyncManagerError::ChainNotFound)?;
+        Ok(chain.replace_wallet(cfg).await?)
+    }
+
     #[allow(clippy::unused_async)]
     pub async fn chain_handle(&self, chain: &ChainKey) -> Option<ChainHandle> {
         self.state

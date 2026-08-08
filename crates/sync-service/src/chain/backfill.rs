@@ -58,6 +58,11 @@ impl WalletTailFallbackState {
         self.last_indexed_tail_attempt_at = Some(now);
     }
 
+    #[cfg(test)]
+    pub(super) const fn indexed_tail_attempt_recorded_for_test(&self) -> bool {
+        self.last_indexed_tail_attempt_at.is_some()
+    }
+
     pub(super) fn should_try_indexed_tail_fallback(
         &self,
         block_time: Duration,
@@ -356,32 +361,45 @@ impl ChainService {
     }
 
     pub(super) async fn reset_wallets(&self, safe_head: u64, reset_from_block: u64) {
-        let wallets = self.wallets.read().await;
-        for (cache_key, registration) in wallets.iter() {
-            let from_block =
-                wallet_reorg_backfill_from_block(reset_from_block, registration.start_block);
-            let sync_target = wallet_sync_target(safe_head, registration.sync_to_block);
-            let replay_plan = WalletResetReplayPlan::new(
-                registration.start_block,
-                sync_target,
-                registration.sync_to_block.is_none(),
-            );
-            let reset_result = send_wallet_reset(
-                cache_key,
-                &registration.backfill_sender,
-                &registration.handle,
-                self.next_wallet_reset_intent(),
-                from_block,
-                replay_plan,
-                registration.handle.last_scanned_raw(),
-            )
-            .await;
-            if reset_result.reset_generation().is_none() {
-                debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
-                continue;
-            }
-            debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted for actor-owned replay");
+        let _registration_guard = self.wallet_registration_gate.lock().await;
+        let registration = {
+            let wallet = self.wallet.read().await;
+            wallet.as_ref().map(|registration| {
+                (
+                    registration.cfg.cache_key.clone(),
+                    registration.backfill_sender.clone(),
+                    registration.handle.clone(),
+                    registration.start_block,
+                    registration.sync_to_block,
+                    registration.handle.last_scanned_raw(),
+                )
+            })
+        };
+        let Some((cache_key, backfill_sender, handle, start_block, sync_to_block, last_scanned)) =
+            registration
+        else {
+            return;
+        };
+        let cache_key = cache_key.as_str();
+        let from_block = wallet_reorg_backfill_from_block(reset_from_block, start_block);
+        let sync_target = wallet_sync_target(safe_head, sync_to_block);
+        let replay_plan =
+            WalletResetReplayPlan::new(start_block, sync_target, sync_to_block.is_none());
+        let reset_result = send_wallet_reset(
+            cache_key,
+            &backfill_sender,
+            &handle,
+            self.next_wallet_reset_intent(),
+            from_block,
+            replay_plan,
+            last_scanned,
+        )
+        .await;
+        if reset_result.reset_generation().is_none() {
+            debug!(?reset_result, cache_key = %cache_key, "skipping rejected wallet reset");
+            return;
         }
+        debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted for actor-owned replay");
     }
 
     pub(super) async fn check_forest_reorg(

@@ -14,7 +14,10 @@ use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 use cid::Cid;
 use ed25519_dalek::SigningKey;
-use local_db::{BlobMeta, DbConfig, DbStore, WalletCacheKey, WalletMeta};
+use local_db::{
+    BlobMeta, DbConfig, DbStore, WalletCacheKey, WalletMeta, WalletPendingResetRecord,
+    WalletSyncActorStateRecord,
+};
 use merkletree::tree::MerkleForest;
 use multihash_codetable::{Code, MultihashDigest};
 use poi::cache::{PoiCache, PoiCacheIdentity};
@@ -42,8 +45,9 @@ use super::service::{
     wait_for_wallet_ready,
 };
 use super::workers::{
-    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
-    reconcile_retained_acquisition,
+    WalletBackfillSlot, drain_pending_backfill_requests, pending_tip_from_block,
+    pending_tip_provider_covers_target, reconcile_retained_acquisition,
+    wallet_lag_fallback_state_for_test,
 };
 use super::{
     ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
@@ -72,10 +76,11 @@ use crate::types::{
     IndexedArtifactManifestSource, IndexedArtifactSourceConfig, LogBatch,
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback, SyncProgressStage,
     SyncProgressUnit, WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
-    WalletBackfillGrant, WalletBackfillOwnerDisposition, WalletBackfillRejectReason,
-    WalletBackfillStartResult, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
-    WalletIndexedCatchUpSource, WalletObservation, WalletPendingOverlay, WalletReadiness,
-    WalletReadinessError, WalletScanApply, WalletScanRowsPayload, WalletSyncToken, WalletViewState,
+    WalletBackfillGrant, WalletBackfillOwnerDisposition, WalletBackfillOwnerSignal,
+    WalletBackfillRejectReason, WalletBackfillStartResult, WalletConfig, WalletCurrentSnapshot,
+    WalletInactiveReason, WalletIndexedCatchUpSource, WalletObservation, WalletPendingOverlay,
+    WalletReadiness, WalletReadinessError, WalletScanApply, WalletScanRowsPayload, WalletSyncToken,
+    WalletViewState,
 };
 use crate::types::{PublicDataPlaneEpoch, PublicScanReadScope};
 use crate::wallet::test_support::spawn_wallet_worker;
@@ -156,7 +161,67 @@ fn test_backfill_driver(
     reset_generation: u64,
     job_id: u64,
 ) -> WalletBackfillDriver {
-    WalletBackfillDriver::from_token(test_sync_token(reset_generation, job_id), sender)
+    test_backfill_driver_for_actor(sender, 1, reset_generation, job_id)
+}
+
+fn test_backfill_driver_for_actor(
+    sender: mpsc::Sender<BackfillEvent>,
+    actor_id: u64,
+    reset_generation: u64,
+    job_id: u64,
+) -> WalletBackfillDriver {
+    WalletBackfillDriver::from_token(
+        WalletSyncToken::for_test(1, actor_id, reset_generation, job_id),
+        sender,
+    )
+}
+
+fn test_backfill_driver_with_retirement_signal(
+    sender: mpsc::Sender<BackfillEvent>,
+    actor_id: u64,
+    reset_generation: u64,
+    job_id: u64,
+) -> (
+    WalletBackfillDriver,
+    oneshot::Receiver<WalletBackfillOwnerSignal>,
+) {
+    let (liveness, receiver) = oneshot::channel();
+    let grant = WalletBackfillGrant::for_actor_accepted_job(
+        WalletSyncToken::for_test(1, actor_id, reset_generation, job_id),
+        sender,
+        liveness,
+    );
+    (grant.activate(), receiver)
+}
+
+const SYNTHETIC_BACKFILL_JOB_ID: u64 = u64::MAX;
+
+async fn assert_test_backfill_actor_current(service: &Arc<ChainService>, handle: &WalletHandle) {
+    assert!(
+        service
+            .wallet
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|registration| registration.handle.same_actor_as(handle)),
+        "installed service actor must remain current before synthetic backfill"
+    );
+}
+
+async fn acknowledge_next_wallet_removal(rx: &mut mpsc::Receiver<BackfillRequest>) {
+    loop {
+        match rx.recv().await.expect("backfill receiver remains active") {
+            BackfillRequest::Add {
+                driver, cache_key, ..
+            } => {
+                driver.retire(&cache_key).await;
+            }
+            BackfillRequest::Remove { response, .. } => {
+                response.send(()).expect("acknowledge wallet removal");
+                return;
+            }
+        }
+    }
 }
 
 async fn send_wallet_scan_apply(
@@ -408,6 +473,229 @@ fn wallet_backfill_terminal_finish_results_remove_cursor() {
 }
 
 #[tokio::test]
+async fn restored_replay_is_published_before_startup_planner_can_supersede_it() {
+    let root_dir = temp_db_root("service-restored-replay-admission");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let chain = test_chain_config(
+        &scope,
+        Arc::new(QueryRpcPool::new(
+            vec![rpc_url.clone()],
+            Duration::from_secs(1),
+        )),
+        None,
+    );
+    let service = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let (service, mut backfill_rx) = service;
+    let mut cfg = test_wallet_config(&scope, rpc_url);
+    cfg.start_block = Some(100);
+    cfg.use_indexed_wallet_catch_up = false;
+    db.put_wallet_meta(
+        &cfg.cache_key,
+        &WalletMeta {
+            last_scanned_block: 79,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("seed post-rewind cursor");
+    db.put_wallet_sync_actor_state(&WalletSyncActorStateRecord {
+        chain_id: cfg.chain.chain_id,
+        wallet_id: cfg.cache_key.to_string(),
+        highest_accepted_reset_intent: 7,
+        pending_reset: Some(WalletPendingResetRecord {
+            intent_id: 7,
+            from_block: 80,
+            replay_start_block: 80,
+            replay_target_block: 99,
+            follow_safe_head: false,
+        }),
+        updated_at: 1,
+    })
+    .expect("seed restored replay");
+
+    let handle = service
+        .register_wallet(cfg.clone())
+        .await
+        .expect("register wallet");
+    let request = tokio::time::timeout(Duration::from_secs(1), backfill_rx.recv())
+        .await
+        .expect("restored replay Add arrives")
+        .expect("backfill channel remains open");
+    let BackfillRequest::Add {
+        from_block,
+        to_block,
+        driver,
+        cache_key,
+        ..
+    } = request
+    else {
+        panic!("restored replay must be the first backfill request");
+    };
+    assert_eq!((from_block, to_block), (80, 99));
+    assert_eq!(driver.token().actor_id(), handle.actor_id());
+    assert!(
+        service
+            .wallet
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|registration| registration.handle.same_actor_as(&handle))
+    );
+    assert_eq!(handle.readiness(), WalletReadiness::Syncing);
+
+    service.safe_head_tx.send_replace(120);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backfill_rx.recv())
+            .await
+            .is_err(),
+        "generic startup must wait for restored replay completion"
+    );
+    assert_eq!(handle.readiness(), WalletReadiness::Syncing);
+
+    driver.retire(&cache_key).await;
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let handle = handle.clone();
+        async move { service.unregister_wallet(&handle).await }
+    });
+    let remove = tokio::time::timeout(Duration::from_secs(1), backfill_rx.recv())
+        .await
+        .expect("wallet removal request arrives")
+        .expect("backfill channel remains open");
+    let BackfillRequest::Remove { response, .. } = remove else {
+        panic!("wallet cleanup must request removal");
+    };
+    response.send(()).expect("acknowledge wallet removal");
+    tokio::time::timeout(Duration::from_secs(1), unregistering)
+        .await
+        .expect("wallet unregister completes")
+        .expect("wallet unregister task joins");
+    service.cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn zero_head_backfill_loop_retires_and_replaces_target_zero_wallets() {
+    let root_dir = temp_db_root("zero-head-backfill-retirement");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let chain = test_chain_config(
+        &scope,
+        Arc::new(QueryRpcPool::new(
+            vec![rpc_url.clone()],
+            Duration::from_secs(1),
+        )),
+        None,
+    );
+    let (service, backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    spawn_backfill_loop(
+        Arc::clone(&service),
+        backfill_rx,
+        service.chain.rpcs.clone(),
+        None,
+        service.safe_head_tx.subscribe(),
+        service.cancel.clone(),
+    );
+
+    let old = install_test_backfill_actor(&service, &scope, rpc_url.clone(), "zero-head-old").await;
+    let (barrier_tx, barrier_rx) = oneshot::channel();
+    service
+        .backfill_tx
+        .send(BackfillRequest::Remove {
+            cache_key: old.cache_key.to_string(),
+            actor_id: old.actor_id().saturating_add(1),
+            response: barrier_tx,
+        })
+        .await
+        .expect("send zero-head parked-state probe");
+    tokio::time::timeout(Duration::from_secs(1), barrier_rx)
+        .await
+        .expect("zero-head loop acknowledges parked-state probe")
+        .expect("zero-head probe acknowledgement remains connected");
+    tokio::task::yield_now().await;
+
+    tokio::time::timeout(Duration::from_secs(1), service.unregister_wallet(&old))
+        .await
+        .expect("unregister completes while safe head remains zero");
+    assert!(service.wallet.read().await.is_none());
+
+    let middle =
+        install_test_backfill_actor(&service, &scope, rpc_url.clone(), "zero-head-middle").await;
+    let (middle_barrier_tx, middle_barrier_rx) = oneshot::channel();
+    service
+        .backfill_tx
+        .send(BackfillRequest::Remove {
+            cache_key: middle.cache_key.to_string(),
+            actor_id: middle.actor_id().saturating_add(1),
+            response: middle_barrier_tx,
+        })
+        .await
+        .expect("send second zero-head parked-state probe");
+    tokio::time::timeout(Duration::from_secs(1), middle_barrier_rx)
+        .await
+        .expect("second zero-head probe is acknowledged")
+        .expect("second zero-head probe acknowledgement remains connected");
+
+    let mut successor_cfg = test_wallet_config(&scope, rpc_url);
+    successor_cfg.cache_key = test_cache_key("zero-head-successor");
+    successor_cfg.sync_to_block = Some(0);
+    successor_cfg.use_indexed_wallet_catch_up = false;
+    let successor = tokio::time::timeout(
+        Duration::from_secs(1),
+        service.replace_wallet(successor_cfg),
+    )
+    .await
+    .expect("replace completes while safe head remains zero")
+    .expect("replace succeeds");
+    assert!(
+        service
+            .wallet_handle(successor.cache_key.as_str())
+            .await
+            .is_some_and(|handle| handle.same_actor_as(&successor))
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        service.unregister_wallet(&successor),
+    )
+    .await
+    .expect("successor unregister completes");
+    service.cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn concurrent_register_wallet_returns_single_actor_handle() {
     let root_dir = temp_db_root("concurrent-register-wallet");
     let db = Arc::new(
@@ -450,7 +738,21 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
     let (safe_head_tx, _safe_head_rx) = watch::channel(0);
     let (forest_last_tx, _forest_last_rx) = watch::channel(0);
     let (live_log_tx, _live_log_rx) = broadcast::channel(8);
-    let (backfill_tx, _backfill_rx) = mpsc::channel(8);
+    let (backfill_tx, mut backfill_rx) = mpsc::channel(8);
+    let backfill_task = tokio::spawn(async move {
+        while let Some(request) = backfill_rx.recv().await {
+            match request {
+                BackfillRequest::Add {
+                    driver, cache_key, ..
+                } => {
+                    driver.retire(&cache_key).await;
+                }
+                BackfillRequest::Remove { response, .. } => {
+                    let _ = response.send(());
+                }
+            }
+        }
+    });
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -466,8 +768,8 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         live_log_tx,
         backfill_tx,
         archive_provider: None,
-        wallets: RwLock::new(HashMap::new()),
-        wallet_registration_gates: Mutex::new(HashMap::new()),
+        wallet: RwLock::new(None),
+        wallet_registration_gate: Mutex::new(()),
         cancel: CancellationToken::new(),
         live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
@@ -483,14 +785,14 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
 
     let (first, second) = tokio::join!(
         service.register_wallet(cfg.clone()),
-        service.register_wallet(cfg),
+        service.register_wallet(cfg.clone()),
     );
     let first = first.expect("register first wallet");
     let second = second.expect("register second wallet");
 
     assert_eq!(first.actor_id(), second.actor_id());
     assert_eq!(first.actor_id(), 1);
-    assert_eq!(service.wallets.read().await.len(), 1);
+    assert!(service.wallet.read().await.is_some());
     assert_eq!(
         service
             .wallet_actor_next
@@ -517,7 +819,36 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         }
     ));
     drop(held_authority);
+    let mut distinct_a = cfg.clone();
+    distinct_a.cache_key = test_cache_key("distinct-a");
+    let mut distinct_b = cfg.clone();
+    distinct_b.cache_key = test_cache_key("distinct-b");
+    let (distinct_a, distinct_b) = tokio::join!(
+        service.register_wallet(distinct_a),
+        service.register_wallet(distinct_b),
+    );
+    assert_eq!(
+        [distinct_a.is_ok(), distinct_b.is_ok()]
+            .into_iter()
+            .filter(|registered| *registered)
+            .count(),
+        1
+    );
+    let distinct_conflicts = usize::from(matches!(
+        &distinct_a,
+        Err(ChainError::WalletAlreadyRegistered)
+    )) + usize::from(matches!(
+        &distinct_b,
+        Err(ChainError::WalletAlreadyRegistered)
+    ));
+    assert_eq!(distinct_conflicts, 1);
+    let distinct_handle = distinct_a.or(distinct_b).expect("one distinct wallet wins");
+    service.unregister_wallet(&distinct_handle).await;
     service.cancel.cancel();
+    drop(service);
+    backfill_task
+        .await
+        .expect("backfill acknowledgement task joins");
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -525,6 +856,139 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
 #[tokio::test]
 async fn unexpected_terminal_wallet_is_reaped_and_concurrent_retry_replaces_once() {
     let root_dir = temp_db_root("unexpected-terminal-wallet-replacement");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc_url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let mut cfg = test_wallet_config(&scope, rpc_url);
+    cfg.sync_to_block = Some(0);
+    cfg.use_indexed_wallet_catch_up = false;
+    let terminal = service
+        .register_wallet(cfg.clone())
+        .await
+        .expect("register terminal wallet");
+    let worker_cancel = service
+        .wallet
+        .read()
+        .await
+        .as_ref()
+        .expect("terminal wallet registration")
+        .cancel
+        .clone();
+
+    worker_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while terminal.readiness() != WalletReadiness::Shutdown {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unexpected worker termination published shutdown");
+    assert!(service.wallet_handle(&cfg.cache_key).await.is_none());
+
+    let mut displaced_cfg = cfg.clone();
+    displaced_cfg.cache_key = test_cache_key("terminal-displaced-by-b");
+    let registering_cfg = displaced_cfg.clone();
+    let registering = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.register_wallet(registering_cfg).await }
+    });
+    acknowledge_next_wallet_removal(&mut backfill_rx).await;
+    let displaced = registering
+        .await
+        .expect("wallet B registration task joins")
+        .expect("register wallet B after terminal wallet A");
+    assert!(
+        service
+            .wallet_handle(displaced_cfg.cache_key.as_str())
+            .await
+            .is_some_and(|handle| handle.same_actor_as(&displaced))
+    );
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let displaced = displaced.clone();
+        async move { service.unregister_wallet(&displaced).await }
+    });
+    acknowledge_next_wallet_removal(&mut backfill_rx).await;
+    unregistering.await.expect("wallet B unregister task joins");
+
+    let (first, second) = tokio::join!(
+        service.register_wallet(cfg.clone()),
+        service.register_wallet(cfg.clone()),
+    );
+    let first = first.expect("register first replacement");
+    let second = second.expect("register concurrent replacement");
+    assert_ne!(first.actor_id(), terminal.actor_id());
+    assert_eq!(first.actor_id(), second.actor_id());
+    assert_eq!(
+        service
+            .wallet_actor_next
+            .load(std::sync::atomic::Ordering::Acquire),
+        4,
+        "concurrent retry must create exactly one fresh actor"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let wallet = service.wallet.read().await;
+            if wallet
+                .as_ref()
+                .is_some_and(|registration| registration.handle.same_actor_as(&first))
+            {
+                break;
+            }
+            drop(wallet);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stale terminal reaper preserved the replacement");
+    assert!(
+        service
+            .wallet_handle(&cfg.cache_key)
+            .await
+            .is_some_and(|handle| handle.same_actor_as(&first))
+    );
+
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let first = first.clone();
+        async move { service.unregister_wallet(&first).await }
+    });
+    acknowledge_next_wallet_removal(&mut backfill_rx).await;
+    unregistering.await.expect("first actor cleanup joins");
+    service.cancel.cancel();
+    drop(terminal);
+    drop(first);
+    drop(second);
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn terminal_reaper_cleanup_failure_shuts_down_service_before_successor_install() {
+    let root_dir = temp_db_root("terminal-reaper-cleanup-failure");
     let db = Arc::new(
         DbStore::open(DbConfig {
             root_dir: root_dir.clone(),
@@ -548,22 +1012,21 @@ async fn unexpected_terminal_wallet_is_reaped_and_concurrent_retry_replaces_once
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ),
     );
-    let mut cfg = test_wallet_config(&scope, rpc_url);
-    cfg.sync_to_block = Some(0);
-    cfg.use_indexed_wallet_catch_up = false;
+    let mut terminal_cfg = test_wallet_config(&scope, rpc_url.clone());
+    terminal_cfg.sync_to_block = Some(0);
+    terminal_cfg.use_indexed_wallet_catch_up = false;
     let terminal = service
-        .register_wallet(cfg.clone())
+        .register_wallet(terminal_cfg.clone())
         .await
         .expect("register terminal wallet");
     let worker_cancel = service
-        .wallets
+        .wallet
         .read()
         .await
-        .get(terminal.cache_key.as_str())
-        .expect("terminal wallet registration")
+        .as_ref()
+        .expect("terminal registration")
         .cancel
         .clone();
-
     worker_cancel.cancel();
     tokio::time::timeout(Duration::from_secs(1), async {
         while terminal.readiness() != WalletReadiness::Shutdown {
@@ -571,54 +1034,613 @@ async fn unexpected_terminal_wallet_is_reaped_and_concurrent_retry_replaces_once
         }
     })
     .await
-    .expect("unexpected worker termination published shutdown");
-    assert!(service.wallet_handle(&cfg.cache_key).await.is_none());
-
-    let (first, second) = tokio::join!(
-        service.register_wallet(cfg.clone()),
-        service.register_wallet(cfg.clone()),
-    );
-    let first = first.expect("register first replacement");
-    let second = second.expect("register concurrent replacement");
-    assert_ne!(first.actor_id(), terminal.actor_id());
-    assert_eq!(first.actor_id(), second.actor_id());
-    assert_eq!(
-        service
-            .wallet_actor_next
-            .load(std::sync::atomic::Ordering::Acquire),
-        3,
-        "concurrent retry must create exactly one fresh actor"
-    );
-
+    .expect("terminal worker reaches shutdown");
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let wallets = service.wallets.read().await;
-            if wallets.len() == 1
-                && wallets
-                    .get(first.cache_key.as_str())
-                    .is_some_and(|registration| registration.handle.same_actor_as(&first))
-            {
+            if service.wallet.read().await.is_none() {
                 break;
             }
-            drop(wallets);
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("stale terminal reaper preserved the replacement");
+    .expect("terminal reaper takes the registration before successor retry");
+
+    let mut successor_cfg = terminal_cfg;
+    successor_cfg.cache_key = test_cache_key("reaper-failure-successor");
+    let registering = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.register_wallet(successor_cfg).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !service.cancel.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal reaper failure shuts down service");
+    let result = tokio::time::timeout(Duration::from_secs(1), registering)
+        .await
+        .expect("successor registration resolves")
+        .expect("successor registration task joins");
+    assert!(matches!(result, Err(ChainError::Shutdown)));
+    assert!(service.wallet.read().await.is_none());
+    drop(terminal);
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn replace_wallet_waits_for_old_worker_and_fences_stale_removal() {
+    let root_dir = temp_db_root("replace-wallet-ordering");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc_url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let mut old_cfg = test_wallet_config(&scope, rpc_url.clone());
+    old_cfg.sync_to_block = Some(0);
+    old_cfg.use_indexed_wallet_catch_up = false;
+    let old_handle = service
+        .register_wallet(old_cfg)
+        .await
+        .expect("register old wallet");
+    old_handle.publish_readiness_for_test(&WalletReadiness::Ready);
+
+    let (worker_finished_tx, worker_finished_rx) = oneshot::channel();
+    let (release_worker_tx, release_worker_rx) = oneshot::channel();
+    {
+        let mut wallet = service.wallet.write().await;
+        let registration = wallet.as_mut().expect("old registration");
+        let old_worker = std::mem::replace(&mut registration.worker, tokio::spawn(async {}));
+        registration.worker = tokio::spawn(async move {
+            old_worker.await.expect("old worker completed");
+            let _ = worker_finished_tx.send(());
+            let _ = release_worker_rx.await;
+        });
+    }
+
+    let mut successor_cfg = test_wallet_config(&scope, rpc_url);
+    successor_cfg.cache_key = test_cache_key("replacement-successor");
+    successor_cfg.sync_to_block = Some(0);
+    successor_cfg.use_indexed_wallet_catch_up = false;
+    let replacing = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.replace_wallet(successor_cfg).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while old_handle.readiness() != WalletReadiness::Shutdown {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement retires old actor");
+    tokio::time::timeout(Duration::from_secs(1), worker_finished_rx)
+        .await
+        .expect("old worker reaches controlled cleanup blocker")
+        .expect("controlled cleanup notification is sent");
+    let remove_response = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match backfill_rx
+                .recv()
+                .await
+                .expect("backfill loop remains active")
+            {
+                BackfillRequest::Add {
+                    driver, cache_key, ..
+                } => {
+                    driver.retire(&cache_key).await;
+                }
+                BackfillRequest::Remove { response, .. } => break response,
+            }
+        }
+    })
+    .await
+    .expect("replacement sends backfill removal");
+    for _ in 0..8 {
+        assert!(service.wallet.read().await.is_none());
+        assert!(!replacing.is_finished());
+        tokio::task::yield_now().await;
+    }
+
+    release_worker_tx.send(()).expect("release old worker");
+    remove_response
+        .send(())
+        .expect("acknowledge retired backfill cursor");
+    let successor = tokio::time::timeout(Duration::from_secs(1), replacing)
+        .await
+        .expect("replacement completes after worker cleanup")
+        .expect("replacement task joins")
+        .expect("replacement succeeds");
     assert!(
         service
-            .wallet_handle(&cfg.cache_key)
+            .wallet_handle(successor.cache_key.as_str())
             .await
-            .is_some_and(|handle| handle.same_actor_as(&first))
+            .is_some_and(|handle| handle.same_actor_as(&successor))
     );
 
-    service.unregister_wallet(&first).await;
+    service.unregister_wallet(&old_handle).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        service
+            .wallet_handle(successor.cache_key.as_str())
+            .await
+            .is_some_and(|handle| handle.same_actor_as(&successor))
+    );
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let successor = successor.clone();
+        async move { service.unregister_wallet(&successor).await }
+    });
+    loop {
+        match backfill_rx
+            .recv()
+            .await
+            .expect("backfill loop remains active")
+        {
+            BackfillRequest::Add {
+                driver, cache_key, ..
+            } => {
+                driver.retire(&cache_key).await;
+            }
+            BackfillRequest::Remove { response, .. } => {
+                response.send(()).expect("acknowledge successor removal");
+                break;
+            }
+        }
+    }
+    unregistering.await.expect("successor cleanup joins");
     service.cancel.cancel();
-    drop(terminal);
-    drop(first);
-    drop(second);
-    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn replace_wallet_owned_operation_survives_caller_abort() {
+    let root_dir = temp_db_root("replace-wallet-backfill-ack");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc_url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let mut old_cfg = test_wallet_config(&scope, rpc_url.clone());
+    old_cfg.sync_to_block = Some(0);
+    old_cfg.use_indexed_wallet_catch_up = false;
+    let old_handle = service
+        .register_wallet(old_cfg)
+        .await
+        .expect("register old wallet");
+    old_handle.publish_readiness_for_test(&WalletReadiness::Ready);
+
+    let mut successor_cfg = test_wallet_config(&scope, rpc_url);
+    successor_cfg.cache_key = test_cache_key("ack-successor");
+    successor_cfg.sync_to_block = Some(0);
+    successor_cfg.use_indexed_wallet_catch_up = false;
+    let successor_cache_key = successor_cfg.cache_key.clone();
+    let replacing = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.replace_wallet(successor_cfg).await }
+    });
+
+    let response = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match backfill_rx
+                .recv()
+                .await
+                .expect("backfill loop remains active")
+            {
+                BackfillRequest::Add {
+                    driver, cache_key, ..
+                } => {
+                    driver.retire(&cache_key).await;
+                }
+                BackfillRequest::Remove { response, .. } => break response,
+            }
+        }
+    })
+    .await
+    .expect("replacement sends backfill removal");
+    assert!(
+        !replacing.is_finished(),
+        "replacement must await removal ack"
+    );
+    assert!(service.wallet.read().await.is_none());
+    replacing.abort();
+    response
+        .send(())
+        .expect("send backfill removal acknowledgement");
+    let successor = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(handle) = service.wallet_handle(&successor_cache_key).await {
+                break handle;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned replacement completes after caller abort");
+    assert!(
+        service
+            .wallet_handle(successor.cache_key.as_str())
+            .await
+            .is_some_and(|handle| handle.same_actor_as(&successor))
+    );
+    service.unregister_wallet(&old_handle).await;
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let successor = successor.clone();
+        async move { service.unregister_wallet(&successor).await }
+    });
+    loop {
+        match backfill_rx
+            .recv()
+            .await
+            .expect("backfill loop remains active")
+        {
+            BackfillRequest::Add {
+                driver, cache_key, ..
+            } => {
+                driver.retire(&cache_key).await;
+            }
+            BackfillRequest::Remove { response, .. } => {
+                response.send(()).expect("acknowledge successor removal");
+                break;
+            }
+        }
+    }
+    unregistering.await.expect("successor cleanup joins");
+    service.cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn replace_wallet_leaves_slot_empty_when_old_worker_cleanup_panics() {
+    let root_dir = temp_db_root("replace-wallet-worker-panic");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc_url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let mut old_cfg = test_wallet_config(&scope, rpc_url.clone());
+    old_cfg.sync_to_block = Some(0);
+    old_cfg.use_indexed_wallet_catch_up = false;
+    let old_handle = service
+        .register_wallet(old_cfg)
+        .await
+        .expect("register old wallet");
+    old_handle.publish_readiness_for_test(&WalletReadiness::Ready);
+    {
+        let mut wallet = service.wallet.write().await;
+        let registration = wallet.as_mut().expect("old registration");
+        let original = std::mem::replace(&mut registration.worker, tokio::spawn(async {}));
+        registration.worker = tokio::spawn(async move {
+            let _ = original.await;
+            panic!("intentional retirement worker panic");
+        });
+    }
+
+    let mut successor_cfg = test_wallet_config(&scope, rpc_url);
+    successor_cfg.cache_key = test_cache_key("panic-successor");
+    successor_cfg.sync_to_block = Some(0);
+    successor_cfg.use_indexed_wallet_catch_up = false;
+    let replacing = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.replace_wallet(successor_cfg).await }
+    });
+    let response = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match backfill_rx
+                .recv()
+                .await
+                .expect("backfill loop remains active")
+            {
+                BackfillRequest::Add {
+                    driver, cache_key, ..
+                } => {
+                    driver.retire(&cache_key).await;
+                }
+                BackfillRequest::Remove { response, .. } => break response,
+            }
+        }
+    })
+    .await
+    .expect("replacement sends backfill removal");
+    response
+        .send(())
+        .expect("send backfill removal acknowledgement");
+    let error = tokio::time::timeout(Duration::from_secs(1), replacing)
+        .await
+        .expect("replacement completes after cleanup failure")
+        .expect("replacement task joins")
+        .expect_err("worker panic must reject replacement");
+    assert!(matches!(error, ChainError::WalletWorkerRetirementFailed));
+    assert!(service.wallet.read().await.is_none());
+    assert!(
+        service
+            .wallet_handle(old_handle.cache_key.as_str())
+            .await
+            .is_none()
+    );
+    service.cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn reset_wallets_serializes_replacement_until_actor_authority_is_released() {
+    let root_dir = temp_db_root("reset-wallet-replacement-ordering");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc_url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let mut old_cfg = test_wallet_config(&scope, rpc_url.clone());
+    old_cfg.sync_to_block = Some(0);
+    old_cfg.use_indexed_wallet_catch_up = false;
+    let old_handle = service
+        .register_wallet(old_cfg)
+        .await
+        .expect("register old wallet");
+    old_handle.publish_readiness_for_test(&WalletReadiness::Ready);
+    let authority = old_handle.hold_actor_authority_for_test().await;
+    let resetting = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.reset_wallets(0, 0).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if service.wallet_registration_gate.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reset owns registration gate");
+
+    let mut successor_cfg = test_wallet_config(&scope, rpc_url);
+    successor_cfg.cache_key = test_cache_key("reset-successor");
+    successor_cfg.sync_to_block = Some(0);
+    successor_cfg.use_indexed_wallet_catch_up = false;
+    let replacing = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.replace_wallet(successor_cfg).await }
+    });
+    for _ in 0..8 {
+        assert!(!resetting.is_finished());
+        assert!(!replacing.is_finished());
+        assert!(service.wallet.read().await.is_some());
+        tokio::task::yield_now().await;
+    }
+    drop(authority);
+    tokio::time::timeout(Duration::from_secs(1), resetting)
+        .await
+        .expect("reset completes after authority release")
+        .expect("reset task joins");
+
+    let response = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match backfill_rx
+                .recv()
+                .await
+                .expect("backfill loop remains active")
+            {
+                BackfillRequest::Add {
+                    driver, cache_key, ..
+                } => {
+                    driver.retire(&cache_key).await;
+                }
+                BackfillRequest::Remove { response, .. } => break response,
+            }
+        }
+    })
+    .await
+    .expect("replacement sends backfill removal");
+    response
+        .send(())
+        .expect("send backfill removal acknowledgement");
+    let successor = tokio::time::timeout(Duration::from_secs(1), replacing)
+        .await
+        .expect("replacement completes after reset")
+        .expect("replacement task joins")
+        .expect("replacement succeeds");
+    assert!(
+        service
+            .wallet_handle(successor.cache_key.as_str())
+            .await
+            .is_some_and(|handle| handle.same_actor_as(&successor))
+    );
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let successor = successor.clone();
+        async move { service.unregister_wallet(&successor).await }
+    });
+    loop {
+        match backfill_rx
+            .recv()
+            .await
+            .expect("backfill loop remains active")
+        {
+            BackfillRequest::Add {
+                driver, cache_key, ..
+            } => {
+                driver.retire(&cache_key).await;
+            }
+            BackfillRequest::Remove { response, .. } => {
+                response.send(()).expect("acknowledge successor removal");
+                break;
+            }
+        }
+    }
+    unregistering.await.expect("successor cleanup joins");
+    service.cancel.cancel();
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn wallet_lag_fallback_resets_timing_for_same_key_reincarnation() {
+    let root_dir = temp_db_root("wallet-lag-reincarnation");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc_url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
+        test_proxy_poi_policy(),
+    );
+    let mut cfg = test_wallet_config(&scope, rpc_url);
+    cfg.use_indexed_wallet_catch_up = true;
+    cfg.sync_to_block = Some(1_000);
+    let first = service
+        .register_wallet(cfg.clone())
+        .await
+        .expect("register first actor");
+    first.publish_readiness_for_test(&WalletReadiness::Ready);
+    let mut state = None;
+    let now = std::time::Instant::now();
+    let first_state = wallet_lag_fallback_state_for_test(&service, &mut state, 1_000, now)
+        .await
+        .expect("first lag state");
+    assert_eq!(first_state.0, first.actor_id());
+    assert!(!first_state.1);
+    let first_attempt = wallet_lag_fallback_state_for_test(
+        &service,
+        &mut state,
+        1_000,
+        now + Duration::from_secs(20),
+    )
+    .await
+    .expect("first lag attempt state");
+    assert_eq!(first_attempt.0, first.actor_id());
+    assert!(first_attempt.1);
+
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let first = first.clone();
+        async move { service.unregister_wallet(&first).await }
+    });
+    acknowledge_next_wallet_removal(&mut backfill_rx).await;
+    unregistering.await.expect("first actor cleanup joins");
+    let second = service
+        .register_wallet(cfg)
+        .await
+        .expect("register reincarnated actor");
+    second.publish_readiness_for_test(&WalletReadiness::Ready);
+    let second_state = wallet_lag_fallback_state_for_test(
+        &service,
+        &mut state,
+        1_000,
+        now + Duration::from_secs(21),
+    )
+    .await
+    .expect("reincarnated lag state");
+    assert_eq!(second_state.0, second.actor_id());
+    assert!(!second_state.1);
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let second = second.clone();
+        async move { service.unregister_wallet(&second).await }
+    });
+    acknowledge_next_wallet_removal(&mut backfill_rx).await;
+    unregistering.await.expect("second actor cleanup joins");
+    service.cancel.cancel();
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -692,7 +1714,7 @@ async fn manager_resets_persisted_cache_once_and_every_registered_public_data_pl
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-        assert!(service.wallets.read().await.is_empty());
+        assert!(service.wallet.read().await.is_none());
         manager.insert_chain_for_test(key, Arc::clone(&service));
         registered.push((key, service));
     }
@@ -740,7 +1762,7 @@ async fn manager_resets_persisted_cache_once_and_every_registered_public_data_pl
             service.public_data_plane().diagnostics().await.epoch,
             PublicDataPlaneEpoch::new(1),
         );
-        assert!(service.wallets.read().await.is_empty());
+        assert!(service.wallet.read().await.is_none());
     }
 
     manager.shutdown().await;
@@ -988,7 +2010,7 @@ async fn shutdown_terminalizes_readiness_and_awaits_owned_worker_panic() {
     );
     let scope = test_scope();
     let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
-    let service = test_chain_service(
+    let (service, mut backfill_rx) = test_chain_service_with_backfill(
         Arc::clone(&db),
         test_chain_config(
             &scope,
@@ -1002,6 +2024,7 @@ async fn shutdown_terminalizes_readiness_and_awaits_owned_worker_panic() {
             Arc::clone(&db),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ),
+        test_proxy_poi_policy(),
     );
     let mut cfg = test_wallet_config(&scope, rpc_url);
     cfg.sync_to_block = Some(0);
@@ -1015,10 +2038,8 @@ async fn shutdown_terminalizes_readiness_and_awaits_owned_worker_panic() {
     let (owned_worker_completed_tx, owned_worker_completed_rx) = oneshot::channel();
     let (release_owned_worker_tx, release_owned_worker_rx) = oneshot::channel();
     {
-        let mut wallets = service.wallets.write().await;
-        let registration = wallets
-            .get_mut(handle.cache_key.as_str())
-            .expect("wallet registration");
+        let mut wallet = service.wallet.write().await;
+        let registration = wallet.as_mut().expect("wallet registration");
         let owned_worker = std::mem::replace(&mut registration.worker, tokio::spawn(async {}));
         registration.worker = tokio::spawn(async move {
             owned_worker.await.expect("owned wallet worker completed");
@@ -1053,6 +2074,7 @@ async fn shutdown_terminalizes_readiness_and_awaits_owned_worker_panic() {
         .await
         .expect("shutdown cancelled and awaited the wallet worker despite authority contention")
         .expect("owned worker reached retirement barrier");
+    acknowledge_next_wallet_removal(&mut backfill_rx).await;
     assert!(
         !shutdown.is_finished(),
         "shutdown must await its owned worker"
@@ -2601,10 +3623,9 @@ async fn active_backfill_drains_reset_replacement_request() {
     let (request_tx, mut request_rx) = mpsc::channel(4);
     let (old_sender, old_receiver) = mpsc::channel(1);
     let (new_sender, _new_receiver) = mpsc::channel(1);
-    let mut cursors = HashMap::new();
-    cursors.insert(
-        "test".to_string(),
-        WalletBackfill::new(
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: "test".to_string(),
+        cursor: WalletBackfill::new(
             100,
             1_000,
             true,
@@ -2613,7 +3634,7 @@ async fn active_backfill_drains_reset_replacement_request() {
             test_backfill_driver(old_sender, 0, 1),
             std::time::Instant::now(),
         ),
-    );
+    });
 
     request_tx
         .try_send(BackfillRequest::Add {
@@ -2627,9 +3648,9 @@ async fn active_backfill_drains_reset_replacement_request() {
         })
         .expect("queue reset replacement backfill");
 
-    drain_pending_backfill_requests(&mut request_rx, &mut cursors).await;
+    drain_pending_backfill_requests(&mut request_rx, &mut cursor, Some(("test", 1))).await;
 
-    let cursor = cursors.get("test").expect("cursor retained");
+    let cursor = &cursor.expect("cursor retained").cursor;
     assert_eq!(cursor.from_block, 80);
     assert_eq!(cursor.target_block, 150);
     assert!(cursor.follow_safe_head);
@@ -2643,9 +3664,10 @@ async fn stale_actor_backfill_remove_cannot_remove_replacement_cursor() {
     let (request_tx, mut request_rx) = mpsc::channel(1);
     let (event_tx, _event_rx) = mpsc::channel(1);
     let replacement_token = WalletSyncToken::for_test(1, 2, 0, 1);
-    let mut cursors = HashMap::from([(
-        "test".to_string(),
-        WalletBackfill::new(
+    let (remove_response, remove_ack) = oneshot::channel();
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: "test".to_string(),
+        cursor: WalletBackfill::new(
             100,
             120,
             false,
@@ -2654,20 +3676,23 @@ async fn stale_actor_backfill_remove_cannot_remove_replacement_cursor() {
             WalletBackfillDriver::from_token(replacement_token, event_tx),
             std::time::Instant::now(),
         ),
-    )]);
+    });
     request_tx
         .try_send(BackfillRequest::Remove {
             cache_key: "test".to_string(),
             actor_id: 1,
+            response: remove_response,
         })
         .expect("queue stale actor removal");
 
-    drain_pending_backfill_requests(&mut request_rx, &mut cursors).await;
+    drain_pending_backfill_requests(&mut request_rx, &mut cursor, None).await;
+    remove_ack.await.expect("stale removal acknowledged");
 
     assert_eq!(
-        cursors
-            .get("test")
+        cursor
+            .as_ref()
             .expect("replacement cursor remains")
+            .cursor
             .driver
             .token(),
         replacement_token,
@@ -2679,10 +3704,9 @@ async fn active_backfill_ignores_stale_replacement_request() {
     let (request_tx, mut request_rx) = mpsc::channel(4);
     let (active_sender, active_receiver) = mpsc::channel(1);
     let (stale_sender, stale_receiver) = mpsc::channel(1);
-    let mut cursors = HashMap::new();
-    cursors.insert(
-        "test".to_string(),
-        WalletBackfill::new(
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: "test".to_string(),
+        cursor: WalletBackfill::new(
             100,
             1_000,
             true,
@@ -2691,11 +3715,11 @@ async fn active_backfill_ignores_stale_replacement_request() {
             test_backfill_driver(active_sender, 1, 2),
             std::time::Instant::now(),
         ),
-    );
+    });
 
     request_tx
         .try_send(BackfillRequest::Add {
-            cache_key: "test".to_string(),
+            cache_key: "other-wallet".to_string(),
             from_block: 80,
             to_block: 150,
             follow_safe_head: true,
@@ -2705,15 +3729,145 @@ async fn active_backfill_ignores_stale_replacement_request() {
         })
         .expect("queue stale replacement backfill");
 
-    drain_pending_backfill_requests(&mut request_rx, &mut cursors).await;
+    drain_pending_backfill_requests(&mut request_rx, &mut cursor, Some(("test", 1))).await;
 
-    let cursor = cursors.get("test").expect("active cursor retained");
+    let cursor = &cursor.expect("active cursor retained").cursor;
     assert_eq!(cursor.from_block, 100);
     assert_eq!(cursor.target_block, 1_000);
     assert_eq!(cursor.driver.token().reset_generation(), 1);
     assert_eq!(cursor.driver.token().job_id(), 2);
     assert!(stale_receiver.is_empty());
     assert!(active_receiver.is_empty());
+}
+
+#[tokio::test]
+async fn active_backfill_ignores_same_key_stale_token_request() {
+    let (request_tx, mut request_rx) = mpsc::channel(2);
+    let (active_sender, _active_receiver) = mpsc::channel(1);
+    let (stale_sender, _stale_receiver) = mpsc::channel(1);
+    let (stale_driver, stale_retirement) =
+        test_backfill_driver_with_retirement_signal(stale_sender, 1, 0, 1);
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: "test".to_string(),
+        cursor: WalletBackfill::new(
+            100,
+            1_000,
+            true,
+            100,
+            None,
+            test_backfill_driver_for_actor(active_sender, 1, 0, 2),
+            std::time::Instant::now(),
+        ),
+    });
+    request_tx
+        .try_send(BackfillRequest::Add {
+            cache_key: "test".to_string(),
+            from_block: 80,
+            to_block: 150,
+            follow_safe_head: true,
+            progress_start_block: 80,
+            acquisition_range: None,
+            driver: stale_driver,
+        })
+        .expect("queue same-key stale request");
+
+    let draining = tokio::spawn(async move {
+        drain_pending_backfill_requests(&mut request_rx, &mut cursor, Some(("test", 1))).await;
+        cursor
+    });
+    let signal = tokio::time::timeout(Duration::from_secs(1), stale_retirement)
+        .await
+        .expect("same-key stale driver retirement is signalled")
+        .expect("same-key stale driver retirement signal arrives");
+    assert_eq!(
+        signal.disposition,
+        WalletBackfillOwnerDisposition::BenignRetirement
+    );
+    if let Some(acknowledgement) = signal.acknowledgement {
+        acknowledgement
+            .send(())
+            .expect("acknowledge same-key stale driver retirement");
+    }
+    let cursor = draining.await.expect("backfill admission task joins");
+    let cursor = &cursor.expect("active cursor retained").cursor;
+    assert_eq!(cursor.from_block, 100);
+    assert_eq!(cursor.target_block, 1_000);
+    assert_eq!(cursor.driver.token().job_id(), 2);
+}
+
+#[tokio::test]
+async fn old_backfill_add_after_remove_cannot_replace_successor() {
+    let (request_tx, mut request_rx) = mpsc::channel(4);
+    let (old_sender, _old_receiver) = mpsc::channel(1);
+    let (stale_sender, _stale_receiver) = mpsc::channel(1);
+    let (successor_sender, _successor_receiver) = mpsc::channel(1);
+    let (stale_driver, stale_retirement) =
+        test_backfill_driver_with_retirement_signal(stale_sender, 1, 1, 2);
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: "test".to_string(),
+        cursor: WalletBackfill::new(
+            100,
+            120,
+            false,
+            100,
+            None,
+            test_backfill_driver_for_actor(old_sender, 1, 1, 1),
+            std::time::Instant::now(),
+        ),
+    });
+    request_tx
+        .try_send(BackfillRequest::Remove {
+            cache_key: "test".to_string(),
+            actor_id: 1,
+            response: oneshot::channel().0,
+        })
+        .expect("queue old removal");
+    request_tx
+        .try_send(BackfillRequest::Add {
+            cache_key: "test".to_string(),
+            from_block: 200,
+            to_block: 220,
+            follow_safe_head: false,
+            progress_start_block: 200,
+            acquisition_range: None,
+            driver: test_backfill_driver_for_actor(successor_sender, 2, 1, 3),
+        })
+        .expect("queue successor add");
+    request_tx
+        .try_send(BackfillRequest::Add {
+            cache_key: "test".to_string(),
+            from_block: 150,
+            to_block: 170,
+            follow_safe_head: false,
+            progress_start_block: 150,
+            acquisition_range: None,
+            driver: stale_driver,
+        })
+        .expect("queue stale old add");
+
+    let draining = tokio::spawn(async move {
+        drain_pending_backfill_requests(&mut request_rx, &mut cursor, Some(("test", 2))).await;
+        cursor
+    });
+    let signal = tokio::time::timeout(Duration::from_secs(1), stale_retirement)
+        .await
+        .expect("stale old driver retirement is signalled")
+        .expect("stale old driver retirement signal arrives");
+    assert_eq!(
+        signal.disposition,
+        WalletBackfillOwnerDisposition::BenignRetirement
+    );
+    if let Some(acknowledgement) = signal.acknowledgement {
+        acknowledgement
+            .send(())
+            .expect("acknowledge stale old driver retirement");
+    }
+    let cursor = draining.await.expect("backfill admission task joins");
+
+    let cursor = &cursor.expect("successor cursor installed").cursor;
+    assert_eq!(cursor.from_block, 200);
+    assert_eq!(cursor.target_block, 220);
+    assert_eq!(cursor.driver.token().actor_id(), 2);
 }
 
 #[test]
@@ -3198,223 +4352,102 @@ async fn wallet_send_helpers_reject_when_worker_channel_closed() {
 }
 
 #[tokio::test]
-async fn wallet_backfill_loop_does_not_commit_later_wallet_past_target() {
-    let root_dir = temp_db_root("wallet-backfill-target-bound");
+async fn backfill_slot_rejects_different_wallet_without_changing_active_target() {
+    let root_dir = temp_db_root("backfill-slot-different-wallet");
     let db = Arc::new(
         DbStore::open(DbConfig {
             root_dir: root_dir.clone(),
         })
         .expect("open db"),
     );
-    let scope = ChainScope {
-        chain_type: ChainType::Evm,
-        chain_id: 1,
-        railgun_contract: Address::from([0xcc; 20]),
-    };
-    let rpc = JsonRpcServer::spawn(vec![
-        serde_json::json!([]),
-        rpc_block(199, 1_700_000_199, 0x11),
-    ]);
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![rpc.url.clone()],
-        Duration::from_secs(1),
-    ));
-    let chain = ChainConfig {
-        chain_id: scope.chain_id,
-        contract: scope.railgun_contract,
-        rpcs: Arc::clone(&rpcs),
-        archive_rpc_url: None,
-        archive_until_block: 0,
-        deployment_block: 0,
-        v2_start_block: 0,
-        legacy_shield_block: 0,
-        block_range: 100,
-        indexed_wallet_block_range: 100,
-        block_time: Duration::from_secs(12),
-        poll_interval: Duration::from_millis(1),
-        finality_depth: 0,
-        quick_sync_endpoint: None,
-        indexed_artifact_source: None,
-        anchor_interval: 1000,
-        anchor_retention: 5,
-        http_client: None,
-        progress_tx: None,
-    };
-    let (head_tx, _head_rx) = watch::channel(0);
-    let (safe_head_tx, safe_head_rx) = watch::channel(199);
-    let (forest_last_tx, _forest_last_rx) = watch::channel(0);
-    let (live_log_tx, wallet_a_live_rx) = broadcast::channel(8);
-    let wallet_b_live_rx = live_log_tx.subscribe();
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(8);
-    let loop_cancel = CancellationToken::new();
-    let worker_cancel = CancellationToken::new();
-    let public_data_plane = ChainPublicDataPlane::new(
+    let scope = test_scope();
+    let rpc = JsonRpcServer::spawn(Vec::new());
+    let service = test_chain_service(
         Arc::clone(&db),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        test_chain_config(
+            &scope,
+            Arc::new(QueryRpcPool::new(
+                vec![rpc.url.clone()],
+                Duration::from_secs(1),
+            )),
+            None,
+        ),
+        ChainPublicDataPlane::new(
+            Arc::clone(&db),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
     );
-    let service = Arc::new(ChainService {
-        chain: chain.clone(),
-        poi_policy: test_proxy_poi_policy(),
-        db: Arc::clone(&db),
-        forest: Arc::new(RwLock::new(MerkleForest::new())),
-        head_tx,
-        safe_head_tx,
-        forest_last_tx,
-        live_log_tx,
-        backfill_tx: backfill_request_tx.clone(),
-        archive_provider: None,
-        wallets: RwLock::new(HashMap::new()),
-        wallet_registration_gates: Mutex::new(HashMap::new()),
-        cancel: loop_cancel.clone(),
-        live_log_task: std::sync::Mutex::new(None),
-        anchor_last: std::sync::atomic::AtomicU64::new(0),
-        txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
-        wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
-        wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
-        public_data_plane: public_data_plane.clone(),
+    let active = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "wallet-a").await;
+    let active_cache_key = active.cache_key.as_str().to_string();
+    let active_actor_id = active.actor_id();
+    let (active_sender, _active_receiver) = mpsc::channel(1);
+    let (other_sender, _other_receiver) = mpsc::channel(1);
+    let (other_driver, other_retirement) =
+        test_backfill_driver_with_retirement_signal(other_sender, 2, 0, SYNTHETIC_BACKFILL_JOB_ID);
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: active_cache_key.clone(),
+        cursor: WalletBackfill::new(
+            100,
+            199,
+            false,
+            100,
+            None,
+            test_backfill_driver_for_actor(
+                active_sender,
+                active_actor_id,
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
+            std::time::Instant::now(),
+        ),
     });
-    let (wallet_a_tx, wallet_a_rx) = mpsc::channel(8);
-    let (wallet_b_tx, wallet_b_rx) = mpsc::channel(8);
-    let mut wallet_a_cfg = test_wallet_config(&scope, rpc.url.clone());
-    wallet_a_cfg.cache_key = test_cache_key("wallet-a");
-    wallet_a_cfg.sync_to_block = Some(199);
-    wallet_a_cfg.quick_sync_endpoint = None;
-    wallet_a_cfg.use_indexed_wallet_catch_up = false;
-    let mut wallet_b_cfg = test_wallet_config(&scope, rpc.url.clone());
-    let wallet_b_cache_key = test_cache_key("wallet-b");
-    wallet_b_cfg.cache_key = wallet_b_cache_key.clone();
-    wallet_b_cfg.sync_to_block = Some(130);
-    wallet_b_cfg.quick_sync_endpoint = None;
-    wallet_b_cfg.use_indexed_wallet_catch_up = false;
-
-    let wallet_a = spawn_wallet_worker(
-        WalletWorkerServices {
-            db: Arc::clone(&db),
-            http_client: None,
-            indexed_artifact_source: None,
-            poi_runtime: test_wallet_poi_runtime(),
-            forest: Arc::new(RwLock::new(MerkleForest::new())),
-            backfill_tx: backfill_request_tx.clone(),
-            backfill_sender: wallet_a_tx.clone(),
-            public_data_plane: public_data_plane.clone(),
-        },
-        wallet_a_cfg,
-        1,
-        wallet_a_live_rx,
-        wallet_a_rx,
-        worker_cancel.clone(),
-        Vec::new(),
-        99,
-    )
-    .await
-    .expect("spawn wallet a");
-    let wallet_b = spawn_wallet_worker(
-        WalletWorkerServices {
-            db: Arc::clone(&db),
-            http_client: None,
-            indexed_artifact_source: None,
-            poi_runtime: test_wallet_poi_runtime(),
-            forest: Arc::new(RwLock::new(MerkleForest::new())),
-            backfill_tx: backfill_request_tx.clone(),
-            backfill_sender: wallet_b_tx.clone(),
-            public_data_plane: public_data_plane.clone(),
-        },
-        wallet_b_cfg,
-        2,
-        wallet_b_live_rx,
-        wallet_b_rx,
-        worker_cancel.clone(),
-        Vec::new(),
-        119,
-    )
-    .await
-    .expect("spawn wallet b");
-    spawn_backfill_loop(
-        Arc::clone(&service),
-        backfill_request_rx,
-        Arc::clone(&rpcs),
-        None,
-        safe_head_rx,
-        loop_cancel.clone(),
-    );
-    let wallet_a_token = wallet_a.mint_sync_token(0);
-    let wallet_b_token = wallet_b.mint_sync_token(0);
-    let wallet_a_lease =
-        match send_wallet_target("wallet-a", &wallet_a_tx, 199, wallet_a_token).await {
-            WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
-            result @ WalletBackfillStartResult::Rejected { .. } => {
-                panic!("wallet A target rejected: {result:?}")
-            }
-        };
-    let wallet_b_lease =
-        match send_wallet_target("wallet-b", &wallet_b_tx, 130, wallet_b_token).await {
-            WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
-            result @ WalletBackfillStartResult::Rejected { .. } => {
-                panic!("wallet B target rejected: {result:?}")
-            }
-        };
-    backfill_request_tx
+    let (request_tx, mut request_rx) = mpsc::channel(1);
+    request_tx
         .send(BackfillRequest::Add {
-            cache_key: "wallet-a".to_string(),
-            from_block: 100,
-            to_block: 199,
-            follow_safe_head: false,
-            progress_start_block: 100,
-            acquisition_range: None,
-            driver: wallet_a_lease,
-        })
-        .await
-        .expect("send wallet A backfill request");
-    backfill_request_tx
-        .send(BackfillRequest::Add {
-            cache_key: "wallet-b".to_string(),
+            cache_key: test_cache_key("wallet-b").as_str().to_string(),
             from_block: 120,
             to_block: 130,
             follow_safe_head: false,
             progress_start_block: 120,
             acquisition_range: None,
-            driver: wallet_b_lease,
+            driver: other_driver,
         })
         .await
-        .expect("send wallet B backfill request");
+        .expect("queue different-wallet request");
+    assert_test_backfill_actor_current(&service, &active).await;
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wallet_a.last_scanned() != Some(199)
-            || wallet_b.last_scanned() != Some(130)
-            || !wallet_a.readiness().is_ready()
-            || !wallet_b.readiness().is_ready()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("wallet backfill loop completed");
-
-    assert_eq!(wallet_a.last_scanned(), Some(199));
-    assert_eq!(wallet_b.last_scanned(), Some(130));
+    let active_cache_key_for_drain = active_cache_key.clone();
+    let draining = tokio::spawn(async move {
+        drain_pending_backfill_requests(
+            &mut request_rx,
+            &mut cursor,
+            Some((active_cache_key_for_drain.as_str(), active_actor_id)),
+        )
+        .await;
+        cursor
+    });
+    let signal = tokio::time::timeout(Duration::from_secs(1), other_retirement)
+        .await
+        .expect("different-wallet driver retirement is signalled")
+        .expect("different-wallet driver retirement signal arrives");
     assert_eq!(
-        db.get_wallet_meta(&wallet_b_cache_key)
-            .expect("wallet B meta read")
-            .expect("wallet B meta")
-            .last_scanned_block,
-        130,
+        signal.disposition,
+        WalletBackfillOwnerDisposition::BenignRetirement
     );
-    assert!(
-        rpc.requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("logs request")
-            .contains("eth_getLogs")
-    );
-    let diagnostics = public_data_plane.diagnostics().await;
-    assert!(diagnostics.events.iter().any(|event| {
-        event.kind == PublicDataPlaneDiagnosticKind::SourceSelected
-            && event.source == Some(PublicScanSource::Rpc)
-            && event.range.is_some()
-            && event.epoch == PublicDataPlaneEpoch::new(0)
-    }));
+    if let Some(acknowledgement) = signal.acknowledgement {
+        acknowledgement
+            .send(())
+            .expect("acknowledge different-wallet driver retirement");
+    }
+    let cursor = draining.await.expect("backfill admission task joins");
+    let cursor = &cursor.expect("active cursor retained").cursor;
+    assert_eq!(cursor.from_block, 100);
+    assert_eq!(cursor.target_block, 199);
+    assert_eq!(cursor.driver.token().actor_id(), active_actor_id);
+    assert_eq!(cursor.driver.token().job_id(), SYNTHETIC_BACKFILL_JOB_ID);
 
-    worker_cancel.cancel();
-    loop_cancel.cancel();
+    service.unregister_wallet(&active).await;
+    drop(service);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -3446,8 +4479,15 @@ async fn wallet_backfill_loop_rebases_non_contiguous_cursor_to_actor_progress() 
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (service, backfill_request_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    let backfill_request_tx = service.backfill_tx.clone();
+    let registered = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "test").await;
+    let cache_key = registered.cache_key.as_str().to_string();
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
     let cancel = CancellationToken::new();
     spawn_backfill_loop(
@@ -3503,14 +4543,20 @@ async fn wallet_backfill_loop_rebases_non_contiguous_cursor_to_actor_progress() 
             .expect("finish rebased wallet backfill");
     });
 
+    assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
         .send(BackfillRequest::add(
-            "test",
+            &cache_key,
             100,
             110,
             false,
             100,
-            test_backfill_driver(wallet_tx, 0, 1),
+            test_backfill_driver_for_actor(
+                wallet_tx,
+                registered.actor_id(),
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
         ))
         .await
         .expect("send stale wallet backfill request");
@@ -3520,6 +4566,7 @@ async fn wallet_backfill_loop_rebases_non_contiguous_cursor_to_actor_progress() 
         .expect("rebased wallet backfill completed")
         .expect("actor response task completed");
 
+    service.unregister_wallet(&registered).await;
     cancel.cancel();
     drop(service);
     drop(db);
@@ -3598,8 +4645,15 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
             .await
             .expect("seed newer row page");
     }
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (service, backfill_request_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    let backfill_request_tx = service.backfill_tx.clone();
+    let registered = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "test").await;
+    let cache_key = registered.cache_key.as_str().to_string();
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
     let cancel = CancellationToken::new();
     spawn_backfill_loop(
@@ -3639,15 +4693,21 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
             .expect("finish cached suffix backfill");
     });
 
+    assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
         .send(BackfillRequest::add_with_acquisition(
-            "test",
+            &cache_key,
             106,
             110,
             false,
             106,
             (100, 105),
-            test_backfill_driver(wallet_tx, 0, 1),
+            test_backfill_driver_for_actor(
+                wallet_tx,
+                registered.actor_id(),
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
         ))
         .await
         .expect("send wallet backfill request");
@@ -3703,6 +4763,7 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
         "successful delivery must remain replayable"
     );
 
+    service.unregister_wallet(&registered).await;
     cancel.cancel();
     drop(service);
     drop(db);
@@ -3744,8 +4805,15 @@ async fn wallet_backfill_loop_reuses_cached_prefix_before_fetching_delivery_tail
         })
         .await
         .expect("seed cached acquisition prefix");
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (service, backfill_request_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    let backfill_request_tx = service.backfill_tx.clone();
+    let registered = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "test").await;
+    let cache_key = registered.cache_key.as_str().to_string();
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
     let cancel = CancellationToken::new();
     spawn_backfill_loop(
@@ -3784,15 +4852,21 @@ async fn wallet_backfill_loop_reuses_cached_prefix_before_fetching_delivery_tail
             .expect("finish cached-prefix backfill");
     });
 
+    assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
         .send(BackfillRequest::add_with_acquisition(
-            "test",
+            &cache_key,
             106,
             110,
             false,
             106,
             (100, 110),
-            test_backfill_driver(wallet_tx, 0, 1),
+            test_backfill_driver_for_actor(
+                wallet_tx,
+                registered.actor_id(),
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
         ))
         .await
         .expect("send wallet backfill request");
@@ -3824,6 +4898,7 @@ async fn wallet_backfill_loop_reuses_cached_prefix_before_fetching_delivery_tail
         "successful scheduler acquisition must retain the merged warm window"
     );
 
+    service.unregister_wallet(&registered).await;
     cancel.cancel();
     drop(service);
     drop(db);
@@ -3870,8 +4945,15 @@ async fn wallet_backfill_loop_reacquires_prefix_invalidated_before_tail_commit()
         })
         .await
         .expect("seed cached acquisition prefix");
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (service, backfill_request_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane.clone(),
+        test_proxy_poi_policy(),
+    );
+    let backfill_request_tx = service.backfill_tx.clone();
+    let registered = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "test").await;
+    let cache_key = registered.cache_key.as_str().to_string();
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
     let cancel = CancellationToken::new();
     spawn_backfill_loop(
@@ -3910,15 +4992,21 @@ async fn wallet_backfill_loop_reacquires_prefix_invalidated_before_tail_commit()
             .expect("finish reacquired-prefix backfill");
     });
 
+    assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
         .send(BackfillRequest::add_with_acquisition(
-            "test",
+            &cache_key,
             106,
             110,
             false,
             106,
             (100, 110),
-            test_backfill_driver(wallet_tx, 0, 1),
+            test_backfill_driver_for_actor(
+                wallet_tx,
+                registered.actor_id(),
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
         ))
         .await
         .expect("send wallet backfill request");
@@ -3963,6 +5051,7 @@ async fn wallet_backfill_loop_reacquires_prefix_invalidated_before_tail_commit()
         "prefix invalidation must force full acquisition restoration before finish"
     );
 
+    service.unregister_wallet(&registered).await;
     cancel.cancel();
     drop(service);
     drop(db);
@@ -4006,8 +5095,15 @@ async fn wallet_backfill_loop_reacquires_full_window_after_stale_cached_delivery
         })
         .await
         .expect("seed cached delivery suffix");
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (service, backfill_request_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane.clone(),
+        test_proxy_poi_policy(),
+    );
+    let backfill_request_tx = service.backfill_tx.clone();
+    let registered = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "test").await;
+    let cache_key = registered.cache_key.as_str().to_string();
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
     let cancel = CancellationToken::new();
     spawn_backfill_loop(
@@ -4074,15 +5170,21 @@ async fn wallet_backfill_loop_reacquires_full_window_after_stale_cached_delivery
             .expect("finish reacquired backfill");
     });
 
+    assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
         .send(BackfillRequest::add_with_acquisition(
-            "test",
+            &cache_key,
             106,
             110,
             false,
             106,
             (100, 110),
-            test_backfill_driver(wallet_tx, 0, 1),
+            test_backfill_driver_for_actor(
+                wallet_tx,
+                registered.actor_id(),
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
         ))
         .await
         .expect("send wallet backfill request");
@@ -4116,6 +5218,7 @@ async fn wallet_backfill_loop_reacquires_full_window_after_stale_cached_delivery
         "retry must restore the full acquisition window",
     );
 
+    service.unregister_wallet(&registered).await;
     cancel.cancel();
     drop(service);
     drop(db);
@@ -4167,147 +5270,46 @@ async fn retained_acquisition_reconciliation_restores_missing_cache_without_movi
         .await
         .expect("commit retained acquisition");
     cursor.finish_retained_acquisition();
-    let mut cursors = HashMap::from([(String::from("test"), cursor)]);
+    let mut cursor = Some(WalletBackfillSlot {
+        cache_key: String::from("test"),
+        cursor,
+    });
 
     public_data_plane
         .invalidate_public_scan_coverage_from(100)
         .await;
-    assert!(!reconcile_retained_acquisition(&service, &mut cursors, "test").await);
+    assert!(!reconcile_retained_acquisition(&service, &mut cursor).await);
 
-    let cursor = cursors.get("test").expect("cursor remains active");
-    assert_eq!(cursor.acquisition_range(), Some((100, 105)));
-    assert_eq!(cursor.retained_acquisition_range(), Some((100, 105)));
+    let active_cursor = &cursor.as_ref().expect("cursor remains active").cursor;
+    assert_eq!(active_cursor.acquisition_range(), Some((100, 105)));
+    assert_eq!(active_cursor.retained_acquisition_range(), Some((100, 105)));
+    assert_eq!(active_cursor.from_block, 106);
+
+    let apply = WalletScanApply::rows(
+        100,
+        105,
+        WalletScanInputRows::default(),
+        public_data_plane.begin_public_scan_read(),
+        PublicScanSource::Rpc,
+        Some([0x22; 32]),
+    );
+    public_data_plane
+        .commit_completed_wallet_scan_acquisition(PublicScanRange::new(100, 105), &[apply])
+        .await
+        .expect("recommit retained acquisition");
+    cursor
+        .as_mut()
+        .expect("cursor remains active")
+        .cursor
+        .finish_retained_acquisition();
+    public_data_plane
+        .invalidate_public_scan_coverage_from(100)
+        .await;
+    assert!(reconcile_retained_acquisition(&service, &mut cursor).await);
+    let cursor = &cursor.as_ref().expect("cursor remains active").cursor;
+    assert_eq!(cursor.acquisition_range(), None);
+    assert_eq!(cursor.retained_acquisition_range(), None);
     assert_eq!(cursor.from_block, 106);
-
-    drop(service);
-    drop(db);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
-async fn retained_acquisition_reconciliation_consumes_one_restore_budget_per_range() {
-    let root_dir = temp_db_root("retained-acquisition-restoration-budget");
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("open db"),
-    );
-    let scope = test_scope();
-    let rpc = JsonRpcServer::spawn(Vec::new());
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![rpc.url.clone()],
-        Duration::from_secs(1),
-    ));
-    let chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    let public_data_plane = ChainPublicDataPlane::new(
-        Arc::clone(&db),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
-    let (sender, _receiver) = mpsc::channel(1);
-    let ranges = [(100, 105), (200, 205)];
-    let mut cursors = HashMap::from([
-        (
-            String::from("first"),
-            WalletBackfill::new(
-                106,
-                110,
-                false,
-                106,
-                Some(ranges[0]),
-                test_backfill_driver(sender.clone(), 0, 1),
-                std::time::Instant::now(),
-            ),
-        ),
-        (
-            String::from("second"),
-            WalletBackfill::new(
-                206,
-                210,
-                false,
-                206,
-                Some(ranges[1]),
-                test_backfill_driver(sender, 0, 2),
-                std::time::Instant::now(),
-            ),
-        ),
-    ]);
-
-    for (from_block, to_block) in ranges {
-        let apply = WalletScanApply::rows(
-            from_block,
-            to_block,
-            WalletScanInputRows::default(),
-            public_data_plane.begin_public_scan_read(),
-            PublicScanSource::Rpc,
-            Some([0x11; 32]),
-        );
-        public_data_plane
-            .commit_completed_wallet_scan_acquisition(
-                PublicScanRange::new(from_block, to_block),
-                &[apply],
-            )
-            .await
-            .expect("commit retained acquisition");
-    }
-    for cursor in cursors.values_mut() {
-        cursor.finish_retained_acquisition();
-    }
-
-    public_data_plane
-        .invalidate_public_scan_coverage_from(100)
-        .await;
-    assert!(!reconcile_retained_acquisition(&service, &mut cursors, "first").await);
-    assert!(!reconcile_retained_acquisition(&service, &mut cursors, "second").await);
-    assert_eq!(cursors["first"].acquisition_range(), Some(ranges[0]));
-    assert_eq!(cursors["second"].acquisition_range(), Some(ranges[1]));
-    assert_eq!(cursors["first"].from_block, 106);
-    assert_eq!(cursors["second"].from_block, 206);
-
-    for (from_block, to_block) in ranges {
-        let apply = WalletScanApply::rows(
-            from_block,
-            to_block,
-            WalletScanInputRows::default(),
-            public_data_plane.begin_public_scan_read(),
-            PublicScanSource::Rpc,
-            Some([0x22; 32]),
-        );
-        public_data_plane
-            .commit_completed_wallet_scan_acquisition(
-                PublicScanRange::new(from_block, to_block),
-                &[apply],
-            )
-            .await
-            .expect("recommit retained acquisition");
-    }
-    for cursor in cursors.values_mut() {
-        cursor.finish_retained_acquisition();
-    }
-
-    public_data_plane
-        .invalidate_public_scan_coverage_from(100)
-        .await;
-    assert!(reconcile_retained_acquisition(&service, &mut cursors, "first").await);
-    assert!(reconcile_retained_acquisition(&service, &mut cursors, "second").await);
-    for (key, from_block) in [("first", 106), ("second", 206)] {
-        let cursor = &cursors[key];
-        assert_eq!(
-            cursor.acquisition_range(),
-            None,
-            "{key} acquisition abandoned"
-        );
-        assert_eq!(
-            cursor.retained_acquisition_range(),
-            None,
-            "{key} retained provenance abandoned"
-        );
-        assert_eq!(
-            cursor.from_block, from_block,
-            "{key} delivery cursor rewound"
-        );
-    }
 
     drop(service);
     drop(db);
@@ -4344,8 +5346,15 @@ async fn wallet_backfill_loop_abandons_malformed_warm_gap_before_delivering_tail
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    let (backfill_request_tx, backfill_request_rx) = mpsc::channel(1);
+    let (service, backfill_request_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    let backfill_request_tx = service.backfill_tx.clone();
+    let registered = install_test_backfill_actor(&service, &scope, rpc.url.clone(), "test").await;
+    let cache_key = registered.cache_key.as_str().to_string();
     let (_safe_head_tx, safe_head_rx) = watch::channel(110);
     let cancel = CancellationToken::new();
     spawn_backfill_loop(
@@ -4383,15 +5392,21 @@ async fn wallet_backfill_loop_abandons_malformed_warm_gap_before_delivering_tail
             .expect("finish malformed warm backfill");
     });
 
+    assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
         .send(BackfillRequest::add_with_acquisition(
-            "test",
+            &cache_key,
             106,
             110,
             false,
             106,
             (100, 105),
-            test_backfill_driver(wallet_tx, 0, 1),
+            test_backfill_driver_for_actor(
+                wallet_tx,
+                registered.actor_id(),
+                0,
+                SYNTHETIC_BACKFILL_JOB_ID,
+            ),
         ))
         .await
         .expect("send malformed warm backfill request");
@@ -4432,6 +5447,7 @@ async fn wallet_backfill_loop_abandons_malformed_warm_gap_before_delivering_tail
         request.contains(r#""fromBlock":"0x6a""#) && request.contains(r#""toBlock":"0x6e""#)
     }));
 
+    service.unregister_wallet(&registered).await;
     cancel.cancel();
     drop(service);
     drop(db);
@@ -4502,8 +5518,8 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         live_log_tx,
         backfill_tx: service_backfill_tx,
         archive_provider: None,
-        wallets: RwLock::new(HashMap::new()),
-        wallet_registration_gates: Mutex::new(HashMap::new()),
+        wallet: RwLock::new(None),
+        wallet_registration_gate: Mutex::new(()),
         cancel: CancellationToken::new(),
         live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
@@ -4652,8 +5668,8 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         live_log_tx,
         backfill_tx: service_backfill_tx,
         archive_provider: None,
-        wallets: RwLock::new(HashMap::new()),
-        wallet_registration_gates: Mutex::new(HashMap::new()),
+        wallet: RwLock::new(None),
+        wallet_registration_gate: Mutex::new(()),
         cancel: CancellationToken::new(),
         live_log_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
@@ -6588,32 +7604,60 @@ fn test_chain_service_with_policy(
     public_data_plane: ChainPublicDataPlane,
     poi_policy: GlobalPoiPolicy,
 ) -> Arc<ChainService> {
+    test_chain_service_with_backfill(db, chain, public_data_plane, poi_policy).0
+}
+
+fn test_chain_service_with_backfill(
+    db: Arc<DbStore>,
+    chain: ChainConfig,
+    public_data_plane: ChainPublicDataPlane,
+    poi_policy: GlobalPoiPolicy,
+) -> (Arc<ChainService>, mpsc::Receiver<BackfillRequest>) {
     let (head_tx, _head_rx) = watch::channel(0);
     let (safe_head_tx, _safe_head_rx) = watch::channel(0);
     let (forest_last_tx, _forest_last_rx) = watch::channel(0);
     let (live_log_tx, _live_log_rx) = broadcast::channel(8);
-    let (backfill_tx, _backfill_rx) = mpsc::channel(1);
-    Arc::new(ChainService {
-        chain,
-        poi_policy,
-        db,
-        forest: Arc::new(RwLock::new(MerkleForest::new())),
-        head_tx,
-        safe_head_tx,
-        forest_last_tx,
-        live_log_tx,
-        backfill_tx,
-        archive_provider: None,
-        wallets: RwLock::new(HashMap::new()),
-        wallet_registration_gates: Mutex::new(HashMap::new()),
-        cancel: CancellationToken::new(),
-        live_log_task: std::sync::Mutex::new(None),
-        anchor_last: std::sync::atomic::AtomicU64::new(0),
-        txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
-        wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
-        wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
-        public_data_plane,
-    })
+    let (backfill_tx, backfill_rx) = mpsc::channel(8);
+    (
+        Arc::new(ChainService {
+            chain,
+            poi_policy,
+            db,
+            forest: Arc::new(RwLock::new(MerkleForest::new())),
+            head_tx,
+            safe_head_tx,
+            forest_last_tx,
+            live_log_tx,
+            backfill_tx,
+            archive_provider: None,
+            wallet: RwLock::new(None),
+            wallet_registration_gate: Mutex::new(()),
+            cancel: CancellationToken::new(),
+            live_log_task: std::sync::Mutex::new(None),
+            anchor_last: std::sync::atomic::AtomicU64::new(0),
+            txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+            wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
+            wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
+            public_data_plane,
+        }),
+        backfill_rx,
+    )
+}
+
+async fn install_test_backfill_actor(
+    service: &Arc<ChainService>,
+    scope: &ChainScope,
+    rpc_url: Url,
+    cache_key: &str,
+) -> WalletHandle {
+    let mut cfg = test_wallet_config(scope, rpc_url);
+    cfg.cache_key = test_cache_key(cache_key);
+    cfg.sync_to_block = Some(0);
+    cfg.use_indexed_wallet_catch_up = false;
+    service
+        .register_wallet(cfg)
+        .await
+        .expect("register matching backfill actor")
 }
 
 struct TestArtifactSource {

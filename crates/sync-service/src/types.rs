@@ -2667,6 +2667,7 @@ pub(crate) enum BackfillRequest {
     Remove {
         cache_key: String,
         actor_id: u64,
+        response: oneshot::Sender<()>,
     },
 }
 

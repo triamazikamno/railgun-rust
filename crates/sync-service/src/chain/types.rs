@@ -1,8 +1,8 @@
 use super::{
     Arc, AtomicBool, AtomicU64, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig,
-    ChainPublicDataPlane, CommitmentUpdateError, DbStore, DynProvider, GlobalPoiPolicy, HashMap,
-    JoinHandle, MerkleForest, Mutex, PersistError, PublicDataPlaneError, RwLock, SharedLogBatch,
-    SyncError, SyncProgressSender, SyncProgressUpdate, TransportError, WalletBackfillResetResult,
+    ChainPublicDataPlane, CommitmentUpdateError, DbStore, DynProvider, GlobalPoiPolicy, JoinHandle,
+    MerkleForest, Mutex, PersistError, PublicDataPlaneError, RwLock, SharedLogBatch, SyncError,
+    SyncProgressSender, SyncProgressUpdate, TransportError, WalletBackfillResetResult,
     WalletCacheError, WalletConfig, WalletHandle, WalletIndexedCatchUpSource,
     WalletIndexedCatchUpStatus, WalletObservationPublisher, WalletScanApply, WalletScanError,
     broadcast, debug, mpsc, watch,
@@ -229,6 +229,8 @@ pub enum ChainError {
     NoHealthyRpc,
     #[error("wallet not found")]
     WalletNotFound,
+    #[error("a different wallet is already registered")]
+    WalletAlreadyRegistered,
     #[error("wallet reset failed")]
     WalletResetFailed,
     #[error(
@@ -249,6 +251,12 @@ pub enum ChainError {
     WalletResetRejected(WalletBackfillResetResult),
     #[error("backfill request failed")]
     BackfillRequestFailed,
+    #[error("wallet backfill retirement cleanup failed")]
+    WalletBackfillRetirementFailed,
+    #[error("wallet worker failed during retirement")]
+    WalletWorkerRetirementFailed,
+    #[error("wallet replacement task failed")]
+    WalletReplacementTaskFailed,
 }
 
 impl From<mpsc::error::SendError<BackfillEvent>> for ChainError {
@@ -329,8 +337,8 @@ pub struct ChainService {
     pub(super) live_log_tx: broadcast::Sender<SharedLogBatch>,
     pub(super) backfill_tx: mpsc::Sender<BackfillRequest>,
     pub(super) archive_provider: Option<DynProvider>,
-    pub(super) wallets: RwLock<HashMap<String, WalletRegistration>>,
-    pub(super) wallet_registration_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pub(super) wallet: RwLock<Option<WalletRegistration>>,
+    pub(super) wallet_registration_gate: Mutex<()>,
     pub(super) cancel: CancellationToken,
     pub(super) live_log_task: StdMutex<Option<JoinHandle<()>>>,
     pub(super) anchor_last: AtomicU64,

@@ -2185,22 +2185,17 @@ impl ChainPublicDataPlane {
         &self,
         apply: &WalletScanApply,
     ) -> Result<PublicDataPlaneEpoch, PublicDataPlaneError> {
-        self.record_public_scan_apply_with_acquisitions(apply, &[])
+        self.record_public_scan_apply_with_acquisition(apply, None)
             .await
             .map(|(epoch, _)| epoch)
     }
 
-    pub(crate) async fn record_public_scan_apply_with_acquisitions(
+    pub(crate) async fn record_public_scan_apply_with_acquisition(
         &self,
         apply: &WalletScanApply,
-        candidates: &[WalletScanAcquisitionCandidate],
-    ) -> Result<
-        (
-            PublicDataPlaneEpoch,
-            Vec<(PublicScanRange, WalletScanAcquisitionOutcome)>,
-        ),
-        PublicDataPlaneError,
-    > {
+        candidate: Option<&WalletScanAcquisitionCandidate>,
+    ) -> Result<(PublicDataPlaneEpoch, Option<WalletScanAcquisitionOutcome>), PublicDataPlaneError>
+    {
         let mut state = self.state.lock().await;
         let current_epoch = self.current_epoch();
         let base = state.transaction_snapshot();
@@ -2218,26 +2213,11 @@ impl ChainPublicDataPlane {
             return Err(error);
         }
         Self::ensure_recent_scan_row_page_limit(&ordinary)?;
-        let mut final_staged = ordinary;
-        let mut accepted = Vec::<(PublicScanRange, Vec<PublicScanRows>)>::new();
-        let mut outcomes = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let mut proposed_ranges = accepted.iter().map(|(range, _)| *range).collect::<Vec<_>>();
-            proposed_ranges.push(candidate.range);
-            let mut candidate_compacted = None;
+        let (final_staged, outcome) = if let Some(candidate) = candidate {
+            let proposed_ranges = [candidate.range];
             let mut trial = base.transaction_snapshot();
             let proposal_result = (|| {
                 Self::stage_wallet_scan_apply(&mut trial, current_epoch, apply, &proposed_ranges)?;
-                for (range, compacted) in &accepted {
-                    if !Self::cached_wallet_scan_is_exact(&trial, *range, current_epoch) {
-                        Self::stage_compacted_wallet_scan_acquisition(
-                            &mut trial,
-                            current_epoch,
-                            compacted,
-                            &proposed_ranges,
-                        )?;
-                    }
-                }
                 if !Self::cached_wallet_scan_is_exact(&trial, candidate.range, current_epoch)
                     || trial.recent_scan_rows.len() > RECENT_PUBLIC_SCAN_ROW_PAGE_LIMIT
                 {
@@ -2254,34 +2234,32 @@ impl ChainPublicDataPlane {
                         &compacted,
                         &proposed_ranges,
                     )?;
-                    candidate_compacted = Some(compacted);
                 }
                 Self::ensure_recent_scan_row_page_limit(&trial)?;
-                for range in &proposed_ranges {
-                    if !Self::cached_wallet_scan_is_exact(&trial, *range, current_epoch) {
-                        return Err(PublicDataPlaneError::InvalidCompletedAcquisition {
-                            reason: "accepted acquisition is not exactly replayable".to_string(),
-                        });
-                    }
+                if !Self::cached_wallet_scan_is_exact(&trial, candidate.range, current_epoch) {
+                    return Err(PublicDataPlaneError::InvalidCompletedAcquisition {
+                        reason: "accepted acquisition is not exactly replayable".to_string(),
+                    });
                 }
                 Ok(())
             })();
-            if let Err(error) = proposal_result {
-                let outcome = if matches!(
-                    &error,
-                    PublicDataPlaneError::CompletedAcquisitionRowPageLimit { .. }
-                ) {
-                    WalletScanAcquisitionOutcome::NonRetainable(error)
-                } else {
-                    WalletScanAcquisitionOutcome::Rejected(error)
-                };
-                outcomes.push((candidate.range, outcome));
-                continue;
+            match proposal_result {
+                Ok(()) => (trial, Some(WalletScanAcquisitionOutcome::Retained)),
+                Err(error) => {
+                    let outcome = if matches!(
+                        &error,
+                        PublicDataPlaneError::CompletedAcquisitionRowPageLimit { .. }
+                    ) {
+                        WalletScanAcquisitionOutcome::NonRetainable(error)
+                    } else {
+                        WalletScanAcquisitionOutcome::Rejected(error)
+                    };
+                    (ordinary, Some(outcome))
+                }
             }
-            final_staged = trial;
-            accepted.push((candidate.range, candidate_compacted.unwrap_or_default()));
-            outcomes.push((candidate.range, WalletScanAcquisitionOutcome::Retained));
-        }
+        } else {
+            (ordinary, None)
+        };
 
         state.coverage = final_staged.coverage;
         state.recent_scan_rows = final_staged.recent_scan_rows;
@@ -2290,12 +2268,12 @@ impl ChainPublicDataPlane {
             source: Some(apply.rows.source),
             range: Some(PublicScanRange::new(apply.from_block, apply.to_block)),
             reason: format!(
-                "recorded public scan apply with {} acquisition candidates",
-                candidates.len()
+                "recorded public scan apply with {} acquisition candidate",
+                usize::from(candidate.is_some())
             ),
             epoch: current_epoch,
         });
-        Ok((current_epoch, outcomes))
+        Ok((current_epoch, outcome))
     }
 
     pub(crate) async fn commit_completed_wallet_scan_acquisition(
@@ -4288,25 +4266,17 @@ mod tests {
             PublicScanSource::Rpc,
             None,
         );
-        let (_, outcomes) = data_plane
-            .record_public_scan_apply_with_acquisitions(
-                &full_apply,
-                &[WalletScanAcquisitionCandidate {
-                    range: PublicScanRange::new(105, 108),
-                    applies: vec![candidate_apply],
-                }],
-            )
+        let candidate = WalletScanAcquisitionCandidate {
+            range: PublicScanRange::new(105, 108),
+            applies: vec![candidate_apply],
+        };
+        let (_, outcome) = data_plane
+            .record_public_scan_apply_with_acquisition(&full_apply, Some(&candidate))
             .await
             .expect("publish wider apply and acquisition");
         assert!(matches!(
-            outcomes.as_slice(),
-            [(
-                PublicScanRange {
-                    from_block: 105,
-                    to_block: 108
-                },
-                WalletScanAcquisitionOutcome::Retained
-            )]
+            outcome,
+            Some(WalletScanAcquisitionOutcome::Retained)
         ));
         assert!(
             data_plane
@@ -4382,26 +4352,18 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let (_, outcomes) = data_plane
-            .record_public_scan_apply_with_acquisitions(
-                &fresh_apply,
-                &[WalletScanAcquisitionCandidate {
-                    range: PublicScanRange::new(100, 104),
-                    applies: candidate_applies,
-                }],
-            )
+        let candidate = WalletScanAcquisitionCandidate {
+            range: PublicScanRange::new(100, 104),
+            applies: candidate_applies,
+        };
+        let (_, outcome) = data_plane
+            .record_public_scan_apply_with_acquisition(&fresh_apply, Some(&candidate))
             .await
             .expect("publish fresh page and compact acquisition");
 
         assert!(matches!(
-            outcomes.as_slice(),
-            [(
-                PublicScanRange {
-                    from_block: 100,
-                    to_block: 104
-                },
-                WalletScanAcquisitionOutcome::Retained
-            )]
+            outcome,
+            Some(WalletScanAcquisitionOutcome::Retained)
         ));
         let replay = data_plane
             .cached_wallet_scan_exact(100, 104)
