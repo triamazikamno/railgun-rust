@@ -89,14 +89,13 @@ use delta::{
 use handle::{
     EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus, ExpectedRecordState,
     ExpectedWalletOutput, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
-    OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES, OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER,
-    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OUTPUT_POI_RECOVERY_VERIFY_PROOF, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-    PendingOutputPoiSubject, PendingOutputPoiSubmissionPredicate,
-    PendingOutputPoiValidationEvidence, RecoveredOutgoingSubmissionSibling,
-    WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE, WalletIndexedCatchUpCommand,
-    WalletPendingOverlayUpdate, WalletPoiRefreshSelection, WalletPrivateRemoteAuthority,
-    WalletPrivateRequest,
+    OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
+    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,
+    PendingOutputPoiSubmissionPredicate, PendingOutputPoiValidationEvidence,
+    RecoveredOutgoingSubmissionSibling, WALLET_POI_REFRESH_INTERVAL, WALLET_POI_STATUS_BATCH_SIZE,
+    WalletIndexedCatchUpCommand, WalletPendingOverlayUpdate, WalletPoiRefreshSelection,
+    WalletPrivateRemoteAuthority, WalletPrivateRequest,
 };
 pub(crate) use handle::{
     OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,

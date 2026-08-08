@@ -2245,7 +2245,7 @@ async fn restarted_candidate_maintenance_lists_and_dispatches_poi_proxy_proofs()
         public_data_plane: &public_data_plane,
         http_client: None,
         indexed_artifact_source: None,
-        forest: &forest_snapshot,
+        forest: Arc::new(forest_snapshot),
         poi_client: &poi_client,
         private_poi: &private_poi,
         poi_runtime: &poi_runtime,
@@ -2413,47 +2413,36 @@ fn live_metadata_flush_mark_persisted_resets_thresholds() {
 }
 
 #[test]
-fn recovery_input_tree_search_finds_root_before_later_commitments() {
+fn recovery_input_tree_search_finds_root_beyond_former_bounded_window() {
     let first_input = test_wallet_utxo(0);
-    let mut forest_before_later = MerkleForest::new();
-    forest_before_later
-        .insert_leaf(MerkleTreeUpdate {
-            tree_number: first_input.utxo.tree,
-            tree_position: first_input.utxo.position,
-            hash: first_input.utxo.note.commitment(),
-        })
-        .expect("insert input leaf");
-    let expected_root = forest_before_later
-        .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 1)
+    let mut forest = MerkleForest::new();
+    for position in 0..256 {
+        forest
+            .insert_leaf(MerkleTreeUpdate {
+                tree_number: first_input.utxo.tree,
+                tree_position: position,
+                hash: if position == first_input.utxo.position {
+                    first_input.utxo.note.commitment()
+                } else {
+                    U256::from(position + 12)
+                },
+            })
+            .expect("insert deterministic leaf");
+    }
+    let expected_root = forest
+        .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 64)
         .expect("historical proof")
         .root;
-
-    let mut forest_after_later = forest_before_later;
-    forest_after_later
-        .insert_leaf(MerkleTreeUpdate {
-            tree_number: first_input.utxo.tree,
-            tree_position: 1,
-            hash: uint!(12_U256),
-        })
-        .expect("insert later leaf");
-    forest_after_later
-        .insert_leaf(MerkleTreeUpdate {
-            tree_number: first_input.utxo.tree,
-            tree_position: 2,
-            hash: uint!(13_U256),
-        })
-        .expect("insert second later leaf");
-
-    let current_proof = forest_after_later
-        .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 3)
+    let current_proof = forest
+        .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 256)
         .expect("current proof");
     assert_ne!(current_proof.root, expected_root);
 
     let input_merkle = recovery_input_merkle_tree_for_root(
-        &forest_after_later,
+        &forest,
         first_input.utxo.tree,
         &first_input,
-        3,
+        256,
         expected_root,
     )
     .expect("find historical root");
@@ -2463,8 +2452,8 @@ fn recovery_input_tree_search_finds_root_before_later_commitments() {
     assert_eq!(recovered_proof.leaf, first_input.utxo.note.commitment());
 }
 
-#[test]
-fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_notes() {
+#[tokio::test]
+async fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_notes() {
     let spending_public_key = [uint!(4_U256), uint!(5_U256)];
     let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
     let broadcaster_keys =
@@ -2526,6 +2515,7 @@ fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_notes(
         .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
         .expect("input proof")
         .root;
+    let forest = Arc::new(forest);
     let transaction = Transaction {
         proof: SnarkProof::default(),
         merkleRoot: FixedBytes::from(merkle_root.to_be_bytes::<32>()),
@@ -2608,6 +2598,7 @@ fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_notes(
         spending_public_key,
         &scan_keys,
     )
+    .await
     .expect("build unshield recovery chunk from calldata");
 
     assert!(chunk.chunk.has_unshield);
@@ -2634,8 +2625,8 @@ fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_notes(
     );
 }
 
-#[test]
-fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_calldata() {
+#[tokio::test]
+async fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_calldata() {
     let spending_public_key = [uint!(4_U256), uint!(5_U256)];
     let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
     let mut input = test_wallet_utxo(0);
@@ -2670,6 +2661,7 @@ fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_callda
         .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
         .expect("input proof")
         .root;
+    let forest = Arc::new(forest);
     let row = PublicTxidTransaction {
         txid_index: 12,
         transaction: TxidPublicCacheTransaction {
@@ -2731,6 +2723,7 @@ fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_callda
         spending_public_key,
         &scan_keys,
     )
+    .await
     .expect("build recovery chunk from public row");
 
     assert_eq!(chunk.target_txid_index, Some(12));
@@ -2754,6 +2747,7 @@ fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_callda
         spending_public_key,
         &scan_keys,
     )
+    .await
     .expect_err("missing selected-source unshield preimage must fail closed");
     assert_eq!(failure.status, OutputPoiRecoveryStatus::UnsupportedShape);
     assert!(failure.retry_after.is_none());
@@ -3593,6 +3587,7 @@ async fn fresh_import_sender_candidate_refreshes_validated_txid_and_materializes
         .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
         .expect("input proof")
         .root;
+    let forest = Arc::new(forest);
     let transaction = Transaction {
         merkleRoot: FixedBytes::from(merkle_root.to_be_bytes::<32>()),
         boundParams: BoundParams::new_transact(
@@ -3763,7 +3758,7 @@ async fn fresh_import_sender_candidate_refreshes_validated_txid_and_materializes
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: poi_runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &poi_runtime,
@@ -3925,7 +3920,7 @@ async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
         authority.remote_authority(),
         PoiRpcClient::new(Url::parse("http://127.0.0.1:1").expect("unused POI endpoint")),
     );
-    let forest = MerkleForest::new();
+    let forest = Arc::new(MerkleForest::new());
     let wallet_utxos = vec![input];
     let report = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
         output_recovery: OutputPoiRecoveryRequest {
@@ -3936,7 +3931,7 @@ async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &runtime,
@@ -4112,7 +4107,7 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
         authority.remote_authority(),
         PoiRpcClient::new(Url::parse("http://127.0.0.1:1").expect("unused POI endpoint")),
     );
-    let forest = MerkleForest::new();
+    let forest = Arc::new(MerkleForest::new());
     cfg.quick_sync_endpoint =
         Some(Url::parse("http://127.0.0.1:1").expect("unused configured GraphQL endpoint"));
     let current_poi_mock = spawn_poi_rpc(serde_json::json!({
@@ -4130,7 +4125,7 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: current_runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &current_runtime,
@@ -4169,7 +4164,7 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &runtime,
@@ -4270,7 +4265,7 @@ async fn already_valid_sender_candidate_is_retired_without_txid_or_proof_request
         PoiRpcClient::new(endpoint.clone()),
     );
     let runtime = test_artifact_poi_runtime();
-    let forest = MerkleForest::new();
+    let forest = Arc::new(MerkleForest::new());
     let wallet_utxos = vec![input];
     let waiting = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
         output_recovery: OutputPoiRecoveryRequest {
@@ -4281,7 +4276,7 @@ async fn already_valid_sender_candidate_is_retired_without_txid_or_proof_request
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &runtime,
@@ -4362,7 +4357,7 @@ async fn already_valid_sender_candidate_is_retired_without_txid_or_proof_request
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &runtime,
@@ -4393,7 +4388,7 @@ async fn already_valid_sender_candidate_is_retired_without_txid_or_proof_request
             public_data_plane: &public_data_plane,
             http_client: None,
             indexed_artifact_source: None,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: runtime.public_client(),
             private_poi: &private_poi,
             poi_runtime: &runtime,
@@ -4569,7 +4564,7 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
     let public_data_plane =
         ChainPublicDataPlane::new(Arc::clone(&store), Arc::new(AtomicU64::new(0)));
     let poi_runtime = test_artifact_poi_runtime();
-    let forest = MerkleForest::new();
+    let forest = Arc::new(MerkleForest::new());
     let wallet_nullifiers = WalletNullifierIndex::new(&wallet_utxos, &cfg.scan_keys);
     let request = OutputPoiRecoveryRequest {
         authority: &authority,
@@ -4579,7 +4574,7 @@ async fn assert_stale_output_recovery_source_stops_before_transport(cached_input
         public_data_plane: &public_data_plane,
         http_client: None,
         indexed_artifact_source: None,
-        forest: &forest,
+        forest: Arc::clone(&forest),
         poi_client: &poi_client,
         private_poi: &private_poi,
         poi_runtime: &poi_runtime,

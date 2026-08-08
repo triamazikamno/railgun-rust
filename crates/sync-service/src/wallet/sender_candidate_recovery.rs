@@ -653,18 +653,39 @@ async fn prepare_sender_candidate_materialization(
         if qualified.outputs.is_empty() {
             return Ok(None);
         }
+        if !sender_candidate_still_current(
+            request.authority,
+            request.cache_store,
+            request.cfg,
+            candidate,
+        )
+        .await
+        {
+            return Ok(None);
+        }
         let recovery_chunk = build_recovery_chunk_for_public_transaction(
             qualified.output_start_global,
             qualified.output_notes,
             candidate.source.tx_hash,
             &wallet_nullifiers,
             &qualified.public_row.transaction,
-            request.forest,
+            &request.forest,
             request.active_list_keys,
             spending_public_key,
             &request.cfg.scan_keys,
             Some(qualified.txid_index),
-        )?;
+        )
+        .await?;
+        if !sender_candidate_still_current(
+            request.authority,
+            request.cache_store,
+            request.cfg,
+            candidate,
+        )
+        .await
+        {
+            return Ok(None);
+        }
         if let OutputPoiProofSourceResolution::Local { source, .. } = &proof_source_resolution {
             preflight_local_recovery_chunk_input_proofs(
                 Some(source),

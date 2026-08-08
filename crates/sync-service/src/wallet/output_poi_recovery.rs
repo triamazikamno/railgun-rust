@@ -10,16 +10,16 @@ use super::{
     DenseMerkleTree, Duration, EVM_CHAIN_TYPE, ExpectedPoiStatus, ExpectedWalletOutput, FixedBytes,
     HashMap, IndexedArtifactSourceConfig, InputWitness, Instant, LocalPoiMerkleProofSource,
     MerkleForest, Note, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
-    OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES, OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER,
-    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OUTPUT_POI_RECOVERY_VERIFY_PROOF, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
-    OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-    PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiPreflight,
-    PendingOutputPoiRemoteAttempt, PendingOutputPoiRole, PendingOutputPoiSubmissionPlan,
-    PoiMerkleProof, PoiMerkleProofSource, PoiPrivateApplyOutcome, PoiRpcClient, PoiStatus,
-    PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
-    PreTransactionPoiMap, PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusKey,
-    PublicTxidCacheKey, PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
+    OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
+    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiContextRecord,
+    PendingOutputPoiObservation, PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt,
+    PendingOutputPoiRole, PendingOutputPoiSubmissionPlan, PoiMerkleProof, PoiMerkleProofSource,
+    PoiPrivateApplyOutcome, PoiRpcClient, PoiStatus, PostTransactionPoiData,
+    PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
+    PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusKey, PublicTxidCacheKey,
+    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
     PublicTxidSyncRequest, PublicTxidTransaction, RailgunSpendSigner, RwLock,
     SenderTransactionCandidate, TREE_LEAF_COUNT, TransactionPlanChunk, TxidPublicCacheError, U256,
     Utxo, UtxoCommitmentKind, UtxoPoiMetadata, ValidatedRailgunTxidStatus, WalletCacheStore,
@@ -62,7 +62,7 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
     pub(super) public_data_plane: &'a ChainPublicDataPlane,
     pub(super) http_client: Option<&'a reqwest::Client>,
     pub(super) indexed_artifact_source: Option<&'a IndexedArtifactSourceConfig>,
-    pub(super) forest: &'a MerkleForest,
+    pub(super) forest: Arc<MerkleForest>,
     pub(super) poi_client: &'a PoiRpcClient,
     pub(super) private_poi: &'a WalletPrivatePoiClients,
     pub(super) poi_runtime: &'a WalletPoiRuntime,
@@ -1286,11 +1286,22 @@ pub(super) async fn build_output_poi_recovery_chunk_from_public_cache(
         &rows,
         sender_candidate.as_ref(),
         &cached_transactions,
-        request.forest,
+        &request.forest,
         required_poi_list_keys,
         spending_public_key,
         &request.cfg.scan_keys,
-    )?;
+    )
+    .await?;
+    if !request
+        .candidate_still_current(candidate, required_poi_list_keys)
+        .await
+    {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::TxFetchFailed,
+            "output POI recovery candidate changed while building recovery chunk",
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        ));
+    }
     if let Some((local_proof_source, _revision_fence)) = request
         .local_proof_source_if_ready(required_poi_list_keys)
         .await
@@ -1583,13 +1594,13 @@ pub(super) fn build_output_poi_recovery_chunk(
     ))
 }
 
-pub(super) fn build_output_poi_recovery_chunk_from_public_rows(
+pub(super) async fn build_output_poi_recovery_chunk_from_public_rows(
     candidate: &WalletUtxo,
     wallet_nullifiers: &WalletNullifierIndex<'_>,
     rows: &[PublicTxidTransaction],
     sender_candidate: Option<&SenderTransactionCandidate>,
     cached_transactions: &[Transaction],
-    forest: &MerkleForest,
+    forest: &Arc<MerkleForest>,
     active_list_keys: &[FixedBytes<32>],
     spending_public_key: [U256; 2],
     scan_keys: &railgun_wallet::scan::WalletScanKeys,
@@ -1653,6 +1664,7 @@ pub(super) fn build_output_poi_recovery_chunk_from_public_rows(
         scan_keys,
         Some(row.txid_index),
     )
+    .await
 }
 
 fn output_notes_for_public_transaction(
@@ -1765,13 +1777,13 @@ fn cached_transaction_matches_public_row(
         && u64::from(u32::from(transaction.boundParams.treeNumber)) == public.utxo_tree_in
 }
 
-pub(super) fn build_recovery_chunk_for_public_transaction(
+pub(super) async fn build_recovery_chunk_for_public_transaction(
     output_start_global: u128,
     mut output_notes: Vec<Note>,
     source_tx_hash: FixedBytes<32>,
     wallet_nullifiers: &WalletNullifierIndex<'_>,
     transaction: &TxidPublicCacheTransaction,
-    forest: &MerkleForest,
+    forest: &Arc<MerkleForest>,
     active_list_keys: &[FixedBytes<32>],
     spending_public_key: [U256; 2],
     scan_keys: &railgun_wallet::scan::WalletScanKeys,
@@ -1849,13 +1861,14 @@ pub(super) fn build_recovery_chunk_for_public_transaction(
             "transaction has no wallet-owned inputs",
         )
     })?;
-    let input_merkle = recovery_input_merkle_tree_for_root(
-        forest,
+    let input_merkle = recovery_input_merkle_tree_for_root_blocking(
+        Arc::clone(forest),
         input_tree,
-        first_input,
+        (*first_input).clone(),
         max_leaf_count,
         transaction.merkle_root,
-    )?;
+    )
+    .await?;
     let mut input_witnesses = Vec::with_capacity(inputs.len());
     for input in inputs {
         let proof = input_merkle.tree.prove(input.utxo.position);
@@ -2140,6 +2153,7 @@ pub(super) fn recovery_input_merkle_tree_for_root(
     merkle_root: U256,
 ) -> Result<RecoveryInputMerkleTree, RecoveryFailure> {
     let min_leaf_count = first_input.utxo.position.saturating_add(1);
+    let max_leaf_count = max_leaf_count.min(TREE_LEAF_COUNT);
     if max_leaf_count < min_leaf_count {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::MissingMerkleProof,
@@ -2147,9 +2161,6 @@ pub(super) fn recovery_input_merkle_tree_for_root(
             OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
         ));
     }
-    let lower_bound = max_leaf_count
-        .saturating_sub(OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES)
-        .max(min_leaf_count);
     if forest
         .leaf_at(input_tree, first_input.utxo.position)
         .is_none()
@@ -2161,20 +2172,48 @@ pub(super) fn recovery_input_merkle_tree_for_root(
         ));
     }
     let mut tree = DenseMerkleTree::from_forest_prefix(forest, input_tree, max_leaf_count);
-    for leaf_count in (lower_bound..=max_leaf_count).rev() {
-        let proof = tree.prove(first_input.utxo.position);
-        if proof.leaf == first_input.utxo.note.commitment() && proof.root == merkle_root {
-            return Ok(RecoveryInputMerkleTree { tree });
+    for leaf_count in (min_leaf_count..=max_leaf_count).rev() {
+        if tree.root() == merkle_root {
+            let proof = tree.prove(first_input.utxo.position);
+            if proof.leaf == first_input.utxo.note.commitment() && proof.root == merkle_root {
+                return Ok(RecoveryInputMerkleTree { tree });
+            }
         }
-        if leaf_count > lower_bound {
+        if leaf_count > min_leaf_count {
             tree.remove_leaf(leaf_count - 1);
         }
     }
     Err(RecoveryFailure::retryable(
         OutputPoiRecoveryStatus::MissingMerkleProof,
-        "reconstructed Merkle proof does not match transaction root within recovery search window",
+        "reconstructed Merkle proof does not match transaction root in local Merkle history",
         OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
     ))
+}
+
+async fn recovery_input_merkle_tree_for_root_blocking(
+    forest: Arc<MerkleForest>,
+    input_tree: u32,
+    first_input: WalletUtxo,
+    max_leaf_count: u64,
+    merkle_root: U256,
+) -> Result<RecoveryInputMerkleTree, RecoveryFailure> {
+    tokio::task::spawn_blocking(move || {
+        recovery_input_merkle_tree_for_root(
+            &forest,
+            input_tree,
+            &first_input,
+            max_leaf_count,
+            merkle_root,
+        )
+    })
+    .await
+    .map_err(|error| {
+        RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::MissingMerkleProof,
+            format!("historical Merkle proof search failed: {error}"),
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        )
+    })?
 }
 
 #[cfg(test)]

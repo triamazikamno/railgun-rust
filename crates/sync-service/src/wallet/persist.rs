@@ -432,7 +432,7 @@ impl OutputPoiRecoveryRun<'_> {
                 error: candidate_error,
             };
         }
-        let forest = self.forest.read().await.clone();
+        let forest = Arc::new(self.forest.read().await.clone());
         let candidate_report =
             materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
                 output_recovery: OutputPoiRecoveryRequest {
@@ -443,7 +443,7 @@ impl OutputPoiRecoveryRun<'_> {
                     public_data_plane: self.public_data_plane,
                     http_client: self.http_client,
                     indexed_artifact_source: self.indexed_artifact_source,
-                    forest: &forest,
+                    forest: Arc::clone(&forest),
                     poi_client: self.client,
                     private_poi: self.private_poi,
                     poi_runtime: self.poi_runtime,
@@ -493,7 +493,7 @@ impl OutputPoiRecoveryRun<'_> {
             public_data_plane: self.public_data_plane,
             http_client: self.http_client,
             indexed_artifact_source: self.indexed_artifact_source,
-            forest: &forest,
+            forest: Arc::clone(&forest),
             poi_client: self.client,
             private_poi: self.private_poi,
             poi_runtime: self.poi_runtime,
