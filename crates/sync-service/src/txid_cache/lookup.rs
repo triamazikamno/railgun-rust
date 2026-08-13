@@ -90,6 +90,84 @@ pub(crate) fn validated_transactions_for_outer_hash(
     })
 }
 
+pub(crate) fn artifact_bounded_transactions_for_outer_hash(
+    db: &DbStore,
+    key: TxidPublicCacheKey<'_>,
+    transaction_hash: FixedBytes<32>,
+) -> Result<Vec<TxidPublicCacheEntry>, TxidPublicCacheError> {
+    let cache = super::TxidPublicCache::new(db, key);
+    let manifest = cache
+        .load_manifest()?
+        .ok_or(TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        })?;
+    manifest.validate_for(key)?;
+    let bound = manifest
+        .artifact_cached_txid_index
+        .ok_or(TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        })?;
+    let mut matches = Vec::new();
+    let mut expected_index = 0_u64;
+    for page_ref in &manifest.pages {
+        if expected_index > bound {
+            break;
+        }
+        let page_end = page_ref
+            .start_index
+            .checked_add(page_ref.row_count)
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "artifact-bounded TXID page range overflows".to_string(),
+                )
+            })?;
+        if page_ref.start_index < expected_index || page_end <= expected_index {
+            return Err(TxidPublicCacheError::MetadataMismatch(format!(
+                "artifact-bounded TXID page coverage overlaps at index {expected_index}"
+            )));
+        }
+        if page_ref.start_index > expected_index {
+            return Err(TxidPublicCacheError::MissingLeaf {
+                index: expected_index,
+            });
+        }
+        let page = page_ref.read(db, manifest.cache_key())?;
+        for row in page.rows {
+            if row.txid_index > bound {
+                break;
+            }
+            if row.txid_index != expected_index {
+                return if row.txid_index < expected_index {
+                    Err(TxidPublicCacheError::MetadataMismatch(format!(
+                        "artifact-bounded TXID rows overlap at index {expected_index}"
+                    )))
+                } else {
+                    Err(TxidPublicCacheError::MissingLeaf {
+                        index: expected_index,
+                    })
+                };
+            }
+            if row.transaction.transaction_hash == transaction_hash {
+                matches.push(row.clone().into());
+            }
+            expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch("txid index overflow".to_string())
+            })?;
+            if expected_index > bound {
+                break;
+            }
+        }
+    }
+    if expected_index <= bound {
+        return Err(TxidPublicCacheError::MissingLeaf {
+            index: expected_index,
+        });
+    }
+    Ok(matches)
+}
+
 pub(super) fn find_target_row(
     manifest: &TxidPublicCacheManifest,
     db: &DbStore,

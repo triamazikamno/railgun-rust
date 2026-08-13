@@ -214,13 +214,9 @@ pub(super) struct TxidPublicCacheManifest {
     pub(super) latest_validated_merkleroot: Option<FixedBytes<32>>,
     #[serde(default)]
     pub(super) validated_cached_txid_index: Option<u64>,
+    #[serde(default)]
+    pub(super) artifact_cached_txid_index: Option<u64>,
     pub(super) pages: Vec<TxidPublicCachePageRef>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct TxidPublicCacheRefresh {
-    pub(super) fetched_rows: u64,
-    pub(super) refreshed_to: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

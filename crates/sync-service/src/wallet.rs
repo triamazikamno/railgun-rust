@@ -38,9 +38,9 @@ use railgun_wallet::{
 };
 
 use crate::chain::{
-    ChainError, ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey,
-    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest, PublicTxidTransaction,
+    ChainError, ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey,
+    PublicTxidCacheKey, PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
+    PublicTxidSyncRequest, PublicTxidTransaction, TxidPublicProof,
 };
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::txid_cache::TxidPublicCacheError;
@@ -108,9 +108,11 @@ use output_poi_recovery::{
     mark_valid_output_poi_recoveries, mark_valid_output_poi_recoveries_authorized,
     new_output_poi_recovery_record, output_poi_recovery_candidates, recover_missing_output_pois,
 };
+#[cfg(test)]
+use pending_output_poi::apply_owned_poi_private_delta_on_actor;
 use pending_output_poi::{
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
-    apply_owned_poi_private_delta_on_actor, apply_poi_private_delta,
+    apply_owned_poi_private_delta_on_actor_with_active_lists, apply_poi_private_delta,
     current_pending_output_poi_subject, expected_pending_context_state, expected_recovery_state,
     pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
     pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,

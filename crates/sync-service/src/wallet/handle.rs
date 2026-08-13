@@ -88,8 +88,8 @@ impl WalletPoiRefreshSelection {
 use super::{
     Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, Mutex,
     Ordering, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OwnedMutexGuard,
-    PendingOutputPoiContextIntent, PendingOutputPoiContextRecord, PoiStatus, RwLock,
-    SenderCandidatePublicDataFence, SenderTransactionCandidate, SyncProgressUpdate, Utxo,
+    PendingOutputPoiContextIntent, PendingOutputPoiContextRecord, PoiStatus, PublicPoiCorpusHandle,
+    RwLock, SenderCandidatePublicDataFence, SenderTransactionCandidate, SyncProgressUpdate, Utxo,
     UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
     WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCacheKey,
@@ -416,10 +416,10 @@ pub(crate) enum PendingOutputPoiValidationEvidence {
 /// Owned semantic POI intent for actor re-entry (jobs never write mirrors or stale rows).
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
-    /// Consume a still-current sender candidate whose external outputs are already valid.
-    SenderCandidateAlreadyValid {
+    /// Retire an exact sender candidate after the actor re-reads local artifact POI status.
+    SenderCandidateLocallyValid {
         expected_candidate: SenderTransactionCandidate,
-        active_list_keys: Vec<FixedBytes<32>>,
+        corpus: PublicPoiCorpusHandle,
     },
     /// Install standard external pending/recovery siblings, reuse exact wallet-owned substitutes,
     /// and consume their scan candidate in one actor-owned durable commit.

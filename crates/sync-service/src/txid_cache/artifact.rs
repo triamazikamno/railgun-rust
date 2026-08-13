@@ -363,13 +363,16 @@ impl TxidPublicCacheManifest {
         chunks: &[VerifiedIndexedArtifactChunk],
         to_index: Option<u64>,
         latest_validated_merkleroot: Option<FixedBytes<32>>,
+        artifact_start_index: u64,
     ) -> Result<u64, TxidPublicCacheError> {
         let db = permit.db();
-        let Some(next_range_start) = self
-            .validated_cached_txid_index
-            .map_or(Some(0), |index| index.checked_add(1))
-        else {
-            return Ok(0);
+        let marker_start = self
+            .artifact_cached_txid_index
+            .map_or(0, |index| index.saturating_add(1));
+        let next_range_start = if self.artifact_cached_txid_index.is_none() {
+            artifact_start_index
+        } else {
+            marker_start
         };
         if to_index.is_some_and(|to_index| to_index < next_range_start) {
             return Ok(0);
@@ -408,51 +411,72 @@ impl TxidPublicCacheManifest {
         );
 
         let mut applied_rows = 0_u64;
+        let retained_latest = self.latest_validated_txid_index;
+        let mut background_changed_retained_latest = false;
         for chunk in &ready {
-            let (pages, applied_range_end) = materialize_pages_for_apply(chunk, to_index)?;
-            if pages.is_empty() {
+            let applied_range_end = to_index.map_or(chunk.descriptor.range.end, |to_index| {
+                chunk.descriptor.range.end.min(to_index)
+            });
+            if applied_range_end < chunk.descriptor.range.start {
                 continue;
             }
-            if applied_range_end == chunk.descriptor.range.end {
-                verify_declared_merkle_root(
-                    chunk.descriptor.metadata.root.as_ref(),
-                    self,
-                    db,
-                    chunk.descriptor.range.start,
-                    applied_range_end,
-                    &pages,
-                )?;
-            } else {
-                let full_pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
-                verify_declared_merkle_root(
-                    chunk.descriptor.metadata.root.as_ref(),
-                    self,
-                    db,
-                    chunk.descriptor.range.start,
-                    chunk.descriptor.range.end,
-                    &full_pages,
-                )?;
+            let mut pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
+            verify_declared_merkle_root(
+                chunk.descriptor.metadata.root.as_ref(),
+                self,
+                db,
+                chunk.descriptor.range.start,
+                chunk.descriptor.range.end,
+                &pages,
+            )?;
+            let apply_range_start = next_range_start.max(chunk.descriptor.range.start);
+            if apply_range_start != chunk.descriptor.range.start
+                || applied_range_end != chunk.descriptor.range.end
+            {
+                pages = truncate_pages_to_range(pages, apply_range_start, applied_range_end)?;
             }
-            if to_index == Some(applied_range_end) && latest_validated_merkleroot.is_some() {
+            let latest_root_verified = if to_index == Some(applied_range_end)
+                && let Some(latest_validated_merkleroot) = latest_validated_merkleroot
+            {
                 verify_declared_merkle_root(
-                    latest_validated_merkleroot.as_ref(),
+                    Some(&latest_validated_merkleroot),
                     self,
                     db,
-                    chunk.descriptor.range.start,
+                    apply_range_start,
                     applied_range_end,
                     &pages,
                 )?;
+                true
+            } else {
+                false
+            };
+            let bounded_authority_verified =
+                applied_range_end < chunk.descriptor.range.end && latest_root_verified;
+            if to_index.is_none()
+                && !pages.is_empty()
+                && retained_latest.is_some_and(|latest| apply_range_start <= latest)
+            {
+                background_changed_retained_latest = true;
             }
             for page in pages {
                 let row_count = page.rows.len() as u64;
                 if page.start_index < self.next_txid_index {
-                    self.insert_or_replace_staged_artifact_page(permit, &page)?;
+                    self.insert_or_replace_staged_page(permit, &page)?;
                 } else {
-                    self.append_staged_artifact_page(permit, &page)?;
+                    self.append_staged_page(permit, &page)?;
                 }
                 applied_rows = applied_rows.saturating_add(row_count);
             }
             self.validated_cached_txid_index = Some(applied_range_end);
+            let full_authenticated_chunk = applied_range_end == chunk.descriptor.range.end
+                && (apply_range_start == chunk.descriptor.range.start
+                    || self.artifact_cached_txid_index.is_some());
+            if full_authenticated_chunk || bounded_authority_verified {
+                self.artifact_cached_txid_index = Some(
+                    self.artifact_cached_txid_index
+                        .map_or(applied_range_end, |index| index.max(applied_range_end)),
+                );
+            }
             debug!(
                 cid = %chunk.descriptor.cid,
                 range_start = chunk.descriptor.range.start,
@@ -465,6 +489,10 @@ impl TxidPublicCacheManifest {
             if to_index.is_some_and(|to_index| applied_range_end >= to_index) {
                 break;
             }
+        }
+        if background_changed_retained_latest {
+            self.latest_validated_txid_index = None;
+            self.latest_validated_merkleroot = None;
         }
         Ok(applied_rows)
     }
@@ -589,29 +617,14 @@ fn verify_declared_merkle_root(
     Ok(())
 }
 
-fn materialize_pages_for_apply(
-    chunk: &VerifiedIndexedArtifactChunk,
-    to_index: Option<u64>,
-) -> Result<(Vec<TxidPublicCachePage>, u64), TxidPublicCacheError> {
-    let applied_range_end = to_index.map_or(chunk.descriptor.range.end, |to_index| {
-        chunk.descriptor.range.end.min(to_index)
-    });
-    if applied_range_end < chunk.descriptor.range.start {
-        return Ok((Vec::new(), applied_range_end));
-    }
-    let mut pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
-    if applied_range_end < chunk.descriptor.range.end {
-        pages = truncate_pages_to_range_end(pages, applied_range_end)?;
-    }
-    Ok((pages, applied_range_end))
-}
-
-fn truncate_pages_to_range_end(
+fn truncate_pages_to_range(
     mut pages: Vec<TxidPublicCachePage>,
+    range_start: u64,
     range_end: u64,
 ) -> Result<Vec<TxidPublicCachePage>, TxidPublicCacheError> {
     for page in &mut pages {
-        page.rows.retain(|row| row.txid_index <= range_end);
+        page.rows
+            .retain(|row| row.txid_index >= range_start && row.txid_index <= range_end);
     }
     pages.retain(|page| !page.rows.is_empty());
     for page in &mut pages {
@@ -922,7 +935,10 @@ impl TxidPublicCacheManifest {
         permit: &TxidPublicCacheWritePermit<'_>,
         chunks: &[VerifiedIndexedArtifactChunk],
     ) -> Result<u64, TxidPublicCacheError> {
-        self.apply_artifact_chunks_bounded(permit, chunks, None, None)
+        let artifact_start_index = self
+            .validated_cached_txid_index
+            .map_or(0, |index| index.saturating_add(1));
+        self.apply_artifact_chunks_bounded(permit, chunks, None, None, artifact_start_index)
     }
 }
 

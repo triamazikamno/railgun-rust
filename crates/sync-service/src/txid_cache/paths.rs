@@ -30,13 +30,10 @@ pub(super) fn page_file_name(key: TxidPublicCacheKey<'_>, start_index: u64) -> S
     )
 }
 
-pub(super) fn staged_artifact_page_file_name(
-    key: TxidPublicCacheKey<'_>,
-    start_index: u64,
-) -> String {
+pub(super) fn staged_page_file_name(key: TxidPublicCacheKey<'_>, start_index: u64) -> String {
     let nonce = TXID_CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{}-{}-{}-{}-artifact-{start_index:016}-{}-{nonce}.msgpack",
+        "{}-{}-{}-{}-staged-{start_index:016}-{}-{nonce}.msgpack",
         key.chain_type,
         key.chain_id,
         contract_component(key),

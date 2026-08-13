@@ -1,7 +1,7 @@
 use super::{
     Arc, BTreeMap, BlindedCommitmentData, FixedBytes, PendingOutputPoiSubmitter, PoiError,
-    PoiMerkleProof, PoiMerkleProofSource, PoiRpcClient, PoiStatus, PoiStatusReader,
-    PreTransactionPoiError, SingleCommitmentProofContext, WalletPrivateRemoteAuthority,
+    PoiRpcClient, PoiStatus, PoiStatusReader, SingleCommitmentProofContext,
+    WalletPrivateRemoteAuthority,
 };
 use std::convert::Infallible;
 
@@ -122,7 +122,6 @@ impl WalletPrivateRemoteGate {
 pub(crate) struct WalletPrivatePoiClients {
     effects: WalletPrivateRemoteEffects,
     status: Arc<dyn PoiStatusReader>,
-    proofs: Arc<dyn PoiMerkleProofSource>,
     submit: Arc<dyn PendingOutputPoiSubmitter>,
 }
 
@@ -131,7 +130,6 @@ impl WalletPrivatePoiClients {
         Self {
             effects: WalletPrivateRemoteEffects::new(authority),
             status: Arc::new(client.clone()),
-            proofs: Arc::new(client.clone()),
             submit: Arc::new(client),
         }
     }
@@ -160,32 +158,6 @@ impl WalletPrivatePoiClients {
                     chain_id,
                     list_keys,
                     blinded_commitment_datas,
-                )
-            })
-            .await
-    }
-
-    pub(crate) async fn poi_merkle_proofs<Check, CheckFuture, CheckError>(
-        &self,
-        check_subject: Check,
-        txid_version: &str,
-        chain_type: u8,
-        chain_id: u64,
-        list_key: &FixedBytes<32>,
-        blinded_commitments: &[FixedBytes<32>],
-    ) -> Result<Vec<PoiMerkleProof>, WalletPrivateRemoteError<PreTransactionPoiError, CheckError>>
-    where
-        Check: FnOnce() -> CheckFuture,
-        CheckFuture: std::future::Future<Output = Result<bool, CheckError>>,
-    {
-        self.effects
-            .run(check_subject, || {
-                self.proofs.poi_merkle_proofs(
-                    txid_version,
-                    chain_type,
-                    chain_id,
-                    list_key,
-                    blinded_commitments,
                 )
             })
             .await
@@ -255,13 +227,11 @@ impl WalletPrivatePoiClients {
     pub(crate) fn for_test(
         authority: WalletPrivateRemoteAuthority,
         status: Arc<dyn PoiStatusReader>,
-        proofs: Arc<dyn PoiMerkleProofSource>,
         submit: Arc<dyn PendingOutputPoiSubmitter>,
     ) -> Self {
         Self {
             effects: WalletPrivateRemoteEffects::new(authority),
             status,
-            proofs,
             submit,
         }
     }
@@ -271,15 +241,7 @@ impl WalletPrivatePoiClients {
         status: Arc<dyn PoiStatusReader>,
     ) -> Self {
         let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
-        Self::for_test(authority, status, unavailable.clone(), unavailable)
-    }
-
-    pub(crate) fn for_proofs(
-        authority: WalletPrivateRemoteAuthority,
-        proofs: Arc<dyn PoiMerkleProofSource>,
-    ) -> Self {
-        let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
-        Self::for_test(authority, unavailable.clone(), proofs, unavailable)
+        Self::for_test(authority, status, unavailable)
     }
 
     pub(crate) fn for_submit(
@@ -287,7 +249,7 @@ impl WalletPrivatePoiClients {
         submit: Arc<dyn PendingOutputPoiSubmitter>,
     ) -> Self {
         let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
-        Self::for_test(authority, unavailable.clone(), unavailable, submit)
+        Self::for_test(authority, unavailable, submit)
     }
 }
 
@@ -310,22 +272,6 @@ mod test_support {
         ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError>
         {
             Err(PoiError::MerkleRootsRejected)
-        }
-    }
-
-    #[async_trait]
-    impl PoiMerkleProofSource for UnavailablePrivatePoiTransport {
-        async fn poi_merkle_proofs(
-            &self,
-            _txid_version: &str,
-            _chain_type: u8,
-            _chain_id: u64,
-            _list_key: &FixedBytes<32>,
-            _blinded_commitments: &[FixedBytes<32>],
-        ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
-            Err(PreTransactionPoiError::ProofSource(
-                "private POI test transport unavailable".to_string(),
-            ))
         }
     }
 

@@ -3,6 +3,61 @@ use super::{
     TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCacheRow, TxidPublicProof, U256,
     find_target_row, read_tree_leaves,
 };
+
+pub(crate) fn txid_public_artifact_bounded_proof(
+    db: &DbStore,
+    key: TxidPublicCacheKey<'_>,
+    target_txid_index: Option<u64>,
+    expected_leaf_hash: U256,
+    output_start_global: u128,
+) -> Result<TxidPublicProof, TxidPublicCacheError> {
+    let cache = TxidPublicCache::new(db, key);
+    let manifest = cache
+        .load_manifest()?
+        .ok_or(TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: target_txid_index.unwrap_or(0),
+        })?;
+    manifest.validate_for(key)?;
+    let artifact_cached_txid_index =
+        manifest
+            .artifact_cached_txid_index
+            .ok_or(TxidPublicCacheError::CacheNotReady {
+                next_index: 0,
+                required_index: target_txid_index.unwrap_or(0),
+            })?;
+    if target_txid_index.is_some_and(|target_index| target_index > artifact_cached_txid_index) {
+        return Err(TxidPublicCacheError::CacheNotReady {
+            next_index: artifact_cached_txid_index.saturating_add(1),
+            required_index: target_txid_index.unwrap_or(artifact_cached_txid_index),
+        });
+    }
+    let target = match target_txid_index {
+        Some(txid_index) => row_for_txid_index(&manifest, db, txid_index)?
+            .ok_or(TxidPublicCacheError::MissingLeaf { index: txid_index })?,
+        None => find_target_row_through(
+            &manifest,
+            db,
+            expected_leaf_hash,
+            output_start_global,
+            artifact_cached_txid_index,
+        )?,
+    };
+    if target.txid_leaf_hash != FixedBytes::from(expected_leaf_hash.to_be_bytes::<32>())
+        || target.transaction.output_start_global() != output_start_global
+    {
+        return Err(TxidPublicCacheError::LeafMismatch);
+    }
+    let root_txid_index = txid_root_index_for_target(target.txid_index, artifact_cached_txid_index);
+    if root_txid_index > artifact_cached_txid_index {
+        return Err(TxidPublicCacheError::CacheNotReady {
+            next_index: artifact_cached_txid_index.saturating_add(1),
+            required_index: root_txid_index,
+        });
+    }
+    validate_contiguous_rows_through(&manifest, db, root_txid_index)?;
+    proof_for_target_root(&manifest, db, &target, root_txid_index)
+}
 pub(crate) fn txid_public_proof_for_recovered_output(
     db: &DbStore,
     key: TxidPublicCacheKey<'_>,
@@ -140,6 +195,112 @@ pub(super) fn txid_public_proof_for_target_row(
         target_txid_index: target.txid_index,
         root_txid_index,
         proof,
+    })
+}
+
+fn proof_for_target_root(
+    manifest: &TxidPublicCacheManifest,
+    db: &DbStore,
+    target: &TxidPublicCacheRow,
+    root_txid_index: u64,
+) -> Result<TxidPublicProof, TxidPublicCacheError> {
+    let target_tree = target.txid_index / TREE_LEAF_COUNT;
+    let target_index = target.txid_index % TREE_LEAF_COUNT;
+    let root_index = root_txid_index % TREE_LEAF_COUNT;
+    let leaf_count = root_index.saturating_add(1);
+    let leaves = read_tree_leaves(manifest, db, target_tree, leaf_count)?;
+    let tree = DenseMerkleTree::from_ordered_leaves(leaves, leaf_count);
+    let proof = tree.prove(target_index);
+    if proof.leaf != U256::from_be_bytes(target.txid_leaf_hash.0) {
+        return Err(TxidPublicCacheError::LeafMismatch);
+    }
+    Ok(TxidPublicProof {
+        target_txid_index: target.txid_index,
+        root_txid_index,
+        proof,
+    })
+}
+
+fn find_target_row_through(
+    manifest: &TxidPublicCacheManifest,
+    db: &DbStore,
+    expected_leaf_hash: U256,
+    output_start_global: u128,
+    artifact_cached_txid_index: u64,
+) -> Result<TxidPublicCacheRow, TxidPublicCacheError> {
+    let expected_leaf_hash = FixedBytes::from(expected_leaf_hash.to_be_bytes::<32>());
+    let mut found = None;
+    for page_ref in &manifest.pages {
+        let page = page_ref.read(db, manifest.cache_key())?;
+        for row in page.rows {
+            if row.txid_index > artifact_cached_txid_index
+                || row.txid_leaf_hash != expected_leaf_hash
+                || row.transaction.output_start_global() != output_start_global
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(TxidPublicCacheError::AmbiguousTarget);
+            }
+            found = Some(row);
+        }
+    }
+    found.ok_or(TxidPublicCacheError::MissingTarget)
+}
+
+fn validate_contiguous_rows_through(
+    manifest: &TxidPublicCacheManifest,
+    db: &DbStore,
+    txid_index: u64,
+) -> Result<(), TxidPublicCacheError> {
+    let mut expected_index = 0_u64;
+    for page_ref in &manifest.pages {
+        if expected_index > txid_index {
+            return Ok(());
+        }
+        let page_end = page_ref
+            .start_index
+            .checked_add(page_ref.row_count)
+            .ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch(
+                    "artifact-bounded TXID page range overflows".to_string(),
+                )
+            })?;
+        if page_end <= expected_index {
+            continue;
+        }
+        if page_ref.start_index > expected_index {
+            return Err(TxidPublicCacheError::MissingLeaf {
+                index: expected_index,
+            });
+        }
+        let page = page_ref.read(db, manifest.cache_key())?;
+        page.validate_for(manifest.cache_key())?;
+        if page.start_index != page_ref.start_index || page.rows.len() as u64 != page_ref.row_count
+        {
+            return Err(TxidPublicCacheError::MetadataMismatch(
+                "artifact-bounded TXID page reference does not match its payload".to_string(),
+            ));
+        }
+        for row in page.rows {
+            if row.txid_index < expected_index {
+                continue;
+            }
+            if row.txid_index != expected_index {
+                return Err(TxidPublicCacheError::MissingLeaf {
+                    index: expected_index,
+                });
+            }
+            if row.txid_index == txid_index {
+                return Ok(());
+            }
+            expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                TxidPublicCacheError::MetadataMismatch("txid index overflow".to_string())
+            })?;
+        }
+    }
+    Err(TxidPublicCacheError::MissingLeaf {
+        index: expected_index,
     })
 }
 

@@ -339,6 +339,7 @@ struct GetLatestValidatedRailgunTxidParams {
 #[serde(rename_all = "camelCase")]
 pub struct ValidatedRailgunTxidStatus {
     pub validated_txid_index: Option<u64>,
+    #[serde(rename = "validatedTxidMerkleroot", alias = "validatedMerkleroot")]
     pub validated_merkleroot: Option<String>,
 }
 
@@ -1684,15 +1685,22 @@ mod tests {
     #[test]
     fn validated_txid_response_deserializes() {
         let status: ValidatedRailgunTxidStatus = decode_json_rpc_response(
-            r#"{"result":{"validatedTxidIndex":105578,"validatedMerkleroot":"2946581b750a59be1865ea5499ed515957865df1dcecf5db07ea5c7fcf473396"}}"#,
+            r#"{"result":{"validatedTxidIndex":105578,"validatedTxidMerkleroot":"2946581b750a59be1865ea5499ed515957865df1dcecf5db07ea5c7fcf473396"}}"#,
         )
-        .expect("decode validated txid");
+        .expect("decode current validated txid");
 
         assert_eq!(status.validated_txid_index, Some(105_578));
         assert_eq!(
             status.validated_merkleroot.as_deref(),
             Some("2946581b750a59be1865ea5499ed515957865df1dcecf5db07ea5c7fcf473396")
         );
+
+        let legacy: ValidatedRailgunTxidStatus = decode_json_rpc_response(
+            r#"{"result":{"validatedTxidIndex":105578,"validatedMerkleroot":"legacy-root"}}"#,
+        )
+        .expect("decode legacy validated txid");
+        assert_eq!(legacy.validated_txid_index, Some(105_578));
+        assert_eq!(legacy.validated_merkleroot.as_deref(), Some("legacy-root"));
     }
 
     #[test]

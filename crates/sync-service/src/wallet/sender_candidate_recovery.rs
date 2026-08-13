@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::chain::ChainPublicDataPlaneCommitGuard;
+use crate::chain::{ChainPublicDataPlaneCommitGuard, PublicTxidDataAuthority};
 use crate::types::PublicDataPlaneEpoch;
+use railgun_wallet::tx::PoiMerkleProofSource;
 
 use super::output_poi_recovery::{
     OutputPoiProofSourceResolution, PublicCacheTxidRecoveryRequest, PublicCacheTxidRefreshRequest,
@@ -21,7 +22,7 @@ pub(super) struct SenderCandidateRecoveryRequest<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SenderCandidateRecoveryReport {
     pub(super) materialized: usize,
-    pub(super) retired_already_valid: usize,
+    pub(super) retired_locally_valid: usize,
     pub(super) awaiting_public_txid_data: u64,
     pub(super) awaiting_poi_data: u64,
     pub(super) retrying: u64,
@@ -31,7 +32,7 @@ pub(crate) struct SenderCandidateRecoveryReport {
 
 impl SenderCandidateRecoveryReport {
     pub(super) const fn completed(&self) -> usize {
-        self.materialized.saturating_add(self.retired_already_valid)
+        self.materialized.saturating_add(self.retired_locally_valid)
     }
 
     pub(super) fn matches_candidates(&self, candidates: &[SenderTransactionCandidate]) -> bool {
@@ -54,6 +55,7 @@ pub(crate) struct SenderCandidatePublicDataFence {
     cache_key: PublicTxidCacheKey,
     epoch: PublicDataPlaneEpoch,
     rows: Vec<PublicTxidTransaction>,
+    authority: PublicTxidDataAuthority,
 }
 
 impl fmt::Debug for SenderCandidatePublicDataFence {
@@ -62,6 +64,7 @@ impl fmt::Debug for SenderCandidatePublicDataFence {
             .debug_struct("SenderCandidatePublicDataFence")
             .field("epoch", &self.epoch)
             .field("row_count", &self.rows.len())
+            .field("authority", &self.authority)
             .finish_non_exhaustive()
     }
 }
@@ -72,12 +75,14 @@ impl SenderCandidatePublicDataFence {
         cache_key: PublicTxidCacheKey,
         epoch: PublicDataPlaneEpoch,
         rows: Vec<PublicTxidTransaction>,
+        authority: PublicTxidDataAuthority,
     ) -> Self {
         Self {
             public_data_plane: public_data_plane.clone(),
             cache_key,
             epoch,
             rows,
+            authority,
         }
     }
 
@@ -85,8 +90,11 @@ impl SenderCandidatePublicDataFence {
         self.public_data_plane.current_epoch() == self.epoch
             && self
                 .public_data_plane
-                .txid_transactions_for_outer_hash(&self.cache_key, outer_transaction_hash)
-                .is_ok_and(|rows| rows == self.rows)
+                .txid_transactions_for_outer_hash_with_authority(
+                    &self.cache_key,
+                    outer_transaction_hash,
+                )
+                .is_ok_and(|(rows, authority)| rows == self.rows && authority == self.authority)
             && self.public_data_plane.current_epoch() == self.epoch
     }
 
@@ -110,94 +118,189 @@ enum SenderRowQualification {
     WalletAuthored,
 }
 
-struct SenderRecoveryRemoteProofSource<'a> {
-    request: &'a OutputPoiRecoveryRequest<'a>,
-    candidate: &'a SenderTransactionCandidate,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SenderCandidateLocalClassification {
+    pub(crate) external_outputs: Vec<BlindedCommitmentData>,
 }
 
-#[async_trait]
-impl PoiMerkleProofSource for SenderRecoveryRemoteProofSource<'_> {
-    async fn poi_merkle_proofs(
-        &self,
-        txid_version: &str,
-        chain_type: u8,
-        chain_id: u64,
-        list_key: &FixedBytes<32>,
-        blinded_commitments: &[FixedBytes<32>],
-    ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
-        if !self.request.active_list_keys.contains(list_key) {
-            return Err(PreTransactionPoiError::ProofSource(format!(
-                "sender output recovery rejected non-active listKey={}",
-                hex::encode(list_key)
-            )));
-        }
-        match self
-            .request
-            .private_poi
-            .poi_merkle_proofs(
-                || async {
-                    Ok::<bool, std::convert::Infallible>(
-                        sender_candidate_still_current(
-                            self.request.authority,
-                            self.request.cache_store,
-                            self.request.cfg,
-                            self.candidate,
-                        )
-                        .await,
-                    )
-                },
-                txid_version,
-                chain_type,
-                chain_id,
-                list_key,
-                blinded_commitments,
-            )
-            .await
-        {
-            Ok(proofs) => Ok(proofs),
-            Err(WalletPrivateRemoteError::Remote(error)) => Err(error),
-            Err(WalletPrivateRemoteError::Check(error)) => match error {},
-            Err(WalletPrivateRemoteError::Stale(reason)) => {
-                Err(PreTransactionPoiError::ProofSource(format!(
-                    "sender output recovery proof request rejected: {reason:?}"
-                )))
-            }
-        }
-    }
-}
-
-enum AlreadyValidCandidateOutcome {
-    Retired,
-    Continue,
-    AwaitingPoiData,
-    Retry,
-    Stale,
-}
-
-fn external_candidate_status_data(
-    cfg: &WalletConfig,
+/// Classify a candidate without consulting public or remote state.
+///
+/// This is deliberately shared by the preflight and actor paths.  The actor repeats it from
+/// its fresh wallet snapshot before allowing the candidate-only durable deletion.
+pub(crate) fn classify_sender_candidate_for_local_retirement(
     candidate: &SenderTransactionCandidate,
-) -> Vec<BlindedCommitmentData> {
-    candidate
-        .outputs
+    wallet_utxos: &[WalletUtxo],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+) -> Option<SenderCandidateLocalClassification> {
+    candidate.validate().ok()?;
+
+    let expected_spends = candidate
+        .wallet_spends
         .iter()
-        .filter_map(|output| {
-            let note = output.note.as_ref()?;
-            if note.npk == Note::npk_for(cfg.scan_keys.master_public_key, note.random) {
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if expected_spends.len() != candidate.wallet_spends.len() {
+        return None;
+    }
+    let actual_spend_entries = wallet_utxos
+        .iter()
+        .filter(|wallet_utxo| wallet_utxo.spent.as_ref() == Some(&candidate.source))
+        .map(|wallet_utxo| SenderTransactionCandidateSpend {
+            tree: wallet_utxo.utxo.tree,
+            position: wallet_utxo.utxo.position,
+            commitment: wallet_utxo.utxo.poi.commitment,
+        })
+        .collect::<Vec<_>>();
+    let actual_spends = actual_spend_entries
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_spends.len() != actual_spend_entries.len() {
+        return None;
+    }
+    if actual_spends != expected_spends {
+        return None;
+    }
+
+    let mut external_outputs = Vec::new();
+    let mut external_blinded_commitments = BTreeSet::new();
+    for output in &candidate.outputs {
+        let owned_by_scan_key = output.note.as_ref().is_some_and(|note| {
+            note.npk == Note::npk_for(scan_keys.master_public_key, note.random)
+        });
+        let exact_wallet_matches = wallet_utxos
+            .iter()
+            .filter(|wallet_utxo| {
+                let Some(note) = output.note.as_ref() else {
+                    return wallet_utxo.utxo.source == candidate.source
+                        && wallet_utxo.utxo.tree == output.tree
+                        && wallet_utxo.utxo.position == output.position
+                        && wallet_utxo.utxo.poi.commitment == output.commitment
+                        && wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Transact
+                        && wallet_utxo.utxo.poi.npk
+                            == FixedBytes::from(
+                                Note::npk_for(
+                                    scan_keys.master_public_key,
+                                    wallet_utxo.utxo.note.random,
+                                )
+                                .to_be_bytes::<32>(),
+                            )
+                        && sender_candidate_poi_identity_matches(
+                            &wallet_utxo.utxo.poi,
+                            &Utxo::new(
+                                wallet_utxo.utxo.note.clone(),
+                                output.tree,
+                                output.position,
+                                candidate.source.clone(),
+                                UtxoCommitmentKind::Transact,
+                            )
+                            .poi,
+                        );
+                };
+                let recomputed = Utxo::new(
+                    note.clone(),
+                    output.tree,
+                    output.position,
+                    candidate.source.clone(),
+                    UtxoCommitmentKind::Transact,
+                );
+                wallet_utxo.utxo.source == candidate.source
+                    && wallet_utxo.utxo.tree == output.tree
+                    && wallet_utxo.utxo.position == output.position
+                    && sender_candidate_poi_identity_matches(&wallet_utxo.utxo.poi, &recomputed.poi)
+                    && wallet_utxo.utxo.note.npk
+                        == Note::npk_for(scan_keys.master_public_key, note.random)
+            })
+            .count();
+
+        if exact_wallet_matches > 1 {
+            return None;
+        }
+        if owned_by_scan_key {
+            if exact_wallet_matches != 1 {
                 return None;
             }
-            let output = Utxo::new(
-                note.clone(),
-                output.tree,
-                output.position,
-                candidate.source.clone(),
-                UtxoCommitmentKind::Transact,
-            );
-            Some(BlindedCommitmentData::transact(
-                output.poi.blinded_commitment,
-            ))
-        })
-        .collect()
+            continue;
+        }
+        let note = output.note.as_ref()?;
+        let recomputed = Utxo::new(
+            note.clone(),
+            output.tree,
+            output.position,
+            candidate.source.clone(),
+            UtxoCommitmentKind::Transact,
+        );
+        if !external_blinded_commitments.insert(recomputed.poi.blinded_commitment) {
+            return None;
+        }
+        external_outputs.push(BlindedCommitmentData::transact(
+            recomputed.poi.blinded_commitment,
+        ));
+    }
+    if external_outputs.is_empty() {
+        return None;
+    }
+    Some(SenderCandidateLocalClassification { external_outputs })
+}
+
+fn sender_candidate_poi_identity_matches(
+    actual: &UtxoPoiMetadata,
+    expected: &UtxoPoiMetadata,
+) -> bool {
+    actual.commitment_kind == expected.commitment_kind
+        && actual.commitment == expected.commitment
+        && actual.npk == expected.npk
+        && actual.blinded_commitment == expected.blinded_commitment
+}
+
+async fn locally_valid_sender_candidate(
+    request: &OutputPoiRecoveryRequest<'_>,
+    candidate: &SenderTransactionCandidate,
+) -> Option<PublicPoiCorpusHandle> {
+    if !request.poi_runtime.is_indexed_artifacts() || request.active_list_keys.is_empty() {
+        return None;
+    }
+    let classification = classify_sender_candidate_for_local_retirement(
+        candidate,
+        request.wallet_utxos,
+        &request.cfg.scan_keys,
+    )?;
+    let key = PublicPoiCorpusKey::wallet_default(request.cfg.chain.chain_id);
+    if !request
+        .public_data_plane
+        .poi_corpus_ready_for_lists(key.clone(), request.active_list_keys)
+        .await
+    {
+        return None;
+    }
+    let corpus = request
+        .public_data_plane
+        .ensure_poi_corpus(key)
+        .await
+        .ok()?;
+    let _revision_fence = corpus.revision_read_fence().await;
+    let statuses = corpus
+        .status_reader()
+        .pois_per_list(
+            DEFAULT_TXID_VERSION,
+            EVM_CHAIN_TYPE,
+            request.cfg.chain.chain_id,
+            request.active_list_keys,
+            &classification.external_outputs,
+        )
+        .await
+        .ok()?;
+    let all_valid = classification.external_outputs.iter().all(|data| {
+        statuses
+            .get(&data.blinded_commitment)
+            .is_some_and(|per_list| {
+                request
+                    .active_list_keys
+                    .iter()
+                    .all(|list_key| per_list.get(list_key) == Some(&PoiStatus::Valid))
+            })
+    });
+    all_valid.then_some(corpus)
 }
 
 async fn refresh_sender_candidate_public_txid_cache(
@@ -223,151 +326,6 @@ async fn refresh_sender_candidate_public_txid_cache(
     }
 }
 
-fn candidate_statuses_are_valid(
-    request_data: &[BlindedCommitmentData],
-    active_list_keys: &[FixedBytes<32>],
-    statuses: &BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>,
-) -> bool {
-    !request_data.is_empty()
-        && request_data.iter().all(|data| {
-            statuses
-                .get(&data.blinded_commitment)
-                .is_some_and(|per_list| {
-                    active_list_keys
-                        .iter()
-                        .all(|list_key| per_list.get(list_key) == Some(&PoiStatus::Valid))
-                })
-        })
-}
-
-async fn apply_already_valid_candidate(
-    request: &OutputPoiRecoveryRequest<'_>,
-    candidate: &SenderTransactionCandidate,
-) -> AlreadyValidCandidateOutcome {
-    match apply_poi_private_delta(
-        request.authority,
-        request.db,
-        request.cache_store,
-        request.cfg,
-        OwnedPoiPrivateDelta::SenderCandidateAlreadyValid {
-            expected_candidate: candidate.clone(),
-            active_list_keys: request.active_list_keys.to_vec(),
-        },
-    )
-    .await
-    {
-        Ok(PoiPrivateApplyOutcome::Applied { .. }) => AlreadyValidCandidateOutcome::Retired,
-        Ok(PoiPrivateApplyOutcome::Skipped) => AlreadyValidCandidateOutcome::Stale,
-        Err(_) => AlreadyValidCandidateOutcome::Retry,
-    }
-}
-
-async fn retire_candidate_if_already_valid(
-    request: &OutputPoiRecoveryRequest<'_>,
-    candidate: &SenderTransactionCandidate,
-    request_data: &[BlindedCommitmentData],
-) -> AlreadyValidCandidateOutcome {
-    if request_data.is_empty() || request.active_list_keys.is_empty() {
-        return AlreadyValidCandidateOutcome::Continue;
-    }
-    match request.poi_runtime {
-        WalletPoiRuntime::IndexedArtifacts { .. } => {
-            let key = PublicPoiCorpusKey::wallet_default(request.cfg.chain.chain_id);
-            if request
-                .public_data_plane
-                .poi_corpus_ready_for_lists(key.clone(), request.active_list_keys)
-                .await
-            {
-                let Ok(corpus) = request.public_data_plane.ensure_poi_corpus(key).await else {
-                    return AlreadyValidCandidateOutcome::AwaitingPoiData;
-                };
-                let _revision_fence = corpus.revision_read_fence().await;
-                let reader = corpus.status_reader();
-                let Ok(statuses) = reader
-                    .pois_per_list(
-                        DEFAULT_TXID_VERSION,
-                        EVM_CHAIN_TYPE,
-                        request.cfg.chain.chain_id,
-                        request.active_list_keys,
-                        request_data,
-                    )
-                    .await
-                else {
-                    return AlreadyValidCandidateOutcome::Retry;
-                };
-                if !candidate_statuses_are_valid(request_data, request.active_list_keys, &statuses)
-                {
-                    return AlreadyValidCandidateOutcome::Continue;
-                }
-                apply_already_valid_candidate(request, candidate).await
-            } else if request.poi_runtime.wallet_read_fallback_enabled() {
-                retire_candidate_if_already_valid_remote(request, candidate, request_data).await
-            } else {
-                AlreadyValidCandidateOutcome::AwaitingPoiData
-            }
-        }
-        WalletPoiRuntime::PoiProxy { .. } => {
-            retire_candidate_if_already_valid_remote(request, candidate, request_data).await
-        }
-    }
-}
-
-async fn retire_candidate_if_already_valid_remote(
-    request: &OutputPoiRecoveryRequest<'_>,
-    candidate: &SenderTransactionCandidate,
-    request_data: &[BlindedCommitmentData],
-) -> AlreadyValidCandidateOutcome {
-    let statuses = match request
-        .private_poi
-        .pois_per_list(
-            || async {
-                Ok::<bool, std::convert::Infallible>(
-                    sender_candidate_still_current(
-                        request.authority,
-                        request.cache_store,
-                        request.cfg,
-                        candidate,
-                    )
-                    .await,
-                )
-            },
-            DEFAULT_TXID_VERSION,
-            EVM_CHAIN_TYPE,
-            request.cfg.chain.chain_id,
-            request.active_list_keys,
-            request_data,
-        )
-        .await
-    {
-        Ok(statuses) => statuses,
-        Err(WalletPrivateRemoteError::Stale(_)) => return AlreadyValidCandidateOutcome::Stale,
-        Err(WalletPrivateRemoteError::Check(error)) => match error {},
-        Err(WalletPrivateRemoteError::Remote(_)) => return AlreadyValidCandidateOutcome::Retry,
-    };
-    if !candidate_statuses_are_valid(request_data, request.active_list_keys, &statuses) {
-        return AlreadyValidCandidateOutcome::Continue;
-    }
-    apply_already_valid_candidate(request, candidate).await
-}
-
-#[cfg(test)]
-pub(super) async fn sender_recovery_remote_proofs_for_test(
-    request: &OutputPoiRecoveryRequest<'_>,
-    candidate: &SenderTransactionCandidate,
-    list_key: &FixedBytes<32>,
-    blinded_commitments: &[FixedBytes<32>],
-) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
-    SenderRecoveryRemoteProofSource { request, candidate }
-        .poi_merkle_proofs(
-            DEFAULT_TXID_VERSION,
-            EVM_CHAIN_TYPE,
-            request.cfg.chain.chain_id,
-            list_key,
-            blinded_commitments,
-        )
-        .await
-}
-
 pub(super) async fn materialize_sender_transaction_candidates(
     request: SenderCandidateRecoveryRequest<'_>,
 ) -> SenderCandidateRecoveryReport {
@@ -391,6 +349,12 @@ pub(super) async fn materialize_sender_transaction_candidates(
     if candidates.is_empty() {
         return report;
     }
+    debug!(
+        chain_id = output_request.cfg.chain.chain_id,
+        candidates = candidates.len(),
+        force_retry = output_request.force_retry,
+        "sender candidate recovery scan started"
+    );
     let cache_key = PublicTxidCacheKey::new(
         ChainScope {
             chain_type: ChainType::Evm,
@@ -402,51 +366,53 @@ pub(super) async fn materialize_sender_transaction_candidates(
     let mut public_txid_cache_refreshed = None;
     for candidate in candidates {
         let candidate_id = candidate.semantic_id();
-        let external_status_data = external_candidate_status_data(output_request.cfg, &candidate);
-        let has_unknown_output = candidate.outputs.iter().any(|output| output.note.is_none());
-        let output_count = u64::try_from(external_status_data.len())
+        let output_count = u64::try_from(candidate.outputs.len())
             .unwrap_or(u64::MAX)
-            .saturating_add(u64::from(has_unknown_output));
-        let already_valid = if has_unknown_output {
-            AlreadyValidCandidateOutcome::Continue
-        } else {
-            retire_candidate_if_already_valid(output_request, &candidate, &external_status_data)
-                .await
-        };
-        match already_valid {
-            AlreadyValidCandidateOutcome::Retired => {
-                report.retired_already_valid = report.retired_already_valid.saturating_add(1);
-                report.expected_candidates.remove(&candidate_id);
-                continue;
+            .max(1);
+        if let Some(corpus) = locally_valid_sender_candidate(output_request, &candidate).await {
+            let apply_result = apply_poi_private_delta(
+                output_request.authority,
+                output_request.db,
+                output_request.cache_store,
+                output_request.cfg,
+                OwnedPoiPrivateDelta::SenderCandidateLocallyValid {
+                    expected_candidate: candidate.clone(),
+                    corpus,
+                },
+            )
+            .await;
+            match apply_result {
+                Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                    report.retired_locally_valid = report.retired_locally_valid.saturating_add(1);
+                    report.expected_candidates.remove(&candidate_id);
+                }
+                Ok(PoiPrivateApplyOutcome::Skipped) => {}
+                Err(_) => {
+                    report.needs_attention = report.needs_attention.saturating_add(output_count);
+                }
             }
-            AlreadyValidCandidateOutcome::AwaitingPoiData => {
-                report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(output_count);
-                continue;
-            }
-            AlreadyValidCandidateOutcome::Retry => {
-                report.retrying = report.retrying.saturating_add(output_count);
-                continue;
-            }
-            AlreadyValidCandidateOutcome::Stale => continue,
-            AlreadyValidCandidateOutcome::Continue => {}
+            continue;
         }
-        let Some(spending_public_key) = output_request.cfg.spending_public_key else {
-            report.retrying = report.retrying.saturating_add(output_count);
-            continue;
-        };
-        let Some(prover) = output_request.cfg.poi_recovery_prover.as_ref() else {
-            report.retrying = report.retrying.saturating_add(output_count);
-            continue;
-        };
         if output_request.active_list_keys.is_empty() {
+            report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(output_count);
+            continue;
+        }
+        let proof_source_resolution = output_request
+            .resolve_proof_source(output_request.active_list_keys)
+            .await;
+        if matches!(
+            &proof_source_resolution,
+            OutputPoiProofSourceResolution::Unavailable
+        ) {
+            log_local_poi_cache_unavailable(output_request.cfg, "sender_candidate_recovery");
             report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(output_count);
             continue;
         }
         let mut data_epoch = output_request.public_data_plane.current_epoch();
         let mut rows = output_request
             .public_data_plane
-            .txid_transactions_for_outer_hash(&cache_key, candidate.source.tx_hash);
-        if matches!(&rows, Ok(rows) if rows.is_empty())
+            .txid_transactions_for_outer_hash_with_authority(&cache_key, candidate.source.tx_hash);
+        if matches!(&rows, Ok((rows, _)) if rows.is_empty())
             || matches!(&rows, Err(TxidPublicCacheError::CacheNotReady { .. }))
         {
             let refreshed = refresh_sender_candidate_public_txid_cache(
@@ -459,20 +425,23 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 data_epoch = output_request.public_data_plane.current_epoch();
                 rows = output_request
                     .public_data_plane
-                    .txid_transactions_for_outer_hash(&cache_key, candidate.source.tx_hash);
+                    .txid_transactions_for_outer_hash_with_authority(
+                        &cache_key,
+                        candidate.source.tx_hash,
+                    );
             } else {
                 report.retrying = report.retrying.saturating_add(output_count);
                 continue;
             }
         }
-        let mut rows = match rows {
-            Ok(rows) if rows.is_empty() => {
+        let (mut rows, fetched_authority) = match rows {
+            Ok((rows, _authority)) if rows.is_empty() => {
                 report.awaiting_public_txid_data = report
                     .awaiting_public_txid_data
                     .saturating_add(output_count);
                 continue;
             }
-            Ok(rows) => rows,
+            Ok((rows, authority)) => (rows, authority),
             Err(TxidPublicCacheError::CacheNotReady { .. }) => {
                 report.awaiting_public_txid_data = report
                     .awaiting_public_txid_data
@@ -484,6 +453,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 continue;
             }
         };
+        let mut authority = fetched_authority;
         let mut qualification = qualify_sender_candidate(
             &candidate,
             output_request.wallet_utxos,
@@ -502,11 +472,13 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 continue;
             }
             data_epoch = output_request.public_data_plane.current_epoch();
-            rows = match output_request
+            (rows, authority) = match output_request
                 .public_data_plane
-                .txid_transactions_for_outer_hash(&cache_key, candidate.source.tx_hash)
-            {
-                Ok(rows) if !rows.is_empty() => rows,
+                .txid_transactions_for_outer_hash_with_authority(
+                    &cache_key,
+                    candidate.source.tx_hash,
+                ) {
+                Ok((rows, authority)) if !rows.is_empty() => (rows, authority),
                 Ok(_) | Err(TxidPublicCacheError::CacheNotReady { .. }) => {
                     report.awaiting_public_txid_data = report
                         .awaiting_public_txid_data
@@ -528,12 +500,22 @@ pub(super) async fn materialize_sender_transaction_candidates(
         let qualified = match qualification {
             Ok(Some(qualified)) => qualified,
             Ok(None) => {
+                debug!(
+                    chain_id = output_request.cfg.chain.chain_id,
+                    category = "public_rows_do_not_cover_candidate",
+                    "sender candidate recovery qualification incomplete"
+                );
                 report.awaiting_public_txid_data = report
                     .awaiting_public_txid_data
                     .saturating_add(output_count);
                 continue;
             }
             Err(()) => {
+                warn!(
+                    chain_id = output_request.cfg.chain.chain_id,
+                    category = "candidate_shape_or_wallet_association_mismatch",
+                    "sender candidate recovery qualification failed"
+                );
                 report.needs_attention = report.needs_attention.saturating_add(output_count);
                 continue;
             }
@@ -543,19 +525,37 @@ pub(super) async fn materialize_sender_transaction_candidates(
             cache_key.clone(),
             data_epoch,
             rows,
+            authority,
         );
+        let Some(spending_public_key) = output_request.cfg.spending_public_key else {
+            report.retrying = report.retrying.saturating_add(output_count);
+            continue;
+        };
+        let Some(prover) = output_request.cfg.poi_recovery_prover.as_ref() else {
+            report.retrying = report.retrying.saturating_add(output_count);
+            continue;
+        };
         let prepared = match prepare_sender_candidate_materialization(
             output_request,
             &candidate,
             qualified,
             spending_public_key,
             prover,
+            &public_data_fence,
+            proof_source_resolution,
         )
         .await
         {
             Ok(Some(prepared)) => prepared,
             Ok(None) => continue,
             Err(failure) => {
+                warn!(
+                    chain_id = output_request.cfg.chain.chain_id,
+                    status = ?failure.status,
+                    retryable = failure.retry_after.is_some(),
+                    failure_category = failure.category,
+                    "sender candidate recovery preparation failed"
+                );
                 if failure.retry_after.is_some() {
                     report.retrying = report.retrying.saturating_add(output_count);
                 } else {
@@ -608,6 +608,17 @@ pub(super) async fn materialize_sender_transaction_candidates(
             Err(_) => report.needs_attention = report.needs_attention.saturating_add(output_count),
         }
     }
+    debug!(
+        chain_id = output_request.cfg.chain.chain_id,
+        materialized = report.materialized,
+        retired_locally_valid = report.retired_locally_valid,
+        awaiting_public_txid_data = report.awaiting_public_txid_data,
+        awaiting_poi_data = report.awaiting_poi_data,
+        retrying = report.retrying,
+        needs_attention = report.needs_attention,
+        expected_candidates = report.expected_candidates.len(),
+        "sender candidate recovery scan complete"
+    );
     report
 }
 
@@ -625,6 +636,8 @@ async fn prepare_sender_candidate_materialization(
     qualified: Vec<QualifiedSenderTransaction>,
     spending_public_key: [U256; 2],
     prover: &railgun_wallet::prover::ProverService,
+    public_data_fence: &SenderCandidatePublicDataFence,
+    proof_source_resolution: OutputPoiProofSourceResolution,
 ) -> Result<Option<PreparedSenderCandidateMaterialization>, RecoveryFailure> {
     if !sender_candidate_still_current(
         request.authority,
@@ -636,11 +649,8 @@ async fn prepare_sender_candidate_materialization(
     {
         return Ok(None);
     }
-    let proof_source_resolution = request.resolve_proof_source(request.active_list_keys).await;
-    let remote_proof_source = SenderRecoveryRemoteProofSource { request, candidate };
     let proof_source: &dyn PoiMerkleProofSource = match &proof_source_resolution {
         OutputPoiProofSourceResolution::Local { source, .. } => source,
-        OutputPoiProofSourceResolution::RemoteFallback => &remote_proof_source,
         OutputPoiProofSourceResolution::Unavailable => return Ok(None),
     };
     let wallet_nullifiers = WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys);
@@ -686,15 +696,16 @@ async fn prepare_sender_candidate_materialization(
         {
             return Ok(None);
         }
-        if let OutputPoiProofSourceResolution::Local { source, .. } = &proof_source_resolution {
-            preflight_local_recovery_chunk_input_proofs(
-                Some(source),
-                request.cfg,
-                &recovery_chunk,
-                request.active_list_keys,
-            )
-            .await?;
-        }
+        let OutputPoiProofSourceResolution::Local { source, .. } = &proof_source_resolution else {
+            return Ok(None);
+        };
+        preflight_local_recovery_chunk_input_proofs(
+            Some(source),
+            request.cfg,
+            &recovery_chunk,
+            request.active_list_keys,
+        )
+        .await?;
         let txid_data =
             recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
                 public_data_plane: request.public_data_plane,
@@ -757,6 +768,18 @@ async fn prepare_sender_candidate_materialization(
         {
             return Ok(None);
         }
+        if qualified.public_row.transaction.has_unshield
+            && !submit_sender_unshield_transaction_pois(
+                request,
+                candidate,
+                public_data_fence,
+                txid_data.poi_data.txid_merkleroot_index,
+                &pre_transaction_pois,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         for output in &qualified.outputs {
             let expected = ExpectedWalletOutput::new(&WalletUtxo::new(output.clone()));
             let coordinate_matches = request
@@ -816,8 +839,7 @@ async fn prepare_sender_candidate_materialization(
     }
     let poi_corpus_revision_fence = match proof_source_resolution {
         OutputPoiProofSourceResolution::Local { revision_fence, .. } => Some(revision_fence),
-        OutputPoiProofSourceResolution::RemoteFallback
-        | OutputPoiProofSourceResolution::Unavailable => None,
+        OutputPoiProofSourceResolution::Unavailable => None,
     };
     Ok(Some(PreparedSenderCandidateMaterialization {
         pending_updates,
@@ -826,6 +848,58 @@ async fn prepare_sender_candidate_materialization(
         proof_outputs: proof_outputs.into_iter().collect(),
         poi_corpus_revision_fence,
     }))
+}
+
+async fn submit_sender_unshield_transaction_pois(
+    request: &OutputPoiRecoveryRequest<'_>,
+    candidate: &SenderTransactionCandidate,
+    public_data_fence: &SenderCandidatePublicDataFence,
+    txid_merkleroot_index: u64,
+    pre_transaction_pois: &PreTransactionPoiMap,
+) -> Result<bool, RecoveryFailure> {
+    for list_key in request.active_list_keys {
+        let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
+            return Ok(false);
+        };
+        for poi in per_leaf.values() {
+            match request
+                .private_poi
+                .submit_transact_proof(
+                    || async {
+                        Ok::<bool, std::convert::Infallible>(
+                            public_data_fence.is_current(candidate.source.tx_hash)
+                                && sender_candidate_still_current(
+                                    request.authority,
+                                    request.cache_store,
+                                    request.cfg,
+                                    candidate,
+                                )
+                                .await,
+                        )
+                    },
+                    DEFAULT_TXID_VERSION,
+                    EVM_CHAIN_TYPE,
+                    request.cfg.chain.chain_id,
+                    list_key,
+                    txid_merkleroot_index,
+                    poi,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(WalletPrivateRemoteError::Stale(_)) => return Ok(false),
+                Err(WalletPrivateRemoteError::Check(error)) => match error {},
+                Err(WalletPrivateRemoteError::Remote(_)) => {
+                    return Err(RecoveryFailure::retryable(
+                        OutputPoiRecoveryStatus::SubmitFailed,
+                        "sender unshield POI submission failed",
+                        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn qualify_sender_candidate(
@@ -1284,5 +1358,56 @@ mod tests {
         let mut wrong_output = row;
         wrong_output.transaction.commitments[0] = U256::from(123);
         assert!(qualify_sender_candidate(&candidate, &[input], &keys, vec![wrong_output]).is_err());
+    }
+
+    #[test]
+    fn local_retirement_classifier_requires_exact_spends_and_classifies_owned_change() {
+        let (keys, candidate, input, _) = fixture();
+        let owned_note = Note::new_change(
+            keys.master_public_key,
+            Address::from([0x22; 20]),
+            U256::from(3),
+            [0x77; 16],
+        );
+        let owned_output = SenderTransactionCandidateOutput {
+            tree: 2,
+            position: 4,
+            commitment: FixedBytes::from(owned_note.commitment().to_be_bytes::<32>()),
+            note: Some(owned_note.clone()),
+        };
+        let mixed = SenderTransactionCandidate::new(
+            candidate.chain_id,
+            candidate.wallet_id.clone(),
+            candidate.source.clone(),
+            candidate.wallet_spends.clone(),
+            vec![candidate.outputs[0].clone(), owned_output.clone()],
+        )
+        .expect("mixed candidate");
+        let owned_utxo = WalletUtxo {
+            utxo: Utxo::new(
+                owned_note,
+                owned_output.tree,
+                owned_output.position,
+                mixed.source.clone(),
+                UtxoCommitmentKind::Transact,
+            ),
+            spent: None,
+        };
+
+        let classification = classify_sender_candidate_for_local_retirement(
+            &mixed,
+            &[input.clone(), owned_utxo],
+            &keys,
+        )
+        .expect("exact mixed candidate classification");
+        assert_eq!(classification.external_outputs.len(), 1);
+
+        let mut extra_spend = input;
+        extra_spend.utxo.position += 1;
+        extra_spend.spent = Some(mixed.source.clone());
+        assert!(
+            classify_sender_candidate_for_local_retirement(&mixed, &[extra_spend], &keys,)
+                .is_none()
+        );
     }
 }

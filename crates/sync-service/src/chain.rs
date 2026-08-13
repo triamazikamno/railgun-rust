@@ -63,14 +63,15 @@ mod service;
 mod types;
 mod workers;
 
+pub(crate) use crate::txid_cache::TxidPublicProof;
 use backfill::{WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks};
 #[cfg(test)]
 pub(crate) use data_plane::commit_artifact_after_admission;
 pub(crate) use data_plane::{
-    ChainPublicDataPlane, ChainPublicDataPlaneCommitGuard, PublicPoiCorpusKey, PublicTxidCacheKey,
-    PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest, PublicTxidTransaction, WalletScanAcquisitionCandidate,
-    WalletScanAcquisitionOutcome,
+    ChainPublicDataPlane, ChainPublicDataPlaneCommitGuard, PublicPoiCorpusHandle,
+    PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidDataAuthority, PublicTxidLatestValidated,
+    PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest, PublicTxidTransaction,
+    WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome,
 };
 use forest_db::MerkleForestDbExt;
 use indexed_wallet::{

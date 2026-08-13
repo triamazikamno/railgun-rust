@@ -21,9 +21,9 @@ use super::{
     WalletReadinessError, WalletRemoteDone, WalletResetReplayPlan, WalletResetRewindStatus,
     WalletScanApply, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncActorStateRecord,
     WalletSyncToken, WalletUtxo, WalletUtxoMutation, WalletViewState, WalletWorkerServices,
-    apply_owned_poi_private_delta_on_actor, apply_wallet_delta_to_vec_with_outcome, broadcast,
-    chain_pending_overlay_matches, debug, default_active_poi_list_keys,
-    force_resubmit_matching_pending_output_pois_authorized, info,
+    apply_owned_poi_private_delta_on_actor_with_active_lists,
+    apply_wallet_delta_to_vec_with_outcome, broadcast, chain_pending_overlay_matches, debug,
+    default_active_poi_list_keys, force_resubmit_matching_pending_output_pois_authorized, info,
     mark_valid_output_poi_recoveries_authorized, mpsc, now_epoch_secs, oneshot,
     pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,
     pending_overlay_from_delta, process_pending_output_poi_observations_authorized,
@@ -2632,13 +2632,14 @@ pub(crate) async fn prepare_wallet_worker(
                         delta,
                         reply,
                     } = apply_req;
-                    let result = apply_owned_poi_private_delta_on_actor(
+                    let result = apply_owned_poi_private_delta_on_actor_with_active_lists(
                         &worker_handle,
                         &cancel,
                         reset_generation,
                         db.as_ref(),
                         cache_store.as_ref(),
                         &cfg,
+                        &active_poi_list_keys,
                         delta,
                     )
                     .await;
@@ -2738,7 +2739,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 cache_key = %cfg.cache_key,
                                 recovered,
                                 candidate_materialized = candidate_report.materialized,
-                                candidate_retired_already_valid = candidate_report.retired_already_valid,
+                                candidate_retired_locally_valid = candidate_report.retired_locally_valid,
                                 candidate_awaiting_public_txid_data = candidate_report.awaiting_public_txid_data,
                                 candidate_awaiting_poi_data = candidate_report.awaiting_poi_data,
                                 candidate_retrying = candidate_report.retrying,
@@ -7918,9 +7919,9 @@ mod tests {
         )
         .await
         .expect("spawn wallet worker");
-        let workflow_before_reset = *handle.observation().ppoi_workflow_status();
-        assert_eq!(workflow_before_reset.needs_attention, 2);
-        assert_eq!(workflow_before_reset.validation_revision, 0);
+        let workflow_initial = *handle.observation().ppoi_workflow_status();
+        assert_eq!(workflow_initial.needs_attention, 2);
+        assert_eq!(workflow_initial.validation_revision, 0);
 
         assert_eq!(
             send_target(&handle, &backfill_tx, 120, 0).await,
@@ -7928,6 +7929,27 @@ mod tests {
         );
         let rev_before_reset = *handle.rev_rx.borrow();
         let store_calls_before_reset = cache_store.state().store_calls;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle
+                    .observation()
+                    .ppoi_workflow_status()
+                    .awaiting_poi_data
+                    == 1
+                    && handle
+                        .observation()
+                        .ppoi_workflow_status()
+                        .retrying_recovery
+                        == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sender local POI recovery wait state is published");
+        let workflow_before_reset = *handle.observation().ppoi_workflow_status();
         cache_store.fail_next_store();
 
         assert_eq!(

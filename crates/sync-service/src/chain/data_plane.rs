@@ -14,7 +14,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{FixedBytes, U256};
 use local_db::{BlobMeta, DbStore, PoiArtifactCacheRecord, PoiCorpusJournalHeadRecord};
-use merkletree::tree::MerkleProof;
 use poi::artifacts::v4::{Manifest, Scope};
 use poi::cache::{PoiCache, PoiCacheIdentity, PoiCacheJournalDelta, PoiCacheRootValidation};
 use poi::poi::{BlockedShield, PoiStatus};
@@ -45,7 +44,8 @@ use crate::public_cache::{
 use crate::runtime_admission::DbRuntimeLease;
 use crate::txid_cache::{
     TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheTransaction,
-    TxidPublicLatestValidated, txid_public_proof_for_recovered_output,
+    TxidPublicLatestValidated, TxidPublicProof, artifact_bounded_transactions_for_outer_hash,
+    txid_public_artifact_bounded_proof, txid_public_proof_for_recovered_output,
     txid_public_proof_for_recovered_output_at_index, validated_transactions_for_outer_hash,
 };
 use crate::types::{
@@ -183,7 +183,7 @@ impl PublicPoiCorpusKey {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct PublicPoiCorpusHandle {
     local_caches: LocalPoiCaches,
 }
@@ -245,6 +245,12 @@ pub(crate) struct PublicTxidLatestValidated {
 pub(crate) struct PublicTxidTransaction {
     pub txid_index: u64,
     pub transaction: TxidPublicCacheTransaction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicTxidDataAuthority {
+    LatestValidated,
+    ArtifactBounded { txid_index: u64 },
 }
 
 impl From<TxidPublicLatestValidated> for PublicTxidLatestValidated {
@@ -312,14 +318,6 @@ impl PublicTxidProofTarget {
 pub(crate) struct PublicTxidProofRequest {
     pub key: PublicTxidCacheKey,
     pub target: PublicTxidProofTarget,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PublicTxidProof {
-    pub latest_validated: PublicTxidLatestValidated,
-    pub target_txid_index: u64,
-    pub root_txid_index: u64,
-    pub proof: MerkleProof,
 }
 
 #[derive(Clone)]
@@ -1831,6 +1829,40 @@ impl ChainPublicDataPlane {
         })
     }
 
+    pub(crate) fn txid_transactions_for_outer_hash_with_authority(
+        &self,
+        key: &PublicTxidCacheKey,
+        transaction_hash: FixedBytes<32>,
+    ) -> Result<(Vec<PublicTxidTransaction>, PublicTxidDataAuthority), TxidPublicCacheError> {
+        match self.txid_transactions_for_outer_hash(key, transaction_hash) {
+            Ok(rows) if !rows.is_empty() => Ok((rows, PublicTxidDataAuthority::LatestValidated)),
+            Ok(_) | Err(TxidPublicCacheError::CacheNotReady { .. }) => {
+                let entries = artifact_bounded_transactions_for_outer_hash(
+                    self.db.as_ref(),
+                    key.as_cache_key(),
+                    transaction_hash,
+                )?;
+                let bound = TxidPublicCache::new(self.db.as_ref(), key.as_cache_key())
+                    .cached_artifact_txid_index()?
+                    .ok_or(TxidPublicCacheError::CacheNotReady {
+                        next_index: 0,
+                        required_index: 0,
+                    })?;
+                Ok((
+                    entries
+                        .into_iter()
+                        .map(|entry| PublicTxidTransaction {
+                            txid_index: entry.txid_index,
+                            transaction: entry.transaction,
+                        })
+                        .collect(),
+                    PublicTxidDataAuthority::ArtifactBounded { txid_index: bound },
+                ))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub(crate) async fn sync_txid_public_cache(
         &self,
         request: PublicTxidSyncRequest<'_>,
@@ -1851,7 +1883,7 @@ impl ChainPublicDataPlane {
     pub(crate) fn txid_public_proof(
         &self,
         request: &PublicTxidProofRequest,
-    ) -> Result<PublicTxidProof, TxidPublicCacheError> {
+    ) -> Result<TxidPublicProof, TxidPublicCacheError> {
         let key = request.key.as_cache_key();
         let cache = TxidPublicCache::new(self.db.as_ref(), key);
         let latest =
@@ -1889,12 +1921,21 @@ impl ChainPublicDataPlane {
                 "TXID proof extends beyond its validated marker".to_string(),
             ));
         }
-        Ok(PublicTxidProof {
-            latest_validated: latest.into(),
-            target_txid_index: proof.target_txid_index,
-            root_txid_index: proof.root_txid_index,
-            proof: proof.proof,
-        })
+        Ok(proof)
+    }
+
+    pub(crate) fn txid_artifact_bounded_proof(
+        &self,
+        request: &PublicTxidProofRequest,
+    ) -> Result<TxidPublicProof, TxidPublicCacheError> {
+        let (expected_leaf_hash, output_start_global) = request.target.proof_inputs();
+        txid_public_artifact_bounded_proof(
+            self.db.as_ref(),
+            request.key.as_cache_key(),
+            request.target.txid_index(),
+            expected_leaf_hash,
+            output_start_global,
+        )
     }
 
     pub(crate) fn cached_wallet_scan_artifact_chunk(

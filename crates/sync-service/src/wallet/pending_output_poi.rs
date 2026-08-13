@@ -4,8 +4,8 @@ use crate::SenderTransactionCandidate;
 
 use super::{
     BTreeMap, BlindedCommitmentData, CancellationToken, ChainPublicDataPlane,
-    CommitmentObservation, DbStore, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
-    ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant,
+    CommitmentObservation, DEFAULT_TXID_VERSION, DbStore, EVM_CHAIN_TYPE, ExpectedPoiListState,
+    ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant,
     OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
     OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
@@ -16,7 +16,7 @@ use super::{
     WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletHandle, WalletPoiRuntime,
     WalletPpoiWorkflowStatus, WalletPrivateCommit, WalletPrivateMutationAuthority,
     WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletPrivateRemoteError,
-    WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug,
+    WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug, default_active_poi_list_keys,
     new_output_poi_recovery_record, now_epoch_secs, warn,
 };
 
@@ -1499,10 +1499,12 @@ pub(super) async fn apply_poi_private_delta(
     if let Some(client) = authority.apply_client() {
         return client.apply(authority.reset_generation(), delta).await;
     }
-    apply_poi_private_delta_inline(authority, db, cache_store, cfg, delta).await
+    let active_list_keys = default_active_poi_list_keys();
+    apply_poi_private_delta_inline(authority, db, cache_store, cfg, &active_list_keys, delta).await
 }
 
 /// Actor-turn apply of an owned POI delta (sole private writer path).
+#[cfg(test)]
 pub(super) async fn apply_owned_poi_private_delta_on_actor(
     handle: &WalletHandle,
     cancel: &CancellationToken,
@@ -1513,7 +1515,23 @@ pub(super) async fn apply_owned_poi_private_delta_on_actor(
     delta: OwnedPoiPrivateDelta,
 ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
     let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
-    apply_poi_private_delta_inline(&authority, db, cache_store, cfg, delta).await
+    let active_list_keys = default_active_poi_list_keys();
+    apply_poi_private_delta_inline(&authority, db, cache_store, cfg, &active_list_keys, delta).await
+}
+
+/// Actor-turn apply using the actor's current active-list configuration.
+pub(super) async fn apply_owned_poi_private_delta_on_actor_with_active_lists(
+    handle: &WalletHandle,
+    cancel: &CancellationToken,
+    reset_generation: u64,
+    db: &DbStore,
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    delta: OwnedPoiPrivateDelta,
+) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+    let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
+    apply_poi_private_delta_inline(&authority, db, cache_store, cfg, active_list_keys, delta).await
 }
 
 /// Exclusive apply: acquire → fresh snapshot → fold → durable commit → mirrors → drop.
@@ -1523,6 +1541,7 @@ async fn apply_poi_private_delta_inline(
     _db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
     delta: OwnedPoiPrivateDelta,
 ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
     let permit = authority
@@ -1538,15 +1557,19 @@ async fn apply_poi_private_delta_inline(
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
     match delta {
-        OwnedPoiPrivateDelta::SenderCandidateAlreadyValid {
+        OwnedPoiPrivateDelta::SenderCandidateLocallyValid {
             expected_candidate,
-            active_list_keys,
+            corpus,
         } => {
             if active_list_keys.is_empty()
-                || !super::sender_candidate_recovery::sender_candidate_matches_wallet_snapshot(
+                || expected_candidate.chain_id != cfg.chain.chain_id
+                || expected_candidate.wallet_id != cfg.cache_key
+                || super::sender_candidate_recovery::classify_sender_candidate_for_local_retirement(
                     &expected_candidate,
                     &snapshot,
+                    &cfg.scan_keys,
                 )
+                .is_none_or(|classification| classification.external_outputs.is_empty())
             {
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -1567,15 +1590,49 @@ async fn apply_poi_private_delta_inline(
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
             }
+
+            // Keep the corpus revision fence through the final local read and candidate-only
+            // commit.  The wallet permit is acquired first, establishing the lock order.
+            let _revision_fence = corpus.revision_read_fence().await;
+            let classification =
+                super::sender_candidate_recovery::classify_sender_candidate_for_local_retirement(
+                    &expected_candidate,
+                    &snapshot,
+                    &cfg.scan_keys,
+                );
+            let Some(classification) = classification else {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            };
+            let statuses = corpus
+                .status_reader()
+                .pois_per_list(
+                    DEFAULT_TXID_VERSION,
+                    EVM_CHAIN_TYPE,
+                    cfg.chain.chain_id,
+                    active_list_keys,
+                    &classification.external_outputs,
+                )
+                .await
+                .map_err(|_| WalletCacheError::Crypto)?;
+            if !classification.external_outputs.iter().all(|data| {
+                statuses
+                    .get(&data.blinded_commitment)
+                    .is_some_and(|per_list| {
+                        active_list_keys
+                            .iter()
+                            .all(|list_key| per_list.get(list_key) == Some(&PoiStatus::Valid))
+                    })
+            }) {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
             let candidate_delete = [expected_candidate.semantic_id()];
             let workflow_status = wallet_ppoi_workflow_status_after_mutations(
                 cache_store,
                 cfg,
-                &active_list_keys,
-                permit
-                    .ppoi_workflow_status()
-                    .validation_revision
-                    .saturating_add(1),
+                active_list_keys,
+                permit.ppoi_workflow_status().validation_revision,
                 &[],
                 &[],
                 &[],
@@ -1624,7 +1681,7 @@ async fn apply_poi_private_delta_inline(
                     &expected_candidate,
                     &snapshot,
                 )
-                || !public_data_fence.is_current(expected_candidate.semantic_id())
+                || !public_data_fence.is_current(expected_candidate.source.tx_hash)
             {
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -1759,7 +1816,7 @@ async fn apply_poi_private_delta_inline(
             let proof_outputs = proof_outputs.into_iter().collect::<BTreeSet<_>>();
             if proof_outputs.len() != blinded_commitments.len()
                 || proof_outputs != blinded_commitments
-                || !public_data_fence.is_current(expected_candidate.semantic_id())
+                || !public_data_fence.is_current(expected_candidate.source.tx_hash)
             {
                 drop(permit);
                 return Ok(PoiPrivateApplyOutcome::Skipped);

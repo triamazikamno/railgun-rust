@@ -6,8 +6,8 @@ use super::proof::{
 };
 use super::{
     TxidPublicCache, TxidPublicCacheKey, TxidPublicLatestValidated,
-    txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
-    validated_transactions_for_outer_hash,
+    txid_public_artifact_bounded_proof, txid_public_proof_for_recovered_output,
+    txid_public_proof_for_recovered_output_at_index, validated_transactions_for_outer_hash,
 };
 use crate::indexed_artifacts::{
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
@@ -261,7 +261,9 @@ async fn txid_public_cache_isolates_contracts_on_the_same_chain_and_db() {
             .load_or_new_manifest()
             .expect("load contract manifest");
         let page = super::TxidPublicCachePage::from_indexed_transactions(key, 0, vec![row]);
-        manifest.append_page(&permit, &page).expect("append page");
+        manifest
+            .append_page_after_prefix_validation(&permit, &page)
+            .expect("append page");
         super::update_index_for_page(&permit, &page).expect("write contract index");
         manifest.validated_cached_txid_index = Some(0);
         manifest.latest_validated_txid_index = Some(0);
@@ -622,9 +624,12 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
     };
     let cache = TxidPublicCache::new(&db, key);
     let stale = indexed_transaction(0x11, 0x02, 0x01, 0x03);
+    let stale_tail = indexed_transaction(0x12, 0x07, 0x08, 0x09);
     let corrected = indexed_transaction(0x22, 0x04, 0x05, 0x06);
+    let corrected_tail = indexed_transaction(0x23, 0x0a, 0x0b, 0x0c);
+    let corrected_final = indexed_transaction(0x24, 0x0d, 0x0e, 0x0f);
     let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(std::slice::from_ref(&stale)));
+        spawn_graphql_response(public_txid_response(&[stale.clone(), stale_tail]));
 
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
@@ -641,17 +646,32 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
         stale_cached.transaction.transaction_hash,
         stale.transaction_hash
     );
+    let before_manifest = cache
+        .load_manifest()
+        .expect("load manifest before correction")
+        .expect("manifest before correction present");
+    let before_page_ref = before_manifest.pages[0].clone();
+    let before_page_bytes = fs::read(db.resolve_path(&before_page_ref.relative_path))
+        .expect("read page before correction");
 
     let corrected_leaf = corrected.txid_leaf_hash();
-    let corrected_root = root_for_single_leaf(corrected_leaf);
+    let corrected_root = txid_root_for_transactions(&[
+        corrected.clone(),
+        corrected_tail.clone(),
+        corrected_final.clone(),
+    ]);
     let (validated_endpoint, _validated_requests) =
-        spawn_graphql_response(public_txid_response(std::slice::from_ref(&corrected)));
+        spawn_graphql_response(public_txid_response(&[
+            corrected.clone(),
+            corrected_tail.clone(),
+            corrected_final.clone(),
+        ]));
     cache
         .sync(
             &validated_endpoint,
             None,
             TxidPublicLatestValidated {
-                txid_index: 0,
+                txid_index: 2,
                 merkleroot: Some(corrected_root),
             },
         )
@@ -669,7 +689,32 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
         refreshed_row.txid_leaf_hash,
         FixedBytes::from(corrected_leaf.to_be_bytes::<32>())
     );
-    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert_eq!(manifest.validated_cached_txid_index, Some(2));
+    assert_eq!(manifest.next_txid_index, 3);
+    assert_eq!(manifest.pages.len(), 1);
+    assert_ne!(
+        manifest.pages[0].relative_path,
+        before_page_ref.relative_path
+    );
+    assert_eq!(
+        fs::read(db.resolve_path(&before_page_ref.relative_path))
+            .expect("read preserved page after correction"),
+        before_page_bytes
+    );
+    let refreshed_tail = row_for_txid_index(&manifest, &db, 1)
+        .expect("read refreshed tail")
+        .expect("refreshed tail present");
+    assert_eq!(
+        refreshed_tail.transaction.transaction_hash,
+        corrected_tail.transaction_hash
+    );
+    let refreshed_final = row_for_txid_index(&manifest, &db, 2)
+        .expect("read refreshed final row")
+        .expect("refreshed final row present");
+    assert_eq!(
+        refreshed_final.transaction.transaction_hash,
+        corrected_final.transaction_hash
+    );
     assert!(
         index_entries_for_hash(&db, key, stale.transaction_hash)
             .expect("read stale tx hash index")
@@ -686,6 +731,49 @@ async fn txid_public_cache_refreshes_prefetched_rows_when_validated() {
         corrected_cached.transaction.transaction_hash,
         corrected.transaction_hash
     );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_cache_completes_multi_page_graph_tip_append() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = test_cache_key();
+    let page_size = super::TXID_CACHE_PAGE_SIZE.get();
+    let rows = (0..=page_size)
+        .map(|offset| {
+            let offset = offset as u8;
+            indexed_transaction(
+                offset,
+                offset.wrapping_add(1),
+                offset.wrapping_add(2),
+                offset.wrapping_add(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (endpoint, _requests) = spawn_graphql_responses(vec![
+        public_txid_response(&rows[..page_size]),
+        public_txid_response(&rows[page_size..]),
+    ]);
+
+    let fetched = TxidPublicCache::new(&db, key)
+        .sync_to_graph_tip(&endpoint, None)
+        .await
+        .expect("multi-page graph-tip append should complete");
+    assert_eq!(fetched, (page_size + 1) as u64);
+    let manifest = TxidPublicCache::new(&db, key)
+        .load_manifest()
+        .expect("load multi-page manifest")
+        .expect("multi-page manifest present");
+    assert_eq!(manifest.next_txid_index, (page_size + 1) as u64);
+    assert_eq!(manifest.pages.len(), 2);
+    assert_eq!(manifest.pages[0].start_index, 0);
+    assert_eq!(manifest.pages[1].start_index, page_size as u64);
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -901,7 +989,7 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
     let corrected_leaf = corrected.txid_leaf_hash();
     let corrected_root = root_for_single_leaf(corrected_leaf);
     let (prefetch_endpoint, _prefetch_requests) =
-        spawn_graphql_response(public_txid_response(&[stale]));
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&stale)));
 
     cache
         .sync_to_graph_tip(&prefetch_endpoint, None)
@@ -932,6 +1020,15 @@ async fn txid_public_cache_retries_incomplete_validated_refresh_for_same_latest(
         .expect("manifest present");
     assert_eq!(manifest.latest_validated_txid_index, None);
     assert_eq!(manifest.validated_cached_txid_index, None);
+    assert_eq!(manifest.next_txid_index, 1);
+    assert_eq!(
+        row_for_txid_index(&manifest, &db, 0)
+            .expect("read stale row")
+            .expect("stale row present")
+            .transaction
+            .transaction_hash,
+        stale.transaction_hash
+    );
     assert!(
         cache
             .cached_latest_validated()
@@ -1154,6 +1251,59 @@ async fn txid_public_cache_local_sufficiency_waits_for_background_sync_lock() {
         second.transaction_hash
     );
 
+    let changed = indexed_transaction(0x61, 0x07, 0x08, 0x09);
+    let changed_root = root_for_single_leaf(changed.txid_leaf_hash());
+    let changed_chunk =
+        public_txid_artifact_chunk(0, std::slice::from_ref(&changed), Some(changed_root));
+    let (changed_source, _changed_server) = public_txid_artifact_source(vec![changed_chunk]);
+    {
+        let cache = TxidPublicCache::new(db.as_ref(), key);
+        let permit = cache.begin_write().await;
+        let mut manifest = permit
+            .cache()
+            .load_or_new_manifest()
+            .expect("load background replacement manifest");
+        manifest.artifact_cached_txid_index = None;
+        manifest
+            .write_to(&permit)
+            .expect("clear artifact provenance for replacement");
+    }
+    let replaced = TxidPublicCache::new(db.as_ref(), key)
+        .sync_to_indexed_tip(None, None, Some(&changed_source))
+        .await
+        .expect("background artifact replacement succeeds");
+    assert_eq!(replaced, 1);
+    let manifest = TxidPublicCache::new(db.as_ref(), key)
+        .load_manifest()
+        .expect("reload replacement manifest")
+        .expect("replacement manifest present");
+    assert_eq!(manifest.latest_validated_txid_index, None);
+    assert_eq!(manifest.latest_validated_merkleroot, None);
+    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert_eq!(manifest.artifact_cached_txid_index, Some(0));
+    assert_eq!(
+        row_for_txid_index(&manifest, &db, 0)
+            .expect("read replaced row")
+            .expect("replaced row present")
+            .transaction
+            .transaction_hash,
+        changed.transaction_hash
+    );
+    assert!(
+        TxidPublicCache::new(db.as_ref(), key)
+            .cached_latest_validated()
+            .expect("read cleared latest marker")
+            .is_none()
+    );
+    let artifact_rows =
+        super::artifact_bounded_transactions_for_outer_hash(&db, key, changed.transaction_hash)
+            .expect("read artifact-bounded replacement row");
+    assert_eq!(artifact_rows.len(), 1);
+    assert!(matches!(
+        validated_transactions_for_outer_hash(&db, key, changed.transaction_hash),
+        Err(super::TxidPublicCacheError::CacheNotReady { .. })
+    ));
+
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -1184,6 +1334,7 @@ async fn txid_public_cache_rejects_oversized_graph_offset_without_writing_page()
         latest_validated_txid_index: None,
         latest_validated_merkleroot: None,
         validated_cached_txid_index: None,
+        artifact_cached_txid_index: None,
         pages: Vec::new(),
     };
     {
@@ -1216,6 +1367,49 @@ async fn txid_public_cache_rejects_oversized_graph_offset_without_writing_page()
 }
 
 #[tokio::test]
+async fn txid_public_cache_rejects_validated_gap_before_graphql_request() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = test_cache_key();
+    let row = indexed_transaction(0x41, 0x02, 0x01, 0x03);
+    let mut manifest = seed_validated_pages(&db, key, vec![vec![row]]).await;
+    manifest.validated_cached_txid_index = Some(1);
+    {
+        let permit = TxidPublicCache::new(&db, key).begin_write().await;
+        manifest
+            .write_to(&permit)
+            .expect("write gapped validated progress");
+    }
+
+    let (endpoint, requests) = spawn_graphql_response(public_txid_response(&[]));
+    let error = TxidPublicCache::new(&db, key)
+        .sync(
+            &endpoint,
+            None,
+            TxidPublicLatestValidated {
+                txid_index: 2,
+                merkleroot: None,
+            },
+        )
+        .await
+        .expect_err("a validated gap must be rejected before GraphQL");
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::MissingLeaf { index: 1 }
+    ));
+    assert!(
+        requests.recv_timeout(Duration::from_millis(100)).is_err(),
+        "validated gap must not issue a GraphQL request"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -1239,6 +1433,7 @@ async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
         latest_validated_txid_index: Some(0),
         latest_validated_merkleroot: None,
         validated_cached_txid_index: Some(0),
+        artifact_cached_txid_index: None,
         pages: Vec::new(),
     };
     {
@@ -1261,7 +1456,7 @@ async fn txid_public_cached_latest_ignores_rootless_high_water_without_rows() {
 }
 
 #[tokio::test]
-async fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_roots() {
+async fn txid_public_artifact_chunks_materialize_out_of_order() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1294,6 +1489,7 @@ async fn txid_public_artifact_chunks_materialize_out_of_order_with_checkpoint_ro
 
     assert_eq!(applied, 2);
     assert_eq!(manifest.validated_cached_txid_index, Some(1));
+    assert_eq!(manifest.artifact_cached_txid_index, Some(1));
     let first_row = row_for_txid_index(&manifest, &db, 0)
         .expect("read first row")
         .expect("first row present");
@@ -1362,6 +1558,7 @@ async fn txid_public_artifact_apply_ignores_chunks_already_covered_by_progress()
             std::slice::from_ref(&spanning_chunk),
             Some(0),
             Some(root),
+            0,
         )
         .expect("stale spanning artifact chunk should be ignored");
     assert_eq!(stale_bounded_applied, 0);
@@ -1896,7 +2093,7 @@ async fn txid_public_full_range_artifact_root_mismatch_falls_back_to_graphql() {
 }
 
 #[tokio::test]
-async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql() {
+async fn txid_public_corrective_failure_preserves_published_manifest_and_page_bytes() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1929,6 +2126,10 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
         .read(&db, key)
         .expect("read persisted page");
     assert_eq!(before_page.rows.len(), 2);
+    let manifest_path = db.blob_path(super::TXID_CACHE_BLOB_KIND, &super::manifest_file_name(key));
+    let before_manifest_bytes = fs::read(&manifest_path).expect("read persisted manifest blob");
+    let page_path = db.resolve_path(&persisted_page_ref.relative_path);
+    let before_page_bytes = fs::read(&page_path).expect("read persisted page blob");
 
     let artifact_first = indexed_transaction(0x41, 0x07, 0x08, 0x09);
     let artifact_second = indexed_transaction(0x42, 0x0a, 0x0b, 0x0c);
@@ -1938,13 +2139,11 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
         public_txid_artifact_chunk(1, &[artifact_second], Some(FixedBytes::from([0xee; 32])));
     let graph_first = indexed_transaction(0x51, 0x0d, 0x0e, 0x0f);
     let graph_second = indexed_transaction(0x52, 0x10, 0x11, 0x12);
-    let graph_root = txid_root_for_transactions(&[graph_first.clone(), graph_second.clone()]);
-    let (endpoint, requests) = spawn_graphql_response(public_txid_response(&[
-        graph_first.clone(),
-        graph_second.clone(),
-    ]));
+    let graph_root = FixedBytes::from([0x99; 32]);
+    let (endpoint, requests) =
+        spawn_graphql_response(public_txid_response(&[graph_first, graph_second]));
 
-    cache
+    let error = cache
         .sync_with_artifact_chunks(
             &endpoint,
             None,
@@ -1955,28 +2154,60 @@ async fn txid_public_artifact_failure_after_partial_apply_falls_back_to_graphql(
             Some(&[first_chunk, bad_second_chunk]),
         )
         .await
-        .expect("artifact failure before durable progress should fall back to GraphQL");
+        .expect_err("invalid GraphQL correction must fail closed");
+    assert!(matches!(error, super::TxidPublicCacheError::RootMismatch));
     let after_manifest = cache
         .load_manifest()
         .expect("reload manifest")
         .expect("manifest present");
-    assert_eq!(after_manifest.validated_cached_txid_index, Some(1));
-    assert_eq!(after_manifest.latest_validated_merkleroot, Some(graph_root));
+    assert_eq!(
+        after_manifest.next_txid_index,
+        before_manifest.next_txid_index
+    );
+    assert_eq!(
+        after_manifest.validated_cached_txid_index,
+        before_manifest.validated_cached_txid_index
+    );
+    assert_eq!(
+        after_manifest.latest_validated_txid_index,
+        before_manifest.latest_validated_txid_index
+    );
+    assert_eq!(
+        after_manifest.latest_validated_merkleroot,
+        before_manifest.latest_validated_merkleroot
+    );
+    assert_eq!(
+        after_manifest.artifact_cached_txid_index,
+        before_manifest.artifact_cached_txid_index
+    );
+    assert_eq!(after_manifest.pages.len(), before_manifest.pages.len());
+    assert_eq!(
+        after_manifest.pages[0].relative_path,
+        persisted_page_ref.relative_path
+    );
     let after_page = after_manifest.pages[0]
         .read(&db, key)
-        .expect("read fallback page");
+        .expect("read preserved page");
     assert_eq!(after_page.rows.len(), 2);
     assert_eq!(
         after_page.rows[0].transaction.transaction_hash,
-        graph_first.transaction_hash
+        old_first.transaction_hash
     );
     assert_eq!(
         after_page.rows[1].transaction.transaction_hash,
-        graph_second.transaction_hash
+        old_second.transaction_hash
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("read preserved manifest blob"),
+        before_manifest_bytes
+    );
+    assert_eq!(
+        fs::read(&page_path).expect("read preserved page blob"),
+        before_page_bytes
     );
     let request = requests
         .recv_timeout(Duration::from_secs(5))
-        .expect("GraphQL fallback request received");
+        .expect("corrective GraphQL request received");
     assert!(request.contains("PublicTxidPage"));
 
     drop(db);
@@ -2696,70 +2927,7 @@ async fn txid_public_background_does_not_fetch_prior_only_catalog() {
 }
 
 #[tokio::test]
-async fn txid_public_background_skips_prior_tail_after_progress() {
-    let root_dir = temp_db_root();
-    let db = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-    let key = TxidPublicCacheKey {
-        chain_type: 0,
-        chain_id: 1,
-        railgun_contract: artifact_scope().railgun_contract,
-        txid_version: TEST_TXID_VERSION,
-    };
-    let cache = TxidPublicCache::new(&db, key);
-    let first = indexed_transaction(0x64, 0x02, 0x01, 0x03);
-    let second = indexed_transaction(0x65, 0x04, 0x05, 0x06);
-    let prefix_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
-    let seed_chunk =
-        public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(prefix_root));
-    let (seed_source, _seed_server) = public_txid_artifact_source(vec![seed_chunk]);
-    cache
-        .sync_with_artifact_source(
-            None,
-            None,
-            TxidPublicLatestValidated {
-                txid_index: 1,
-                merkleroot: Some(prefix_root),
-            },
-            Some(&seed_source),
-        )
-        .await
-        .expect("seed validated artifact progress");
-
-    let first_root = root_for_single_leaf(first.txid_leaf_hash());
-    let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
-    let retained_cid = raw_cid(&prior_tail.bytes).to_string();
-    let current_tail =
-        public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
-    let (retention_source, _retention_server) = public_txid_artifact_source_with_catalogs(vec![
-        (1, vec![prior_tail.clone()]),
-        (2, vec![prior_tail, current_tail]),
-    ]);
-
-    let fetched = cache
-        .sync_to_indexed_tip(None, None, Some(&retention_source))
-        .await
-        .expect("background pass should not need current rows");
-
-    assert_eq!(fetched, 0);
-    assert!(
-        db.get_blob_meta(
-            super::TXID_CACHE_BLOB_KIND,
-            &super::artifact_chunk_blob_id(key, &retained_cid),
-        )
-        .expect("read prior-tail chunk metadata")
-        .is_none(),
-        "no-progress background sync must not fetch prior tails"
-    );
-
-    drop(db);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
-async fn txid_public_background_skips_prior_tail_with_graphql_fallback_configured() {
+async fn txid_public_background_artifact_provenance_skips_prior_tail_and_graphql() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -2790,36 +2958,69 @@ async fn txid_public_background_skips_prior_tail_with_graphql_fallback_configure
         )
         .await
         .expect("seed validated artifact progress");
+    let manifest = cache
+        .load_manifest()
+        .expect("load artifact manifest")
+        .expect("artifact manifest present");
+    assert_eq!(manifest.artifact_cached_txid_index, Some(1));
 
     let first_root = root_for_single_leaf(first.txid_leaf_hash());
     let prior_tail = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
     let retained_cid = raw_cid(&prior_tail.bytes).to_string();
+    let retained_id = super::artifact_chunk_blob_id(key, &retained_cid);
     let current_tail =
         public_txid_artifact_chunk(1, std::slice::from_ref(&second), Some(prefix_root));
     let (retention_source, _retention_server) = public_txid_artifact_source_with_catalogs(vec![
         (1, vec![prior_tail.clone()]),
         (2, vec![prior_tail, current_tail]),
     ]);
-    let (graph_endpoint, graph_requests) = spawn_graphql_response(public_txid_response(&[]));
 
+    let fetched = cache
+        .sync_to_indexed_tip(None, None, Some(&retention_source))
+        .await
+        .expect("no-progress background pass should complete");
+
+    assert_eq!(fetched, 0);
+    assert!(
+        db.get_blob_meta(super::TXID_CACHE_BLOB_KIND, &retained_id)
+            .expect("read prior-tail chunk metadata")
+            .is_none(),
+        "no-progress background sync must not fetch prior tails"
+    );
+
+    let (graph_endpoint, graph_requests) = spawn_graphql_response(public_txid_response(&[]));
     let fetched = cache
         .sync_to_indexed_tip(Some(&graph_endpoint), None, Some(&retention_source))
         .await
-        .expect("no-progress GraphQL fallback should complete");
+        .expect("configured GraphQL background pass should complete");
 
     assert_eq!(fetched, 0);
-    let request = graph_requests
-        .recv_timeout(Duration::from_secs(5))
-        .expect("GraphQL fallback request received");
-    assert!(request.contains("PublicTxidPage"));
     assert!(
-        db.get_blob_meta(
-            super::TXID_CACHE_BLOB_KIND,
-            &super::artifact_chunk_blob_id(key, &retained_cid),
-        )
-        .expect("read prior-tail chunk metadata")
-        .is_none(),
-        "GraphQL fallback must not trigger prior-tail retention"
+        graph_requests
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "an empty artifact plan must not query configured GraphQL"
+    );
+    assert!(
+        db.get_blob_meta(super::TXID_CACHE_BLOB_KIND, &retained_id)
+            .expect("read prior-tail chunk metadata after configured pass")
+            .is_none(),
+        "configured GraphQL must not trigger prior-tail retention"
+    );
+
+    let (empty_source, _empty_server) = public_txid_empty_artifact_source();
+    let (empty_endpoint, empty_requests) = spawn_graphql_response(public_txid_response(&[]));
+    let fetched = cache
+        .sync_to_indexed_tip(Some(&empty_endpoint), None, Some(&empty_source))
+        .await
+        .expect("empty artifact background pass should complete");
+
+    assert_eq!(fetched, 0);
+    assert!(
+        empty_requests
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "empty artifact mode must not query configured GraphQL"
     );
 
     drop(db);
@@ -3182,6 +3383,65 @@ async fn txid_public_cache_skips_unavailable_artifact_when_local_cache_is_suffic
 }
 
 #[tokio::test]
+async fn txid_public_artifact_bounded_proof_survives_restart_and_stops_at_bound() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = test_cache_key();
+    let first = indexed_transaction(0x61, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x62, 0x04, 0x05, 0x06);
+    let second_leaf = second.txid_leaf_hash();
+    let second_output_start = second.output_start_global();
+    let root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let chunk = public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(root));
+    let (source, _server) = public_txid_artifact_source(vec![chunk]);
+    let cache = TxidPublicCache::new(&db, key);
+
+    cache
+        .sync_to_indexed_tip(None, None, Some(&source))
+        .await
+        .expect("apply verified artifact bound");
+    let proof = txid_public_artifact_bounded_proof(
+        &db,
+        key,
+        None,
+        first.txid_leaf_hash(),
+        first.output_start_global(),
+    )
+    .expect("unknown target should use artifact bound");
+    assert_eq!(proof.root_txid_index, 1);
+
+    drop(db);
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen db");
+    let proof =
+        txid_public_artifact_bounded_proof(&db, key, Some(1), second_leaf, second_output_start)
+            .expect("known target should use artifact bound after restart");
+    assert_eq!(proof.root_txid_index, 1);
+    let after_bound = txid_public_artifact_bounded_proof(
+        &db,
+        key,
+        Some(2),
+        first.txid_leaf_hash(),
+        first.output_start_global(),
+    );
+    assert!(matches!(
+        after_bound,
+        Err(super::TxidPublicCacheError::CacheNotReady {
+            required_index: 2,
+            ..
+        })
+    ));
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn txid_public_cache_accepts_rootless_same_index_latest_from_local_rows() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
@@ -3307,7 +3567,7 @@ async fn txid_public_cache_skips_unavailable_artifact_when_background_cache_is_s
 }
 
 #[tokio::test]
-async fn txid_public_cache_rollback_without_root_clamps_validated_progress() {
+async fn txid_public_cache_rollback_preserves_persisted_suffix_and_artifact_provenance() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3323,7 +3583,9 @@ async fn txid_public_cache_rollback_without_root_clamps_validated_progress() {
     let first = indexed_transaction(0x41, 0x02, 0x01, 0x03);
     let second = indexed_transaction(0x42, 0x04, 0x05, 0x06);
     let root = txid_root_for_transactions(&[first.clone(), second.clone()]);
-    let artifact_chunk = public_txid_artifact_chunk(0, &[first.clone(), second], Some(root));
+    let rollback_root = root_for_single_leaf(first.txid_leaf_hash());
+    let artifact_chunk =
+        public_txid_artifact_chunk(0, &[first.clone(), second.clone()], Some(root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![artifact_chunk]);
 
     cache
@@ -3346,31 +3608,97 @@ async fn txid_public_cache_rollback_without_root_clamps_validated_progress() {
             None,
             TxidPublicLatestValidated {
                 txid_index: 0,
-                merkleroot: None,
+                merkleroot: Some(rollback_root),
             },
             Some(&unavailable_source),
         )
         .await
-        .expect("sufficient local cache should satisfy lower rootless latest");
+        .expect("sufficient local cache should satisfy lower latest");
 
     let manifest = cache
         .load_manifest()
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.latest_validated_txid_index, Some(0));
-    assert_eq!(manifest.latest_validated_merkleroot, None);
+    assert_eq!(manifest.latest_validated_merkleroot, Some(rollback_root));
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
-    let proof =
-        txid_public_proof_for_recovered_output(&db, key, first.txid_leaf_hash(), 0, 0, None)
-            .expect("clamped validated prefix should still be usable");
+    assert_eq!(manifest.artifact_cached_txid_index, Some(1));
+    assert_eq!(manifest.next_txid_index, 2);
+    assert!(
+        row_for_txid_index(&manifest, &db, 1)
+            .expect("read retained suffix")
+            .is_some_and(|row| row.transaction.transaction_hash == second.transaction_hash)
+    );
+    assert_eq!(
+        index_entries_for_hash(&db, key, second.transaction_hash)
+            .expect("read retained suffix index")
+            .len(),
+        1
+    );
+    let proof = txid_public_proof_for_recovered_output(
+        &db,
+        key,
+        first.txid_leaf_hash(),
+        0,
+        0,
+        Some(rollback_root),
+    )
+    .expect("clamped validated prefix should still be usable");
     assert_eq!(proof.target_txid_index, 0);
+
+    drop(db);
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen db after rollback");
+    let cache = TxidPublicCache::new(&db, key);
+    let manifest = cache
+        .load_manifest()
+        .expect("load reopened manifest")
+        .expect("reopened manifest present");
+    assert_eq!(manifest.artifact_cached_txid_index, Some(1));
+    assert_eq!(manifest.next_txid_index, 2);
+    assert!(
+        row_for_txid_index(&manifest, &db, 1)
+            .expect("read reopened retained suffix")
+            .is_some_and(|row| row.transaction.transaction_hash == second.transaction_hash)
+    );
+
+    let canonical = indexed_transaction(0x43, 0x07, 0x08, 0x09);
+    let (endpoint, _requests) =
+        spawn_graphql_response(public_txid_response(std::slice::from_ref(&canonical)));
+    cache
+        .sync_to_graph_tip(&endpoint, None)
+        .await
+        .expect("reacquire canonical row after rollback");
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest after canonical reacquisition")
+        .expect("manifest after canonical reacquisition present");
+    assert_eq!(manifest.next_txid_index, 3);
+    assert_eq!(
+        row_for_txid_index(&manifest, &db, 1)
+            .expect("read retained suffix after append")
+            .expect("retained suffix present")
+            .transaction
+            .transaction_hash,
+        second.transaction_hash
+    );
+    assert_eq!(
+        row_for_txid_index(&manifest, &db, 2)
+            .expect("read appended canonical row")
+            .expect("appended canonical row present")
+            .transaction
+            .transaction_hash,
+        canonical.transaction_hash
+    );
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]
-async fn txid_public_cache_rejects_root_mismatched_high_water_without_correction() {
+async fn txid_public_cache_returns_not_ready_for_root_mismatch_without_correction() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3416,16 +3744,23 @@ async fn txid_public_cache_rejects_root_mismatched_high_water_without_correction
             Some(&empty_source),
         )
         .await
-        .expect_err("mismatched high-water cache should require a corrective source");
-    assert!(matches!(error, super::TxidPublicCacheError::RootMismatch));
+        .expect_err("mismatched high-water cache should remain not ready without correction");
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        }
+    ));
 
     let manifest = cache
         .load_manifest()
         .expect("load manifest")
         .expect("manifest present");
-    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert_eq!(manifest.validated_cached_txid_index, None);
     assert_eq!(manifest.latest_validated_txid_index, None);
     assert_eq!(manifest.latest_validated_merkleroot, None);
+    assert_eq!(manifest.artifact_cached_txid_index, None);
     let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read stale row")
         .expect("stale row present");
@@ -3467,10 +3802,7 @@ async fn txid_public_cache_background_falls_back_to_graphql_after_zero_artifact_
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.next_txid_index, 1);
-    let row = row_for_txid_index(&manifest, &db, 0)
-        .expect("read fallback row")
-        .expect("fallback row present");
-    assert_eq!(row.transaction.transaction_hash, graph_row.transaction_hash);
+    assert_eq!(manifest.artifact_cached_txid_index, None);
     let request = graph_requests
         .recv_timeout(Duration::from_secs(5))
         .expect("GraphQL fallback request received");
@@ -3520,6 +3852,7 @@ async fn txid_public_cache_truncates_artifact_chunk_past_latest_validated() {
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert_eq!(manifest.artifact_cached_txid_index, Some(0));
     assert_eq!(manifest.next_txid_index, 1);
     let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read validated prefix row")
@@ -3536,7 +3869,62 @@ async fn txid_public_cache_truncates_artifact_chunk_past_latest_validated() {
 }
 
 #[tokio::test]
-async fn txid_public_cache_artifact_only_truncates_spanning_chunk_to_validated_prefix() {
+async fn txid_public_artifact_prefix_survives_squid_tail_failure() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = test_cache_key();
+    let first = indexed_transaction(0x41, 0x02, 0x01, 0x03);
+    let second = indexed_transaction(0x42, 0x04, 0x05, 0x06);
+    let first_root = root_for_single_leaf(first.txid_leaf_hash());
+    let latest_root = txid_root_for_transactions(&[first.clone(), second]);
+    let first_chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&first), Some(first_root));
+    let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![first_chunk]);
+    let (endpoint, _requests) = spawn_graphql_response(public_txid_response(&[]));
+    let cache = TxidPublicCache::new(&db, key);
+
+    let error = cache
+        .sync_with_artifact_source(
+            Some(&endpoint),
+            None,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(latest_root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect_err("missing Squid tail must fail after artifact prefix progress");
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 1,
+            required_index: 1,
+        }
+    ));
+    let manifest = cache
+        .load_manifest()
+        .expect("load manifest")
+        .expect("artifact prefix manifest persisted");
+    assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert_eq!(manifest.artifact_cached_txid_index, Some(0));
+    assert_eq!(
+        row_for_txid_index(&manifest, &db, 0)
+            .expect("read artifact prefix")
+            .expect("artifact prefix row present")
+            .transaction
+            .transaction_hash,
+        first.transaction_hash
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_cache_artifact_only_partial_prefix_has_no_provenance_marker() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3555,7 +3943,7 @@ async fn txid_public_cache_artifact_only_truncates_spanning_chunk_to_validated_p
     let spanning_chunk = public_txid_artifact_chunk(0, &[first.clone(), second], Some(chunk_root));
     let (artifact_source, _artifact_server) = public_txid_artifact_source(vec![spanning_chunk]);
 
-    cache
+    let error = cache
         .sync_with_artifact_source(
             None,
             None,
@@ -3566,13 +3954,21 @@ async fn txid_public_cache_artifact_only_truncates_spanning_chunk_to_validated_p
             Some(&artifact_source),
         )
         .await
-        .expect("artifact-only spanning chunk should populate validated prefix");
+        .expect_err("artifact-only partial progress needs an authoritative bounded root");
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 0,
+            required_index: 0,
+        }
+    ));
 
     let manifest = cache
         .load_manifest()
         .expect("load manifest")
         .expect("manifest present");
     assert_eq!(manifest.validated_cached_txid_index, Some(0));
+    assert_eq!(manifest.artifact_cached_txid_index, None);
     assert_eq!(manifest.next_txid_index, 1);
     let row = row_for_txid_index(&manifest, &db, 0)
         .expect("read validated prefix row")
@@ -3621,6 +4017,27 @@ async fn txid_public_cache_artifact_only_advances_from_inside_chunk() {
         .expect("seed artifact-only validated row");
 
     let chunk_root = txid_root_for_transactions(&[first.clone(), second.clone()]);
+    let (empty_source, _empty_server) = public_txid_empty_artifact_source();
+    let error = cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            TxidPublicLatestValidated {
+                txid_index: 1,
+                merkleroot: Some(chunk_root),
+            },
+            Some(&empty_source),
+        )
+        .await
+        .expect_err("short artifact marker should retry after available progress is exhausted");
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::CacheNotReady {
+            next_index: 1,
+            required_index: 1,
+        }
+    ));
+
     let covering_chunk = public_txid_artifact_chunk(0, &[first, second.clone()], Some(chunk_root));
     let (covering_source, _covering_server) = public_txid_artifact_source(vec![covering_chunk]);
     cache
@@ -3709,6 +4126,54 @@ async fn txid_public_cache_artifact_only_refreshes_changed_validated_root() {
         .expect("read refreshed row")
         .expect("refreshed row present");
     assert_eq!(row.transaction.transaction_hash, new_row.transaction_hash);
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn txid_public_legacy_markerless_cache_fetches_artifacts_from_zero() {
+    let root_dir = temp_db_root();
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let key = test_cache_key();
+    let row = indexed_transaction(0xa1, 0x02, 0x01, 0x03);
+    let root = root_for_single_leaf(row.txid_leaf_hash());
+    let chunk = public_txid_artifact_chunk(0, std::slice::from_ref(&row), Some(root));
+    let (artifact_source, artifact_server) = public_txid_artifact_source(vec![chunk]);
+    let cache = TxidPublicCache::new(&db, key);
+
+    seed_validated_pages(&db, key, vec![vec![row.clone()]]).await;
+
+    cache
+        .sync_with_artifact_source(
+            None,
+            None,
+            TxidPublicLatestValidated {
+                txid_index: 0,
+                merkleroot: Some(root),
+            },
+            Some(&artifact_source),
+        )
+        .await
+        .expect("legacy markerless cache should establish artifact provenance");
+
+    let manifest = cache
+        .load_manifest()
+        .expect("load migrated manifest")
+        .expect("migrated manifest present");
+    assert_eq!(manifest.artifact_cached_txid_index, Some(0));
+    assert_eq!(
+        row_for_txid_index(&manifest, &db, 0)
+            .expect("read migrated row")
+            .expect("migrated row present")
+            .transaction
+            .transaction_hash,
+        row.transaction_hash
+    );
+    assert!(artifact_server.request_count_excluding(&["/manifest"]) > 0);
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -4036,6 +4501,27 @@ fn test_cache_key() -> TxidPublicCacheKey<'static> {
     }
 }
 
+#[test]
+fn txid_public_cache_root_conflict_above_artifact_bound_preserves_provenance() {
+    let key = test_cache_key();
+    let mut manifest: super::TxidPublicCacheManifest = key.into();
+    manifest.validated_cached_txid_index = Some(5);
+    manifest.latest_validated_txid_index = Some(5);
+    manifest.latest_validated_merkleroot = Some(FixedBytes::from([0x11; 32]));
+    manifest.artifact_cached_txid_index = Some(2);
+
+    assert!(
+        manifest.reconcile_validated_progress_for_latest(TxidPublicLatestValidated {
+            txid_index: 5,
+            merkleroot: Some(FixedBytes::from([0x22; 32])),
+        })
+    );
+    assert_eq!(manifest.latest_validated_txid_index, None);
+    assert_eq!(manifest.latest_validated_merkleroot, None);
+    assert_eq!(manifest.validated_cached_txid_index, Some(2));
+    assert_eq!(manifest.artifact_cached_txid_index, Some(2));
+}
+
 async fn seed_validated_pages(
     db: &DbStore,
     key: TxidPublicCacheKey<'_>,
@@ -4053,7 +4539,9 @@ async fn seed_validated_pages(
         let row_count = transactions.len() as u64;
         let page =
             super::TxidPublicCachePage::from_indexed_transactions(key, start_index, transactions);
-        manifest.append_page(&permit, &page).expect("append page");
+        manifest
+            .append_page_after_prefix_validation(&permit, &page)
+            .expect("append page");
         super::update_index_for_page(&permit, &page).expect("update advisory index");
         start_index += row_count;
     }
@@ -4704,6 +5192,34 @@ fn spawn_graphql_response(response_body: String) -> (Url, mpsc::Receiver<String>
         stream
             .write_all(response.as_bytes())
             .expect("write response");
+    });
+    (url, rx)
+}
+
+fn spawn_graphql_responses(response_bodies: Vec<String>) -> (Url, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let url = Url::parse(&format!(
+        "http://{}/graphql",
+        listener.local_addr().expect("local addr")
+    ))
+    .expect("mock url");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for response_body in response_bodies {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            tx.send(request).expect("send request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
     });
     (url, rx)
 }
