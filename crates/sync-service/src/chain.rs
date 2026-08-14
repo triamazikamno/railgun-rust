@@ -84,6 +84,7 @@ use indexed_wallet::{
 use logs::{anchor_file_name, fetch_logs_for_range_with_provider, parse_anchor_block, sort_logs};
 use merkle_artifacts::run_merkle_artifact_catch_up_into;
 pub(crate) use service::PreparedChainService;
+use service::WalletIndexedTailFallbackResult;
 use types::{
     EVM_CHAIN_TYPE, ForestReorgDecision, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind,
     PendingTipWalletRegistration, TXID_PUBLIC_CACHE_SYNC_INTERVAL, WalletIndexedCatchUpStatusGuard,
@@ -95,6 +96,17 @@ use workers::{
     spawn_txid_public_cache_loop, spawn_wallet_lag_fallback_loop,
     wallet_finish_result_removes_cursor, wallet_finish_retry_request,
 };
+
+async fn await_wallet_cancellation<F, T>(cancel: &CancellationToken, future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        () = cancel.cancelled() => None,
+        output = &mut future => Some(output),
+    }
+}
 
 pub use data_plane::{
     ChainPublicSyncCacheReset, LocalPoiQueryUnavailable, LocalPoiRootValidation,

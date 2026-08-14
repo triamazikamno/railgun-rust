@@ -41,8 +41,8 @@ use super::data_plane::{PublicScanCoverageWrite, PublicScanRows};
 use super::indexed_wallet::{complete_stream_checkpoint, wallet_startup_hedge_block_count};
 use super::logs::combined_log_event_signatures_for_range;
 use super::service::{
-    WalletShortStartupPlan, await_live_log_task_shutdown, wait_for_startup_sync_target,
-    wait_for_wallet_ready,
+    IndexedWalletCatchUpOutcome, WalletShortStartupPlan, await_live_log_task_shutdown,
+    wait_for_startup_sync_target, wait_for_wallet_ready,
 };
 use super::workers::{
     WalletBackfillSlot, drain_pending_backfill_requests, pending_tip_from_block,
@@ -5785,6 +5785,190 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
 }
 
 #[tokio::test]
+async fn wallet_retirement_interrupts_active_rpc_backfill_and_reuses_coordinator() {
+    let root_dir = temp_db_root("wallet-retirement-active-rpc");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let (rpc, blocked) = JsonRpcServer::spawn_with_blocked_response(vec![serde_json::json!([])], 0);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.block_range = 10;
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let (service, backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    let registered =
+        install_test_backfill_actor(&service, &scope, rpc.url.clone(), "retired").await;
+    let actor_cancel = service
+        .wallet
+        .read()
+        .await
+        .as_ref()
+        .expect("registered wallet")
+        .cancel
+        .clone();
+    let (_safe_head_tx, safe_head_rx) = watch::channel(110);
+    let loop_cancel = CancellationToken::new();
+    spawn_backfill_loop(
+        Arc::clone(&service),
+        backfill_rx,
+        Arc::clone(&rpcs),
+        None,
+        safe_head_rx,
+        loop_cancel.clone(),
+    );
+
+    let (wallet_tx, mut wallet_rx) = mpsc::channel(1);
+    let (liveness, mut retirement) = oneshot::channel();
+    let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
+        WalletSyncToken::for_test(1, registered.actor_id(), 0, SYNTHETIC_BACKFILL_JOB_ID),
+        wallet_tx,
+        liveness,
+        actor_cancel,
+    )
+    .activate();
+    service
+        .backfill_tx
+        .send(BackfillRequest::add(
+            registered.cache_key.as_str(),
+            100,
+            110,
+            false,
+            100,
+            driver,
+        ))
+        .await
+        .expect("queue active backfill");
+    wait_for_std_signal(blocked.request_started, "active RPC request started").await;
+
+    let unregistering = tokio::spawn({
+        let service = Arc::clone(&service);
+        let registered = registered.clone();
+        async move { service.unregister_wallet(&registered).await }
+    });
+    let signal = tokio::time::timeout(Duration::from_secs(1), &mut retirement)
+        .await
+        .expect("active driver retirement signalled")
+        .expect("active driver retirement signal received");
+    assert_eq!(
+        signal.disposition,
+        WalletBackfillOwnerDisposition::BenignRetirement
+    );
+    signal
+        .acknowledgement
+        .expect("active retirement acknowledgement")
+        .send(())
+        .expect("acknowledge active driver retirement");
+    tokio::time::timeout(Duration::from_secs(1), unregistering)
+        .await
+        .expect("wallet retirement completes while RPC is blocked")
+        .expect("wallet retirement task joins");
+
+    blocked
+        .release
+        .send(())
+        .expect("release retired RPC request");
+    assert!(
+        wallet_rx.try_recv().is_err(),
+        "retired RPC must not reach actor"
+    );
+
+    let mut successor_cfg = test_wallet_config(&scope, rpc.url);
+    successor_cfg.cache_key = test_cache_key("retirement-successor");
+    successor_cfg.sync_to_block = Some(0);
+    successor_cfg.use_indexed_wallet_catch_up = false;
+    let successor = service
+        .register_wallet(successor_cfg)
+        .await
+        .expect("successor admission after active RPC retirement");
+    assert_ne!(successor.actor_id(), registered.actor_id());
+    service.unregister_wallet(&successor).await;
+    loop_cancel.cancel();
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn indexed_catch_up_cancellation_is_typed_after_driver_acceptance() {
+    let scope = test_scope();
+    let probe = r#"{"data":{"squidStatus":{"height":"110"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#;
+    let (squid, blocked) = GraphqlServer::spawn_owned_with_blocked_response(
+        vec![
+            probe.to_string(),
+            indexed_wallet_nullifier_page(101, U256::ZERO),
+        ],
+        1,
+    );
+    let context = IndexedCatchUpTestContext::new(&scope, squid.url.clone(), None, 100, 100).await;
+    let service = Arc::clone(&context.service);
+    let cfg = context.wallet_cfg.clone();
+    let handle = context.handle.clone();
+    let cancel = context.cancel.clone();
+    let sender = context.wallet_backfill_tx.clone();
+    let catch_up = tokio::spawn(async move {
+        service
+            .indexed_wallet_catch_up_outcome(
+                &cfg,
+                0,
+                100,
+                110,
+                &handle,
+                &cancel,
+                IndexedWalletCatchUpSourceOrder::SquidFirst,
+                true,
+                (
+                    &sender,
+                    crate::types::WalletSchedulableProgress {
+                        last_scanned: 100,
+                        reset_generation: 0,
+                    },
+                ),
+            )
+            .await
+    });
+    wait_for_std_signal(blocked.request_started, "indexed page request started").await;
+    context.cancel.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(1), catch_up)
+        .await
+        .expect("indexed cancellation returns while page is blocked")
+        .expect("indexed catch-up task joins");
+    assert_eq!(outcome, IndexedWalletCatchUpOutcome::Cancelled(100));
+    assert!(
+        context
+            .handle
+            .last_scanned()
+            .is_none_or(|last_scanned| last_scanned <= 100)
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while context.handle.indexed_catch_up_rx.borrow().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled indexed status clears");
+    blocked
+        .release
+        .send(())
+        .expect("release cancelled indexed page");
+    context.cleanup();
+}
+
+#[tokio::test]
 async fn wallet_snapshot_does_not_fetch_optional_prior_endpoint() {
     let BlockedWalletOptionalMaintenanceFixture {
         root_dir,
@@ -8016,8 +8200,8 @@ fn handle_graphql_request(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.len()
     );
-    stream.write_all(headers.as_bytes()).expect("write headers");
-    stream.write_all(response.as_bytes()).expect("write body");
+    let _ = stream.write_all(headers.as_bytes());
+    let _ = stream.write_all(response.as_bytes());
 }
 
 fn handle_json_rpc_request(

@@ -24,6 +24,7 @@ use tokio::sync::{
     OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, mpsc,
     oneshot, watch,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use url::Url;
 
@@ -2344,6 +2345,7 @@ struct WalletBackfillOwner {
     token: WalletSyncToken,
     sender: mpsc::Sender<BackfillEvent>,
     liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
+    cancel: CancellationToken,
 }
 
 impl WalletBackfillOwner {
@@ -2373,7 +2375,7 @@ pub(crate) struct WalletSyncTargetLease {
 }
 
 impl WalletSyncTargetLease {
-    pub(crate) const fn for_actor_accepted_job(
+    pub(crate) fn for_actor_accepted_job(
         token: WalletSyncToken,
         sender: mpsc::Sender<BackfillEvent>,
         liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
@@ -2383,6 +2385,7 @@ impl WalletSyncTargetLease {
                 token,
                 sender,
                 liveness,
+                cancel: CancellationToken::new(),
             }),
         }
     }
@@ -2405,16 +2408,27 @@ impl PartialEq for WalletBackfillGrant {
 impl Eq for WalletBackfillGrant {}
 
 impl WalletBackfillGrant {
-    pub(crate) const fn for_actor_accepted_job(
+    #[cfg(test)]
+    pub(crate) fn for_actor_accepted_job(
         token: WalletSyncToken,
         sender: mpsc::Sender<BackfillEvent>,
         liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
+    ) -> Self {
+        Self::for_actor_accepted_job_with_cancel(token, sender, liveness, CancellationToken::new())
+    }
+
+    pub(crate) const fn for_actor_accepted_job_with_cancel(
+        token: WalletSyncToken,
+        sender: mpsc::Sender<BackfillEvent>,
+        liveness: oneshot::Sender<WalletBackfillOwnerSignal>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             inner: Some(WalletBackfillOwner {
                 token,
                 sender,
                 liveness,
+                cancel,
             }),
         }
     }
@@ -2502,6 +2516,10 @@ impl WalletBackfillDriver {
 
     pub(crate) const fn sender(&self) -> &mpsc::Sender<BackfillEvent> {
         &self.inner().sender
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.inner().cancel.clone()
     }
 
     pub(crate) async fn apply(

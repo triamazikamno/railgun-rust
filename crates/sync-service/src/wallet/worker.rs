@@ -2115,10 +2115,11 @@ pub(crate) async fn prepare_wallet_worker(
                                 let (liveness, receiver) = oneshot::channel();
                                 accepted_backfill_liveness
                                     .push(accepted_backfill_owner_dropped(token, receiver));
-                                let driver = WalletBackfillGrant::for_actor_accepted_job(
+                                let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                     token,
                                     backfill_sender.clone(),
                                     liveness,
+                                    cancel.clone(),
                                 )
                                 .activate();
                                 let request = BackfillRequest::add(
@@ -3391,11 +3392,12 @@ pub(crate) async fn prepare_wallet_worker(
                             let result = WalletBackfillStartResult::Accepted {
                                 committed_to: last_scanned,
                                 target_block,
-                                grant: WalletBackfillGrant::for_actor_accepted_job(
-                                    token,
-                                    backfill_sender.clone(),
-                                    liveness,
-                                ),
+                                    grant: WalletBackfillGrant::for_actor_accepted_job_with_cancel(
+                                        token,
+                                        backfill_sender.clone(),
+                                        liveness,
+                                        cancel.clone(),
+                                    ),
                             };
                             match response.send(result) {
                                 Ok(()) => {
@@ -3840,10 +3842,11 @@ pub(crate) async fn prepare_wallet_worker(
                                 let (liveness, receiver) = oneshot::channel();
                                 accepted_backfill_liveness
                                     .push(accepted_backfill_owner_dropped(token, receiver));
-                                let driver = WalletBackfillGrant::for_actor_accepted_job(
+                                let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                     token,
                                     backfill_sender.clone(),
                                     liveness,
+                                    cancel.clone(),
                                 )
                                 .activate();
                                 match backfill_tx.try_send(BackfillRequest::add(
@@ -3960,10 +3963,11 @@ pub(crate) async fn prepare_wallet_worker(
                                     accepted_backfill_liveness.push(
                                         accepted_backfill_owner_dropped(live_token, receiver),
                                     );
-                                    let driver = WalletBackfillGrant::for_actor_accepted_job(
+                                    let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                         live_token,
                                         backfill_sender.clone(),
                                         liveness,
+                                        cancel.clone(),
                                     )
                                     .activate();
                                     let retry = BackfillRequest::add(

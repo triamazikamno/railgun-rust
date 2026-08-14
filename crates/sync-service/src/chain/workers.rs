@@ -7,8 +7,9 @@ use super::{
     WalletBackfillDriver, WalletBackfillFinishResult, WalletBackfillRejectReason,
     WalletBackfillStartResult, WalletHandle, WalletReadinessError, WalletScanAcquisitionCandidate,
     WalletScanAcquisitionOutcome, WalletScanApply, WalletScanInputRows, WalletScanRows,
-    WalletScanRowsPayload, WalletTailFallbackState, debug, info, min, mpsc, sort_logs,
-    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_sync_target, warn, watch,
+    WalletScanRowsPayload, WalletTailFallbackState, await_wallet_cancellation, debug, info, min,
+    mpsc, sort_logs, wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_sync_target,
+    warn, watch,
 };
 
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
@@ -260,6 +261,7 @@ struct WalletLagFallbackCandidate {
     follow_safe_head: bool,
     sender: mpsc::Sender<BackfillEvent>,
     handle: WalletHandle,
+    cancel: CancellationToken,
 }
 
 pub(super) struct WalletBackfillSlot {
@@ -334,61 +336,79 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                             stalled_secs = INDEXED_TAIL_FALLBACK_MIN_STALL.as_secs(),
                             "indexed wallet ready-tail fallback triggered"
                         );
-                        let target_result = candidate
-                            .handle
-                            .start_backfill(
+                        let Some(target_result) = await_wallet_cancellation(
+                            &candidate.cancel,
+                            candidate.handle.start_backfill(
                                 &candidate.cache_key,
                                 &candidate.sender,
                                 progress,
                                 candidate.target_block,
-                            )
-                            .await;
+                            ),
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
                         let driver = match target_result {
                             WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
                             WalletBackfillStartResult::Rejected { .. } => continue,
                         };
-                        let Some(checkpoint) = service
+                        let tail_result = service
                             .try_indexed_wallet_tail_catch_up(
                                 &candidate.cache_key,
                                 from_block,
                                 candidate.target_block,
                                 progress,
                                 &candidate.sender,
+                                &candidate.cancel,
                             )
-                            .await
-                        else {
-                            debug!(
-                                cache_key = %candidate.cache_key,
-                                from_block,
-                                target_block = candidate.target_block,
-                                "indexed wallet ready-tail fallback unavailable"
-                            );
-                            let request = BackfillRequest::add(
-                                candidate.cache_key.clone(),
-                                from_block,
-                                candidate.target_block,
-                                candidate.follow_safe_head,
-                                from_block,
-                                driver,
-                            );
-                            if let Err(err) = service.backfill_tx.try_send(request) {
-                                warn!(
-                                    ?err,
+                            .await;
+                        if candidate.cancel.is_cancelled() {
+                            driver.retire(&candidate.cache_key).await;
+                            continue;
+                        }
+                        let checkpoint = match tail_result {
+                            super::WalletIndexedTailFallbackResult::Completed(checkpoint) => {
+                                checkpoint
+                            }
+                            super::WalletIndexedTailFallbackResult::Cancelled => {
+                                driver.retire(&candidate.cache_key).await;
+                                continue;
+                            }
+                            super::WalletIndexedTailFallbackResult::Unavailable => {
+                                debug!(
                                     cache_key = %candidate.cache_key,
                                     from_block,
                                     target_block = candidate.target_block,
-                                    "failed to enqueue ready-tail fallback backfill"
+                                    "indexed wallet ready-tail fallback unavailable"
                                 );
-                                if let BackfillRequest::Add { driver, .. } = err.into_inner() {
-                                    driver
-                                        .fail(
-                                            &candidate.cache_key,
-                                            WalletReadinessError::BackfillUnavailable,
-                                        )
-                                        .await;
+                                let request = BackfillRequest::add(
+                                    candidate.cache_key.clone(),
+                                    from_block,
+                                    candidate.target_block,
+                                    candidate.follow_safe_head,
+                                    from_block,
+                                    driver,
+                                );
+                                if let Err(err) = service.backfill_tx.try_send(request) {
+                                    warn!(
+                                        ?err,
+                                        cache_key = %candidate.cache_key,
+                                        from_block,
+                                        target_block = candidate.target_block,
+                                        "failed to enqueue ready-tail fallback backfill"
+                                    );
+                                    if let BackfillRequest::Add { driver, .. } = err.into_inner() {
+                                        driver
+                                            .fail(
+                                                &candidate.cache_key,
+                                                WalletReadinessError::BackfillUnavailable,
+                                            )
+                                            .await;
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
                         };
                         if checkpoint < from_block {
                             let request = BackfillRequest::add(
@@ -564,6 +584,7 @@ async fn wallet_lag_fallback_candidate(
         follow_safe_head: registration.sync_to_block.is_none(),
         sender: registration.backfill_sender.clone(),
         handle: registration.handle.clone(),
+        cancel: registration.cancel.clone(),
     })
 }
 
@@ -908,6 +929,9 @@ pub(super) fn spawn_backfill_loop(
             }
             drain_pending_backfill_requests_for_service(&service, &mut backfill_rx, &mut cursor)
                 .await;
+            if retire_cancelled_backfill_cursor(&mut cursor).await {
+                continue;
+            }
 
             if cursor.is_none() {
                 tokio::select! {
@@ -950,8 +974,17 @@ pub(super) fn spawn_backfill_loop(
                     .as_ref()
                     .and_then(|slot| slot.cursor.persistence_retry_at())
                     .expect("deferred wallet cursor has retry deadline");
+                let actor_cancel = cursor
+                    .as_ref()
+                    .expect("cursor installed")
+                    .cursor
+                    .driver
+                    .cancellation_token();
                 tokio::select! {
                     () = cancel.cancelled() => break,
+                    () = actor_cancel.cancelled() => {
+                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                    }
                     request = backfill_rx.recv() => {
                         let Some(request) = request else { break };
                         let active_actor = current_backfill_actor(&service).await;
@@ -980,11 +1013,16 @@ pub(super) fn spawn_backfill_loop(
             {
                 let slot = cursor.as_ref().expect("cursor installed");
                 let key = slot.cache_key.clone();
-                let result = slot
-                    .cursor
-                    .driver
-                    .finish(&key, slot.cursor.target_block)
-                    .await;
+                let cancellation = slot.cursor.driver.cancellation_token();
+                let Some(result) = await_wallet_cancellation(
+                    &cancellation,
+                    slot.cursor.driver.finish(&key, slot.cursor.target_block),
+                )
+                .await
+                else {
+                    let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                    continue;
+                };
                 let remove_cursor = wallet_finish_result_removes_cursor(&result);
                 let committed_to = result.committed_to();
                 let persistence_failed = matches!(
@@ -1046,23 +1084,37 @@ pub(super) fn spawn_backfill_loop(
                     stalled_secs = INDEXED_TAIL_FALLBACK_MIN_STALL.as_secs(),
                     "indexed wallet tail fallback triggered"
                 );
-                let Some(checkpoint) = service
+                let cancellation = cursor
+                    .as_ref()
+                    .expect("cursor exists during indexed tail fallback")
+                    .cursor
+                    .driver
+                    .cancellation_token();
+                let tail_result = service
                     .try_indexed_wallet_tail_catch_up(
                         &key,
                         from_block,
                         target_block,
                         progress,
                         &sender,
+                        &cancellation,
                     )
-                    .await
-                else {
-                    debug!(
-                        cache_key = %key,
-                        from_block,
-                        target_block,
-                        "indexed wallet tail fallback unavailable"
-                    );
-                    continue;
+                    .await;
+                let checkpoint = match tail_result {
+                    super::WalletIndexedTailFallbackResult::Completed(checkpoint) => checkpoint,
+                    super::WalletIndexedTailFallbackResult::Cancelled => {
+                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        continue;
+                    }
+                    super::WalletIndexedTailFallbackResult::Unavailable => {
+                        debug!(
+                            cache_key = %key,
+                            from_block,
+                            target_block,
+                            "indexed wallet tail fallback unavailable"
+                        );
+                        continue;
+                    }
                 };
                 let latest_safe_head = *safe_head_rx.borrow();
                 if let Some(slot) = cursor.as_mut()
@@ -1092,8 +1144,12 @@ pub(super) fn spawn_backfill_loop(
                     // successfully fetched a block number yet.  Wait for it
                     // instead of prematurely marking wallets as done.
                     debug!("safe_head is 0, waiting for head poller before backfill");
+                    let actor_cancel = slot.cursor.driver.cancellation_token();
                     tokio::select! {
                         () = cancel.cancelled() => break,
+                        () = actor_cancel.cancelled() => {
+                            let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        }
                         request = backfill_rx.recv() => {
                             let Some(request) = request else { break };
                             let active_actor = current_backfill_actor(&service).await;
@@ -1125,23 +1181,38 @@ pub(super) fn spawn_backfill_loop(
                     requested_to_block
                 }
             });
+            let cancellation = cursor
+                .as_ref()
+                .expect("cursor installed before remote backfill")
+                .cursor
+                .driver
+                .cancellation_token();
             let Some(rpc) = rpcs.random_provider() else {
                 warn!("no healthy rpc providers available");
-                tokio::time::sleep(service.chain.poll_interval).await;
+                let _ = await_wallet_cancellation(
+                    &cancellation,
+                    tokio::time::sleep(service.chain.poll_interval),
+                )
+                .await;
                 continue;
             };
             let read_scope = service.begin_public_scan_read();
             let fetch_logs_started = Instant::now();
-            match service
-                .chain
-                .fetch_logs_for_range(
+            let Some(logs_result) = await_wallet_cancellation(
+                &cancellation,
+                service.chain.fetch_logs_for_range(
                     &rpc.provider,
                     archive_provider.as_ref(),
                     from_block,
                     to_block,
-                )
-                .await
-            {
+                ),
+            )
+            .await
+            else {
+                let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                continue;
+            };
+            match logs_result {
                 Ok(mut logs) => {
                     debug!(
                         from_block,
@@ -1152,18 +1223,31 @@ pub(super) fn spawn_backfill_loop(
                     );
                     sort_logs(&mut logs);
                     let timestamps_started = Instant::now();
-                    let block_timestamps = match service
-                        .chain
-                        .fetch_log_block_timestamps(&rpc.provider, archive_provider.as_ref(), &logs)
-                        .await
-                    {
+                    let Some(timestamps_result) = await_wallet_cancellation(
+                        &cancellation,
+                        service.chain.fetch_log_block_timestamps(
+                            &rpc.provider,
+                            archive_provider.as_ref(),
+                            &logs,
+                        ),
+                    )
+                    .await
+                    else {
+                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        continue;
+                    };
+                    let block_timestamps = match timestamps_result {
                         Ok(block_timestamps) => block_timestamps,
                         Err(err) => {
                             warn!(?err, "failed to fetch backfill log block timestamps");
                             if err.should_mark_rpc_unhealthy() {
                                 rpcs.mark_bad_provider(&rpc);
                             } else {
-                                tokio::time::sleep(service.chain.poll_interval).await;
+                                let _ = await_wallet_cancellation(
+                                    &cancellation,
+                                    tokio::time::sleep(service.chain.poll_interval),
+                                )
+                                .await;
                             }
                             continue;
                         }
@@ -1179,15 +1263,20 @@ pub(super) fn spawn_backfill_loop(
                         .chain
                         .archive_boundary_crossed_by(from_block, to_block)
                     {
-                        match service
-                            .chain
-                            .fetch_block_hash(
+                        let Some(boundary_hash_result) = await_wallet_cancellation(
+                            &cancellation,
+                            service.chain.fetch_block_hash(
                                 &rpc.provider,
                                 archive_provider.as_ref(),
                                 archive_endpoint,
-                            )
-                            .await
-                        {
+                            ),
+                        )
+                        .await
+                        else {
+                            let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                            continue;
+                        };
+                        match boundary_hash_result {
                             Ok(Some(_)) => {}
                             Ok(None) => {
                                 warn!(
@@ -1207,18 +1296,31 @@ pub(super) fn spawn_backfill_loop(
                                 if err.should_mark_rpc_unhealthy() {
                                     rpcs.mark_bad_provider(&rpc);
                                 } else {
-                                    tokio::time::sleep(service.chain.poll_interval).await;
+                                    let _ = await_wallet_cancellation(
+                                        &cancellation,
+                                        tokio::time::sleep(service.chain.poll_interval),
+                                    )
+                                    .await;
                                 }
                                 continue;
                             }
                         }
                     }
                     let block_hash_started = Instant::now();
-                    let to_block_hash = match service
-                        .chain
-                        .fetch_block_hash(&rpc.provider, archive_provider.as_ref(), to_block)
-                        .await
-                    {
+                    let Some(to_block_hash_result) = await_wallet_cancellation(
+                        &cancellation,
+                        service.chain.fetch_block_hash(
+                            &rpc.provider,
+                            archive_provider.as_ref(),
+                            to_block,
+                        ),
+                    )
+                    .await
+                    else {
+                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        continue;
+                    };
+                    let to_block_hash = match to_block_hash_result {
                         Ok(Some(hash)) => Some(hash),
                         Ok(None) => {
                             warn!(
@@ -1233,7 +1335,11 @@ pub(super) fn spawn_backfill_loop(
                             if err.should_mark_rpc_unhealthy() {
                                 rpcs.mark_bad_provider(&rpc);
                             } else {
-                                tokio::time::sleep(service.chain.poll_interval).await;
+                                let _ = await_wallet_cancellation(
+                                    &cancellation,
+                                    tokio::time::sleep(service.chain.poll_interval),
+                                )
+                                .await;
                             }
                             continue;
                         }
@@ -1378,13 +1484,20 @@ pub(super) fn spawn_backfill_loop(
                                 "RPC wallet backfill source selected",
                             )
                             .await;
-                        let apply_result = cursor
-                            .as_ref()
-                            .expect("wallet cursor exists while applying")
-                            .cursor
-                            .driver
-                            .apply(&key, apply)
-                            .await;
+                        let Some(apply_result) = await_wallet_cancellation(
+                            &cancellation,
+                            cursor
+                                .as_ref()
+                                .expect("wallet cursor exists while applying")
+                                .cursor
+                                .driver
+                                .apply(&key, apply),
+                        )
+                        .await
+                        else {
+                            let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                            continue;
+                        };
                         let mut remove_cursor = false;
                         if let Some(slot) = cursor.as_mut() {
                             let cursor = &mut slot.cursor;
@@ -1463,7 +1576,11 @@ pub(super) fn spawn_backfill_loop(
                     if err.should_mark_rpc_unhealthy() {
                         rpcs.mark_bad_provider(&rpc);
                     } else {
-                        tokio::time::sleep(service.chain.poll_interval).await;
+                        let _ = await_wallet_cancellation(
+                            &cancellation,
+                            tokio::time::sleep(service.chain.poll_interval),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1471,6 +1588,19 @@ pub(super) fn spawn_backfill_loop(
         retire_backfill_loop_state(&mut cursor, &mut backfill_rx).await;
     };
     tokio::spawn(task.instrument(tracing::info_span!("sync_backfill")));
+}
+
+async fn retire_cancelled_backfill_cursor(cursor: &mut Option<WalletBackfillSlot>) -> bool {
+    let cancelled = cursor
+        .as_ref()
+        .is_some_and(|slot| slot.cursor.driver.cancellation_token().is_cancelled());
+    if !cancelled {
+        return false;
+    }
+    if let Some(slot) = cursor.take() {
+        slot.cursor.driver.retire(&slot.cache_key).await;
+    }
+    true
 }
 
 async fn retire_backfill_loop_state(
