@@ -112,12 +112,17 @@ use output_poi_recovery::{
 use pending_output_poi::apply_owned_poi_private_delta_on_actor;
 use pending_output_poi::{
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
-    apply_owned_poi_private_delta_on_actor_with_active_lists, apply_poi_private_delta,
-    current_pending_output_poi_subject, expected_pending_context_state, expected_recovery_state,
-    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
-    pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,
-    pending_output_poi_submission_plan_current, preflight_and_remote_submit_pending_output_poi,
-    process_pending_output_poi_observations_authorized, submit_observed_pending_output_pois_inner,
+    PendingOutputPoiTentativeAttemptKey, PendingOutputPoiTentativeCandidate,
+    PendingOutputPoiTentativeLocalStatus, apply_owned_poi_private_delta_on_actor_with_active_lists,
+    apply_poi_private_delta, current_pending_output_poi_subject, expected_pending_context_state,
+    expected_recovery_state, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_observation_state_updates,
+    pending_output_poi_rewind_state_updates, pending_output_poi_submission_plan_current,
+    preflight_and_remote_submit_pending_output_poi,
+    prepare_pending_output_poi_tentative_candidates,
+    process_pending_output_poi_observations_authorized,
+    read_pending_output_poi_tentative_local_statuses, submit_observed_pending_output_pois_inner,
+    submit_pending_output_poi_tentative_candidates,
     verify_submitted_pending_output_pois_with_config_authorized, wallet_ppoi_workflow_status,
     wallet_ppoi_workflow_status_after_mutations,
 };

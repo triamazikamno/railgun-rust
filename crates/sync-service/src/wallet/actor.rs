@@ -1429,6 +1429,21 @@ pub(crate) enum WalletRemoteDone {
         verified_pending: usize,
         verified_errors: usize,
     },
+    PoiMaintenanceAborted {
+        credential: WalletActorCredential,
+        key: PoiRemoteJobKey,
+        reason: &'static str,
+    },
+    PendingOutputPoiTentative {
+        credential: WalletActorCredential,
+        retryable: Vec<super::PendingOutputPoiTentativeAttemptKey>,
+        accepted_candidates: Vec<super::PendingOutputPoiTentativeCandidate>,
+        accepted: usize,
+        missing_txid: usize,
+        remote_failure: usize,
+        context_stale: usize,
+        authority_stale: bool,
+    },
 }
 
 #[cfg(test)]

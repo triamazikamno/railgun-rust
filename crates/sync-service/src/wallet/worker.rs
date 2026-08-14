@@ -3,10 +3,13 @@ use super::{
     Arc, AtomicU64, BackfillEvent, CancellationToken, ChainError, ChainPublicDataPlane, DbStore,
     Duration, FixedBytes, FuturesUnordered, HashSet, IndexedArtifactSourceConfig, Instant,
     Instrument, LocalPoiStatusReader, MerkleForest, Mutex, OutputPoiRecoveryRun,
-    PendingOutputPoiContextIntent, PendingWalletReset, PoiMaintenanceController, PoiProxyFallback,
-    PoiRemoteJobKey, PoiRpcClient, PoiStatusReader, PublicPoiCorpusKey, RwLock, SharedLogBatch,
-    SyncProgressStage, SyncProgressUpdate, WALLET_POI_REFRESH_INTERVAL, WalletActorCommitToken,
-    WalletActorCredential, WalletActorLifecycleCell, WalletActorState, WalletBackfillApplyResult,
+    PendingOutputPoiContextIntent, PendingOutputPoiTentativeAttemptKey,
+    PendingOutputPoiTentativeCandidate, PendingOutputPoiTentativeLocalStatus, PendingWalletReset,
+    PoiMaintenanceController, PoiMaintenanceError, PoiProxyFallback, PoiRemoteJobKey, PoiRpcClient,
+    PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey, RwLock,
+    SenderCandidateRecoveryReport, SharedLogBatch, SyncProgressStage, SyncProgressUpdate,
+    WALLET_POI_REFRESH_INTERVAL, WalletActorCommitToken, WalletActorCredential,
+    WalletActorLifecycleCell, WalletActorState, WalletBackfillApplyResult,
     WalletBackfillFinishResult, WalletBackfillGrant, WalletBackfillOwnerDisposition,
     WalletBackfillOwnerSignal, WalletBackfillRejectReason, WalletBackfillResetResult,
     WalletBackfillStartResult, WalletCacheError, WalletCacheStore, WalletCheckpointMutation,
@@ -26,9 +29,12 @@ use super::{
     default_active_poi_list_keys, force_resubmit_matching_pending_output_pois_authorized, info,
     mark_valid_output_poi_recoveries_authorized, mpsc, now_epoch_secs, oneshot,
     pending_output_poi_observation_state_updates, pending_output_poi_rewind_state_updates,
-    pending_overlay_from_delta, process_pending_output_poi_observations_authorized,
+    pending_overlay_from_delta, prepare_pending_output_poi_tentative_candidates,
+    process_pending_output_poi_observations_authorized,
+    read_pending_output_poi_tentative_local_statuses,
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
     rewind_wallet_utxos, sender_transaction_candidate_rewind_ids,
+    submit_pending_output_poi_tentative_candidates,
     verify_submitted_pending_output_pois_with_config_authorized, wallet_poi_status_refresh_needed,
     wallet_poi_status_refresh_needed_for_selection, wallet_ppoi_workflow_status,
     wallet_ppoi_workflow_status_after_mutations, wallet_utxo_stable_identity, warn, watch,
@@ -36,7 +42,10 @@ use super::{
 use crate::PublicScanSource;
 use crate::types::BackfillRequest;
 use crate::types::{PoiCorpusRevision, WalletSyncTargetLease};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
 const fn wallet_private_request_error(
@@ -65,6 +74,37 @@ fn wallet_poi_refresh_interval_with_period(period: Duration) -> tokio::time::Int
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval
+}
+
+const POI_MAINTENANCE_WATCHDOG: Duration = Duration::from_mins(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoiMaintenanceAbortReason {
+    Timeout,
+    Panic,
+}
+
+impl PoiMaintenanceAbortReason {
+    const fn category(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Panic => "panic",
+        }
+    }
+}
+
+async fn run_poi_maintenance_with_watchdog<F, T>(
+    future: F,
+    timeout: Duration,
+) -> Result<T, PoiMaintenanceAbortReason>
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::time::timeout(timeout, AssertUnwindSafe(future).catch_unwind()).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(PoiMaintenanceAbortReason::Panic),
+        Err(_) => Err(PoiMaintenanceAbortReason::Timeout),
+    }
 }
 
 async fn next_poi_corpus_revision(
@@ -502,14 +542,58 @@ struct PoiMaintenanceJob {
     force_output_poi_recovery: bool,
 }
 
+struct PoiMaintenanceOutcome {
+    recovered: usize,
+    candidate_report: SenderCandidateRecoveryReport,
+    recovery_error: Option<PoiMaintenanceError>,
+    forced_pending_attempts: usize,
+    submitted: usize,
+    verified_completed: usize,
+    verified_pending: usize,
+    verified_errors: usize,
+}
+
 impl PoiMaintenanceJob {
     fn spawn(self) {
         tokio::spawn(async move {
-            self.run().await;
+            let done_tx = self.done_tx.clone();
+            let credential = self.credential;
+            let key = self.key;
+            let maintenance = Box::pin(self.run());
+            let result =
+                run_poi_maintenance_with_watchdog(maintenance, POI_MAINTENANCE_WATCHDOG).await;
+            let done = match result {
+                Ok(outcome) => WalletRemoteDone::PoiMaintenance {
+                    credential,
+                    key,
+                    recovered: outcome.recovered,
+                    candidate_report: outcome.candidate_report,
+                    recovery_error: outcome.recovery_error,
+                    forced_pending_attempts: outcome.forced_pending_attempts,
+                    submitted: outcome.submitted,
+                    verified_completed: outcome.verified_completed,
+                    verified_pending: outcome.verified_pending,
+                    verified_errors: outcome.verified_errors,
+                },
+                Err(reason) => {
+                    warn!(
+                        category = reason.category(),
+                        "poi maintenance watchdog aborted job"
+                    );
+                    WalletRemoteDone::PoiMaintenanceAborted {
+                        credential,
+                        key,
+                        reason: reason.category(),
+                    }
+                }
+            };
+            if done_tx.send(done).await.is_err() {
+                debug!("poi maintenance completion delivery skipped; actor stopped");
+            }
         });
     }
 
-    async fn run(self) {
+    async fn run(self) -> PoiMaintenanceOutcome {
         let authority = WalletPrivateMutationAuthority::new(
             &self.handle,
             self.credential.reset_generation,
@@ -573,6 +657,10 @@ impl PoiMaintenanceJob {
             .await;
         }
 
+        debug!(
+            chain_id = self.cfg.chain.chain_id,
+            "poi maintenance pending verification started"
+        );
         let pending_verification = verify_submitted_pending_output_pois_with_config_authorized(
             &authority,
             &self.public_data_plane,
@@ -584,6 +672,13 @@ impl PoiMaintenanceJob {
             &self.active_poi_list_keys,
         )
         .await;
+        debug!(
+            chain_id = self.cfg.chain.chain_id,
+            completed = pending_verification.completed,
+            pending = pending_verification.pending,
+            errors = pending_verification.errors,
+            "poi maintenance pending verification complete"
+        );
 
         let forced_pending_attempts = if self.force_output_poi_recovery {
             force_resubmit_matching_pending_output_pois_authorized(
@@ -623,6 +718,10 @@ impl PoiMaintenanceJob {
             && recovery.error.is_none()
             && recovery.recovered == 0
             && forced_pending_attempts == 0;
+        debug!(
+            chain_id = self.cfg.chain.chain_id,
+            force_submission_retry, "poi maintenance retry-submitted stage started"
+        );
         let submitted = process_pending_output_poi_observations_authorized(
             &authority,
             self.db.as_ref(),
@@ -633,22 +732,213 @@ impl PoiMaintenanceJob {
             force_submission_retry,
         )
         .await;
+        debug!(
+            chain_id = self.cfg.chain.chain_id,
+            force_submission_retry, submitted, "poi maintenance retry-submitted stage complete"
+        );
+        PoiMaintenanceOutcome {
+            recovered: recovery.recovered,
+            candidate_report: recovery.candidate_report,
+            recovery_error: recovery.error,
+            forced_pending_attempts,
+            submitted,
+            verified_completed: pending_verification.completed,
+            verified_pending: pending_verification.pending,
+            verified_errors: pending_verification.errors,
+        }
+    }
+}
 
-        let _ = self
-            .done_tx
-            .send(WalletRemoteDone::PoiMaintenance {
-                credential: self.credential,
-                key: self.key,
-                recovered: recovery.recovered,
-                candidate_report: recovery.candidate_report,
-                recovery_error: recovery.error,
-                forced_pending_attempts,
-                submitted,
-                verified_completed: pending_verification.completed,
-                verified_pending: pending_verification.pending,
-                verified_errors: pending_verification.errors,
+fn spawn_pending_output_poi_tentative_job(
+    handle: &WalletHandle,
+    cancel: &CancellationToken,
+    done_tx: &mpsc::Sender<WalletRemoteDone>,
+    cache_store: &Arc<dyn WalletCacheStore>,
+    cfg: &WalletConfig,
+    poi_runtime: &WalletPoiRuntime,
+    active_list_keys: &[FixedBytes<32>],
+    candidates: Vec<PendingOutputPoiTentativeCandidate>,
+) {
+    let handle = handle.clone();
+    let cancel = cancel.clone();
+    let credential = WalletActorCredential::current_for(&handle);
+    let done_tx = done_tx.clone();
+    let cache_store = Arc::clone(cache_store);
+    let cfg = cfg.clone();
+    let poi_client = poi_runtime.public_client().clone();
+    let active_list_keys = active_list_keys.to_vec();
+    tokio::spawn(async move {
+        let authority =
+            WalletPrivateMutationAuthority::new(&handle, credential.reset_generation, &cancel);
+        let private_poi =
+            WalletPrivatePoiClients::from_rpc(authority.remote_authority(), poi_client);
+        let result = submit_pending_output_poi_tentative_candidates(
+            &authority,
+            cache_store.as_ref(),
+            &cfg,
+            &active_list_keys,
+            &candidates,
+            &private_poi,
+        )
+        .await;
+        let _ = done_tx
+            .send(WalletRemoteDone::PendingOutputPoiTentative {
+                credential,
+                retryable: result.retryable,
+                accepted_candidates: result.accepted_candidates,
+                accepted: result.accepted,
+                missing_txid: result.missing_txid,
+                remote_failure: result.remote_failure,
+                context_stale: result.context_stale,
+                authority_stale: result.authority_stale,
             })
             .await;
+    });
+}
+
+#[derive(Default)]
+struct PendingOutputPoiTentativeAttemptTracker {
+    attempts:
+        BTreeMap<(u64, PendingOutputPoiTentativeAttemptKey), PendingOutputPoiTentativeCandidate>,
+    valid_lists: BTreeMap<(u64, PendingOutputPoiTentativeAttemptKey), BTreeSet<FixedBytes<32>>>,
+}
+
+impl PendingOutputPoiTentativeAttemptTracker {
+    fn reserve(
+        &mut self,
+        reset_generation: u64,
+        candidate: PendingOutputPoiTentativeCandidate,
+    ) -> bool {
+        let key = candidate.attempt_key();
+        self.attempts
+            .insert((reset_generation, key), candidate)
+            .is_none()
+    }
+
+    fn accept(&mut self, reset_generation: u64, candidates: &[PendingOutputPoiTentativeCandidate]) {
+        for candidate in candidates {
+            let key = candidate.attempt_key();
+            self.attempts
+                .insert((reset_generation, key.clone()), candidate.clone());
+        }
+    }
+
+    fn release_retryable(
+        &mut self,
+        reset_generation: u64,
+        keys: &[PendingOutputPoiTentativeAttemptKey],
+    ) {
+        for key in keys {
+            self.attempts.remove(&(reset_generation, key.clone()));
+            self.valid_lists.remove(&(reset_generation, key.clone()));
+        }
+    }
+
+    fn clear_generation(&mut self, reset_generation: u64) {
+        self.attempts
+            .retain(|(generation, _), _| *generation == reset_generation);
+        self.valid_lists
+            .retain(|(generation, _), _| *generation == reset_generation);
+    }
+
+    fn clear(&mut self) {
+        self.attempts.clear();
+        self.valid_lists.clear();
+    }
+
+    fn candidates(&self, reset_generation: u64) -> Vec<PendingOutputPoiTentativeCandidate> {
+        self.attempts
+            .iter()
+            .filter(|((generation, _), _)| *generation == reset_generation)
+            .map(|(_, candidate)| candidate.clone())
+            .collect()
+    }
+
+    fn record_local_statuses(
+        &mut self,
+        reset_generation: u64,
+        statuses: &[PendingOutputPoiTentativeLocalStatus],
+    ) -> (usize, usize) {
+        let mut newly_valid_outputs = 0;
+        let mut newly_valid_lists = 0;
+        for status in statuses {
+            let key = status.candidate.attempt_key();
+            if self
+                .attempts
+                .get(&(reset_generation, key.clone()))
+                .is_some_and(|candidate| candidate.attempt_key() == key)
+            {
+                let valid_lists = self.valid_lists.entry((reset_generation, key)).or_default();
+                let before = valid_lists.len();
+                valid_lists.extend(status.valid_list_keys.iter().copied());
+                let added = valid_lists.len().saturating_sub(before);
+                if added > 0 {
+                    newly_valid_outputs += 1;
+                    newly_valid_lists += added;
+                }
+            }
+        }
+        (newly_valid_outputs, newly_valid_lists)
+    }
+
+    fn prune_for_observations(
+        &mut self,
+        reset_generation: u64,
+        observations: &[super::CommitmentObservation],
+    ) {
+        let stale = self
+            .attempts
+            .iter()
+            .filter(|((generation, _), candidate)| {
+                *generation == reset_generation
+                    && !observations.iter().any(|observation| {
+                        candidate.output_commitment()
+                            == FixedBytes::from(observation.commitment.to_be_bytes::<32>())
+                            && candidate.observation().tree == observation.tree
+                            && candidate.observation().position == observation.position
+                            && candidate.observation().source == observation.source
+                    })
+            })
+            .map(|((_, key), _)| key.clone())
+            .collect::<Vec<_>>();
+        self.release_retryable(reset_generation, &stale);
+    }
+
+    fn apply_to_overlay(
+        &self,
+        reset_generation: u64,
+        overlay: &mut WalletPendingOverlay,
+        refreshed_at: u64,
+    ) -> bool {
+        let mut changed = false;
+        for ((generation, key), candidate) in &self.attempts {
+            if *generation != reset_generation {
+                continue;
+            }
+            let Some(valid_lists) = self.valid_lists.get(&(*generation, key.clone())) else {
+                continue;
+            };
+            let Some(wallet_utxo) = overlay.new_utxos.iter_mut().find(|wallet_utxo| {
+                let observation = candidate.observation();
+                candidate.output_commitment() == wallet_utxo.utxo.poi.commitment
+                    && observation.tree == wallet_utxo.utxo.tree
+                    && observation.position == wallet_utxo.utxo.position
+                    && observation.source == wallet_utxo.utxo.source
+            }) else {
+                continue;
+            };
+            let statuses = valid_lists
+                .iter()
+                .copied()
+                .map(|list_key| (list_key, super::PoiStatus::Valid))
+                .collect::<BTreeMap<_, _>>();
+            changed |= wallet_utxo.utxo.poi.apply_status_refresh(
+                candidate.list_keys(),
+                Some(&statuses),
+                refreshed_at,
+            ) > 0;
+        }
+        changed
     }
 }
 
@@ -1807,6 +2097,94 @@ impl Drop for PreparedWalletWorker {
     }
 }
 
+async fn refresh_tentative_pending_output_poi_statuses(
+    handle: &WalletHandle,
+    cancel: &CancellationToken,
+    corpus: Option<&PublicPoiCorpusHandle>,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    reset_generation: u64,
+    tracker: &mut PendingOutputPoiTentativeAttemptTracker,
+) {
+    tracker.clear_generation(reset_generation);
+    let candidates = tracker.candidates(reset_generation);
+    let statuses = read_pending_output_poi_tentative_local_statuses(
+        corpus,
+        cfg,
+        active_list_keys,
+        &candidates,
+    )
+    .await;
+    let (newly_valid_outputs, newly_valid_lists) =
+        tracker.record_local_statuses(reset_generation, &statuses);
+    if newly_valid_lists > 0 {
+        info!(
+            valid_outputs = newly_valid_outputs,
+            valid_lists = newly_valid_lists,
+            pending_outputs = candidates.len().saturating_sub(newly_valid_outputs),
+            "tentative POI visible in local corpus"
+        );
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
+    let Ok(permit) = authority.acquire().await else {
+        return;
+    };
+    let mut overlay = permit.pending_overlay().read().await.clone();
+    let changed = tracker.apply_to_overlay(reset_generation, &mut overlay, now_epoch_secs());
+    if changed && permit.replace_chain_pending_overlay(overlay).await.is_ok() {
+        let _ = permit.notify_if_changed(true).await;
+    }
+}
+
+fn spawn_tentative_poi_corpus_refresh(
+    public_data_plane: &ChainPublicDataPlane,
+    cancel: &CancellationToken,
+    chain_id: u64,
+    refresh_in_flight: &Arc<AtomicBool>,
+) {
+    if refresh_in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let public_data_plane = public_data_plane.clone();
+    let cancel = cancel.clone();
+    let refresh_guard = TentativePoiCorpusRefreshGuard(Arc::clone(refresh_in_flight));
+    tokio::spawn(async move {
+        let _refresh_guard = refresh_guard;
+        let retry = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            result = public_data_plane.retry_poi_artifact_cache(chain_id) => result,
+        };
+        let Ok(retry) = retry else {
+            debug!(chain_id, "tentative POI corpus refresh admission skipped");
+            return;
+        };
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            result = retry.wait() => {
+                if result.is_err() {
+                    debug!(chain_id, "tentative POI corpus refresh failed");
+                }
+            }
+        }
+    });
+}
+
+struct TentativePoiCorpusRefreshGuard(Arc<AtomicBool>);
+
+impl Drop for TentativePoiCorpusRefreshGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub(crate) async fn prepare_wallet_worker(
     services: WalletWorkerServices,
     cfg: WalletConfig,
@@ -2002,6 +2380,10 @@ pub(crate) async fn prepare_wallet_worker(
             mpsc::channel::<WalletPrivateApplyRequest>(32);
         let private_apply = WalletPrivateApplyClient::new(private_apply_tx);
         let mut poi_maintenance = PoiMaintenanceController::new();
+        // Tentative attempts are actor-lifetime only; safe-head maintenance never consults this set.
+        let mut pending_output_poi_tentative_attempts =
+            PendingOutputPoiTentativeAttemptTracker::default();
+        let tentative_poi_corpus_refresh_in_flight = Arc::new(AtomicBool::new(false));
         let mut actor_state = actor_state;
         let mut accepted_backfill_liveness = FuturesUnordered::new();
         let mut accepted_indexed_job_liveness = FuturesUnordered::new();
@@ -2745,6 +3127,8 @@ pub(crate) async fn prepare_wallet_worker(
                                 candidate_awaiting_poi_data = candidate_report.awaiting_poi_data,
                                 candidate_retrying = candidate_report.retrying,
                                 candidate_needs_attention = candidate_report.needs_attention,
+                                candidate_covered_by_pending_contexts =
+                                    candidate_report.covered_by_pending_contexts,
                                 candidate_report_is_current,
                                 forced_pending_attempts,
                                 submitted,
@@ -2758,6 +3142,87 @@ pub(crate) async fn prepare_wallet_worker(
                                     && candidate_report.retrying == 0
                                     && candidate_report.needs_attention == 0,
                                 "wallet POI remote maintenance complete"
+                            );
+                        }
+                        WalletRemoteDone::PoiMaintenanceAborted {
+                            credential,
+                            key,
+                            reason,
+                        } => {
+                            on_poi_maintenance_done(
+                                &mut poi_maintenance,
+                                &remote_done_tx,
+                                &private_apply,
+                                &poi_refreshing_tx,
+                                &worker_handle,
+                                &cancel,
+                                &db,
+                                &cache_store,
+                                &cfg,
+                                &public_data_plane,
+                                http_client.as_ref(),
+                                indexed_artifact_source.as_ref(),
+                                &poi_runtime,
+                                &forest,
+                                &utxos,
+                                &active_poi_list_keys,
+                                key,
+                            );
+                            if credential.is_current(&worker_handle) {
+                                warn!(
+                                    category = reason,
+                                    "wallet POI maintenance aborted before completion"
+                                );
+                            } else {
+                                debug!(
+                                    category = reason,
+                                    "stale wallet POI maintenance abort dropped"
+                                );
+                            }
+                        }
+                        WalletRemoteDone::PendingOutputPoiTentative {
+                            credential,
+                            accepted_candidates,
+                            retryable,
+                            accepted,
+                            missing_txid,
+                            remote_failure,
+                            context_stale,
+                            authority_stale: _authority_stale,
+                        } => {
+                            if !credential.is_current(&worker_handle) {
+                                debug!("stale tentative pending output POI result dropped");
+                                continue;
+                            }
+                            pending_output_poi_tentative_attempts
+                                .accept(credential.reset_generation, &accepted_candidates);
+                            pending_output_poi_tentative_attempts
+                                .release_retryable(credential.reset_generation, &retryable);
+                            if !accepted_candidates.is_empty() {
+                                spawn_tentative_poi_corpus_refresh(
+                                    &public_data_plane,
+                                    &cancel,
+                                    cfg.chain.chain_id,
+                                    &tentative_poi_corpus_refresh_in_flight,
+                                );
+                                refresh_tentative_pending_output_poi_statuses(
+                                    &worker_handle,
+                                    &cancel,
+                                    poi_corpus_handle.as_ref(),
+                                    &cfg,
+                                    &active_poi_list_keys,
+                                    credential.reset_generation,
+                                    &mut pending_output_poi_tentative_attempts,
+                                )
+                                .await;
+                            }
+                            info!(
+                                accepted,
+                                missing_txid,
+                                remote_failure,
+                                context_stale,
+                                retryable = retryable.len(),
+                                "tentative pending output POI submission complete"
                             );
                         }
                     }
@@ -3023,6 +3488,8 @@ pub(crate) async fn prepare_wallet_worker(
                         );
                         continue;
                     }
+                    pending_output_poi_tentative_attempts
+                        .clear_generation(current_reset_generation);
                     let authority = WalletPrivateMutationAuthority::new(
                         &worker_handle,
                         current_reset_generation,
@@ -3050,8 +3517,12 @@ pub(crate) async fn prepare_wallet_worker(
                         });
                         continue;
                     }
-                    let overlay = match request.update {
-                        WalletPendingOverlayUpdate::Clear => WalletPendingOverlay::default(),
+                    let mut tentative_observations = Vec::new();
+                    let mut overlay = match request.update {
+                        WalletPendingOverlayUpdate::Clear => {
+                            pending_output_poi_tentative_attempts.clear();
+                            WalletPendingOverlay::default()
+                        }
                         WalletPendingOverlayUpdate::PublicRows(rows) => {
                             let delta = match rows.payload {
                                 WalletScanRowsPayload::Rows(rows) => {
@@ -3065,6 +3536,15 @@ pub(crate) async fn prepare_wallet_worker(
                                 },
                                 #[cfg(test)]
                                 WalletScanRowsPayload::IndexedDeltaForTest { delta } => *delta,
+                            };
+                            tentative_observations = delta.commitment_observations.clone();
+                            pending_output_poi_tentative_attempts.prune_for_observations(
+                                actor_state.reset_generation(),
+                                &tentative_observations,
+                            );
+                            let delta = WalletLogDelta {
+                                commitment_observations: Vec::new(),
+                                ..delta
                             };
                             let confirmed = utxos.read().await;
                             if !actor_state
@@ -3081,6 +3561,11 @@ pub(crate) async fn prepare_wallet_worker(
                             pending_overlay_from_delta(&cfg, &confirmed, delta)
                         }
                     };
+                    pending_output_poi_tentative_attempts.apply_to_overlay(
+                        actor_state.reset_generation(),
+                        &mut overlay,
+                        now_epoch_secs(),
+                    );
                     let changed = match permit.replace_chain_pending_overlay(overlay).await {
                         Ok(changed) => changed,
                         Err(reason) => {
@@ -3102,6 +3587,55 @@ pub(crate) async fn prepare_wallet_worker(
                         });
                     });
                     drop(permit);
+                    if !tentative_observations.is_empty() {
+                        let observation_count = tentative_observations.len();
+                        let mut candidate_count = 0;
+                        let mut reserved_count = 0;
+                        let tentative_candidates =
+                            match prepare_pending_output_poi_tentative_candidates(
+                                cache_store.as_ref(),
+                                &cfg,
+                                &active_poi_list_keys,
+                                &tentative_observations,
+                            )
+                            {
+                                Ok(candidates) => {
+                                    candidate_count = candidates.len();
+                                    let reserved = candidates
+                                        .into_iter()
+                                        .filter(|candidate| {
+                                            pending_output_poi_tentative_attempts.reserve(
+                                                actor_state.reset_generation(),
+                                                candidate.clone(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
+                                    reserved_count = reserved.len();
+                                    reserved
+                                }
+                                Err(_err) => Vec::new(),
+                            };
+                        if reserved_count > 0 {
+                            info!(
+                                observations = observation_count,
+                                candidates = candidate_count,
+                                reserved = reserved_count,
+                                "tentative pending output POI candidates scheduled"
+                            );
+                        }
+                        if !tentative_candidates.is_empty() {
+                            spawn_pending_output_poi_tentative_job(
+                                &worker_handle,
+                                &cancel,
+                                &remote_done_tx,
+                                &cache_store,
+                                &cfg,
+                                &poi_runtime,
+                                &active_poi_list_keys,
+                                tentative_candidates,
+                            );
+                        }
+                    }
                 }
                 revision = next_poi_corpus_revision(&mut poi_corpus_revision_rx) => {
                     let Some(mut revision) = revision else {
@@ -3124,6 +3658,16 @@ pub(crate) async fn prepare_wallet_worker(
                     if let Some(revision_rx) = poi_corpus_revision_rx.as_mut() {
                         revision = *revision_rx.borrow_and_update();
                     }
+                    refresh_tentative_pending_output_poi_statuses(
+                        &worker_handle,
+                        &cancel,
+                        poi_corpus_handle.as_ref(),
+                        &cfg,
+                        &active_poi_list_keys,
+                        actor_state.reset_generation(),
+                        &mut pending_output_poi_tentative_attempts,
+                    )
+                    .await;
                     let _ = actor_state.transition_active(
                         &worker_handle,
                         &cancel,
@@ -3772,6 +4316,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 Ok(Ok(())) => {
                                     accepted_backfill_liveness.clear();
                                     accepted_indexed_job_liveness.clear();
+                                    pending_output_poi_tentative_attempts.clear();
                                 }
                                 Ok(Err(err)) => {
                                     warn!(?err, cache_key = %cfg.cache_key, intent_id, from_block, "failed to persist wallet reset acceptance");
@@ -4164,6 +4709,28 @@ mod tests {
     use super::test_support::spawn_wallet_worker;
     use super::*;
     use crate::types::WalletResetToken;
+    use crate::wallet::actor::PoiRemoteJobKind;
+
+    #[tokio::test]
+    async fn maintenance_watchdog_converts_timeout_and_panic_to_sanitized_abort_reasons() {
+        let timeout = run_poi_maintenance_with_watchdog(
+            std::future::pending::<()>(),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("maintenance timeout should abort");
+        assert_eq!(timeout, PoiMaintenanceAbortReason::Timeout);
+        assert_eq!(timeout.category(), "timeout");
+
+        let panic = run_poi_maintenance_with_watchdog(
+            async { panic!("test maintenance panic") },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("maintenance panic should abort");
+        assert_eq!(panic, PoiMaintenanceAbortReason::Panic);
+        assert_eq!(panic.category(), "panic");
+    }
 
     #[test]
     fn wallet_scan_progress_retains_configured_baseline_across_pages() {
@@ -4254,6 +4821,175 @@ mod tests {
     };
     use crate::wallet::{EVM_CHAIN_TYPE, WalletActorLifecycle};
 
+    #[test]
+    fn tentative_failed_identity_is_released_for_retry() {
+        let mut tracker = PendingOutputPoiTentativeAttemptTracker::default();
+        let candidate = PendingOutputPoiTentativeCandidate::for_test();
+        let key = candidate.attempt_key();
+        assert!(tracker.reserve(0, candidate.clone()));
+        assert!(!tracker.reserve(0, candidate.clone()));
+        tracker.release_retryable(0, std::slice::from_ref(&key));
+        assert!(tracker.reserve(0, candidate));
+    }
+
+    #[test]
+    fn tentative_valid_projection_requires_exact_overlay_identity() {
+        let candidate = PendingOutputPoiTentativeCandidate::for_test();
+        let list_key = candidate.list_keys()[0];
+        let mut tracker = PendingOutputPoiTentativeAttemptTracker::default();
+        assert!(tracker.reserve(0, candidate.clone()));
+        tracker.accept(0, std::slice::from_ref(&candidate));
+        tracker.record_local_statuses(
+            0,
+            &[PendingOutputPoiTentativeLocalStatus {
+                candidate,
+                valid_list_keys: vec![list_key],
+            }],
+        );
+
+        let mut wallet_utxo = test_wallet_utxo(3, 2);
+        wallet_utxo.utxo.tree = 1;
+        wallet_utxo.utxo.source = UtxoSource {
+            tx_hash: FixedBytes::from([0x22; 32]),
+            block_number: 3,
+            block_timestamp: 4,
+        };
+        wallet_utxo.utxo.poi.commitment = FixedBytes::from([0x11; 32]);
+        wallet_utxo.utxo.poi.statuses.clear();
+        let mut overlay = WalletPendingOverlay {
+            new_utxos: vec![wallet_utxo],
+            ..WalletPendingOverlay::default()
+        };
+        assert!(tracker.apply_to_overlay(0, &mut overlay, 10));
+        assert_eq!(
+            overlay.new_utxos[0].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+
+        overlay.new_utxos[0].utxo.position += 1;
+        overlay.new_utxos[0].utxo.poi.statuses.clear();
+        assert!(!tracker.apply_to_overlay(0, &mut overlay, 11));
+        assert!(overlay.new_utxos[0].utxo.poi.statuses.is_empty());
+    }
+
+    #[test]
+    fn tentative_attempt_pruning_requires_current_exact_observation() {
+        let candidate = PendingOutputPoiTentativeCandidate::for_test();
+        let key = candidate.attempt_key();
+        let mut tracker = PendingOutputPoiTentativeAttemptTracker::default();
+        assert!(tracker.reserve(0, candidate.clone()));
+        tracker.accept(0, std::slice::from_ref(&candidate));
+        tracker.record_local_statuses(
+            0,
+            &[PendingOutputPoiTentativeLocalStatus {
+                candidate: candidate.clone(),
+                valid_list_keys: vec![candidate.list_keys()[0]],
+            }],
+        );
+        let mut wallet_utxo = test_wallet_utxo(3, 2);
+        wallet_utxo.utxo.tree = 1;
+        wallet_utxo.utxo.source = UtxoSource {
+            tx_hash: FixedBytes::from([0x22; 32]),
+            block_number: 3,
+            block_timestamp: 4,
+        };
+        wallet_utxo.utxo.poi.commitment = FixedBytes::from([0x11; 32]);
+        let mut overlay = WalletPendingOverlay {
+            new_utxos: vec![wallet_utxo],
+            ..WalletPendingOverlay::default()
+        };
+
+        tracker.prune_for_observations(0, std::slice::from_ref(candidate.observation()));
+        assert!(tracker.attempts.contains_key(&(0, key.clone())));
+        assert!(tracker.apply_to_overlay(0, &mut overlay, 10));
+
+        let mut changed_coordinate = candidate.observation().clone();
+        changed_coordinate.position += 1;
+        tracker.prune_for_observations(0, &[changed_coordinate]);
+        assert!(!tracker.attempts.contains_key(&(0, key.clone())));
+        assert!(!tracker.valid_lists.contains_key(&(0, key)));
+        overlay.new_utxos[0].utxo.poi.statuses.clear();
+        assert!(!tracker.apply_to_overlay(0, &mut overlay, 11));
+
+        let mut source_changed_tracker = PendingOutputPoiTentativeAttemptTracker::default();
+        assert!(source_changed_tracker.reserve(0, candidate.clone()));
+        source_changed_tracker.accept(0, std::slice::from_ref(&candidate));
+        source_changed_tracker.record_local_statuses(
+            0,
+            &[PendingOutputPoiTentativeLocalStatus {
+                candidate: candidate.clone(),
+                valid_list_keys: vec![candidate.list_keys()[0]],
+            }],
+        );
+        let mut changed_source = candidate.observation().clone();
+        changed_source.source.tx_hash = FixedBytes::from([0xaa; 32]);
+        source_changed_tracker.prune_for_observations(0, &[changed_source]);
+        assert!(source_changed_tracker.attempts.is_empty());
+        assert!(source_changed_tracker.valid_lists.is_empty());
+    }
+
+    #[test]
+    fn tentative_validity_is_monotonic_until_pruned() {
+        let candidate = PendingOutputPoiTentativeCandidate::for_test();
+        let key = candidate.attempt_key();
+        let first_list = candidate.list_keys()[0];
+        let second_list = candidate.list_keys()[1];
+        let mut tracker = PendingOutputPoiTentativeAttemptTracker::default();
+        assert!(tracker.reserve(0, candidate.clone()));
+        tracker.accept(0, std::slice::from_ref(&candidate));
+
+        assert_eq!(
+            tracker.record_local_statuses(
+                0,
+                &[PendingOutputPoiTentativeLocalStatus {
+                    candidate: candidate.clone(),
+                    valid_list_keys: vec![first_list],
+                }],
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            tracker.record_local_statuses(
+                0,
+                &[PendingOutputPoiTentativeLocalStatus {
+                    candidate: candidate.clone(),
+                    valid_list_keys: Vec::new(),
+                }],
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            tracker.record_local_statuses(
+                0,
+                &[PendingOutputPoiTentativeLocalStatus {
+                    candidate: candidate.clone(),
+                    valid_list_keys: vec![second_list],
+                }],
+            ),
+            (1, 1)
+        );
+        tracker.accept(0, std::slice::from_ref(&candidate));
+        assert_eq!(
+            tracker.valid_lists[&(0, key)],
+            BTreeSet::from([first_list, second_list])
+        );
+    }
+
+    #[test]
+    fn tentative_corpus_refresh_gate_releases_after_drop() {
+        let gate = Arc::new(AtomicBool::new(false));
+        assert!(
+            gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        );
+        assert!(
+            gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        );
+        drop(TentativePoiCorpusRefreshGuard(Arc::clone(&gate)));
+        assert!(!gate.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn committed_corpus_revision_waiter_observes_latest_revision() {
         let (revision_tx, revision_rx) = watch::channel(PoiCorpusRevision::default());
@@ -4342,6 +5078,17 @@ mod tests {
         let _authority_guard = handle.authority_lock.lock().await;
         sync_poi_refreshing_from_controller(&controller, &poi_refreshing_tx, &handle, &cancel);
         assert!(*poi_refreshing_rx.borrow());
+
+        let key = WalletActorCredential::current_for(&handle);
+        assert!(controller.request(true, true, Some(key)).is_none());
+        assert!(controller.on_job_done(PoiRemoteJobKey {
+            actor_id: key.actor_id,
+            reset_generation: key.reset_generation,
+            kind: PoiRemoteJobKind::Maintenance,
+        }));
+        sync_poi_refreshing_from_controller(&controller, &poi_refreshing_tx, &handle, &cancel);
+        assert!(!*poi_refreshing_rx.borrow());
+        assert!(controller.try_start(true, Some(key)).is_some());
 
         cancel.cancel();
         drop(db);

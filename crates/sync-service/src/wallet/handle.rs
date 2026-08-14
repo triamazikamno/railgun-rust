@@ -487,6 +487,16 @@ pub(crate) enum OwnedPoiPrivateDelta {
         valid_list_keys: Vec<FixedBytes<32>>,
         now: u64,
     },
+    /// Reconcile only the list keys proven Valid by the local POI corpus. The context remains
+    /// pending when other active lists still need submission.
+    LocallyValidPendingLists {
+        subject: PendingOutputPoiSubject,
+        expected_context_fingerprint: Vec<u8>,
+        expected_recovery: ExpectedRecordState,
+        active_list_keys: Vec<FixedBytes<32>>,
+        valid_list_keys: Vec<FixedBytes<32>>,
+        now: u64,
+    },
     /// Apply remotely-read statuses only to currently matching unspent UTXOs.
     PoiStatusRefresh {
         active_list_keys: Vec<FixedBytes<32>>,

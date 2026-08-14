@@ -1755,7 +1755,7 @@ impl ChainPublicDataPlane {
             .map(|service| service.progress_rx())
     }
 
-    async fn retry_poi_artifact_cache(
+    pub(crate) async fn retry_poi_artifact_cache(
         &self,
         chain_id: u64,
     ) -> Result<PoiArtifactCacheRetry, PublicDataPlaneError> {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
 
 use crate::chain::{ChainPublicDataPlaneCommitGuard, PublicTxidDataAuthority};
 use crate::types::PublicDataPlaneEpoch;
@@ -8,9 +9,9 @@ use railgun_wallet::tx::PoiMerkleProofSource;
 use super::output_poi_recovery::{
     OutputPoiProofSourceResolution, PublicCacheTxidRecoveryRequest, PublicCacheTxidRefreshRequest,
     RecoveryFailure, WalletNullifierIndex, build_recovery_chunk_for_public_transaction,
-    new_output_poi_recovery_record_for_output, pending_output_poi_context_from_output_recovery,
-    preflight_local_recovery_chunk_input_proofs, recovered_output_txid_data_from_public_cache,
-    refresh_public_txid_cache,
+    new_output_poi_recovery_record_for_output, output_poi_recovery_proof_retry_after,
+    pending_output_poi_context_from_output_recovery, preflight_local_recovery_chunk_input_proofs,
+    recovered_output_txid_data_from_public_cache, refresh_public_txid_cache,
 };
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -27,6 +28,7 @@ pub(crate) struct SenderCandidateRecoveryReport {
     pub(super) awaiting_poi_data: u64,
     pub(super) retrying: u64,
     pub(super) needs_attention: u64,
+    pub(super) covered_by_pending_contexts: u64,
     pub(super) expected_candidates: BTreeMap<FixedBytes<32>, Vec<u8>>,
 }
 
@@ -303,6 +305,211 @@ async fn locally_valid_sender_candidate(
     all_valid.then_some(corpus)
 }
 
+async fn locally_valid_sender_candidate_outputs(
+    request: &OutputPoiRecoveryRequest<'_>,
+    candidate: &SenderTransactionCandidate,
+) -> BTreeSet<FixedBytes<32>> {
+    if !request.poi_runtime.is_indexed_artifacts()
+        || request.active_list_keys.is_empty()
+        || !request
+            .public_data_plane
+            .poi_corpus_ready_for_lists(
+                PublicPoiCorpusKey::wallet_default(request.cfg.chain.chain_id),
+                request.active_list_keys,
+            )
+            .await
+    {
+        return BTreeSet::new();
+    }
+    let Some(output_data) = candidate
+        .outputs
+        .iter()
+        .map(|output| {
+            let note = output.note.as_ref()?;
+            let utxo = Utxo::new(
+                note.clone(),
+                output.tree,
+                output.position,
+                candidate.source.clone(),
+                UtxoCommitmentKind::Transact,
+            );
+            (utxo.poi.commitment == output.commitment)
+                .then_some(BlindedCommitmentData::transact(utxo.poi.blinded_commitment))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return BTreeSet::new();
+    };
+    let Ok(corpus) = request
+        .public_data_plane
+        .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(
+            request.cfg.chain.chain_id,
+        ))
+        .await
+    else {
+        return BTreeSet::new();
+    };
+    let _revision_fence = corpus.revision_read_fence().await;
+    let Ok(statuses) = corpus
+        .status_reader()
+        .pois_per_list(
+            DEFAULT_TXID_VERSION,
+            EVM_CHAIN_TYPE,
+            request.cfg.chain.chain_id,
+            request.active_list_keys,
+            &output_data,
+        )
+        .await
+    else {
+        return BTreeSet::new();
+    };
+    output_data
+        .iter()
+        .filter(|data| {
+            statuses
+                .get(&data.blinded_commitment)
+                .is_some_and(|per_list| {
+                    request
+                        .active_list_keys
+                        .iter()
+                        .all(|list_key| per_list.get(list_key) == Some(&PoiStatus::Valid))
+                })
+        })
+        .map(|data| data.blinded_commitment)
+        .collect()
+}
+
+fn pending_context_covers_sender_output(
+    chain_id: u64,
+    wallet_id: &str,
+    candidate: &SenderTransactionCandidate,
+    output: &crate::SenderTransactionCandidateOutput,
+    active_list_keys: &[FixedBytes<32>],
+    context: &PendingOutputPoiContextRecord,
+) -> bool {
+    if context.terminal_error.is_some()
+        || context.chain_id != chain_id
+        || context.wallet_id != wallet_id
+        || context.output_commitment != output.commitment
+    {
+        return false;
+    }
+    let Some(note) = output.note.as_ref() else {
+        return false;
+    };
+    if context.output_npk != FixedBytes::from(note.npk.to_be_bytes::<32>()) {
+        return false;
+    }
+    let Some(observation) = context.observation.as_ref() else {
+        return false;
+    };
+    observation.output_tree == u64::from(output.tree)
+        && observation.output_position == output.position
+        && observation.tx_hash == candidate.source.tx_hash
+        && observation.block_number == candidate.source.block_number
+        && observation.block_timestamp == candidate.source.block_timestamp
+        && active_list_keys.iter().all(|list_key| {
+            context.list_keys().contains(list_key)
+                && context
+                    .pre_transaction_pois_per_txid_leaf_per_list
+                    .get(list_key)
+                    .is_some_and(|pois| !pois.is_empty())
+        })
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SenderCandidateCoverage {
+    local_valid: u64,
+    pending_contexts: u64,
+}
+
+fn sender_candidate_coverage_from_routes(
+    candidate: &SenderTransactionCandidate,
+    local_valid_commitments: &BTreeSet<FixedBytes<32>>,
+    pending_context_commitments: &BTreeSet<FixedBytes<32>>,
+) -> Option<SenderCandidateCoverage> {
+    let mut coverage = SenderCandidateCoverage::default();
+    for output in &candidate.outputs {
+        if local_valid_commitments.contains(&output.commitment) {
+            coverage.local_valid = coverage.local_valid.saturating_add(1);
+        } else if pending_context_commitments.contains(&output.commitment) {
+            coverage.pending_contexts = coverage.pending_contexts.saturating_add(1);
+        } else {
+            return None;
+        }
+    }
+    (coverage.pending_contexts > 0).then_some(coverage)
+}
+
+async fn sender_candidate_coverage(
+    request: &OutputPoiRecoveryRequest<'_>,
+    candidate: &SenderTransactionCandidate,
+) -> Option<SenderCandidateCoverage> {
+    if candidate.validate().is_err()
+        || classify_sender_candidate_for_local_retirement(
+            candidate,
+            request.wallet_utxos,
+            &request.cfg.scan_keys,
+        )
+        .is_none()
+        || !sender_candidate_still_current(
+            request.authority,
+            request.cache_store,
+            request.cfg,
+            candidate,
+        )
+        .await
+    {
+        return None;
+    }
+    let local_valid = locally_valid_sender_candidate_outputs(request, candidate).await;
+    let mut local_valid_commitments = BTreeSet::new();
+    let mut pending_context_commitments = BTreeSet::new();
+    for output in &candidate.outputs {
+        let blinded_commitment = output.note.as_ref().and_then(|note| {
+            let utxo = Utxo::new(
+                note.clone(),
+                output.tree,
+                output.position,
+                candidate.source.clone(),
+                UtxoCommitmentKind::Transact,
+            );
+            (utxo.poi.commitment == output.commitment).then_some(utxo.poi.blinded_commitment)
+        });
+        if blinded_commitment.is_some_and(|blinded| local_valid.contains(&blinded)) {
+            local_valid_commitments.insert(output.commitment);
+            continue;
+        }
+        let pending = request
+            .cache_store
+            .get_pending_output_poi_context(
+                request.cfg.chain.chain_id,
+                &request.cfg.cache_key,
+                &output.commitment,
+            )
+            .ok()
+            .flatten()
+            .is_some_and(|context| {
+                pending_context_covers_sender_output(
+                    request.cfg.chain.chain_id,
+                    request.cfg.cache_key.as_str(),
+                    candidate,
+                    output,
+                    request.active_list_keys,
+                    &context,
+                )
+            });
+        if pending {
+            pending_context_commitments.insert(output.commitment);
+        }
+    }
+    sender_candidate_coverage_from_routes(
+        candidate,
+        &local_valid_commitments,
+        &pending_context_commitments,
+    )
+}
+
 async fn refresh_sender_candidate_public_txid_cache(
     request: &OutputPoiRecoveryRequest<'_>,
     cache_key: &PublicTxidCacheKey,
@@ -369,6 +576,18 @@ pub(super) async fn materialize_sender_transaction_candidates(
         let output_count = u64::try_from(candidate.outputs.len())
             .unwrap_or(u64::MAX)
             .max(1);
+        if let Some(coverage) = sender_candidate_coverage(output_request, &candidate).await {
+            report.covered_by_pending_contexts = report
+                .covered_by_pending_contexts
+                .saturating_add(coverage.pending_contexts);
+            debug!(
+                chain_id = output_request.cfg.chain.chain_id,
+                covered_by_local_valid = coverage.local_valid,
+                covered_by_pending_contexts = coverage.pending_contexts,
+                "sender candidate recovery skipped covered candidate"
+            );
+            continue;
+        }
         if let Some(corpus) = locally_valid_sender_candidate(output_request, &candidate).await {
             let apply_result = apply_poi_private_delta(
                 output_request.authority,
@@ -616,6 +835,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
         awaiting_poi_data = report.awaiting_poi_data,
         retrying = report.retrying,
         needs_attention = report.needs_attention,
+        covered_by_pending_contexts = report.covered_by_pending_contexts,
         expected_candidates = report.expected_candidates.len(),
         "sender candidate recovery scan complete"
     );
@@ -717,8 +937,13 @@ async fn prepare_sender_candidate_materialization(
                 started: Instant::now(),
             })
             .await?;
-        let pre_transaction_pois =
-            generate_post_transaction_pois(PostTransactionPoiGenerationRequest {
+        debug!(
+            chain_id = request.cfg.chain.chain_id,
+            "sender candidate proof generation started"
+        );
+        let proof_generation_started = Instant::now();
+        let pre_transaction_pois = generate_sender_candidate_post_transaction_pois(
+            PostTransactionPoiGenerationRequest {
                 chunk: &recovery_chunk.chunk,
                 txid_data: &txid_data.poi_data,
                 chain_type: EVM_CHAIN_TYPE,
@@ -728,15 +953,15 @@ async fn prepare_sender_candidate_materialization(
                 proof_source,
                 prover,
                 verify_proof: OUTPUT_POI_RECOVERY_VERIFY_PROOF,
-            })
-            .await
-            .map_err(|err| {
-                RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::ProofGenerationFailed,
-                    err.to_string(),
-                    output_poi_recovery::output_poi_recovery_proof_retry_after(&err),
-                )
-            })?;
+            },
+            SENDER_CANDIDATE_PROOF_GENERATION_TIMEOUT,
+        )
+        .await?;
+        debug!(
+            chain_id = request.cfg.chain.chain_id,
+            elapsed_ms = proof_generation_started.elapsed().as_millis(),
+            "sender candidate proof generation complete"
+        );
         let mut transaction_proof_outputs = None;
         for list_key in request.active_list_keys {
             let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
@@ -848,6 +1073,42 @@ async fn prepare_sender_candidate_materialization(
         proof_outputs: proof_outputs.into_iter().collect(),
         poi_corpus_revision_fence,
     }))
+}
+
+const SENDER_CANDIDATE_PROOF_GENERATION_TIMEOUT: Duration = Duration::from_mins(2);
+
+async fn generate_sender_candidate_post_transaction_pois(
+    request: PostTransactionPoiGenerationRequest<'_>,
+    timeout: Duration,
+) -> Result<PreTransactionPoiMap, RecoveryFailure> {
+    generate_sender_candidate_post_transaction_pois_with_timeout(
+        generate_post_transaction_pois(request),
+        timeout,
+    )
+    .await
+}
+
+async fn generate_sender_candidate_post_transaction_pois_with_timeout<F>(
+    future: F,
+    timeout: Duration,
+) -> Result<PreTransactionPoiMap, RecoveryFailure>
+where
+    F: Future<Output = Result<PreTransactionPoiMap, PreTransactionPoiError>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(pois)) => Ok(pois),
+        Ok(Err(error)) => Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::ProofGenerationFailed,
+            error.to_string(),
+            output_poi_recovery_proof_retry_after(&error),
+        )),
+        Err(_) => Err(RecoveryFailure::retryable_category(
+            OutputPoiRecoveryStatus::ProofGenerationFailed,
+            "proof_generation_timeout",
+            "post-transaction POI proof generation timed out",
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        )),
+    }
 }
 
 async fn submit_sender_unshield_transaction_pois(
@@ -1126,7 +1387,18 @@ mod tests {
     use crate::txid_cache::TxidPublicCacheTransaction;
     use alloy::primitives::Address;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
+    use broadcaster_core::transact::{PreTxPoi, SnarkJsProof};
     use local_db::WalletCacheKey;
+
+    fn sample_pre_tx_poi() -> PreTxPoi {
+        PreTxPoi {
+            snark_proof: SnarkJsProof::zero(),
+            txid_merkleroot: FixedBytes::ZERO,
+            poi_merkleroots: vec![FixedBytes::ZERO],
+            blinded_commitments_out: vec![FixedBytes::ZERO],
+            railgun_txid_if_has_unshield: alloy::primitives::Bytes::copy_from_slice(&[0_u8]),
+        }
+    }
 
     fn fixture() -> (
         ViewingKeyData,
@@ -1409,5 +1681,182 @@ mod tests {
             classify_sender_candidate_for_local_retirement(&mixed, &[extra_spend], &keys,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pending_context_coverage_requires_current_observation_and_retained_pois() {
+        let (_keys, candidate, _input, _) = fixture();
+        let list_key = FixedBytes::from([0x77; 32]);
+        let output = &candidate.outputs[0];
+        let note = output.note.as_ref().expect("fixture note");
+        let mut context = PendingOutputPoiContextRecord {
+            chain_id: candidate.chain_id,
+            wallet_id: candidate.wallet_id.to_string(),
+            txid_version: DEFAULT_TXID_VERSION.to_string(),
+            output_commitment: output.commitment,
+            output_npk: FixedBytes::from(note.npk.to_be_bytes::<32>()),
+            utxo_tree_in: 1,
+            railgun_txid: U256::ZERO,
+            txid_merkleroot_index: None,
+            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(
+                list_key,
+                BTreeMap::from([(FixedBytes::from([0x88; 32]), sample_pre_tx_poi())]),
+            )]),
+            required_poi_list_keys: vec![list_key],
+            output_role: PendingOutputPoiRole::Recipient,
+            created_at: 1,
+            source_operation_id: None,
+            observation: Some(PendingOutputPoiObservation {
+                output_tree: u64::from(output.tree),
+                output_position: output.position,
+                tx_hash: candidate.source.tx_hash,
+                block_number: candidate.source.block_number,
+                block_timestamp: candidate.source.block_timestamp,
+            }),
+            submitted_poi_list_keys: Vec::new(),
+            terminal_error: None,
+        };
+
+        assert!(pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context,
+        ));
+        context.observation.as_mut().expect("observation").tx_hash = FixedBytes::from([0xaa; 32]);
+        assert!(!pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context,
+        ));
+        context.observation.as_mut().expect("observation").tx_hash = candidate.source.tx_hash;
+        context
+            .observation
+            .as_mut()
+            .expect("observation")
+            .block_number += 1;
+        assert!(!pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context,
+        ));
+        context
+            .observation
+            .as_mut()
+            .expect("observation")
+            .block_number = candidate.source.block_number;
+        context.output_npk = FixedBytes::from([0x99; 32]);
+        assert!(!pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context,
+        ));
+        context.output_npk = FixedBytes::from(note.npk.to_be_bytes::<32>());
+        context.observation = None;
+        assert!(!pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context,
+        ));
+        context.observation = Some(PendingOutputPoiObservation {
+            output_tree: u64::from(output.tree),
+            output_position: output.position,
+            tx_hash: candidate.source.tx_hash,
+            block_number: candidate.source.block_number,
+            block_timestamp: candidate.source.block_timestamp,
+        });
+        context.pre_transaction_pois_per_txid_leaf_per_list.clear();
+        assert!(!pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context,
+        ));
+    }
+
+    #[test]
+    fn mixed_sender_candidate_coverage_uses_local_and_pending_routes_without_retiring() {
+        let (_keys, mut candidate, _input, _) = fixture();
+        let second_note = Note::new_change(
+            U256::from(9),
+            Address::from([0x22; 20]),
+            U256::from(11),
+            [0x67; 16],
+        );
+        let second_output = SenderTransactionCandidateOutput {
+            tree: 2,
+            position: 4,
+            commitment: FixedBytes::from(second_note.commitment().to_be_bytes::<32>()),
+            note: Some(second_note),
+        };
+        let third_note = Note::new_change(
+            U256::from(9),
+            Address::from([0x22; 20]),
+            U256::from(12),
+            [0x68; 16],
+        );
+        let third_output = SenderTransactionCandidateOutput {
+            tree: 2,
+            position: 5,
+            commitment: FixedBytes::from(third_note.commitment().to_be_bytes::<32>()),
+            note: Some(third_note),
+        };
+        candidate.outputs.extend([second_output, third_output]);
+        candidate
+            .outputs
+            .sort_by_key(|output| (output.tree, output.position));
+
+        let local = BTreeSet::from([candidate.outputs[0].commitment]);
+        // These represent fresh pending contexts accepted by the predicate above.
+        let fresh_pending_contexts = BTreeSet::from([
+            candidate.outputs[1].commitment,
+            candidate.outputs[2].commitment,
+        ]);
+        let coverage =
+            sender_candidate_coverage_from_routes(&candidate, &local, &fresh_pending_contexts)
+                .expect("mixed coverage should short-circuit");
+        assert_eq!(coverage.local_valid, 1);
+        assert_eq!(coverage.pending_contexts, 2);
+
+        let all_local = candidate
+            .outputs
+            .iter()
+            .map(|output| output.commitment)
+            .collect();
+        assert!(
+            sender_candidate_coverage_from_routes(&candidate, &all_local, &BTreeSet::new())
+                .is_none()
+        );
+
+        let missing = BTreeSet::from([candidate.outputs[1].commitment]);
+        assert!(sender_candidate_coverage_from_routes(&candidate, &local, &missing).is_none());
+    }
+
+    #[tokio::test]
+    async fn sender_candidate_proof_generation_timeout_is_retryable() {
+        let failure = generate_sender_candidate_post_transaction_pois_with_timeout(
+            std::future::pending(),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("hanging proof generation must time out");
+        assert_eq!(failure.category, "proof_generation_timeout");
+        assert!(failure.retry_after.is_some());
     }
 }
