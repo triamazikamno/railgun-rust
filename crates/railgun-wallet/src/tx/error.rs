@@ -56,6 +56,18 @@ pub enum BuildError {
     MissingProof { tree: u32, position: u64 },
     #[error("min gas price exceeds uint72: {0}")]
     MinGasPriceTooLarge(u128),
+    #[error("EIP-7702 authority must be non-zero")]
+    InvalidRelayAdapt7702Authority,
+    #[error("EIP-7702 delegate must be non-zero")]
+    InvalidRelayAdapt7702Delegate,
+    #[error("EIP-7702 public native Shield amount must be non-zero")]
+    InvalidRelayAdapt7702ShieldAmount,
+    #[error("EIP-7702 public native Shield requests must contain only base-native values")]
+    InvalidRelayAdapt7702ShieldToken,
+    #[error("EIP-7702 Shield amount does not match supplied Shield requests")]
+    RelayAdapt7702ShieldAmountMismatch,
+    #[error("EIP-7702 private recipe requires a non-zero wrapped base token")]
+    InvalidRelayAdapt7702WrappedBaseToken,
     #[error("encrypt note failed: {0}")]
     Encrypt(#[from] crate::notes::NoteError),
     #[error("prove failed: {0}")]

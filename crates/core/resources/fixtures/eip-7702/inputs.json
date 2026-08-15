@@ -1,0 +1,213 @@
+{
+  "schema": "eip-7702-fixture-inputs",
+  "schemaVersion": "1",
+  "fixtureStatus": {
+    "purpose": "Deterministic input baseline for later static compatibility vectors.",
+    "expectedOutputsIncluded": false,
+    "cryptographicProofsClaimed": false,
+    "runtimeReferenceRequired": false
+  },
+  "keys": {
+    "authority": {
+      "kind": "private key",
+      "privateKey": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "derivedAddress": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+      "deterministic": true,
+      "testOnly": true,
+      "secret": false
+    },
+    "wrongAuthority": {
+      "kind": "private key",
+      "privateKey": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "derivedAddress": "0x1563915e194D8CfBA1943570603F7606A3115508",
+      "deterministic": true,
+      "testOnly": true,
+      "secret": false
+    },
+    "encryptionSharedKey": {
+      "kind": "shared test key",
+      "key": "0x3333333333333333333333333333333333333333333333333333333333333333",
+      "deterministic": true,
+      "testOnly": true,
+      "secret": false
+    }
+  },
+  "protocol": {
+    "chainId": "31337",
+    "delegate": "0x7702000000000000000000000000000000000001",
+    "authorizationNonce": "37",
+    "executeNonce": "911",
+    "outerPayerNonce": "4821",
+    "gasLimit": "987654",
+    "maxFeePerGas": "42000000000",
+    "maxPriorityFeePerGas": "1700000000",
+    "outerValue": "123456789012345",
+    "shieldAmount": "123456789012345",
+    "requireSuccess": true,
+    "minGasLimit": "0",
+    "actionCallValue": "0",
+    "baseNativeToken": {
+      "tokenType": "0",
+      "tokenAddress": "0x0000000000000000000000000000000000000000",
+      "tokenSubID": "0"
+    }
+  },
+  "emptyBatch": {
+    "versions": [
+      "currentNonceAware",
+      "legacyPreExecuteNonce"
+    ],
+    "transactions": [],
+    "actionData": {
+      "requireSuccess": true,
+      "minGasLimit": "0",
+      "calls": [
+        {
+          "to": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+          "data": "0x7702aabbccddeeff00112233445566778899aabbccddeeff0011223344556677",
+          "value": "0"
+        }
+      ]
+    }
+  },
+  "transactionAbiEncodingOnly": {
+    "note": "ABI encoding only; values are deterministic shape inputs and do not form a valid cryptographic proof.",
+    "transaction": {
+      "proof": {
+        "a": {
+          "x": "1",
+          "y": "2"
+        },
+        "b": {
+          "x": [
+            "3",
+            "4"
+          ],
+          "y": [
+            "5",
+            "6"
+          ]
+        },
+        "c": {
+          "x": "7",
+          "y": "8"
+        }
+      },
+      "merkleRoot": "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "nullifiers": [
+        "0x2121212121212121212121212121212121212121212121212121212121212121",
+        "0x2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "commitments": [
+        "0x2323232323232323232323232323232323232323232323232323232323232323",
+        "0x2424242424242424242424242424242424242424242424242424242424242424"
+      ],
+      "boundParams": {
+        "treeNumber": "17",
+        "minGasPrice": "0",
+        "unshield": "1",
+        "chainID": "31337",
+        "adaptContract": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+        "adaptParams": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "commitmentCiphertext": [
+          {
+            "ciphertext": [
+              "0x3131313131313131313131313131313131313131313131313131313131313131",
+              "0x3232323232323232323232323232323232323232323232323232323232323232",
+              "0x3333333333333333333333333333333333333333333333333333333333333333",
+              "0x3434343434343434343434343434343434343434343434343434343434343434"
+            ],
+            "blindedSenderViewingKey": "0x3535353535353535353535353535353535353535353535353535353535353535",
+            "blindedReceiverViewingKey": "0x3636363636363636363636363636363636363636363636363636363636363636",
+            "annotationData": "0xabcdef0123456789",
+            "memo": "0x1122334455667788"
+          }
+        ]
+      },
+      "unshieldPreimage": {
+        "npk": "0x3737373737373737373737373737373737373737373737373737373737373737",
+        "token": {
+          "tokenType": "0",
+          "tokenAddress": "0x0000000000000000000000000000000000000000",
+          "tokenSubID": "0"
+        },
+        "value": "123456789012345"
+      }
+    }
+  },
+  "authorityActionData": {
+    "note": "Generic authority-targeted action-data input with nontrivial deterministic calldata.",
+    "requireSuccess": true,
+    "minGasLimit": "0",
+    "calls": [
+      {
+        "to": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+        "data": "0x7702aabbccddeeff00112233445566778899aabbccddeeff0011223344556677",
+        "value": "0"
+      }
+    ]
+  },
+  "shieldRequest": {
+    "wrapBaseAmount": "123456789012345",
+    "shieldRequests": [
+      {
+        "preimage": {
+          "npk": "0x4545454545454545454545454545454545454545454545454545454545454545",
+          "token": {
+            "tokenType": "0",
+            "tokenAddress": "0x0000000000000000000000000000000000000000",
+            "tokenSubID": "0"
+          },
+          "value": "123456789012345"
+        },
+        "ciphertext": {
+          "encryptedBundle": [
+            "0x4141414141414141414141414141414141414141414141414141414141414141",
+            "0x4242424242424242424242424242424242424242424242424242424242424242",
+            "0x4343434343434343434343434343434343434343434343434343434343434343"
+          ],
+          "shieldKey": "0x4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      }
+    ]
+  },
+  "baseTokenUnshield": {
+    "recipient": "0x0000000000000000000000000000000000000002",
+    "token": {
+      "tokenType": "0",
+      "tokenAddress": "0x0000000000000000000000000000000000000000",
+      "tokenSubID": "0"
+    },
+    "unwrapBaseAmount": "0",
+    "transferRequests": [
+      {
+        "token": {
+          "tokenType": "0",
+          "tokenAddress": "0x0000000000000000000000000000000000000000",
+          "tokenSubID": "0"
+        },
+        "to": "0x0000000000000000000000000000000000000002",
+        "value": "0"
+      }
+    ],
+    "outerValue": "0"
+  },
+  "wireMetadataInputs": {
+    "note": "Metadata inputs for later strict TX7702 assembly; calldata and signed outputs are intentionally not stored here.",
+    "transactType": "TX7702",
+    "to": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    "chainID": "31337",
+    "chainType": "0",
+    "feesID": "0x4646464646464646464646464646464646464646464646464646464646464646",
+    "broadcasterViewingKey": "0x3333333333333333333333333333333333333333333333333333333333333333",
+    "useRelayAdapt": true,
+    "devLog": false,
+    "txidVersion": "V2_PoseidonMerkle",
+    "minVersion": "10.10.0-rc.1",
+    "maxVersion": "10.10.0-rc.1",
+    "gasLimit": "987654",
+    "maxFeePerGas": "42000000000",
+    "maxPriorityFeePerGas": "1700000000",
+    "preTransactionPOIsPerTxidLeafPerList": {}
+  }
+}

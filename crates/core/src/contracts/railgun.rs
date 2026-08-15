@@ -113,7 +113,52 @@ sol! {
     function execute(Transaction[] _transactions, RelayAdapt7702ActionData _actionData, bytes _signature) payable;
     function shield(ShieldRequest[] _shieldRequests);
 
+    interface RelayAdapt7702Current {
+        function railgun() external view returns (address);
+        function wBase() external view returns (address);
+        function adaptImplementation() external view returns (address);
+        function DOMAIN_SEPARATOR() external view returns (bytes32);
+        function EXECUTE_TYPEHASH() external view returns (bytes32);
+        function MULTICALL_TYPEHASH() external view returns (bytes32);
+        function nonce() external view returns (uint256);
+
+        function execute(
+            Transaction[] _transactions,
+            RelayAdapt7702ActionData _actionData,
+            uint256 _executeNonce,
+            bytes _signature
+        ) payable;
+
+        function getExecutePayloadHash(
+            Transaction[] _transactions,
+            RelayAdapt7702ActionData _actionData,
+            uint256 _executeNonce
+        ) external pure returns (bytes32);
+    }
+
+    interface RelayAdapt7702Legacy {
+        function railgun() external view returns (address);
+        function wBase() external view returns (address);
+        function adaptImplementation() external view returns (address);
+        function DOMAIN_SEPARATOR() external view returns (bytes32);
+        function EXECUTE_TYPEHASH() external view returns (bytes32);
+        function MULTICALL_TYPEHASH() external view returns (bytes32);
+        function nonce() external view returns (uint256);
+
+        function execute(
+            Transaction[] _transactions,
+            RelayAdapt7702ActionData _actionData,
+            bytes _signature
+        ) payable;
+
+        function getExecutePayloadHash(
+            Transaction[] _transactions,
+            RelayAdapt7702ActionData _actionData
+        ) external pure returns (bytes32);
+    }
+
     function unwrapBase(uint256 _amount);
+    function wrapBase(uint256 _amount);
     function transfer(TokenTransfer[] _transfers);
 
     function approve(address spender, uint256 amount) returns (bool);
@@ -443,6 +488,9 @@ impl ActionData {
         keccak256(input.abi_encode_params())
     }
 }
+
+#[cfg(test)]
+mod abi_compatibility;
 
 #[cfg(test)]
 mod tests {

@@ -9,10 +9,15 @@ use async_trait::async_trait;
 use poi::poi::PoiMerkleProof;
 
 use broadcaster_core::contracts::railgun::{
-    ActionData, BoundParams, SnarkProof, TokenTransfer, relayCall, transactCall,
+    ActionData, BoundParams, CommitmentPreimage, ShieldCiphertext, ShieldRequest, SnarkProof,
+    TokenData, TokenTransfer, relayCall, shieldCall, transactCall, transferCall, unwrapBaseCall,
+    wrapBaseCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::eip7702::{
+    Eip7702AuthorizationNonce, RelayAdapt7702ExecutionNonce, RelayAdapt7702ExecutionVersion,
+};
 use broadcaster_core::notes::Note;
 use broadcaster_core::transact::{
     DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, parse_transact_calldata,
@@ -32,10 +37,11 @@ use crate::tx::{
     MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource, MixedPrivateSend,
     MixedPrivateSendRole, PoiCircuitVariant, PoiMerkleProofSource, PostTransactionPoiData,
     PostTransactionPoiGenerationRequest, PreTransactionPoiError,
-    PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, SelectedInputIdentity,
-    SendRequest, TransactionBuilder, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS,
-    compute_railgun_txid_from_public_inputs, generate_post_transaction_pois,
-    generate_pre_transaction_pois, insert_pre_transaction_poi, poi_circuit_variant,
+    PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, RelayAdapt7702PlanRequest,
+    RelayAdapt7702Recipe, SelectedInputIdentity, SendRequest, TransactionBuilder,
+    TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, compute_railgun_txid_from_public_inputs,
+    generate_post_transaction_pois, generate_pre_transaction_pois, insert_pre_transaction_poi,
+    poi_circuit_variant,
 };
 
 use super::{
@@ -240,6 +246,20 @@ fn test_transaction_builder() -> TransactionBuilder {
         chain_id: 1,
         railgun_contract: Address::from([0x51; 20]),
         relay_adapt_contract: Address::from([0x52; 20]),
+    }
+}
+
+fn native_shield_request(amount: u64) -> ShieldRequest {
+    ShieldRequest {
+        preimage: CommitmentPreimage {
+            npk: FixedBytes::from([0x31; 32]),
+            token: TokenData::base_native(),
+            value: Uint::<120, 2>::from(amount),
+        },
+        ciphertext: ShieldCiphertext {
+            encryptedBundle: [FixedBytes::from([0x32; 32]); 3],
+            shieldKey: FixedBytes::from([0x33; 32]),
+        },
     }
 }
 
@@ -978,6 +998,404 @@ async fn relay_composite_binds_action_data_and_uses_exact_actions() {
         );
         assert_ne!(transaction.boundParams.adaptParams, UNRELAYED_ADAPT_PARAMS);
     }
+}
+
+#[tokio::test]
+async fn relay_adapt_7702_public_native_shield_has_exact_empty_batch_recipe() {
+    let wallet = test_wallet();
+    let builder = test_transaction_builder();
+    let authority = Address::from([0x81; 20]);
+    let delegate = Address::from([0x82; 20]);
+    let amount = uint!(9_U256);
+    let authorization_nonce = 0x0123_4567_89ab_cdef_u64;
+    let execution_nonce = U256::from_be_bytes([0xe7; 32]);
+    let request = RelayAdapt7702PlanRequest {
+        authority,
+        delegate,
+        authorization_nonce: Eip7702AuthorizationNonce::new(authorization_nonce),
+        execution_version: RelayAdapt7702ExecutionVersion::CurrentNonceAware {
+            nonce: RelayAdapt7702ExecutionNonce::new(execution_nonce),
+        },
+        recipe: RelayAdapt7702Recipe::PublicNativeShield {
+            amount,
+            shield_requests: vec![native_shield_request(9)],
+        },
+        verify_proof: false,
+    };
+    let request_debug = format!("{request:?}");
+
+    let plan = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            request,
+            &MockTransactionProver,
+        )
+        .await
+        .expect("public native Shield plan");
+    let plan_debug = format!("{plan:?}");
+    let authorization_nonce_hex = format!("{authorization_nonce:x}");
+    let execution_nonce_hex = alloy::hex::encode(execution_nonce.to_be_bytes::<32>());
+    for rendered in [&request_debug, &plan_debug] {
+        for sentinel in [
+            authorization_nonce.to_string(),
+            authorization_nonce_hex.clone(),
+            format!("0x{authorization_nonce_hex}"),
+            execution_nonce.to_string(),
+            execution_nonce_hex.clone(),
+            format!("0x{execution_nonce_hex}"),
+        ] {
+            assert!(
+                !rendered.contains(sentinel.as_str()),
+                "leaked EIP-7702 nonce in debug output: {sentinel}"
+            );
+        }
+    }
+    assert!(request_debug.contains("recipe: \"public-native-shield\""));
+    assert!(request_debug.contains("verify_proof: false"));
+    assert!(request_debug.contains("authorization_nonce_present: true"));
+    assert!(request_debug.contains("execution_version: \"current\""));
+    assert!(request_debug.contains("execution_nonce_present: true"));
+    assert!(plan_debug.contains("authorization_nonce_present: true"));
+    assert!(plan_debug.contains("execution_version: \"current\""));
+    assert!(plan_debug.contains("execution_nonce_present: true"));
+    assert!(plan_debug.contains("transaction_count: 0"));
+    assert!(plan_debug.contains("action_call_count: 2"));
+
+    assert!(plan.transactions.is_empty());
+    assert!(plan.chunks.is_empty());
+    assert!(plan.inputs.is_empty());
+    assert!(plan.outputs.is_empty());
+    assert_eq!(plan.outer_value, amount);
+    assert_eq!(plan.action_data.calls.len(), 2);
+    assert!(plan.action_data.requireSuccess);
+    assert_eq!(plan.action_data.minGasLimit, U256::ZERO);
+    assert!(
+        plan.action_data
+            .calls
+            .iter()
+            .all(|call| call.to == authority && call.value.is_zero())
+    );
+
+    let wrap = wrapBaseCall::abi_decode(&plan.action_data.calls[0].data).expect("decode wrapBase");
+    assert_eq!(wrap._amount, amount);
+    let shield = shieldCall::abi_decode(&plan.action_data.calls[1].data).expect("decode shield");
+    assert_eq!(shield._shieldRequests.len(), 1);
+    assert_eq!(U256::from(shield._shieldRequests[0].preimage.value), amount);
+    assert_eq!(
+        &plan.action_data.calls[0].data[..4],
+        &wrapBaseCall::SELECTOR
+    );
+    assert_eq!(&plan.action_data.calls[1].data[..4], &shieldCall::SELECTOR);
+
+    let expected_hash = plan
+        .execution_version
+        .execute_payload_hash(&plan.transactions, &plan.action_data);
+    assert_eq!(plan.prepared_execution.payload_hash(), expected_hash);
+    let same_payload_with_zero_outer =
+        broadcaster_core::eip7702::PreparedRelayAdapt7702Execution::prepare(
+            builder.chain_id,
+            authority,
+            delegate,
+            Eip7702AuthorizationNonce::new(authorization_nonce),
+            plan.execution_version,
+            plan.transactions.clone(),
+            plan.action_data.clone(),
+            U256::ZERO,
+        );
+    assert_eq!(
+        plan.prepared_execution.payload_hash(),
+        same_payload_with_zero_outer.payload_hash()
+    );
+}
+
+#[tokio::test]
+async fn relay_adapt_7702_private_unshield_preserves_metadata_and_binds_authority_before_proof() {
+    let wallet = test_wallet();
+    let builder = test_transaction_builder();
+    let authority = Address::from([0x91; 20]);
+    let delegate = Address::from([0x92; 20]);
+    let wrapped_base_token = Address::from([0x93; 20]);
+    let recipient = Address::from([0x94; 20]);
+    let broadcaster = sample_address_data(0x95).address_data();
+    let utxos = vec![wallet_test_utxo(&wallet, wrapped_base_token, 10, 0, 0)];
+    let forest = forest_for_utxos(&utxos);
+    let prover = RecordingTransactionProver::default();
+    let request = RelayAdapt7702PlanRequest {
+        authority,
+        delegate,
+        authorization_nonce: Eip7702AuthorizationNonce::new(13),
+        execution_version: RelayAdapt7702ExecutionVersion::LegacyPreExecuteNonce,
+        recipe: RelayAdapt7702Recipe::PrivateBaseTokenUnshield {
+            wrapped_base_token,
+            amount: uint!(8_U256),
+            recipient,
+            broadcaster_fee: Some(BroadcasterFeeOutput {
+                recipient: broadcaster,
+                token_address: wrapped_base_token,
+                amount: uint!(1_U256),
+            }),
+            spend_up_to: false,
+        },
+        verify_proof: false,
+    };
+
+    let plan = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &prover,
+        )
+        .await
+        .expect("private base-token Unshield plan");
+
+    assert_eq!(plan.transactions.len(), 1);
+    assert_eq!(plan.chunks.len(), 1);
+    assert_eq!(plan.inputs.len(), 1);
+    assert_eq!(plan.outputs.len(), 3);
+    assert_eq!(plan.outer_value, U256::ZERO);
+    assert_eq!(plan.leg_metadata.len(), 1);
+    assert_eq!(
+        plan.leg_metadata[0].recipient,
+        CompositeUnshieldRecipient::RelayAdapt
+    );
+    assert_eq!(plan.leg_metadata[0].transaction_indices, vec![0]);
+    assert_eq!(plan.unshield_outputs.len(), 1);
+    assert_eq!(
+        plan.unshield_outputs[0].recipient,
+        CompositeUnshieldRecipient::RelayAdapt
+    );
+    assert_eq!(plan.unshield_outputs[0].amount, uint!(8_U256));
+    assert!(plan.broadcaster_fee_note.is_some());
+    assert_eq!(plan.private_output_roles.len(), 2);
+    assert_eq!(plan.action_data.calls.len(), 2);
+    assert!(plan.action_data.requireSuccess);
+    assert_eq!(plan.action_data.minGasLimit, U256::ZERO);
+    assert!(
+        plan.action_data
+            .calls
+            .iter()
+            .all(|call| call.to == authority && call.value.is_zero())
+    );
+
+    let unwrap =
+        unwrapBaseCall::abi_decode(&plan.action_data.calls[0].data).expect("decode unwrapBase");
+    assert_eq!(unwrap._amount, U256::ZERO);
+    let transfer =
+        transferCall::abi_decode(&plan.action_data.calls[1].data).expect("decode transfer");
+    assert_eq!(transfer._transfers.len(), 1);
+    assert_eq!(transfer._transfers[0].token.tokenAddress, Address::ZERO);
+    assert_eq!(transfer._transfers[0].to, recipient);
+    assert_eq!(transfer._transfers[0].value, U256::ZERO);
+    assert_eq!(
+        &plan.action_data.calls[0].data[..4],
+        &unwrapBaseCall::SELECTOR
+    );
+    assert_eq!(
+        &plan.action_data.calls[1].data[..4],
+        &transferCall::SELECTOR
+    );
+
+    let transaction = &plan.transactions[0];
+    assert_eq!(transaction.boundParams.adaptContract, authority);
+    assert_eq!(transaction.boundParams.adaptParams, UNRELAYED_ADAPT_PARAMS);
+    assert_eq!(transaction.boundParams.minGasPrice, Uint::<72, 2>::ZERO);
+    assert_eq!(
+        prover.bound_params_hashes(),
+        vec![transaction.boundParams.hash()]
+    );
+    assert_eq!(plan.prepared_execution.authority(), authority);
+    assert_eq!(
+        plan.prepared_execution
+            .execution_typed_data()
+            .domain()
+            .verifying_contract,
+        Some(authority)
+    );
+}
+
+#[tokio::test]
+async fn relay_adapt_7702_planner_rejects_malformed_closed_recipes() {
+    let wallet = test_wallet();
+    let builder = test_transaction_builder();
+    let authority = Address::from([0xa1; 20]);
+    let delegate = Address::from([0xa2; 20]);
+    let base_request = |recipe| RelayAdapt7702PlanRequest {
+        authority,
+        delegate,
+        authorization_nonce: Eip7702AuthorizationNonce::new(0),
+        execution_version: RelayAdapt7702ExecutionVersion::LegacyPreExecuteNonce,
+        recipe,
+        verify_proof: false,
+    };
+
+    let zero_shield = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            base_request(RelayAdapt7702Recipe::PublicNativeShield {
+                amount: U256::ZERO,
+                shield_requests: Vec::new(),
+            }),
+            &MockTransactionProver,
+        )
+        .await
+        .expect_err("zero Shield amount must fail");
+    assert!(matches!(
+        zero_shield,
+        BuildError::InvalidRelayAdapt7702ShieldAmount
+    ));
+
+    let non_native = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            base_request(RelayAdapt7702Recipe::PublicNativeShield {
+                amount: uint!(1_U256),
+                shield_requests: vec![ShieldRequest {
+                    preimage: CommitmentPreimage {
+                        npk: FixedBytes::ZERO,
+                        token: TokenData::erc20(Address::from([0xa3; 20])),
+                        value: Uint::<120, 2>::from(1_u64),
+                    },
+                    ciphertext: ShieldCiphertext {
+                        encryptedBundle: [FixedBytes::ZERO; 3],
+                        shieldKey: FixedBytes::ZERO,
+                    },
+                }],
+            }),
+            &MockTransactionProver,
+        )
+        .await
+        .expect_err("non-native Shield token must fail");
+    assert!(matches!(
+        non_native,
+        BuildError::InvalidRelayAdapt7702ShieldToken
+    ));
+
+    let mismatched_amount = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            base_request(RelayAdapt7702Recipe::PublicNativeShield {
+                amount: uint!(2_U256),
+                shield_requests: vec![native_shield_request(1)],
+            }),
+            &MockTransactionProver,
+        )
+        .await
+        .expect_err("Shield amount mismatch must fail");
+    assert!(matches!(
+        mismatched_amount,
+        BuildError::RelayAdapt7702ShieldAmountMismatch
+    ));
+
+    let zero_wrapped_token = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            base_request(RelayAdapt7702Recipe::PrivateBaseTokenUnshield {
+                wrapped_base_token: Address::ZERO,
+                amount: uint!(1_U256),
+                recipient: authority,
+                broadcaster_fee: None,
+                spend_up_to: false,
+            }),
+            &MockTransactionProver,
+        )
+        .await
+        .expect_err("zero wrapped-base token must fail");
+    assert!(matches!(
+        zero_wrapped_token,
+        BuildError::InvalidRelayAdapt7702WrappedBaseToken
+    ));
+}
+
+#[test]
+fn relay_adapt_7702_planner_fixture_is_static_and_provenance_bound() {
+    let fixture = include_str!("../../../tests/fixtures/relay-adapt-7702-planner.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(fixture).expect("parse planner fixture JSON");
+
+    let provenance = &fixture["provenance"];
+    assert_eq!(
+        provenance["authority"],
+        "frozen MIT npm package baseline @railgun-community/engine@9.7.0-rc.0"
+    );
+    assert_eq!(
+        provenance["integrity"],
+        "sha512-68mjGZAWNIblnGWIb/ISDLc0BIdM9xVOnmh1No/o0tLYlZWHpiFjc4lIxWhA4v57Z0+zalzXWiN1/zWGh7Wihg=="
+    );
+    assert_eq!(
+        provenance["source_path"],
+        "@railgun-community/engine/dist/abi/V2/RelayAdapt7702.json"
+    );
+    assert_eq!(
+        provenance["fixture_status"],
+        "not derived from the cited UNLICENSED source/test"
+    );
+
+    let public_shield = &fixture["recipes"]["public_native_shield"];
+    assert_eq!(
+        public_shield["authority"],
+        "0x8181818181818181818181818181818181818181"
+    );
+    assert_eq!(
+        public_shield["delegate"],
+        "0x8282828282828282828282828282828282828282"
+    );
+    assert_eq!(public_shield["outer_value"], "0x09");
+    for count in ["railgun_transactions", "chunks", "inputs", "outputs"] {
+        assert_eq!(public_shield[count], 0);
+    }
+    assert_eq!(
+        public_shield["calls"],
+        serde_json::json!([
+            { "name": "wrapBase", "selector": "0xe9a059a3", "value": "0x00" },
+            { "name": "shield", "selector": "0x044a40c3", "value": "0x00" }
+        ])
+    );
+    assert_eq!(public_shield["bound_min_gas_price"], "0x00");
+    assert_eq!(public_shield["adapt_params"], "0x00");
+    assert_eq!(public_shield["require_success"], true);
+    assert_eq!(public_shield["min_gas_limit"], "0x00");
+    assert_eq!(public_shield["recovery_planner_exposed"], false);
+
+    let private_unshield = &fixture["recipes"]["private_base_token_unshield"];
+    assert_eq!(
+        private_unshield["authority"],
+        "0x9191919191919191919191919191919191919191"
+    );
+    assert_eq!(
+        private_unshield["delegate"],
+        "0x9292929292929292929292929292929292929292"
+    );
+    assert_eq!(private_unshield["outer_value"], "0x00");
+    assert_eq!(
+        private_unshield["calls"],
+        serde_json::json!([
+            { "name": "unwrapBase", "selector": "0xd5774a28", "value": "0x00" },
+            { "name": "transfer", "selector": "0xc2e9ffd8", "value": "0x00" }
+        ])
+    );
+    assert_eq!(private_unshield["bound_min_gas_price"], "0x00");
+    assert_eq!(private_unshield["adapt_params"], "0x00");
+    assert_eq!(private_unshield["require_success"], true);
+    assert_eq!(private_unshield["min_gas_limit"], "0x00");
+    assert_eq!(private_unshield["recovery_planner_exposed"], false);
 }
 
 #[tokio::test]

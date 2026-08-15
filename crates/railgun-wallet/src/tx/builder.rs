@@ -8,10 +8,12 @@ use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use broadcaster_core::contracts::railgun::{
-    ActionData, BoundParams, CommitmentCiphertext, CommitmentPreimage, SnarkProof, Transaction,
-    relayCall, transactCall,
+    ActionData, BoundParams, Call, CommitmentCiphertext, CommitmentPreimage,
+    RelayAdapt7702ActionData, ShieldRequest, SnarkProof, TokenTransfer, Transaction, relayCall,
+    shieldCall, transactCall, wrapBaseCall,
 };
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::eip7702::PreparedRelayAdapt7702Execution;
 use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleProof};
@@ -23,13 +25,14 @@ use crate::prover::{ProverError, ProverService};
 use super::{
     BroadcasterFeeOutput, BuildError, CompositePlanShape, CompositePrivateOutputRole,
     CompositePrivateOutputRoleKind, CompositeUnshieldLeg, CompositeUnshieldLegMetadata,
-    CompositeUnshieldPlan, CompositeUnshieldPlannedOutput, CompositeUnshieldRequest, InputWitness,
-    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan,
-    MixedPrivateActionPreview, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    MixedPrivateOutputSource, MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs,
-    PublicInputs, SelectedInputIdentity, SendPlan, SendRequest, TransactPlan, TransactionBuilder,
-    TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan,
-    UnshieldRequest,
+    CompositeUnshieldLegRole, CompositeUnshieldPlan, CompositeUnshieldPlannedOutput,
+    CompositeUnshieldRecipient, CompositeUnshieldRequest, InputWitness, MAX_BATCH_TRANSACTIONS,
+    MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan, MixedPrivateActionPreview,
+    MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource,
+    MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs, PublicInputs,
+    RelayAdapt7702Plan, RelayAdapt7702PlanRequest, RelayAdapt7702Recipe, SelectedInputIdentity,
+    SendPlan, SendRequest, TransactPlan, TransactionBuilder, TransactionCall, TransactionPlanChunk,
+    UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan, UnshieldRequest,
 };
 
 use selection::{
@@ -56,6 +59,16 @@ use selection::select_utxos;
 struct MixedPrivateActionSelectionPlan {
     selections: Vec<BatchUtxoSelection>,
     preview: MixedPrivateActionPreview,
+}
+
+struct CompositeUnshieldUnprovenPlan {
+    unproven_plans: Vec<UnprovenTransactionPlan>,
+    broadcaster_fee_note: Option<Note>,
+    unshield_outputs: Vec<CompositeUnshieldPlannedOutput>,
+    leg_metadata: Vec<CompositeUnshieldLegMetadata>,
+    private_output_roles: Vec<CompositePrivateOutputRole>,
+    relay_call_count: usize,
+    uses_relay_adapt: bool,
 }
 
 impl TransactionBuilder {
@@ -161,6 +174,240 @@ impl TransactionBuilder {
             .await
     }
 
+    /// Build one of the closed, authority-bound `RelayAdapt7702` recipes.
+    pub async fn build_relay_adapt_7702_plan(
+        &self,
+        wallet: &WalletKeys,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: RelayAdapt7702PlanRequest,
+        prover: &ProverService,
+    ) -> Result<RelayAdapt7702Plan, BuildError> {
+        self.build_relay_adapt_7702_plan_with_signer(
+            &wallet.viewing,
+            wallet,
+            forest,
+            utxos,
+            request,
+            prover,
+        )
+        .await
+    }
+
+    /// Build a `RelayAdapt7702` recipe using externally scoped viewing data and spend signer.
+    pub async fn build_relay_adapt_7702_plan_with_signer(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: RelayAdapt7702PlanRequest,
+        prover: &ProverService,
+    ) -> Result<RelayAdapt7702Plan, BuildError> {
+        self.build_relay_adapt_7702_plan_inner(viewing, signer, forest, utxos, request, prover)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_relay_adapt_7702_plan_inner<P: TransactionProver>(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: RelayAdapt7702PlanRequest,
+        prover: &P,
+    ) -> Result<RelayAdapt7702Plan, BuildError> {
+        if request.authority == Address::ZERO {
+            return Err(BuildError::InvalidRelayAdapt7702Authority);
+        }
+        if request.delegate == Address::ZERO {
+            return Err(BuildError::InvalidRelayAdapt7702Delegate);
+        }
+
+        let RelayAdapt7702PlanRequest {
+            authority,
+            delegate,
+            authorization_nonce,
+            execution_version,
+            recipe,
+            verify_proof,
+        } = request;
+
+        match recipe {
+            RelayAdapt7702Recipe::PublicNativeShield {
+                amount,
+                shield_requests,
+            } => {
+                validate_public_native_shield(amount, &shield_requests)?;
+                let action_data = RelayAdapt7702ActionData {
+                    requireSuccess: true,
+                    minGasLimit: U256::ZERO,
+                    calls: vec![
+                        Call {
+                            to: authority,
+                            data: wrapBaseCall { _amount: amount }.abi_encode().into(),
+                            value: U256::ZERO,
+                        },
+                        Call {
+                            to: authority,
+                            data: shieldCall {
+                                _shieldRequests: shield_requests,
+                            }
+                            .abi_encode()
+                            .into(),
+                            value: U256::ZERO,
+                        },
+                    ],
+                };
+                let transactions = Vec::new();
+                let prepared_execution = PreparedRelayAdapt7702Execution::prepare(
+                    self.chain_id,
+                    authority,
+                    delegate,
+                    authorization_nonce,
+                    execution_version,
+                    transactions.clone(),
+                    action_data.clone(),
+                    amount,
+                );
+                Ok(RelayAdapt7702Plan {
+                    authority,
+                    delegate,
+                    authorization_nonce,
+                    execution_version,
+                    prepared_execution,
+                    transactions,
+                    chunks: Vec::new(),
+                    action_data,
+                    outer_value: amount,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    broadcaster_fee_note: None,
+                    unshield_outputs: Vec::new(),
+                    leg_metadata: Vec::new(),
+                    private_output_roles: Vec::new(),
+                    shape: CompositePlanShape {
+                        transaction_count: 0,
+                        input_count: 0,
+                        private_output_count: 0,
+                        public_output_count: 0,
+                        relay_call_count: 2,
+                        uses_relay_adapt: true,
+                    },
+                })
+            }
+            RelayAdapt7702Recipe::PrivateBaseTokenUnshield {
+                wrapped_base_token,
+                amount,
+                recipient,
+                broadcaster_fee,
+                spend_up_to,
+            } => {
+                if wrapped_base_token == Address::ZERO {
+                    return Err(BuildError::InvalidRelayAdapt7702WrappedBaseToken);
+                }
+
+                let composite_request = CompositeUnshieldRequest {
+                    legs: vec![CompositeUnshieldLeg {
+                        token_address: wrapped_base_token,
+                        amount,
+                        recipient: CompositeUnshieldRecipient::RelayAdapt,
+                        role: CompositeUnshieldLegRole::Primary,
+                    }],
+                    relay_actions: None,
+                    broadcaster_fee,
+                    min_gas_price: 0,
+                    verify_proof,
+                    spend_up_to,
+                };
+                let CompositeUnshieldUnprovenPlan {
+                    mut unproven_plans,
+                    broadcaster_fee_note,
+                    unshield_outputs,
+                    leg_metadata,
+                    private_output_roles,
+                    ..
+                } = self.build_composite_unshield_unproven(
+                    viewing,
+                    signer,
+                    forest,
+                    utxos,
+                    &composite_request,
+                    authority,
+                    2,
+                    0,
+                )?;
+
+                // These fields are part of the Railgun proof inputs, so bind them before proving.
+                for plan in &mut unproven_plans {
+                    plan.transaction.boundParams.adaptContract = authority;
+                    plan.transaction.boundParams.adaptParams = UNRELAYED_ADAPT_PARAMS;
+                    plan.transaction.boundParams.minGasPrice = Uint::<72, 2>::ZERO;
+                }
+                let action_data = RelayAdapt7702ActionData {
+                    requireSuccess: true,
+                    minGasLimit: U256::ZERO,
+                    calls: vec![
+                        ActionData::unwrap_base_call(authority, U256::ZERO),
+                        ActionData::transfer_call(
+                            authority,
+                            vec![TokenTransfer::base_native(recipient, U256::ZERO)],
+                        ),
+                    ],
+                };
+                let proven_plans =
+                    prove_transaction_plans(unproven_plans, signer, prover, verify_proof).await?;
+                let (transactions, chunks) = split_proven_plans(proven_plans);
+                let inputs = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.inputs.clone())
+                    .collect::<Vec<_>>();
+                let outputs = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.outputs.clone())
+                    .collect::<Vec<_>>();
+                let prepared_execution = PreparedRelayAdapt7702Execution::prepare(
+                    self.chain_id,
+                    authority,
+                    delegate,
+                    authorization_nonce,
+                    execution_version,
+                    transactions.clone(),
+                    action_data.clone(),
+                    U256::ZERO,
+                );
+                let shape = CompositePlanShape {
+                    transaction_count: chunks.len(),
+                    input_count: inputs.len(),
+                    private_output_count: private_output_roles.len(),
+                    public_output_count: unshield_outputs.len(),
+                    relay_call_count: action_data.calls.len(),
+                    uses_relay_adapt: true,
+                };
+
+                Ok(RelayAdapt7702Plan {
+                    authority,
+                    delegate,
+                    authorization_nonce,
+                    execution_version,
+                    prepared_execution,
+                    transactions,
+                    chunks,
+                    action_data,
+                    outer_value: U256::ZERO,
+                    inputs,
+                    outputs,
+                    broadcaster_fee_note,
+                    unshield_outputs,
+                    leg_metadata,
+                    private_output_roles,
+                    shape,
+                })
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn build_composite_unshield_plan_inner<P: TransactionProver>(
         &self,
@@ -171,6 +418,120 @@ impl TransactionBuilder {
         request: CompositeUnshieldRequest,
         prover: &P,
     ) -> Result<CompositeUnshieldPlan, BuildError> {
+        let relay_call_count = request
+            .relay_actions
+            .as_ref()
+            .map_or(0, |actions| actions.calls.len());
+        let CompositeUnshieldUnprovenPlan {
+            mut unproven_plans,
+            broadcaster_fee_note,
+            unshield_outputs,
+            leg_metadata,
+            private_output_roles,
+            relay_call_count,
+            uses_relay_adapt,
+        } = self.build_composite_unshield_unproven(
+            viewing,
+            signer,
+            forest,
+            utxos,
+            &request,
+            self.relay_adapt_contract,
+            relay_call_count,
+            request.min_gas_price,
+        )?;
+
+        let action_data = if uses_relay_adapt {
+            let actions = request
+                .relay_actions
+                .clone()
+                .ok_or(BuildError::MissingCompositeRelayActions)?;
+            let action_data = actions.action_data(
+                self.relay_adapt_contract,
+                FixedBytes::<31>::from(rand_array()),
+            )?;
+            debug_assert!(action_data.requireSuccess);
+            let transactions = unproven_plans
+                .iter()
+                .map(|plan| &plan.transaction)
+                .collect::<Vec<_>>();
+            let adapt_params = action_data.adapt_params(&transactions);
+            for plan in &mut unproven_plans {
+                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
+                plan.transaction.boundParams.adaptParams = adapt_params;
+            }
+            Some(action_data)
+        } else {
+            None
+        };
+
+        let proven_plans =
+            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
+        let (transactions, chunks) = split_proven_plans(proven_plans);
+
+        let call = if let Some(action_data) = action_data.as_ref() {
+            let data = relayCall {
+                _transactions: transactions,
+                _actionData: action_data.clone(),
+            }
+            .abi_encode();
+            TransactionCall {
+                to: self.relay_adapt_contract,
+                data: data.into(),
+            }
+        } else {
+            let data = transactCall {
+                _transactions: transactions,
+            }
+            .abi_encode();
+            TransactionCall {
+                to: self.railgun_contract,
+                data: data.into(),
+            }
+        };
+        let inputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.inputs.clone())
+            .collect::<Vec<_>>();
+        let outputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.outputs.clone())
+            .collect::<Vec<_>>();
+        let shape = CompositePlanShape {
+            transaction_count: chunks.len(),
+            input_count: inputs.len(),
+            private_output_count: private_output_roles.len(),
+            public_output_count: unshield_outputs.len(),
+            relay_call_count,
+            uses_relay_adapt,
+        };
+
+        Ok(CompositeUnshieldPlan {
+            call,
+            inputs,
+            outputs,
+            chunks,
+            broadcaster_fee_note,
+            unshield_outputs,
+            leg_metadata,
+            private_output_roles,
+            action_data,
+            shape,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_composite_unshield_unproven(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: &CompositeUnshieldRequest,
+        relay_adapt_contract: Address,
+        relay_call_count: usize,
+        min_gas_price: u128,
+    ) -> Result<CompositeUnshieldUnprovenPlan, BuildError> {
         if request.legs.is_empty() {
             return Err(BuildError::EmptyCompositeUnshieldRequest);
         }
@@ -179,10 +540,6 @@ impl TransactionBuilder {
             .legs
             .iter()
             .any(|leg| leg.recipient.uses_relay_adapt());
-        let relay_call_count = request
-            .relay_actions
-            .as_ref()
-            .map_or(0, |actions| actions.calls.len());
         if has_relay_adapt_leg && relay_call_count == 0 {
             return Err(BuildError::MissingCompositeRelayActions);
         }
@@ -251,7 +608,7 @@ impl TransactionBuilder {
             broadcaster_fee_note = Some(fee_note);
             unproven_plans.push(fee_plan_builder.build_unproven_fee_only(
                 fee.token_address,
-                request.min_gas_price,
+                min_gas_price,
                 outputs,
                 commitment_ciphertext,
                 Some(&mut input_witness_cache),
@@ -277,7 +634,7 @@ impl TransactionBuilder {
                 leg_fee,
                 request.spend_up_to,
             )?;
-            let unshield_to = leg.recipient.unshield_to(self.relay_adapt_contract);
+            let unshield_to = leg.recipient.unshield_to(relay_adapt_contract);
 
             for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
                 let transaction_index = unproven_plans.len();
@@ -347,7 +704,7 @@ impl TransactionBuilder {
                     verify_proof: request.verify_proof,
                     spend_up_to: request.spend_up_to,
                     broadcaster_fee: allocation.fee,
-                    min_gas_price: request.min_gas_price,
+                    min_gas_price,
                 };
                 unproven_plans.push(plan_builder.build_unproven_unshield(
                     unshield_request,
@@ -359,87 +716,14 @@ impl TransactionBuilder {
             }
         }
 
-        let action_data = if uses_relay_adapt {
-            let actions = request
-                .relay_actions
-                .clone()
-                .ok_or(BuildError::MissingCompositeRelayActions)?;
-            let action_data = actions.action_data(
-                self.relay_adapt_contract,
-                FixedBytes::<31>::from(rand_array()),
-            )?;
-            debug_assert!(action_data.requireSuccess);
-            let transactions = unproven_plans
-                .iter()
-                .map(|plan| &plan.transaction)
-                .collect::<Vec<_>>();
-            let adapt_params = action_data.adapt_params(&transactions);
-            for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
-                plan.transaction.boundParams.adaptParams = adapt_params;
-            }
-            Some(action_data)
-        } else {
-            None
-        };
-
-        let proven_plans =
-            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
-        let mut transactions = Vec::with_capacity(proven_plans.len());
-        let mut chunks = Vec::with_capacity(proven_plans.len());
-        for proven in proven_plans {
-            transactions.push(proven.transaction);
-            chunks.push(proven.chunk);
-        }
-
-        let call = if let Some(action_data) = action_data.as_ref() {
-            let data = relayCall {
-                _transactions: transactions,
-                _actionData: action_data.clone(),
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.relay_adapt_contract,
-                data: data.into(),
-            }
-        } else {
-            let data = transactCall {
-                _transactions: transactions,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.railgun_contract,
-                data: data.into(),
-            }
-        };
-        let inputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.inputs.clone())
-            .collect::<Vec<_>>();
-        let outputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.outputs.clone())
-            .collect::<Vec<_>>();
-        let shape = CompositePlanShape {
-            transaction_count: chunks.len(),
-            input_count: inputs.len(),
-            private_output_count: private_output_roles.len(),
-            public_output_count: unshield_outputs.len(),
-            relay_call_count,
-            uses_relay_adapt,
-        };
-
-        Ok(CompositeUnshieldPlan {
-            call,
-            inputs,
-            outputs,
-            chunks,
+        Ok(CompositeUnshieldUnprovenPlan {
+            unproven_plans,
             broadcaster_fee_note,
             unshield_outputs,
             leg_metadata,
             private_output_roles,
-            action_data,
-            shape,
+            relay_call_count,
+            uses_relay_adapt,
         })
     }
 
@@ -2110,6 +2394,44 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             signature,
         })
     }
+}
+
+fn validate_public_native_shield(
+    amount: U256,
+    shield_requests: &[ShieldRequest],
+) -> Result<(), BuildError> {
+    if amount.is_zero() {
+        return Err(BuildError::InvalidRelayAdapt7702ShieldAmount);
+    }
+
+    let supplied_amount = shield_requests
+        .iter()
+        .try_fold(U256::ZERO, |sum, request| {
+            if request.preimage.token.tokenType != 0
+                || request.preimage.token.tokenAddress != Address::ZERO
+                || !request.preimage.token.tokenSubID.is_zero()
+            {
+                return Err(BuildError::InvalidRelayAdapt7702ShieldToken);
+            }
+            sum.checked_add(U256::from(request.preimage.value))
+                .ok_or(BuildError::RelayAdapt7702ShieldAmountMismatch)
+        })?;
+    if supplied_amount != amount {
+        return Err(BuildError::RelayAdapt7702ShieldAmountMismatch);
+    }
+    Ok(())
+}
+
+fn split_proven_plans(
+    proven_plans: Vec<ProvenTransactionPlan>,
+) -> (Vec<Transaction>, Vec<TransactionPlanChunk>) {
+    let mut transactions = Vec::with_capacity(proven_plans.len());
+    let mut chunks = Vec::with_capacity(proven_plans.len());
+    for proven in proven_plans {
+        transactions.push(proven.transaction);
+        chunks.push(proven.chunk);
+    }
+    (transactions, chunks)
 }
 
 struct SendOutputs {

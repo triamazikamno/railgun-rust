@@ -642,7 +642,7 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
                 relay_adapt_contract: address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405"),
-                relay_adapt_7702_contract: address!("0x2df3d82c06339387a4532c685daaf39a218cf56e"),
+                relay_adapt_7702_contract: address!("0x05aE73C5925d843864AE6f261f3175dE2ebCd963"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
                 rpc_urls: default_rpc_urls(&[
                     "https://ethereum-public.nodies.app",
@@ -671,7 +671,7 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: address!("0x590162bf4b50f6576a459b75309ee21d92178a10"),
                 relay_adapt_contract: address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd"),
-                relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
+                relay_adapt_7702_contract: address!("0x48cf4b897f64D81212c1423D78a05E828d0cE19d"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
                 rpc_urls: default_rpc_urls(&[
                     "https://bsc.publicnode.com",
@@ -698,7 +698,7 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: address!("0x19b620929f97b7b990801496c3b361ca5def8c71"),
                 relay_adapt_contract: address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd"),
-                relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
+                relay_adapt_7702_contract: address!("0x48cf4b897f64D81212c1423D78a05E828d0cE19d"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
                 rpc_urls: default_rpc_urls(&[
                     "https://rpc-mainnet.matic.quiknode.pro",
@@ -725,7 +725,7 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
                 relay_adapt_contract: address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
-                relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
+                relay_adapt_7702_contract: address!("0x48cf4b897f64D81212c1423D78a05E828d0cE19d"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
                 rpc_urls: default_rpc_urls(&[
                     "https://arbitrum-one-public.nodies.app",

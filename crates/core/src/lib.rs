@@ -1,5 +1,6 @@
 pub mod contracts;
 pub mod crypto;
+pub mod eip7702;
 pub mod notes;
 pub mod provider;
 pub mod query_rpc_pool;

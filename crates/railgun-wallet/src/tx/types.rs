@@ -1,8 +1,15 @@
+use std::fmt;
+
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 
-use broadcaster_core::contracts::railgun::{ActionData, TokenTransfer, Transaction};
+use broadcaster_core::contracts::railgun::{
+    ActionData, RelayAdapt7702ActionData, ShieldRequest, TokenTransfer, Transaction,
+};
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::eip7702::{
+    Eip7702AuthorizationNonce, PreparedRelayAdapt7702Execution, RelayAdapt7702ExecutionVersion,
+};
 use broadcaster_core::notes::Note;
 use broadcaster_core::tree::TREE_DEPTH;
 use broadcaster_core::utxo::Utxo;
@@ -117,6 +124,149 @@ pub struct CompositeUnshieldPlan {
     pub private_output_roles: Vec<CompositePrivateOutputRole>,
     pub action_data: Option<ActionData>,
     pub shape: CompositePlanShape,
+}
+
+/// The only transaction recipes supported by the initial EIP-7702 planner.
+///
+/// Keeping this closed prevents callers from constructing arbitrary external
+/// calls, nested Multicall, direct Railgun targets, or recovery-shaped plans.
+pub enum RelayAdapt7702Recipe {
+    PublicNativeShield {
+        amount: U256,
+        shield_requests: Vec<ShieldRequest>,
+    },
+    PrivateBaseTokenUnshield {
+        wrapped_base_token: Address,
+        amount: U256,
+        recipient: Address,
+        broadcaster_fee: Option<BroadcasterFeeOutput>,
+        spend_up_to: bool,
+    },
+}
+
+/// Explicit signer-neutral inputs for one supported EIP-7702 recipe.
+pub struct RelayAdapt7702PlanRequest {
+    pub authority: Address,
+    pub delegate: Address,
+    pub authorization_nonce: Eip7702AuthorizationNonce,
+    pub execution_version: RelayAdapt7702ExecutionVersion,
+    pub recipe: RelayAdapt7702Recipe,
+    pub verify_proof: bool,
+}
+
+impl RelayAdapt7702PlanRequest {
+    #[must_use]
+    pub const fn public_native_shield(
+        authority: Address,
+        delegate: Address,
+        authorization_nonce: Eip7702AuthorizationNonce,
+        execution_version: RelayAdapt7702ExecutionVersion,
+        amount: U256,
+        shield_requests: Vec<ShieldRequest>,
+    ) -> Self {
+        Self {
+            authority,
+            delegate,
+            authorization_nonce,
+            execution_version,
+            recipe: RelayAdapt7702Recipe::PublicNativeShield {
+                amount,
+                shield_requests,
+            },
+            verify_proof: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn private_base_token_unshield(
+        authority: Address,
+        delegate: Address,
+        authorization_nonce: Eip7702AuthorizationNonce,
+        execution_version: RelayAdapt7702ExecutionVersion,
+        wrapped_base_token: Address,
+        amount: U256,
+        recipient: Address,
+        broadcaster_fee: Option<BroadcasterFeeOutput>,
+        spend_up_to: bool,
+    ) -> Self {
+        Self {
+            authority,
+            delegate,
+            authorization_nonce,
+            execution_version,
+            recipe: RelayAdapt7702Recipe::PrivateBaseTokenUnshield {
+                wrapped_base_token,
+                amount,
+                recipient,
+                broadcaster_fee,
+                spend_up_to,
+            },
+            verify_proof: false,
+        }
+    }
+}
+
+impl fmt::Debug for RelayAdapt7702PlanRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let recipe = match &self.recipe {
+            RelayAdapt7702Recipe::PublicNativeShield { .. } => "public-native-shield",
+            RelayAdapt7702Recipe::PrivateBaseTokenUnshield { .. } => "private-base-token-unshield",
+        };
+        let (execution_version, execution_nonce_present) = match self.execution_version {
+            RelayAdapt7702ExecutionVersion::LegacyPreExecuteNonce => ("legacy", false),
+            RelayAdapt7702ExecutionVersion::CurrentNonceAware { .. } => ("current", true),
+        };
+        formatter
+            .debug_struct("RelayAdapt7702PlanRequest")
+            .field("recipe", &recipe)
+            .field("verify_proof", &self.verify_proof)
+            .field("authorization_nonce_present", &true)
+            .field("execution_version", &execution_version)
+            .field("execution_nonce_present", &execution_nonce_present)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A proof-complete EIP-7702 plan. Signatures are prepared by the core value
+/// only after all Railgun proving and metadata assembly has completed.
+#[derive(Clone)]
+pub struct RelayAdapt7702Plan {
+    pub authority: Address,
+    pub delegate: Address,
+    pub authorization_nonce: Eip7702AuthorizationNonce,
+    pub execution_version: RelayAdapt7702ExecutionVersion,
+    pub prepared_execution: PreparedRelayAdapt7702Execution,
+    pub transactions: Vec<Transaction>,
+    pub chunks: Vec<TransactionPlanChunk>,
+    pub action_data: RelayAdapt7702ActionData,
+    pub outer_value: U256,
+    pub inputs: Vec<InputWitness>,
+    pub outputs: Vec<Note>,
+    pub broadcaster_fee_note: Option<Note>,
+    pub unshield_outputs: Vec<CompositeUnshieldPlannedOutput>,
+    pub leg_metadata: Vec<CompositeUnshieldLegMetadata>,
+    pub private_output_roles: Vec<CompositePrivateOutputRole>,
+    pub shape: CompositePlanShape,
+}
+
+impl fmt::Debug for RelayAdapt7702Plan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (execution_version, execution_nonce_present) = match self.execution_version {
+            RelayAdapt7702ExecutionVersion::LegacyPreExecuteNonce => ("legacy", false),
+            RelayAdapt7702ExecutionVersion::CurrentNonceAware { .. } => ("current", true),
+        };
+        formatter
+            .debug_struct("RelayAdapt7702Plan")
+            .field("authorization_nonce_present", &true)
+            .field("execution_version", &execution_version)
+            .field("execution_nonce_present", &execution_nonce_present)
+            .field("transaction_count", &self.transactions.len())
+            .field("input_count", &self.inputs.len())
+            .field("output_count", &self.outputs.len())
+            .field("action_call_count", &self.action_data.calls.len())
+            .field("outer_value_nonzero", &(!self.outer_value.is_zero()))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]

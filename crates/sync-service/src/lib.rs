@@ -6,6 +6,7 @@ mod poi_cache;
 mod poi_limits;
 pub mod poi_v4;
 mod public_cache;
+pub mod relay_adapt_7702;
 mod runtime_admission;
 mod sender_candidate;
 mod trustless_artifacts;
@@ -27,6 +28,14 @@ pub use public_cache::{
     OfflinePoiCorpusReset, PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
     PersistedPublicSyncCacheResetReport, reset_offline_poi_corpus,
     reset_persisted_public_sync_caches,
+};
+pub use relay_adapt_7702::{
+    RelayAdapt7702AddressMetadata, RelayAdapt7702AdvisoryRegistryMetadata,
+    RelayAdapt7702ChainMetadata, RelayAdapt7702CurrentMetadata, RelayAdapt7702EvidenceClass,
+    RelayAdapt7702ExecutionVersionKind, RelayAdapt7702HistoricalMetadata, RelayAdapt7702Provenance,
+    advisory_relay_adapt_7702_registry, current_relay_adapt_7702, known_relay_adapt_7702_history,
+    relay_adapt_7702_address_metadata, relay_adapt_7702_metadata,
+    resolve_relay_adapt_7702_metadata,
 };
 pub use sender_candidate::{
     SENDER_TRANSACTION_CANDIDATE_FORMAT_VERSION, SenderTransactionCandidate,

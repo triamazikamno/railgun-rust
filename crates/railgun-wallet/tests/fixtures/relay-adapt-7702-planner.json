@@ -1,0 +1,43 @@
+{
+  "fixture_kind": "test-only-static-relay-adapt-7702-planner",
+  "provenance": {
+    "authority": "frozen MIT npm package baseline @railgun-community/engine@9.7.0-rc.0",
+    "integrity": "sha512-68mjGZAWNIblnGWIb/ISDLc0BIdM9xVOnmh1No/o0tLYlZWHpiFjc4lIxWhA4v57Z0+zalzXWiN1/zWGh7Wihg==",
+    "fixture_status": "not derived from the cited UNLICENSED source/test",
+    "source_path": "@railgun-community/engine/dist/abi/V2/RelayAdapt7702.json"
+  },
+  "recipes": {
+    "public_native_shield": {
+      "authority": "0x8181818181818181818181818181818181818181",
+      "delegate": "0x8282828282828282828282828282828282828282",
+      "outer_value": "0x09",
+      "railgun_transactions": 0,
+      "chunks": 0,
+      "inputs": 0,
+      "outputs": 0,
+      "calls": [
+        { "name": "wrapBase", "selector": "0xe9a059a3", "value": "0x00" },
+        { "name": "shield", "selector": "0x044a40c3", "value": "0x00" }
+      ],
+      "bound_min_gas_price": "0x00",
+      "adapt_params": "0x00",
+      "require_success": true,
+      "min_gas_limit": "0x00",
+      "recovery_planner_exposed": false
+    },
+    "private_base_token_unshield": {
+      "authority": "0x9191919191919191919191919191919191919191",
+      "delegate": "0x9292929292929292929292929292929292929292",
+      "outer_value": "0x00",
+      "calls": [
+        { "name": "unwrapBase", "selector": "0xd5774a28", "value": "0x00" },
+        { "name": "transfer", "selector": "0xc2e9ffd8", "value": "0x00" }
+      ],
+      "bound_min_gas_price": "0x00",
+      "adapt_params": "0x00",
+      "require_success": true,
+      "min_gas_limit": "0x00",
+      "recovery_planner_exposed": false
+    }
+  }
+}
