@@ -100,7 +100,7 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::notes::Note;
 use broadcaster_core::transact::{
-    MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash,
+    MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, compute_railgun_txid_parts, railgun_txid_leaf_hash,
     railgun_txid_leaf_hash_with_output_start,
 };
 use broadcaster_core::tree::TREE_LEAF_COUNT;
@@ -3131,7 +3131,7 @@ fn output_poi_recovery_reports_missing_private_output_indexes() {
 }
 
 #[tokio::test]
-async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() {
+async fn public_cache_txid_recovery_refreshes_stale_marker_for_known_target() {
     let spending_public_key = [uint!(4_U256), uint!(5_U256)];
     let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
     let mut input = test_wallet_utxo(0);
@@ -3166,7 +3166,7 @@ async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() 
         ..transaction
     };
     let bound_params_hash = transaction.boundParams.hash();
-    let recovery_chunk = build_output_poi_recovery_chunk(
+    let mut recovery_chunk = build_output_poi_recovery_chunk(
         &output,
         &wallet_nullifiers,
         std::slice::from_ref(&transaction),
@@ -3211,6 +3211,25 @@ async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() 
             ]
         }
     });
+    let seed_leaf = railgun_txid_leaf_hash_with_output_start(
+        compute_railgun_txid_parts(
+            &[U256::from(0xaa_u64)],
+            &[U256::from(0xbb_u64)],
+            U256::from(0xcc_u64),
+        ),
+        0,
+        U256::ZERO,
+    );
+    let expected_leaf = railgun_txid_leaf_hash_with_output_start(
+        recovery_chunk.chunk.railgun_txid(),
+        u64::from(recovery_chunk.chunk.tree_number),
+        U256::from(recovery_chunk.output_start_global),
+    );
+    let latest_root = FixedBytes::from(
+        DenseMerkleTree::from_ordered_leaves(vec![seed_leaf, expected_leaf], 2)
+            .root()
+            .to_be_bytes::<32>(),
+    );
     let seed_graph_response = serde_json::json!({
         "data": {
             "transactions": [graph_response["data"]["transactions"][0].clone()]
@@ -3274,13 +3293,11 @@ async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() 
                 ..
             }
     ));
-    let poi_mock = spawn_poi_rpc_sequence(vec![
-        serde_json::json!({
-            "validatedTxidIndex": 1,
-            "validatedMerkleroot": null,
-        }),
-        serde_json::json!(true),
-    ])
+    recovery_chunk.target_txid_index = Some(1);
+    let poi_mock = spawn_poi_rpc_sequence(vec![serde_json::json!({
+        "validatedTxidIndex": 1,
+        "validatedMerkleroot": hex::encode_prefixed(latest_root),
+    })])
     .await;
     let poi_client = PoiRpcClient::new(poi_mock.url.clone());
     let mut cfg = wallet_config(scan_keys.nullifying_key);
@@ -3307,11 +3324,13 @@ async fn public_cache_txid_recovery_refreshes_stale_marker_for_unknown_target() 
         .recv_timeout(Duration::from_secs(2))
         .expect("latest validated marker request");
     assert_eq!(latest_request["method"], "ppoi_validated_txid");
-    let validate_request = poi_mock
-        .requests
-        .recv_timeout(Duration::from_secs(2))
-        .expect("root validation request");
-    assert_eq!(validate_request["method"], "ppoi_validate_txid_merkleroot");
+    assert!(
+        poi_mock
+            .requests
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "latest-root recovery must not issue a target validation request"
+    );
     let latest = public_data_plane
         .cached_txid_latest_validated(&DataPlanePublicTxidCacheKey::new(
             ChainScope {
@@ -3415,8 +3434,8 @@ async fn public_cache_txid_recovery_uses_artifact_bound_before_latest_refresh() 
     let mut cfg = wallet_config(U256::ZERO);
     cfg.quick_sync_endpoint = Some(Url::parse("http://127.0.0.1:1/graphql").expect("squid URL"));
 
-    for accepted in [true, false] {
-        let poi_mock = spawn_poi_rpc_sequence(vec![serde_json::json!(accepted)]).await;
+    {
+        let poi_mock = spawn_poi_rpc_sequence(Vec::new()).await;
         let poi_client = PoiRpcClient::new(poi_mock.url.clone());
         let result = recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
             public_data_plane: &public_data_plane,
@@ -3429,42 +3448,22 @@ async fn public_cache_txid_recovery_uses_artifact_bound_before_latest_refresh() 
         })
         .await;
 
-        let validate_request = poi_mock
-            .requests
-            .recv_timeout(Duration::from_secs(2))
-            .expect("historical root validation request");
-        assert_eq!(validate_request["method"], "ppoi_validate_txid_merkleroot");
-        assert_eq!(validate_request["params"]["tree"], 0);
-        assert_eq!(validate_request["params"]["index"], 0);
-        assert_eq!(
-            validate_request["params"]["merkleroot"],
-            hex::encode(artifact_root)
-        );
         assert!(
             poi_mock
                 .requests
                 .recv_timeout(Duration::from_millis(100))
                 .is_err(),
-            "artifact-bounded recovery must not request the latest validated marker"
+            "artifact-bounded recovery must not request POI TXID validation"
         );
 
-        match (accepted, result) {
-            (true, Ok(recovered)) => {
-                assert_eq!(recovered.poi_data.txid_merkleroot, artifact_root);
-                assert_eq!(recovered.poi_data.txid_merkleroot_index, 0);
-                assert_eq!(recovered.poi_data.txid_merkle_proof_indices, U256::ZERO);
-                assert_eq!(
-                    recovered.poi_data.txid_merkle_proof_path_elements,
-                    artifact_path
-                );
-            }
-            (false, Err(failure)) => {
-                assert_eq!(failure.status, OutputPoiRecoveryStatus::MissingMerkleProof);
-                assert_eq!(failure.category, "public_txid_fetch_failed");
-            }
-            (true, Err(failure)) => panic!("accepted artifact_bound recovery failed: {failure:?}"),
-            (false, Ok(_)) => panic!("rejected artifact_bound root returned recovery data"),
-        }
+        let recovered = result.expect("authenticated artifact_bound recovery failed");
+        assert_eq!(recovered.poi_data.txid_merkleroot, artifact_root);
+        assert_eq!(recovered.poi_data.txid_merkleroot_index, 0);
+        assert_eq!(recovered.poi_data.txid_merkle_proof_indices, U256::ZERO);
+        assert_eq!(
+            recovered.poi_data.txid_merkle_proof_path_elements,
+            artifact_path
+        );
     }
 
     drop(store);
@@ -4783,10 +4782,13 @@ async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
         .await
         .expect("seed validated foreign TXID row");
 
-    let poi_mock = spawn_poi_rpc(serde_json::json!({
-        "validatedTxidIndex": 0,
-        "validatedMerkleroot": null,
-    }))
+    let poi_mock = spawn_poi_rpc_sequence(vec![
+        serde_json::json!({
+            "validatedTxidIndex": 0,
+            "validatedMerkleroot": null,
+        }),
+        serde_json::json!(true),
+    ])
     .await;
     let runtime = test_artifact_poi_runtime_with_fallback(poi_mock.url);
     cfg.quick_sync_endpoint =
@@ -4827,11 +4829,22 @@ async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
         "unexpected batch refresh report: {report:?}"
     );
     assert_eq!(report.retrying, 0);
-    let request = poi_mock
+    let latest_request = poi_mock
         .requests
         .recv_timeout(Duration::from_secs(2))
-        .expect("single latest validated TXID request");
-    assert_eq!(request["method"], "ppoi_validated_txid");
+        .expect("latest validated TXID request");
+    assert_eq!(latest_request["method"], "ppoi_validated_txid");
+    let global_checkpoint_request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("global latest checkpoint validation request");
+    assert_eq!(
+        global_checkpoint_request["method"],
+        "ppoi_validate_txid_merkleroot"
+    );
+    assert_eq!(global_checkpoint_request["params"]["tree"], 0);
+    assert_eq!(global_checkpoint_request["params"]["index"], 0);
+    // The null-root latest marker is validated globally, once for the shared batch refresh.
     assert!(poi_mock.requests.try_recv().is_err());
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -5349,10 +5362,13 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
     let forest = Arc::new(MerkleForest::new());
     cfg.quick_sync_endpoint =
         Some(Url::parse("http://127.0.0.1:1").expect("unused configured GraphQL endpoint"));
-    let current_poi_mock = spawn_poi_rpc(serde_json::json!({
-        "validatedTxidIndex": 0,
-        "validatedMerkleroot": null,
-    }))
+    let current_poi_mock = spawn_poi_rpc_sequence(vec![
+        serde_json::json!({
+            "validatedTxidIndex": 0,
+            "validatedMerkleroot": null,
+        }),
+        serde_json::json!(true),
+    ])
     .await;
     let current_runtime = test_artifact_poi_runtime_with_fallback(current_poi_mock.url);
     let still_partial = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
@@ -5380,18 +5396,33 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
         "unexpected current-boundary report: {still_partial:?}"
     );
     assert_eq!(still_partial.needs_attention, 0);
-    let current_request = current_poi_mock
+    let current_latest_request = current_poi_mock
         .requests
         .recv_timeout(Duration::from_secs(2))
-        .expect("current validated TXID request");
-    assert_eq!(current_request["method"], "ppoi_validated_txid");
+        .expect("current latest validated TXID request");
+    assert_eq!(current_latest_request["method"], "ppoi_validated_txid");
+    let current_checkpoint_request = current_poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("current global latest checkpoint validation request");
+    assert_eq!(
+        current_checkpoint_request["method"],
+        "ppoi_validate_txid_merkleroot"
+    );
+    assert_eq!(current_checkpoint_request["params"]["tree"], 0);
+    assert_eq!(current_checkpoint_request["params"]["index"], 0);
+    // The null-root marker is validated at the global latest index before candidate attention.
+    assert!(current_poi_mock.requests.try_recv().is_err());
 
     let (refresh_endpoint, refresh_requests) = spawn_http_response(refresh_graph_response).await;
     cfg.quick_sync_endpoint = Some(refresh_endpoint);
-    let poi_mock = spawn_poi_rpc(serde_json::json!({
-        "validatedTxidIndex": 1,
-        "validatedMerkleroot": null,
-    }))
+    let poi_mock = spawn_poi_rpc_sequence(vec![
+        serde_json::json!({
+            "validatedTxidIndex": 1,
+            "validatedMerkleroot": null,
+        }),
+        serde_json::json!(true),
+    ])
     .await;
     let runtime = test_artifact_poi_runtime_with_fallback(poi_mock.url);
     let report = materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
@@ -5422,11 +5453,23 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
             .recv_timeout(Duration::from_secs(2))
             .is_ok()
     );
-    let request = poi_mock
+    let latest_request = poi_mock
         .requests
         .recv_timeout(Duration::from_secs(2))
         .expect("latest validated TXID request");
-    assert_eq!(request["method"], "ppoi_validated_txid");
+    assert_eq!(latest_request["method"], "ppoi_validated_txid");
+    let checkpoint_request = poi_mock
+        .requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("global latest checkpoint validation request");
+    assert_eq!(
+        checkpoint_request["method"],
+        "ppoi_validate_txid_merkleroot"
+    );
+    assert_eq!(checkpoint_request["params"]["tree"], 0);
+    assert_eq!(checkpoint_request["params"]["index"], 1);
+    // The second null-root marker is validated globally before candidate attention.
+    assert!(poi_mock.requests.try_recv().is_err());
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

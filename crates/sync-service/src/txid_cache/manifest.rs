@@ -1,10 +1,12 @@
 use super::{
-    BlobMeta, DbStore, Digest, ErrorKind, Sha256, TXID_CACHE_BLOB_KIND, TXID_CACHE_FORMAT_VERSION,
-    TXID_CACHE_PAGE_SIZE, TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey,
-    TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCachePageRef, TxidPublicCacheRow,
-    TxidPublicCacheWritePermit, cache_id, fs, manifest_file_name, now_epoch_secs, page_file_name,
+    BlobMeta, DbStore, Digest, ErrorKind, FixedBytes, Sha256, TXID_CACHE_BLOB_KIND,
+    TXID_CACHE_FORMAT_VERSION, TXID_CACHE_PAGE_SIZE, TxidPublicCache, TxidPublicCacheError,
+    TxidPublicCacheKey, TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCachePageRef,
+    TxidPublicCacheRow, TxidPublicCacheWritePermit, TxidPublicCheckpoint,
+    TxidPublicCheckpointSource, cache_id, fs, manifest_file_name, now_epoch_secs, page_file_name,
     staged_page_file_name, warn, write_blob_file,
 };
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
 enum TxidPublicCachePageWriteMode {
@@ -26,6 +28,7 @@ impl From<TxidPublicCacheKey<'_>> for TxidPublicCacheManifest {
             latest_validated_merkleroot: None,
             validated_cached_txid_index: None,
             artifact_cached_txid_index: None,
+            checkpoints: BTreeMap::new(),
             pages: Vec::new(),
         }
     }
@@ -125,6 +128,27 @@ impl TxidPublicCacheManifest {
                 "cache identity mismatch".to_string(),
             ));
         }
+        for (index, checkpoint) in &self.checkpoints {
+            if *index != checkpoint.txid_index {
+                return Err(TxidPublicCacheError::MetadataMismatch(
+                    "TXID checkpoint index mismatch".to_string(),
+                ));
+            }
+            if *index >= self.next_txid_index {
+                return Err(TxidPublicCacheError::MetadataMismatch(
+                    "TXID checkpoint is beyond cached rows".to_string(),
+                ));
+            }
+        }
+        if let Some(index) = self.latest_validated_txid_index
+            && let Some(root) = self.latest_validated_merkleroot
+            && self
+                .checkpoints
+                .get(&index)
+                .is_some_and(|checkpoint| checkpoint.merkleroot != root)
+        {
+            return Err(TxidPublicCacheError::RootMismatch);
+        }
         Ok(())
     }
 
@@ -167,6 +191,54 @@ impl TxidPublicCacheManifest {
             },
         )?;
         Ok(())
+    }
+
+    pub(super) fn insert_checkpoint(
+        &mut self,
+        txid_index: u64,
+        merkleroot: FixedBytes<32>,
+        source: TxidPublicCheckpointSource,
+    ) -> Result<(), TxidPublicCacheError> {
+        if txid_index >= self.next_txid_index {
+            return Err(TxidPublicCacheError::MissingLeaf { index: txid_index });
+        }
+        if let Some(existing) = self.checkpoints.get(&txid_index) {
+            if existing.merkleroot != merkleroot {
+                return Err(TxidPublicCacheError::RootMismatch);
+            }
+            return Ok(());
+        }
+        self.checkpoints.insert(
+            txid_index,
+            TxidPublicCheckpoint {
+                txid_index,
+                merkleroot,
+                source,
+            },
+        );
+        Ok(())
+    }
+
+    pub(super) fn checkpoint_root(
+        &self,
+        txid_index: u64,
+    ) -> Result<FixedBytes<32>, TxidPublicCacheError> {
+        self.checkpoints
+            .get(&txid_index)
+            .map(|checkpoint| checkpoint.merkleroot)
+            .ok_or(TxidPublicCacheError::CacheNotReady {
+                next_index: self
+                    .checkpoints
+                    .keys()
+                    .next_back()
+                    .map_or(0, |index| index.saturating_add(1)),
+                required_index: txid_index,
+            })
+    }
+
+    pub(super) fn invalidate_checkpoints_from(&mut self, mutation_start: u64) {
+        self.checkpoints
+            .retain(|txid_index, _| *txid_index < mutation_start);
     }
 
     pub(super) fn append_page_after_prefix_validation(

@@ -44,9 +44,10 @@ use crate::public_cache::{
 use crate::runtime_admission::DbRuntimeLease;
 use crate::txid_cache::{
     TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheTransaction,
-    TxidPublicLatestValidated, TxidPublicProof, artifact_bounded_transactions_for_outer_hash,
-    txid_public_artifact_bounded_proof, txid_public_proof_for_recovered_output,
-    txid_public_proof_for_recovered_output_at_index, validated_transactions_for_outer_hash,
+    TxidPublicCheckpointCandidate, TxidPublicLatestValidated, TxidPublicProof,
+    artifact_bounded_transactions_for_outer_hash, txid_public_artifact_bounded_proof,
+    txid_public_proof_for_recovered_output, txid_public_proof_for_recovered_output_at_index,
+    validated_transactions_for_outer_hash,
 };
 use crate::types::{
     IndexedArtifactSourceConfig, LocalPoiCaches, PoiArtifactCacheAttemptId,
@@ -1913,6 +1914,26 @@ impl ChainPublicDataPlane {
                 &self.indexed_artifact_maintenance,
                 Arc::clone(&self.db),
             )
+            .await
+    }
+
+    pub(crate) async fn txid_public_checkpoint_candidates(
+        &self,
+        key: &PublicTxidCacheKey,
+        through_index: u64,
+    ) -> Result<Vec<TxidPublicCheckpointCandidate>, TxidPublicCacheError> {
+        TxidPublicCache::new(self.db.as_ref(), key.as_cache_key())
+            .missing_checkpoint_candidates(through_index)
+            .await
+    }
+
+    pub(crate) async fn commit_txid_public_checkpoint(
+        &self,
+        key: &PublicTxidCacheKey,
+        candidate: TxidPublicCheckpointCandidate,
+    ) -> Result<(), TxidPublicCacheError> {
+        TxidPublicCache::new(self.db.as_ref(), key.as_cache_key())
+            .commit_checkpoint(candidate)
             .await
     }
 

@@ -72,7 +72,7 @@ pub(crate) enum TxidPublicCacheError {
     MissingLeaf { index: u64 },
     #[error("cached TXID proof leaf does not match target row")]
     LeafMismatch,
-    #[error("cached TXID root does not match latest validated root")]
+    #[error("cached TXID root does not match authenticated root")]
     RootMismatch,
     #[error("TXID cache metadata mismatch: {0}")]
     MetadataMismatch(String),
@@ -195,6 +195,29 @@ pub(crate) struct TxidPublicProof {
     pub proof: MerkleProof,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TxidPublicCheckpointSource {
+    LatestValidated,
+    IndexedArtifact,
+    PoiHistoryValidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TxidPublicCheckpoint {
+    pub(crate) txid_index: u64,
+    pub(crate) merkleroot: FixedBytes<32>,
+    pub(crate) source: TxidPublicCheckpointSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TxidPublicCheckpointCandidate {
+    pub(crate) root_txid_index: u64,
+    pub(crate) tree: u64,
+    pub(crate) index: u64,
+    pub(crate) merkleroot: FixedBytes<32>,
+    pub(super) read_scope: TxidPublicCacheReadScope,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TxidPublicLatestValidated {
     pub txid_index: u64,
@@ -216,6 +239,8 @@ pub(super) struct TxidPublicCacheManifest {
     pub(super) validated_cached_txid_index: Option<u64>,
     #[serde(default)]
     pub(super) artifact_cached_txid_index: Option<u64>,
+    #[serde(default)]
+    pub(super) checkpoints: BTreeMap<u64, TxidPublicCheckpoint>,
     pub(super) pages: Vec<TxidPublicCachePageRef>,
 }
 

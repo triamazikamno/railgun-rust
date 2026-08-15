@@ -69,14 +69,60 @@ pub(in crate::wallet) async fn refresh_public_txid_cache(
     };
     public_data_plane
         .sync_txid_public_cache(PublicTxidSyncRequest {
-            key: cache_key,
+            key: cache_key.clone(),
             endpoint,
             http_client,
             latest,
             indexed_artifact_source,
         })
         .await
-        .map_err(|err| txid_public_cache_failure(&err))
+        .map_err(|err| txid_public_cache_failure(&err))?;
+    validate_public_txid_checkpoints(public_data_plane, &cache_key, latest, poi_client).await
+}
+
+async fn validate_public_txid_checkpoints(
+    public_data_plane: &ChainPublicDataPlane,
+    cache_key: &PublicTxidCacheKey,
+    latest: PublicTxidLatestValidated,
+    poi_client: &PoiRpcClient,
+) -> Result<(), RecoveryFailure> {
+    let candidates = public_data_plane
+        .txid_public_checkpoint_candidates(cache_key, latest.txid_index)
+        .await
+        .map_err(|err| txid_public_cache_failure(&err))?;
+    for candidate in candidates {
+        let accepted = poi_client
+            .validate_txid_merkleroot(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                cache_key.scope.chain_id,
+                candidate.tree,
+                candidate.index,
+                &candidate.merkleroot,
+            )
+            .await
+            .map_err(|err| {
+                RecoveryFailure::retryable_category(
+                    OutputPoiRecoveryStatus::MissingMerkleProof,
+                    "public_txid_fetch_failed",
+                    format!("validate public TXID checkpoint failed: {err}"),
+                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                )
+            })?;
+        if !accepted {
+            return Err(RecoveryFailure::retryable_category(
+                OutputPoiRecoveryStatus::MissingMerkleProof,
+                "public_txid_fetch_failed",
+                "POI node rejected a public TXID checkpoint",
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            ));
+        }
+        public_data_plane
+            .commit_txid_public_checkpoint(cache_key, candidate)
+            .await
+            .map_err(|err| txid_public_cache_failure(&err))?;
+    }
+    Ok(())
 }
 
 pub(in crate::wallet) async fn public_txid_rows_for_outer_hash(
@@ -173,12 +219,9 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
             }) {
                 Ok(proof) => Some(proof),
                 Err(err) => {
-                    if target.txid_index().is_none()
-                        && matches!(
-                            &err,
-                            TxidPublicCacheError::MissingTarget
-                                | TxidPublicCacheError::CacheNotReady { .. }
-                        )
+                    if matches!(&err, TxidPublicCacheError::CacheNotReady { .. })
+                        || (target.txid_index().is_none()
+                            && matches!(&err, TxidPublicCacheError::MissingTarget))
                     {
                         None
                     } else {
@@ -249,59 +292,12 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
         }
     };
     let proof_elapsed_ms = proof_started.elapsed().as_millis();
-    let target_tree = cached.target_txid_index / TREE_LEAF_COUNT;
     let target_index = cached.target_txid_index % TREE_LEAF_COUNT;
-    let root_index = cached.root_txid_index % TREE_LEAF_COUNT;
     let txid_merkleroot = FixedBytes::from(cached.proof.root.to_be_bytes::<32>());
-    let validate_root_started = Instant::now();
-    let valid_root = poi_client
-        .validate_txid_merkleroot(
-            DEFAULT_TXID_VERSION,
-            EVM_CHAIN_TYPE,
-            cfg.chain.chain_id,
-            target_tree,
-            root_index,
-            &txid_merkleroot,
-        )
-        .await
-        .map_err(|err| {
-            warn!(
-                chain_id = cfg.chain.chain_id,
-                target_txid_index = cached.target_txid_index,
-                root_txid_index = cached.root_txid_index,
-                proof_source,
-                failure_category = "poi_root_validation_request_failed",
-                "output POI recovery TXID data failed"
-            );
-            RecoveryFailure::retryable_category(
-                OutputPoiRecoveryStatus::MissingMerkleProof,
-                "public_txid_fetch_failed",
-                format!("validate recovered TXID merkleroot failed: {err}"),
-                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-            )
-        })?;
-    let validate_root_elapsed_ms = validate_root_started.elapsed().as_millis();
-    if !valid_root {
-        warn!(
-            chain_id = cfg.chain.chain_id,
-            target_txid_index = cached.target_txid_index,
-            root_txid_index = cached.root_txid_index,
-            proof_source,
-            failure_category = "proof_root_rejected",
-            "output POI recovery TXID data failed"
-        );
-        return Err(RecoveryFailure::retryable_category(
-            OutputPoiRecoveryStatus::MissingMerkleProof,
-            "public_txid_fetch_failed",
-            "POI node rejected recovered TXID merkleroot",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
     debug!(
         chain_id = cfg.chain.chain_id,
         cache_sync_elapsed_ms,
         txid_tree_elapsed_ms = proof_elapsed_ms,
-        validate_root_elapsed_ms,
         elapsed_ms = started.elapsed().as_millis(),
         proof_source,
         "output POI recovery TXID data ready from public cache"

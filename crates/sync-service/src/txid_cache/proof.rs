@@ -185,6 +185,10 @@ pub(super) fn txid_public_proof_for_target_row(
     }
 
     let computed_root = FixedBytes::from(proof.root.to_be_bytes::<32>());
+    let authenticated_root = manifest.checkpoint_root(root_txid_index)?;
+    if authenticated_root != computed_root {
+        return Err(TxidPublicCacheError::RootMismatch);
+    }
     if root_txid_index == latest_validated_txid_index
         && latest_validated_merkleroot.is_some_and(|root| root != computed_root)
     {
@@ -213,6 +217,10 @@ fn proof_for_target_root(
     let proof = tree.prove(target_index);
     if proof.leaf != U256::from_be_bytes(target.txid_leaf_hash.0) {
         return Err(TxidPublicCacheError::LeafMismatch);
+    }
+    let computed_root = FixedBytes::from(proof.root.to_be_bytes::<32>());
+    if manifest.checkpoint_root(root_txid_index)? != computed_root {
+        return Err(TxidPublicCacheError::RootMismatch);
     }
     Ok(TxidPublicProof {
         target_txid_index: target.txid_index,

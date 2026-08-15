@@ -53,7 +53,9 @@ pub(crate) use proof::{
 pub(crate) use sync::reset_txid_public_cache;
 pub(crate) use types::{
     TxidPublicCache, TxidPublicCacheEntry, TxidPublicCacheError, TxidPublicCacheKey,
-    TxidPublicCacheReset, TxidPublicCacheTransaction, TxidPublicLatestValidated, TxidPublicProof,
+    TxidPublicCacheReset, TxidPublicCacheTransaction, TxidPublicCheckpoint,
+    TxidPublicCheckpointCandidate, TxidPublicCheckpointSource, TxidPublicLatestValidated,
+    TxidPublicProof,
 };
 
 impl TxidPublicCache<'_> {
@@ -96,6 +98,13 @@ pub(crate) async fn seed_verified_artifact_bound_for_test(
     update_index_for_page(&permit, &page)?;
     manifest.validated_cached_txid_index = Some(bound_index);
     manifest.artifact_cached_txid_index = Some(bound_index);
+    manifest
+        .insert_checkpoint(
+            bound_index,
+            root,
+            types::TxidPublicCheckpointSource::IndexedArtifact,
+        )
+        .expect("insert test artifact checkpoint");
     manifest.write_to(&permit)?;
     Ok((bound_index, root))
 }

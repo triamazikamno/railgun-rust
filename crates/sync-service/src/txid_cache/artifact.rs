@@ -3,8 +3,9 @@ use super::{
     Sha256, SystemTime, TREE_LEAF_COUNT, TXID_CACHE_BLOB_KIND, TXID_CACHE_FORMAT_VERSION,
     TXID_CACHE_PAGE_SIZE, TxidPublicCache, TxidPublicCacheError, TxidPublicCacheKey,
     TxidPublicCacheManifest, TxidPublicCachePage, TxidPublicCacheReadScope, TxidPublicCacheRow,
-    TxidPublicCacheTransaction, TxidPublicCacheWritePermit, U256, artifact_chunk_blob_id,
-    artifact_chunk_file_name, fs, now_epoch_secs, read_tree_leaves, warn, write_blob_file,
+    TxidPublicCacheTransaction, TxidPublicCacheWritePermit, TxidPublicCheckpointSource, U256,
+    artifact_chunk_blob_id, artifact_chunk_file_name, fs, now_epoch_secs, read_tree_leaves, warn,
+    write_blob_file,
 };
 
 use crate::indexed_artifacts::{
@@ -374,26 +375,36 @@ impl TxidPublicCacheManifest {
         } else {
             marker_start
         };
-        if to_index.is_some_and(|to_index| to_index < next_range_start) {
+        let backfill_artifact_checkpoints =
+            self.checkpoints.is_empty() && self.artifact_cached_txid_index.is_some();
+        if to_index.is_some_and(|to_index| to_index < next_range_start)
+            && !backfill_artifact_checkpoints
+        {
             return Ok(0);
         }
         let chunks = chunks
             .iter()
-            .filter(|chunk| chunk.descriptor.range.end >= next_range_start)
+            .filter(|chunk| {
+                backfill_artifact_checkpoints || chunk.descriptor.range.end >= next_range_start
+            })
             .cloned()
             .collect::<Vec<_>>();
         let Some(first_chunk) = chunks.first() else {
             return Ok(0);
         };
-        let stager_start = chunks
-            .iter()
-            .filter_map(|chunk| {
-                let range = &chunk.descriptor.range;
-                (range.start <= next_range_start && next_range_start <= range.end)
-                    .then_some(range.start)
-            })
-            .min()
-            .unwrap_or(next_range_start);
+        let stager_start = if backfill_artifact_checkpoints {
+            first_chunk.descriptor.range.start
+        } else {
+            chunks
+                .iter()
+                .filter_map(|chunk| {
+                    let range = &chunk.descriptor.range;
+                    (range.start <= next_range_start && next_range_start <= range.end)
+                        .then_some(range.start)
+                })
+                .min()
+                .unwrap_or(next_range_start)
+        };
         let mut stager = VerifiedIndexedArtifactChunkStager::new(
             IndexedDatasetKind::PublicTxid,
             first_chunk.descriptor.scope.clone(),
@@ -402,6 +413,22 @@ impl TxidPublicCacheManifest {
         );
         stager.stage_many(chunks.iter().cloned())?;
         let ready = stager.drain_contiguous()?;
+        if !backfill_artifact_checkpoints {
+            let mutation_start = ready
+                .iter()
+                .filter_map(|chunk| {
+                    let applied_range_end = to_index
+                        .map_or(chunk.descriptor.range.end, |to_index| {
+                            chunk.descriptor.range.end.min(to_index)
+                        });
+                    let apply_range_start = next_range_start.max(chunk.descriptor.range.start);
+                    (applied_range_end >= apply_range_start).then_some(apply_range_start)
+                })
+                .min();
+            if let Some(mutation_start) = mutation_start {
+                self.invalidate_checkpoints_from(mutation_start);
+            }
+        }
         debug!(
             staged_chunks = chunks.len(),
             ready_chunks = ready.len(),
@@ -414,13 +441,37 @@ impl TxidPublicCacheManifest {
         let retained_latest = self.latest_validated_txid_index;
         let mut background_changed_retained_latest = false;
         for chunk in &ready {
+            let mut pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
+            if backfill_artifact_checkpoints
+                && self
+                    .artifact_cached_txid_index
+                    .is_some_and(|bound| chunk.descriptor.range.end <= bound)
+            {
+                verify_declared_merkle_root(
+                    chunk.descriptor.metadata.root.as_ref(),
+                    self,
+                    db,
+                    chunk.descriptor.range.start,
+                    chunk.descriptor.range.end,
+                    &pages,
+                )?;
+                self.insert_checkpoint(
+                    chunk.descriptor.range.end,
+                    chunk.descriptor.metadata.root.ok_or_else(|| {
+                        TxidPublicCacheError::MetadataMismatch(
+                            "public_txid artifact missing Merkle root metadata".to_string(),
+                        )
+                    })?,
+                    TxidPublicCheckpointSource::IndexedArtifact,
+                )?;
+                continue;
+            }
             let applied_range_end = to_index.map_or(chunk.descriptor.range.end, |to_index| {
                 chunk.descriptor.range.end.min(to_index)
             });
             if applied_range_end < chunk.descriptor.range.start {
                 continue;
             }
-            let mut pages = Vec::<TxidPublicCachePage>::try_from(chunk)?;
             verify_declared_merkle_root(
                 chunk.descriptor.metadata.root.as_ref(),
                 self,
@@ -476,6 +527,23 @@ impl TxidPublicCacheManifest {
                     self.artifact_cached_txid_index
                         .map_or(applied_range_end, |index| index.max(applied_range_end)),
                 );
+            }
+            if full_authenticated_chunk {
+                self.insert_checkpoint(
+                    chunk.descriptor.range.end,
+                    chunk.descriptor.metadata.root.ok_or_else(|| {
+                        TxidPublicCacheError::MetadataMismatch(
+                            "public_txid artifact missing Merkle root metadata".to_string(),
+                        )
+                    })?,
+                    TxidPublicCheckpointSource::IndexedArtifact,
+                )?;
+            } else if bounded_authority_verified {
+                self.insert_checkpoint(
+                    applied_range_end,
+                    latest_validated_merkleroot.expect("bounded authority has latest root"),
+                    TxidPublicCheckpointSource::LatestValidated,
+                )?;
             }
             debug!(
                 cid = %chunk.descriptor.cid,
