@@ -12,7 +12,7 @@ use broadcaster_core::contracts::railgun::{
     RelayAdapt7702ActionData, ShieldRequest, SnarkProof, TokenTransfer, Transaction, relayCall,
     shieldCall, transactCall, wrapBaseCall,
 };
-use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData, checked_pack_chain_id};
 use broadcaster_core::eip7702::PreparedRelayAdapt7702Execution;
 use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
 use broadcaster_core::utxo::Utxo;
@@ -225,6 +225,8 @@ impl TransactionBuilder {
         if request.delegate == Address::ZERO {
             return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702Delegate);
         }
+        let packed_chain_id = checked_pack_chain_id(self.chain_type, self.chain_id)
+            .ok_or(RelayAdapt7702BuildError::InvalidRelayAdapt7702ChainIdentity)?;
 
         let RelayAdapt7702PlanRequest {
             authority,
@@ -345,6 +347,12 @@ impl TransactionBuilder {
                     plan.transaction.boundParams.adaptContract = authority;
                     plan.transaction.boundParams.adaptParams = UNRELAYED_ADAPT_PARAMS;
                     plan.transaction.boundParams.minGasPrice = Uint::<72, 2>::ZERO;
+                }
+                if unproven_plans
+                    .iter()
+                    .any(|plan| plan.transaction.boundParams.chainID != packed_chain_id)
+                {
+                    return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702ChainIdentity);
                 }
                 let action_data = RelayAdapt7702ActionData {
                     requireSuccess: true,

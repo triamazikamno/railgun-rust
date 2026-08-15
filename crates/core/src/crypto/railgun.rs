@@ -259,9 +259,17 @@ pub fn derive_master_public_key(spending_public_key: [U256; 2], nullifying_key: 
     ])
 }
 
+pub const PACKED_CHAIN_ID_VALUE_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+#[must_use]
+pub fn checked_pack_chain_id(chain_type: u8, chain_id: u64) -> Option<u64> {
+    ((chain_id & !PACKED_CHAIN_ID_VALUE_MASK) == 0)
+        .then_some((u64::from(chain_type) << 56) | chain_id)
+}
+
 #[must_use]
 pub fn pack_chain_id(chain_type: u8, chain_id: u64) -> u64 {
-    let id = chain_id & 0x00FF_FFFF_FFFF_FFFF;
+    let id = chain_id & PACKED_CHAIN_ID_VALUE_MASK;
     (u64::from(chain_type) << 56) | id
 }
 
@@ -314,4 +322,21 @@ fn unpack_spending_public_key(packed: [u8; 32]) -> Result<[U256; 2], RailgunErro
         U256::from_be_slice(spub_x.into_bigint().to_bytes_be().as_slice()),
         U256::from_be_slice(spub_y.into_bigint().to_bytes_be().as_slice()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PACKED_CHAIN_ID_VALUE_MASK, checked_pack_chain_id, pack_chain_id};
+
+    #[test]
+    fn checked_chain_packing_accepts_the_mask_boundary_and_rejects_overflow() {
+        assert_eq!(
+            checked_pack_chain_id(7, PACKED_CHAIN_ID_VALUE_MASK),
+            Some(pack_chain_id(7, PACKED_CHAIN_ID_VALUE_MASK))
+        );
+        assert_eq!(
+            checked_pack_chain_id(7, PACKED_CHAIN_ID_VALUE_MASK + 1),
+            None
+        );
+    }
 }

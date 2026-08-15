@@ -14,7 +14,7 @@ use broadcaster_core::contracts::railgun::{
     wrapBaseCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
-use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::crypto::railgun::{PACKED_CHAIN_ID_VALUE_MASK, ViewingKeyData};
 use broadcaster_core::eip7702::{
     Eip7702AuthorizationNonce, RelayAdapt7702ExecutionNonce, RelayAdapt7702ExecutionVersion,
 };
@@ -1109,6 +1109,38 @@ async fn relay_adapt_7702_public_native_shield_has_exact_empty_batch_recipe() {
         plan.prepared_execution.payload_hash(),
         same_payload_with_zero_outer.payload_hash()
     );
+}
+
+#[tokio::test]
+async fn relay_adapt_7702_planner_rejects_unrepresentable_chain_before_proving() {
+    let wallet = test_wallet();
+    let mut builder = test_transaction_builder();
+    builder.chain_id = PACKED_CHAIN_ID_VALUE_MASK + 1;
+    let request = RelayAdapt7702PlanRequest {
+        authority: Address::from([0x81; 20]),
+        delegate: Address::from([0x82; 20]),
+        authorization_nonce: Eip7702AuthorizationNonce::new(1),
+        execution_version: RelayAdapt7702ExecutionVersion::LegacyPreExecuteNonce,
+        recipe: RelayAdapt7702Recipe::PublicNativeShield {
+            amount: uint!(9_U256),
+            shield_requests: vec![native_shield_request(9)],
+        },
+        verify_proof: false,
+    };
+
+    assert!(matches!(
+        builder
+            .build_relay_adapt_7702_plan_inner(
+                &wallet.viewing,
+                &wallet,
+                &MerkleForest::new(),
+                &[],
+                request,
+                &MockTransactionProver,
+            )
+            .await,
+        Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702ChainIdentity)
+    ));
 }
 
 #[tokio::test]

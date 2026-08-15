@@ -79,6 +79,8 @@ pub enum RelayAdapt7702BuildError {
     RelayAdapt7702ShieldAmountMismatch,
     #[error("EIP-7702 private recipe requires a non-zero wrapped base token")]
     InvalidRelayAdapt7702WrappedBaseToken,
+    #[error("EIP-7702 chain identity is not representable")]
+    InvalidRelayAdapt7702ChainIdentity,
 }
 
 #[derive(Debug, Error)]

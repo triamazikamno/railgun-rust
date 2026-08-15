@@ -1,12 +1,12 @@
 use alloy::primitives::{Bytes, FixedBytes, U256};
 
 use broadcaster_core::contracts::railgun::CommitmentCiphertext;
-use broadcaster_core::crypto::aes_gcm::{
-    AesGcmError, decrypt_in_place_16b_iv, encrypt_in_place_16b_iv, split_iv_tag,
-};
-use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::crypto::aes_gcm::{AesGcmError, encrypt_in_place_16b_iv};
+use broadcaster_core::crypto::railgun::AddressData;
 use broadcaster_core::crypto::shared_key::shared_symmetric_key;
-pub use broadcaster_core::notes::{Note, NoteError, decrypt_legacy_random, decrypt_shield_random};
+pub use broadcaster_core::notes::{
+    Note, NoteError, decrypt_legacy_random, decrypt_sender_note, decrypt_shield_random,
+};
 
 use crate::keys::note_blinding_keys;
 
@@ -110,62 +110,13 @@ impl From<NoteCiphertext> for CommitmentCiphertext {
     }
 }
 
-/// Decrypts an output note with the sender viewing key and validates its commitment.
-///
-/// `None` means the slot is not sender-decryptable, malformed, or does not match the expected
-/// commitment. Callers that retain unavailable slots can represent those cases explicitly.
-#[must_use]
-pub fn decrypt_sender_note(
-    ciphertext: &CommitmentCiphertext,
-    expected_commitment: U256,
-    scan_keys: &ViewingKeyData,
-) -> Option<Note> {
-    if ciphertext.blindedReceiverViewingKey == FixedBytes::ZERO {
-        return None;
-    }
-    let shared_key = shared_symmetric_key(
-        &scan_keys.viewing_private_key,
-        &ciphertext.blindedReceiverViewingKey.0,
-    )
-    .ok()?;
-    let (iv, tag) = split_iv_tag(ciphertext.ciphertext[0].0);
-    let mut plaintext = Vec::with_capacity(96 + ciphertext.memo.len());
-    plaintext.extend_from_slice(&ciphertext.ciphertext[1].0);
-    plaintext.extend_from_slice(&ciphertext.ciphertext[2].0);
-    plaintext.extend_from_slice(&ciphertext.ciphertext[3].0);
-    plaintext.extend_from_slice(ciphertext.memo.as_ref());
-    decrypt_in_place_16b_iv(&shared_key, &iv, &tag, &mut plaintext).ok()?;
-    if plaintext.len() < 96 {
-        return None;
-    }
-
-    let encoded_mpk = U256::from_be_slice(&plaintext[0..32]);
-    let token_hash = U256::from_be_slice(&plaintext[32..64]);
-    let mut random = [0u8; 16];
-    random.copy_from_slice(&plaintext[64..80]);
-    let value = U256::from_be_slice(&plaintext[80..96]);
-    for receiver_mpk in [encoded_mpk ^ scan_keys.master_public_key, encoded_mpk] {
-        let note = Note {
-            token_hash,
-            value,
-            random,
-            npk: Note::npk_for(receiver_mpk, random),
-        };
-        if note.commitment() == expected_commitment {
-            return Some(note);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, FixedBytes, U256};
 
+    use super::{Note, NoteCiphertext, decrypt_sender_note};
     use broadcaster_core::contracts::railgun::CommitmentCiphertext;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
-
-    use super::{Note, NoteCiphertext, decrypt_sender_note};
 
     fn sender_fixture() -> (ViewingKeyData, Note, CommitmentCiphertext) {
         let keys =

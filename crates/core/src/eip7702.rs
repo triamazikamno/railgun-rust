@@ -135,7 +135,24 @@ pub enum RelayAdapt7702ExecutionVersion {
     CurrentNonceAware { nonce: RelayAdapt7702ExecutionNonce },
 }
 
+/// The selector/nonce shape of a closed `RelayAdapt7702` execution version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelayAdapt7702ExecutionVersionKind {
+    CurrentNonceAware,
+    LegacyPreExecuteNonce,
+}
+
 impl RelayAdapt7702ExecutionVersion {
+    #[must_use]
+    pub const fn kind(self) -> RelayAdapt7702ExecutionVersionKind {
+        match self {
+            Self::CurrentNonceAware { .. } => RelayAdapt7702ExecutionVersionKind::CurrentNonceAware,
+            Self::LegacyPreExecuteNonce => {
+                RelayAdapt7702ExecutionVersionKind::LegacyPreExecuteNonce
+            }
+        }
+    }
+
     #[must_use]
     pub fn execute_payload_hash(
         &self,

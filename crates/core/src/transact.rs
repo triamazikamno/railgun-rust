@@ -10,8 +10,10 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use alloy::eips::eip7702::SignedAuthorization;
 use alloy::hex;
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::sol_types::{SolCall, SolValue};
+use alloy::primitives::{Address, Bytes, FixedBytes, Signature, U256};
+use alloy::sol_types::SolCall;
+#[cfg(test)]
+use alloy::sol_types::SolValue;
 use ruint::uint;
 
 use crate::contracts::railgun::{
@@ -22,12 +24,15 @@ use crate::crypto::aes_gcm::{
     AesGcmError, decrypt_in_place_16b_iv, encrypt_in_place_16b_iv, split_iv_tag,
 };
 use crate::crypto::poseidon::poseidon;
+use crate::crypto::railgun::{AddressData, ViewingKeyData};
 use crate::crypto::shared_key::{ed25519_private_scalar_bytes, shared_symmetric_key};
+#[cfg(test)]
+use crate::eip7702::FinalizedRelayAdapt7702Call;
 use crate::eip7702::{
-    FinalizedRelayAdapt7702Call, PreparedRelayAdapt7702Execution, RelayAdapt7702ExecutionNonce,
-    RelayAdapt7702ExecutionVersion,
+    PreparedRelayAdapt7702Execution, RelayAdapt7702ExecutionNonce, RelayAdapt7702ExecutionVersion,
+    RelayAdapt7702ExecutionVersionKind,
 };
-use crate::notes::Note;
+use crate::notes::{Note, decrypt_receiver_fee_note, decrypt_sender_note};
 use crate::tree::{TREE_DEPTH, TREE_LEAF_COUNT_U256};
 
 #[derive(Debug, Error)]
@@ -81,6 +86,194 @@ pub enum Transact7702Error {
     CanonicalOperationMismatch,
     #[error("strict TX7702 broadcaster policy rejected")]
     StrictBroadcasterPolicy,
+    #[error("strict TX7702 fee-note assurance failed")]
+    FeeNoteAssurance,
+    #[error("invalid TX7702 chain identity")]
+    InvalidChainIdentity,
+}
+
+/// Checked chain identity used by strict TX7702 validation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Transact7702NetworkContext {
+    chain_type: u8,
+    chain_id: u64,
+    packed_chain_id: u64,
+}
+
+impl Transact7702NetworkContext {
+    pub fn new(chain_type: u8, chain_id: u64) -> Result<Self, Transact7702Error> {
+        let packed_chain_id = crate::crypto::railgun::checked_pack_chain_id(chain_type, chain_id)
+            .ok_or(Transact7702Error::InvalidChainIdentity)?;
+        Ok(Self {
+            chain_type,
+            chain_id,
+            packed_chain_id,
+        })
+    }
+
+    #[must_use]
+    pub const fn chain_type(self) -> u8 {
+        self.chain_type
+    }
+
+    #[must_use]
+    pub const fn chain_id(self) -> u64 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub const fn packed_chain_id(self) -> u64 {
+        self.packed_chain_id
+    }
+}
+
+impl fmt::Debug for Transact7702NetworkContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Transact7702NetworkContext")
+            .field("chain_type", &self.chain_type)
+            .field("chain_id", &self.chain_id)
+            .field("packed_chain_id", &self.packed_chain_id)
+            .finish()
+    }
+}
+
+/// Sender-side immutable inputs for strict TX7702 encryption and validation.
+pub struct Transact7702OutboundContext<'a> {
+    network: Transact7702NetworkContext,
+    prepared: &'a PreparedRelayAdapt7702Execution,
+    expected_fee_note: &'a Note,
+    sender_viewing: &'a ViewingKeyData,
+    broadcaster_public: &'a AddressData,
+    required_poi_list_keys: Vec<FixedBytes<32>>,
+}
+
+impl<'a> Transact7702OutboundContext<'a> {
+    #[must_use]
+    pub fn new(
+        network: Transact7702NetworkContext,
+        prepared: &'a PreparedRelayAdapt7702Execution,
+        expected_fee_note: &'a Note,
+        sender_viewing: &'a ViewingKeyData,
+        broadcaster_public: &'a AddressData,
+        required_poi_list_keys: &[FixedBytes<32>],
+    ) -> Self {
+        Self {
+            network,
+            prepared,
+            expected_fee_note,
+            sender_viewing,
+            broadcaster_public,
+            required_poi_list_keys: required_poi_list_keys.to_vec(),
+        }
+    }
+
+    #[must_use]
+    pub const fn network(&self) -> Transact7702NetworkContext {
+        self.network
+    }
+    #[must_use]
+    pub const fn prepared(&self) -> &'a PreparedRelayAdapt7702Execution {
+        self.prepared
+    }
+    #[must_use]
+    pub const fn expected_fee_note(&self) -> &'a Note {
+        self.expected_fee_note
+    }
+    #[must_use]
+    pub const fn sender_viewing(&self) -> &'a ViewingKeyData {
+        self.sender_viewing
+    }
+    #[must_use]
+    pub const fn broadcaster_public(&self) -> &'a AddressData {
+        self.broadcaster_public
+    }
+    #[must_use]
+    pub fn required_poi_list_keys(&self) -> &[FixedBytes<32>] {
+        &self.required_poi_list_keys
+    }
+}
+
+impl fmt::Debug for Transact7702OutboundContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Transact7702OutboundContext")
+            .field("network_present", &true)
+            .field("prepared_present", &true)
+            .field("expected_fee_note_present", &true)
+            .field("sender_viewing_present", &true)
+            .field("broadcaster_public_present", &true)
+            .field(
+                "required_poi_list_count",
+                &self.required_poi_list_keys.len(),
+            )
+            .finish()
+    }
+}
+
+/// Broadcaster-side immutable inputs for strict TX7702 decryption and validation.
+pub struct Transact7702InboundContext<'a> {
+    network: Transact7702NetworkContext,
+    expected_delegate: Address,
+    expected_version: RelayAdapt7702ExecutionVersionKind,
+    broadcaster_viewing: &'a ViewingKeyData,
+    required_poi_list_keys: Vec<FixedBytes<32>>,
+}
+
+impl<'a> Transact7702InboundContext<'a> {
+    #[must_use]
+    pub fn new(
+        network: Transact7702NetworkContext,
+        expected_delegate: Address,
+        expected_version: RelayAdapt7702ExecutionVersionKind,
+        broadcaster_viewing: &'a ViewingKeyData,
+        required_poi_list_keys: &[FixedBytes<32>],
+    ) -> Self {
+        Self {
+            network,
+            expected_delegate,
+            expected_version,
+            broadcaster_viewing,
+            required_poi_list_keys: required_poi_list_keys.to_vec(),
+        }
+    }
+
+    #[must_use]
+    pub const fn network(&self) -> Transact7702NetworkContext {
+        self.network
+    }
+    #[must_use]
+    pub const fn expected_delegate(&self) -> Address {
+        self.expected_delegate
+    }
+    #[must_use]
+    pub const fn expected_version(&self) -> RelayAdapt7702ExecutionVersionKind {
+        self.expected_version
+    }
+    #[must_use]
+    pub const fn broadcaster_viewing(&self) -> &'a ViewingKeyData {
+        self.broadcaster_viewing
+    }
+    #[must_use]
+    pub fn required_poi_list_keys(&self) -> &[FixedBytes<32>] {
+        &self.required_poi_list_keys
+    }
+}
+
+impl fmt::Debug for Transact7702InboundContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Transact7702InboundContext")
+            .field("network_present", &true)
+            .field("expected_delegate_present", &true)
+            .field("expected_version", &self.expected_version)
+            .field("broadcaster_viewing_present", &true)
+            .field(
+                "required_poi_list_count",
+                &self.required_poi_list_keys.len(),
+            )
+            .finish()
+    }
 }
 
 /// Ed25519 pubkey (compressed Edwards Y) -> Montgomery u
@@ -587,7 +780,8 @@ impl fmt::Debug for BroadcasterRawParamsTransact7702 {
 }
 
 impl BroadcasterRawParamsTransact7702 {
-    pub fn validate_finalized_operation(
+    #[cfg(test)]
+    fn validate_finalized_operation(
         &self,
         prepared: &PreparedRelayAdapt7702Execution,
         finalized: &FinalizedRelayAdapt7702Call,
@@ -657,7 +851,8 @@ impl BroadcasterRawParamsTransact7702 {
         Ok(())
     }
 
-    pub fn validate_broadcaster_request(
+    #[cfg(test)]
+    fn validate_broadcaster_request(
         &self,
         prepared: &PreparedRelayAdapt7702Execution,
         finalized: &FinalizedRelayAdapt7702Call,
@@ -738,6 +933,341 @@ impl BroadcasterRawParamsTransact7702 {
     }
 }
 
+const fn strict_signature_from_authorization(
+    authorization: &BroadcasterRawParamsTransact7702Authorization,
+) -> Result<Signature, Transact7702Error> {
+    if !matches!(authorization.signature.v, 27 | 28) {
+        return Err(Transact7702Error::InvalidAuthorizationParity);
+    }
+    Ok(Signature::new(
+        U256::from_be_bytes(authorization.signature.r.0),
+        U256::from_be_bytes(authorization.signature.s.0),
+        authorization.signature.v == 28,
+    ))
+}
+
+fn strict_execution_signature(data: &Bytes) -> Result<Signature, Transact7702Error> {
+    Signature::try_from(data.as_ref()).map_err(|_| Transact7702Error::CanonicalOperationMismatch)
+}
+
+struct StrictParsedEnvelope {
+    version: RelayAdapt7702ExecutionVersion,
+    transactions: Vec<Transaction>,
+    action_data: RelayAdapt7702ActionData,
+    execution_signature: Bytes,
+    parsed_transactions: Vec<ParsedTransactTransaction>,
+}
+
+fn strict_parse_envelope(
+    data: &Bytes,
+    txid_version: &str,
+) -> Result<StrictParsedEnvelope, Transact7702Error> {
+    let ParsedTransactEnvelope::RelayAdapt7702 {
+        version,
+        transactions,
+        action_data,
+        execution_signature,
+    } = parse_transact_envelope(data).map_err(|_| Transact7702Error::StrictBroadcasterPolicy)?
+    else {
+        return Err(Transact7702Error::StrictBroadcasterPolicy);
+    };
+    if transactions.is_empty() {
+        return Err(Transact7702Error::StrictBroadcasterPolicy);
+    }
+    let parsed_transactions = transactions
+        .iter()
+        .map(|transaction| {
+            ParsedTransactTransaction::from_transaction(transaction, Some(txid_version))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Transact7702Error::StrictBroadcasterPolicy)?;
+    Ok(StrictParsedEnvelope {
+        version,
+        transactions,
+        action_data,
+        execution_signature,
+        parsed_transactions,
+    })
+}
+
+fn strict_validate_fee_and_policy(
+    params: &BroadcasterRawParamsTransact7702,
+    network: Transact7702NetworkContext,
+    broadcaster_master_public_key: U256,
+    transactions: &[Transaction],
+    parsed_transactions: Vec<ParsedTransactTransaction>,
+    action_data: &RelayAdapt7702ActionData,
+    fee_note: &Note,
+    required_poi_list_keys: &[FixedBytes<32>],
+) -> Result<ParsedTransactCalldata, Transact7702Error> {
+    if !matches!(
+        params.transact_type,
+        BroadcasterRawParamsTransact7702Type::Tx7702
+    ) || params.broadcaster_viewing_key == FixedBytes::ZERO
+        || params.fees_id.is_empty()
+        || params.gas_limit == 0
+        || params.max_fee_per_gas.is_zero()
+        || params.max_priority_fee_per_gas > params.max_fee_per_gas
+        || fee_note.token_hash.to_be_bytes::<32>()[..12] != [0u8; 12]
+        || fee_note.npk != Note::npk_for(broadcaster_master_public_key, fee_note.random)
+    {
+        return Err(Transact7702Error::StrictBroadcasterPolicy);
+    }
+
+    let tx0 = transactions
+        .first()
+        .ok_or(Transact7702Error::StrictBroadcasterPolicy)?;
+    let fee_commitment = tx0
+        .commitments
+        .first()
+        .copied()
+        .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    tx0.boundParams
+        .commitmentCiphertext
+        .first()
+        .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    if fee_commitment != FixedBytes::from(fee_note.commitment().to_be_bytes::<32>()) {
+        return Err(Transact7702Error::FeeNoteAssurance);
+    }
+
+    let railgun_txid = parsed_transactions
+        .first()
+        .ok_or(Transact7702Error::StrictBroadcasterPolicy)?
+        .railgun_txid;
+    let utxo_tree_in = parsed_transactions
+        .first()
+        .ok_or(Transact7702Error::StrictBroadcasterPolicy)?
+        .utxo_tree_in;
+    let mut parsed = ParsedTransactCalldata {
+        fee_token: Address::from_slice(&fee_note.token_hash.to_be_bytes::<32>()[12..]),
+        fee_amount: fee_note.value,
+        railgun_txid,
+        utxo_tree_in,
+        fee_commitment,
+        fee_note_npk: fee_note.npk.into(),
+        tx_nullifiers_len: tx0.nullifiers.len(),
+        tx_commitments_out_len: tx0.commitments.len(),
+        transactions: parsed_transactions,
+        action_data: Some(ActionData {
+            random: FixedBytes::ZERO,
+            requireSuccess: action_data.requireSuccess,
+            minGasLimit: action_data.minGasLimit,
+            calls: action_data.calls.clone(),
+        }),
+        fee_note_assurance: None,
+    };
+
+    if !required_poi_list_keys.is_empty() {
+        let txid_version = supported_txid_version(Some(&params.txid_version))
+            .map_err(|_| Transact7702Error::StrictBroadcasterPolicy)?;
+        let mut transaction_leaves = Vec::with_capacity(parsed.transactions.len());
+        for transaction in &parsed.transactions {
+            let leaf = railgun_txid_leaf_hash(transaction.railgun_txid, transaction.utxo_tree_in);
+            transaction_leaves.push((
+                FixedBytes::from(leaf.to_be_bytes::<32>()),
+                FixedBytes::from(dummy_txid_root(leaf).to_be_bytes::<32>()),
+            ));
+        }
+        if !required_poi_list_keys.iter().all(|list_key| {
+            params
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .get(list_key)
+                .is_some_and(|per_leaf| {
+                    transaction_leaves.iter().all(|(leaf, expected_root)| {
+                        per_leaf
+                            .get(leaf)
+                            .is_some_and(|poi| poi.txid_merkleroot == *expected_root)
+                    })
+                })
+        }) {
+            return Err(Transact7702Error::StrictBroadcasterPolicy);
+        }
+        parsed.fee_note_assurance = Some(FeeNoteAssuranceContext {
+            chain_type: network.chain_type(),
+            txid_version: txid_version.to_string(),
+            railgun_txid,
+            utxo_tree_in,
+            fee_commitment,
+            fee_note_npk: fee_note.npk.into(),
+            pre_transaction_pois_per_txid_leaf_per_list: params
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .clone(),
+            required_poi_list_keys: required_poi_list_keys.to_vec(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn strict_validate_outbound(
+    params: &BroadcasterRawParamsTransact7702,
+    context: &Transact7702OutboundContext<'_>,
+) -> Result<ParsedTransactCalldata, Transact7702Error> {
+    let network = context.network();
+    if context.prepared().chain_id() != network.chain_id()
+        || params.chain_type != u64::from(network.chain_type())
+        || params.chain_id != network.chain_id()
+        || params.authorization.chain_id != U256::from(network.chain_id())
+        || params.broadcaster_viewing_key
+            != FixedBytes::from(context.broadcaster_public().viewing_public_key)
+    {
+        return Err(Transact7702Error::InvalidChainIdentity);
+    }
+    let StrictParsedEnvelope {
+        version,
+        transactions,
+        action_data,
+        execution_signature,
+        parsed_transactions,
+    } = strict_parse_envelope(&params.data, &params.txid_version)?;
+    if version != context.prepared().execution_version() {
+        return Err(Transact7702Error::StrictBroadcasterPolicy);
+    }
+    if transactions
+        .iter()
+        .any(|transaction| transaction.boundParams.chainID != network.packed_chain_id())
+    {
+        return Err(Transact7702Error::InvalidChainIdentity);
+    }
+    let fee_commitment = transactions
+        .first()
+        .and_then(|transaction| transaction.commitments.first())
+        .copied()
+        .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    let fee_ciphertext = transactions[0]
+        .boundParams
+        .commitmentCiphertext
+        .first()
+        .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    let resolved_fee_note = decrypt_sender_note(
+        fee_ciphertext,
+        U256::from_be_bytes(fee_commitment.0),
+        context.sender_viewing(),
+    )
+    .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    let expected = context.expected_fee_note();
+    if resolved_fee_note.token_hash != expected.token_hash
+        || resolved_fee_note.value != expected.value
+        || resolved_fee_note.random != expected.random
+        || resolved_fee_note.npk != expected.npk
+    {
+        return Err(Transact7702Error::FeeNoteAssurance);
+    }
+    let authorization_signature = strict_signature_from_authorization(&params.authorization)?;
+    let execution_signature = strict_execution_signature(&execution_signature)?;
+    let finalized = context
+        .prepared()
+        .finalize(authorization_signature, execution_signature)
+        .map_err(|_| Transact7702Error::CanonicalOperationMismatch)?;
+    let expected_authorization =
+        BroadcasterRawParamsTransact7702Authorization::try_from(finalized.authorization())
+            .map_err(|_| Transact7702Error::CanonicalOperationMismatch)?;
+    if params.to != finalized.to()
+        || params.data != *finalized.data()
+        || params.authorization != expected_authorization
+        || finalized.value() != U256::ZERO
+    {
+        return Err(Transact7702Error::CanonicalOperationMismatch);
+    }
+    strict_validate_fee_and_policy(
+        params,
+        network,
+        context.broadcaster_public().master_public_key,
+        &transactions,
+        parsed_transactions,
+        &action_data,
+        &resolved_fee_note,
+        context.required_poi_list_keys(),
+    )
+}
+
+fn strict_validate_inbound(
+    params: &BroadcasterRawParamsTransact7702,
+    context: &Transact7702InboundContext<'_>,
+) -> Result<ParsedTransactCalldata, Transact7702Error> {
+    let network = context.network();
+    if params.chain_type != u64::from(network.chain_type())
+        || params.chain_id != network.chain_id()
+        || params.authorization.chain_id != U256::from(network.chain_id())
+    {
+        return Err(Transact7702Error::InvalidChainIdentity);
+    }
+    if params.broadcaster_viewing_key
+        != FixedBytes::from(context.broadcaster_viewing().viewing_public_key)
+    {
+        return Err(Transact7702Error::StrictBroadcasterPolicy);
+    }
+    let StrictParsedEnvelope {
+        version,
+        transactions,
+        action_data,
+        execution_signature,
+        parsed_transactions,
+    } = strict_parse_envelope(&params.data, &params.txid_version)?;
+    if version.kind() != context.expected_version()
+        || params.authorization.address != context.expected_delegate()
+    {
+        return Err(Transact7702Error::StrictBroadcasterPolicy);
+    }
+    if transactions
+        .iter()
+        .any(|transaction| transaction.boundParams.chainID != network.packed_chain_id())
+    {
+        return Err(Transact7702Error::InvalidChainIdentity);
+    }
+    let prepared = PreparedRelayAdapt7702Execution::prepare(
+        network.chain_id(),
+        params.to,
+        context.expected_delegate(),
+        crate::eip7702::Eip7702AuthorizationNonce::new(params.authorization.nonce),
+        version,
+        transactions.clone(),
+        action_data.clone(),
+        U256::ZERO,
+    );
+    let finalized = prepared
+        .finalize(
+            strict_signature_from_authorization(&params.authorization)?,
+            strict_execution_signature(&execution_signature)?,
+        )
+        .map_err(|_| Transact7702Error::CanonicalOperationMismatch)?;
+    let expected_authorization =
+        BroadcasterRawParamsTransact7702Authorization::try_from(finalized.authorization())
+            .map_err(|_| Transact7702Error::CanonicalOperationMismatch)?;
+    if params.to != finalized.to()
+        || params.data != *finalized.data()
+        || params.authorization != expected_authorization
+        || finalized.value() != U256::ZERO
+    {
+        return Err(Transact7702Error::CanonicalOperationMismatch);
+    }
+    let fee_commitment = transactions
+        .first()
+        .and_then(|transaction| transaction.commitments.first())
+        .copied()
+        .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    let fee_ciphertext = transactions[0]
+        .boundParams
+        .commitmentCiphertext
+        .first()
+        .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    let resolved_fee_note = decrypt_receiver_fee_note(
+        fee_ciphertext,
+        U256::from_be_bytes(fee_commitment.0),
+        context.broadcaster_viewing(),
+    )
+    .ok_or(Transact7702Error::FeeNoteAssurance)?;
+    strict_validate_fee_and_policy(
+        params,
+        network,
+        context.broadcaster_viewing().master_public_key,
+        &transactions,
+        parsed_transactions,
+        &action_data,
+        &resolved_fee_note,
+        context.required_poi_list_keys(),
+    )
+}
+
 #[derive(Clone)]
 pub struct EncryptedTransactRequest {
     pub pubkey: [u8; 32],
@@ -806,19 +1336,12 @@ impl EncryptedTransactRequest {
     pub fn encrypt_7702(
         broadcaster_viewing_pubkey: [u8; 32],
         params: &BroadcasterRawParamsTransact7702,
-        prepared: &PreparedRelayAdapt7702Execution,
-        finalized: &FinalizedRelayAdapt7702Call,
-        viewing_privkey: &[u8; 32],
-        receiver_master_public_key: U256,
-        required_poi_list_keys: &[FixedBytes<32>],
+        context: &Transact7702OutboundContext<'_>,
     ) -> Result<Self, Transact7702Error> {
-        params.validate_broadcaster_request(
-            prepared,
-            finalized,
-            viewing_privkey,
-            receiver_master_public_key,
-            required_poi_list_keys,
-        )?;
+        if broadcaster_viewing_pubkey != context.broadcaster_public().viewing_public_key {
+            return Err(Transact7702Error::StrictBroadcasterPolicy);
+        }
+        strict_validate_outbound(params, context)?;
         let mut client_seed = [0u8; 32];
         getrandom::fill(&mut client_seed)
             .map_err(|_| Transact7702Error::from(TransactError::Random))?;
@@ -930,24 +1453,48 @@ impl fmt::Debug for DecryptedTransact {
     }
 }
 
-pub struct DecryptedTransact7702 {
-    pub shared_key: [u8; 32],
-    pub params: BroadcasterRawParamsTransact7702,
+pub struct ValidatedDecryptedTransact7702 {
+    shared_key: [u8; 32],
+    params: BroadcasterRawParamsTransact7702,
+    parsed: ParsedTransactCalldata,
 }
 
-impl fmt::Debug for DecryptedTransact7702 {
+impl ValidatedDecryptedTransact7702 {
+    #[must_use]
+    pub const fn params(&self) -> &BroadcasterRawParamsTransact7702 {
+        &self.params
+    }
+
+    #[must_use]
+    pub const fn parsed(&self) -> &ParsedTransactCalldata {
+        &self.parsed
+    }
+
+    #[must_use]
+    pub const fn shared_key(&self) -> &[u8; 32] {
+        &self.shared_key
+    }
+}
+
+impl fmt::Debug for ValidatedDecryptedTransact7702 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DecryptedTransact7702")
+            .debug_struct("ValidatedDecryptedTransact7702")
             .field("shared_key", &"<redacted>")
-            .field("params", &self.params)
+            .field("params", &"<redacted>")
+            .field("parsed", &"<redacted>")
+            .field("transaction_count", &self.parsed.transactions.len())
+            .field(
+                "fee_note_assurance_present",
+                &self.parsed.fee_note_assurance.is_some(),
+            )
             .finish()
     }
 }
 
 pub enum DecryptedTransactRequest {
-    Legacy(DecryptedTransact),
-    Tx7702(DecryptedTransact7702),
+    Legacy(Box<DecryptedTransact>),
+    Tx7702(Box<ValidatedDecryptedTransact7702>),
 }
 
 impl fmt::Debug for DecryptedTransactRequest {
@@ -980,29 +1527,41 @@ pub fn try_decrypt_transact_request(
     }))
 }
 
-pub fn try_decrypt_transact_request_7702(
-    viewing_priv_seed: &[u8; 32],
+pub fn try_decrypt_and_validate_transact_request_7702(
     pubkey: [u8; 32],
     encrypted_data: &[Bytes; 2],
-) -> Result<Option<DecryptedTransact7702>, Transact7702Error> {
-    let Some((shared, params)) = decrypt_request_7702(viewing_priv_seed, pubkey, encrypted_data)?
+    inbound_context: &Transact7702InboundContext<'_>,
+) -> Result<Option<ValidatedDecryptedTransact7702>, Transact7702Error> {
+    let shared = shared_key_32(
+        &inbound_context.broadcaster_viewing().viewing_private_key,
+        &pubkey,
+    )
+    .map_err(Transact7702Error::from)?;
+    let Some(plaintext) =
+        decrypt_authenticated_plaintext(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?
     else {
         return Ok(None);
     };
-
+    let params: BroadcasterRawParamsTransact7702 = deserialize_transact_plaintext_7702(&plaintext)?;
+    let parsed = strict_validate_inbound(&params, inbound_context)?;
     trace_decrypted_request(encrypted_data, "tx7702");
-    Ok(Some(DecryptedTransact7702 {
+    Ok(Some(ValidatedDecryptedTransact7702 {
         shared_key: shared,
         params,
+        parsed,
     }))
 }
 
 pub fn try_decrypt_transact_request_dispatched(
-    viewing_priv_seed: &[u8; 32],
     pubkey: [u8; 32],
     encrypted_data: &[Bytes; 2],
+    inbound_context: &Transact7702InboundContext<'_>,
 ) -> Result<Option<DecryptedTransactRequest>, Transact7702Error> {
-    let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(Transact7702Error::from)?;
+    let shared = shared_key_32(
+        &inbound_context.broadcaster_viewing().viewing_private_key,
+        &pubkey,
+    )
+    .map_err(Transact7702Error::from)?;
     let Some(plaintext) =
         decrypt_authenticated_plaintext(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?
     else {
@@ -1010,14 +1569,22 @@ pub fn try_decrypt_transact_request_dispatched(
     };
 
     let request = match transact_dispatch_kind(&plaintext)? {
-        TransactDispatchKind::Legacy => DecryptedTransactRequest::Legacy(DecryptedTransact {
-            shared_key: shared,
-            params: deserialize_transact_plaintext_7702(&plaintext)?,
-        }),
-        TransactDispatchKind::Tx7702 => DecryptedTransactRequest::Tx7702(DecryptedTransact7702 {
-            shared_key: shared,
-            params: deserialize_transact_plaintext_7702(&plaintext)?,
-        }),
+        TransactDispatchKind::Legacy => {
+            DecryptedTransactRequest::Legacy(Box::new(DecryptedTransact {
+                shared_key: shared,
+                params: deserialize_transact_plaintext_7702(&plaintext)?,
+            }))
+        }
+        TransactDispatchKind::Tx7702 => {
+            let params: BroadcasterRawParamsTransact7702 =
+                deserialize_transact_plaintext_7702(&plaintext)?;
+            let parsed = strict_validate_inbound(&params, inbound_context)?;
+            DecryptedTransactRequest::Tx7702(Box::new(ValidatedDecryptedTransact7702 {
+                shared_key: shared,
+                params,
+                parsed,
+            }))
+        }
     };
     let envelope_kind = match &request {
         DecryptedTransactRequest::Legacy(decrypted) => {
@@ -1049,28 +1616,6 @@ fn decrypt_request<T: serde::de::DeserializeOwned>(
     let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(|_| TransactError::SharedKey)?;
     let params = decrypt::<T>(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?;
     Ok(params.map(|params| (shared, params)))
-}
-
-fn decrypt_request_7702(
-    viewing_priv_seed: &[u8; 32],
-    pubkey: [u8; 32],
-    encrypted_data: &[Bytes; 2],
-) -> Result<Option<([u8; 32], BroadcasterRawParamsTransact7702)>, Transact7702Error> {
-    let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(Transact7702Error::from)?;
-    let params = decrypt_7702(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?;
-    Ok(params.map(|params| (shared, params)))
-}
-
-fn decrypt_7702(
-    shared_key: &[u8; 32],
-    ivtag: &[u8],
-    ct: Vec<u8>,
-) -> Result<Option<BroadcasterRawParamsTransact7702>, Transact7702Error> {
-    let Some(plaintext) = decrypt_authenticated_plaintext(shared_key, ivtag, ct)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(deserialize_transact_plaintext_7702(&plaintext)?))
 }
 
 fn trace_decrypted_request(encrypted_data: &[Bytes; 2], envelope_kind: &'static str) {
@@ -1114,6 +1659,38 @@ fn decrypt_authenticated_plaintext(
         "deserializing transact plaintext"
     );
     Ok(Some(ct))
+}
+
+#[cfg(test)]
+fn try_decrypt_transact_request_7702(
+    viewing_priv_seed: &[u8; 32],
+    pubkey: [u8; 32],
+    encrypted_data: &[Bytes; 2],
+) -> Result<Option<ValidatedDecryptedTransact7702>, Transact7702Error> {
+    let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(Transact7702Error::from)?;
+    let Some(plaintext) =
+        decrypt_authenticated_plaintext(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?
+    else {
+        return Ok(None);
+    };
+    let params = deserialize_transact_plaintext_7702(&plaintext)?;
+    Ok(Some(ValidatedDecryptedTransact7702 {
+        shared_key: shared,
+        params,
+        parsed: ParsedTransactCalldata {
+            fee_token: Address::ZERO,
+            fee_amount: U256::ZERO,
+            railgun_txid: U256::ZERO,
+            utxo_tree_in: 0,
+            fee_commitment: FixedBytes::ZERO,
+            fee_note_npk: FixedBytes::ZERO,
+            tx_nullifiers_len: 0,
+            tx_commitments_out_len: 0,
+            transactions: Vec::new(),
+            action_data: None,
+            fee_note_assurance: None,
+        },
+    }))
 }
 
 fn deserialize_transact_plaintext<T: serde::de::DeserializeOwned>(
@@ -1653,10 +2230,12 @@ mod tests {
         BroadcasterTransactRequestType, DEFAULT_TXID_VERSION, DecryptedTransact,
         DecryptedTransactRequest, EncryptedTransactRequest, FeeNoteAssuranceContext,
         ParsedTransactCalldata, ParsedTransactEnvelope, ParsedTransactTransaction, PreTxPoi,
-        SnarkJsProof, Transact7702Error, TransactError, compute_railgun_txid, decrypt,
+        SnarkJsProof, Transact7702Error, Transact7702InboundContext, Transact7702NetworkContext,
+        Transact7702OutboundContext, TransactError, compute_railgun_txid, decrypt,
         decrypt_authenticated_plaintext, dummy_txid_root, encrypt_params_with_seed,
         encrypt_params_with_seed_7702, parse_transact_calldata, parse_transact_envelope,
-        railgun_txid_leaf_hash, try_decrypt_transact_request, try_decrypt_transact_request_7702,
+        railgun_txid_leaf_hash, try_decrypt_and_validate_transact_request_7702,
+        try_decrypt_transact_request, try_decrypt_transact_request_7702,
         try_decrypt_transact_request_dispatched,
     };
     use crate::contracts::railgun::{
@@ -1670,6 +2249,7 @@ mod tests {
     use crate::eip7702::{
         Eip7702AuthorizationNonce, FinalizedRelayAdapt7702Call, PreparedRelayAdapt7702Execution,
         RelayAdapt7702ExecutionNonce, RelayAdapt7702ExecutionVersion,
+        RelayAdapt7702ExecutionVersionKind,
     };
     use crate::notes::Note;
     use alloy::eips::eip7702::{Authorization, SignedAuthorization};
@@ -1792,6 +2372,28 @@ mod tests {
         ViewingKeyData::from_spending_public_key([7u8; 32], [uint!(3_U256), uint!(9_U256)])
     }
 
+    fn strict_expected_fee_note(viewing: &ViewingKeyData) -> Note {
+        Note {
+            token_hash: U256::from_be_slice(Address::from([0x22; 20]).as_slice()),
+            value: U256::from(42_u64),
+            random: [0x55; 16],
+            npk: Note::npk_for(viewing.master_public_key, [0x55; 16]),
+        }
+    }
+
+    fn inbound_context<'a>(
+        viewing: &'a ViewingKeyData,
+        required_poi_list_keys: &[FixedBytes<32>],
+    ) -> Transact7702InboundContext<'a> {
+        Transact7702InboundContext::new(
+            Transact7702NetworkContext::new(0, 1_337).expect("test network"),
+            Address::from([0x12; 20]),
+            RelayAdapt7702ExecutionVersionKind::CurrentNonceAware,
+            viewing,
+            required_poi_list_keys,
+        )
+    }
+
     fn sample_ciphertext(
         viewing_key_data: &ViewingKeyData,
         token: Address,
@@ -1822,7 +2424,7 @@ mod tests {
         CommitmentCiphertext {
             ciphertext: ciphertext_words.map(FixedBytes::from),
             blindedSenderViewingKey: FixedBytes::from(blinded_sender),
-            blindedReceiverViewingKey: FixedBytes::ZERO,
+            blindedReceiverViewingKey: FixedBytes::from(blinded_sender),
             annotationData: Bytes::new(),
             memo: Bytes::new(),
         }
@@ -2087,7 +2689,8 @@ mod tests {
         FixedBytes<32>,
     ) {
         let viewing_key_data = sample_viewing_key_data();
-        let (_, first_transaction, _, _, _) = sample_transaction_and_params(None);
+        let (_, mut first_transaction, _, _, _) = sample_transaction_and_params(None);
+        first_transaction.boundParams.chainID = crate::crypto::railgun::pack_chain_id(0, 1_337);
         let transactions = vec![first_transaction, validation_transaction(2)];
         let action_data = validation_action_data(1);
         let (prepared, finalized) = validation_operation(
@@ -2122,6 +2725,7 @@ mod tests {
         }
 
         let mut params = strict_params_for_finalized(&finalized);
+        params.broadcaster_viewing_key = viewing_key_data.viewing_public_key.into();
         params.pre_transaction_pois_per_txid_leaf_per_list =
             BTreeMap::from([(required_list_key, per_leaf)]);
 
@@ -2132,6 +2736,126 @@ mod tests {
             viewing_key_data,
             required_list_key,
         )
+    }
+
+    struct StrictRoleSeparatedFixture {
+        params: BroadcasterRawParamsTransact7702,
+        prepared: PreparedRelayAdapt7702Execution,
+        sender_viewing: ViewingKeyData,
+        broadcaster_viewing: ViewingKeyData,
+        expected_fee_note: Note,
+        required_list_key: FixedBytes<32>,
+    }
+
+    fn role_separated_fee_ciphertext(
+        sender_viewing: &ViewingKeyData,
+        broadcaster_viewing: &ViewingKeyData,
+        note: &Note,
+    ) -> CommitmentCiphertext {
+        let shared_key = shared_symmetric_key(
+            &sender_viewing.viewing_private_key,
+            &broadcaster_viewing.viewing_public_key,
+        )
+        .expect("role-separated shared key");
+        let encoded_mpk = broadcaster_viewing.master_public_key ^ sender_viewing.master_public_key;
+        let mut plaintext = Vec::with_capacity(96);
+        plaintext.extend_from_slice(&encoded_mpk.to_be_bytes::<32>());
+        plaintext.extend_from_slice(&note.token_hash.to_be_bytes::<32>());
+        plaintext.extend_from_slice(&note.random);
+        let value_bytes = note.value.to_be_bytes::<32>();
+        plaintext.extend_from_slice(&value_bytes[16..]);
+        let iv_tag =
+            encrypt_in_place_16b_iv(&shared_key, &mut plaintext).expect("encrypt fee note");
+
+        let mut ciphertext_words = [[0u8; 32]; 4];
+        ciphertext_words[0].copy_from_slice(&iv_tag);
+        ciphertext_words[1].copy_from_slice(&plaintext[..32]);
+        ciphertext_words[2].copy_from_slice(&plaintext[32..64]);
+        ciphertext_words[3].copy_from_slice(&plaintext[64..96]);
+        CommitmentCiphertext {
+            ciphertext: ciphertext_words.map(FixedBytes::from),
+            blindedSenderViewingKey: FixedBytes::from(sender_viewing.viewing_public_key),
+            blindedReceiverViewingKey: FixedBytes::from(broadcaster_viewing.viewing_public_key),
+            annotationData: Bytes::new(),
+            memo: Bytes::new(),
+        }
+    }
+
+    fn strict_role_params_for_transactions(
+        transactions: Vec<Transaction>,
+        broadcaster_viewing: &ViewingKeyData,
+    ) -> (
+        BroadcasterRawParamsTransact7702,
+        PreparedRelayAdapt7702Execution,
+        FinalizedRelayAdapt7702Call,
+        FixedBytes<32>,
+    ) {
+        let action_data = validation_action_data(1);
+        let (prepared, finalized) = validation_operation(
+            VALIDATION_SIGNER_KEY,
+            1_337,
+            Address::from([0x12; 20]),
+            0x100,
+            RelayAdapt7702ExecutionVersion::CurrentNonceAware {
+                nonce: RelayAdapt7702ExecutionNonce::new(U256::from(77_u64)),
+            },
+            transactions,
+            action_data,
+            U256::ZERO,
+        );
+        let required_list_key = FixedBytes::from([0x88; 32]);
+        let mut per_leaf = BTreeMap::new();
+        for transaction in prepared.transactions() {
+            let railgun_txid = compute_railgun_txid(transaction, Some(DEFAULT_TXID_VERSION))
+                .expect("role fixture txid");
+            let utxo_tree_in = transaction.boundParams.treeNumber.into();
+            let leaf = railgun_txid_leaf_hash(railgun_txid, utxo_tree_in);
+            per_leaf.insert(
+                FixedBytes::from(leaf.to_be_bytes::<32>()),
+                PreTxPoi {
+                    snark_proof: SnarkJsProof::zero(),
+                    txid_merkleroot: FixedBytes::from(dummy_txid_root(leaf).to_be_bytes::<32>()),
+                    poi_merkleroots: vec![FixedBytes::ZERO],
+                    blinded_commitments_out: vec![FixedBytes::from([0x77; 32])],
+                    railgun_txid_if_has_unshield: Bytes::new(),
+                },
+            );
+        }
+        let mut params = strict_params_for_finalized(&finalized);
+        params.broadcaster_viewing_key = broadcaster_viewing.viewing_public_key.into();
+        params.pre_transaction_pois_per_txid_leaf_per_list =
+            BTreeMap::from([(required_list_key, per_leaf)]);
+        (params, prepared, finalized, required_list_key)
+    }
+
+    fn strict_role_separated_fixture() -> StrictRoleSeparatedFixture {
+        let sender_viewing =
+            ViewingKeyData::from_spending_public_key([0x07; 32], [uint!(3_U256), uint!(9_U256)]);
+        let broadcaster_viewing =
+            ViewingKeyData::from_spending_public_key([0x79; 32], [uint!(13_U256), uint!(17_U256)]);
+        let expected_fee_note = strict_expected_fee_note(&broadcaster_viewing);
+        let (_, baseline_prepared, _, _, _) = strict_fee_validation_fixture(U256::ZERO);
+        let mut first_transaction = baseline_prepared.transactions()[0].clone();
+        first_transaction.commitments[0] = expected_fee_note.commitment().into();
+        first_transaction.boundParams.commitmentCiphertext = vec![role_separated_fee_ciphertext(
+            &sender_viewing,
+            &broadcaster_viewing,
+            &expected_fee_note,
+        )];
+        let transactions = vec![
+            first_transaction,
+            baseline_prepared.transactions()[1].clone(),
+        ];
+        let (params, prepared, _, required_list_key) =
+            strict_role_params_for_transactions(transactions, &broadcaster_viewing);
+        StrictRoleSeparatedFixture {
+            params,
+            prepared,
+            sender_viewing,
+            broadcaster_viewing,
+            expected_fee_note,
+            required_list_key,
+        }
     }
 
     fn assert_strict_validation_rejected(
@@ -2572,21 +3296,31 @@ mod tests {
             Err(Transact7702Error::StrictBroadcasterPolicy)
         ));
 
-        let broadcaster_viewing_private_seed = [0x79; 32];
-        let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
-            .verifying_key()
-            .to_bytes();
+        let StrictRoleSeparatedFixture {
+            mut params,
+            prepared,
+            sender_viewing,
+            broadcaster_viewing,
+            expected_fee_note,
+            required_list_key: _,
+        } = strict_role_separated_fixture();
+        params.chain_type = 256;
+        let broadcaster_public = broadcaster_viewing.address_data();
+        let outbound_context = Transact7702OutboundContext::new(
+            Transact7702NetworkContext::new(0, 1_337).expect("test network"),
+            &prepared,
+            &expected_fee_note,
+            &sender_viewing,
+            &broadcaster_public,
+            &[],
+        );
         assert!(matches!(
             EncryptedTransactRequest::encrypt_7702(
-                broadcaster_viewing_pubkey,
+                broadcaster_viewing.viewing_public_key,
                 &params,
-                &prepared,
-                &finalized,
-                &viewing_key_data.viewing_private_key,
-                viewing_key_data.master_public_key,
-                &[],
+                &outbound_context,
             ),
-            Err(Transact7702Error::StrictBroadcasterPolicy)
+            Err(Transact7702Error::InvalidChainIdentity)
         ));
     }
 
@@ -3211,22 +3945,37 @@ mod tests {
         let _decrypt_trace_test_guard = DECRYPT_TRACE_TEST_LOCK
             .lock()
             .expect("decrypt trace test lock poisoned");
-        let (params, prepared, finalized, viewing_key_data, required_list_key) =
-            strict_fee_validation_fixture(U256::ZERO);
-        let broadcaster_viewing_private_seed = [0x79; 32];
-        let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
-            .verifying_key()
-            .to_bytes();
-        let encrypted = EncryptedTransactRequest::encrypt_7702(
-            broadcaster_viewing_pubkey,
-            &params,
+        let StrictRoleSeparatedFixture {
+            params,
+            prepared,
+            sender_viewing,
+            broadcaster_viewing,
+            expected_fee_note,
+            required_list_key,
+        } = strict_role_separated_fixture();
+        let broadcaster_public = broadcaster_viewing.address_data();
+        let outbound_context = Transact7702OutboundContext::new(
+            Transact7702NetworkContext::new(0, 1_337).expect("test network"),
             &prepared,
-            &finalized,
-            &viewing_key_data.viewing_private_key,
-            viewing_key_data.master_public_key,
+            &expected_fee_note,
+            &sender_viewing,
+            &broadcaster_public,
             &[required_list_key],
+        );
+        let inbound_context = inbound_context(&broadcaster_viewing, &[required_list_key]);
+        let encrypted = EncryptedTransactRequest::encrypt_7702(
+            broadcaster_viewing.viewing_public_key,
+            &params,
+            &outbound_context,
         )
         .expect("encrypt validated strict TX7702 request");
+        let outbound_debug = format!("{outbound_context:?}");
+        let inbound_debug = format!("{inbound_context:?}");
+        assert!(!outbound_debug.contains(&format!("{:?}", sender_viewing.viewing_private_key)));
+        assert!(
+            !outbound_debug.contains(&format!("{:?}", broadcaster_viewing.viewing_private_key))
+        );
+        assert!(!inbound_debug.contains(&format!("{:?}", broadcaster_viewing.viewing_private_key)));
 
         assert_eq!(
             decrypt_authenticated_plaintext(
@@ -3255,13 +4004,18 @@ mod tests {
                 .expect("serialize encrypted data")
         );
 
-        let explicit = try_decrypt_transact_request_7702(
-            &broadcaster_viewing_private_seed,
+        let explicit = try_decrypt_and_validate_transact_request_7702(
             encrypted.pubkey,
             &encrypted.encrypted_data,
+            &inbound_context,
         )
         .expect("explicit strict decrypt")
         .expect("strict request");
+        let explicit_debug = format!("{explicit:?}");
+        assert!(!explicit_debug.contains(&format!("{:?}", sender_viewing.viewing_private_key)));
+        assert!(
+            !explicit_debug.contains(&format!("{:?}", broadcaster_viewing.viewing_private_key))
+        );
         assert_eq!(explicit.shared_key, encrypted.shared_key);
         let expected_params_json =
             serde_json::to_value(&params).expect("serialize expected strict params");
@@ -3271,9 +4025,9 @@ mod tests {
         );
 
         let dispatched = try_decrypt_transact_request_dispatched(
-            &broadcaster_viewing_private_seed,
             encrypted.pubkey,
             &encrypted.encrypted_data,
+            &inbound_context,
         )
         .expect("dispatch strict decrypt")
         .expect("dispatched request");
@@ -3293,27 +4047,155 @@ mod tests {
 
     #[test]
     fn strict_tx7702_public_encryption_rejects_mutation_before_ciphertext() {
-        let (mut params, prepared, finalized, viewing_key_data, required_list_key) =
-            strict_fee_validation_fixture(U256::ZERO);
+        let StrictRoleSeparatedFixture {
+            mut params,
+            prepared,
+            sender_viewing,
+            broadcaster_viewing,
+            expected_fee_note,
+            required_list_key,
+        } = strict_role_separated_fixture();
         params.authorization.nonce += 1;
-        let broadcaster_viewing_private_seed = [0x79; 32];
-        let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
-            .verifying_key()
-            .to_bytes();
+        let broadcaster_public = broadcaster_viewing.address_data();
+        let outbound_context = Transact7702OutboundContext::new(
+            Transact7702NetworkContext::new(0, 1_337).expect("test network"),
+            &prepared,
+            &expected_fee_note,
+            &sender_viewing,
+            &broadcaster_public,
+            &[required_list_key],
+        );
 
         let result = EncryptedTransactRequest::encrypt_7702(
-            broadcaster_viewing_pubkey,
+            broadcaster_viewing.viewing_public_key,
             &params,
-            &prepared,
-            &finalized,
-            &viewing_key_data.viewing_private_key,
-            viewing_key_data.master_public_key,
-            &[required_list_key],
+            &outbound_context,
         );
 
         assert!(matches!(
             result,
             Err(Transact7702Error::CanonicalOperationMismatch)
+        ));
+    }
+
+    #[test]
+    fn strict_tx7702_fee_commitment_and_ciphertext_mismatch_rejects_both_roles() {
+        let StrictRoleSeparatedFixture {
+            params: _,
+            prepared,
+            sender_viewing,
+            broadcaster_viewing,
+            expected_fee_note,
+            required_list_key: _,
+        } = strict_role_separated_fixture();
+        let note_b = Note {
+            token_hash: expected_fee_note.token_hash,
+            value: expected_fee_note.value + U256::from(1_u64),
+            random: [0x56; 16],
+            npk: Note::npk_for(broadcaster_viewing.master_public_key, [0x56; 16]),
+        };
+        let mut transactions = prepared.transactions().to_vec();
+        transactions[0].boundParams.commitmentCiphertext[0] =
+            role_separated_fee_ciphertext(&sender_viewing, &broadcaster_viewing, &note_b);
+        let (params, prepared, _, required_list_key) =
+            strict_role_params_for_transactions(transactions, &broadcaster_viewing);
+        let broadcaster_public = broadcaster_viewing.address_data();
+        let outbound_context = Transact7702OutboundContext::new(
+            Transact7702NetworkContext::new(0, 1_337).expect("test network"),
+            &prepared,
+            &expected_fee_note,
+            &sender_viewing,
+            &broadcaster_public,
+            &[required_list_key],
+        );
+        assert!(matches!(
+            EncryptedTransactRequest::encrypt_7702(
+                broadcaster_viewing.viewing_public_key,
+                &params,
+                &outbound_context,
+            ),
+            Err(Transact7702Error::FeeNoteAssurance)
+        ));
+
+        let encrypted = encrypt_params_with_seed_7702(
+            broadcaster_viewing.viewing_public_key,
+            &params,
+            [0x7a; 32],
+        )
+        .expect("encrypt mismatched raw DTO in test");
+        let inbound_context = inbound_context(&broadcaster_viewing, &[required_list_key]);
+        assert!(matches!(
+            try_decrypt_and_validate_transact_request_7702(
+                encrypted.pubkey,
+                &encrypted.encrypted_data,
+                &inbound_context,
+            ),
+            Err(Transact7702Error::FeeNoteAssurance)
+        ));
+        assert!(matches!(
+            try_decrypt_transact_request_dispatched(
+                encrypted.pubkey,
+                &encrypted.encrypted_data,
+                &inbound_context,
+            ),
+            Err(Transact7702Error::FeeNoteAssurance)
+        ));
+    }
+
+    #[test]
+    fn strict_tx7702_nonfirst_transaction_chain_mismatch_rejects_both_roles() {
+        let StrictRoleSeparatedFixture {
+            params: _,
+            prepared,
+            sender_viewing,
+            broadcaster_viewing,
+            expected_fee_note,
+            required_list_key: _,
+        } = strict_role_separated_fixture();
+        let mut transactions = prepared.transactions().to_vec();
+        transactions[1].boundParams.chainID = crate::crypto::railgun::pack_chain_id(0, 1_338);
+        let (params, prepared, _, required_list_key) =
+            strict_role_params_for_transactions(transactions, &broadcaster_viewing);
+        let broadcaster_public = broadcaster_viewing.address_data();
+        let outbound_context = Transact7702OutboundContext::new(
+            Transact7702NetworkContext::new(0, 1_337).expect("test network"),
+            &prepared,
+            &expected_fee_note,
+            &sender_viewing,
+            &broadcaster_public,
+            &[required_list_key],
+        );
+        assert!(matches!(
+            EncryptedTransactRequest::encrypt_7702(
+                broadcaster_viewing.viewing_public_key,
+                &params,
+                &outbound_context,
+            ),
+            Err(Transact7702Error::InvalidChainIdentity)
+        ));
+
+        let encrypted = encrypt_params_with_seed_7702(
+            broadcaster_viewing.viewing_public_key,
+            &params,
+            [0x7a; 32],
+        )
+        .expect("encrypt chain-mismatched raw DTO in test");
+        let inbound_context = inbound_context(&broadcaster_viewing, &[required_list_key]);
+        assert!(matches!(
+            try_decrypt_and_validate_transact_request_7702(
+                encrypted.pubkey,
+                &encrypted.encrypted_data,
+                &inbound_context,
+            ),
+            Err(Transact7702Error::InvalidChainIdentity)
+        ));
+        assert!(matches!(
+            try_decrypt_transact_request_dispatched(
+                encrypted.pubkey,
+                &encrypted.encrypted_data,
+                &inbound_context,
+            ),
+            Err(Transact7702Error::InvalidChainIdentity)
         ));
     }
 
@@ -3326,6 +4208,11 @@ mod tests {
         let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
             .verifying_key()
             .to_bytes();
+        let legacy_viewing = ViewingKeyData::from_spending_public_key(
+            broadcaster_viewing_private_seed,
+            [uint!(3_U256), uint!(9_U256)],
+        );
+        let legacy_context = inbound_context(&legacy_viewing, &[]);
         let client_seed = [0x7a; 32];
 
         let (_, transaction, direct_params, _, _) = sample_transaction_and_params(None);
@@ -3377,9 +4264,9 @@ mod tests {
                 }
 
                 let dispatched = try_decrypt_transact_request_dispatched(
-                    &broadcaster_viewing_private_seed,
                     encrypted.pubkey,
                     &encrypted.encrypted_data,
+                    &legacy_context,
                 )
                 .expect("legacy dispatch")
                 .expect("dispatched legacy request");
@@ -3401,9 +4288,9 @@ mod tests {
                 .expect("encrypt legacy extension request");
         assert!(matches!(
             try_decrypt_transact_request_dispatched(
-                &broadcaster_viewing_private_seed,
                 encrypted.pubkey,
                 &encrypted.encrypted_data,
+                &legacy_context,
             ),
             Ok(Some(DecryptedTransactRequest::Legacy(_)))
         ));
@@ -3419,15 +4306,35 @@ mod tests {
         let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
             .verifying_key()
             .to_bytes();
+        let boundary_viewing = ViewingKeyData::from_spending_public_key(
+            broadcaster_viewing_private_seed,
+            [uint!(3_U256), uint!(9_U256)],
+        );
+        let boundary_context = Transact7702InboundContext::new(
+            Transact7702NetworkContext::new(0, 31_337).expect("test network"),
+            Address::from([0x44; 20]),
+            RelayAdapt7702ExecutionVersionKind::CurrentNonceAware,
+            &boundary_viewing,
+            &[],
+        );
+        let wrong_key_viewing =
+            ViewingKeyData::from_spending_public_key([0x7b; 32], [uint!(3_U256), uint!(9_U256)]);
+        let wrong_key_context = Transact7702InboundContext::new(
+            Transact7702NetworkContext::new(0, 31_337).expect("test network"),
+            Address::from([0x44; 20]),
+            RelayAdapt7702ExecutionVersionKind::CurrentNonceAware,
+            &wrong_key_viewing,
+            &[],
+        );
         let client_seed = [0x7a; 32];
 
         let valid = encrypt_params_with_seed(broadcaster_viewing_pubkey, &base, client_seed)
             .expect("encrypt strict boundary fixture");
         assert!(matches!(
             try_decrypt_transact_request_dispatched(
-                &[0x7b; 32],
                 valid.pubkey,
                 &valid.encrypted_data,
+                &wrong_key_context,
             ),
             Ok(None)
         ));
@@ -3438,18 +4345,18 @@ mod tests {
         tampered_data[1] = Bytes::from(tampered_ciphertext);
         assert!(matches!(
             try_decrypt_transact_request_dispatched(
-                &broadcaster_viewing_private_seed,
                 valid.pubkey,
                 &tampered_data,
+                &boundary_context,
             ),
             Ok(None)
         ));
 
         let malformed_data = [Bytes::from(vec![0u8; 31]), valid.encrypted_data[1].clone()];
         let error = try_decrypt_transact_request_dispatched(
-            &broadcaster_viewing_private_seed,
             valid.pubkey,
             &malformed_data,
+            &boundary_context,
         )
         .expect_err("malformed IV/tag length should fail");
         assert!(matches!(
@@ -3545,9 +4452,9 @@ mod tests {
                 encrypt_params_with_seed(broadcaster_viewing_pubkey, &value, client_seed)
                     .expect("encrypt malformed strict boundary fixture");
             let error = try_decrypt_transact_request_dispatched(
-                &broadcaster_viewing_private_seed,
                 encrypted.pubkey,
                 &encrypted.encrypted_data,
+                &boundary_context,
             )
             .expect_err(label);
             assert!(
@@ -3588,6 +4495,11 @@ mod tests {
         let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
             .verifying_key()
             .to_bytes();
+        let fallback_viewing = ViewingKeyData::from_spending_public_key(
+            broadcaster_viewing_private_seed,
+            [uint!(3_U256), uint!(9_U256)],
+        );
+        let fallback_context = inbound_context(&fallback_viewing, &[]);
         let encrypted = EncryptedTransactRequest::encrypt_with_seed(
             broadcaster_viewing_pubkey,
             &params,
@@ -3597,9 +4509,9 @@ mod tests {
 
         assert!(matches!(
             try_decrypt_transact_request_dispatched(
-                &broadcaster_viewing_private_seed,
                 encrypted.pubkey,
                 &encrypted.encrypted_data,
+                &fallback_context,
             ),
             Err(Transact7702Error::JsonDeserialize)
         ));

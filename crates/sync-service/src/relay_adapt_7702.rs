@@ -6,14 +6,7 @@
 
 use alloy::primitives::{Address, address};
 
-/// The execute ABI kind for a deployment, without an execution nonce value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RelayAdapt7702ExecutionVersionKind {
-    /// The current nonce-aware `execute` ABI.
-    CurrentNonceAware,
-    /// The legacy `execute` ABI without an execute nonce argument.
-    LegacyPreExecuteNonce,
-}
+pub use broadcaster_core::eip7702::RelayAdapt7702ExecutionVersionKind;
 
 /// Evidence class attached to a `RelayAdapt7702` metadata record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
