@@ -56,6 +56,17 @@ pub enum BuildError {
     MissingProof { tree: u32, position: u64 },
     #[error("min gas price exceeds uint72: {0}")]
     MinGasPriceTooLarge(u128),
+    #[error("encrypt note failed: {0}")]
+    Encrypt(#[from] crate::notes::NoteError),
+    #[error("prove failed: {0}")]
+    Prover(#[from] ProverError),
+}
+
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum RelayAdapt7702BuildError {
+    #[error(transparent)]
+    Build(#[from] BuildError),
     #[error("EIP-7702 authority must be non-zero")]
     InvalidRelayAdapt7702Authority,
     #[error("EIP-7702 delegate must be non-zero")]
@@ -68,10 +79,6 @@ pub enum BuildError {
     RelayAdapt7702ShieldAmountMismatch,
     #[error("EIP-7702 private recipe requires a non-zero wrapped base token")]
     InvalidRelayAdapt7702WrappedBaseToken,
-    #[error("encrypt note failed: {0}")]
-    Encrypt(#[from] crate::notes::NoteError),
-    #[error("prove failed: {0}")]
-    Prover(#[from] ProverError),
 }
 
 #[derive(Debug, Error)]

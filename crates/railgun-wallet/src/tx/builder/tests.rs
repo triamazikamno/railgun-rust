@@ -37,11 +37,11 @@ use crate::tx::{
     MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource, MixedPrivateSend,
     MixedPrivateSendRole, PoiCircuitVariant, PoiMerkleProofSource, PostTransactionPoiData,
     PostTransactionPoiGenerationRequest, PreTransactionPoiError,
-    PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, RelayAdapt7702PlanRequest,
-    RelayAdapt7702Recipe, SelectedInputIdentity, SendRequest, TransactionBuilder,
-    TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, compute_railgun_txid_from_public_inputs,
-    generate_post_transaction_pois, generate_pre_transaction_pois, insert_pre_transaction_poi,
-    poi_circuit_variant,
+    PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, RelayAdapt7702BuildError,
+    RelayAdapt7702PlanRequest, RelayAdapt7702Recipe, SelectedInputIdentity, SendRequest,
+    TransactionBuilder, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS,
+    compute_railgun_txid_from_public_inputs, generate_post_transaction_pois,
+    generate_pre_transaction_pois, insert_pre_transaction_poi, poi_circuit_variant,
 };
 
 use super::{
@@ -1250,7 +1250,7 @@ async fn relay_adapt_7702_planner_rejects_malformed_closed_recipes() {
         .expect_err("zero Shield amount must fail");
     assert!(matches!(
         zero_shield,
-        BuildError::InvalidRelayAdapt7702ShieldAmount
+        RelayAdapt7702BuildError::InvalidRelayAdapt7702ShieldAmount
     ));
 
     let non_native = builder
@@ -1279,7 +1279,7 @@ async fn relay_adapt_7702_planner_rejects_malformed_closed_recipes() {
         .expect_err("non-native Shield token must fail");
     assert!(matches!(
         non_native,
-        BuildError::InvalidRelayAdapt7702ShieldToken
+        RelayAdapt7702BuildError::InvalidRelayAdapt7702ShieldToken
     ));
 
     let mismatched_amount = builder
@@ -1298,7 +1298,7 @@ async fn relay_adapt_7702_planner_rejects_malformed_closed_recipes() {
         .expect_err("Shield amount mismatch must fail");
     assert!(matches!(
         mismatched_amount,
-        BuildError::RelayAdapt7702ShieldAmountMismatch
+        RelayAdapt7702BuildError::RelayAdapt7702ShieldAmountMismatch
     ));
 
     let zero_wrapped_token = builder
@@ -1320,7 +1320,29 @@ async fn relay_adapt_7702_planner_rejects_malformed_closed_recipes() {
         .expect_err("zero wrapped-base token must fail");
     assert!(matches!(
         zero_wrapped_token,
-        BuildError::InvalidRelayAdapt7702WrappedBaseToken
+        RelayAdapt7702BuildError::InvalidRelayAdapt7702WrappedBaseToken
+    ));
+
+    let ordinary_failure = builder
+        .build_relay_adapt_7702_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &MerkleForest::new(),
+            &[],
+            base_request(RelayAdapt7702Recipe::PrivateBaseTokenUnshield {
+                wrapped_base_token: Address::from([0xa4; 20]),
+                amount: uint!(1_U256),
+                recipient: authority,
+                broadcaster_fee: None,
+                spend_up_to: false,
+            }),
+            &MockTransactionProver,
+        )
+        .await
+        .expect_err("ordinary builder failure must be wrapped");
+    assert!(matches!(
+        ordinary_failure,
+        RelayAdapt7702BuildError::Build(BuildError::InsufficientBalance(_))
     ));
 }
 

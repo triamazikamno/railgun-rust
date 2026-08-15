@@ -30,9 +30,10 @@ use super::{
     MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan, MixedPrivateActionPreview,
     MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource,
     MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs, PublicInputs,
-    RelayAdapt7702Plan, RelayAdapt7702PlanRequest, RelayAdapt7702Recipe, SelectedInputIdentity,
-    SendPlan, SendRequest, TransactPlan, TransactionBuilder, TransactionCall, TransactionPlanChunk,
-    UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan, UnshieldRequest,
+    RelayAdapt7702BuildError, RelayAdapt7702Plan, RelayAdapt7702PlanRequest, RelayAdapt7702Recipe,
+    SelectedInputIdentity, SendPlan, SendRequest, TransactPlan, TransactionBuilder,
+    TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan,
+    UnshieldRequest,
 };
 
 use selection::{
@@ -182,7 +183,7 @@ impl TransactionBuilder {
         utxos: &[Utxo],
         request: RelayAdapt7702PlanRequest,
         prover: &ProverService,
-    ) -> Result<RelayAdapt7702Plan, BuildError> {
+    ) -> Result<RelayAdapt7702Plan, RelayAdapt7702BuildError> {
         self.build_relay_adapt_7702_plan_with_signer(
             &wallet.viewing,
             wallet,
@@ -203,7 +204,7 @@ impl TransactionBuilder {
         utxos: &[Utxo],
         request: RelayAdapt7702PlanRequest,
         prover: &ProverService,
-    ) -> Result<RelayAdapt7702Plan, BuildError> {
+    ) -> Result<RelayAdapt7702Plan, RelayAdapt7702BuildError> {
         self.build_relay_adapt_7702_plan_inner(viewing, signer, forest, utxos, request, prover)
             .await
     }
@@ -217,12 +218,12 @@ impl TransactionBuilder {
         utxos: &[Utxo],
         request: RelayAdapt7702PlanRequest,
         prover: &P,
-    ) -> Result<RelayAdapt7702Plan, BuildError> {
+    ) -> Result<RelayAdapt7702Plan, RelayAdapt7702BuildError> {
         if request.authority == Address::ZERO {
-            return Err(BuildError::InvalidRelayAdapt7702Authority);
+            return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702Authority);
         }
         if request.delegate == Address::ZERO {
-            return Err(BuildError::InvalidRelayAdapt7702Delegate);
+            return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702Delegate);
         }
 
         let RelayAdapt7702PlanRequest {
@@ -305,7 +306,7 @@ impl TransactionBuilder {
                 spend_up_to,
             } => {
                 if wrapped_base_token == Address::ZERO {
-                    return Err(BuildError::InvalidRelayAdapt7702WrappedBaseToken);
+                    return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702WrappedBaseToken);
                 }
 
                 let composite_request = CompositeUnshieldRequest {
@@ -2399,9 +2400,9 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
 fn validate_public_native_shield(
     amount: U256,
     shield_requests: &[ShieldRequest],
-) -> Result<(), BuildError> {
+) -> Result<(), RelayAdapt7702BuildError> {
     if amount.is_zero() {
-        return Err(BuildError::InvalidRelayAdapt7702ShieldAmount);
+        return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702ShieldAmount);
     }
 
     let supplied_amount = shield_requests
@@ -2411,13 +2412,13 @@ fn validate_public_native_shield(
                 || request.preimage.token.tokenAddress != Address::ZERO
                 || !request.preimage.token.tokenSubID.is_zero()
             {
-                return Err(BuildError::InvalidRelayAdapt7702ShieldToken);
+                return Err(RelayAdapt7702BuildError::InvalidRelayAdapt7702ShieldToken);
             }
             sum.checked_add(U256::from(request.preimage.value))
-                .ok_or(BuildError::RelayAdapt7702ShieldAmountMismatch)
+                .ok_or(RelayAdapt7702BuildError::RelayAdapt7702ShieldAmountMismatch)
         })?;
     if supplied_amount != amount {
-        return Err(BuildError::RelayAdapt7702ShieldAmountMismatch);
+        return Err(RelayAdapt7702BuildError::RelayAdapt7702ShieldAmountMismatch);
     }
     Ok(())
 }

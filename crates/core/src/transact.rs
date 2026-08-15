@@ -58,16 +58,23 @@ pub enum TransactError {
     InvalidTokenHash,
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("transact JSON serialization failed")]
-    JsonSerialize,
-    #[error("transact JSON deserialization failed")]
-    JsonDeserialize,
     #[error("abi decode error: {0}")]
     AbiDecode(#[from] alloy::sol_types::Error),
     #[error("missing pre-transaction POI for required list key")]
     MissingPreTransactionPoiForAssurance,
     #[error("unsupported txid version: {txid_version}")]
     UnsupportedTxidVersion { txid_version: String },
+}
+
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum Transact7702Error {
+    #[error(transparent)]
+    Transact(#[from] TransactError),
+    #[error("transact JSON serialization failed")]
+    JsonSerialize,
+    #[error("transact JSON deserialization failed")]
+    JsonDeserialize,
     #[error("invalid EIP-7702 authorization parity")]
     InvalidAuthorizationParity,
     #[error("canonical EIP-7702 operation mismatch")]
@@ -475,12 +482,12 @@ pub struct BroadcasterRawParamsTransact7702Authorization {
 }
 
 impl TryFrom<&SignedAuthorization> for BroadcasterRawParamsTransact7702Authorization {
-    type Error = TransactError;
+    type Error = Transact7702Error;
 
     fn try_from(value: &SignedAuthorization) -> Result<Self, Self::Error> {
         let v = match value.signature() {
             Ok(_) => 27 + u64::from(value.y_parity()),
-            Err(_) => return Err(TransactError::InvalidAuthorizationParity),
+            Err(_) => return Err(Transact7702Error::InvalidAuthorizationParity),
         };
 
         Ok(Self {
@@ -584,13 +591,13 @@ impl BroadcasterRawParamsTransact7702 {
         &self,
         prepared: &PreparedRelayAdapt7702Execution,
         finalized: &FinalizedRelayAdapt7702Call,
-    ) -> Result<(), TransactError> {
+    ) -> Result<(), Transact7702Error> {
         if self.to != prepared.authority()
             || finalized.to() != prepared.authority()
             || self.to != finalized.to()
             || finalized.value() != prepared.outer_value()
         {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         let authorization = finalized.authorization().inner();
@@ -598,18 +605,18 @@ impl BroadcasterRawParamsTransact7702 {
             || authorization.address != prepared.delegate()
             || authorization.nonce != prepared.authorization_nonce().value()
         {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         let expected_authorization =
             BroadcasterRawParamsTransact7702Authorization::try_from(finalized.authorization())
-                .map_err(|_| TransactError::CanonicalOperationMismatch)?;
+                .map_err(|_| Transact7702Error::CanonicalOperationMismatch)?;
         if self.authorization != expected_authorization {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         if self.data != finalized.data().clone() {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         let ParsedTransactEnvelope::RelayAdapt7702 {
@@ -618,14 +625,14 @@ impl BroadcasterRawParamsTransact7702 {
             action_data,
             execution_signature: parsed_signature,
         } = parse_transact_envelope(&self.data)
-            .map_err(|_| TransactError::CanonicalOperationMismatch)?
+            .map_err(|_| Transact7702Error::CanonicalOperationMismatch)?
         else {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         };
 
         let execution_signature = Bytes::from(finalized.execution_signature().as_bytes());
         if version != prepared.execution_version() || parsed_signature != execution_signature {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         let expected_data = prepared.execution_version().encode_execute(
@@ -634,7 +641,7 @@ impl BroadcasterRawParamsTransact7702 {
             execution_signature,
         );
         if finalized.data() != &expected_data {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         let prepared_values = (
@@ -644,7 +651,7 @@ impl BroadcasterRawParamsTransact7702 {
             .abi_encode_params();
         let parsed_values = (transactions, action_data).abi_encode_params();
         if parsed_values != prepared_values {
-            return Err(TransactError::CanonicalOperationMismatch);
+            return Err(Transact7702Error::CanonicalOperationMismatch);
         }
 
         Ok(())
@@ -657,9 +664,9 @@ impl BroadcasterRawParamsTransact7702 {
         viewing_privkey: &[u8; 32],
         receiver_master_public_key: U256,
         required_poi_list_keys: &[FixedBytes<32>],
-    ) -> Result<ParsedTransactCalldata, TransactError> {
-        let chain_type =
-            u8::try_from(self.chain_type).map_err(|_| TransactError::StrictBroadcasterPolicy)?;
+    ) -> Result<ParsedTransactCalldata, Transact7702Error> {
+        let chain_type = u8::try_from(self.chain_type)
+            .map_err(|_| Transact7702Error::StrictBroadcasterPolicy)?;
         self.validate_finalized_operation(prepared, finalized)?;
 
         if !matches!(
@@ -673,7 +680,7 @@ impl BroadcasterRawParamsTransact7702 {
             || self.max_fee_per_gas.is_zero()
             || self.max_priority_fee_per_gas > self.max_fee_per_gas
         {
-            return Err(TransactError::StrictBroadcasterPolicy);
+            return Err(Transact7702Error::StrictBroadcasterPolicy);
         }
 
         let mut parsed = parse_transact_calldata(
@@ -682,7 +689,7 @@ impl BroadcasterRawParamsTransact7702 {
             receiver_master_public_key,
             Some(&self.txid_version),
         )
-        .map_err(|_| TransactError::StrictBroadcasterPolicy)?;
+        .map_err(|_| Transact7702Error::StrictBroadcasterPolicy)?;
 
         if required_poi_list_keys.is_empty() {
             parsed.fee_note_assurance = None;
@@ -708,11 +715,11 @@ impl BroadcasterRawParamsTransact7702 {
                         })
                     })
             }) {
-                return Err(TransactError::StrictBroadcasterPolicy);
+                return Err(Transact7702Error::StrictBroadcasterPolicy);
             }
 
             let txid_version = supported_txid_version(Some(&self.txid_version))
-                .map_err(|_| TransactError::StrictBroadcasterPolicy)?;
+                .map_err(|_| Transact7702Error::StrictBroadcasterPolicy)?;
             parsed.fee_note_assurance = Some(FeeNoteAssuranceContext {
                 chain_type,
                 txid_version: txid_version.to_string(),
@@ -748,13 +755,42 @@ fn encrypt_params_with_seed<T: Serialize>(
         .to_bytes();
     let shared_key = shared_key_for_broadcaster(&client_seed, &broadcaster_viewing_pubkey)
         .map_err(|_| TransactError::SharedKey)?;
-    let mut plaintext = serde_json::to_vec(params).map_err(|_| TransactError::JsonSerialize)?;
+    let mut plaintext = serde_json::to_vec(params)
+        .map_err(|_| TransactError::Json(legacy_json_serialize_error()))?;
     let iv_tag = encrypt_in_place_16b_iv(&shared_key, &mut plaintext)?;
     Ok(EncryptedTransactRequest {
         pubkey,
         encrypted_data: [Bytes::copy_from_slice(&iv_tag), Bytes::from(plaintext)],
         shared_key,
     })
+}
+
+fn encrypt_params_with_seed_7702<T: Serialize>(
+    broadcaster_viewing_pubkey: [u8; 32],
+    params: &T,
+    client_seed: [u8; 32],
+) -> Result<EncryptedTransactRequest, Transact7702Error> {
+    let pubkey = SigningKey::from_bytes(&client_seed)
+        .verifying_key()
+        .to_bytes();
+    let shared_key = shared_key_for_broadcaster(&client_seed, &broadcaster_viewing_pubkey)
+        .map_err(Transact7702Error::from)?;
+    let mut plaintext = serde_json::to_vec(params).map_err(|_| Transact7702Error::JsonSerialize)?;
+    let iv_tag =
+        encrypt_in_place_16b_iv(&shared_key, &mut plaintext).map_err(TransactError::from)?;
+    Ok(EncryptedTransactRequest {
+        pubkey,
+        encrypted_data: [Bytes::copy_from_slice(&iv_tag), Bytes::from(plaintext)],
+        shared_key,
+    })
+}
+
+fn legacy_json_serialize_error() -> serde_json::Error {
+    <serde_json::Error as serde::ser::Error>::custom("transact JSON serialization failed")
+}
+
+fn legacy_json_deserialize_error() -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom("transact JSON deserialization failed")
 }
 
 impl EncryptedTransactRequest {
@@ -775,7 +811,7 @@ impl EncryptedTransactRequest {
         viewing_privkey: &[u8; 32],
         receiver_master_public_key: U256,
         required_poi_list_keys: &[FixedBytes<32>],
-    ) -> Result<Self, TransactError> {
+    ) -> Result<Self, Transact7702Error> {
         params.validate_broadcaster_request(
             prepared,
             finalized,
@@ -784,8 +820,9 @@ impl EncryptedTransactRequest {
             required_poi_list_keys,
         )?;
         let mut client_seed = [0u8; 32];
-        getrandom::fill(&mut client_seed).map_err(|_| TransactError::Random)?;
-        encrypt_params_with_seed(broadcaster_viewing_pubkey, params, client_seed)
+        getrandom::fill(&mut client_seed)
+            .map_err(|_| Transact7702Error::from(TransactError::Random))?;
+        encrypt_params_with_seed_7702(broadcaster_viewing_pubkey, params, client_seed)
     }
 
     pub fn encrypt_with_seed(
@@ -947,12 +984,8 @@ pub fn try_decrypt_transact_request_7702(
     viewing_priv_seed: &[u8; 32],
     pubkey: [u8; 32],
     encrypted_data: &[Bytes; 2],
-) -> Result<Option<DecryptedTransact7702>, TransactError> {
-    let Some((shared, params)) = decrypt_request::<BroadcasterRawParamsTransact7702>(
-        viewing_priv_seed,
-        pubkey,
-        encrypted_data,
-    )?
+) -> Result<Option<DecryptedTransact7702>, Transact7702Error> {
+    let Some((shared, params)) = decrypt_request_7702(viewing_priv_seed, pubkey, encrypted_data)?
     else {
         return Ok(None);
     };
@@ -968,8 +1001,8 @@ pub fn try_decrypt_transact_request_dispatched(
     viewing_priv_seed: &[u8; 32],
     pubkey: [u8; 32],
     encrypted_data: &[Bytes; 2],
-) -> Result<Option<DecryptedTransactRequest>, TransactError> {
-    let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(|_| TransactError::SharedKey)?;
+) -> Result<Option<DecryptedTransactRequest>, Transact7702Error> {
+    let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(Transact7702Error::from)?;
     let Some(plaintext) =
         decrypt_authenticated_plaintext(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?
     else {
@@ -979,11 +1012,11 @@ pub fn try_decrypt_transact_request_dispatched(
     let request = match transact_dispatch_kind(&plaintext)? {
         TransactDispatchKind::Legacy => DecryptedTransactRequest::Legacy(DecryptedTransact {
             shared_key: shared,
-            params: deserialize_transact_plaintext(&plaintext)?,
+            params: deserialize_transact_plaintext_7702(&plaintext)?,
         }),
         TransactDispatchKind::Tx7702 => DecryptedTransactRequest::Tx7702(DecryptedTransact7702 {
             shared_key: shared,
-            params: deserialize_transact_plaintext(&plaintext)?,
+            params: deserialize_transact_plaintext_7702(&plaintext)?,
         }),
     };
     let envelope_kind = match &request {
@@ -1016,6 +1049,28 @@ fn decrypt_request<T: serde::de::DeserializeOwned>(
     let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(|_| TransactError::SharedKey)?;
     let params = decrypt::<T>(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?;
     Ok(params.map(|params| (shared, params)))
+}
+
+fn decrypt_request_7702(
+    viewing_priv_seed: &[u8; 32],
+    pubkey: [u8; 32],
+    encrypted_data: &[Bytes; 2],
+) -> Result<Option<([u8; 32], BroadcasterRawParamsTransact7702)>, Transact7702Error> {
+    let shared = shared_key_32(viewing_priv_seed, &pubkey).map_err(Transact7702Error::from)?;
+    let params = decrypt_7702(&shared, &encrypted_data[0], encrypted_data[1].to_vec())?;
+    Ok(params.map(|params| (shared, params)))
+}
+
+fn decrypt_7702(
+    shared_key: &[u8; 32],
+    ivtag: &[u8],
+    ct: Vec<u8>,
+) -> Result<Option<BroadcasterRawParamsTransact7702>, Transact7702Error> {
+    let Some(plaintext) = decrypt_authenticated_plaintext(shared_key, ivtag, ct)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(deserialize_transact_plaintext_7702(&plaintext)?))
 }
 
 fn trace_decrypted_request(encrypted_data: &[Bytes; 2], envelope_kind: &'static str) {
@@ -1064,7 +1119,14 @@ fn decrypt_authenticated_plaintext(
 fn deserialize_transact_plaintext<T: serde::de::DeserializeOwned>(
     plaintext: &[u8],
 ) -> Result<T, TransactError> {
-    serde_json::from_slice(plaintext).map_err(|_| TransactError::JsonDeserialize)
+    serde_json::from_slice(plaintext)
+        .map_err(|_| TransactError::Json(legacy_json_deserialize_error()))
+}
+
+fn deserialize_transact_plaintext_7702<T: serde::de::DeserializeOwned>(
+    plaintext: &[u8],
+) -> Result<T, Transact7702Error> {
+    serde_json::from_slice(plaintext).map_err(|_| Transact7702Error::JsonDeserialize)
 }
 
 enum TransactDispatchKind {
@@ -1081,9 +1143,9 @@ fn data_starts_with_selector(data: &str, selector: [u8; 4]) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&hex::encode(selector)))
 }
 
-fn transact_dispatch_kind(plaintext: &[u8]) -> Result<TransactDispatchKind, TransactError> {
+fn transact_dispatch_kind(plaintext: &[u8]) -> Result<TransactDispatchKind, Transact7702Error> {
     let object: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(plaintext).map_err(|_| TransactError::JsonDeserialize)?;
+        serde_json::from_slice(plaintext).map_err(|_| Transact7702Error::JsonDeserialize)?;
     let has_strict_only_marker = object.contains_key("gasLimit")
         || object
             .get("data")
@@ -1094,16 +1156,16 @@ fn transact_dispatch_kind(plaintext: &[u8]) -> Result<TransactDispatchKind, Tran
             });
     let Some(value) = object.get("transactType") else {
         if has_strict_only_marker {
-            return Err(TransactError::JsonDeserialize);
+            return Err(Transact7702Error::JsonDeserialize);
         }
         return Ok(TransactDispatchKind::Legacy);
     };
     let transact_type: BroadcasterTransactRequestType =
-        serde_json::from_value(value.clone()).map_err(|_| TransactError::JsonDeserialize)?;
+        serde_json::from_value(value.clone()).map_err(|_| Transact7702Error::JsonDeserialize)?;
     match transact_type {
         BroadcasterTransactRequestType::Common => {
             if has_strict_only_marker {
-                Err(TransactError::JsonDeserialize)
+                Err(Transact7702Error::JsonDeserialize)
             } else {
                 Ok(TransactDispatchKind::Legacy)
             }
@@ -1591,10 +1653,10 @@ mod tests {
         BroadcasterTransactRequestType, DEFAULT_TXID_VERSION, DecryptedTransact,
         DecryptedTransactRequest, EncryptedTransactRequest, FeeNoteAssuranceContext,
         ParsedTransactCalldata, ParsedTransactEnvelope, ParsedTransactTransaction, PreTxPoi,
-        SnarkJsProof, TransactError, compute_railgun_txid, decrypt,
+        SnarkJsProof, Transact7702Error, TransactError, compute_railgun_txid, decrypt,
         decrypt_authenticated_plaintext, dummy_txid_root, encrypt_params_with_seed,
-        parse_transact_calldata, parse_transact_envelope, railgun_txid_leaf_hash,
-        try_decrypt_transact_request, try_decrypt_transact_request_7702,
+        encrypt_params_with_seed_7702, parse_transact_calldata, parse_transact_envelope,
+        railgun_txid_leaf_hash, try_decrypt_transact_request, try_decrypt_transact_request_7702,
         try_decrypt_transact_request_dispatched,
     };
     use crate::contracts::railgun::{
@@ -2092,7 +2154,8 @@ mod tests {
         assert!(
             matches!(
                 error,
-                TransactError::CanonicalOperationMismatch | TransactError::StrictBroadcasterPolicy
+                Transact7702Error::CanonicalOperationMismatch
+                    | Transact7702Error::StrictBroadcasterPolicy
             ),
             "{label}: unexpected error {error:?}"
         );
@@ -2123,7 +2186,10 @@ mod tests {
         let error = params
             .validate_finalized_operation(prepared, finalized)
             .expect_err(label);
-        assert!(matches!(error, TransactError::CanonicalOperationMismatch));
+        assert!(matches!(
+            error,
+            Transact7702Error::CanonicalOperationMismatch
+        ));
 
         let rendered = format!("{error:?} {error}");
         for sentinel in [
@@ -2503,7 +2569,7 @@ mod tests {
                 viewing_key_data.master_public_key,
                 &[],
             ),
-            Err(TransactError::StrictBroadcasterPolicy)
+            Err(Transact7702Error::StrictBroadcasterPolicy)
         ));
 
         let broadcaster_viewing_private_seed = [0x79; 32];
@@ -2520,7 +2586,7 @@ mod tests {
                 viewing_key_data.master_public_key,
                 &[],
             ),
-            Err(TransactError::StrictBroadcasterPolicy)
+            Err(Transact7702Error::StrictBroadcasterPolicy)
         ));
     }
 
@@ -2853,7 +2919,7 @@ mod tests {
         let invalid = SignedAuthorization::new_unchecked(authorization, 2, r, s);
         assert!(matches!(
             BroadcasterRawParamsTransact7702Authorization::try_from(&invalid),
-            Err(TransactError::InvalidAuthorizationParity)
+            Err(Transact7702Error::InvalidAuthorizationParity)
         ));
     }
 
@@ -3247,7 +3313,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransactError::CanonicalOperationMismatch)
+            Err(Transact7702Error::CanonicalOperationMismatch)
         ));
     }
 
@@ -3306,7 +3372,7 @@ mod tests {
                             encrypted.pubkey,
                             &encrypted.encrypted_data,
                         ),
-                        Err(TransactError::JsonDeserialize)
+                        Err(Transact7702Error::JsonDeserialize)
                     ));
                 }
 
@@ -3386,7 +3452,10 @@ mod tests {
             &malformed_data,
         )
         .expect_err("malformed IV/tag length should fail");
-        assert!(matches!(&error, TransactError::InvalidIvTag { len: 31 }));
+        assert!(matches!(
+            &error,
+            Transact7702Error::Transact(TransactError::InvalidIvTag { len: 31 })
+        ));
         assert!(!format!("{error:?} {error}").contains("SENTINEL-FEE-ID"));
 
         for label in [
@@ -3482,7 +3551,7 @@ mod tests {
             )
             .expect_err(label);
             assert!(
-                matches!(&error, TransactError::JsonDeserialize),
+                matches!(&error, Transact7702Error::JsonDeserialize),
                 "{label}: {error:?}"
             );
 
@@ -3532,7 +3601,7 @@ mod tests {
                 encrypted.pubkey,
                 &encrypted.encrypted_data,
             ),
-            Err(TransactError::JsonDeserialize)
+            Err(Transact7702Error::JsonDeserialize)
         ));
     }
 
@@ -3904,13 +3973,31 @@ mod tests {
         let error = decrypt::<BroadcasterRawParamsTransact>(&key, &iv_tag, plaintext)
             .expect_err("malformed JSON should fail");
 
-        assert!(matches!(&error, TransactError::JsonDeserialize));
+        assert!(matches!(&error, TransactError::Json(_)));
         let debug = format!("{error:?}");
         let display = error.to_string();
-        assert_eq!(debug, "JsonDeserialize");
-        assert_eq!(display, "transact JSON deserialization failed");
-        assert!(!debug.contains("MALFORMED-PLAINTEXT"));
-        assert!(!display.contains("MALFORMED-PLAINTEXT"));
+        assert!(debug.contains("transact JSON deserialization failed"));
+        assert_eq!(
+            display,
+            "json parse error: transact JSON deserialization failed"
+        );
+        let mut source_chain = String::new();
+        let mut source = std::error::Error::source(&error);
+        while let Some(current) = source {
+            source_chain.push_str(&current.to_string());
+            source = current.source();
+        }
+        assert!(source_chain.contains("transact JSON deserialization failed"));
+        for rendered in [&debug, &display, &source_chain] {
+            assert!(
+                !rendered.contains("MALFORMED-PLAINTEXT"),
+                "leaked malformed JSON: {rendered}"
+            );
+            assert!(
+                !rendered.contains("sentinel"),
+                "leaked custom JSON detail: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -3921,6 +4008,64 @@ mod tests {
 
         assert!(matches!(&error, TransactError::Json(_)));
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn legacy_and_strict_json_serialization_errors_keep_their_boundaries() {
+        struct SerializationSentinel;
+
+        impl serde::Serialize for SerializationSentinel {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("SERIALIZATION-SENTINEL"))
+            }
+        }
+
+        let broadcaster_viewing_private_seed = [0x79; 32];
+        let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
+            .verifying_key()
+            .to_bytes();
+        let serialization_sentinel = SerializationSentinel;
+
+        let Err(legacy) = encrypt_params_with_seed(
+            broadcaster_viewing_pubkey,
+            &serialization_sentinel,
+            [0x7a; 32],
+        ) else {
+            panic!("sentinel serializer must fail legacy serialization");
+        };
+        assert!(matches!(legacy, TransactError::Json(_)));
+        let legacy_debug = format!("{legacy:?}");
+        let legacy_display = legacy.to_string();
+        let mut legacy_source_chain = String::new();
+        let mut source = std::error::Error::source(&legacy);
+        while let Some(current) = source {
+            legacy_source_chain.push_str(&current.to_string());
+            source = current.source();
+        }
+        for rendered in [&legacy_debug, &legacy_display, &legacy_source_chain] {
+            assert!(!rendered.contains("SERIALIZATION-SENTINEL"));
+            assert!(rendered.contains("transact JSON serialization failed"));
+        }
+        assert_eq!(
+            legacy_display,
+            "json parse error: transact JSON serialization failed"
+        );
+
+        let Err(strict) = encrypt_params_with_seed_7702(
+            broadcaster_viewing_pubkey,
+            &serialization_sentinel,
+            [0x7a; 32],
+        ) else {
+            panic!("sentinel serializer must fail strict serialization");
+        };
+        assert!(matches!(strict, Transact7702Error::JsonSerialize));
+        let strict_debug = format!("{strict:?}");
+        let strict_display = strict.to_string();
+        assert!(!strict_debug.contains("SERIALIZATION-SENTINEL"));
+        assert!(!strict_display.contains("SERIALIZATION-SENTINEL"));
     }
 
     #[test]
