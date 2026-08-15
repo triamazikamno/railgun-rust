@@ -17,7 +17,9 @@ use poi::cache::{
 use poi::poi::{
     BlockedShield, DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys,
 };
+use railgun_wallet::UtxoCommitmentKind;
 use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch};
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, warn};
 
@@ -31,15 +33,190 @@ use crate::poi_artifacts::{
 use crate::types::{
     LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheGraphProgress,
     PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-    PoiArtifactSourceConfig,
+    PoiArtifactSourceConfig, WalletObservation, WalletReadiness,
 };
 use crate::wallet::wallet_poi_status_client;
 
 const EVM_CHAIN_TYPE: u8 = 0;
-const POI_CACHE_MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
+const POI_CACHE_EVENT_ACTIVE_INTERVAL: Duration = Duration::from_secs(15);
+const POI_CACHE_EVENT_IDLE_INTERVAL: Duration = Duration::from_mins(5);
+const POI_CACHE_BLOCKED_ACTIVE_INTERVAL: Duration = Duration::from_mins(1);
+const POI_CACHE_BLOCKED_IDLE_INTERVAL: Duration = Duration::from_mins(30);
+const POI_CACHE_FAILURE_RETRY_INTERVAL: Duration = Duration::from_mins(1);
 const POI_ARTIFACT_RPC_FAILURE_THRESHOLD: u32 = 3;
 const POI_ARTIFACT_RPC_STALE_AFTER: Duration = Duration::from_mins(5);
 const POI_CACHE_COMMAND_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PoiCacheDemand {
+    events: bool,
+    blocked_shields: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoiCacheSyncScope {
+    events: bool,
+    blocked_shields: bool,
+}
+
+impl PoiCacheSyncScope {
+    const FULL: Self = Self {
+        events: true,
+        blocked_shields: true,
+    };
+
+    const EVENTS: Self = Self {
+        events: true,
+        blocked_shields: false,
+    };
+
+    const BLOCKED_SHIELDS: Self = Self {
+        events: false,
+        blocked_shields: true,
+    };
+
+    const fn union(self, other: Self) -> Self {
+        Self {
+            events: self.events || other.events,
+            blocked_shields: self.blocked_shields || other.blocked_shields,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PoiCacheMaintenanceSchedule {
+    demand_actor_id: Option<u64>,
+    demand: PoiCacheDemand,
+    event_deadline: TokioInstant,
+    blocked_shields_deadline: TokioInstant,
+    event_last_success: Option<TokioInstant>,
+    blocked_shields_last_success: Option<TokioInstant>,
+}
+
+impl PoiCacheMaintenanceSchedule {
+    fn new(now: TokioInstant) -> Self {
+        Self {
+            demand_actor_id: None,
+            demand: PoiCacheDemand::default(),
+            event_deadline: now,
+            blocked_shields_deadline: now,
+            event_last_success: None,
+            blocked_shields_last_success: None,
+        }
+    }
+
+    fn update_demand(&mut self, demand: PoiCacheDemand, now: TokioInstant) {
+        if !self.demand.events && demand.events {
+            self.event_deadline = now;
+        } else if self.demand.events && !demand.events {
+            self.event_deadline = self
+                .event_last_success
+                .map_or(now, |last| last + POI_CACHE_EVENT_IDLE_INTERVAL);
+        }
+        if !self.demand.blocked_shields && demand.blocked_shields {
+            self.blocked_shields_deadline = now;
+        } else if self.demand.blocked_shields && !demand.blocked_shields {
+            self.blocked_shields_deadline = self
+                .blocked_shields_last_success
+                .map_or(now, |last| last + POI_CACHE_BLOCKED_IDLE_INTERVAL);
+        }
+        self.demand = demand;
+    }
+
+    fn due_scope(&self, now: TokioInstant) -> Option<PoiCacheSyncScope> {
+        let events = now >= self.event_deadline;
+        let blocked_shields = now >= self.blocked_shields_deadline;
+        let scope = match (events, blocked_shields) {
+            (true, true) => PoiCacheSyncScope::FULL,
+            (true, false) => PoiCacheSyncScope::EVENTS,
+            (false, true) => PoiCacheSyncScope::BLOCKED_SHIELDS,
+            (false, false) => return None,
+        };
+        Some(scope)
+    }
+
+    fn next_deadline(&self) -> TokioInstant {
+        self.event_deadline.min(self.blocked_shields_deadline)
+    }
+
+    fn record_success(&mut self, scope: PoiCacheSyncScope, completed_at: TokioInstant) {
+        if scope.events {
+            self.event_last_success = Some(completed_at);
+            self.event_deadline = completed_at
+                + if self.demand.events {
+                    POI_CACHE_EVENT_ACTIVE_INTERVAL
+                } else {
+                    POI_CACHE_EVENT_IDLE_INTERVAL
+                };
+        }
+        if scope.blocked_shields {
+            self.blocked_shields_last_success = Some(completed_at);
+            self.blocked_shields_deadline = completed_at
+                + if self.demand.blocked_shields {
+                    POI_CACHE_BLOCKED_ACTIVE_INTERVAL
+                } else {
+                    POI_CACHE_BLOCKED_IDLE_INTERVAL
+                };
+        }
+    }
+
+    fn record_failure(&mut self, scope: PoiCacheSyncScope, now: TokioInstant) {
+        if scope.events {
+            self.event_deadline = now + POI_CACHE_FAILURE_RETRY_INTERVAL;
+        }
+        if scope.blocked_shields {
+            self.blocked_shields_deadline = now + POI_CACHE_FAILURE_RETRY_INTERVAL;
+        }
+    }
+}
+
+fn apply_poi_cache_demand_update(
+    schedule: &mut PoiCacheMaintenanceSchedule,
+    actor_id: u64,
+    demand: PoiCacheDemand,
+    now: TokioInstant,
+) -> bool {
+    if schedule
+        .demand_actor_id
+        .is_some_and(|current| actor_id < current)
+    {
+        return false;
+    }
+    schedule.demand_actor_id = Some(actor_id);
+    schedule.update_demand(demand, now);
+    true
+}
+
+fn effective_poi_cache_scope(
+    scope: PoiCacheSyncScope,
+    baseline: &BTreeMap<FixedBytes<32>, PoiCache>,
+    active_list_keys: &[FixedBytes<32>],
+) -> PoiCacheSyncScope {
+    if scope.events
+        && active_list_keys.iter().any(|list_key| {
+            baseline
+                .get(list_key)
+                .is_none_or(|cache| !cache.progress().blocked_shields_synced)
+        })
+    {
+        PoiCacheSyncScope::FULL
+    } else {
+        scope
+    }
+}
+
+fn replacement_poi_cache_scope(
+    requested: PoiCacheSyncScope,
+    active: Option<&ActivePoiCacheAttempt>,
+) -> PoiCacheSyncScope {
+    requested.union(active.map_or(
+        PoiCacheSyncScope {
+            events: false,
+            blocked_shields: false,
+        },
+        |attempt| attempt.scope,
+    ))
+}
 
 struct ChainPoiCacheCoordinator {
     db: Arc<DbStore>,
@@ -94,7 +271,12 @@ struct ChainPoiCacheHandle {
 }
 
 enum ChainPoiCacheCommand {
+    UpdateDemand {
+        actor_id: u64,
+        demand: PoiCacheDemand,
+    },
     Retry {
+        scope: PoiCacheSyncScope,
         admission: oneshot::Sender<Result<PoiCacheRetryHandle, PoiCacheServiceError>>,
     },
     QuiesceForPublicCacheReset {
@@ -273,6 +455,23 @@ impl PoiCacheService {
         &self,
         chain_id: u64,
     ) -> Result<PoiCacheRetryHandle, PoiCacheServiceError> {
+        self.retry_chain_with_scope(chain_id, PoiCacheSyncScope::FULL)
+            .await
+    }
+
+    pub(crate) async fn retry_chain_events(
+        &self,
+        chain_id: u64,
+    ) -> Result<PoiCacheRetryHandle, PoiCacheServiceError> {
+        self.retry_chain_with_scope(chain_id, PoiCacheSyncScope::EVENTS)
+            .await
+    }
+
+    async fn retry_chain_with_scope(
+        &self,
+        chain_id: u64,
+        scope: PoiCacheSyncScope,
+    ) -> Result<PoiCacheRetryHandle, PoiCacheServiceError> {
         self.ensure_chain_id(chain_id)?;
         match self.local_caches(chain_id).await {
             Ok(Some(_)) => {}
@@ -292,7 +491,7 @@ impl PoiCacheService {
         let (admission, admitted) = oneshot::channel();
         if handle
             .command_tx
-            .send(ChainPoiCacheCommand::Retry { admission })
+            .send(ChainPoiCacheCommand::Retry { scope, admission })
             .await
             .is_err()
         {
@@ -306,6 +505,36 @@ impl PoiCacheService {
             self.remove_chain_handle(&handle).await;
             Err(PoiCacheServiceError::CoordinatorStopped)
         }
+    }
+
+    pub(crate) async fn update_wallet_demand(
+        &self,
+        actor_id: u64,
+        observation: &crate::types::WalletObservation,
+    ) {
+        let demand = poi_cache_demand(observation, &self.active_list_keys);
+        let handle = self.coordinator.lock().await.as_ref().cloned();
+        let Some(handle) = handle else {
+            return;
+        };
+        let _ = handle
+            .command_tx
+            .send(ChainPoiCacheCommand::UpdateDemand { actor_id, demand })
+            .await;
+    }
+
+    pub(crate) async fn clear_wallet_demand(&self, actor_id: u64) {
+        let handle = self.coordinator.lock().await.as_ref().cloned();
+        let Some(handle) = handle else {
+            return;
+        };
+        let _ = handle
+            .command_tx
+            .send(ChainPoiCacheCommand::UpdateDemand {
+                actor_id,
+                demand: PoiCacheDemand::default(),
+            })
+            .await;
     }
 
     pub(crate) async fn local_caches(
@@ -649,6 +878,7 @@ impl Drop for PoiCacheService {
 struct ActivePoiCacheAttempt {
     id: PoiArtifactCacheAttemptId,
     generation: u64,
+    scope: PoiCacheSyncScope,
     cancel: CancellationToken,
     job: BoxFuture<'static, PreparedPoiCacheBatch>,
     retry_completion: Option<oneshot::Sender<Result<(), PoiCacheServiceError>>>,
@@ -792,6 +1022,7 @@ struct PreparedPoiCacheCandidate {
 struct PreparedPoiCacheBatch {
     candidates: Vec<PreparedPoiCacheCandidate>,
     source_outcomes: Vec<PoiListSourceOutcome>,
+    actual_scope: PoiCacheSyncScope,
     result: Result<(), String>,
 }
 
@@ -921,17 +1152,25 @@ async fn run_chain_poi_cache_coordinator(
     let mut active = None;
     let mut public_cache_reset = None;
     let mut compaction_lane = PoiCorpusCompactionLane::default();
-    let mut maintenance = tokio::time::interval_at(
-        tokio::time::Instant::now() + POI_CACHE_MAINTENANCE_INTERVAL,
-        POI_CACHE_MAINTENANCE_INTERVAL,
-    );
-    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut maintenance = PoiCacheMaintenanceSchedule::new(TokioInstant::now());
     info!(
         chain_id,
         list_count = task.active_list_keys.len(),
         "starting chain-owned POI cache coordinator"
     );
-    let _ = start_chain_poi_cache_attempt(&mut task, &mut active, generation, &health, None).await;
+    if start_chain_poi_cache_attempt(
+        &mut task,
+        &mut active,
+        generation,
+        &health,
+        PoiCacheSyncScope::FULL,
+        None,
+    )
+    .await
+    .is_err()
+    {
+        maintenance.record_failure(PoiCacheSyncScope::FULL, TokioInstant::now());
+    }
 
     loop {
         tokio::select! {
@@ -951,7 +1190,15 @@ async fn run_chain_poi_cache_coordinator(
                     break;
                 };
                 match command {
-                    ChainPoiCacheCommand::Retry { admission } => {
+                    ChainPoiCacheCommand::UpdateDemand { actor_id, demand } => {
+                        let _ = apply_poi_cache_demand_update(
+                            &mut maintenance,
+                            actor_id,
+                            demand,
+                            TokioInstant::now(),
+                        );
+                    }
+                    ChainPoiCacheCommand::Retry { scope, admission } => {
                         clear_released_public_cache_reset(&mut public_cache_reset);
                         if public_cache_reset.is_some()
                             || task.runtime.public_cache_reset_gate.try_read().is_err()
@@ -959,6 +1206,7 @@ async fn run_chain_poi_cache_coordinator(
                             let _ = admission.send(Err(PoiCacheServiceError::CorpusResetInProgress));
                             continue;
                         }
+                        let replacement_scope = replacement_poi_cache_scope(scope, active.as_ref());
                         cancel_active_attempt(&mut active, |attempt_id| {
                             PoiCacheServiceError::AttemptSuperseded { attempt_id }
                         });
@@ -968,6 +1216,7 @@ async fn run_chain_poi_cache_coordinator(
                             &mut active,
                             generation,
                             &health,
+                            replacement_scope,
                             Some(completion),
                         )
                         .await {
@@ -993,6 +1242,10 @@ async fn run_chain_poi_cache_coordinator(
                                 }
                             }
                             Err(error) => {
+                                maintenance.record_failure(
+                                    replacement_scope,
+                                    TokioInstant::now(),
+                                );
                                 let _ = admission.send(Err(error));
                             }
                         }
@@ -1015,6 +1268,8 @@ async fn run_chain_poi_cache_coordinator(
                 let finished = active.take().expect("completed POI cache attempt is active");
                 let attempt_id = finished.id;
                 let attempt_generation = finished.generation;
+                let attempt_scope = finished.scope;
+                let actual_scope = completion.actual_scope;
                 let source_outcomes = completion.source_outcomes.clone();
                 let finished_attempt = finish_chain_poi_cache_attempt(
                     &task,
@@ -1032,6 +1287,11 @@ async fn run_chain_poi_cache_coordinator(
                     Err(PoiCacheServiceError::Shutdown { .. })
                 ) {
                     record_list_source_outcomes(&mut health, &source_outcomes);
+                }
+                if attempt_result.is_ok() {
+                    maintenance.record_success(actual_scope, TokioInstant::now());
+                } else {
+                    maintenance.record_failure(attempt_scope, TokioInstant::now());
                 }
                 let retry_completion = drop_completed_attempt(finished);
                 if let Some(response) = retry_completion {
@@ -1055,28 +1315,40 @@ async fn run_chain_poi_cache_coordinator(
                 finish_background_poi_corpus_compaction(&task, generation, completion).await;
                 start_next_poi_corpus_compaction(&task, &mut compaction_lane, generation);
             }
-            _ = maintenance.tick(), if active.is_none()
+            () = tokio::time::sleep_until(maintenance.next_deadline()), if active.is_none()
                 && public_cache_reset.is_none() => {
-                let _ = start_chain_poi_cache_attempt(
-                    &mut task,
-                    &mut active,
-                    generation,
-                    &health,
-                    None,
-                )
-                .await;
+                let now = TokioInstant::now();
+                if let Some(scope) = maintenance.due_scope(now)
+                    && start_chain_poi_cache_attempt(
+                        &mut task,
+                        &mut active,
+                        generation,
+                        &health,
+                        scope,
+                        None,
+                    )
+                    .await
+                    .is_err()
+                {
+                    maintenance.record_failure(scope, now);
+                }
             }
             () = wait_for_public_cache_reset_release(&mut public_cache_reset),
                 if active.is_none() => {
                 public_cache_reset = None;
-                let _ = start_chain_poi_cache_attempt(
+                if start_chain_poi_cache_attempt(
                     &mut task,
                     &mut active,
                     generation,
                     &health,
+                    PoiCacheSyncScope::FULL,
                     None,
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    maintenance.record_failure(PoiCacheSyncScope::FULL, TokioInstant::now());
+                }
             }
         }
     }
@@ -1156,6 +1428,7 @@ fn cancel_active_attempt(
     let ActivePoiCacheAttempt {
         id,
         generation: _,
+        scope: _,
         cancel,
         job,
         retry_completion,
@@ -1190,6 +1463,7 @@ async fn start_chain_poi_cache_attempt(
     active: &mut Option<ActivePoiCacheAttempt>,
     generation: u64,
     health: &BTreeMap<FixedBytes<32>, PoiSourceHealth>,
+    scope: PoiCacheSyncScope,
     retry_completion: Option<oneshot::Sender<Result<(), PoiCacheServiceError>>>,
 ) -> Result<PoiArtifactCacheAttemptId, PoiCacheServiceError> {
     let Ok(_public_cache_reset_admission) = task.runtime.public_cache_reset_gate.try_read() else {
@@ -1197,6 +1471,7 @@ async fn start_chain_poi_cache_attempt(
     };
     let attempt_id = task.runtime.next_attempt_id();
     let baseline = task.local_caches.read().await.clone();
+    let scope = effective_poi_cache_scope(scope, &baseline, &task.active_list_keys);
     let ready = cache_map_available_for_lists(task.chain_id, &baseline, &task.active_list_keys);
     let completed = task
         .active_list_keys
@@ -1212,10 +1487,18 @@ async fn start_chain_poi_cache_attempt(
                 || PoiSourceHealth::new(None).attempt_plan(corpus_ready),
                 |health| health.attempt_plan(corpus_ready),
             );
+            let plan = if scope.events {
+                plan
+            } else {
+                PoiListAttemptPlan {
+                    use_artifact: false,
+                    artifact_after_rpc_failure: false,
+                }
+            };
             (*list_key, plan)
         })
         .collect::<BTreeMap<_, _>>();
-    let use_artifact = source_plans.values().any(|plan| plan.use_artifact);
+    let use_artifact = scope.events && source_plans.values().any(|plan| plan.use_artifact);
     let baseline_list_progress =
         cache_map_list_progress(task.chain_id, &baseline, &task.active_list_keys);
     let (current_event_index, target_event_index) =
@@ -1259,6 +1542,7 @@ async fn start_chain_poi_cache_attempt(
         generation,
         ready,
         source_plans,
+        scope,
         event_tx: task.job_tx.clone(),
         cancel: attempt_cancel.clone(),
         poi_artifact_persistence: task.poi_artifact_persistence.clone(),
@@ -1273,6 +1557,7 @@ async fn start_chain_poi_cache_attempt(
     *active = Some(ActivePoiCacheAttempt {
         id: attempt_id,
         generation,
+        scope,
         cancel: attempt_cancel,
         job,
         retry_completion,
@@ -1318,6 +1603,7 @@ struct PoiCacheCandidateJob {
     generation: u64,
     ready: bool,
     source_plans: BTreeMap<FixedBytes<32>, PoiListAttemptPlan>,
+    scope: PoiCacheSyncScope,
     event_tx: mpsc::UnboundedSender<ChainPoiCacheJobEvent>,
     cancel: CancellationToken,
     poi_artifact_persistence: PoiArtifactPersistenceHandle,
@@ -1332,6 +1618,7 @@ async fn produce_chain_poi_cache_candidates(
     let mut source_outcomes = Vec::with_capacity(job.active_list_keys.len());
     let mut errors = Vec::new();
     let mut observed_manifest = None;
+    let mut actual_scope = job.scope;
     for (list_index, list_key) in job.active_list_keys.iter().copied().enumerate() {
         let plan = job
             .source_plans
@@ -1384,7 +1671,7 @@ async fn produce_chain_poi_cache_candidates(
             };
         let range_start_index = baseline_cache.progress().next_event_index;
 
-        if plan.use_artifact {
+        if job.scope.events && plan.use_artifact {
             match Box::pin(prepare_artifact_candidate(
                 &job,
                 &client,
@@ -1398,6 +1685,7 @@ async fn produce_chain_poi_cache_candidates(
             .await
             {
                 Ok(candidate) => {
+                    actual_scope = actual_scope.union(PoiCacheSyncScope::FULL);
                     if let Some(candidate) = candidate {
                         candidates.push(candidate);
                     }
@@ -1416,7 +1704,7 @@ async fn produce_chain_poi_cache_candidates(
                 }
                 Err(artifact_error) => {
                     warn!(chain_id = job.chain_id, list_key = %hex::encode(list_key), %artifact_error, "artifact candidate failed; trying public range fallback");
-                    match public_rpc_candidate_cache(&rpc_client, baseline_cache).await {
+                    match public_rpc_candidate_cache(&rpc_client, baseline_cache, job.scope).await {
                         Ok(result) => {
                             source_outcomes.push(PoiListSourceOutcome {
                                 list_key,
@@ -1465,7 +1753,7 @@ async fn produce_chain_poi_cache_candidates(
                 baseline_cache.progress().next_event_index.checked_sub(1),
                 None,
             );
-            match public_rpc_candidate_cache(&rpc_client, baseline_cache).await {
+            match public_rpc_candidate_cache(&rpc_client, baseline_cache, job.scope).await {
                 Ok(result) => {
                     source_outcomes.push(PoiListSourceOutcome {
                         list_key,
@@ -1505,6 +1793,7 @@ async fn produce_chain_poi_cache_candidates(
                     .await
                     {
                         Ok(candidate) => {
+                            actual_scope = actual_scope.union(PoiCacheSyncScope::FULL);
                             if let Some(candidate) = candidate {
                                 candidates.push(candidate);
                             }
@@ -1556,6 +1845,7 @@ async fn produce_chain_poi_cache_candidates(
     PreparedPoiCacheBatch {
         candidates,
         source_outcomes,
+        actual_scope,
         result,
     }
 }
@@ -1680,6 +1970,7 @@ async fn finish_chain_poi_cache_attempt(
         candidates,
         source_outcomes,
         result: network_result,
+        ..
     } = batch;
     let mut commit_result = validate_artifact_manifest_sequences(
         candidates
@@ -2197,6 +2488,42 @@ fn record_list_source_outcomes(
     }
 }
 
+fn poi_cache_demand(
+    observation: &WalletObservation,
+    active_list_keys: &[FixedBytes<32>],
+) -> PoiCacheDemand {
+    let (WalletReadiness::Syncing | WalletReadiness::Ready) = observation.readiness() else {
+        return PoiCacheDemand::default();
+    };
+    let Some(snapshot) = observation.view().current_snapshot() else {
+        return PoiCacheDemand::default();
+    };
+    let mut demand = PoiCacheDemand::default();
+    for wallet_utxo in snapshot
+        .utxos
+        .iter()
+        .chain(snapshot.pending_overlay.new_utxos.iter())
+        .filter(|wallet_utxo| !wallet_utxo.is_spent())
+    {
+        let unresolved = active_list_keys.iter().any(|list_key| {
+            wallet_utxo
+                .utxo
+                .poi
+                .statuses
+                .get(list_key)
+                .is_none_or(|status| status.is_recoverable())
+        });
+        if unresolved {
+            demand.events = true;
+            demand.blocked_shields |=
+                wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Shield;
+        }
+    }
+    let workflow = observation.ppoi_workflow_status();
+    demand.events |= workflow.awaiting_validation > 0 || workflow.awaiting_poi_data > 0;
+    demand
+}
+
 fn cache_map_available_for_list(
     chain_id: u64,
     caches: &BTreeMap<FixedBytes<32>, PoiCache>,
@@ -2401,22 +2728,54 @@ async fn chain_poi_cache_list_progress(
 async fn public_rpc_candidate_cache(
     client: &PoiRpcClient,
     cache: PoiCache,
+    scope: PoiCacheSyncScope,
 ) -> Result<PoiRpcSyncResult, PoiCacheError> {
-    let (mut cache, result) = cache
-        .sync_bounded_with_journal(
-            client,
-            POI_EVENTS_PAGE_SIZE,
-            POI_MERKLETREE_LEAVES_PAGE_SIZE,
-            crate::poi_limits::POI_RPC_EVENT_PAGE_LIMIT,
-        )
-        .await?;
+    let (mut cache, result) = match scope {
+        PoiCacheSyncScope {
+            events: true,
+            blocked_shields: true,
+        } => {
+            cache
+                .sync_bounded_with_journal(
+                    client,
+                    POI_EVENTS_PAGE_SIZE,
+                    POI_MERKLETREE_LEAVES_PAGE_SIZE,
+                    crate::poi_limits::POI_RPC_EVENT_PAGE_LIMIT,
+                )
+                .await?
+        }
+        PoiCacheSyncScope {
+            events: true,
+            blocked_shields: false,
+        } => {
+            cache
+                .sync_events_bounded_with_journal(
+                    client,
+                    POI_EVENTS_PAGE_SIZE,
+                    POI_MERKLETREE_LEAVES_PAGE_SIZE,
+                    crate::poi_limits::POI_RPC_EVENT_PAGE_LIMIT,
+                )
+                .await?
+        }
+        PoiCacheSyncScope {
+            events: false,
+            blocked_shields: true,
+        } => cache.sync_blocked_shields_with_journal(client).await?,
+        PoiCacheSyncScope {
+            events: false,
+            blocked_shields: false,
+        } => unreachable!("empty POI cache synchronization scope"),
+    };
     if cache.progress().next_event_index == 0 {
         return Ok(PoiRpcSyncResult {
             outcome: result.outcome,
             candidate: None,
         });
     }
-    if !cache.validate_roots(client).await? {
+    if cache.progress().next_event_index > 0
+        && cache.validated_roots().is_none()
+        && !cache.validate_roots(client).await?
+    {
         return Err(PoiCacheError::InvalidRoots);
     }
     let candidate = result.outcome.changed.then_some(PoiRpcCandidate {
@@ -2460,19 +2819,23 @@ impl PoiCacheService {
 mod tests {
     use super::{
         ActivePoiCacheAttempt, ChainPoiCacheCommand, ChainPoiCacheCoordinator, EVM_CHAIN_TYPE,
-        PersistedPoiArtifactCache, PoiCacheCandidateJob, PoiCacheService, PoiCacheServiceError,
-        PoiCacheServiceRuntime, PoiCorpusCompactionLane, PoiCorpusCompactionRequest,
-        PoiListSourceOutcome, PoiRpcAttemptOutcome, PoiSourceHealth, PreparedPoiCacheBatch,
-        PreparedPoiCacheCandidate, PreparedPoiCachePersistence, PreparedPublicRpcPersistence,
-        StagedPoiCacheCandidate, apply_staged_poi_cache_batch, cancel_active_attempt,
-        cancel_poi_corpus_compaction_lane, chain_poi_cache_list_progress, drop_completed_attempt,
+        POI_CACHE_BLOCKED_ACTIVE_INTERVAL, POI_CACHE_BLOCKED_IDLE_INTERVAL,
+        POI_CACHE_EVENT_ACTIVE_INTERVAL, POI_CACHE_EVENT_IDLE_INTERVAL,
+        POI_CACHE_FAILURE_RETRY_INTERVAL, PersistedPoiArtifactCache, PoiCacheCandidateJob,
+        PoiCacheDemand, PoiCacheMaintenanceSchedule, PoiCacheService, PoiCacheServiceError,
+        PoiCacheServiceRuntime, PoiCacheSyncScope, PoiCorpusCompactionLane,
+        PoiCorpusCompactionRequest, PoiListSourceOutcome, PoiRpcAttemptOutcome, PoiSourceHealth,
+        PreparedPoiCacheBatch, PreparedPoiCacheCandidate, PreparedPoiCachePersistence,
+        PreparedPublicRpcPersistence, StagedPoiCacheCandidate, apply_poi_cache_demand_update,
+        apply_staged_poi_cache_batch, cancel_active_attempt, cancel_poi_corpus_compaction_lane,
+        chain_poi_cache_list_progress, drop_completed_attempt, effective_poi_cache_scope,
         enqueue_poi_corpus_compactions, finish_chain_poi_cache_attempt,
-        install_cache_if_not_behind, new_poi_artifact_cache_progress, poi_cache_error_diagnostic,
-        produce_chain_poi_cache_candidates, public_rpc_candidate_cache,
+        install_cache_if_not_behind, new_poi_artifact_cache_progress, poi_cache_demand,
+        poi_cache_error_diagnostic, produce_chain_poi_cache_candidates, public_rpc_candidate_cache,
         publish_active_attempt_progress,
         publish_chain_poi_cache_ready_and_acknowledge_initialization, record_list_source_outcomes,
-        run_background_poi_corpus_compaction, single_list_event_index, source_health_for_lists,
-        stage_poi_cache_candidate, start_next_poi_corpus_compaction,
+        replacement_poi_cache_scope, run_background_poi_corpus_compaction, single_list_event_index,
+        source_health_for_lists, stage_poi_cache_candidate, start_next_poi_corpus_compaction,
         validate_artifact_manifest_sequences, wait_for_active_poi_corpus_compaction,
     };
     use crate::chain::PoiArtifactPersistenceHandle;
@@ -2485,7 +2848,9 @@ mod tests {
     use crate::types::{
         LocalPoiCaches, PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind,
         PoiArtifactCacheGraphProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-        PoiArtifactManifestSource, PoiArtifactSourceConfig,
+        PoiArtifactManifestSource, PoiArtifactSourceConfig, WalletCurrentSnapshot,
+        WalletObservation, WalletPendingOverlay, WalletPpoiWorkflowStatus, WalletReadiness,
+        WalletViewState,
     };
     use crate::wallet::test_support::{LivePoiTailError, live_tail_candidate_cache};
     use alloy::primitives::{FixedBytes, U256};
@@ -2504,7 +2869,7 @@ mod tests {
         BlockedShield, PoiEventType, PoiRpcClient, PoiSyncedListEvent, SignedPoiEvent,
         default_active_poi_list_key,
     };
-    use railgun_wallet::PoiStatus;
+    use railgun_wallet::{Note, PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
@@ -2515,6 +2880,7 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::watch;
+    use tokio::time::Instant as TokioInstant;
     use tokio_util::sync::CancellationToken;
     use url::Url;
 
@@ -2536,6 +2902,228 @@ mod tests {
             validate_artifact_manifest_sequences([9, 10].into_iter()),
             Err(PoiCacheServiceError::Refresh { .. })
         ));
+    }
+
+    #[test]
+    fn maintenance_schedule_uses_demand_intervals_and_last_success() {
+        let now = TokioInstant::now();
+        let mut schedule = PoiCacheMaintenanceSchedule::new(now);
+        assert_eq!(schedule.due_scope(now), Some(PoiCacheSyncScope::FULL));
+        assert_eq!(
+            PoiCacheSyncScope::EVENTS.union(PoiCacheSyncScope::BLOCKED_SHIELDS),
+            PoiCacheSyncScope::FULL
+        );
+
+        schedule.record_success(PoiCacheSyncScope::FULL, now);
+        schedule.update_demand(
+            PoiCacheDemand {
+                events: true,
+                blocked_shields: true,
+            },
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            schedule.due_scope(now + Duration::from_secs(1)),
+            Some(PoiCacheSyncScope::FULL)
+        );
+
+        let active_success = now + Duration::from_secs(2);
+        schedule.record_success(PoiCacheSyncScope::FULL, active_success);
+        assert_eq!(
+            schedule.event_deadline,
+            active_success + POI_CACHE_EVENT_ACTIVE_INTERVAL
+        );
+        assert_eq!(
+            schedule.blocked_shields_deadline,
+            active_success + POI_CACHE_BLOCKED_ACTIVE_INTERVAL
+        );
+
+        schedule.update_demand(PoiCacheDemand::default(), now + Duration::from_secs(3));
+        assert_eq!(
+            schedule.event_deadline,
+            active_success + POI_CACHE_EVENT_IDLE_INTERVAL
+        );
+        assert_eq!(
+            schedule.blocked_shields_deadline,
+            active_success + POI_CACHE_BLOCKED_IDLE_INTERVAL
+        );
+
+        let failed_at = active_success + Duration::from_secs(4);
+        schedule.record_failure(PoiCacheSyncScope::BLOCKED_SHIELDS, failed_at);
+        assert_eq!(
+            schedule.blocked_shields_deadline,
+            failed_at + POI_CACHE_FAILURE_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn demand_activation_is_immediate_and_identity_fenced() {
+        let now = TokioInstant::now();
+        let mut schedule = PoiCacheMaintenanceSchedule::new(now);
+        schedule.record_success(PoiCacheSyncScope::FULL, now);
+        assert!(apply_poi_cache_demand_update(
+            &mut schedule,
+            2,
+            PoiCacheDemand {
+                events: true,
+                blocked_shields: false,
+            },
+            now + Duration::from_secs(1),
+        ));
+        assert_eq!(
+            schedule.due_scope(now + Duration::from_secs(1)),
+            Some(PoiCacheSyncScope::EVENTS)
+        );
+        assert!(!apply_poi_cache_demand_update(
+            &mut schedule,
+            1,
+            PoiCacheDemand::default(),
+            now + Duration::from_secs(2),
+        ));
+        assert!(schedule.demand.events);
+    }
+
+    #[test]
+    fn event_scope_requires_initialized_blocked_shield_snapshots() {
+        let list_key = FixedBytes::from([0x12; 32]);
+        let mut initialized = cache_with_events(
+            PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key),
+            &[snapshot_event(0, FixedBytes::from([0x34; 32]))],
+        );
+        initialized
+            .apply_blocked_shields(&[])
+            .expect("mark blocked snapshot initialized");
+
+        assert_eq!(
+            effective_poi_cache_scope(
+                PoiCacheSyncScope::EVENTS,
+                &BTreeMap::from([(list_key, initialized)]),
+                &[list_key],
+            ),
+            PoiCacheSyncScope::EVENTS
+        );
+
+        let missing = cache_with_events(
+            PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key),
+            &[snapshot_event(0, FixedBytes::from([0x34; 32]))],
+        );
+        assert_eq!(
+            effective_poi_cache_scope(
+                PoiCacheSyncScope::EVENTS,
+                &BTreeMap::from([(list_key, missing)]),
+                &[list_key],
+            ),
+            PoiCacheSyncScope::FULL
+        );
+        assert_eq!(
+            effective_poi_cache_scope(PoiCacheSyncScope::EVENTS, &BTreeMap::new(), &[list_key],),
+            PoiCacheSyncScope::FULL
+        );
+        assert_eq!(
+            effective_poi_cache_scope(
+                PoiCacheSyncScope::BLOCKED_SHIELDS,
+                &BTreeMap::new(),
+                &[list_key],
+            ),
+            PoiCacheSyncScope::BLOCKED_SHIELDS
+        );
+    }
+
+    #[test]
+    fn event_retry_replaces_active_full_scope_without_dropping_blocked_work() {
+        let active = ActivePoiCacheAttempt {
+            id: attempt_id(1),
+            generation: 0,
+            scope: PoiCacheSyncScope::FULL,
+            cancel: CancellationToken::new(),
+            job: Box::pin(std::future::pending()),
+            retry_completion: None,
+        };
+
+        assert_eq!(
+            replacement_poi_cache_scope(PoiCacheSyncScope::EVENTS, Some(&active)),
+            PoiCacheSyncScope::FULL
+        );
+        assert_eq!(
+            replacement_poi_cache_scope(PoiCacheSyncScope::EVENTS, None),
+            PoiCacheSyncScope::EVENTS
+        );
+    }
+
+    #[test]
+    fn demand_derivation_uses_unspent_current_and_pending_utxos() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let mut transact = demand_utxo(1, UtxoCommitmentKind::Transact);
+        transact
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::Missing);
+        let mut shield = demand_utxo(2, UtxoCommitmentKind::Shield);
+        shield
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::Unknown);
+        let mut spent = demand_utxo(3, UtxoCommitmentKind::Shield);
+        spent.spent = Some(UtxoSource {
+            tx_hash: FixedBytes::from([0x33; 32]),
+            block_number: 3,
+            block_timestamp: 3,
+        });
+        let pending = demand_utxo(4, UtxoCommitmentKind::Transact);
+
+        let demand = poi_cache_demand(
+            &demand_observation(
+                vec![transact, shield, spent],
+                WalletPendingOverlay {
+                    new_utxos: vec![pending],
+                    ..WalletPendingOverlay::default()
+                },
+                WalletPpoiWorkflowStatus::default(),
+            ),
+            &[list_key],
+        );
+        assert_eq!(
+            demand,
+            PoiCacheDemand {
+                events: true,
+                blocked_shields: true,
+            }
+        );
+
+        let workflow = poi_cache_demand(
+            &demand_observation(
+                Vec::new(),
+                WalletPendingOverlay::default(),
+                WalletPpoiWorkflowStatus {
+                    awaiting_poi_data: 1,
+                    awaiting_validation: 1,
+                    ..WalletPpoiWorkflowStatus::default()
+                },
+            ),
+            &[list_key],
+        );
+        assert_eq!(
+            workflow,
+            PoiCacheDemand {
+                events: true,
+                blocked_shields: false,
+            }
+        );
+
+        let reset = WalletObservation::new(
+            WalletViewState::ResetPending {
+                intent_id: 1,
+                from_block: 2,
+                reset_generation: 3,
+            },
+            WalletReadiness::Syncing,
+        );
+        assert_eq!(
+            poi_cache_demand(&reset, &[list_key]),
+            PoiCacheDemand::default()
+        );
     }
 
     #[test]
@@ -2644,6 +3232,7 @@ mod tests {
         let result = public_rpc_candidate_cache(
             &PoiRpcClient::new(mock.url.clone()),
             PoiCache::new(identity.clone()),
+            PoiCacheSyncScope::FULL,
         )
         .await
         .expect("empty public RPC synchronization succeeds");
@@ -2700,6 +3289,7 @@ mod tests {
                     }),
                     artifact_succeeded: false,
                 }],
+                actual_scope: PoiCacheSyncScope::FULL,
                 result: Ok(()),
             },
         )
@@ -2733,6 +3323,84 @@ mod tests {
         drop(coordinator);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn public_rpc_candidate_reuses_validated_roots_but_revalidates_pending_roots() {
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let unchanged = spawn_poi_rpc_sequence(vec![serde_json::json!([])]);
+        let unchanged_result = public_rpc_candidate_cache(
+            &PoiRpcClient::new(unchanged.url.clone()),
+            cache_with_events(
+                identity.clone(),
+                &[snapshot_event(0, FixedBytes::from([0x55; 32]))],
+            ),
+            PoiCacheSyncScope::EVENTS,
+        )
+        .await
+        .expect("unchanged validated roots");
+        assert!(unchanged_result.candidate.is_none());
+        assert_eq!(
+            unchanged
+                .requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("event request")["method"],
+            "ppoi_poi_events"
+        );
+        assert!(unchanged.requests.try_recv().is_err());
+
+        let mut pending =
+            cache_with_events(identity, &[snapshot_event(0, FixedBytes::from([0x55; 32]))]);
+        pending
+            .apply_verified_artifact_events(&[snapshot_event(1, FixedBytes::from([0x66; 32]))])
+            .expect("mutate event corpus");
+        let retry = spawn_poi_rpc_sequence(vec![serde_json::json!([]), serde_json::json!(true)]);
+        public_rpc_candidate_cache(
+            &PoiRpcClient::new(retry.url.clone()),
+            pending,
+            PoiCacheSyncScope::EVENTS,
+        )
+        .await
+        .expect("pending roots revalidated");
+        let methods = [
+            retry
+                .requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("pending event request"),
+            retry
+                .requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("root validation request"),
+        ];
+        assert_eq!(methods[0]["method"], "ppoi_poi_events");
+        assert_eq!(methods[1]["method"], "ppoi_validate_poi_merkleroots");
+    }
+
+    #[tokio::test]
+    async fn blocked_only_candidate_keeps_empty_event_delta_for_persistence() {
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let mock = spawn_poi_rpc_sequence(vec![serde_json::json!([])]);
+        let result = public_rpc_candidate_cache(
+            &PoiRpcClient::new(mock.url.clone()),
+            cache_with_events(identity, &[snapshot_event(0, FixedBytes::from([0x77; 32]))]),
+            PoiCacheSyncScope::BLOCKED_SHIELDS,
+        )
+        .await
+        .expect("blocked-only candidate");
+
+        let candidate = result
+            .candidate
+            .expect("changed blocked snapshot candidate");
+        assert!(candidate.delta.is_empty());
+        assert_eq!(candidate.blocked_shields, Some(Vec::new()));
+        assert_eq!(
+            mock.requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("blocked-shields request")["method"],
+            "ppoi_blocked_shields"
+        );
     }
 
     #[tokio::test]
@@ -2776,6 +3444,7 @@ mod tests {
                 list_key,
                 PoiSourceHealth::new(None).attempt_plan(true),
             )]),
+            scope: PoiCacheSyncScope::FULL,
             event_tx,
             cancel: CancellationToken::new(),
             poi_artifact_persistence: test_persistence(&db),
@@ -2955,6 +3624,7 @@ mod tests {
                     }),
                     artifact_succeeded: false,
                 }],
+                actual_scope: PoiCacheSyncScope::FULL,
                 result: Ok(()),
             },
         )
@@ -3065,6 +3735,37 @@ mod tests {
             .expect("apply cache events");
         cache.accept_current_roots();
         cache
+    }
+
+    fn demand_utxo(position: u64, kind: UtxoCommitmentKind) -> WalletUtxo {
+        WalletUtxo::new(Utxo::new(
+            Note {
+                token_hash: U256::from(1),
+                value: U256::from(10),
+                random: [0; 16],
+                npk: U256::from(2),
+            },
+            0,
+            position,
+            UtxoSource {
+                tx_hash: FixedBytes::from([position as u8; 32]),
+                block_number: position,
+                block_timestamp: position,
+            },
+            kind,
+        ))
+    }
+
+    fn demand_observation(
+        utxos: Vec<WalletUtxo>,
+        overlay: WalletPendingOverlay,
+        workflow: WalletPpoiWorkflowStatus,
+    ) -> WalletObservation {
+        WalletObservation::with_ppoi_workflow_status(
+            WalletViewState::Current(WalletCurrentSnapshot::new(0, 0, 0, utxos, overlay)),
+            WalletReadiness::Ready,
+            workflow,
+        )
     }
 
     fn persisted_public_rpc_journal_with_delta_count(
@@ -3722,9 +4423,11 @@ mod tests {
         let (initialized_tx, initialized_rx) = tokio::sync::watch::channel(true);
         let (stopped_tx, stopped_rx) = tokio::sync::watch::channel(false);
         let coordinator = tokio::spawn(async move {
-            let Some(ChainPoiCacheCommand::Retry { admission }) = command_rx.recv().await else {
+            let Some(ChainPoiCacheCommand::Retry { scope, admission }) = command_rx.recv().await
+            else {
                 panic!("expected retry command");
             };
+            assert_eq!(scope, PoiCacheSyncScope::FULL);
             drop(admission);
             drop(initialized_tx);
             drop(stopped_tx);
@@ -3740,6 +4443,62 @@ mod tests {
             Err(PoiCacheServiceError::CoordinatorStopped)
         ));
         assert!(service.coordinator.lock().await.is_none());
+        coordinator.await.expect("coordinator task");
+
+        service.shutdown().await;
+        drop(service);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn retry_scope_wrappers_route_full_and_event_commands() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let service = PoiCacheService::new(Arc::clone(&db), artifact_config(), None)
+            .expect("initialize POI cache service");
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(2);
+        let (initialized_tx, initialized_rx) = tokio::sync::watch::channel(true);
+        let (stopped_tx, stopped_rx) = tokio::sync::watch::channel(false);
+        let coordinator = tokio::spawn(async move {
+            for expected_scope in [PoiCacheSyncScope::FULL, PoiCacheSyncScope::EVENTS] {
+                let Some(ChainPoiCacheCommand::Retry { scope, admission }) =
+                    command_rx.recv().await
+                else {
+                    panic!("expected retry command");
+                };
+                assert_eq!(scope, expected_scope);
+                assert!(
+                    admission
+                        .send(Err(PoiCacheServiceError::Refresh {
+                            reason: "test scope routing".to_string(),
+                        }))
+                        .is_ok()
+                );
+            }
+            drop(initialized_tx);
+            drop(stopped_tx);
+        });
+        *service.coordinator.lock().await = Some(super::ChainPoiCacheHandle {
+            command_tx,
+            initialized_rx,
+            stopped_rx,
+        });
+
+        assert!(matches!(
+            service.retry_chain(1).await,
+            Err(PoiCacheServiceError::Refresh { .. })
+        ));
+        assert!(matches!(
+            service.retry_chain_events(1).await,
+            Err(PoiCacheServiceError::Refresh { .. })
+        ));
         coordinator.await.expect("coordinator task");
 
         service.shutdown().await;
@@ -4642,6 +5401,7 @@ mod tests {
                     None,
                 )],
                 source_outcomes: Vec::new(),
+                actual_scope: PoiCacheSyncScope::FULL,
                 result: Ok(()),
             },
         ));
@@ -4746,6 +5506,7 @@ mod tests {
                     None,
                 )],
                 source_outcomes: Vec::new(),
+                actual_scope: PoiCacheSyncScope::FULL,
                 result: Err("second list failed".to_string()),
             },
         )
@@ -4950,6 +5711,7 @@ mod tests {
         let mut active = Some(ActivePoiCacheAttempt {
             id: attempt_id(44),
             generation: 0,
+            scope: PoiCacheSyncScope::FULL,
             cancel: CancellationToken::new(),
             job: Box::pin(PendingCandidate {
                 dropped: Arc::clone(&dropped),
@@ -5020,6 +5782,7 @@ mod tests {
         let active = ActivePoiCacheAttempt {
             id: replacement_id,
             generation: 0,
+            scope: PoiCacheSyncScope::FULL,
             cancel: CancellationToken::new(),
             job: Box::pin(std::future::pending()),
             retry_completion: None,
@@ -5074,6 +5837,7 @@ mod tests {
                 std::task::Poll::Ready(PreparedPoiCacheBatch {
                     candidates: Vec::new(),
                     source_outcomes: Vec::new(),
+                    actual_scope: PoiCacheSyncScope::FULL,
                     result: Ok(()),
                 })
             }
@@ -5090,6 +5854,7 @@ mod tests {
         let response = drop_completed_attempt(ActivePoiCacheAttempt {
             id: attempt_id(45),
             generation: 0,
+            scope: PoiCacheSyncScope::FULL,
             cancel: CancellationToken::new(),
             job: Box::pin(ReadyCandidate {
                 dropped: Arc::clone(&dropped),
@@ -5166,6 +5931,14 @@ mod tests {
             })
             .expect("open temp db"),
         );
+        let list_key = default_active_poi_list_key();
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let mut initialized =
+            cache_with_events(identity, &[snapshot_event(0, FixedBytes::from([0x45; 32]))]);
+        initialized
+            .apply_blocked_shields(&[])
+            .expect("mark blocked snapshot initialized");
+        persist_cache(&db, &initialized);
         let stalled = spawn_stalled_http_server();
         let service = Arc::new(
             PoiCacheService::new(
@@ -5191,7 +5964,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("first retry reached network");
 
-        let second = service.retry_chain(1).await.expect("admit second retry");
+        let second = service
+            .retry_chain_events(1)
+            .await
+            .expect("admit event-only retry");
         let second_id = second.attempt_id();
         assert!(second_id > first_id);
         assert_eq!(service.progress_rx().borrow()[&1].attempt_id, second_id);

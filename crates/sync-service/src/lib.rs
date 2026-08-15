@@ -42,9 +42,9 @@ pub use types::{
     PublicScanSource, SyncProgressSender, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
     WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
     WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletObservation,
-    WalletPendingSpentMarkOutcome, WalletPpoiWorkflowStatus, WalletPrivateRequestError,
-    WalletReadiness, WalletReadinessError, WalletReadinessWaitError, WalletSchedulableProgress,
-    WalletViewState,
+    WalletPendingSpentMarkOutcome, WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus,
+    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
+    WalletSchedulableProgress, WalletViewState,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

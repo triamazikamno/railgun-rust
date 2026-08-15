@@ -52,11 +52,11 @@ use crate::types::{
     WalletBackfillResetResult, WalletBackfillStartResult, WalletCacheStore,
     WalletCheckpointMutation, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
     WalletIndexedCatchUpStatus, WalletLocalPoiCaches, WalletObservation,
-    WalletPendingSpentMarkOutcome, WalletPpoiWorkflowStatus, WalletPrivateCommit,
-    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
-    WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken, WalletScanApply,
-    WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncToken,
-    WalletUtxoMutation, WalletViewState,
+    WalletPendingSpentMarkOutcome, WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus,
+    WalletPrivateCommit, WalletPrivateRequestError, WalletReadiness, WalletReadinessError,
+    WalletReadinessWaitError, WalletResetReplayPlan, WalletResetRewindStatus, WalletResetToken,
+    WalletScanApply, WalletScanRows, WalletScanRowsPayload, WalletSyncActorStateCommit,
+    WalletSyncToken, WalletUtxoMutation, WalletViewState,
 };
 use crate::{
     SenderTransactionCandidate, SenderTransactionCandidateSpend,
@@ -123,7 +123,7 @@ use pending_output_poi::{
     process_pending_output_poi_observations_authorized,
     read_pending_output_poi_tentative_local_statuses, submit_observed_pending_output_pois_inner,
     submit_pending_output_poi_tentative_candidates,
-    verify_submitted_pending_output_pois_with_config_authorized, wallet_ppoi_workflow_status,
+    verify_submitted_pending_output_pois_with_config_authorized,
     wallet_ppoi_workflow_status_after_mutations,
 };
 pub(crate) use persist::WalletPoiRuntime;

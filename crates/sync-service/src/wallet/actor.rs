@@ -25,12 +25,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::{
     WalletBackfillOwnerDisposition, WalletBackfillRejectReason, WalletInactiveReason,
-    WalletIndexedCatchUpStatus, WalletObservation, WalletPpoiWorkflowStatus,
-    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletResetReplayPlan,
-    WalletResetToken, WalletSyncToken, WalletViewState,
+    WalletIndexedCatchUpStatus, WalletObservation, WalletPpoiSubmissionStatus,
+    WalletPpoiWorkflowStatus, WalletPrivateRequestError, WalletReadiness, WalletReadinessError,
+    WalletResetReplayPlan, WalletResetToken, WalletSyncToken, WalletViewState,
 };
 
 use super::handle::{WalletPoiRefreshSelection, WalletPrivateViewTicket};
+use super::pending_output_poi::WalletPpoiWorkflowProjection;
 
 /// Publication and apply authority for a wallet actor instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,10 +92,11 @@ impl WalletObservationPublisher {
             if published.readiness() == &readiness {
                 false
             } else {
-                *published = WalletObservation::with_ppoi_workflow_status(
+                *published = WalletObservation::with_ppoi_workflow_projection(
                     published.view().clone(),
                     readiness,
                     *published.ppoi_workflow_status(),
+                    published.ppoi_submission_statuses_arc(),
                 );
                 true
             }
@@ -103,25 +105,16 @@ impl WalletObservationPublisher {
 
     pub(crate) fn publish_view(&self, view: WalletViewState) {
         let _ = self.sender.send_if_modified(|published| {
-            if published.view() == &view {
-                false
+            let submissions = if matches!(&view, WalletViewState::Current(_)) {
+                published.ppoi_submission_statuses_arc()
             } else {
-                *published = WalletObservation::with_ppoi_workflow_status(
-                    view,
-                    published.readiness().clone(),
-                    *published.ppoi_workflow_status(),
-                );
-                true
-            }
-        });
-    }
-
-    pub(crate) fn publish(&self, view: WalletViewState, readiness: WalletReadiness) {
-        let _ = self.sender.send_if_modified(|published| {
-            let observation = WalletObservation::with_ppoi_workflow_status(
+                Arc::from([])
+            };
+            let observation = WalletObservation::with_ppoi_workflow_projection(
                 view,
-                readiness,
+                published.readiness().clone(),
                 *published.ppoi_workflow_status(),
+                submissions,
             );
             if published == &observation {
                 false
@@ -132,19 +125,85 @@ impl WalletObservationPublisher {
         });
     }
 
-    pub(crate) fn publish_ppoi_workflow_status(&self, status: WalletPpoiWorkflowStatus) {
+    pub(crate) fn publish(&self, view: WalletViewState, readiness: WalletReadiness) {
         let _ = self.sender.send_if_modified(|published| {
-            if published.ppoi_workflow_status() == &status {
+            let submissions = if matches!(&view, WalletViewState::Current(_)) {
+                published.ppoi_submission_statuses_arc()
+            } else {
+                Arc::from([])
+            };
+            let observation = WalletObservation::with_ppoi_workflow_projection(
+                view,
+                readiness,
+                *published.ppoi_workflow_status(),
+                submissions,
+            );
+            if published == &observation {
                 false
             } else {
-                *published = WalletObservation::with_ppoi_workflow_status(
+                published.clone_from(&observation);
+                true
+            }
+        });
+    }
+
+    fn publish_with_ppoi_workflow_projection(
+        &self,
+        view: WalletViewState,
+        readiness: WalletReadiness,
+        projection: WalletPpoiWorkflowProjection,
+    ) {
+        let submissions = if matches!(&view, WalletViewState::Current(_)) {
+            projection.submissions
+        } else {
+            Arc::from([])
+        };
+        let observation = WalletObservation::with_ppoi_workflow_projection(
+            view,
+            readiness,
+            projection.status,
+            submissions,
+        );
+        let _ = self.sender.send_if_modified(|published| {
+            if published == &observation {
+                false
+            } else {
+                published.clone_from(&observation);
+                true
+            }
+        });
+    }
+
+    pub(crate) fn publish_ppoi_workflow_projection(
+        &self,
+        status: WalletPpoiWorkflowStatus,
+        submissions: Arc<[WalletPpoiSubmissionStatus]>,
+    ) {
+        let _ = self.sender.send_if_modified(|published| {
+            let submissions = if matches!(published.view(), WalletViewState::Current(_)) {
+                submissions
+            } else {
+                Arc::from([])
+            };
+            if published.ppoi_workflow_status() == &status
+                && published.ppoi_submission_statuses() == submissions.as_ref()
+            {
+                false
+            } else {
+                *published = WalletObservation::with_ppoi_workflow_projection(
                     published.view().clone(),
                     published.readiness().clone(),
                     status,
+                    submissions,
                 );
                 true
             }
         });
+    }
+
+    pub(crate) fn publish_ppoi_workflow_status(&self, status: WalletPpoiWorkflowStatus) {
+        let submissions = self.sender.borrow().ppoi_submission_statuses_arc();
+        self.publish_ppoi_workflow_projection(status, submissions);
     }
 
     pub(crate) fn ppoi_workflow_status(&self) -> WalletPpoiWorkflowStatus {
@@ -153,13 +212,14 @@ impl WalletObservationPublisher {
 
     pub(crate) fn publish_terminal(&self, reason: WalletInactiveReason, reset_generation: u64) {
         let status = self.ppoi_workflow_status().cleared();
-        let observation = WalletObservation::with_ppoi_workflow_status(
+        let observation = WalletObservation::with_ppoi_workflow_projection(
             WalletViewState::Inactive {
                 reason,
                 reset_generation,
             },
             WalletReadiness::Shutdown,
             status,
+            Arc::from([]),
         );
         self.sender.send_replace(observation);
     }
@@ -639,6 +699,22 @@ impl WalletActorState {
     ) -> R {
         let result = transition(WalletActorMutation { state: self });
         self.observation.publish(view, self.derived_readiness());
+        result
+    }
+
+    pub(super) fn transition_with_view_and_ppoi_workflow_projection<R>(
+        &mut self,
+        _token: &WalletActorApplyToken<'_>,
+        view: WalletViewState,
+        projection: WalletPpoiWorkflowProjection,
+        transition: impl for<'a> FnOnce(WalletActorMutation<'a>) -> R,
+    ) -> R {
+        let result = transition(WalletActorMutation { state: self });
+        self.observation.publish_with_ppoi_workflow_projection(
+            view,
+            self.derived_readiness(),
+            projection,
+        );
         result
     }
 
@@ -1628,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_publication_preserves_workflow_and_terminal_clears_outstanding() {
+    fn observation_publication_preserves_workflow_and_terminal_clears_submission_projection() {
         let initial_view = WalletViewState::Current(crate::types::WalletCurrentSnapshot::new(
             7,
             0,
@@ -1652,13 +1728,23 @@ mod tests {
             needs_attention: 3,
             validation_revision: 4,
         };
-        publisher.publish_ppoi_workflow_status(status);
+        let submissions: Arc<[WalletPpoiSubmissionStatus]> =
+            Arc::from(vec![WalletPpoiSubmissionStatus {
+                output_commitment: alloy::primitives::FixedBytes::from([0x42; 32]),
+                last_submission_at: 17,
+            }]);
+        publisher.publish_ppoi_workflow_projection(status, submissions.clone());
         publisher.publish_readiness(WalletReadiness::Failed(WalletReadinessError::ApplyFailed));
+        assert_eq!(
+            receiver.borrow().ppoi_submission_statuses(),
+            submissions.as_ref()
+        );
         publisher.publish_view(WalletViewState::ResetPending {
             intent_id: 1,
             from_block: 5,
             reset_generation: 1,
         });
+        assert!(receiver.borrow().ppoi_submission_statuses().is_empty());
         publisher.publish(
             WalletViewState::Current(crate::types::WalletCurrentSnapshot::new(
                 9,
@@ -1670,6 +1756,7 @@ mod tests {
             WalletReadiness::Syncing,
         );
         assert_eq!(receiver.borrow().ppoi_workflow_status(), &status);
+        assert!(receiver.borrow().ppoi_submission_statuses().is_empty());
 
         publisher.publish_terminal(WalletInactiveReason::Shutdown, 1);
         assert_eq!(
@@ -1679,6 +1766,7 @@ mod tests {
                 ..WalletPpoiWorkflowStatus::default()
             }
         );
+        assert!(receiver.borrow().ppoi_submission_statuses().is_empty());
     }
 
     #[test]

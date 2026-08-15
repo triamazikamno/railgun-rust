@@ -67,7 +67,6 @@ use super::{
     submit_pending_output_poi_tentative_candidates,
     verify_submitted_pending_output_pois_with_config_authorized, wallet_poi_status_client,
     wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
-    wallet_ppoi_workflow_status,
 };
 use crate::chain::PublicTxidTransaction;
 use crate::chain::{
@@ -82,8 +81,9 @@ use crate::types::{
     ChainKey, GlobalPoiPolicy, PendingOutputPoiContextIntent, PoiArtifactManifestSource,
     PoiArtifactSourceConfig, PoiProxyFallback, WalletCacheStore, WalletCheckpointMutation,
     WalletConfig, WalletCurrentSnapshot, WalletInactiveReason, WalletLocalPoiCaches,
-    WalletPpoiWorkflowStatus, WalletPrivateCommit, WalletPrivateRequestError,
-    WalletSchedulableProgress, WalletSyncActorStateCommit, WalletUtxoMutation,
+    WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus, WalletPrivateCommit,
+    WalletPrivateRequestError, WalletSchedulableProgress, WalletSyncActorStateCommit,
+    WalletUtxoMutation,
 };
 use crate::{
     SenderTransactionCandidate, SenderTransactionCandidateOutput, SenderTransactionCandidateSpend,
@@ -1425,6 +1425,28 @@ fn output_poi_recovery_record(
     }
 }
 
+fn wallet_ppoi_workflow_status_for_test(
+    store: &DbStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    validation_revision: u64,
+) -> WalletPpoiWorkflowStatus {
+    wallet_ppoi_workflow_status_after_mutations(
+        store,
+        cfg,
+        active_list_keys,
+        validation_revision,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .expect("derive workflow status")
+    .status
+}
+
 #[test]
 fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
     let root_dir = temp_db_root();
@@ -1446,6 +1468,19 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
         PendingOutputPoiRole::BroadcasterFee,
     );
     awaiting_validation.submitted_poi_list_keys = vec![active_list];
+    let mut acknowledged_recovery = output_poi_recovery_record(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        awaiting_validation.output_commitment,
+        OutputPoiRecoveryStatus::Submitted,
+        None,
+    );
+    acknowledged_recovery.source_tx_hash = awaiting_validation
+        .observation
+        .as_ref()
+        .expect("acknowledged observation")
+        .tx_hash;
+    acknowledged_recovery.last_submission_at = Some(42);
     let mut terminal = external_pending_output_record(
         &cfg,
         0xc4,
@@ -1453,6 +1488,7 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
         PendingOutputPoiRole::RecoveredOutgoing,
     );
     terminal.terminal_error = Some("test-only terminal error".to_string());
+    terminal.submitted_poi_list_keys = vec![active_list];
     let failed =
         external_pending_output_record(&cfg, 0xc5, active_list, PendingOutputPoiRole::Recipient);
     let mut unobserved =
@@ -1460,6 +1496,9 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
     unobserved.observation = None;
     let inactive =
         external_pending_output_record(&cfg, 0xc7, inactive_list, PendingOutputPoiRole::Recipient);
+    let mut stale =
+        external_pending_output_record(&cfg, 0xc8, active_list, PendingOutputPoiRole::Recipient);
+    stale.submitted_poi_list_keys = vec![active_list];
     for context in [
         &awaiting_submission,
         &awaiting_validation,
@@ -1467,11 +1506,15 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
         &failed,
         &unobserved,
         &inactive,
+        &stale,
     ] {
         store
             .put_pending_output_poi_context(context)
             .expect("store pending context");
     }
+    store
+        .put_output_poi_recovery(&acknowledged_recovery)
+        .expect("store acknowledged recovery");
     let failed_observation = failed.observation.as_ref().expect("observed context");
     let mut failed_recovery = output_poi_recovery_record(
         cfg.chain.chain_id,
@@ -1481,17 +1524,124 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
         None,
     );
     failed_recovery.source_tx_hash = failed_observation.tx_hash;
+    failed_recovery.last_submission_at = Some(77);
     store
         .put_output_poi_recovery(&failed_recovery)
         .expect("store failed recovery");
+    let mut no_timestamp_recovery = output_poi_recovery_record(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        terminal.output_commitment,
+        OutputPoiRecoveryStatus::Submitted,
+        None,
+    );
+    no_timestamp_recovery.source_tx_hash = terminal
+        .observation
+        .as_ref()
+        .expect("terminal observation")
+        .tx_hash;
+    store
+        .put_output_poi_recovery(&no_timestamp_recovery)
+        .expect("store no-timestamp recovery");
+    let mut stale_recovery = output_poi_recovery_record(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        stale.output_commitment,
+        OutputPoiRecoveryStatus::SubmitFailed,
+        None,
+    );
+    stale_recovery.last_submission_at = Some(99);
+    store
+        .put_output_poi_recovery(&stale_recovery)
+        .expect("store stale recovery");
 
-    let status = wallet_ppoi_workflow_status(&store, &cfg, &[active_list], 9)
-        .expect("derive workflow status");
+    let status = wallet_ppoi_workflow_status_for_test(&store, &cfg, &[active_list], 9);
 
     assert_eq!(status.awaiting_submission, 1);
     assert_eq!(status.awaiting_validation, 1);
-    assert_eq!(status.needs_attention, 2);
+    assert_eq!(status.needs_attention, 3);
     assert_eq!(status.validation_revision, 9);
+
+    let projection = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        9,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .expect("derive submission projection");
+    assert_eq!(
+        projection.submissions.as_ref(),
+        &[WalletPpoiSubmissionStatus {
+            output_commitment: awaiting_validation.output_commitment,
+            last_submission_at: 42,
+        }]
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn wallet_ppoi_submission_projection_includes_change_without_external_workflow_count() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let cfg = wallet_config(U256::ZERO);
+    let active_list = FixedBytes::from([0xd8; 32]);
+    let mut context =
+        external_pending_output_record(&cfg, 0xd9, active_list, PendingOutputPoiRole::Change);
+    context.submitted_poi_list_keys = vec![active_list];
+    let mut recovery = output_poi_recovery_record(
+        cfg.chain.chain_id,
+        &cfg.cache_key,
+        context.output_commitment,
+        OutputPoiRecoveryStatus::Submitted,
+        None,
+    );
+    recovery.source_tx_hash = context
+        .observation
+        .as_ref()
+        .expect("change observation")
+        .tx_hash;
+    recovery.last_submission_at = Some(123);
+    store
+        .put_pending_output_poi_context(&context)
+        .expect("store change context");
+    store
+        .put_output_poi_recovery(&recovery)
+        .expect("store change recovery");
+
+    let status = wallet_ppoi_workflow_status_for_test(&store, &cfg, &[active_list], 0);
+    assert_eq!(status, WalletPpoiWorkflowStatus::default());
+
+    let projection = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        0,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .expect("derive change submission projection");
+    assert_eq!(
+        projection.submissions.as_ref(),
+        &[WalletPpoiSubmissionStatus {
+            output_commitment: context.output_commitment,
+            last_submission_at: 123,
+        }]
+    );
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -1543,7 +1693,8 @@ fn wallet_ppoi_workflow_status_transitions_candidate_output_without_double_count
         std::slice::from_ref(&candidate),
         &[],
     )
-    .expect("derive candidate workflow status");
+    .expect("derive candidate workflow status")
+    .status;
     assert_eq!(awaiting_recovery.awaiting_recovery, 2);
     assert_eq!(awaiting_recovery.outstanding_count(), 2);
 
@@ -1566,7 +1717,8 @@ fn wallet_ppoi_workflow_status_transitions_candidate_output_without_double_count
         std::slice::from_ref(&candidate),
         &[],
     )
-    .expect("derive materialized workflow status");
+    .expect("derive materialized workflow status")
+    .status;
     assert_eq!(after_materialization.awaiting_recovery, 1);
     assert_eq!(after_materialization.awaiting_submission, 1);
     assert_eq!(after_materialization.outstanding_count(), 2);
@@ -1595,6 +1747,7 @@ fn wallet_ppoi_workflow_status_keeps_matching_valid_recovery_awaiting_reconcilia
         None,
     );
     recovery.source_tx_hash = context.observation.as_ref().expect("observation").tx_hash;
+    recovery.last_submission_at = Some(4);
     store
         .put_pending_output_poi_context(&context)
         .expect("store pending context");
@@ -1602,8 +1755,7 @@ fn wallet_ppoi_workflow_status_keeps_matching_valid_recovery_awaiting_reconcilia
         .put_output_poi_recovery(&recovery)
         .expect("store valid recovery");
 
-    let status = wallet_ppoi_workflow_status(&store, &cfg, &[active_list], 3)
-        .expect("derive workflow status");
+    let status = wallet_ppoi_workflow_status_for_test(&store, &cfg, &[active_list], 3);
 
     assert_eq!(
         status,
@@ -1613,6 +1765,52 @@ fn wallet_ppoi_workflow_status_keeps_matching_valid_recovery_awaiting_reconcilia
             ..WalletPpoiWorkflowStatus::default()
         }
     );
+
+    recovery.last_submission_at = Some(8);
+    let updated = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        3,
+        &[],
+        &[],
+        std::slice::from_ref(&recovery),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("derive updated submission projection");
+    assert_eq!(updated.submissions[0].last_submission_at, 8);
+
+    let deleted = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        3,
+        &[],
+        &[],
+        &[],
+        std::slice::from_ref(&context.output_commitment),
+        &[],
+        &[],
+    )
+    .expect("derive deleted submission projection");
+    assert!(deleted.submissions.is_empty());
+
+    let validation_deleted = wallet_ppoi_workflow_status_after_mutations(
+        &store,
+        &cfg,
+        &[active_list],
+        4,
+        &[],
+        std::slice::from_ref(&context.output_commitment),
+        &[],
+        std::slice::from_ref(&context.output_commitment),
+        &[],
+        &[],
+    )
+    .expect("derive validation deletion projection");
+    assert!(validation_deleted.submissions.is_empty());
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

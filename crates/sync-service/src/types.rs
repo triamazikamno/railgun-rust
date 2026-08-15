@@ -2202,12 +2202,20 @@ impl WalletPpoiWorkflowStatus {
     }
 }
 
+/// Latest successful PPOI submission acknowledgement for one sender-created output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletPpoiSubmissionStatus {
+    pub output_commitment: FixedBytes<32>,
+    pub last_submission_at: u64,
+}
+
 /// One authoritative public observation of a wallet actor's private projection and readiness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletObservation {
     view: WalletViewState,
     readiness: WalletReadiness,
     ppoi_workflow_status: WalletPpoiWorkflowStatus,
+    ppoi_submission_statuses: Arc<[WalletPpoiSubmissionStatus]>,
 }
 
 impl WalletObservation {
@@ -2219,6 +2227,15 @@ impl WalletObservation {
         view: WalletViewState,
         readiness: WalletReadiness,
         ppoi_workflow_status: WalletPpoiWorkflowStatus,
+    ) -> Self {
+        Self::with_ppoi_workflow_projection(view, readiness, ppoi_workflow_status, Arc::from([]))
+    }
+
+    pub(crate) fn with_ppoi_workflow_projection(
+        view: WalletViewState,
+        readiness: WalletReadiness,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus,
+        ppoi_submission_statuses: Arc<[WalletPpoiSubmissionStatus]>,
     ) -> Self {
         assert_eq!(
             matches!(&view, WalletViewState::Inactive { .. }),
@@ -2232,6 +2249,7 @@ impl WalletObservation {
             view,
             readiness,
             ppoi_workflow_status,
+            ppoi_submission_statuses,
         }
     }
 
@@ -2248,6 +2266,15 @@ impl WalletObservation {
     #[must_use]
     pub const fn ppoi_workflow_status(&self) -> &WalletPpoiWorkflowStatus {
         &self.ppoi_workflow_status
+    }
+
+    #[must_use]
+    pub fn ppoi_submission_statuses(&self) -> &[WalletPpoiSubmissionStatus] {
+        &self.ppoi_submission_statuses
+    }
+
+    pub(crate) fn ppoi_submission_statuses_arc(&self) -> Arc<[WalletPpoiSubmissionStatus]> {
+        Arc::clone(&self.ppoi_submission_statuses)
     }
 }
 

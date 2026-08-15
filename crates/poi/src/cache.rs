@@ -29,6 +29,23 @@ const POI_BLOCKED_SHIELDS_PAGE_SIZE: u64 = 500;
 const POI_BLOCKED_SHIELDS_LIMIT: usize = 100_000;
 const DENSE_POI_PROOF_MIN_COMMITMENTS_PER_TREE: usize = 1;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PoiCacheSyncScope {
+    Full,
+    Events,
+    BlockedShields,
+}
+
+impl PoiCacheSyncScope {
+    const fn sync_events(self) -> bool {
+        matches!(self, Self::Full | Self::Events)
+    }
+
+    const fn sync_blocked_shields(self) -> bool {
+        matches!(self, Self::Full | Self::BlockedShields)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoiCacheIdentity {
     pub chain_type: u8,
@@ -999,7 +1016,13 @@ impl PoiCache {
     ) -> Result<PoiCacheSyncOutcome, PoiCacheError> {
         let mut candidate = self.clone();
         let result = candidate
-            .sync_bounded_candidate(client, event_page_size, leaf_page_size, max_event_pages)
+            .sync_bounded_candidate(
+                client,
+                event_page_size,
+                leaf_page_size,
+                max_event_pages,
+                PoiCacheSyncScope::Full,
+            )
             .await?;
         *self = candidate;
         Ok(result.outcome)
@@ -1013,7 +1036,48 @@ impl PoiCache {
         max_event_pages: usize,
     ) -> Result<(Self, PoiCacheJournalSyncResult), PoiCacheError> {
         let result = self
-            .sync_bounded_candidate(client, event_page_size, leaf_page_size, max_event_pages)
+            .sync_bounded_candidate(
+                client,
+                event_page_size,
+                leaf_page_size,
+                max_event_pages,
+                PoiCacheSyncScope::Full,
+            )
+            .await?;
+        Ok((self, result))
+    }
+
+    pub async fn sync_events_bounded_with_journal(
+        mut self,
+        client: &PoiRpcClient,
+        event_page_size: u64,
+        leaf_page_size: u64,
+        max_event_pages: usize,
+    ) -> Result<(Self, PoiCacheJournalSyncResult), PoiCacheError> {
+        let result = self
+            .sync_bounded_candidate(
+                client,
+                event_page_size,
+                leaf_page_size,
+                max_event_pages,
+                PoiCacheSyncScope::Events,
+            )
+            .await?;
+        Ok((self, result))
+    }
+
+    pub async fn sync_blocked_shields_with_journal(
+        mut self,
+        client: &PoiRpcClient,
+    ) -> Result<(Self, PoiCacheJournalSyncResult), PoiCacheError> {
+        let result = self
+            .sync_bounded_candidate(
+                client,
+                POI_EVENTS_PAGE_SIZE,
+                POI_MERKLETREE_LEAVES_PAGE_SIZE,
+                usize::MAX,
+                PoiCacheSyncScope::BlockedShields,
+            )
             .await?;
         Ok((self, result))
     }
@@ -1024,11 +1088,16 @@ impl PoiCache {
         event_page_size: u64,
         leaf_page_size: u64,
         max_event_pages: usize,
+        scope: PoiCacheSyncScope,
     ) -> Result<PoiCacheJournalSyncResult, PoiCacheError> {
-        if event_page_size == 0 || leaf_page_size == 0 || max_event_pages == 0 {
+        if scope.sync_events()
+            && (event_page_size == 0 || leaf_page_size == 0 || max_event_pages == 0)
+        {
             return Err(PoiCacheError::InvalidPageSize);
         }
-        if self.snapshot.progress.next_event_index != self.snapshot.progress.next_leaf_index {
+        if scope.sync_events()
+            && self.snapshot.progress.next_event_index != self.snapshot.progress.next_leaf_index
+        {
             return Err(PoiCacheError::SyncCursorMismatch {
                 next_event_index: self.snapshot.progress.next_event_index,
                 next_leaf_index: self.snapshot.progress.next_leaf_index,
@@ -1056,7 +1125,7 @@ impl PoiCache {
         let mut journal_events = Vec::new();
         let mut journal_leaves = Vec::new();
         let mut event_pages = 0_usize;
-        loop {
+        while scope.sync_events() {
             let start_index = self.snapshot.progress.next_event_index;
             let end_index = start_index
                 .checked_add(event_page_size - 1)
@@ -1135,7 +1204,9 @@ impl PoiCache {
             }
         }
 
-        while self.snapshot.progress.next_leaf_index < self.snapshot.progress.next_event_index {
+        while scope.sync_events()
+            && self.snapshot.progress.next_leaf_index < self.snapshot.progress.next_event_index
+        {
             let start_index = self.snapshot.progress.next_leaf_index;
             let remaining = self.snapshot.progress.next_event_index - start_index;
             let page_size = leaf_page_size.min(remaining);
@@ -1200,67 +1271,76 @@ impl PoiCache {
             );
         }
 
-        if let Some(index) = event_commitments.keys().next().copied() {
+        if scope.sync_events()
+            && let Some(index) = event_commitments.keys().next().copied()
+        {
             return Err(PoiCacheError::MissingEventLeaf { index });
         }
 
-        let blocked_started = Instant::now();
-        let previous_blocked_shields_synced = self.snapshot.progress.blocked_shields_synced;
-        let previous_blocked_shields = self.snapshot.blocked_shields_by_blinded_commitment.clone();
-        let requested_blocked_shield_count =
-            usize::try_from(POI_BLOCKED_SHIELDS_PAGE_SIZE).unwrap_or(usize::MAX);
-        let mut blocked_shields = Vec::new();
-        let mut blocked_start_index = 0_u64;
-        loop {
-            let blocked_end_index = blocked_start_index
-                .checked_add(POI_BLOCKED_SHIELDS_PAGE_SIZE)
-                .ok_or(PoiCacheError::RangeOverflow)?;
-            let page = client
-                .blocked_shields(
-                    &self.snapshot.identity.txid_version,
-                    self.snapshot.identity.chain_type,
-                    self.snapshot.identity.chain_id,
-                    &self.snapshot.identity.list_key,
-                    blocked_start_index,
-                    blocked_end_index,
-                )
-                .await?;
-            if page.len() > requested_blocked_shield_count {
-                return Err(PoiCacheError::BlockedShieldPageTooLarge {
-                    start_index: blocked_start_index,
-                    end_index: blocked_end_index,
-                    requested: POI_BLOCKED_SHIELDS_PAGE_SIZE,
-                    actual: page.len(),
-                });
+        let (blocked_shields, blocked_shields_changed) = if scope.sync_blocked_shields() {
+            let blocked_started = Instant::now();
+            let previous_blocked_shields_synced = self.snapshot.progress.blocked_shields_synced;
+            let previous_blocked_shields =
+                self.snapshot.blocked_shields_by_blinded_commitment.clone();
+            let requested_blocked_shield_count =
+                usize::try_from(POI_BLOCKED_SHIELDS_PAGE_SIZE).unwrap_or(usize::MAX);
+            let mut blocked_shields = Vec::new();
+            let mut blocked_start_index = 0_u64;
+            loop {
+                let blocked_end_index = blocked_start_index
+                    .checked_add(POI_BLOCKED_SHIELDS_PAGE_SIZE)
+                    .ok_or(PoiCacheError::RangeOverflow)?;
+                let page = client
+                    .blocked_shields(
+                        &self.snapshot.identity.txid_version,
+                        self.snapshot.identity.chain_type,
+                        self.snapshot.identity.chain_id,
+                        &self.snapshot.identity.list_key,
+                        blocked_start_index,
+                        blocked_end_index,
+                    )
+                    .await?;
+                if page.len() > requested_blocked_shield_count {
+                    return Err(PoiCacheError::BlockedShieldPageTooLarge {
+                        start_index: blocked_start_index,
+                        end_index: blocked_end_index,
+                        requested: POI_BLOCKED_SHIELDS_PAGE_SIZE,
+                        actual: page.len(),
+                    });
+                }
+                if blocked_shields.len().saturating_add(page.len()) > POI_BLOCKED_SHIELDS_LIMIT {
+                    return Err(PoiCacheError::BlockedShieldLimitExceeded {
+                        limit: POI_BLOCKED_SHIELDS_LIMIT,
+                    });
+                }
+                for blocked_shield in &page {
+                    verify_blocked_shield(blocked_shield, &self.snapshot.identity.list_key.0)?;
+                }
+                let returned = page.len();
+                blocked_shields.extend(page);
+                if returned < requested_blocked_shield_count {
+                    break;
+                }
+                blocked_start_index = blocked_end_index;
             }
-            if blocked_shields.len().saturating_add(page.len()) > POI_BLOCKED_SHIELDS_LIMIT {
-                return Err(PoiCacheError::BlockedShieldLimitExceeded {
-                    limit: POI_BLOCKED_SHIELDS_LIMIT,
-                });
-            }
-            for blocked_shield in &page {
-                verify_blocked_shield(blocked_shield, &self.snapshot.identity.list_key.0)?;
-            }
-            let returned = page.len();
-            blocked_shields.extend(page);
-            if returned < requested_blocked_shield_count {
-                break;
-            }
-            blocked_start_index = blocked_end_index;
-        }
-        outcome.blocked_shields = self.replace_blocked_shields(&blocked_shields)?;
-        let blocked_shields_changed = (!previous_blocked_shields_synced
-            && self.snapshot.progress.next_event_index > 0)
-            || self.snapshot.blocked_shields_by_blinded_commitment != previous_blocked_shields;
+            outcome.blocked_shields = self.replace_blocked_shields(&blocked_shields)?;
+            let changed = (!previous_blocked_shields_synced
+                && (scope == PoiCacheSyncScope::BlockedShields
+                    || self.snapshot.progress.next_event_index > 0))
+                || self.snapshot.blocked_shields_by_blinded_commitment != previous_blocked_shields;
+            debug!(
+                chain_id = self.snapshot.identity.chain_id,
+                list_key = %hex::encode(self.snapshot.identity.list_key),
+                returned = blocked_shields.len(),
+                applied = outcome.blocked_shields,
+                elapsed_ms = blocked_started.elapsed().as_millis(),
+                "local POI blocked shields synced"
+            );
+            (Some(blocked_shields), changed)
+        } else {
+            (None, false)
+        };
         outcome.changed = outcome.events > 0 || outcome.leaves > 0 || blocked_shields_changed;
-        debug!(
-            chain_id = self.snapshot.identity.chain_id,
-            list_key = %hex::encode(self.snapshot.identity.list_key),
-            returned = blocked_shields.len(),
-            applied = outcome.blocked_shields,
-            elapsed_ms = blocked_started.elapsed().as_millis(),
-            "local POI blocked shields synced"
-        );
 
         debug!(
             chain_id = self.snapshot.identity.chain_id,
@@ -1285,7 +1365,7 @@ impl PoiCache {
                 events: journal_events,
                 leaves: journal_leaves,
             },
-            blocked_shields: blocked_shields_changed.then_some(blocked_shields),
+            blocked_shields: blocked_shields.filter(|_| blocked_shields_changed),
         })
     }
 
@@ -2015,6 +2095,46 @@ mod tests {
         assert!(requests[3]["params"].get("bloomFilterSerialized").is_none());
         assert_eq!(requests[3]["params"]["startIndex"], 0);
         assert_eq!(requests[3]["params"]["endIndex"], 500);
+    }
+
+    #[tokio::test]
+    async fn scoped_event_sync_skips_blocked_shield_snapshot() {
+        let commitment = FixedBytes::from([0x42; 32]);
+        let mock = spawn_json_rpc(vec![
+            json_rpc_result(&json!([event(0, commitment)])),
+            json_rpc_result(&json!([hex::encode_prefixed(commitment)])),
+        ]);
+        let (cache, result) = PoiCache::new(identity())
+            .sync_events_bounded_with_journal(&PoiRpcClient::new(mock.url.clone()), 2, 2, 4)
+            .await
+            .expect("event-only sync");
+
+        assert_eq!(result.outcome.events, 1);
+        assert!(result.blocked_shields.is_none());
+        assert_eq!(cache.progress().next_event_index, 1);
+        assert_eq!(
+            [request_json(&mock), request_json(&mock)]
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ppoi_poi_events", "ppoi_poi_merkletree_leaves"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_blocked_shield_sync_skips_events_and_leaves() {
+        let mock = spawn_json_rpc(vec![json_rpc_result(&json!([]))]);
+        let (cache, result) = PoiCache::new(identity())
+            .sync_blocked_shields_with_journal(&PoiRpcClient::new(mock.url.clone()))
+            .await
+            .expect("blocked-shield-only sync");
+
+        assert!(result.delta.is_empty());
+        assert!(result.blocked_shields.is_some());
+        assert!(cache.progress().blocked_shields_synced);
+        let request = request_json(&mock);
+        assert_eq!(request["method"], "ppoi_blocked_shields");
+        assert!(mock.requests.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ use crate::txid_cache::{
 };
 use crate::types::{
     IndexedArtifactSourceConfig, LocalPoiCaches, PoiArtifactCacheAttemptId,
-    PoiArtifactCacheProgress, PoiCorpusRevision,
+    PoiArtifactCacheProgress, PoiCorpusRevision, WalletObservation,
 };
 use crate::wallet::{LocalPoiMerkleProofSource, LocalPoiStatusReader};
 
@@ -1562,6 +1562,22 @@ impl ChainPublicDataPlane {
         self
     }
 
+    pub(crate) async fn update_poi_cache_demand(
+        &self,
+        actor_id: u64,
+        observation: &WalletObservation,
+    ) {
+        if let Some(service) = self.poi_cache_service.as_ref() {
+            service.update_wallet_demand(actor_id, observation).await;
+        }
+    }
+
+    pub(crate) async fn clear_poi_cache_demand(&self, actor_id: u64) {
+        if let Some(service) = self.poi_cache_service.as_ref() {
+            service.clear_wallet_demand(actor_id).await;
+        }
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.begin_shutdown();
         self.indexed_artifact_maintenance.shutdown().await;
@@ -1767,6 +1783,26 @@ impl ChainPublicDataPlane {
         };
         service
             .retry_chain(chain_id)
+            .await
+            .map(|retry| PoiArtifactCacheRetry { chain_id, retry })
+            .map_err(|reason| PublicDataPlaneError::PoiCorpusRefresh {
+                chain_id,
+                reason: reason.to_string(),
+            })
+    }
+
+    pub(crate) async fn retry_poi_artifact_cache_events(
+        &self,
+        chain_id: u64,
+    ) -> Result<PoiArtifactCacheRetry, PublicDataPlaneError> {
+        let Some(service) = self.poi_cache_service.as_ref() else {
+            return Err(PublicDataPlaneError::PoiCorpusUnavailable {
+                chain_id,
+                txid_version: DEFAULT_TXID_VERSION.to_string(),
+            });
+        };
+        service
+            .retry_chain_events(chain_id)
             .await
             .map(|retry| PoiArtifactCacheRetry { chain_id, retry })
             .map_err(|reason| PublicDataPlaneError::PoiCorpusRefresh {

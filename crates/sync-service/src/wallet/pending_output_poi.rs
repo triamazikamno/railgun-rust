@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::SenderTransactionCandidate;
 use poi::error::PoiRpcError;
@@ -15,30 +16,16 @@ use super::{
     PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey, RecoveredOutgoingSubmissionSibling,
     SingleCommitmentProofContext, UtxoPoiMetadata, WalletCacheError, WalletCacheKey,
     WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletHandle, WalletPoiRuntime,
-    WalletPpoiWorkflowStatus, WalletPrivateCommit, WalletPrivateMutationAuthority,
-    WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletPrivateRemoteError,
-    WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug, default_active_poi_list_keys,
-    info, new_output_poi_recovery_record, now_epoch_secs, warn,
+    WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus, WalletPrivateCommit,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug,
+    default_active_poi_list_keys, info, new_output_poi_recovery_record, now_epoch_secs, warn,
 };
 
-pub(super) fn wallet_ppoi_workflow_status(
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    validation_revision: u64,
-) -> Result<WalletPpoiWorkflowStatus, WalletCacheError> {
-    wallet_ppoi_workflow_status_after_mutations(
-        cache_store,
-        cfg,
-        active_list_keys,
-        validation_revision,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-    )
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WalletPpoiWorkflowProjection {
+    pub(super) status: WalletPpoiWorkflowStatus,
+    pub(super) submissions: Arc<[WalletPpoiSubmissionStatus]>,
 }
 
 pub(super) fn wallet_ppoi_workflow_status_after_mutations(
@@ -52,7 +39,7 @@ pub(super) fn wallet_ppoi_workflow_status_after_mutations(
     recovery_deletes: &[FixedBytes<32>],
     candidate_updates: &[SenderTransactionCandidate],
     candidate_deletes: &[FixedBytes<32>],
-) -> Result<WalletPpoiWorkflowStatus, WalletCacheError> {
+) -> Result<WalletPpoiWorkflowProjection, WalletCacheError> {
     let mut recoveries = cache_store
         .list_output_poi_recoveries(cfg.chain.chain_id, &cfg.cache_key)?
         .into_iter()
@@ -90,6 +77,7 @@ pub(super) fn wallet_ppoi_workflow_status_after_mutations(
         validation_revision,
         ..WalletPpoiWorkflowStatus::default()
     };
+    let mut submissions = Vec::new();
     for candidate in candidates.values() {
         let mut has_unknown_output = false;
         for output in &candidate.outputs {
@@ -109,9 +97,6 @@ pub(super) fn wallet_ppoi_workflow_status_after_mutations(
         }
     }
     for context in contexts.values() {
-        if context.output_role == PendingOutputPoiRole::Change {
-            continue;
-        }
         let Some(observation) = context.observation.as_ref() else {
             continue;
         };
@@ -123,25 +108,37 @@ pub(super) fn wallet_ppoi_workflow_status_after_mutations(
         if required_active_lists.is_empty() {
             continue;
         }
-        let matching_valid_recovery =
-            recoveries
-                .get(&context.output_commitment)
-                .is_some_and(|recovery| {
-                    recovery.source_tx_hash == observation.tx_hash
-                        && recovery.status == OutputPoiRecoveryStatus::Valid
-                });
-        let recovery_needs_attention =
-            recoveries
-                .get(&context.output_commitment)
-                .is_some_and(|recovery| {
-                    recovery.source_tx_hash != observation.tx_hash
-                        || !matches!(
-                            recovery.status,
-                            OutputPoiRecoveryStatus::Recoverable
-                                | OutputPoiRecoveryStatus::Submitted
-                                | OutputPoiRecoveryStatus::Valid
-                        )
-                });
+        let recovery = recoveries.get(&context.output_commitment);
+        let matching_valid_recovery = recovery.is_some_and(|recovery| {
+            recovery.source_tx_hash == observation.tx_hash
+                && recovery.status == OutputPoiRecoveryStatus::Valid
+        });
+        let recovery_needs_attention = recovery.is_some_and(|recovery| {
+            recovery.source_tx_hash != observation.tx_hash
+                || !matches!(
+                    recovery.status,
+                    OutputPoiRecoveryStatus::Recoverable
+                        | OutputPoiRecoveryStatus::Submitted
+                        | OutputPoiRecoveryStatus::Valid
+                )
+        });
+        if let Some(last_submission_at) = recovery
+            .filter(|recovery| recovery.source_tx_hash == observation.tx_hash)
+            .and_then(|recovery| recovery.last_submission_at)
+            .filter(|last_submission_at| *last_submission_at != 0)
+            && context
+                .submitted_poi_list_keys
+                .iter()
+                .any(|list_key| active_list_keys.contains(list_key))
+        {
+            submissions.push(WalletPpoiSubmissionStatus {
+                output_commitment: context.output_commitment,
+                last_submission_at,
+            });
+        }
+        if context.output_role == PendingOutputPoiRole::Change {
+            continue;
+        }
         if context.terminal_error.is_some() || recovery_needs_attention {
             status.needs_attention = status.needs_attention.saturating_add(1);
         } else if matching_valid_recovery
@@ -154,7 +151,10 @@ pub(super) fn wallet_ppoi_workflow_status_after_mutations(
             status.awaiting_submission = status.awaiting_submission.saturating_add(1);
         }
     }
-    Ok(status)
+    Ok(WalletPpoiWorkflowProjection {
+        status,
+        submissions: Arc::from(submissions),
+    })
 }
 
 fn wallet_ppoi_workflow_status_after_validation(
@@ -163,7 +163,7 @@ fn wallet_ppoi_workflow_status_after_validation(
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
     retired_output_commitment: FixedBytes<32>,
-) -> Result<WalletPpoiWorkflowStatus, WalletCacheError> {
+) -> Result<WalletPpoiWorkflowProjection, WalletCacheError> {
     let pending_deletes = [retired_output_commitment];
     let recovery_deletes = [retired_output_commitment];
     wallet_ppoi_workflow_status_after_mutations(
@@ -2019,7 +2019,7 @@ async fn apply_poi_private_delta_inline(
                     )
                     .with_sender_transaction_candidate_deletes(&candidate_delete),
                 )?;
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(permit);
@@ -2215,7 +2215,7 @@ async fn apply_poi_private_delta_inline(
                     .with_output_poi_recovery_updates(&absent_recovery_updates)
                     .with_sender_transaction_candidate_deletes(&candidate_delete),
                 )?;
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(permit);
@@ -2331,7 +2331,7 @@ async fn apply_poi_private_delta_inline(
                     .with_pending_output_context_updates(&pending_updates)
                     .with_output_poi_recovery_updates(&recovery_updates),
                 )?;
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(permit);
@@ -2472,7 +2472,7 @@ async fn apply_poi_private_delta_inline(
                     .with_pending_output_context_updates(&pending_updates)
                     .with_output_poi_recovery_updates(&recovery_updates),
                 )?;
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(permit);
@@ -2634,7 +2634,7 @@ async fn apply_poi_private_delta_inline(
                     .with_pending_output_context_updates(&pending_updates)
                     .with_output_poi_recovery_updates(&recovery_updates),
                 )?;
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(permit);
@@ -2735,7 +2735,7 @@ async fn apply_poi_private_delta_inline(
                     )
                     .with_pending_output_context_updates(&pending_updates),
                 )?;
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(permit);
@@ -2942,7 +2942,7 @@ async fn apply_poi_private_delta_inline(
                         .unwrap_or_default();
                     permit.apply_notify_changed(&token, locked, &overlay);
                 }
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_status);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
                 Ok::<(), WalletCacheError>(())
             });
             drop(utxos_locked);
@@ -3058,7 +3058,7 @@ async fn apply_poi_private_delta_inline(
                         .with_pending_output_context_deletes(&pending_deletes)
                         .with_output_poi_recovery_deletes(&recovery_deletes),
                     )?;
-                    permit.apply_publish_ppoi_workflow_status(&token, workflow_candidate);
+                    permit.apply_publish_ppoi_workflow_projection(&token, workflow_candidate);
                     Ok::<(), WalletCacheError>(())
                 });
                 drop(permit);
@@ -3178,7 +3178,7 @@ async fn apply_poi_private_delta_inline(
                         .map_or(&[] as &[WalletUtxo], |locked| locked.as_slice());
                     permit.apply_notify_changed(&token, utxos, &overlay);
                 }
-                permit.apply_publish_ppoi_workflow_status(&token, workflow_candidate);
+                permit.apply_publish_ppoi_workflow_projection(&token, workflow_candidate);
                 Ok::<(), WalletCacheError>(())
             });
             drop(utxos_locked);

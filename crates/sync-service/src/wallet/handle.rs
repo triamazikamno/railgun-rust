@@ -85,6 +85,7 @@ impl WalletPoiRefreshSelection {
     }
 }
 
+use super::pending_output_poi::WalletPpoiWorkflowProjection;
 use super::{
     Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, Mutex,
     Ordering, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OwnedMutexGuard,
@@ -762,13 +763,13 @@ impl WalletPrivateMutationPermit<'_> {
         self.handle.notify_changed_with_projection(utxos, overlay);
     }
 
-    pub(super) fn apply_publish_ppoi_workflow_status(
+    pub(super) fn apply_publish_ppoi_workflow_projection(
         &self,
         _token: &WalletActorApplyToken<'_>,
-        status: WalletPpoiWorkflowStatus,
+        projection: WalletPpoiWorkflowProjection,
     ) {
         if let Some(observation) = self.handle.observation.upgrade() {
-            observation.publish_ppoi_workflow_status(status);
+            observation.publish_ppoi_workflow_projection(projection.status, projection.submissions);
         }
     }
 

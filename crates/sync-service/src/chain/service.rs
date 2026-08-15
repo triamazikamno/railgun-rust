@@ -907,16 +907,23 @@ impl ChainService {
 
     fn spawn_wallet_terminal_reaper(self: &Arc<Self>, handle: WalletHandle) {
         let service = Arc::downgrade(self);
+        let public_data_plane = self.public_data_plane.clone();
+        let actor_id = handle.actor_id();
         let mut observation_rx = handle.subscribe_observation();
         tokio::spawn(async move {
             loop {
-                if observation_rx.borrow().readiness() == &WalletReadiness::Shutdown {
+                let observation = observation_rx.borrow_and_update().clone();
+                public_data_plane
+                    .update_poi_cache_demand(actor_id, &observation)
+                    .await;
+                if observation.readiness() == &WalletReadiness::Shutdown {
                     break;
                 }
                 if observation_rx.changed().await.is_err() {
-                    return;
+                    break;
                 }
             }
+            public_data_plane.clear_poi_cache_demand(actor_id).await;
             if let Some(service) = service.upgrade() {
                 service.reap_terminal_wallet_registration(&handle).await;
             }
