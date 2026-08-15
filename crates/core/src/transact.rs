@@ -56,6 +56,8 @@ pub enum TransactError {
     PlaintextTooShort { len: usize },
     #[error("token hash invalid")]
     InvalidTokenHash,
+    #[error("json parse error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("transact JSON serialization failed")]
     JsonSerialize,
     #[error("transact JSON deserialization failed")]
@@ -656,6 +658,8 @@ impl BroadcasterRawParamsTransact7702 {
         receiver_master_public_key: U256,
         required_poi_list_keys: &[FixedBytes<32>],
     ) -> Result<ParsedTransactCalldata, TransactError> {
+        let chain_type =
+            u8::try_from(self.chain_type).map_err(|_| TransactError::StrictBroadcasterPolicy)?;
         self.validate_finalized_operation(prepared, finalized)?;
 
         if !matches!(
@@ -710,7 +714,7 @@ impl BroadcasterRawParamsTransact7702 {
             let txid_version = supported_txid_version(Some(&self.txid_version))
                 .map_err(|_| TransactError::StrictBroadcasterPolicy)?;
             parsed.fee_note_assurance = Some(FeeNoteAssuranceContext {
-                chain_type: self.chain_type as u8,
+                chain_type,
                 txid_version: txid_version.to_string(),
                 railgun_txid: parsed.railgun_txid,
                 utxo_tree_in: parsed.utxo_tree_in,
@@ -2450,7 +2454,10 @@ mod tests {
         let assurance = parsed
             .fee_note_assurance
             .expect("fee note assurance context");
-        assert_eq!(assurance.chain_type, params.chain_type as u8);
+        assert_eq!(
+            assurance.chain_type,
+            u8::try_from(params.chain_type).expect("fixture chain type")
+        );
         assert_eq!(assurance.txid_version, DEFAULT_TXID_VERSION);
         assert_eq!(assurance.railgun_txid, parsed.railgun_txid);
         assert_eq!(assurance.utxo_tree_in, parsed.utxo_tree_in);
@@ -2480,6 +2487,41 @@ mod tests {
             )
             .expect("strict validation without required POI lists");
         assert!(parsed_without_assurance.fee_note_assurance.is_none());
+    }
+
+    #[test]
+    fn strict_tx7702_chain_type_overflow_rejects_before_encryption() {
+        let (mut params, prepared, finalized, viewing_key_data, _) =
+            strict_fee_validation_fixture(U256::ZERO);
+        params.chain_type = 256;
+
+        assert!(matches!(
+            params.validate_broadcaster_request(
+                &prepared,
+                &finalized,
+                &viewing_key_data.viewing_private_key,
+                viewing_key_data.master_public_key,
+                &[],
+            ),
+            Err(TransactError::StrictBroadcasterPolicy)
+        ));
+
+        let broadcaster_viewing_private_seed = [0x79; 32];
+        let broadcaster_viewing_pubkey = SigningKey::from_bytes(&broadcaster_viewing_private_seed)
+            .verifying_key()
+            .to_bytes();
+        assert!(matches!(
+            EncryptedTransactRequest::encrypt_7702(
+                broadcaster_viewing_pubkey,
+                &params,
+                &prepared,
+                &finalized,
+                &viewing_key_data.viewing_private_key,
+                viewing_key_data.master_public_key,
+                &[],
+            ),
+            Err(TransactError::StrictBroadcasterPolicy)
+        ));
     }
 
     #[test]
@@ -3869,6 +3911,16 @@ mod tests {
         assert_eq!(display, "transact JSON deserialization failed");
         assert!(!debug.contains("MALFORMED-PLAINTEXT"));
         assert!(!display.contains("MALFORMED-PLAINTEXT"));
+    }
+
+    #[test]
+    fn transact_json_error_preserves_public_source_compatibility() {
+        let json_error = serde_json::from_str::<Value>("{")
+            .expect_err("malformed JSON should produce a serde_json error");
+        let error: TransactError = json_error.into();
+
+        assert!(matches!(&error, TransactError::Json(_)));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]

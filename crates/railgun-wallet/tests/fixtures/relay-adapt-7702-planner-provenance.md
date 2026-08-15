@@ -6,7 +6,7 @@ recipes, their authority-owned call order, zero inner values, outer values, and
 zero Railgun adapter fields. Tests consume the committed data directly and do
 not invoke an external generator, package manager, or reference checkout.
 
-The fixture is not copied, cloned, compiled, or derived from the cited
-`Railgun-Privacy/contract` `UNLICENSED` source or test citation. That citation
-is separate behavioral evidence only and is not fixture provenance or a
-deployment claim.
+The cited `Railgun-Privacy/contract` `UNLICENSED` source/tests were inspected
+separately as citation-only behavioral evidence. No source/test content was
+copied, vendored, cloned, compiled, or used to derive this fixture, any vector,
+or any value. The citation is not fixture provenance or a deployment claim.

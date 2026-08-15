@@ -10,7 +10,8 @@ vectors, deployment safety evidence, or source-code audit results.
 - Input file: `inputs.json`
 - Input file SHA-256: `3fda1c2ab1fd1b9523a11e9f9f1c0d8ca13afaa005c7a6536ed92cac7cd566ac`
 - Fixture inputs are committed independently of the reference checkout.
-- Fixtures are independently selected and are not copied, compiled, or derived from the cited `UNLICENSED` source or tests.
+- The cited `UNLICENSED` source/tests were inspected separately as citation-only behavioral evidence.
+- No source/test content was copied, vendored, cloned, compiled, or used to derive any fixture, vector, or value.
 - See [RelayAdapt7702 ABI provenance](../../abi/relay-adapt-7702/PROVENANCE.md) for the pinned source citation and evidence classification; this file does not duplicate that matrix.
 - Runtime tests must not require Node, npm, or the reference checkout.
 
@@ -112,7 +113,8 @@ These files are compatibility evidence only. They do not claim deployment
 bytecode, immutable values, source or deployment safety, implementation
 identity, address mapping, cryptographic proof validity, or validity of the
 dummy Railgun transaction. The cited `Railgun-Privacy/contract` source and
-tests are UNLICENSED citation-only material: they were not read, copied,
-vendored, cloned, compiled, or used to derive any fixture, vector, or value.
+tests are `UNLICENSED` citation-only material: they were inspected separately
+as behavioral evidence. No source/test content was copied, vendored, cloned,
+compiled, or used to derive any fixture, vector, or value.
 Any change to these fixtures requires explicit review of the provenance and
 cross-language outputs.
