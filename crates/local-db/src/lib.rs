@@ -416,6 +416,8 @@ pub enum DbError {
     InvalidLegacyDesktopWalletCacheRowKey { key: String },
     #[error("invalid schema-7 pending-output POI context row {key}")]
     InvalidSchemaSevenPendingOutputPoiContext { key: String },
+    #[error("invalid legacy composite wallet row in {table}: {key}")]
+    InvalidLegacyCompositeWalletRow { table: &'static str, key: String },
     #[error("schema migration destination already exists in {table}: {key}")]
     SchemaMigrationDestinationConflict { table: &'static str, key: String },
     #[error("opaque wallet-private row id must not be empty")]
@@ -4744,6 +4746,13 @@ impl DbStore {
             table.insert(META_KEY, migrated_meta.as_slice())?;
         }
         before_commit()?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn migrate_legacy_composite_wallet_keys(&self) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        migrations::migrate_legacy_composite_wallet_keys(&txn)?;
         txn.commit()?;
         Ok(())
     }
