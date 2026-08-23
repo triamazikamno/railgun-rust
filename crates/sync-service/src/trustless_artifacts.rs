@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::str;
 use std::time::{Duration, Instant, SystemTime};
 
+use blake2b_simd::Params;
 use bytes::Bytes;
 use chrono::Utc;
 use cid::{Cid, Version};
-use futures::{StreamExt, io::Cursor, stream::FuturesUnordered};
+use futures::{StreamExt, future::BoxFuture, io::Cursor, stream::FuturesUnordered};
 use ipld_core::{codec::Codec, ipld::Ipld};
 use ipld_dagpb::{PbLink, PbNode};
 use libp2p_identity::{PeerId, PublicKey};
@@ -14,6 +15,7 @@ use poi::SensitiveUrl;
 use quick_protobuf::BytesReader;
 use reqwest::header::{ACCEPT, HeaderValue};
 use serde_ipld_dagcbor::codec::DagCborCodec;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::debug;
 use url::Url;
@@ -23,6 +25,7 @@ const DAG_PB_CODEC: u64 = 0x70;
 const LIBP2P_KEY_CODEC: u64 = 0x72;
 
 const CAR_ACCEPT: HeaderValue = HeaderValue::from_static("application/vnd.ipld.car");
+const RAW_ACCEPT: HeaderValue = HeaderValue::from_static("application/vnd.ipld.raw");
 const IPNS_RECORD_ACCEPT: HeaderValue =
     HeaderValue::from_static("application/vnd.ipfs.ipns-record");
 
@@ -36,6 +39,8 @@ const ARTIFACT_CAR_FIXED_OVERHEAD_BYTES: usize = 64 * 1024;
 const ARTIFACT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 const ARTIFACT_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS: usize = 8;
+const MAX_CONCURRENT_MANIFEST_CID_REQUESTS: usize = 3;
+const MANIFEST_CID_HEDGE_DELAY: Duration = Duration::from_millis(750);
 const CARV2_PRAGMA: [u8; 11] = [
     0x0a, 0xa1, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x02,
 ];
@@ -67,6 +72,9 @@ struct HttpAttemptTimeouts {
     idle: Duration,
     total: Duration,
 }
+
+type ManifestCidRequestResult = (usize, u128, Result<Vec<u8>, TrustlessArtifactError>);
+type ManifestCidRequest<'a> = BoxFuture<'a, ManifestCidRequestResult>;
 
 impl HttpAttemptTimeouts {
     const PRODUCTION: Self = Self {
@@ -189,10 +197,17 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         &self,
         cid: &str,
     ) -> Result<Vec<u8>, TrustlessArtifactError> {
-        let cid = parse_cid(cid)?;
-        self.fetch_cid_bytes(cid, RetrievalLimits::manifest(), "manifest")
+        self.fetch_manifest_cid_with_metadata(cid)
             .await
             .map(TrustlessArtifactFetchResult::into_bytes)
+    }
+
+    pub(crate) async fn fetch_manifest_cid_with_metadata(
+        &self,
+        cid: &str,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
+        let cid = parse_cid(cid)?;
+        self.fetch_verified_manifest_cid(cid).await
     }
 
     pub(crate) async fn fetch_artifact_cid(
@@ -452,6 +467,195 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         reconstruct_file(cid, &blocks, limits)
     }
 
+    async fn fetch_verified_manifest_cid(
+        &self,
+        cid: Cid,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
+        if self.gateways.is_empty() {
+            return Err(TrustlessArtifactError::NoGateways);
+        }
+        if cid.codec() == RAW_CODEC {
+            raw_multihash_policy(cid)?;
+        }
+
+        let gateway_count = self.gateways.len();
+        let mut next_gateway_index = 0;
+        let mut requests: FuturesUnordered<ManifestCidRequest<'_>> = FuturesUnordered::new();
+        let mut last_error = None;
+
+        let gateway = self.gateways.expose(next_gateway_index);
+        let url = if cid.codec() == RAW_CODEC {
+            raw_gateway_url(gateway, &cid)
+        } else {
+            car_gateway_url(gateway, &cid)
+        };
+        let source = TrustlessHttpSource::Gateway {
+            index: next_gateway_index,
+            count: gateway_count,
+        };
+        requests.push(self.manifest_cid_request(cid, next_gateway_index, url, source));
+        next_gateway_index += 1;
+        let mut next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
+
+        while next_gateway_index < gateway_count || !requests.is_empty() {
+            if requests.is_empty() {
+                let gateway = self.gateways.expose(next_gateway_index);
+                let url = if cid.codec() == RAW_CODEC {
+                    raw_gateway_url(gateway, &cid)
+                } else {
+                    car_gateway_url(gateway, &cid)
+                };
+                let source = TrustlessHttpSource::Gateway {
+                    index: next_gateway_index,
+                    count: gateway_count,
+                };
+                let gateway_index = next_gateway_index;
+                requests.push(self.manifest_cid_request(cid, gateway_index, url, source));
+                next_gateway_index += 1;
+                next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
+                continue;
+            }
+
+            if next_gateway_index < gateway_count
+                && requests.len() < MAX_CONCURRENT_MANIFEST_CID_REQUESTS
+            {
+                tokio::select! {
+                    biased;
+                    result = requests.next() => {
+                        let Some((gateway_index, elapsed_ms, result)) = result else { continue };
+                        match result {
+                            Ok(bytes) => {
+                                debug!(
+                                    gateway_index,
+                                    gateway_count,
+                                    cid = %cid,
+                                    bytes = bytes.len(),
+                                    elapsed_ms,
+                                    attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                                    representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
+                                    "verified CID gateway fetch succeeded"
+                                );
+                                return Ok(TrustlessArtifactFetchResult {
+                                    verified_cid: cid.to_string(),
+                                    bytes,
+                                    gateway_index,
+                                    gateway_count,
+                                });
+                            }
+                            Err(error) => {
+                                debug!(
+                                    ?error,
+                                    gateway_index,
+                                    gateway_count,
+                                    cid = %cid,
+                                    elapsed_ms,
+                                    attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                                    representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
+                                    "verified CID gateway fetch failed"
+                                );
+                                last_error = Some(error);
+                                // A failed request frees a slot immediately; do not wait for the hedge timer.
+                                next_launch_at = tokio::time::Instant::now();
+                            }
+                        }
+                    }
+                    () = tokio::time::sleep_until(next_launch_at) => {
+                        let gateway_index = next_gateway_index;
+                        let gateway = self.gateways.expose(gateway_index);
+                        let url = if cid.codec() == RAW_CODEC {
+                            raw_gateway_url(gateway, &cid)
+                        } else {
+                            car_gateway_url(gateway, &cid)
+                        };
+                        let source = TrustlessHttpSource::Gateway {
+                            index: gateway_index,
+                            count: gateway_count,
+                        };
+                        requests.push(self.manifest_cid_request(cid, gateway_index, url, source));
+                        next_gateway_index += 1;
+                        next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
+                    }
+                }
+            } else if let Some((gateway_index, elapsed_ms, result)) = requests.next().await {
+                match result {
+                    Ok(bytes) => {
+                        debug!(
+                            gateway_index,
+                            gateway_count,
+                            cid = %cid,
+                            bytes = bytes.len(),
+                            elapsed_ms,
+                            attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                            representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
+                            "verified CID gateway fetch succeeded"
+                        );
+                        return Ok(TrustlessArtifactFetchResult {
+                            verified_cid: cid.to_string(),
+                            bytes,
+                            gateway_index,
+                            gateway_count,
+                        });
+                    }
+                    Err(error) => {
+                        debug!(
+                            ?error,
+                            gateway_index,
+                            gateway_count,
+                            cid = %cid,
+                            elapsed_ms,
+                            attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                            representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
+                            "verified CID gateway fetch failed"
+                        );
+                        last_error = Some(error);
+                        next_launch_at = tokio::time::Instant::now();
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(TrustlessArtifactError::NoGateways))
+    }
+
+    fn manifest_cid_request(
+        &self,
+        cid: Cid,
+        gateway_index: usize,
+        url: Url,
+        source: TrustlessHttpSource,
+    ) -> ManifestCidRequest<'_> {
+        Box::pin(async move {
+            let attempt_started = Instant::now();
+            let result = self.fetch_verified_cid_from_url(cid, &url, source).await;
+            (gateway_index, attempt_started.elapsed().as_millis(), result)
+        })
+    }
+
+    async fn fetch_verified_cid_from_url(
+        &self,
+        cid: Cid,
+        url: &Url,
+        source: TrustlessHttpSource,
+    ) -> Result<Vec<u8>, TrustlessArtifactError> {
+        let limits = RetrievalLimits::manifest();
+        if cid.codec() == RAW_CODEC {
+            let bytes = fetch_response_bytes_with_timeouts(
+                self.client,
+                url,
+                source,
+                Some(RAW_ACCEPT),
+                limits.reconstructed_bytes,
+                self.timeouts,
+            )
+            .await?;
+            verify_raw_cid_bytes(cid, &bytes)?;
+            Ok(bytes)
+        } else {
+            self.fetch_cid_bytes_from_url(cid, url, source, limits)
+                .await
+        }
+    }
+
     async fn fetch_ipns_record_candidate(
         &self,
         url: &Url,
@@ -469,6 +673,20 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         .await?;
         verify_ipns_record_candidate(&bytes, peer_id)
     }
+}
+
+/// Fetches and verifies a manifest-sized artifact from the configured gateways.
+pub async fn fetch_verified_cid(
+    client: &reqwest::Client,
+    gateways: &[Url],
+    cid: &str,
+) -> Result<Vec<u8>, VerifiedCidError> {
+    let cid = parse_cid(cid).map_err(VerifiedCidError::from)?;
+    TrustlessArtifactFetcher::new(client, gateways)
+        .fetch_verified_manifest_cid(cid)
+        .await
+        .map(TrustlessArtifactFetchResult::into_bytes)
+        .map_err(VerifiedCidError::from)
 }
 
 pub(crate) async fn fetch_manifest_url(
@@ -1138,6 +1356,45 @@ fn parse_cid(value: &str) -> Result<Cid, TrustlessArtifactError> {
     Cid::try_from(value).map_err(|source| TrustlessArtifactError::InvalidCid { source })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RawMultihash {
+    Identity,
+    Sha2_256,
+    Blake2b256,
+}
+
+const fn raw_multihash_policy(cid: Cid) -> Result<RawMultihash, TrustlessArtifactError> {
+    match cid.hash().code() {
+        0x00 => Ok(RawMultihash::Identity),
+        0x12 => Ok(RawMultihash::Sha2_256),
+        0xb220 => Ok(RawMultihash::Blake2b256),
+        code => Err(TrustlessArtifactError::UnsupportedMultihash { cid, code }),
+    }
+}
+
+fn verify_raw_cid_bytes(cid: Cid, bytes: &[u8]) -> Result<(), TrustlessArtifactError> {
+    let multihash = raw_multihash_policy(cid)?;
+    let matches = match multihash {
+        RawMultihash::Identity => cid.hash().digest() == bytes,
+        RawMultihash::Sha2_256 => {
+            let digest = Sha256::digest(bytes);
+            cid.hash().digest() == &digest[..]
+        }
+        RawMultihash::Blake2b256 => {
+            let digest = Params::new()
+                .hash_length(32)
+                .to_state()
+                .update(bytes)
+                .finalize();
+            cid.hash().digest() == digest.as_bytes()
+        }
+    };
+    if !matches {
+        return Err(TrustlessArtifactError::RawCidDigestMismatch { cid });
+    }
+    Ok(())
+}
+
 fn car_gateway_url(gateway: &Url, cid: &Cid) -> Url {
     let mut url = gateway_resource_url(gateway, "ipfs", &cid.to_string());
     {
@@ -1145,6 +1402,12 @@ fn car_gateway_url(gateway: &Url, cid: &Cid) -> Url {
         query.append_pair("format", "car");
         query.append_pair("dag-scope", "entity");
     }
+    url
+}
+
+fn raw_gateway_url(gateway: &Url, cid: &Cid) -> Url {
+    let mut url = gateway_resource_url(gateway, "ipfs", &cid.to_string());
+    url.query_pairs_mut().append_pair("format", "raw");
     url
 }
 
@@ -1306,6 +1569,10 @@ pub(crate) enum TrustlessArtifactError {
     MissingBlock { cid: Cid },
     #[error("POI artifact CID {cid} uses unsupported codec {codec:#x}")]
     UnsupportedCodec { cid: Cid, codec: u64 },
+    #[error("CID {cid} uses unsupported multihash code {code:#x}")]
+    UnsupportedMultihash { cid: Cid, code: u64 },
+    #[error("raw CID {cid} bytes failed multihash verification")]
+    RawCidDigestMismatch { cid: Cid },
     #[error("POI artifact DAG-PB decode failed")]
     DagPb(#[from] ipld_dagpb::Error),
     #[error("POI artifact UnixFS Data decode failed")]
@@ -1363,6 +1630,19 @@ pub(crate) enum TrustlessArtifactError {
     },
     #[error("no valid IPNS records were returned by configured gateways")]
     NoValidIpnsRecords,
+}
+
+#[derive(Debug, Error)]
+#[error("verified CID fetch failed")]
+pub struct VerifiedCidError {
+    #[source]
+    source: TrustlessArtifactError,
+}
+
+impl From<TrustlessArtifactError> for VerifiedCidError {
+    fn from(source: TrustlessArtifactError) -> Self {
+        Self { source }
+    }
 }
 
 #[cfg(test)]
@@ -2559,6 +2839,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_verified_cid_fetch_accepts_matching_bytes_and_rejects_tampering() {
+        let bytes = b"verified manifest bytes".to_vec();
+        let cid = raw_cid(&bytes);
+        let valid = spawn_once_server(200, bytes.clone());
+        let client = reqwest::Client::new();
+        let gateways = [valid.url.clone()];
+
+        assert_eq!(
+            fetch_verified_cid(&client, &gateways, &cid.to_string())
+                .await
+                .expect("matching CID bytes pass"),
+            bytes
+        );
+        assert_eq!(valid.request_path(), format!("/ipfs/{cid}?format=raw"));
+
+        let tampered = spawn_once_server(200, b"tampered".to_vec());
+        let error = fetch_verified_cid(
+            &client,
+            std::slice::from_ref(&tampered.url),
+            &cid.to_string(),
+        )
+        .await
+        .expect_err("tampered bytes are rejected");
+        assert_eq!(error.to_string(), "verified CID fetch failed");
+        assert!(error.source().is_some());
+    }
+
+    #[tokio::test]
+    async fn public_verified_cid_fetch_supports_blake2b_256_raw_bytes() {
+        let bytes = b"blake2b raw bytes".to_vec();
+        let cid = blake2b_256_cid(&bytes);
+        let valid = spawn_once_server(200, bytes.clone());
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            fetch_verified_cid(&client, std::slice::from_ref(&valid.url), &cid.to_string())
+                .await
+                .expect("matching BLAKE2b-256 CID bytes pass"),
+            bytes
+        );
+        assert_eq!(valid.request_path(), format!("/ipfs/{cid}?format=raw"));
+
+        let tampered = spawn_once_server(200, b"tampered".to_vec());
+        let error = fetch_verified_cid(
+            &client,
+            std::slice::from_ref(&tampered.url),
+            &cid.to_string(),
+        )
+        .await
+        .expect_err("tampered BLAKE2b-256 bytes are rejected");
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<TrustlessArtifactError>()),
+            Some(TrustlessArtifactError::RawCidDigestMismatch { cid: actual })
+                if actual == &cid
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_verified_cid_fetch_supports_identity_raw_bytes() {
+        let bytes = b"identity raw bytes".to_vec();
+        let cid = identity_cid(&bytes);
+        let valid = spawn_once_server(200, bytes.clone());
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            fetch_verified_cid(&client, std::slice::from_ref(&valid.url), &cid.to_string())
+                .await
+                .expect("matching identity CID bytes pass"),
+            bytes
+        );
+        assert_eq!(valid.request_path(), format!("/ipfs/{cid}?format=raw"));
+
+        let tampered = spawn_once_server(200, b"tampered".to_vec());
+        let error = fetch_verified_cid(
+            &client,
+            std::slice::from_ref(&tampered.url),
+            &cid.to_string(),
+        )
+        .await
+        .expect_err("tampered identity bytes are rejected");
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<TrustlessArtifactError>()),
+            Some(TrustlessArtifactError::RawCidDigestMismatch { cid: actual })
+                if actual == &cid
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_verified_cid_fetch_rejects_unsupported_raw_multihash_before_request() {
+        let gateway = spawn_controlled_chunk_server();
+        let cid = cid_with_digest(0x13, &[0; 64]);
+        let error = fetch_verified_cid(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&gateway.url),
+            &cid.to_string(),
+        )
+        .await
+        .expect_err("unsupported raw multihash is rejected");
+
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<TrustlessArtifactError>()),
+            Some(TrustlessArtifactError::UnsupportedMultihash { code: 0x13, .. })
+        ));
+        gateway.assert_no_request();
+    }
+
+    #[tokio::test]
+    async fn public_verified_cid_fetch_reconstructs_dag_pb_from_car() {
+        let leaf = raw_cid(b"dag-pb payload");
+        let root_block = dag_pb_file_node(b"", &[(leaf, "payload", 14)], Some(14));
+        let root = dag_pb_cid(&root_block);
+        let gateway = spawn_once_server(
+            200,
+            car_bytes(
+                root,
+                &[(root, root_block), (leaf, b"dag-pb payload".to_vec())],
+            ),
+        );
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            fetch_verified_cid(
+                &client,
+                std::slice::from_ref(&gateway.url),
+                &root.to_string()
+            )
+            .await
+            .expect("DAG-PB CAR reconstructs"),
+            b"dag-pb payload"
+        );
+        assert_eq!(
+            gateway.request_path(),
+            format!("/ipfs/{root}?format=car&dag-scope=entity")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manifest_cid_fetch_hedges_slow_first_gateway_and_reports_winner() {
+        let bytes = b"hedged verified bytes".to_vec();
+        let cid = raw_cid(&bytes);
+        let slow = spawn_controlled_chunk_server();
+        let healthy = spawn_controlled_chunk_server();
+        let gateways = [slow.url.clone(), healthy.url.clone()];
+        let task = tokio::spawn(async move {
+            TrustlessArtifactFetcher::new(&reqwest::Client::new(), &gateways)
+                .fetch_manifest_cid_with_metadata(&cid.to_string())
+                .await
+        });
+
+        assert_eq!(
+            slow.wait_for_request().await,
+            format!("/ipfs/{cid}?format=raw")
+        );
+        tokio::time::advance(MANIFEST_CID_HEDGE_DELAY).await;
+        assert_eq!(
+            healthy.wait_for_request().await,
+            format!("/ipfs/{cid}?format=raw")
+        );
+        healthy.send_headers(200);
+        healthy.send_chunk(bytes.clone());
+        healthy.finish();
+
+        let fetched = task
+            .await
+            .expect("join hedged fetch")
+            .expect("healthy gateway");
+        assert_eq!(fetched.bytes(), bytes);
+        assert_eq!(fetched.gateway_index(), 1);
+        assert_eq!(fetched.gateway_count(), 2);
+
+        // Release the stalled server thread after the successful request cancels its future.
+        slow.send_headers(500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_verified_cid_fetch_launches_fallback_immediately_after_full_pool_failure() {
+        let bytes = b"fallback verified bytes".to_vec();
+        let cid = raw_cid(&bytes);
+        let servers = (0..4)
+            .map(|_| spawn_controlled_chunk_server())
+            .collect::<Vec<_>>();
+        let gateways = servers
+            .iter()
+            .map(|server| server.url.clone())
+            .collect::<Vec<_>>();
+        let cid_string = cid.to_string();
+        let task = tokio::spawn(async move {
+            fetch_verified_cid(&reqwest::Client::new(), &gateways, &cid_string).await
+        });
+
+        let expected_path = format!("/ipfs/{cid}?format=raw");
+        assert_eq!(servers[0].wait_for_request().await, expected_path);
+        tokio::time::advance(MANIFEST_CID_HEDGE_DELAY).await;
+        assert_eq!(servers[1].wait_for_request().await, expected_path);
+        tokio::time::advance(MANIFEST_CID_HEDGE_DELAY).await;
+        assert_eq!(servers[2].wait_for_request().await, expected_path);
+        servers[3].assert_no_request();
+
+        let failure_at = tokio::time::Instant::now();
+        servers[2].send_headers(500);
+        servers[2].finish();
+        assert_eq!(servers[3].wait_for_request().await, expected_path);
+        assert_eq!(tokio::time::Instant::now(), failure_at);
+
+        servers[3].send_headers(200);
+        servers[3].send_chunk(bytes);
+        servers[3].finish();
+        assert_eq!(
+            task.await
+                .expect("join fallback fetch")
+                .expect("fallback gateway succeeds"),
+            b"fallback verified bytes"
+        );
+
+        // Release the stalled server threads after the successful request cancels their futures.
+        servers[0].send_headers(500);
+        servers[1].send_headers(500);
+    }
+
+    #[tokio::test]
     async fn no_valid_ipns_records_is_reported() {
         let keypair = test_ipns_keypair();
         let name = ipns_name(&keypair);
@@ -2577,6 +3083,26 @@ mod tests {
 
     fn raw_cid(bytes: &[u8]) -> Cid {
         Cid::new_v1(RAW_CODEC, Code::Sha2_256.digest(bytes))
+    }
+
+    fn cid_with_digest(code: u64, digest: &[u8]) -> Cid {
+        Cid::new_v1(
+            RAW_CODEC,
+            cid::multihash::Multihash::wrap(code, digest).expect("valid test multihash"),
+        )
+    }
+
+    fn blake2b_256_cid(bytes: &[u8]) -> Cid {
+        let digest = Params::new()
+            .hash_length(32)
+            .to_state()
+            .update(bytes)
+            .finalize();
+        cid_with_digest(0xb220, digest.as_bytes())
+    }
+
+    fn identity_cid(bytes: &[u8]) -> Cid {
+        cid_with_digest(0x00, bytes)
     }
 
     fn reconstruct_for_test(

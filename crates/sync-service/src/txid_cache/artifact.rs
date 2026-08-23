@@ -126,10 +126,12 @@ impl TxidPublicArtifactSource {
                 stable_current: Vec::new(),
             });
         }
-        let manifest = self
+        let manifest_fetch = self
             .client
-            .fetch_manifest(&self.scope, None, SystemTime::now())
+            .fetch_manifest_with_metadata(&self.scope, None, SystemTime::now())
             .await?;
+        let manifest = manifest_fetch.manifest;
+        let preferred_gateway_index = manifest_fetch.preferred_gateway_index;
         let Some(chain_entry) = manifest
             .chains
             .iter()
@@ -147,7 +149,10 @@ impl TxidPublicArtifactSource {
             self.catalog_may_contain_txid_partition(catalog)
                 && catalog.range.intersects(from_index, range_end)
         }) {
-            catalogs.push(self.fetch_stream_catalog(catalog_descriptor).await?);
+            catalogs.push(
+                self.fetch_stream_catalog(catalog_descriptor, preferred_gateway_index)
+                    .await?,
+            );
         }
         if let Some(context_start) =
             self.required_prior_context_start(&catalogs, from_index, range_end)
@@ -158,7 +163,10 @@ impl TxidPublicArtifactSource {
                     && !catalog.range.intersects(from_index, range_end)
                     && catalog.range.intersects(context_start, context_end)
             }) {
-                catalogs.push(self.fetch_stream_catalog(catalog_descriptor).await?);
+                catalogs.push(
+                    self.fetch_stream_catalog(catalog_descriptor, preferred_gateway_index)
+                        .await?,
+                );
             }
         }
         let plan = IndexedArtifactStreamPlan::plan(
@@ -244,9 +252,12 @@ impl TxidPublicArtifactSource {
     async fn fetch_stream_catalog(
         &self,
         descriptor: &IndexedArtifactDescriptor,
+        preferred_gateway_index: Option<usize>,
     ) -> Result<IndexedArtifactStreamCatalog, TxidPublicCacheError> {
         Ok(IndexedArtifactStreamCatalog::from(
-            self.client.fetch_catalog(descriptor).await?,
+            self.client
+                .fetch_catalog_with_preferred_gateway(descriptor, preferred_gateway_index)
+                .await?,
         ))
     }
 }

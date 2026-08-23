@@ -31,7 +31,9 @@ pub use railgun_indexed_artifacts::{
     LatestIndexedHeight, PublisherIdentity, PublisherKeyAlgorithm, format_scope,
 };
 
-use crate::trustless_artifacts::{TrustlessArtifactError, TrustlessArtifactFetcher};
+use crate::trustless_artifacts::{
+    TrustlessArtifactError, TrustlessArtifactFetchResult, TrustlessArtifactFetcher,
+};
 use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
 
 const INDEXED_ARTIFACT_MAINTENANCE_CAPACITY: usize = 8;
@@ -303,6 +305,11 @@ pub struct VerifiedIndexedArtifactCatalog {
     pub catalog: IndexedArtifactCatalog,
 }
 
+pub(crate) struct IndexedArtifactManifestFetchResult {
+    pub(crate) manifest: IndexedArtifactManifest,
+    pub(crate) preferred_gateway_index: Option<usize>,
+}
+
 impl VerifiedIndexedArtifactCatalog {
     #[must_use]
     pub fn into_catalog(self) -> IndexedArtifactCatalog {
@@ -527,6 +534,17 @@ impl IndexedArtifactManifestClient {
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
     ) -> Result<IndexedArtifactManifest, IndexedArtifactManifestError> {
+        self.fetch_manifest_with_metadata(expected_scope, last_accepted_sequence, now)
+            .await
+            .map(|result| result.manifest)
+    }
+
+    pub(crate) async fn fetch_manifest_with_metadata(
+        &self,
+        expected_scope: &ChainScope,
+        last_accepted_sequence: Option<u64>,
+        now: SystemTime,
+    ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
         match &self.config.manifest_source {
             IndexedArtifactManifestSource::Url(url) => {
                 let started = Instant::now();
@@ -536,7 +554,6 @@ impl IndexedArtifactManifestClient {
                         Err(err) => {
                             debug!(
                                 ?err,
-                                url = %url,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 "indexed artifact manifest URL fetch failed"
                             );
@@ -553,7 +570,6 @@ impl IndexedArtifactManifestClient {
                     Err(err) => {
                         debug!(
                             ?err,
-                            url = %url,
                             bytes = bytes.len(),
                             elapsed_ms = started.elapsed().as_millis(),
                             "indexed artifact manifest URL verification failed"
@@ -562,13 +578,15 @@ impl IndexedArtifactManifestClient {
                     }
                 };
                 debug!(
-                    url = %url,
                     bytes = bytes.len(),
                     manifest_sequence = manifest.sequence,
                     elapsed_ms = started.elapsed().as_millis(),
                     "fetched indexed artifact manifest from explicit URL"
                 );
-                Ok(manifest)
+                Ok(IndexedArtifactManifestFetchResult {
+                    manifest,
+                    preferred_gateway_index: None,
+                })
             }
             IndexedArtifactManifestSource::Cid(cid) => {
                 self.fetch_manifest_from_cid(cid, expected_scope, last_accepted_sequence, now)
@@ -590,12 +608,33 @@ impl IndexedArtifactManifestClient {
         &self,
         descriptor: &IndexedArtifactDescriptor,
     ) -> Result<VerifiedIndexedArtifactCatalog, IndexedArtifactManifestError> {
+        self.fetch_catalog_with_preferred_gateway(descriptor, None)
+            .await
+    }
+
+    pub(crate) async fn fetch_catalog_with_preferred_gateway(
+        &self,
+        descriptor: &IndexedArtifactDescriptor,
+        preferred_gateway_index: Option<usize>,
+    ) -> Result<VerifiedIndexedArtifactCatalog, IndexedArtifactManifestError> {
         validate_catalog_descriptor_for_expansion(descriptor)?;
         let started = Instant::now();
-        let bytes = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
-            .fetch_artifact_cid(&descriptor.cid, descriptor.byte_size)
-            .await
-        {
+        let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
+        let bytes = match match preferred_gateway_index {
+            Some(preferred_gateway_index) => fetcher
+                .fetch_artifact_cid_with_metadata_from_gateway(
+                    &descriptor.cid,
+                    descriptor.byte_size,
+                    preferred_gateway_index,
+                )
+                .await
+                .map(TrustlessArtifactFetchResult::into_bytes),
+            None => {
+                fetcher
+                    .fetch_artifact_cid(&descriptor.cid, descriptor.byte_size)
+                    .await
+            }
+        } {
             Ok(bytes) => bytes,
             Err(err) => {
                 debug!(
@@ -880,10 +919,10 @@ impl IndexedArtifactManifestClient {
         expected_scope: &ChainScope,
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
-    ) -> Result<IndexedArtifactManifest, IndexedArtifactManifestError> {
+    ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
         let started = Instant::now();
-        let bytes = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
-            .fetch_manifest_cid(cid)
+        let fetched = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
+            .fetch_manifest_cid_with_metadata(cid)
             .await
         {
             Ok(bytes) => bytes,
@@ -897,28 +936,35 @@ impl IndexedArtifactManifestClient {
                 return Err(err.into());
             }
         };
-        let manifest =
-            match self.verify_manifest_bytes(&bytes, expected_scope, last_accepted_sequence, now) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    debug!(
-                        ?err,
-                        cid,
-                        bytes = bytes.len(),
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "indexed artifact manifest CID verification failed"
-                    );
-                    return Err(err);
-                }
-            };
+        let manifest = match self.verify_manifest_bytes(
+            fetched.bytes(),
+            expected_scope,
+            last_accepted_sequence,
+            now,
+        ) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                debug!(
+                    ?err,
+                    cid,
+                    bytes = fetched.bytes().len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "indexed artifact manifest CID verification failed"
+                );
+                return Err(err);
+            }
+        };
         debug!(
             cid,
-            bytes = bytes.len(),
+            bytes = fetched.bytes().len(),
             manifest_sequence = manifest.sequence,
             elapsed_ms = started.elapsed().as_millis(),
             "fetched trustless indexed artifact manifest CID"
         );
-        Ok(manifest)
+        Ok(IndexedArtifactManifestFetchResult {
+            manifest,
+            preferred_gateway_index: Some(fetched.gateway_index()),
+        })
     }
 
     async fn fetch_manifest_from_ipns_name(
@@ -927,16 +973,19 @@ impl IndexedArtifactManifestClient {
         expected_scope: &ChainScope,
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
-    ) -> Result<IndexedArtifactManifest, IndexedArtifactManifestError> {
+    ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
         let started = Instant::now();
         let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
         let candidates = fetcher.resolve_ipns_manifest_candidates(name).await?;
         let candidate_count = candidates.len();
         let mut last_error = None;
         for (candidate_index, candidate) in candidates.into_iter().enumerate() {
-            match fetcher.fetch_manifest_cid(&candidate.cid.to_string()).await {
-                Ok(bytes) => match self.verify_manifest_bytes(
-                    &bytes,
+            match fetcher
+                .fetch_manifest_cid_with_metadata(&candidate.cid.to_string())
+                .await
+            {
+                Ok(fetched) => match self.verify_manifest_bytes(
+                    fetched.bytes(),
                     expected_scope,
                     last_accepted_sequence,
                     now,
@@ -952,7 +1001,10 @@ impl IndexedArtifactManifestClient {
                             elapsed_ms = started.elapsed().as_millis(),
                             "fetched trustless indexed artifact manifest through verified IPNS"
                         );
-                        return Ok(manifest);
+                        return Ok(IndexedArtifactManifestFetchResult {
+                            manifest,
+                            preferred_gateway_index: Some(fetched.gateway_index()),
+                        });
                     }
                     Err(err) => {
                         debug!(
@@ -2011,24 +2063,17 @@ mod tests {
         let invalid_manifest_cid = raw_cid(&invalid_manifest_bytes);
 
         let ipns_path = format!("/ipns/{ipns_name}?format=ipns-record");
-        let invalid_manifest_path =
-            format!("/ipfs/{invalid_manifest_cid}?format=car&dag-scope=entity");
-        let valid_manifest_path = format!("/ipfs/{valid_manifest_cid}?format=car&dag-scope=entity");
+        let invalid_manifest_path = format!("/ipfs/{invalid_manifest_cid}?format=raw");
+        let valid_manifest_path = format!("/ipfs/{valid_manifest_cid}?format=raw");
         let high_gateway = PathServer::spawn(
             HashMap::from([
                 (
                     ipns_path.clone(),
                     ipns_record(&ipns_keypair, format!("/ipfs/{invalid_manifest_cid}"), 2),
                 ),
-                (
-                    invalid_manifest_path,
-                    car_bytes(
-                        invalid_manifest_cid,
-                        &[(invalid_manifest_cid, invalid_manifest_bytes)],
-                    ),
-                ),
+                (invalid_manifest_path, invalid_manifest_bytes),
             ]),
-            3,
+            4,
         );
         let low_gateway = PathServer::spawn(
             HashMap::from([
@@ -2036,15 +2081,9 @@ mod tests {
                     ipns_path,
                     ipns_record(&ipns_keypair, format!("/ipfs/{valid_manifest_cid}"), 1),
                 ),
-                (
-                    valid_manifest_path,
-                    car_bytes(
-                        valid_manifest_cid,
-                        &[(valid_manifest_cid, valid_manifest_bytes)],
-                    ),
-                ),
+                (valid_manifest_path, valid_manifest_bytes),
             ]),
-            2,
+            3,
         );
         let mut config = config(trusted_signing_key.verifying_key().to_bytes(), None);
         config.manifest_source = IndexedArtifactManifestSource::IpnsName(ipns_name);
@@ -2429,8 +2468,12 @@ mod tests {
             descriptor.cid.clone(),
             ChunkResponse::new(&bytes, Duration::ZERO),
         )]));
+        let skipped = ChunkServer::spawn(HashMap::from([(
+            descriptor.cid.clone(),
+            ChunkResponse::new(&bytes, Duration::ZERO),
+        )]));
         let mut source_config = config([7_u8; 32], None);
-        source_config.gateway_urls = vec![server.url.clone()];
+        source_config.gateway_urls = vec![server.url.clone(), skipped.url.clone()];
         let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
 
         let verified = client
@@ -2441,6 +2484,86 @@ mod tests {
         assert!(verified.catalog.chunks.is_empty());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(server.max_active(), 1, "catalog should be fetched once");
+        assert!(
+            skipped.request_paths().is_empty(),
+            "default catalog starts at gateway 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_url_manifest_has_no_preferred_gateway() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let scope = scope();
+        let mut manifest = manifest_for_scope(scope.clone(), now_ms());
+        manifest.sign_manifest(&signing_key).expect("sign manifest");
+        let bytes = serde_json::to_vec(&manifest).expect("manifest json");
+        let server = PathServer::spawn(HashMap::from([("/manifest".to_string(), bytes)]), 1);
+        let url = server.url.join("/manifest").expect("manifest URL");
+        let mut source_config = config(signing_key.verifying_key().to_bytes(), None);
+        source_config.manifest_source = IndexedArtifactManifestSource::Url(url);
+        let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
+
+        let fetched = client
+            .fetch_manifest_with_metadata(
+                &scope,
+                None,
+                UNIX_EPOCH + Duration::from_millis(now_ms()),
+            )
+            .await
+            .expect("explicit URL manifest verifies");
+
+        assert_eq!(fetched.preferred_gateway_index, None);
+        assert_eq!(fetched.manifest.sequence, manifest.sequence);
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_preferred_gateway_wraps_after_verification_failure() {
+        let scope = scope();
+        let catalog = IndexedArtifactCatalog {
+            format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope: scope.clone(),
+            chunks: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&catalog).expect("catalog json");
+        let cid = raw_cid(&bytes);
+        let mut descriptor = catalog_descriptor_with_metadata(
+            scope,
+            0,
+            50,
+            0,
+            &bytes,
+            DatasetDescriptorMetadata::default(),
+        );
+        descriptor.cid = cid.to_string();
+        let first = ChunkServer::spawn(HashMap::from([(
+            descriptor.cid.clone(),
+            ChunkResponse::new(&bytes, Duration::ZERO),
+        )]));
+        let skipped = ChunkServer::spawn(HashMap::from([(
+            descriptor.cid.clone(),
+            ChunkResponse::new(&bytes, Duration::ZERO),
+        )]));
+        let preferred = ChunkServer::spawn(HashMap::from([(
+            descriptor.cid.clone(),
+            ChunkResponse::new(b"wrong catalog bytes", Duration::ZERO),
+        )]));
+        let mut source_config = config([7_u8; 32], None);
+        source_config.gateway_urls = vec![
+            first.url.clone(),
+            skipped.url.clone(),
+            preferred.url.clone(),
+        ];
+        let client = IndexedArtifactManifestClient::new(source_config, reqwest::Client::new());
+
+        client
+            .fetch_catalog_with_preferred_gateway(&descriptor, Some(2))
+            .await
+            .expect("fallback catalog verifies");
+
+        assert_eq!(preferred.request_paths().len(), 1);
+        assert_eq!(first.request_paths().len(), 1);
+        assert!(skipped.request_paths().is_empty());
     }
 
     #[test]
@@ -3113,6 +3236,7 @@ mod tests {
     struct ChunkServer {
         url: Url,
         max_active: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl ChunkServer {
@@ -3153,11 +3277,19 @@ mod tests {
                 }
             });
 
-            Self { url, max_active }
+            Self {
+                url,
+                max_active,
+                requests,
+            }
         }
 
         fn max_active(&self) -> usize {
             self.max_active.load(AtomicOrdering::SeqCst)
+        }
+
+        fn request_paths(&self) -> Vec<String> {
+            self.requests.lock().expect("requests lock").clone()
         }
     }
 

@@ -381,10 +381,12 @@ impl IndexedWalletArtifactSession {
                 WALLET_ARTIFACT_MANIFEST_START_PROGRESS,
             );
         }
-        let manifest = client
-            .fetch_manifest(&scope, None, SystemTime::now())
+        let manifest_fetch = client
+            .fetch_manifest_with_metadata(&scope, None, SystemTime::now())
             .await
             .map_err(|err| wallet_artifact_error(&err))?;
+        let manifest = manifest_fetch.manifest;
+        let preferred_gateway_index = manifest_fetch.preferred_gateway_index;
         let manifest_elapsed_ms = manifest_started.elapsed().as_millis();
         if public_data_plane.current_epoch() == read_scope.epoch() {
             send_wallet_artifact_preparation_progress(
@@ -408,6 +410,7 @@ impl IndexedWalletArtifactSession {
             &scope,
             from_block,
             advertised_target_block,
+            preferred_gateway_index,
         )
         .await?;
         let IndexedWalletArtifactDescriptorFetchResult {
@@ -635,6 +638,7 @@ impl IndexedWalletArtifactSession {
         scope: &ChainScope,
         from_block: u64,
         target_block: u64,
+        preferred_gateway_index: Option<usize>,
     ) -> Result<IndexedWalletArtifactDescriptorFetchResult, SyncError> {
         let mut candidate_catalogs = Vec::new();
         for catalog_descriptor in chain_entry.catalogs.iter().filter(|catalog| {
@@ -647,7 +651,7 @@ impl IndexedWalletArtifactSession {
             )
         }) {
             let catalog = client
-                .fetch_catalog(catalog_descriptor)
+                .fetch_catalog_with_preferred_gateway(catalog_descriptor, preferred_gateway_index)
                 .await
                 .map_err(|err| wallet_artifact_error(&err))?;
             candidate_catalogs.push(IndexedArtifactStreamCatalog::from(catalog));

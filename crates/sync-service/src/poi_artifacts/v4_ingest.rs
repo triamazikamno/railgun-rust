@@ -1383,9 +1383,8 @@ mod tests {
         .expect("delayed manifest IPNS record")
         .encode()
         .expect("encode delayed manifest IPNS record");
-        let manifest_car = delayed_raw_car(manifest_cid, &manifest_bytes);
         let (gateway, manifest_request_started, release_manifest) =
-            spawn_delayed_manifest_gateway(ipns_record, manifest_car);
+            spawn_delayed_manifest_gateway(ipns_record, manifest_bytes);
         let persistence =
             PoiArtifactPersistenceHandle::new(db, Arc::new(tokio::sync::Mutex::new(())));
         let ingestor = PoiArtifactIngestor::new(
@@ -1434,69 +1433,6 @@ mod tests {
 
     fn delayed_raw_cid(bytes: &[u8]) -> Cid {
         Cid::new_v1(0x55, Code::Sha2_256.digest(bytes))
-    }
-
-    fn delayed_raw_car(root: Cid, block: &[u8]) -> Vec<u8> {
-        let header = delayed_car_header(root);
-        let cid_bytes = root.to_bytes();
-        let mut car = Vec::new();
-        delayed_write_varint(header.len(), &mut car);
-        car.extend_from_slice(&header);
-        delayed_write_varint(cid_bytes.len() + block.len(), &mut car);
-        car.extend_from_slice(&cid_bytes);
-        car.extend_from_slice(block);
-        car
-    }
-
-    fn delayed_car_header(root: Cid) -> Vec<u8> {
-        let mut header = Vec::new();
-        header.push(0xa2);
-        delayed_write_cbor_text("roots", &mut header);
-        header.push(0x81);
-        header.extend_from_slice(&[0xd8, 0x2a]);
-        let mut cid_link = vec![0_u8];
-        cid_link.extend_from_slice(&root.to_bytes());
-        delayed_write_cbor_bytes(&cid_link, &mut header);
-        delayed_write_cbor_text("version", &mut header);
-        header.push(0x01);
-        header
-    }
-
-    fn delayed_write_cbor_text(value: &str, out: &mut Vec<u8>) {
-        delayed_write_cbor_len(0x60, value.len(), out);
-        out.extend_from_slice(value.as_bytes());
-    }
-
-    fn delayed_write_cbor_bytes(value: &[u8], out: &mut Vec<u8>) {
-        delayed_write_cbor_len(0x40, value.len(), out);
-        out.extend_from_slice(value);
-    }
-
-    fn delayed_write_cbor_len(major: u8, len: usize, out: &mut Vec<u8>) {
-        match len {
-            0..=23 => out.push(major | u8::try_from(len).expect("small delayed CBOR length")),
-            24..=0xff => out.extend_from_slice(&[
-                major | 0x18,
-                u8::try_from(len).expect("u8 delayed CBOR length"),
-            ]),
-            0x100..=0xffff => {
-                out.push(major | 0x19);
-                out.extend_from_slice(
-                    &u16::try_from(len)
-                        .expect("u16 delayed CBOR length")
-                        .to_be_bytes(),
-                );
-            }
-            _ => panic!("delayed CAR fixture length is too large"),
-        }
-    }
-
-    fn delayed_write_varint(mut value: usize, out: &mut Vec<u8>) {
-        while value >= 0x80 {
-            out.push((u8::try_from(value & 0x7f).expect("delayed varint byte")) | 0x80);
-            value >>= 7;
-        }
-        out.push(u8::try_from(value).expect("delayed final varint byte"));
     }
 
     fn spawn_ipns_request_sentinel_gateway(
@@ -1569,7 +1505,7 @@ mod tests {
 
     fn spawn_delayed_manifest_gateway(
         ipns_record: Vec<u8>,
-        manifest_car: Vec<u8>,
+        manifest_bytes: Vec<u8>,
     ) -> (
         Url,
         std::sync::mpsc::Receiver<()>,
@@ -1586,7 +1522,7 @@ mod tests {
         let (manifest_request_tx, manifest_request_started) = std::sync::mpsc::channel();
         let (release_manifest, release_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for (index, body) in [ipns_record, manifest_car].into_iter().enumerate() {
+            for (index, body) in [ipns_record, manifest_bytes].into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().expect("accept delayed gateway request");
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];

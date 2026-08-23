@@ -33,6 +33,7 @@ pub use sender_candidate::{
     SenderTransactionCandidateError, SenderTransactionCandidateOutput,
     SenderTransactionCandidateSpend, sender_transaction_candidate_rewind_ids,
 };
+pub use trustless_artifacts::{VerifiedCidError, fetch_verified_cid};
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
     GlobalPoiPolicy, IndexedArtifactManifestSource, IndexedArtifactSourceConfig,

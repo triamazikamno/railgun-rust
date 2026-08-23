@@ -164,10 +164,12 @@ impl MerkleArtifactSession {
             progress_tx,
             MERKLE_ARTIFACT_MANIFEST_START_PROGRESS,
         );
-        let manifest = client
-            .fetch_manifest(&scope, None, SystemTime::now())
+        let manifest_fetch = client
+            .fetch_manifest_with_metadata(&scope, None, SystemTime::now())
             .await
             .map_err(|err| merkle_artifact_error(&err))?;
+        let manifest = manifest_fetch.manifest;
+        let preferred_gateway_index = manifest_fetch.preferred_gateway_index;
         send_merkle_artifact_preparation_progress(
             progress_tx,
             MERKLE_ARTIFACT_MANIFEST_DONE_PROGRESS,
@@ -191,6 +193,7 @@ impl MerkleArtifactSession {
             &scope,
             from_block,
             target_block,
+            preferred_gateway_index,
         )
         .await
         {
@@ -253,6 +256,7 @@ impl MerkleArtifactSession {
             &scope,
             from_block,
             target_block,
+            preferred_gateway_index,
         )
         .await?;
         send_merkle_artifact_preparation_progress(
@@ -317,6 +321,7 @@ impl MerkleArtifactSession {
         scope: &ChainScope,
         from_block: u64,
         target_block: u64,
+        preferred_gateway_index: Option<usize>,
     ) -> Result<Vec<IndexedArtifactDescriptor>, SyncError> {
         let mut by_tree = BTreeMap::new();
         for catalog_descriptor in chain_entry.catalogs.iter().filter(|catalog| {
@@ -330,7 +335,7 @@ impl MerkleArtifactSession {
                 .is_none_or(|block| block >= from_block)
         }) {
             let catalog = client
-                .fetch_catalog(catalog_descriptor)
+                .fetch_catalog_with_preferred_gateway(catalog_descriptor, preferred_gateway_index)
                 .await
                 .map_err(|err| merkle_artifact_error(&err))?
                 .into_catalog();
@@ -374,6 +379,7 @@ impl MerkleArtifactSession {
         scope: &ChainScope,
         from_block: u64,
         target_block: u64,
+        preferred_gateway_index: Option<usize>,
     ) -> Result<Vec<IndexedArtifactDescriptor>, SyncError> {
         let mut descriptors = Vec::new();
         for catalog_descriptor in chain_entry.catalogs.iter().filter(|catalog| {
@@ -391,7 +397,7 @@ impl MerkleArtifactSession {
                     .is_none_or(|start_block| start_block <= target_block)
         }) {
             let catalog = client
-                .fetch_catalog(catalog_descriptor)
+                .fetch_catalog_with_preferred_gateway(catalog_descriptor, preferred_gateway_index)
                 .await
                 .map_err(|err| merkle_artifact_error(&err))?
                 .into_catalog();

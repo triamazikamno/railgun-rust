@@ -9131,6 +9131,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-transport",
  "async-trait",
+ "blake2b_simd",
  "broadcaster-core",
  "bytes",
  "chrono",
