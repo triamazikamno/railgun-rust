@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::str;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use blake2b_simd::Params;
@@ -20,6 +21,14 @@ use thiserror::Error;
 use tracing::debug;
 use url::Url;
 
+/// Public canonical defaults for artifact gateway consumers.
+pub const DEFAULT_GATEWAYS: &[&str] = &[
+    "https://dweb.link",
+    "https://ipfs.filebase.io",
+    "https://ipfs.io",
+    "https://gateway.pinata.cloud",
+];
+
 const RAW_CODEC: u64 = 0x55;
 const DAG_PB_CODEC: u64 = 0x70;
 const LIBP2P_KEY_CODEC: u64 = 0x72;
@@ -37,10 +46,12 @@ const ARTIFACT_CAR_MAX_BLOCKS: usize = 16_384;
 const ARTIFACT_CAR_MIN_OVERHEAD_BYTES: usize = 1024 * 1024;
 const ARTIFACT_CAR_FIXED_OVERHEAD_BYTES: usize = 64 * 1024;
 const ARTIFACT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
-const ARTIFACT_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_mins(10);
+const ARTIFACT_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS: usize = 8;
 const MAX_CONCURRENT_MANIFEST_CID_REQUESTS: usize = 3;
 const MANIFEST_CID_HEDGE_DELAY: Duration = Duration::from_millis(750);
+const GATEWAY_FAILURE_COOLDOWN: Duration = Duration::from_mins(5);
+const GATEWAY_FAILURE_COOLDOWN_CAP: Duration = Duration::from_mins(15);
 const CARV2_PRAGMA: [u8; 11] = [
     0x0a, 0xa1, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x02,
 ];
@@ -52,9 +63,9 @@ const CAR_HEADER_MAX_BYTES: u64 = 1024 * 1024;
 const CAR_BLOCK_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IpnsManifestCandidate {
-    pub(crate) sequence: u64,
-    pub(crate) cid: Cid,
+pub struct IpnsManifestCandidate {
+    pub sequence: u64,
+    pub cid: Cid,
     eol: chrono::DateTime<Utc>,
 }
 
@@ -73,8 +84,492 @@ struct HttpAttemptTimeouts {
     total: Duration,
 }
 
-type ManifestCidRequestResult = (usize, u128, Result<Vec<u8>, TrustlessArtifactError>);
+type ManifestCidRequestResult = (usize, usize, u128, Result<Vec<u8>, TrustlessArtifactError>);
 type ManifestCidRequest<'a> = BoxFuture<'a, ManifestCidRequestResult>;
+type IpnsRecordRequestResult = (
+    usize,
+    u128,
+    Result<IpnsManifestCandidate, TrustlessArtifactError>,
+);
+
+/// The independently health-tracked resource class requested from a gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GatewayCapability {
+    ArtifactCar,
+    ManifestCid,
+    IpnsRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewaySelectionPolicy {
+    HealthyOnly,
+    AllowCoolingFallback,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatewayHealth {
+    failures: u32,
+    cooldown_until: Option<Instant>,
+    in_flight: usize,
+    half_open: bool,
+}
+
+impl GatewayHealth {
+    const fn new() -> Self {
+        Self {
+            failures: 0,
+            cooldown_until: None,
+            in_flight: 0,
+            half_open: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GatewayPoolState {
+    health: HashMap<(u64, GatewayCapability), GatewayHealth>,
+    seed: u64,
+    generation: u64,
+}
+
+/// Session-scoped gateway selection and health state.
+///
+/// The pool deliberately stores no configured gateway vector. Callers retain
+/// their URL vectors and supply opaque identities for each selection.
+#[derive(Clone)]
+pub struct GatewayPool {
+    state: Arc<Mutex<GatewayPoolState>>,
+}
+
+impl PartialEq for GatewayPool {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for GatewayPool {}
+
+impl std::fmt::Debug for GatewayPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayPool")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for GatewayPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reserved gateway attempt. Dropping it releases the in-flight reservation.
+pub struct GatewayAttempt {
+    pool: GatewayPool,
+    identity: u64,
+    capability: GatewayCapability,
+    generation: u64,
+    owns_half_open: bool,
+    pub index: usize,
+    completed: bool,
+}
+
+impl std::fmt::Debug for GatewayAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayAttempt")
+            .field("capability", &self.capability)
+            .field("index", &self.index)
+            .field("completed", &self.completed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewayPool {
+    #[must_use]
+    pub fn new() -> Self {
+        let seed = next_pool_seed();
+        Self {
+            state: Arc::new(Mutex::new(GatewayPoolState {
+                health: HashMap::new(),
+                seed,
+                generation: 0,
+            })),
+        }
+    }
+
+    /// Clears health and cooldown state and reseeds this session's ranking.
+    pub fn reset(&self) {
+        let (generation, cleared_entries) = {
+            let mut state = recover_mutex(&self.state);
+            state.generation = state.generation.wrapping_add(1);
+            state.seed = next_pool_seed();
+            let cleared_entries = state.health.len();
+            state.health.clear();
+            (state.generation, cleared_entries)
+        };
+        debug!(
+            generation,
+            cleared_health_entries = cleared_entries,
+            "gateway pool health reset"
+        );
+    }
+
+    #[cfg(test)]
+    fn with_seed_for_test(seed: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(GatewayPoolState {
+                health: HashMap::new(),
+                seed,
+                generation: 0,
+            })),
+        }
+    }
+
+    /// Reserve a gateway according to the session ranking and current health.
+    #[must_use]
+    pub fn select(
+        &self,
+        gateway_ids: &[u64],
+        capability: GatewayCapability,
+        preferred_gateway_index: Option<usize>,
+    ) -> Option<GatewayAttempt> {
+        self.select_excluding(
+            gateway_ids,
+            capability,
+            preferred_gateway_index,
+            &HashSet::new(),
+        )
+    }
+
+    fn select_excluding(
+        &self,
+        gateway_ids: &[u64],
+        capability: GatewayCapability,
+        preferred_gateway_index: Option<usize>,
+        excluded_identities: &HashSet<u64>,
+    ) -> Option<GatewayAttempt> {
+        self.select_excluding_with_policy(
+            gateway_ids,
+            capability,
+            preferred_gateway_index,
+            excluded_identities,
+            GatewaySelectionPolicy::AllowCoolingFallback,
+        )
+    }
+
+    fn select_excluding_with_policy(
+        &self,
+        gateway_ids: &[u64],
+        capability: GatewayCapability,
+        preferred_gateway_index: Option<usize>,
+        excluded_identities: &HashSet<u64>,
+        policy: GatewaySelectionPolicy,
+    ) -> Option<GatewayAttempt> {
+        let now = Instant::now();
+        let (attempt, probe_index, fallback) = {
+            let mut state = recover_mutex(&self.state);
+            let mut candidates = Vec::with_capacity(gateway_ids.len());
+            for (index, &identity) in gateway_ids.iter().enumerate() {
+                if excluded_identities.contains(&identity) {
+                    continue;
+                }
+                let health = state
+                    .health
+                    .get(&(identity, capability))
+                    .copied()
+                    .unwrap_or_else(GatewayHealth::new);
+                let cooling =
+                    health.cooldown_until.is_some_and(|until| until > now) || health.half_open;
+                candidates.push((
+                    index,
+                    identity,
+                    rank_for(state.seed, identity),
+                    health,
+                    cooling,
+                ));
+            }
+            let healthy = candidates
+                .iter()
+                .filter(|(_, _, _, _, cooling)| !cooling)
+                .min_by_key(|(index, _, rank, health, _)| {
+                    (
+                        u8::from(preferred_gateway_index != Some(*index)),
+                        health.in_flight,
+                        *rank,
+                    )
+                });
+            let chosen = healthy.or_else(|| {
+                if policy == GatewaySelectionPolicy::HealthyOnly {
+                    return None;
+                }
+                candidates
+                    .iter()
+                    .filter(|(_, _, _, health, _)| health.in_flight == 0)
+                    .min_by_key(|(_, _, rank, health, _)| {
+                        (
+                            health.cooldown_until.map_or(0, |until| {
+                                until.saturating_duration_since(now).as_millis()
+                            }),
+                            health.in_flight,
+                            *rank,
+                        )
+                    })
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .min_by_key(|(_, _, rank, health, _)| (health.in_flight, *rank))
+                    })
+            })?;
+            let (chosen, identity, _, selected_health, cooling) = *chosen;
+            let generation = state.generation;
+            let health = state
+                .health
+                .entry((identity, capability))
+                .or_insert_with(GatewayHealth::new);
+            let owns_half_open =
+                health.cooldown_until.is_some_and(|until| until <= now) && !health.half_open;
+            health.in_flight = health.in_flight.saturating_add(1);
+            if owns_half_open {
+                health.half_open = true;
+            }
+            let fallback = cooling.then_some((
+                chosen,
+                capability,
+                selected_health
+                    .cooldown_until
+                    .map_or(0, |until| until.saturating_duration_since(now).as_millis()),
+                selected_health.in_flight,
+                selected_health.half_open,
+            ));
+            (
+                GatewayAttempt {
+                    pool: self.clone(),
+                    identity,
+                    capability,
+                    generation,
+                    owns_half_open,
+                    index: chosen,
+                    completed: false,
+                },
+                owns_half_open.then_some(chosen),
+                fallback,
+            )
+        };
+        if let Some(gateway_index) = probe_index {
+            debug!(
+                gateway_index,
+                ?capability,
+                "gateway cooldown expired; reserved owning half-open probe"
+            );
+        }
+        if let Some((gateway_index, capability, cooldown_ms, in_flight, half_open)) = fallback {
+            debug!(
+                gateway_index,
+                ?capability,
+                cooldown_ms,
+                in_flight,
+                half_open,
+                "gateway pool selected cooling gateway as last-resort fallback"
+            );
+        }
+        Some(attempt)
+    }
+
+    fn release(
+        &self,
+        identity: u64,
+        capability: GatewayCapability,
+        generation: u64,
+        owns_half_open: bool,
+        gateway_index: usize,
+    ) {
+        let stale_generation = {
+            let mut state = recover_mutex(&self.state);
+            if state.generation == generation {
+                let health = state
+                    .health
+                    .entry((identity, capability))
+                    .or_insert_with(GatewayHealth::new);
+                health.in_flight = health.in_flight.saturating_sub(1);
+                if owns_half_open {
+                    health.half_open = false;
+                }
+                None
+            } else {
+                Some(state.generation)
+            }
+        };
+        if let Some(current_generation) = stale_generation {
+            debug!(
+                gateway_index,
+                ?capability,
+                attempt_generation = generation,
+                current_generation,
+                outcome = "cancellation",
+                "stale gateway attempt cancellation ignored after pool reset"
+            );
+            return;
+        }
+        if owns_half_open {
+            debug!(
+                gateway_index,
+                ?capability,
+                "owning half-open gateway attempt cancelled"
+            );
+        }
+    }
+
+    fn finish(
+        &self,
+        identity: u64,
+        capability: GatewayCapability,
+        generation: u64,
+        owns_half_open: bool,
+        gateway_index: usize,
+        success: bool,
+    ) {
+        let transition = {
+            let mut state = recover_mutex(&self.state);
+            if state.generation == generation {
+                let health = state
+                    .health
+                    .entry((identity, capability))
+                    .or_insert_with(GatewayHealth::new);
+                health.in_flight = health.in_flight.saturating_sub(1);
+                if owns_half_open {
+                    health.half_open = false;
+                }
+                if success {
+                    let recovered =
+                        health.failures != 0 || health.cooldown_until.is_some() || owns_half_open;
+                    health.failures = 0;
+                    health.cooldown_until = None;
+                    Ok((recovered, None))
+                } else {
+                    health.failures = health.failures.saturating_add(1);
+                    let exponent = health.failures.saturating_sub(1).min(4);
+                    let multiplier = 1_u32 << exponent;
+                    let now = Instant::now();
+                    let cooldown = GATEWAY_FAILURE_COOLDOWN
+                        .checked_mul(multiplier)
+                        .unwrap_or(GATEWAY_FAILURE_COOLDOWN_CAP)
+                        .min(GATEWAY_FAILURE_COOLDOWN_CAP);
+                    health.cooldown_until = Some(now + cooldown);
+                    Ok((false, Some((health.failures, cooldown.as_millis()))))
+                }
+            } else {
+                Err(state.generation)
+            }
+        };
+        match transition {
+            Err(current_generation) => {
+                debug!(
+                    gateway_index,
+                    ?capability,
+                    attempt_generation = generation,
+                    current_generation,
+                    outcome = if success { "success" } else { "failure" },
+                    "stale gateway attempt outcome ignored after pool reset"
+                );
+            }
+            Ok((true, _)) => {
+                debug!(
+                    gateway_index,
+                    ?capability,
+                    "gateway recovered after successful attempt"
+                );
+            }
+            Ok((false, Some((failure_count, cooldown_ms)))) => {
+                debug!(
+                    gateway_index,
+                    ?capability,
+                    failure_count,
+                    cooldown_ms,
+                    "gateway entered cooldown after failure"
+                );
+            }
+            Ok((false, None)) => {}
+        }
+    }
+}
+
+impl GatewayAttempt {
+    pub fn success(mut self) {
+        self.pool.finish(
+            self.identity,
+            self.capability,
+            self.generation,
+            self.owns_half_open,
+            self.index,
+            true,
+        );
+        self.completed = true;
+    }
+
+    pub fn failure(mut self) {
+        self.pool.finish(
+            self.identity,
+            self.capability,
+            self.generation,
+            self.owns_half_open,
+            self.index,
+            false,
+        );
+        self.completed = true;
+    }
+}
+
+const fn manifest_attempt_role(ordinal: usize) -> &'static str {
+    if ordinal == 0 {
+        "initial"
+    } else {
+        "hedged_or_fallback"
+    }
+}
+
+impl Drop for GatewayAttempt {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.pool.release(
+                self.identity,
+                self.capability,
+                self.generation,
+                self.owns_half_open,
+                self.index,
+            );
+        }
+    }
+}
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn opaque_gateway_id(url: &Url) -> u64 {
+    let digest = Sha256::digest(url.as_str().as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().expect("gateway digest prefix"))
+}
+
+const fn rank_for(seed: u64, identity: u64) -> u64 {
+    let mut value = seed ^ identity.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn next_pool_seed() -> u64 {
+    static COUNTER: OnceLock<Mutex<u64>> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| Mutex::new(0));
+    let mut value = recover_mutex(counter);
+    *value = value.wrapping_add(1);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    nanos ^ value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 
 impl HttpAttemptTimeouts {
     const PRODUCTION: Self = Self {
@@ -115,9 +610,11 @@ impl RetrievalLimits {
     }
 }
 
-pub(crate) struct TrustlessArtifactFetcher<'a> {
+pub struct TrustlessArtifactFetcher<'a> {
     client: &'a reqwest::Client,
     gateways: GatewayUrls<'a>,
+    gateway_ids: Vec<u64>,
+    pool: GatewayPool,
     timeouts: HttpAttemptTimeouts,
 }
 
@@ -147,7 +644,7 @@ impl GatewayUrls<'_> {
 }
 
 #[derive(Debug)]
-pub(crate) struct TrustlessArtifactFetchResult {
+pub struct TrustlessArtifactFetchResult {
     verified_cid: String,
     bytes: Vec<u8>,
     gateway_index: usize,
@@ -155,54 +652,109 @@ pub(crate) struct TrustlessArtifactFetchResult {
 }
 
 impl TrustlessArtifactFetchResult {
-    pub(crate) fn verified_cid(&self) -> &str {
+    #[must_use]
+    pub fn verified_cid(&self) -> &str {
         &self.verified_cid
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    pub(crate) const fn gateway_index(&self) -> usize {
+    #[must_use]
+    pub const fn gateway_index(&self) -> usize {
         self.gateway_index
     }
 
-    pub(crate) const fn gateway_count(&self) -> usize {
+    #[must_use]
+    pub const fn gateway_count(&self) -> usize {
         self.gateway_count
     }
 
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn verified_for_test(cid: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            verified_cid: cid.into(),
+            bytes,
+            gateway_index: 0,
+            gateway_count: 1,
+        }
     }
 }
 
 impl<'a> TrustlessArtifactFetcher<'a> {
-    pub(crate) const fn new(client: &'a reqwest::Client, gateways: &'a [Url]) -> Self {
+    #[must_use]
+    pub fn new(client: &'a reqwest::Client, gateways: &'a [Url]) -> Self {
         Self {
             client,
             gateways: GatewayUrls::Public(gateways),
+            gateway_ids: gateways.iter().map(opaque_gateway_id).collect(),
+            pool: GatewayPool::new(),
             timeouts: HttpAttemptTimeouts::PRODUCTION,
         }
     }
 
-    pub(crate) const fn new_poi(client: &'a reqwest::Client, gateways: &'a [SensitiveUrl]) -> Self {
+    #[must_use]
+    pub fn new_poi(client: &'a reqwest::Client, gateways: &'a [SensitiveUrl]) -> Self {
         Self {
             client,
             gateways: GatewayUrls::Poi(gateways),
+            gateway_ids: gateways
+                .iter()
+                .map(|gateway| opaque_gateway_id(gateway.expose_url()))
+                .collect(),
+            pool: GatewayPool::new(),
             timeouts: HttpAttemptTimeouts::PRODUCTION,
         }
     }
 
-    pub(crate) async fn fetch_manifest_cid(
-        &self,
-        cid: &str,
-    ) -> Result<Vec<u8>, TrustlessArtifactError> {
+    #[must_use]
+    pub fn new_with_pool(
+        client: &'a reqwest::Client,
+        gateways: &'a [Url],
+        pool: GatewayPool,
+    ) -> Self {
+        Self {
+            client,
+            gateways: GatewayUrls::Public(gateways),
+            gateway_ids: gateways.iter().map(opaque_gateway_id).collect(),
+            pool,
+            timeouts: HttpAttemptTimeouts::PRODUCTION,
+        }
+    }
+
+    #[must_use]
+    pub fn new_poi_with_pool(
+        client: &'a reqwest::Client,
+        gateways: &'a [SensitiveUrl],
+        pool: GatewayPool,
+    ) -> Self {
+        Self {
+            client,
+            gateways: GatewayUrls::Poi(gateways),
+            gateway_ids: gateways
+                .iter()
+                .map(|gateway| opaque_gateway_id(gateway.expose_url()))
+                .collect(),
+            pool,
+            timeouts: HttpAttemptTimeouts::PRODUCTION,
+        }
+    }
+
+    pub async fn fetch_manifest_cid(&self, cid: &str) -> Result<Vec<u8>, TrustlessArtifactError> {
         self.fetch_manifest_cid_with_metadata(cid)
             .await
             .map(TrustlessArtifactFetchResult::into_bytes)
     }
 
-    pub(crate) async fn fetch_manifest_cid_with_metadata(
+    pub async fn fetch_manifest_cid_with_metadata(
         &self,
         cid: &str,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
@@ -210,7 +762,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         self.fetch_verified_manifest_cid(cid).await
     }
 
-    pub(crate) async fn fetch_artifact_cid(
+    pub async fn fetch_artifact_cid(
         &self,
         cid: &str,
         byte_size: u64,
@@ -221,7 +773,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             .map(TrustlessArtifactFetchResult::into_bytes)
     }
 
-    pub(crate) async fn fetch_artifact_cid_with_metadata_from_gateway(
+    pub async fn fetch_artifact_cid_with_metadata_from_gateway(
         &self,
         cid: &str,
         byte_size: u64,
@@ -236,7 +788,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         .await
     }
 
-    pub(crate) async fn fetch_artifact_cid_with_metadata_from_gateway_bounded(
+    pub async fn fetch_artifact_cid_with_metadata_from_gateway_bounded(
         &self,
         cid: &str,
         byte_size: u64,
@@ -248,13 +800,13 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             cid,
             RetrievalLimits::artifact(byte_size)?,
             "artifact",
-            preferred_gateway_index,
+            Some(preferred_gateway_index),
             max_gateway_attempts,
         )
         .await
     }
 
-    pub(crate) async fn resolve_ipns_manifest_candidates(
+    pub async fn resolve_ipns_manifest_candidates(
         &self,
         name: &str,
     ) -> Result<Vec<IpnsManifestCandidate>, TrustlessArtifactError> {
@@ -262,7 +814,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             .await
     }
 
-    pub(crate) async fn resolve_ipns_manifest_candidates_with_clock<F>(
+    pub async fn resolve_ipns_manifest_candidates_with_clock<F>(
         &self,
         name: &str,
         acceptance_time: &F,
@@ -275,17 +827,70 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         }
 
         let peer_id = expected_ipns_peer_id(name)?;
-        let mut candidates = Vec::new();
         let mut errors = Vec::new();
         let gateway_count = self.gateways.len();
+        let mut reserved_identities = HashSet::with_capacity(gateway_count);
+        let phase_one = self
+            .fetch_ipns_phase(
+                name,
+                peer_id,
+                GatewaySelectionPolicy::HealthyOnly,
+                &mut reserved_identities,
+            )
+            .await;
+        let mut candidates = Vec::new();
+        self.collect_ipns_phase_results(
+            name,
+            phase_one,
+            chrono::DateTime::<Utc>::from(acceptance_time()),
+            &mut candidates,
+            &mut errors,
+        );
+        if !candidates.is_empty() {
+            return finalize_ipns_candidates(candidates, errors);
+        }
+
+        let phase_two = self
+            .fetch_ipns_phase(
+                name,
+                peer_id,
+                GatewaySelectionPolicy::AllowCoolingFallback,
+                &mut reserved_identities,
+            )
+            .await;
+        self.collect_ipns_phase_results(
+            name,
+            phase_two,
+            chrono::DateTime::<Utc>::from(acceptance_time()),
+            &mut candidates,
+            &mut errors,
+        );
+        finalize_ipns_candidates(candidates, errors)
+    }
+
+    async fn fetch_ipns_phase(
+        &self,
+        name: &str,
+        peer_id: PeerId,
+        policy: GatewaySelectionPolicy,
+        reserved_identities: &mut HashSet<u64>,
+    ) -> Vec<IpnsRecordRequestResult> {
+        let gateway_count = self.gateways.len();
         let mut requests = FuturesUnordered::new();
-        let mut next_gateway_index = 0;
-        while next_gateway_index < gateway_count || !requests.is_empty() {
-            while next_gateway_index < gateway_count
-                && requests.len() < MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS
-            {
-                let gateway_index = next_gateway_index;
-                next_gateway_index += 1;
+        let mut results = Vec::with_capacity(gateway_count);
+        loop {
+            while requests.len() < MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS {
+                let Some(gateway_attempt) = self.pool.select_excluding_with_policy(
+                    &self.gateway_ids,
+                    GatewayCapability::IpnsRecord,
+                    None,
+                    reserved_identities,
+                    policy,
+                ) else {
+                    break;
+                };
+                reserved_identities.insert(gateway_attempt.identity);
+                let gateway_index = gateway_attempt.index;
                 let gateway = self.gateways.expose(gateway_index);
                 let url = ipns_record_gateway_url(gateway, name);
                 let source = TrustlessHttpSource::Gateway {
@@ -297,12 +902,31 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                     let result = self
                         .fetch_ipns_record_candidate(&url, source, peer_id)
                         .await;
+                    match &result {
+                        Ok(_) => gateway_attempt.success(),
+                        Err(_) => gateway_attempt.failure(),
+                    }
                     (gateway_index, attempt_started.elapsed().as_millis(), result)
                 });
             }
-            let Some((gateway_index, elapsed_ms, result)) = requests.next().await else {
-                continue;
+            let Some(result) = requests.next().await else {
+                break;
             };
+            results.push(result);
+        }
+        results
+    }
+
+    fn collect_ipns_phase_results(
+        &self,
+        name: &str,
+        results: Vec<IpnsRecordRequestResult>,
+        accepted_at: chrono::DateTime<Utc>,
+        candidates: &mut Vec<(usize, IpnsManifestCandidate)>,
+        errors: &mut Vec<(usize, TrustlessArtifactError)>,
+    ) {
+        let gateway_count = self.gateways.len();
+        for (gateway_index, elapsed_ms, result) in results {
             match result {
                 Ok(candidate) => {
                     debug!(
@@ -314,7 +938,22 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                         elapsed_ms,
                         "POI artifact IPNS gateway returned verified record"
                     );
-                    candidates.push((gateway_index, candidate));
+                    if candidate.eol <= accepted_at {
+                        debug!(
+                            gateway_index,
+                            gateway_count,
+                            ipns_name = name,
+                            ipns_sequence = candidate.sequence,
+                            eol = %candidate.eol,
+                            "POI artifact IPNS gateway record expired before aggregate acceptance"
+                        );
+                        errors.push((
+                            gateway_index,
+                            TrustlessArtifactError::ExpiredIpnsRecord { eol: candidate.eol },
+                        ));
+                    } else {
+                        candidates.push((gateway_index, candidate));
+                    }
                 }
                 Err(err) => {
                     debug!(
@@ -329,46 +968,6 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 }
             }
         }
-
-        // This single post-settlement sample is authoritative; keep filtering and return synchronous.
-        let accepted_at = chrono::DateTime::<Utc>::from(acceptance_time());
-        candidates.retain(|(gateway_index, candidate)| {
-            if candidate.eol <= accepted_at {
-                debug!(
-                    gateway_index,
-                    gateway_count,
-                    ipns_name = name,
-                    ipns_sequence = candidate.sequence,
-                    eol = %candidate.eol,
-                    "POI artifact IPNS gateway record expired before aggregate acceptance"
-                );
-                errors.push((
-                    *gateway_index,
-                    TrustlessArtifactError::ExpiredIpnsRecord { eol: candidate.eol },
-                ));
-                false
-            } else {
-                true
-            }
-        });
-        if candidates.is_empty() {
-            return Err(errors
-                .into_iter()
-                .max_by_key(|(gateway_index, _)| *gateway_index)
-                .map_or(TrustlessArtifactError::NoValidIpnsRecords, |(_, err)| err));
-        }
-
-        candidates.sort_by_key(|(gateway_index, candidate)| {
-            (Reverse(candidate.sequence), *gateway_index)
-        });
-        let mut unique_candidates = Vec::with_capacity(candidates.len());
-        let mut seen_candidates = HashSet::with_capacity(candidates.len());
-        for (_, candidate) in candidates {
-            if seen_candidates.insert((candidate.sequence, candidate.cid)) {
-                unique_candidates.push(candidate);
-            }
-        }
-        Ok(unique_candidates)
     }
 
     async fn fetch_cid_bytes(
@@ -377,7 +976,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         limits: RetrievalLimits,
         resource: &'static str,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
-        self.fetch_cid_bytes_from_gateway(cid, limits, resource, 0, self.gateways.len())
+        self.fetch_cid_bytes_from_gateway(cid, limits, resource, None, self.gateways.len())
             .await
     }
 
@@ -386,7 +985,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         cid: Cid,
         limits: RetrievalLimits,
         resource: &'static str,
-        preferred_gateway_index: usize,
+        preferred_gateway_index: Option<usize>,
         max_gateway_attempts: usize,
     ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
         if self.gateways.is_empty() {
@@ -395,9 +994,27 @@ impl<'a> TrustlessArtifactFetcher<'a> {
 
         let mut last_error = None;
         let gateway_count = self.gateways.len();
-        let preferred_gateway_index = preferred_gateway_index % gateway_count;
-        for attempt in 0..gateway_count.min(max_gateway_attempts.max(1)) {
-            let gateway_index = (preferred_gateway_index + attempt) % gateway_count;
+        let preferred_gateway_index = preferred_gateway_index.map(|index| index % gateway_count);
+        let max_attempts = gateway_count.min(max_gateway_attempts.max(1));
+        let mut reserved_identities = HashSet::with_capacity(max_attempts);
+        let mut launched_attempts = 0;
+        while launched_attempts < max_attempts {
+            let Some(gateway_attempt) = self.pool.select_excluding(
+                &self.gateway_ids,
+                GatewayCapability::ArtifactCar,
+                if launched_attempts == 0 {
+                    preferred_gateway_index
+                } else {
+                    None
+                },
+                &reserved_identities,
+            ) else {
+                break;
+            };
+            reserved_identities.insert(gateway_attempt.identity);
+            let attempt = launched_attempts;
+            launched_attempts += 1;
+            let gateway_index = gateway_attempt.index;
             let gateway = self.gateways.expose(gateway_index);
             let attempt_started = Instant::now();
             let url = car_gateway_url(gateway, &cid);
@@ -422,6 +1039,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                             "POI artifact CID gateway fetch succeeded after fallback"
                         );
                     }
+                    gateway_attempt.success();
                     return Ok(TrustlessArtifactFetchResult {
                         verified_cid: cid.to_string(),
                         bytes,
@@ -439,6 +1057,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                         elapsed_ms = attempt_started.elapsed().as_millis(),
                         "POI artifact CID gateway fetch failed"
                     );
+                    gateway_attempt.failure();
                     last_error = Some(err);
                 }
             }
@@ -480,37 +1099,72 @@ impl<'a> TrustlessArtifactFetcher<'a> {
 
         let gateway_count = self.gateways.len();
         let mut next_gateway_index = 0;
+        let mut reserved_identities = HashSet::with_capacity(gateway_count);
         let mut requests: FuturesUnordered<ManifestCidRequest<'_>> = FuturesUnordered::new();
         let mut last_error = None;
 
-        let gateway = self.gateways.expose(next_gateway_index);
+        let Some(gateway_attempt) = self.pool.select_excluding(
+            &self.gateway_ids,
+            GatewayCapability::ManifestCid,
+            None,
+            &reserved_identities,
+        ) else {
+            return Err(TrustlessArtifactError::NoGateways);
+        };
+        reserved_identities.insert(gateway_attempt.identity);
+        let gateway_index = gateway_attempt.index;
+        let gateway = self.gateways.expose(gateway_index);
         let url = if cid.codec() == RAW_CODEC {
             raw_gateway_url(gateway, &cid)
         } else {
             car_gateway_url(gateway, &cid)
         };
         let source = TrustlessHttpSource::Gateway {
-            index: next_gateway_index,
+            index: gateway_index,
             count: gateway_count,
         };
-        requests.push(self.manifest_cid_request(cid, next_gateway_index, url, source));
+        requests.push(self.manifest_cid_request(
+            cid,
+            gateway_index,
+            0,
+            url,
+            source,
+            gateway_attempt,
+        ));
         next_gateway_index += 1;
         let mut next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
 
         while next_gateway_index < gateway_count || !requests.is_empty() {
             if requests.is_empty() {
-                let gateway = self.gateways.expose(next_gateway_index);
+                let Some(gateway_attempt) = self.pool.select_excluding(
+                    &self.gateway_ids,
+                    GatewayCapability::ManifestCid,
+                    None,
+                    &reserved_identities,
+                ) else {
+                    break;
+                };
+                reserved_identities.insert(gateway_attempt.identity);
+                let gateway_index = gateway_attempt.index;
+                let gateway = self.gateways.expose(gateway_index);
                 let url = if cid.codec() == RAW_CODEC {
                     raw_gateway_url(gateway, &cid)
                 } else {
                     car_gateway_url(gateway, &cid)
                 };
                 let source = TrustlessHttpSource::Gateway {
-                    index: next_gateway_index,
+                    index: gateway_index,
                     count: gateway_count,
                 };
-                let gateway_index = next_gateway_index;
-                requests.push(self.manifest_cid_request(cid, gateway_index, url, source));
+                let ordinal = next_gateway_index;
+                requests.push(self.manifest_cid_request(
+                    cid,
+                    gateway_index,
+                    ordinal,
+                    url,
+                    source,
+                    gateway_attempt,
+                ));
                 next_gateway_index += 1;
                 next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
                 continue;
@@ -522,7 +1176,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 tokio::select! {
                     biased;
                     result = requests.next() => {
-                        let Some((gateway_index, elapsed_ms, result)) = result else { continue };
+                        let Some((gateway_index, ordinal, elapsed_ms, result)) = result else { continue };
                         match result {
                             Ok(bytes) => {
                                 debug!(
@@ -531,7 +1185,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                                     cid = %cid,
                                     bytes = bytes.len(),
                                     elapsed_ms,
-                                    attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                                    attempt = manifest_attempt_role(ordinal),
                                     representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
                                     "verified CID gateway fetch succeeded"
                                 );
@@ -549,7 +1203,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                                     gateway_count,
                                     cid = %cid,
                                     elapsed_ms,
-                                    attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                                    attempt = manifest_attempt_role(ordinal),
                                     representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
                                     "verified CID gateway fetch failed"
                                 );
@@ -560,7 +1214,18 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                         }
                     }
                     () = tokio::time::sleep_until(next_launch_at) => {
-                        let gateway_index = next_gateway_index;
+                        let Some(gateway_attempt) = self.pool.select_excluding(
+                            &self.gateway_ids,
+                            GatewayCapability::ManifestCid,
+                            None,
+                            &reserved_identities,
+                        )
+                        else {
+                            next_gateway_index = gateway_count;
+                            continue;
+                        };
+                        reserved_identities.insert(gateway_attempt.identity);
+                        let gateway_index = gateway_attempt.index;
                         let gateway = self.gateways.expose(gateway_index);
                         let url = if cid.codec() == RAW_CODEC {
                             raw_gateway_url(gateway, &cid)
@@ -571,12 +1236,21 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                             index: gateway_index,
                             count: gateway_count,
                         };
-                        requests.push(self.manifest_cid_request(cid, gateway_index, url, source));
+                        let ordinal = next_gateway_index;
+                        requests.push(self.manifest_cid_request(
+                            cid,
+                            gateway_index,
+                            ordinal,
+                            url,
+                            source,
+                            gateway_attempt,
+                        ));
                         next_gateway_index += 1;
                         next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
                     }
                 }
-            } else if let Some((gateway_index, elapsed_ms, result)) = requests.next().await {
+            } else if let Some((gateway_index, ordinal, elapsed_ms, result)) = requests.next().await
+            {
                 match result {
                     Ok(bytes) => {
                         debug!(
@@ -585,7 +1259,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                             cid = %cid,
                             bytes = bytes.len(),
                             elapsed_ms,
-                            attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                            attempt = manifest_attempt_role(ordinal),
                             representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
                             "verified CID gateway fetch succeeded"
                         );
@@ -603,7 +1277,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                             gateway_count,
                             cid = %cid,
                             elapsed_ms,
-                            attempt = if gateway_index == 0 { "preferred" } else { "hedged_or_fallback" },
+                            attempt = manifest_attempt_role(ordinal),
                             representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
                             "verified CID gateway fetch failed"
                         );
@@ -621,13 +1295,24 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         &self,
         cid: Cid,
         gateway_index: usize,
+        ordinal: usize,
         url: Url,
         source: TrustlessHttpSource,
+        gateway_attempt: GatewayAttempt,
     ) -> ManifestCidRequest<'_> {
         Box::pin(async move {
             let attempt_started = Instant::now();
             let result = self.fetch_verified_cid_from_url(cid, &url, source).await;
-            (gateway_index, attempt_started.elapsed().as_millis(), result)
+            match &result {
+                Ok(_) => gateway_attempt.success(),
+                Err(_) => gateway_attempt.failure(),
+            }
+            (
+                gateway_index,
+                ordinal,
+                attempt_started.elapsed().as_millis(),
+                result,
+            )
         })
     }
 
@@ -675,6 +1360,28 @@ impl<'a> TrustlessArtifactFetcher<'a> {
     }
 }
 
+fn finalize_ipns_candidates(
+    mut candidates: Vec<(usize, IpnsManifestCandidate)>,
+    errors: Vec<(usize, TrustlessArtifactError)>,
+) -> Result<Vec<IpnsManifestCandidate>, TrustlessArtifactError> {
+    if candidates.is_empty() {
+        return Err(errors
+            .into_iter()
+            .max_by_key(|(gateway_index, _)| *gateway_index)
+            .map_or(TrustlessArtifactError::NoValidIpnsRecords, |(_, err)| err));
+    }
+    candidates
+        .sort_by_key(|(gateway_index, candidate)| (Reverse(candidate.sequence), *gateway_index));
+    let mut unique_candidates = Vec::with_capacity(candidates.len());
+    let mut seen_candidates = HashSet::with_capacity(candidates.len());
+    for (_, candidate) in candidates {
+        if seen_candidates.insert((candidate.sequence, candidate.cid)) {
+            unique_candidates.push(candidate);
+        }
+    }
+    Ok(unique_candidates)
+}
+
 /// Fetches and verifies a manifest-sized artifact from the configured gateways.
 pub async fn fetch_verified_cid(
     client: &reqwest::Client,
@@ -689,7 +1396,21 @@ pub async fn fetch_verified_cid(
         .map_err(VerifiedCidError::from)
 }
 
-pub(crate) async fn fetch_manifest_url(
+pub async fn fetch_verified_cid_with_pool(
+    client: &reqwest::Client,
+    gateways: &[Url],
+    cid: &str,
+    pool: GatewayPool,
+) -> Result<Vec<u8>, VerifiedCidError> {
+    let cid = parse_cid(cid).map_err(VerifiedCidError::from)?;
+    TrustlessArtifactFetcher::new_with_pool(client, gateways, pool)
+        .fetch_verified_manifest_cid(cid)
+        .await
+        .map(TrustlessArtifactFetchResult::into_bytes)
+        .map_err(VerifiedCidError::from)
+}
+
+pub async fn fetch_manifest_url(
     client: &reqwest::Client,
     url: &Url,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
@@ -1433,7 +2154,7 @@ fn gateway_resource_url(gateway: &Url, namespace: &'static str, value: &str) -> 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnixFsDataType {
+pub enum UnixFsDataType {
     Raw,
     Directory,
     File,
@@ -1488,7 +2209,7 @@ impl<'a> UnixFsData<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrustlessHttpSource {
+pub enum TrustlessHttpSource {
     ExplicitManifest,
     Gateway { index: usize, count: usize },
 }
@@ -1505,7 +2226,7 @@ impl std::fmt::Display for TrustlessHttpSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrustlessHttpPhase {
+pub enum TrustlessHttpPhase {
     ResponseHeaders,
     ResponseBody,
 }
@@ -1520,7 +2241,7 @@ impl std::fmt::Display for TrustlessHttpPhase {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum TrustlessArtifactError {
+pub enum TrustlessArtifactError {
     #[error("POI artifact source has no gateway URLs configured")]
     NoGateways,
     #[error("invalid CID")]
@@ -1646,18 +2367,6 @@ impl From<TrustlessArtifactError> for VerifiedCidError {
 }
 
 #[cfg(test)]
-impl TrustlessArtifactFetchResult {
-    pub(crate) fn verified_for_test(cid: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self {
-            verified_cid: cid.into(),
-            bytes,
-            gateway_index: 0,
-            gateway_count: 1,
-        }
-    }
-}
-
-#[cfg(test)]
 impl TrustlessArtifactFetcher<'_> {
     const fn with_http_timeouts_for_test(mut self, idle: Duration, total: Duration) -> Self {
         self.timeouts = HttpAttemptTimeouts { idle, total };
@@ -1668,6 +2377,234 @@ impl TrustlessArtifactFetcher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_failure_cooldown_skips_failed_gateway() {
+        let gateways = [
+            Url::parse("https://one.example").expect("gateway"),
+            Url::parse("https://two.example").expect("gateway"),
+        ];
+        let ids = gateways.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let pool = GatewayPool::new();
+        let attempt = pool
+            .select(&ids, GatewayCapability::ArtifactCar, Some(0))
+            .expect("first gateway");
+        assert_eq!(attempt.index, 0);
+        attempt.failure();
+        let fallback = pool
+            .select(&ids, GatewayCapability::ArtifactCar, Some(0))
+            .expect("healthy fallback");
+        assert_eq!(fallback.index, 1);
+    }
+
+    #[test]
+    fn gateway_health_isolated_by_capability_and_reset() {
+        let gateways = [
+            Url::parse("https://one.example").expect("gateway"),
+            Url::parse("https://two.example").expect("gateway"),
+        ];
+        let ids = gateways.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let pool = GatewayPool::new();
+        pool.select(&ids, GatewayCapability::IpnsRecord, Some(0))
+            .expect("IPNS gateway")
+            .failure();
+        assert_eq!(
+            pool.select(&ids, GatewayCapability::ArtifactCar, Some(0))
+                .expect("artifact gateway")
+                .index,
+            0
+        );
+        pool.select(&ids, GatewayCapability::ArtifactCar, Some(0))
+            .expect("artifact gateway")
+            .failure();
+        pool.reset();
+        assert_eq!(
+            pool.select(&ids, GatewayCapability::ArtifactCar, Some(0))
+                .expect("reset gateway")
+                .index,
+            0
+        );
+    }
+
+    fn pool_for_gateway_order(gateways: &[Url], order: &[usize]) -> GatewayPool {
+        assert_eq!(gateways.len(), order.len());
+        let ids = gateways.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let seed = (0_u64..1_000_000)
+            .find(|seed| {
+                order
+                    .windows(2)
+                    .all(|pair| rank_for(*seed, ids[pair[0]]) < rank_for(*seed, ids[pair[1]]))
+            })
+            .expect("find deterministic gateway ranking within test seed range");
+        GatewayPool::with_seed_for_test(seed)
+    }
+
+    fn pool_for_sensitive_gateway_order(gateways: &[SensitiveUrl], order: &[usize]) -> GatewayPool {
+        assert_eq!(gateways.len(), order.len());
+        let ids = gateways
+            .iter()
+            .map(|gateway| opaque_gateway_id(gateway.expose_url()))
+            .collect::<Vec<_>>();
+        let seed = (0_u64..1_000_000)
+            .find(|seed| {
+                order
+                    .windows(2)
+                    .all(|pair| rank_for(*seed, ids[pair[0]]) < rank_for(*seed, ids[pair[1]]))
+            })
+            .expect("find deterministic sensitive gateway ranking within test seed range");
+        GatewayPool::with_seed_for_test(seed)
+    }
+
+    #[test]
+    fn shared_pool_keeps_indices_local_to_each_gateway_vector() {
+        let first = [
+            Url::parse("https://one.example").expect("gateway"),
+            Url::parse("https://two.example").expect("gateway"),
+        ];
+        let second = [
+            Url::parse("https://two.example").expect("gateway"),
+            Url::parse("https://three.example").expect("gateway"),
+            Url::parse("https://one.example").expect("gateway"),
+        ];
+        let first_ids = first.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let second_ids = second.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let pool = GatewayPool::new();
+        pool.select(&first_ids, GatewayCapability::ArtifactCar, Some(0))
+            .expect("first vector attempt")
+            .failure();
+        let second_attempt = pool
+            .select(&second_ids, GatewayCapability::ArtifactCar, Some(0))
+            .expect("second vector attempt");
+        assert!(second_attempt.index < second.len());
+        assert_ne!(second[second_attempt.index], first[0]);
+        second_attempt.failure();
+        let first_attempt = pool
+            .select(&first_ids, GatewayCapability::ArtifactCar, Some(0))
+            .expect("first vector fallback");
+        assert!(first_attempt.index < first.len());
+    }
+
+    #[test]
+    fn operation_exclusions_exhaust_cooling_gateways_once() {
+        let ids = [11_u64, 22, 33, 44];
+        let pool = GatewayPool::with_seed_for_test(7);
+        let mut pre_cooling = HashSet::new();
+        for _ in 0..3 {
+            let attempt = pool
+                .select_excluding(&ids, GatewayCapability::ArtifactCar, None, &pre_cooling)
+                .expect("pre-cool gateway");
+            pre_cooling.insert(ids[attempt.index]);
+            attempt.failure();
+        }
+
+        let mut operation_exclusions = HashSet::new();
+        for _ in 0..4 {
+            let attempt = pool
+                .select_excluding(
+                    &ids,
+                    GatewayCapability::ArtifactCar,
+                    None,
+                    &operation_exclusions,
+                )
+                .expect("each cooling gateway is reserved once");
+            assert!(operation_exclusions.insert(ids[attempt.index]));
+            attempt.failure();
+        }
+        assert!(
+            pool.select_excluding(
+                &ids,
+                GatewayCapability::ArtifactCar,
+                None,
+                &operation_exclusions,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_attempt_outcomes_do_not_recreate_reset_state() {
+        let ids = [11_u64];
+        let pool = GatewayPool::with_seed_for_test(8);
+
+        let stale_success = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("stale success attempt");
+        pool.reset();
+        stale_success.success();
+
+        let stale_failure = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("stale failure attempt");
+        pool.reset();
+        stale_failure.failure();
+
+        let stale_drop = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("stale drop attempt");
+        pool.reset();
+        drop(stale_drop);
+
+        assert!(recover_mutex(&pool.state).health.is_empty());
+    }
+
+    #[test]
+    fn half_open_probe_ownership_controls_cancellation() {
+        let ids = [11_u64];
+        let pool = GatewayPool::with_seed_for_test(9);
+        {
+            let mut state = recover_mutex(&pool.state);
+            state.health.insert(
+                (ids[0], GatewayCapability::ArtifactCar),
+                GatewayHealth {
+                    failures: 1,
+                    cooldown_until: Some(
+                        Instant::now()
+                            .checked_sub(Duration::from_secs(1))
+                            .expect("current instant supports one-second test subtraction"),
+                    ),
+                    in_flight: 0,
+                    half_open: false,
+                },
+            );
+        }
+
+        let owner = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("expired cooldown probe");
+        let non_owner = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("least-bad concurrent probe");
+        drop(non_owner);
+        assert!(
+            recover_mutex(&pool.state)
+                .health
+                .get(&(ids[0], GatewayCapability::ArtifactCar))
+                .is_some_and(|health| health.half_open && health.in_flight == 1)
+        );
+        drop(owner);
+        assert!(
+            recover_mutex(&pool.state)
+                .health
+                .get(&(ids[0], GatewayCapability::ArtifactCar))
+                .is_some_and(|health| !health.half_open && health.in_flight == 0)
+        );
+
+        let stale_owner = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("new probe");
+        pool.reset();
+        let current = pool
+            .select(&ids, GatewayCapability::ArtifactCar, None)
+            .expect("post-reset attempt");
+        drop(stale_owner);
+        assert!(
+            recover_mutex(&pool.state)
+                .health
+                .get(&(ids[0], GatewayCapability::ArtifactCar))
+                .is_some_and(|health| !health.half_open && health.in_flight == 1)
+        );
+        drop(current);
+    }
 
     use std::error::Error as StdError;
     use std::time::{Duration, UNIX_EPOCH};
@@ -1960,8 +2897,13 @@ mod tests {
             let client = reqwest::Client::new();
             TrustlessArtifactFetcher::new_poi(&client, &gateways)
                 .with_http_timeouts_for_test(Duration::from_secs(5), Duration::from_secs(12))
-                .fetch_artifact_cid(&cid.to_string(), expected.len() as u64)
+                .fetch_artifact_cid_with_metadata_from_gateway(
+                    &cid.to_string(),
+                    expected.len() as u64,
+                    0,
+                )
                 .await
+                .map(TrustlessArtifactFetchResult::into_bytes)
         });
         slow.wait_for_request().await;
         slow.send_headers(200);
@@ -1998,10 +2940,11 @@ mod tests {
             .iter()
             .map(|server| sensitive_server_url(server.url.clone()))
             .collect::<Vec<_>>();
+        let pool = pool_for_sensitive_gateway_order(&gateways, &[0, 1, 2, 3]);
         let started = tokio::time::Instant::now();
         let task = tokio::spawn(async move {
             let client = reqwest::Client::new();
-            TrustlessArtifactFetcher::new_poi(&client, &gateways)
+            TrustlessArtifactFetcher::new_poi_with_pool(&client, &gateways, pool)
                 .with_http_timeouts_for_test(Duration::from_secs(10), Duration::from_secs(5))
                 .fetch_artifact_cid_with_metadata_from_gateway_bounded(
                     &cid.to_string(),
@@ -2199,11 +3142,15 @@ mod tests {
         let fetcher = TrustlessArtifactFetcher::new(&client, &gateways);
 
         let fetched = fetcher
-            .fetch_artifact_cid(&cid.to_string(), artifact_bytes.len() as u64)
+            .fetch_artifact_cid_with_metadata_from_gateway(
+                &cid.to_string(),
+                artifact_bytes.len() as u64,
+                0,
+            )
             .await
             .expect("fallback to valid CAR");
 
-        assert_eq!(fetched, artifact_bytes);
+        assert_eq!(fetched.bytes, artifact_bytes);
         assert_eq!(
             malformed.request_path(),
             format!("/ipfs/{cid}?format=car&dag-scope=entity")
@@ -2225,11 +3172,15 @@ mod tests {
         let fetcher = TrustlessArtifactFetcher::new(&client, &gateways);
 
         let fetched = fetcher
-            .fetch_artifact_cid(&cid.to_string(), artifact_bytes.len() as u64)
+            .fetch_artifact_cid_with_metadata_from_gateway(
+                &cid.to_string(),
+                artifact_bytes.len() as u64,
+                0,
+            )
             .await
             .expect("fallback to valid CAR");
 
-        assert_eq!(fetched, artifact_bytes);
+        assert_eq!(fetched.bytes, artifact_bytes);
         assert_eq!(
             malformed.request_path(),
             format!("/ipfs/{cid}?format=car&dag-scope=entity")
@@ -2768,6 +3719,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipns_healthy_phase_skips_precooled_gateway_when_current_record_exists() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let cid = raw_cid(b"healthy IPNS phase");
+        let pre_cooled = spawn_controlled_chunk_server();
+        let healthy = spawn_controlled_chunk_server();
+        let gateways = [pre_cooled.url.clone(), healthy.url.clone()];
+        let ids = gateways.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let pool = GatewayPool::new();
+        pool.select(&ids, GatewayCapability::IpnsRecord, Some(0))
+            .expect("pre-cool gateway")
+            .failure();
+        let task = tokio::spawn(async move {
+            TrustlessArtifactFetcher::new_with_pool(&reqwest::Client::new(), &gateways, pool)
+                .resolve_ipns_manifest_candidates(&name)
+                .await
+        });
+
+        healthy.wait_for_request().await;
+        healthy.send_headers(200);
+        healthy.send_chunk(ipns_record(&keypair, format!("/ipfs/{cid}"), 4));
+        healthy.finish();
+
+        let candidates = task
+            .await
+            .expect("join healthy IPNS phase")
+            .expect("current healthy record");
+        assert_eq!(candidates[0].cid, cid);
+        pre_cooled.assert_no_request();
+    }
+
+    #[tokio::test]
+    async fn ipns_fallback_phase_queries_precooled_gateway_after_healthy_failure() {
+        let keypair = test_ipns_keypair();
+        let name = ipns_name(&keypair);
+        let cid = raw_cid(b"fallback IPNS phase");
+        let pre_cooled = spawn_controlled_chunk_server();
+        let failing = spawn_controlled_chunk_server();
+        let gateways = [pre_cooled.url.clone(), failing.url.clone()];
+        let ids = gateways.iter().map(opaque_gateway_id).collect::<Vec<_>>();
+        let pool = GatewayPool::new();
+        pool.select(&ids, GatewayCapability::IpnsRecord, Some(0))
+            .expect("pre-cool gateway")
+            .failure();
+        let task = tokio::spawn(async move {
+            TrustlessArtifactFetcher::new_with_pool(&reqwest::Client::new(), &gateways, pool)
+                .resolve_ipns_manifest_candidates(&name)
+                .await
+        });
+
+        failing.wait_for_request().await;
+        failing.send_headers(503);
+        failing.finish();
+        pre_cooled.wait_for_request().await;
+        pre_cooled.send_headers(200);
+        pre_cooled.send_chunk(ipns_record(&keypair, format!("/ipfs/{cid}"), 9));
+        pre_cooled.finish();
+
+        let candidates = task
+            .await
+            .expect("join fallback IPNS phase")
+            .expect("current fallback record");
+        assert_eq!(candidates[0].cid, cid);
+        assert_eq!(candidates[0].sequence, 9);
+    }
+
+    #[tokio::test]
     async fn artifact_fetch_starts_from_preferred_gateway() {
         let artifact_bytes = b"preferred gateway artifact".to_vec();
         let cid = raw_cid(&artifact_bytes);
@@ -2780,7 +3798,7 @@ mod tests {
             .fetch_artifact_cid_with_metadata_from_gateway(
                 &cid.to_string(),
                 artifact_bytes.len() as u64,
-                1,
+                3,
             )
             .await
             .expect("fetch from preferred gateway");
@@ -2823,18 +3841,18 @@ mod tests {
 
         let expected = format!("/ipfs/{cid}?format=car&dag-scope=entity");
         assert_eq!(first.request_path(), expected);
-        assert_eq!(second.request_path(), expected);
-        assert!(
-            skipped_before
-                .requests
-                .recv_timeout(Duration::from_millis(100))
-                .is_err()
-        );
-        assert!(
-            skipped_after
-                .requests
-                .recv_timeout(Duration::from_millis(100))
-                .is_err()
+        let fallback_attempts = [&skipped_before, &second, &skipped_after]
+            .into_iter()
+            .filter(|server| {
+                server
+                    .requests
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(
+            fallback_attempts, 1,
+            "the bounded fetch made one fallback attempt"
         );
     }
 
@@ -2988,8 +4006,9 @@ mod tests {
         let slow = spawn_controlled_chunk_server();
         let healthy = spawn_controlled_chunk_server();
         let gateways = [slow.url.clone(), healthy.url.clone()];
+        let pool = pool_for_gateway_order(&gateways, &[0, 1]);
         let task = tokio::spawn(async move {
-            TrustlessArtifactFetcher::new(&reqwest::Client::new(), &gateways)
+            TrustlessArtifactFetcher::new_with_pool(&reqwest::Client::new(), &gateways, pool)
                 .fetch_manifest_cid_with_metadata(&cid.to_string())
                 .await
         });
@@ -3030,9 +4049,12 @@ mod tests {
             .iter()
             .map(|server| server.url.clone())
             .collect::<Vec<_>>();
+        let pool = pool_for_gateway_order(&gateways, &[0, 1, 2, 3]);
         let cid_string = cid.to_string();
         let task = tokio::spawn(async move {
-            fetch_verified_cid(&reqwest::Client::new(), &gateways, &cid_string).await
+            TrustlessArtifactFetcher::new_with_pool(&reqwest::Client::new(), &gateways, pool)
+                .fetch_manifest_cid(&cid_string)
+                .await
         });
 
         let expected_path = format!("/ipfs/{cid}?format=raw");

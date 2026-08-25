@@ -8,7 +8,17 @@ pub mod poi_v4;
 mod public_cache;
 mod runtime_admission;
 mod sender_candidate;
-mod trustless_artifacts;
+mod trustless_artifacts {
+    #[cfg(test)]
+    pub(crate) use ::trustless_artifacts::TrustlessHttpSource;
+    pub(crate) use ::trustless_artifacts::{
+        TrustlessArtifactError, TrustlessArtifactFetchResult, TrustlessArtifactFetcher,
+        fetch_manifest_url,
+    };
+    pub use ::trustless_artifacts::{
+        VerifiedCidError, fetch_verified_cid, fetch_verified_cid_with_pool,
+    };
+}
 pub(crate) mod txid_cache;
 pub mod types;
 mod wallet;
@@ -33,7 +43,7 @@ pub use sender_candidate::{
     SenderTransactionCandidateError, SenderTransactionCandidateOutput,
     SenderTransactionCandidateSpend, sender_transaction_candidate_rewind_ids,
 };
-pub use trustless_artifacts::{VerifiedCidError, fetch_verified_cid};
+pub use trustless_artifacts::{VerifiedCidError, fetch_verified_cid, fetch_verified_cid_with_pool};
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
     GlobalPoiPolicy, IndexedArtifactManifestSource, IndexedArtifactSourceConfig,

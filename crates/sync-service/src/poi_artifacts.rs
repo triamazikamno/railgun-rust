@@ -32,6 +32,7 @@ use crate::poi_limits::{
 };
 use crate::trustless_artifacts::TrustlessArtifactError;
 use crate::types::{PoiArtifactCacheGraphProgress, PoiArtifactCachePhase, PoiArtifactSourceConfig};
+use trustless_artifacts::GatewayPool;
 
 mod v4_cache;
 mod v4_ingest;
@@ -67,16 +68,27 @@ type PoiArtifactProgressObserver = Arc<dyn Fn(PoiArtifactProgressEvent) + Send +
 pub(crate) struct PoiArtifactIngestor {
     config: PoiArtifactSourceConfig,
     client: reqwest::Client,
+    gateway_pool: GatewayPool,
     progress_observer: Option<PoiArtifactProgressObserver>,
 }
 
 impl PoiArtifactIngestor {
-    pub(crate) const fn new(config: PoiArtifactSourceConfig, client: reqwest::Client) -> Self {
+    pub(crate) fn new(config: PoiArtifactSourceConfig, client: reqwest::Client) -> Self {
+        let gateway_pool = config.gateway_pool.clone().unwrap_or_default();
         Self {
             config,
             client,
+            gateway_pool,
             progress_observer: None,
         }
+    }
+
+    pub(crate) fn fetcher(&self) -> crate::trustless_artifacts::TrustlessArtifactFetcher<'_> {
+        crate::trustless_artifacts::TrustlessArtifactFetcher::new_poi_with_pool(
+            &self.client,
+            &self.config.gateway_urls,
+            self.gateway_pool.clone(),
+        )
     }
 
     pub(crate) fn with_progress_observer(

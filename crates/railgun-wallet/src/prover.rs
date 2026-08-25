@@ -463,6 +463,34 @@ struct ProverCacheVariant {
     poi_shape: Option<(usize, usize)>,
 }
 
+const EAGER_CACHE_MAX_COMMITMENTS: usize = 3;
+
+fn select_eager_cache_variants(
+    source: &ArtifactSource,
+) -> Result<(Vec<ProverCacheVariant>, usize), ProverError> {
+    let railgun_variants =
+        source.list_variants_with_max_commitments(EAGER_CACHE_MAX_COMMITMENTS)?;
+    let railgun_variant_count = railgun_variants.len();
+    let mut variants = railgun_variants
+        .into_iter()
+        .map(|variant| ProverCacheVariant {
+            variant,
+            poi_shape: None,
+        })
+        .collect::<Vec<_>>();
+    variants.extend([
+        ProverCacheVariant {
+            variant: poi_variant_name(3, 3),
+            poi_shape: Some((3, 3)),
+        },
+        ProverCacheVariant {
+            variant: poi_variant_name(13, 13),
+            poi_shape: Some((13, 13)),
+        },
+    ]);
+    Ok((variants, railgun_variant_count))
+}
+
 struct ProverBlockingContext<'a> {
     db_store: Option<&'a DbStore>,
     cache_lock: &'a Mutex<()>,
@@ -598,7 +626,6 @@ fn spawn_prover_worker(
             .expect("prover runtime");
         // TODO: cache artifacts in memory to avoid repeated disk reads.
         while let Some(job) = receiver.blocking_recv() {
-            let _guard = runtime.enter();
             match job {
                 ProverJob::Railgun {
                     enqueued_at,
@@ -616,9 +643,18 @@ fn spawn_prover_worker(
                         commitments_out = public_inputs.commitments_out.len(),
                         "started railgun prover job"
                     );
-                    let result = catch_unwind(AssertUnwindSafe(|| {
+                    let result = catch_worker_panic(|| {
+                        let paths = with_cache_lock(&cache_lock, || {
+                            runtime
+                                .block_on(source.ensure_artifacts(
+                                    public_inputs.nullifiers.len(),
+                                    public_inputs.commitments_out.len(),
+                                ))
+                                .map_err(ProverError::Artifact)
+                        })?;
                         prove_unshield_blocking(
                             &source,
+                            &paths,
                             &public_inputs,
                             &private_inputs,
                             &signature,
@@ -629,9 +665,8 @@ fn spawn_prover_worker(
                                 queue_wait_elapsed_ms,
                             },
                         )
-                    }))
-                    .unwrap_or_else(|payload| {
-                        let message = panic_payload_to_string(payload.as_ref());
+                    });
+                    if let Err(ProverError::WorkerPanic(message)) = &result {
                         warn!(
                             worker_index,
                             panic = %message,
@@ -639,8 +674,7 @@ fn spawn_prover_worker(
                             commitments_out = public_inputs.commitments_out.len(),
                             "railgun prover worker caught panic"
                         );
-                        Err(ProverError::WorkerPanic(message))
-                    });
+                    }
                     if response.send(result).is_err() {
                         debug!(worker_index, "failed to send prover response");
                     }
@@ -662,9 +696,15 @@ fn spawn_prover_worker(
                         commitments_out = inputs.commitments_out.len(),
                         "started POI prover job"
                     );
-                    let result = catch_unwind(AssertUnwindSafe(|| {
+                    let result = catch_worker_panic(|| {
+                        let paths = with_cache_lock(&cache_lock, || {
+                            runtime
+                                .block_on(source.ensure_poi_artifacts(max_inputs, max_outputs))
+                                .map_err(ProverError::Artifact)
+                        })?;
                         prove_poi_blocking(
                             &source,
+                            &paths,
                             &inputs,
                             verify_proof,
                             &ProverBlockingContext {
@@ -673,9 +713,8 @@ fn spawn_prover_worker(
                                 queue_wait_elapsed_ms,
                             },
                         )
-                    }))
-                    .unwrap_or_else(|payload| {
-                        let message = panic_payload_to_string(payload.as_ref());
+                    });
+                    if let Err(ProverError::WorkerPanic(message)) = &result {
                         warn!(
                             worker_index,
                             panic = %message,
@@ -685,8 +724,7 @@ fn spawn_prover_worker(
                             commitments_out = inputs.commitments_out.len(),
                             "POI prover worker caught panic"
                         );
-                        Err(ProverError::WorkerPanic(message))
-                    });
+                    }
                     if response.send(result).is_err() {
                         debug!(worker_index, "failed to send POI prover response");
                     }
@@ -700,6 +738,30 @@ fn lock_cache(cache_lock: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, P
     cache_lock
         .lock()
         .map_err(|_| ProverError::WorkerPanic("prover cache lock poisoned".to_string()))
+}
+
+fn with_cache_lock<T>(
+    cache_lock: &Mutex<()>,
+    operation: impl FnOnce() -> Result<T, ProverError>,
+) -> Result<T, ProverError> {
+    let guard = lock_cache(cache_lock)?;
+    let result = catch_unwind(AssertUnwindSafe(operation)).unwrap_or_else(|payload| {
+        Err(ProverError::WorkerPanic(panic_payload_to_string(
+            payload.as_ref(),
+        )))
+    });
+    drop(guard);
+    result
+}
+
+fn catch_worker_panic<T>(
+    operation: impl FnOnce() -> Result<T, ProverError>,
+) -> Result<T, ProverError> {
+    catch_unwind(AssertUnwindSafe(operation)).unwrap_or_else(|payload| {
+        Err(ProverError::WorkerPanic(panic_payload_to_string(
+            payload.as_ref(),
+        )))
+    })
 }
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
@@ -722,38 +784,20 @@ fn open_db(config: DbConfig) -> Option<Arc<DbStore>> {
     }
 }
 
-pub fn build_prover_cache(
+pub async fn build_prover_cache(
     source: &ArtifactSource,
-    db_store: Option<&DbStore>,
+    db_store: Option<Arc<DbStore>>,
 ) -> Result<ProverCacheBuildReport, ProverError> {
-    build_prover_cache_with_progress(source, db_store, |_| {})
+    build_prover_cache_with_progress(source, db_store, |_| {}).await
 }
 
-pub fn build_prover_cache_with_progress(
+pub async fn build_prover_cache_with_progress(
     source: &ArtifactSource,
-    db_store: Option<&DbStore>,
+    db_store: Option<Arc<DbStore>>,
     mut on_progress: impl FnMut(ProverCacheBuildProgress),
 ) -> Result<ProverCacheBuildReport, ProverError> {
     let started = Instant::now();
-    let mut variants = source
-        .list_variants()?
-        .into_iter()
-        .map(|variant| ProverCacheVariant {
-            variant,
-            poi_shape: None,
-        })
-        .collect::<Vec<_>>();
-    let railgun_variants = variants.len();
-    variants.extend([
-        ProverCacheVariant {
-            variant: poi_variant_name(3, 3),
-            poi_shape: Some((3, 3)),
-        },
-        ProverCacheVariant {
-            variant: poi_variant_name(13, 13),
-            poi_shape: Some((13, 13)),
-        },
-    ]);
+    let (variants, railgun_variants) = select_eager_cache_variants(source)?;
     let poi_variants = variants.len() - railgun_variants;
     let total_variants = variants.len();
     let mut progress = ProverCacheBuildProgress {
@@ -783,7 +827,7 @@ pub fn build_prover_cache_with_progress(
         progress.current_variant = Some(variant.variant.clone());
         progress.current_variant_is_poi = Some(variant.poi_shape.is_some());
         on_progress(progress.clone());
-        match build_prover_variant_cache(source, db_store, variant) {
+        match build_prover_variant_cache(source, db_store.clone(), variant).await {
             Ok(()) => {
                 succeeded_variants += 1;
                 progress.succeeded_variants = succeeded_variants;
@@ -829,13 +873,32 @@ pub fn build_prover_cache_with_progress(
     Ok(report)
 }
 
-fn build_prover_variant_cache(
+async fn build_prover_variant_cache(
     source: &ArtifactSource,
-    db_store: Option<&DbStore>,
+    db_store: Option<Arc<DbStore>>,
     variant: &ProverCacheVariant,
 ) -> Result<(), ProverError> {
     let started = Instant::now();
-    let paths = source.download_variant(&variant.variant, false)?;
+    source.download_variant(&variant.variant, false).await?;
+    let source = source.clone();
+    let variant = ProverCacheVariant {
+        variant: variant.variant.clone(),
+        poi_shape: variant.poi_shape,
+    };
+    tokio::task::spawn_blocking(move || {
+        build_prover_variant_cache_blocking(&source, db_store.as_deref(), &variant, started)
+    })
+    .await
+    .map_err(|error| ProverError::WorkerPanic(error.to_string()))?
+}
+
+fn build_prover_variant_cache_blocking(
+    source: &ArtifactSource,
+    db_store: Option<&DbStore>,
+    variant: &ProverCacheVariant,
+    started: Instant,
+) -> Result<(), ProverError> {
+    let paths = source.artifact_paths(&variant.variant);
     let wasm_read_started = Instant::now();
     let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
         path: paths.wasm.clone(),
@@ -900,6 +963,7 @@ fn build_prover_variant_cache(
 
 fn prove_unshield_blocking(
     source: &ArtifactSource,
+    paths: &crate::artifacts::ArtifactPaths,
     public_inputs: &PublicInputs,
     private_inputs: &PrivateInputs,
     signature: &[U256; 3],
@@ -907,27 +971,11 @@ fn prove_unshield_blocking(
     context: &ProverBlockingContext<'_>,
 ) -> Result<SnarkProof, ProverError> {
     let total_started = Instant::now();
-    debug!(
-        nullifiers = public_inputs.nullifiers.len(),
-        commitments_out = public_inputs.commitments_out.len(),
-        ?source,
-        "ensuring artifacts"
-    );
-    let ensure_started = Instant::now();
-    {
-        let _cache_guard = lock_cache(context.cache_lock)?;
-        source.ensure_artifacts(
-            public_inputs.nullifiers.len(),
-            public_inputs.commitments_out.len(),
-        )?;
-    }
-    let ensure_elapsed_ms = ensure_started.elapsed().as_millis();
     debug!("loading artifacts");
     let variant = variant_name(
         public_inputs.nullifiers.len(),
         public_inputs.commitments_out.len(),
     );
-    let paths = source.artifact_paths(&variant);
     let wasm_read_started = Instant::now();
     let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
         path: paths.wasm.clone(),
@@ -938,11 +986,10 @@ fn prove_unshield_blocking(
     let expected_hash = source.expected_zkey_hash(&variant)?;
     let mut expected_hash_bytes = [0u8; 32];
     expected_hash_bytes.copy_from_slice(expected_hash.as_slice());
-    let (proving_key, matrices) = {
-        let _cache_guard = lock_cache(context.cache_lock)?;
+    let (proving_key, matrices) = with_cache_lock(context.cache_lock, || {
         load_or_parse_zkey(context.db_store, &variant, expected_hash_bytes, &paths.zkey)
-            .map_err(|e| ProverError::Zkey(e.to_string()))?
-    };
+            .map_err(|e| ProverError::Zkey(e.to_string()))
+    })?;
     let zkey_elapsed_ms = zkey_started.elapsed().as_millis();
     let num_instance_variables = matrices.num_instance_variables;
     let num_constraints = matrices.num_constraints;
@@ -950,11 +997,10 @@ fn prove_unshield_blocking(
 
     let module_started = Instant::now();
     let mut store = Store::default();
-    let cached_module = {
-        let _cache_guard = lock_cache(context.cache_lock)?;
+    let cached_module = with_cache_lock(context.cache_lock, || {
         load_or_compile_wasm_module(context.db_store, &store, &variant, "default", &wasm)
-            .map_err(|err| ProverError::WasmModule(err.to_string()))?
-    };
+            .map_err(|err| ProverError::WasmModule(err.to_string()))
+    })?;
     let module_cache_hit = cached_module.cache_hit;
     let module = cached_module.module;
     let mut calculator = WitnessCalculator::from_module(&mut store, module)?;
@@ -1005,7 +1051,6 @@ fn prove_unshield_blocking(
         commitments_out = public_inputs.commitments_out.len(),
         verify_proof,
         queue_wait_elapsed_ms = context.queue_wait_elapsed_ms,
-        ensure_elapsed_ms,
         wasm_read_elapsed_ms,
         zkey_elapsed_ms,
         module_elapsed_ms,
@@ -1023,6 +1068,7 @@ fn prove_unshield_blocking(
 
 fn prove_poi_blocking(
     source: &ArtifactSource,
+    paths: &crate::artifacts::ArtifactPaths,
     inputs: &PoiProofInputs,
     verify_proof: bool,
     context: &ProverBlockingContext<'_>,
@@ -1035,18 +1081,9 @@ fn prove_poi_blocking(
         nullifiers = inputs.nullifiers.len(),
         commitments_out = inputs.commitments_out.len(),
         wasm_compiler = poi_witness_compiler_name(max_inputs, max_outputs),
-        ?source,
-        "ensuring POI artifacts"
+        "loading POI artifacts"
     );
-    let ensure_started = Instant::now();
-    {
-        let _cache_guard = lock_cache(context.cache_lock)?;
-        source.ensure_poi_artifacts(max_inputs, max_outputs)?;
-    }
-    let ensure_elapsed_ms = ensure_started.elapsed().as_millis();
-    debug!("loading POI artifacts");
     let variant = poi_variant_name(max_inputs, max_outputs);
-    let paths = source.artifact_paths(&variant);
     let wasm_read_started = Instant::now();
     let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
         path: paths.wasm.clone(),
@@ -1057,11 +1094,10 @@ fn prove_poi_blocking(
     let expected_hash = source.expected_zkey_hash(&variant)?;
     let mut expected_hash_bytes = [0u8; 32];
     expected_hash_bytes.copy_from_slice(expected_hash.as_slice());
-    let (proving_key, matrices) = {
-        let _cache_guard = lock_cache(context.cache_lock)?;
+    let (proving_key, matrices) = with_cache_lock(context.cache_lock, || {
         load_or_parse_zkey(context.db_store, &variant, expected_hash_bytes, &paths.zkey)
-            .map_err(|e| ProverError::Zkey(e.to_string()))?
-    };
+            .map_err(|e| ProverError::Zkey(e.to_string()))
+    })?;
     let zkey_elapsed_ms = zkey_started.elapsed().as_millis();
     let num_instance_variables = matrices.num_instance_variables;
     let num_constraints = matrices.num_constraints;
@@ -1070,11 +1106,10 @@ fn prove_poi_blocking(
     let module_started = Instant::now();
     let mut store = poi_witness_store(max_inputs, max_outputs);
     let compiler = poi_witness_compiler_name(max_inputs, max_outputs);
-    let cached_module = {
-        let _cache_guard = lock_cache(context.cache_lock)?;
+    let cached_module = with_cache_lock(context.cache_lock, || {
         load_or_compile_wasm_module(context.db_store, &store, &variant, compiler, &wasm)
-            .map_err(|err| ProverError::WasmModule(err.to_string()))?
-    };
+            .map_err(|err| ProverError::WasmModule(err.to_string()))
+    })?;
     let module_cache_hit = cached_module.cache_hit;
     let module = cached_module.module;
     let mut calculator = WitnessCalculator::from_module(&mut store, module)?;
@@ -1127,7 +1162,6 @@ fn prove_poi_blocking(
         commitments_out = inputs.commitments_out.len(),
         verify_proof,
         queue_wait_elapsed_ms = context.queue_wait_elapsed_ms,
-        ensure_elapsed_ms,
         wasm_read_elapsed_ms,
         zkey_elapsed_ms,
         module_elapsed_ms,
@@ -1230,13 +1264,16 @@ fn public_inputs_from_witness(witness: &[Fr], count: usize) -> Vec<Fr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MERKLE_ZERO_VALUE, PoiProofInputs, PoiWitnessInputs, ark_proof_to_snarkjs,
-        poi_witness_compiler_name,
+        ArtifactError, MERKLE_ZERO_VALUE, PoiProofInputs, PoiWitnessInputs, ProverError,
+        ark_proof_to_snarkjs, poi_witness_compiler_name, select_eager_cache_variants,
+        with_cache_lock,
     };
     use alloy::primitives::U256;
     use alloy::uint;
     use ark_bn254::{Bn254, Fq, Fq2, G1Affine, G2Affine};
     use ark_groth16::Proof;
+
+    use crate::artifacts::ArtifactSource;
 
     fn sample_poi_inputs() -> PoiProofInputs {
         PoiProofInputs {
@@ -1285,6 +1322,41 @@ mod tests {
     }
 
     #[test]
+    fn eager_cache_selection_limits_railgun_shapes_and_keeps_poi_variants() {
+        let source = ArtifactSource::default();
+        let full_manifest = source
+            .list_variants()
+            .expect("embedded variants should parse");
+        let (eager, railgun_count) =
+            select_eager_cache_variants(&source).expect("embedded variants should parse");
+        let eager_railgun = eager
+            .iter()
+            .take(railgun_count)
+            .map(|variant| variant.variant.clone())
+            .collect::<Vec<_>>();
+        let eager_names = eager
+            .iter()
+            .map(|variant| variant.variant.as_str())
+            .collect::<Vec<_>>();
+        let expected_names = eager_railgun
+            .iter()
+            .map(String::as_str)
+            .chain(["POI_3x3", "POI_13x13"])
+            .collect::<Vec<_>>();
+
+        assert_eq!(full_manifest.len(), 57);
+        assert_eq!(eager_railgun.len(), 36);
+        assert_eq!(railgun_count, 36);
+        assert_eq!(eager.len(), 38);
+        assert_eq!(eager_names, expected_names);
+        assert!(full_manifest.iter().any(|variant| variant == "01x13"));
+        assert!(!eager_railgun.iter().any(|variant| variant == "01x13"));
+        for variant in ["01x03", "11x03"] {
+            assert!(eager_railgun.iter().any(|candidate| candidate == variant));
+        }
+    }
+
+    #[test]
     fn ark_proof_to_snarkjs_keeps_snarkjs_pi_b_order() {
         let proof = Proof::<Bn254> {
             a: G1Affine::new_unchecked(fq(5), fq(6)),
@@ -1301,6 +1373,44 @@ mod tests {
                 [uint!(3_U256), uint!(4_U256)]
             ]
         );
+    }
+
+    #[test]
+    fn cache_guard_converts_panics_to_worker_errors() {
+        let lock = std::sync::Mutex::new(());
+        let result = with_cache_lock(&lock, || -> Result<(), ProverError> {
+            panic!("cache panic");
+        });
+        assert!(
+            matches!(result, Err(ProverError::WorkerPanic(message)) if message == "cache panic")
+        );
+    }
+
+    #[test]
+    fn cache_guard_is_reacquirable_after_panic() {
+        let lock = std::sync::Mutex::new(());
+        let _ = with_cache_lock(&lock, || -> Result<(), ProverError> {
+            panic!("cache panic");
+        });
+        assert!(with_cache_lock(&lock, || Ok::<_, ProverError>(())).is_ok());
+    }
+
+    #[test]
+    fn cache_guard_preserves_ordinary_artifact_errors() {
+        let lock = std::sync::Mutex::new(());
+        let result: Result<(), ProverError> = with_cache_lock(&lock, || {
+            Err(ProverError::Artifact(ArtifactError::UnsupportedVariant {
+                nullifiers: 1,
+                commitments: 2,
+            }))
+        });
+        assert!(matches!(
+            result,
+            Err(ProverError::Artifact(ArtifactError::UnsupportedVariant {
+                nullifiers: 1,
+                commitments: 2,
+            }))
+        ));
     }
 
     fn fq(value: u64) -> Fq {

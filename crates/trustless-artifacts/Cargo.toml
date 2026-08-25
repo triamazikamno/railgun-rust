@@ -1,0 +1,38 @@
+[package]
+name = "trustless-artifacts"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+test-utils = []
+
+[dependencies]
+blake2b_simd = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+cid = { workspace = true }
+futures = { workspace = true }
+ipld-dagpb = { workspace = true }
+ipld-core = { workspace = true }
+libp2p-identity = { workspace = true }
+poi = { path = "../poi" }
+quick-protobuf = { workspace = true }
+reqwest = { workspace = true }
+rs-car = { workspace = true }
+rust-ipns = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+multihash-codetable = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

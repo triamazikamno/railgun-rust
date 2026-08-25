@@ -26,6 +26,7 @@ use tokio::sync::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+use trustless_artifacts::GatewayPool;
 use url::Url;
 
 use crate::SenderTransactionCandidate;
@@ -497,6 +498,7 @@ pub struct PoiArtifactSourceConfig {
     pub trusted_publisher_pubkey: FixedBytes<32>,
     pub manifest_source: PoiArtifactManifestSource,
     pub gateway_urls: Vec<SensitiveUrl>,
+    pub gateway_pool: Option<GatewayPool>,
     pub max_manifest_age: Option<Duration>,
 }
 
@@ -534,6 +536,25 @@ pub enum GlobalPoiPolicy {
 
 impl GlobalPoiPolicy {
     #[must_use]
+    pub fn with_optional_gateway_pool(self, gateway_pool: Option<GatewayPool>) -> Self {
+        match gateway_pool {
+            Some(pool) => self.with_gateway_pool(pool),
+            None => self,
+        }
+    }
+
+    #[must_use]
+    pub fn with_gateway_pool(mut self, gateway_pool: GatewayPool) -> Self {
+        if let Self::IndexedArtifacts {
+            artifact_source, ..
+        } = &mut self
+        {
+            artifact_source.gateway_pool = Some(gateway_pool);
+        }
+        self
+    }
+
+    #[must_use]
     pub const fn rpc_url(&self) -> &SensitiveUrl {
         match self {
             Self::IndexedArtifacts { rpc_url, .. } | Self::PoiProxy { rpc_url } => rpc_url,
@@ -551,6 +572,7 @@ pub struct IndexedArtifactSourceConfig {
     pub trusted_publisher_pubkey: FixedBytes<32>,
     pub manifest_source: IndexedArtifactManifestSource,
     pub gateway_urls: Vec<Url>,
+    pub gateway_pool: Option<GatewayPool>,
     pub max_manifest_age: Option<Duration>,
     pub concurrency: usize,
     pub max_in_flight_bytes: u64,
@@ -2897,6 +2919,7 @@ mod tests {
             trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
             manifest_source: PoiArtifactManifestSource::Url(sentinel_url("manifest-sentinel")),
             gateway_urls: vec![sentinel_url("gateway-sentinel")],
+            gateway_pool: None,
             max_manifest_age: Some(std::time::Duration::from_mins(1)),
         };
         let indexed = GlobalPoiPolicy::IndexedArtifacts {

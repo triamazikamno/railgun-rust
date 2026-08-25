@@ -611,6 +611,7 @@ mod tests {
                 Url::parse("https://artifact.example/manifest.json").expect("url"),
             ),
             gateway_urls: vec![Url::parse("https://gateway.example").expect("url")],
+            gateway_pool: None,
             max_manifest_age: None,
             concurrency: 6,
             max_in_flight_bytes: 64 * 1024 * 1024,

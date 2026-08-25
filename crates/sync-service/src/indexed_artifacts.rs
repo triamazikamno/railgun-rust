@@ -35,6 +35,7 @@ use crate::trustless_artifacts::{
     TrustlessArtifactError, TrustlessArtifactFetchResult, TrustlessArtifactFetcher,
 };
 use crate::types::{IndexedArtifactManifestSource, IndexedArtifactSourceConfig};
+use trustless_artifacts::GatewayPool;
 
 const INDEXED_ARTIFACT_MAINTENANCE_CAPACITY: usize = 8;
 const INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES: u64 =
@@ -520,12 +521,26 @@ impl VerifiedIndexedArtifactChunkStager {
 pub struct IndexedArtifactManifestClient {
     config: IndexedArtifactSourceConfig,
     client: reqwest::Client,
+    gateway_pool: GatewayPool,
 }
 
 impl IndexedArtifactManifestClient {
     #[must_use]
-    pub const fn new(config: IndexedArtifactSourceConfig, client: reqwest::Client) -> Self {
-        Self { config, client }
+    pub fn new(config: IndexedArtifactSourceConfig, client: reqwest::Client) -> Self {
+        let gateway_pool = config.gateway_pool.clone().unwrap_or_default();
+        Self {
+            config,
+            client,
+            gateway_pool,
+        }
+    }
+
+    fn fetcher(&self) -> TrustlessArtifactFetcher<'_> {
+        TrustlessArtifactFetcher::new_with_pool(
+            &self.client,
+            &self.config.gateway_urls,
+            self.gateway_pool.clone(),
+        )
     }
 
     pub async fn fetch_manifest(
@@ -619,7 +634,7 @@ impl IndexedArtifactManifestClient {
     ) -> Result<VerifiedIndexedArtifactCatalog, IndexedArtifactManifestError> {
         validate_catalog_descriptor_for_expansion(descriptor)?;
         let started = Instant::now();
-        let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
+        let fetcher = self.fetcher();
         let bytes = match match preferred_gateway_index {
             Some(preferred_gateway_index) => fetcher
                 .fetch_artifact_cid_with_metadata_from_gateway(
@@ -733,7 +748,7 @@ impl IndexedArtifactManifestClient {
             .iter()
             .map(|descriptor| descriptor.byte_size)
             .collect::<Vec<_>>();
-        let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
+        let fetcher = self.fetcher();
         let mut results = Vec::with_capacity(descriptors.len());
         let mut next_index = 0;
         let mut completed_chunks = 0;
@@ -921,10 +936,7 @@ impl IndexedArtifactManifestClient {
         now: SystemTime,
     ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
         let started = Instant::now();
-        let fetched = match TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls)
-            .fetch_manifest_cid_with_metadata(cid)
-            .await
-        {
+        let fetched = match self.fetcher().fetch_manifest_cid_with_metadata(cid).await {
             Ok(bytes) => bytes,
             Err(err) => {
                 debug!(
@@ -975,7 +987,7 @@ impl IndexedArtifactManifestClient {
         now: SystemTime,
     ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
         let started = Instant::now();
-        let fetcher = TrustlessArtifactFetcher::new(&self.client, &self.config.gateway_urls);
+        let fetcher = self.fetcher();
         let candidates = fetcher.resolve_ipns_manifest_candidates(name).await?;
         let candidate_count = candidates.len();
         let mut last_error = None;
@@ -2483,10 +2495,10 @@ mod tests {
 
         assert!(verified.catalog.chunks.is_empty());
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(server.max_active(), 1, "catalog should be fetched once");
-        assert!(
-            skipped.request_paths().is_empty(),
-            "default catalog starts at gateway 0"
+        assert_eq!(
+            server.request_paths().len() + skipped.request_paths().len(),
+            1,
+            "catalog should be fetched once across configured gateways"
         );
     }
 
@@ -2517,7 +2529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_catalog_preferred_gateway_wraps_after_verification_failure() {
+    async fn fetch_catalog_preferred_gateway_falls_back_after_verification_failure() {
         let scope = scope();
         let catalog = IndexedArtifactCatalog {
             format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
@@ -2562,8 +2574,12 @@ mod tests {
             .expect("fallback catalog verifies");
 
         assert_eq!(preferred.request_paths().len(), 1);
-        assert_eq!(first.request_paths().len(), 1);
-        assert!(skipped.request_paths().is_empty());
+        let healthy_fallback_requests = first.request_paths().len() + skipped.request_paths().len();
+        assert_eq!(healthy_fallback_requests, 1);
+        assert_eq!(
+            preferred.request_paths().len() + healthy_fallback_requests,
+            2
+        );
     }
 
     #[test]
@@ -3434,6 +3450,7 @@ mod tests {
             trusted_publisher_pubkey: FixedBytes::from(pubkey),
             manifest_source: IndexedArtifactManifestSource::Cid("bafymanifest".to_string()),
             gateway_urls: Vec::new(),
+            gateway_pool: None,
             max_manifest_age,
             concurrency: 6,
             max_in_flight_bytes: 64 * 1024 * 1024,

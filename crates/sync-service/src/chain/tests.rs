@@ -126,6 +126,7 @@ fn test_poi_artifact_source_config() -> PoiArtifactSourceConfig {
                 .into(),
         ),
         gateway_urls: Vec::new(),
+        gateway_pool: None,
         max_manifest_age: None,
     }
 }
@@ -8420,6 +8421,7 @@ fn blocked_wallet_optional_maintenance_fixture(
             server.url.join("/manifest.json").expect("manifest url"),
         ),
         gateway_urls: vec![server.url.clone()],
+        gateway_pool: None,
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
@@ -8593,6 +8595,7 @@ fn checkpointed_wallet_artifact_source_controlled_with_requests(
         trusted_publisher_pubkey: FixedBytes::from(signing_key.verifying_key().to_bytes()),
         manifest_source: IndexedArtifactManifestSource::Url(manifest_url),
         gateway_urls: vec![server.url.clone()],
+        gateway_pool: None,
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,

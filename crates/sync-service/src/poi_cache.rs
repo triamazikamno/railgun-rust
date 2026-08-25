@@ -3706,6 +3706,7 @@ mod tests {
                     .expect("gateway URL")
                     .into(),
             ],
+            gateway_pool: None,
             max_manifest_age: None,
         }
     }
@@ -3715,6 +3716,7 @@ mod tests {
             trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
             manifest_source: PoiArtifactManifestSource::Url(url.clone().into()),
             gateway_urls: vec![url.into()],
+            gateway_pool: None,
             max_manifest_age: None,
         }
     }

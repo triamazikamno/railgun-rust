@@ -1111,7 +1111,7 @@ where
     }
 }
 
-async fn submit_sender_unshield_transaction_pois(
+pub(super) async fn submit_sender_unshield_transaction_pois(
     request: &OutputPoiRecoveryRequest<'_>,
     candidate: &SenderTransactionCandidate,
     public_data_fence: &SenderCandidatePublicDataFence,

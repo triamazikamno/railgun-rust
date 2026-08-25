@@ -5125,6 +5125,7 @@ mod tests {
                     .into(),
             ),
             gateway_urls: Vec::new(),
+            gateway_pool: None,
             max_manifest_age: None,
         }
     }

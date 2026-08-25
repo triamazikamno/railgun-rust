@@ -11,32 +11,27 @@ alloy-provider = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 alloy-transport = { workspace = true }
 broadcaster-core = { path = "../core" }
-blake2b_simd = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 cid = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures = { workspace = true }
-ipld-dagpb = { workspace = true }
-ipld-core = { workspace = true }
 libp2p-identity = { workspace = true }
 local-db = { path = "../local-db" }
 merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
-quick-protobuf = { workspace = true }
 railgun-indexed-artifacts = { path = "../indexed-artifacts" }
 railgun-wallet = { path = "../railgun-wallet" }
 reqwest = { workspace = true }
 rmp-serde = { workspace = true }
-rs-car = { workspace = true }
 rust-ipns = { workspace = true }
 serde = { workspace = true }
-serde_ipld_dagcbor = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 tracing = { workspace = true }
+trustless-artifacts = { path = "../trustless-artifacts" }
 url = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
@@ -45,6 +40,7 @@ zstd = { workspace = true }
 ed25519-dalek = { workspace = true }
 multihash-codetable = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+trustless-artifacts = { path = "../trustless-artifacts", features = ["test-utils"] }
 
 [lints]
 workspace = true

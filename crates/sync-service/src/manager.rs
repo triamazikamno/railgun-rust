@@ -20,6 +20,7 @@ use crate::public_cache::{
 use crate::runtime_admission::{DbRuntimeLease, DbRuntimeOwnerKind};
 use crate::types::{ChainConfig, ChainKey, GlobalPoiPolicy, WalletConfig};
 use crate::wallet::WalletHandle;
+use trustless_artifacts::GatewayPool;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncManagerError {
@@ -92,6 +93,7 @@ impl PublicSyncCachesResetReport {
 pub struct SyncManager {
     db: Arc<DbStore>,
     poi_policy: GlobalPoiPolicy,
+    gateway_pool: StdMutex<Option<GatewayPool>>,
     state: Arc<StdMutex<SyncManagerState>>,
 }
 
@@ -216,6 +218,7 @@ impl SyncManager {
         Ok(Self {
             db,
             poi_policy,
+            gateway_pool: StdMutex::new(None),
             state: Arc::new(StdMutex::new(SyncManagerState {
                 lifecycle: SyncManagerLifecycle::Running,
                 lease: Some(lease),
@@ -227,6 +230,13 @@ impl SyncManager {
                 next_start_id: 1,
             })),
         })
+    }
+
+    pub fn set_gateway_pool(&self, gateway_pool: GatewayPool) {
+        *self
+            .gateway_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gateway_pool);
     }
 
     pub async fn add_chain(&self, cfg: ChainConfig) -> Result<Arc<ChainService>, SyncManagerError> {
@@ -328,7 +338,12 @@ impl SyncManager {
                     let prepare = ChainService::prepare(
                         Arc::clone(&self.db),
                         cfg.clone(),
-                        self.poi_policy.clone(),
+                        self.poi_policy.clone().with_optional_gateway_pool(
+                            self.gateway_pool
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone(),
+                        ),
                         lease,
                         rpc_http_client.clone(),
                     );
@@ -1426,6 +1441,7 @@ mod tests {
                         .into(),
                 ),
                 gateway_urls: Vec::new(),
+                gateway_pool: None,
                 max_manifest_age: None,
             },
             rpc_url: Url::parse("http://127.0.0.1:1")

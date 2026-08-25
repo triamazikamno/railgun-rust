@@ -1,0 +1,932 @@
+{
+  "01x01": {
+    "zkey": {
+      "cid": "QmcWD9HBLAZ7Z5ToNRkJLFwkBJrReHtDAcmZkuTPtogf9E",
+      "br_bytes": 3447484
+    },
+    "wasm": {
+      "cid": "QmNQb1oXfLhwBrCSMCcXxLQcUF3FRPLsbYoX2UPzaX3jLd",
+      "br_bytes": 895378
+    }
+  },
+  "01x02": {
+    "zkey": {
+      "cid": "QmNbev1sVjtgTCFoXNK8tVAJgpeXM8CWzoQVHDGKV6yVcW",
+      "br_bytes": 3534304
+    },
+    "wasm": {
+      "cid": "Qme3HxBNueCSNmHca2cBv5KeYQYFw2r2pJDVYANEX8n2sx",
+      "br_bytes": 891957
+    }
+  },
+  "01x03": {
+    "zkey": {
+      "cid": "QmV5PZx4HEk18k75SR6ihjByxgirbEJkjxacSFAV51od9G",
+      "br_bytes": 3671986
+    },
+    "wasm": {
+      "cid": "QmNrJe3TuY98D8cKNq5dKZ8PXT42VwKKhWhuhgSSn9prkv",
+      "br_bytes": 897691
+    }
+  },
+  "01x04": {
+    "zkey": {
+      "cid": "QmZREZfqztCAEQxfixNKkxBtG8XM8zbpg3piBaDzhT4uJ3",
+      "br_bytes": 3788058
+    },
+    "wasm": {
+      "cid": "QmewWdZsm5iTcdT4VYBraA5fezRGKCmCxqgMAcH7QmxGK2",
+      "br_bytes": 899100
+    }
+  },
+  "01x05": {
+    "zkey": {
+      "cid": "QmfGEg36pDtNaTSC9eBsvQSYQcGqze4g3CjpM4rBxC5XmK",
+      "br_bytes": 3897410
+    },
+    "wasm": {
+      "cid": "QmcbkJctDEX9aQ2sp9XpUsrL75uZSocuVjaD22NGZFwPxa",
+      "br_bytes": 899429
+    }
+  },
+  "01x06": {
+    "zkey": {
+      "cid": "QmcjQ93hjSh8TWADUWVFhJ2h3omDoHPXMR7x9ei3KRvrp2",
+      "br_bytes": 4007160
+    },
+    "wasm": {
+      "cid": "QmRyW4tMKCfjKRQdX3Vi6RiqXQi8nVhPhXk86Ejifxz9wV",
+      "br_bytes": 899847
+    }
+  },
+  "01x07": {
+    "zkey": {
+      "cid": "QmNuLVK2aVJAhoZVfGnZGbDJzVjzes1Q1PanTFtXWotKMq",
+      "br_bytes": 4121519
+    },
+    "wasm": {
+      "cid": "Qmdgh74sKFhnnrqjWbg1wtvswYhjDD5KaCcR3ZSDAXm7Jt",
+      "br_bytes": 900693
+    }
+  },
+  "01x08": {
+    "zkey": {
+      "cid": "QmazoEDCBM6CrjoPXCHhfYXTAWnF6WjdpvJ4A4Y2gVMc45",
+      "br_bytes": 4228425
+    },
+    "wasm": {
+      "cid": "QmbdPueJu7DvKH5jqH7JVDrqofkBizhLY8HDMt7DDfXVVF",
+      "br_bytes": 901830
+    }
+  },
+  "01x09": {
+    "zkey": {
+      "cid": "QmXMffgBqXfbJkUujTxNXipyKavCoyjKPQrsh5NjhXQBob",
+      "br_bytes": 4346760
+    },
+    "wasm": {
+      "cid": "QmT1F6Mbpmyjs4RS3hMuEZJXRAcKtTsmKWqkx31K8RGYVy",
+      "br_bytes": 901333
+    }
+  },
+  "01x10": {
+    "zkey": {
+      "cid": "QmWRZ8Zy4PdQUgk8QjqnvdSF8cUx8nvgsCMbWVopRuVzPN",
+      "br_bytes": 4470428
+    },
+    "wasm": {
+      "cid": "QmUjZSCSNERYFh5zL83CKE1nDQu5FU8VUE7hdiP8HduUvE",
+      "br_bytes": 901464
+    }
+  },
+  "01x11": {
+    "zkey": {
+      "cid": "QmcsCQka8kdXhGrY9ofUuUMPXaQxbQEBTrh3jiifu9NuL5",
+      "br_bytes": 4569273
+    },
+    "wasm": {
+      "cid": "QmX9NNsJHNqSNXUmMt9YDBRZphfBpV3yiLWJ1JkzHM1Rrm",
+      "br_bytes": 902633
+    }
+  },
+  "01x12": {
+    "zkey": {
+      "cid": "QmXBVGiii6urDzPtDdxBz8V4sWAxNACXZDg3Xte9k3LEwz",
+      "br_bytes": 4685608
+    },
+    "wasm": {
+      "cid": "QmYTWhoowQtXD4YNMf9Qf1ecMwUdp5wRGu5sHM6yKrFkpg",
+      "br_bytes": 914646
+    }
+  },
+  "01x13": {
+    "zkey": {
+      "cid": "QmTwFD8cpV2C9cf9geUDYqdELfYcASCaodcEdNUjbLvkQv",
+      "br_bytes": 4806371
+    },
+    "wasm": {
+      "cid": "QmYKDmXPTF5qaPdvqriPHd5uVhjhe36f5Bdjqu8mh7x44z",
+      "br_bytes": 905593
+    }
+  },
+  "02x01": {
+    "zkey": {
+      "cid": "QmZMfVGWWWLg6fbAdrWAvAnYbbPftxu4di6tubd3xRucWY",
+      "br_bytes": 4608687
+    },
+    "wasm": {
+      "cid": "QmeJ989WpDkiFcQWJWBEBpr1RY7cVmUoxD8oVxk2pV2HMz",
+      "br_bytes": 896553
+    }
+  },
+  "02x02": {
+    "zkey": {
+      "cid": "QmUtJdjJcTHrGFk7PWRt3ZjACqNoSfiZAdptzrpS4KrveL",
+      "br_bytes": 4747339
+    },
+    "wasm": {
+      "cid": "QmWWBHh9c8ubWFPgLQonpJFxTEru1drDypfcGmRa8kS1F2",
+      "br_bytes": 901910
+    }
+  },
+  "02x03": {
+    "zkey": {
+      "cid": "QmZqDzJj6WrHbADv3su2oZxoxpVScCZJdZbzUPNagqHtER",
+      "br_bytes": 4857947
+    },
+    "wasm": {
+      "cid": "QmeZH5kd8Ri5Se9bjwHbkqa29dDBw9psYHoVqMPrCNausm",
+      "br_bytes": 917132
+    }
+  },
+  "02x04": {
+    "zkey": {
+      "cid": "QmakUu5iu4VhNhZruCvxvP7raqe4TYoGzhcf1XoZB2VC44",
+      "br_bytes": 4969193
+    },
+    "wasm": {
+      "cid": "QmR8HpXu3jCvkUrcgVsAzaRESVxam2wBwCnEvjNsvge8zx",
+      "br_bytes": 904856
+    }
+  },
+  "02x05": {
+    "zkey": {
+      "cid": "QmWeFwacMPrmKhq77C4niZfZ98RVg8AKApk3Rx2ZKpE3Zy",
+      "br_bytes": 5075649
+    },
+    "wasm": {
+      "cid": "QmaJhW9iRKWLbpZpAC5Yh43qAiM3W46J5bDBeHeE2M5Cyn",
+      "br_bytes": 912922
+    }
+  },
+  "02x06": {
+    "zkey": {
+      "cid": "QmderuvPuRfzJoez6q3FoKmjXHCgyCcPQrXu36MypaH4q6",
+      "br_bytes": 6244891
+    },
+    "wasm": {
+      "cid": "QmZxcp6GUWh1WUfBkMLR8TBrkS35zeQLvy35DbhbmJ9jLW",
+      "br_bytes": 905408
+    }
+  },
+  "02x07": {
+    "zkey": {
+      "cid": "QmNZYx8mAgMthPMApfY2cJkV9GphBXE21EDYeXWp5w2Hpe",
+      "br_bytes": 6349998
+    },
+    "wasm": {
+      "cid": "QmQRmY9TfzydW9UBm8Tkz7RBWN8H6LgrAJZXebEEvy1rjT",
+      "br_bytes": 904926
+    }
+  },
+  "02x08": {
+    "zkey": {
+      "cid": "QmZjEFZxdVFHdYX482782fYyoXc7zyHZVtsJWHfkfm37SN",
+      "br_bytes": 6468445
+    },
+    "wasm": {
+      "cid": "QmXv2zgaXXbogyXyEHy8hwSt3cf3NK1sRv7xfW4S6pE769",
+      "br_bytes": 911980
+    }
+  },
+  "02x09": {
+    "zkey": {
+      "cid": "QmVdzxoRNjKabkoq8rvZBqVreyUBCaSaSrkLZxiLt5aPww",
+      "br_bytes": 6593302
+    },
+    "wasm": {
+      "cid": "QmbUejxnHpWcFMeUL4rmeSP7DJURvYRoi9kgjS7ubQqZAG",
+      "br_bytes": 907262
+    }
+  },
+  "02x10": {
+    "zkey": {
+      "cid": "QmV7a41UwkB43Nv2QiQMcyrGMMHDcHiLRETZPVCDQYk6iw",
+      "br_bytes": 6688374
+    },
+    "wasm": {
+      "cid": "QmPHDFb8SqmLGfajWoU4V4MYXZ81TuVaqAQZw5k5Gi4BSb",
+      "br_bytes": 906339
+    }
+  },
+  "02x11": {
+    "zkey": {
+      "cid": "QmWkmzZLkZKAtDcAWyjSTc5qLTaKSrVXR3uTeYnV2SgCCz",
+      "br_bytes": 6809126
+    },
+    "wasm": {
+      "cid": "QmbU9JbFGWgaWZWipG4XZMD7RLLMpUyYGNjuhMfWbowNxp",
+      "br_bytes": 915176
+    }
+  },
+  "02x12": {
+    "zkey": {
+      "cid": "QmV1AiB7DpMXrinvXTQgxfsqCJCKddvc8Y9sJkjWVC35KX",
+      "br_bytes": 6926672
+    },
+    "wasm": {
+      "cid": "QmVNP8fn4BAuiGDPqMaPGX1X7zxp2L8ggN3iWy3iwWDdiy",
+      "br_bytes": 908627
+    }
+  },
+  "03x01": {
+    "zkey": {
+      "cid": "QmVbfvBbr1KyhfHH6FJ916HK2xWBq6fHyUm3ssVWunyoc6",
+      "br_bytes": 6871799
+    },
+    "wasm": {
+      "cid": "QmdwVVseNEjPaYy7Ay58Acqtabd6ZJ82pHzWodEBVegYfA",
+      "br_bytes": 914507
+    }
+  },
+  "03x02": {
+    "zkey": {
+      "cid": "QmSLcvLGk8knVsMEA2uw9D7ErT81Zfn7DCcwUPaZbKSTmC",
+      "br_bytes": 6982210
+    },
+    "wasm": {
+      "cid": "QmPCsngzKbScmJkasGvxteKLwhPM2osfKgtL9DtMn4UAvu",
+      "br_bytes": 907288
+    }
+  },
+  "03x03": {
+    "zkey": {
+      "cid": "QmSARSdoYD2RtCqjEoNXbiRyBjQz8KK1uatGEN1fg3iJbo",
+      "br_bytes": 7089890
+    },
+    "wasm": {
+      "cid": "QmYEFkWaVvskQGV8y8j2VjZQr5TRBxgssnFJU1sM33uiMF",
+      "br_bytes": 907213
+    }
+  },
+  "03x04": {
+    "zkey": {
+      "cid": "QmaZqGSPVHHXT7mgt4nG7w6rQamg25FC6PUzpo134TJGvf",
+      "br_bytes": 7198197
+    },
+    "wasm": {
+      "cid": "QmTFq7PTKmNzdpr6eSsTc64UpvNnpg1F9xXk22iYJkRoXz",
+      "br_bytes": 916983
+    }
+  },
+  "03x05": {
+    "zkey": {
+      "cid": "QmYS9QzagFdJ9hUvg1e65wRRZDHarC4spBkrQC9qKno6Xg",
+      "br_bytes": 7317448
+    },
+    "wasm": {
+      "cid": "QmWnRz2PRu7PJ1hcUBAaQ2kW3EN9Q4zEeoTpSGs9FcY6Vz",
+      "br_bytes": 917618
+    }
+  },
+  "03x06": {
+    "zkey": {
+      "cid": "QmdSEFhHxU1vmBD2cw7WE3bKGK4DHat4QTMrRJTarnbVxi",
+      "br_bytes": 7421944
+    },
+    "wasm": {
+      "cid": "QmRQtDxrbRkCuuskY1AKBCRG9GCeHR8d1LiPjkFyYixkuc",
+      "br_bytes": 919173
+    }
+  },
+  "03x07": {
+    "zkey": {
+      "cid": "QmX9Spqo2xdhT8ExccmxMok1CbKAkSRKBZE2gZVsWc3rg7",
+      "br_bytes": 7544870
+    },
+    "wasm": {
+      "cid": "QmXTiD6uAm8vNCBGSjwNyJPoMX8vatbsGf8mJ55s45yrGw",
+      "br_bytes": 922115
+    }
+  },
+  "03x08": {
+    "zkey": {
+      "cid": "QmXbTPJUva1TeEEbrFfpqEW9LJ3NFzVVhjiQhjZHf9ppeq",
+      "br_bytes": 7662861
+    },
+    "wasm": {
+      "cid": "Qmeho3Qqm7TQHYUyQprXNb1QCtPJxoJavP5jJ53pM4nwdZ",
+      "br_bytes": 918825
+    }
+  },
+  "03x09": {
+    "zkey": {
+      "cid": "QmWZzJzAobyBjkA5snTMdNdCKQorsSGEV1nHAcmgBJ4tx1",
+      "br_bytes": 7768009
+    },
+    "wasm": {
+      "cid": "QmTTfrfKtX2sjBDMseNqwg7J7YQSPd3w2Z6dwZmBXQWKZg",
+      "br_bytes": 910838
+    }
+  },
+  "03x10": {
+    "zkey": {
+      "cid": "QmSkERQZPksLhMB9aKokvigrkLehQHjaUTdunai4T3bq32",
+      "br_bytes": 7875872
+    },
+    "wasm": {
+      "cid": "QmV1zbzuGQAgxu3DzWSRRVVq2N1YRBBGRyFFZCNgAsEtgZ",
+      "br_bytes": 919272
+    }
+  },
+  "03x11": {
+    "zkey": {
+      "cid": "QmVv8ooi1D8UugJKvKogSj2okQpfMvebRzd4ncGQdjcqvR",
+      "br_bytes": 7998910
+    },
+    "wasm": {
+      "cid": "QmcFWyyv3c2SVeEdQrk1FjvG8DiLK44QQ8sxhiJRrXcY81",
+      "br_bytes": 911569
+    }
+  },
+  "04x01": {
+    "zkey": {
+      "cid": "QmYTrrzTGqgZXYseCmRQDaGdCcVLm4pXaCRyevfeTuEyCD",
+      "br_bytes": 8054108
+    },
+    "wasm": {
+      "cid": "QmdxeGTBMnMkggcY9BjuXqK5awPHyTGEVPLa5mq1oAjSsZ",
+      "br_bytes": 925548
+    }
+  },
+  "04x02": {
+    "zkey": {
+      "cid": "QmT3uRVKVXyJPTUpn8s9vjqC1J31LE8gv1TTQfiSpToNbq",
+      "br_bytes": 8163197
+    },
+    "wasm": {
+      "cid": "QmbbQ2tbUpav84EhgaGq7vuiyKp3opCe6uKm18NYzM81xA",
+      "br_bytes": 911467
+    }
+  },
+  "04x03": {
+    "zkey": {
+      "cid": "QmeXJjsC7xJYQHNqqeYQUfmRA1xTUU1LhewRaRcEWbUrPk",
+      "br_bytes": 8273800
+    },
+    "wasm": {
+      "cid": "QmaycD1mP7C3kDJ2AXqHRmPp1ankYrxK5vWSKgE5tEUtMR",
+      "br_bytes": 921111
+    }
+  },
+  "04x04": {
+    "zkey": {
+      "cid": "QmYf88dYtYdRiS3H7yLwnRfL1c5fTFDECQuVsC1Dtk2snZ",
+      "br_bytes": 8391373
+    },
+    "wasm": {
+      "cid": "QmVF8AyDAj1YEWzVAidu6Um5SHPAdZ1NQqXAKD5QV3eyZd",
+      "br_bytes": 925547
+    }
+  },
+  "04x05": {
+    "zkey": {
+      "cid": "QmSsfqzMwRium6zg5qLchrrPQLGh5siCbUrVaZEBSuyFq9",
+      "br_bytes": 8497970
+    },
+    "wasm": {
+      "cid": "QmZYpvnYZuWhheUg1gTWdC2neFLNbpg8fS1UeWW1JZuo84",
+      "br_bytes": 924719
+    }
+  },
+  "04x06": {
+    "zkey": {
+      "cid": "QmShGzBvZu9VW6KHRqAmscQjqruwXoj7sKNCGiXM3Yo7Pe",
+      "br_bytes": 8615631
+    },
+    "wasm": {
+      "cid": "QmZBrwj4kUQ7oBwpZCH5qzFj14SWva7HwWYb7d2mVah7nR",
+      "br_bytes": 928228
+    }
+  },
+  "04x07": {
+    "zkey": {
+      "cid": "QmSQWsRoayh6MwrSR8M6bqNLYvr97wj5yU5wLKMmNZVPNg",
+      "br_bytes": 8737429
+    },
+    "wasm": {
+      "cid": "QmV9wVTmAgbyyrdax3vuaqyfMNVCUG85xQWgPeg9zhGHWE",
+      "br_bytes": 913224
+    }
+  },
+  "04x08": {
+    "zkey": {
+      "cid": "Qmbpyocyq7PP3F3eDjoKjrP8KZr58xqEKn8rD686LLkfiR",
+      "br_bytes": 8831100
+    },
+    "wasm": {
+      "cid": "QmfEXSvRrFqt7ju5QxvMb1D1ufuhsHT9ryMGaJox1ZWffk",
+      "br_bytes": 915749
+    }
+  },
+  "04x09": {
+    "zkey": {
+      "cid": "QmSetsLTjAPXuqpjMWjGESHp8qzFA9HCYWZKqBz1ZEjeD2",
+      "br_bytes": 8950631
+    },
+    "wasm": {
+      "cid": "QmTLvqA6ZPy1bFKfydaz3QJHmfcr8SkdJYo5tuTubH5D9e",
+      "br_bytes": 931745
+    }
+  },
+  "04x10": {
+    "zkey": {
+      "cid": "QmeL9A9Hb9j27zDAXgBZse61TvQAy2icg6EQQYK6EgyfVZ",
+      "br_bytes": 9072264
+    },
+    "wasm": {
+      "cid": "Qmb5hwy7h863FjbG1AiWQaStZL4rNjvnhKW1yfXMshLo7U",
+      "br_bytes": 915310
+    }
+  },
+  "05x01": {
+    "zkey": {
+      "cid": "QmNtDuXwQ9Dnvp4SpGqsLmHzzaQGjmbqJuX9bvnNbstWMN",
+      "br_bytes": 9237178
+    },
+    "wasm": {
+      "cid": "QmNsEmrm9SMYdyMWT2cHZQk69bpHhEMScgtygPw9nQ1pEF",
+      "br_bytes": 919157
+    }
+  },
+  "05x02": {
+    "zkey": {
+      "cid": "QmPZh1RQkJgh9QSUu9pN5JauaF2kkapf6aY3T9EUSR4A9f",
+      "br_bytes": 9341610
+    },
+    "wasm": {
+      "cid": "QmT1iNLnNgje1xC79orZDbU9rAt86fQEXVu6PFW1LbxsBL",
+      "br_bytes": 929681
+    }
+  },
+  "05x03": {
+    "zkey": {
+      "cid": "QmaHQABzFNT42tgcA49uMbGpUnTjTyuNLNMcvzY9nMxDYV",
+      "br_bytes": 9459888
+    },
+    "wasm": {
+      "cid": "QmYiXErDpewKk9vV1UVeP2zmgV5C8bnq9AAW6En9PirJru",
+      "br_bytes": 919668
+    }
+  },
+  "05x04": {
+    "zkey": {
+      "cid": "QmTJx1EzB7n2NJXSkEKiSGVxaBGKgc8PKwCdVqDwePiXXZ",
+      "br_bytes": 9566628
+    },
+    "wasm": {
+      "cid": "QmRJbofsxQVRrW6RaEXupJptN7LxDm2n6Jp55ZJcev5PWZ",
+      "br_bytes": 918715
+    }
+  },
+  "05x05": {
+    "zkey": {
+      "cid": "QmUn1mKf2dDLou5qtf7wZfuBLducoUU8Tcv7koZQ9JGdie",
+      "br_bytes": 9683935
+    },
+    "wasm": {
+      "cid": "QmNQVTGd742mFQohjroX1i1juqdh9CRLwvW9PU7nxRytXA",
+      "br_bytes": 919410
+    }
+  },
+  "05x06": {
+    "zkey": {
+      "cid": "QmZ4Mj562NdLyWbCHJzQdf1MRuYURGBLEzZ9ym3K68E5Sz",
+      "br_bytes": 9807595
+    },
+    "wasm": {
+      "cid": "QmbmoG9LVLYic6kUFYMuqbddEXZiuDqwmfw4w2LtrYyL1E",
+      "br_bytes": 931440
+    }
+  },
+  "05x07": {
+    "zkey": {
+      "cid": "QmbWnxYHdcgxtzMq54H1bqYpDkppC68FhdjdWqA3dKaXZB",
+      "br_bytes": 9901789
+    },
+    "wasm": {
+      "cid": "QmdouiJ7J2A9MZPc1cnBWviTD3ArWLvibxrnzGW7ReM2SE",
+      "br_bytes": 920491
+    }
+  },
+  "05x08": {
+    "zkey": {
+      "cid": "QmdMh3p9ueRHp9QvbSUxmzSznebDUhgiSsJEao3VnkxQWK",
+      "br_bytes": 10023055
+    },
+    "wasm": {
+      "cid": "QmWkk6z5tnrXFPL2tWZzQnHG8dZD779DS2azYaRcBtoe4f",
+      "br_bytes": 939623
+    }
+  },
+  "05x09": {
+    "zkey": {
+      "cid": "QmdwV4pKVrhbqk8YStRQewSHQScWkoB6RT6KZ4jbtRNkun",
+      "br_bytes": 10141242
+    },
+    "wasm": {
+      "cid": "QmdVwcgKbJrPNzMgp5ZHMo7XAwz7LHez3TwNa31qKcumE2",
+      "br_bytes": 922805
+    }
+  },
+  "06x01": {
+    "zkey": {
+      "cid": "QmXxE5CQY8DqYcHPRdmqEgMuMNKamotKBQvF8qosUYn5tr",
+      "br_bytes": 12504376
+    },
+    "wasm": {
+      "cid": "QmZmjWu1K3iVYkdeQseSjejwsam4psCxaWrnm6E6f2cMWk",
+      "br_bytes": 941473
+    }
+  },
+  "06x02": {
+    "zkey": {
+      "cid": "QmQHV3VDW9jgkqBn62hRmQ5ndJ29xNetpsCH3Jo7D1QqdT",
+      "br_bytes": 12627246
+    },
+    "wasm": {
+      "cid": "QmanpgeZTGysKFpC8KM6rZrpLiubN9YyRS4itDKMefeMz2",
+      "br_bytes": 922441
+    }
+  },
+  "06x03": {
+    "zkey": {
+      "cid": "QmYdd3itH95eYMaQnKjJwMCJj7nPRcQK2WWf9z5aZKEe32",
+      "br_bytes": 12731913
+    },
+    "wasm": {
+      "cid": "QmVxEropg4jpqmsduxLiVmAsggeU25Feg131GKkNkSGTzQ",
+      "br_bytes": 935604
+    }
+  },
+  "06x04": {
+    "zkey": {
+      "cid": "QmW6sYGNHgX71wwm8ACGVDfZoVkTdFB822jVDhD3y7FHw4",
+      "br_bytes": 12853130
+    },
+    "wasm": {
+      "cid": "QmURMakZJeNNY9jS8Y4Rj2zUNTqzNn9GmsJ2feV1oGJhq3",
+      "br_bytes": 920909
+    }
+  },
+  "06x05": {
+    "zkey": {
+      "cid": "QmX3BpaZK4MWT21h2DJJkEjMbLKcvfjgLYYkuVfsdZevwj",
+      "br_bytes": 12968376
+    },
+    "wasm": {
+      "cid": "QmVtjrhf45yc4xghzsxhLR4d9dqdR8cTXNGL32ntLRDA6p",
+      "br_bytes": 923070
+    }
+  },
+  "06x06": {
+    "zkey": {
+      "cid": "QmdcGL5o7movTUnRPSLZ4gBwvEFCL2ZnGZWXu3kJoUfdNg",
+      "br_bytes": 13065446
+    },
+    "wasm": {
+      "cid": "QmSNEXE1WC4ugWNKCvqrecgFZr8PQd8r7RxP5XAvmY9nih",
+      "br_bytes": 942256
+    }
+  },
+  "06x07": {
+    "zkey": {
+      "cid": "QmRULf6FubDqw4a2GpLrd64N7VQXgsuYVRW9pvFHW9XNAp",
+      "br_bytes": 13192529
+    },
+    "wasm": {
+      "cid": "QmXeNGtPV7Cx2SwHtXqWHrGsE5zqvqby4mSGiKRkGhCqVG",
+      "br_bytes": 923800
+    }
+  },
+  "06x08": {
+    "zkey": {
+      "cid": "QmcX6axsdDvZ9Wv5erBYnW7BknAMBY8yXHAVGLuoy16x25",
+      "br_bytes": 13310165
+    },
+    "wasm": {
+      "cid": "Qmf2Gf48TdQedFFqQZTF4aBwtPtTx6SAPeY7nczKQY2NiD",
+      "br_bytes": 923093
+    }
+  },
+  "07x01": {
+    "zkey": {
+      "cid": "QmXDkna4Hd8nSz6R6e6xUWEDbgBCutuy4ph21KEPinBLeL",
+      "br_bytes": 13698049
+    },
+    "wasm": {
+      "cid": "QmSrTTNyHMRpABjYnk39hjVY58aGgCLbSSC7oMNnBxf9bg",
+      "br_bytes": 924456
+    }
+  },
+  "07x02": {
+    "zkey": {
+      "cid": "QmdB84CQssCvnwLZ8MkQa3nsmMTfPCaDS6uAJFxiLGjGEE",
+      "br_bytes": 13801731
+    },
+    "wasm": {
+      "cid": "QmbanYrqtdtSNxu8J7BARRuyzZYPebum3XGkyED5yWndvC",
+      "br_bytes": 940934
+    }
+  },
+  "07x03": {
+    "zkey": {
+      "cid": "QmQXTnk9bnpRdg4XG6EJUg7BzutcwqprSYnUNa9MUBn5v7",
+      "br_bytes": 13962883
+    },
+    "wasm": {
+      "cid": "QmQghZSeDzqg9wSgGfHaxqQK6uuHuhzr3kMnRDJ3gDSi8H",
+      "br_bytes": 945642
+    }
+  },
+  "07x04": {
+    "zkey": {
+      "cid": "QmfUNaHXNStifmHokq9fCkrGc8xHXcwE8e4rD25xpFmPrz",
+      "br_bytes": 14038931
+    },
+    "wasm": {
+      "cid": "QmPV2CRQXicLLXigBmYGPwP2m9Dw4CfN4rWVN2i43ywdrH",
+      "br_bytes": 947759
+    }
+  },
+  "07x05": {
+    "zkey": {
+      "cid": "QmZsRhbWktdFW75Dc71N7qZQuNLyNVXRrTGKGLvjVfS5xe",
+      "br_bytes": 14138653
+    },
+    "wasm": {
+      "cid": "QmU4C3gKmsvaL9K6rAECKPhqWex3vB4usb4W1tiX2Cj3JD",
+      "br_bytes": 925616
+    }
+  },
+  "07x06": {
+    "zkey": {
+      "cid": "QmYyo6gE7cL2L21He7M5bTNksnVBTuzwZoz9JFKetWAh3C",
+      "br_bytes": 14260324
+    },
+    "wasm": {
+      "cid": "QmQvE6ZjchpvWSDMmMmrwTS7fr2icmC7yv9EMizGosuNvC",
+      "br_bytes": 926429
+    }
+  },
+  "07x07": {
+    "zkey": {
+      "cid": "QmawQEu29HfWunSbNGhwVEXvjZSqgBbudgVGU4FuMWRcgm",
+      "br_bytes": 14376506
+    },
+    "wasm": {
+      "cid": "Qmf2dEKBkGY7KRGTm5Ha3u4vQwgrdzUgtDYBkP4ChsXcJt",
+      "br_bytes": 929801
+    }
+  },
+  "08x01": {
+    "zkey": {
+      "cid": "QmS9LdRA5i6xB9XiqjCjRzsqbJSNhvSn2AjbnxUU21TqeR",
+      "br_bytes": 14873273
+    },
+    "wasm": {
+      "cid": "QmNaYWMggGisWXg6hCS3WMLsznpcyoXtM9YxRekTCyBXPt",
+      "br_bytes": 933069
+    }
+  },
+  "08x02": {
+    "zkey": {
+      "cid": "QmRwXG16MsVBYEYsBMo4iB4qD7ZgwSSbo7316bs8Cfi59j",
+      "br_bytes": 14990017
+    },
+    "wasm": {
+      "cid": "QmPXx5QthMvhftgX962iGM5iFKGpM5YVUYTT4x43akakWZ",
+      "br_bytes": 950717
+    }
+  },
+  "08x03": {
+    "zkey": {
+      "cid": "QmaNDkcPRS6zjr3xo7c2FTzr14gxfZ7T8iz5eaqtMFiZqL",
+      "br_bytes": 15111651
+    },
+    "wasm": {
+      "cid": "Qmck2i3J1Dz5gwzAuXh2nzDQkifipN8MVjGefa6DHYU3XA",
+      "br_bytes": 949998
+    }
+  },
+  "08x04": {
+    "zkey": {
+      "cid": "QmSd9BZX3H9NoYaZ8WVCicXhM8kqxpxNXtA79YqcgW1FpW",
+      "br_bytes": 15208483
+    },
+    "wasm": {
+      "cid": "QmZHrq9D1mt3Uoi6sCQxN8uBr8F7AC99HemmsxeWFWPPUi",
+      "br_bytes": 949373
+    }
+  },
+  "08x05": {
+    "zkey": {
+      "cid": "QmZByoy1XgEb5kMLebyJqRfTTsHdrGybtDTtxbZrto56VT",
+      "br_bytes": 15322831
+    },
+    "wasm": {
+      "cid": "QmbNAjCAuyJFPScmRESyoMbVV4M2sZf3BoU9ipb774aDrh",
+      "br_bytes": 953634
+    }
+  },
+  "08x06": {
+    "zkey": {
+      "cid": "QmT8fSgYsma3kPkHthD7hGfVP1uowG2ZZGdSR7YRzHNgWz",
+      "br_bytes": 15453023
+    },
+    "wasm": {
+      "cid": "QmUWfXJtVdLhdXirAasP5imTpFZUMaXxVfHZcqbyfso3oK",
+      "br_bytes": 932480
+    }
+  },
+  "09x01": {
+    "zkey": {
+      "cid": "QmTxm4GfbRFuoGSpJqTrZ5TSFtfnYLzsnRX8SXPyd97CMe",
+      "br_bytes": 16060624
+    },
+    "wasm": {
+      "cid": "QmUB56aDU8ioj9SeRg5UDpY8G19FVoH3k6aaXVqy6i4PNp",
+      "br_bytes": 958373
+    }
+  },
+  "09x02": {
+    "zkey": {
+      "cid": "QmW8kYdLWEdXzAqaB1YWTTyyMdT414E5dp39E8wAMPo31g",
+      "br_bytes": 16183750
+    },
+    "wasm": {
+      "cid": "QmbLDPDbTrdsJqq3MiMWyjP94CRqtzmstpy8HGjSfvfbau",
+      "br_bytes": 938204
+    }
+  },
+  "09x03": {
+    "zkey": {
+      "cid": "QmYxWHp2xJm3KgxcUzf6Ssd3Kujxm5wNUHQGtpALedE7bR",
+      "br_bytes": 16278376
+    },
+    "wasm": {
+      "cid": "QmPn1C4RrzQX53tQkQDLEsZFBKFAvCLu8z8sKJ6oqs3HmQ",
+      "br_bytes": 953582
+    }
+  },
+  "09x04": {
+    "zkey": {
+      "cid": "QmXDHutZsbDuo6gjtArsScP1HzdMqSYg2VqfCqpFQasGAt",
+      "br_bytes": 16400180
+    },
+    "wasm": {
+      "cid": "QmSR7D9a7cvLfFcSpwKcxsYNoy56cCGGatxpNTNQox1rta",
+      "br_bytes": 936303
+    }
+  },
+  "09x05": {
+    "zkey": {
+      "cid": "QmNqouWwU4JTyeizBrTTYmoVGdJvKvqFzNnKkucDZtwxnK",
+      "br_bytes": 16518799
+    },
+    "wasm": {
+      "cid": "QmTXfrv5VRUYewVhtWSk7XLuy8nWHNBkVmffCjDX1ymDvj",
+      "br_bytes": 937603
+    }
+  },
+  "10x01": {
+    "zkey": {
+      "cid": "Qmd3tMmo4H5QXGYTqtJSua89Pmk5DacerBtPuQE8wcVMXH",
+      "br_bytes": 17251883
+    },
+    "wasm": {
+      "cid": "QmZf4inx35Vg2jHbSzykXLa9aVskRvtvbFpP46HE8SV5B3",
+      "br_bytes": 966255
+    }
+  },
+  "10x02": {
+    "zkey": {
+      "cid": "Qma5v3FjbHU4tBVAEhWRDKSPD9xNpN3Mj3XD1ZBWDjbdPG",
+      "br_bytes": 17343246
+    },
+    "wasm": {
+      "cid": "QmaChFjLe4bri33vfW3pUrXNcAYGmypTRwQETNyWE4P4XT",
+      "br_bytes": 937706
+    }
+  },
+  "10x03": {
+    "zkey": {
+      "cid": "QmXFKQkyhqm47uJ8xUZwnDoirx2qmnUwqbmVo9pueuGnBd",
+      "br_bytes": 17467777
+    },
+    "wasm": {
+      "cid": "QmZKtH7TntNrdSH3EgwVTiy8dGdigiTX8yk3C3GUDrNRTd",
+      "br_bytes": 956573
+    }
+  },
+  "10x04": {
+    "zkey": {
+      "cid": "QmVmFoe88i8sUBtWwWYNBtkD2YCXegHNK5PnFZsMXVet9X",
+      "br_bytes": 17587721
+    },
+    "wasm": {
+      "cid": "QmeKSkFE53tyR1zYBg3izqA392SBQJX9RMw8WEeMMNU3HT",
+      "br_bytes": 944246
+    }
+  },
+  "11x01": {
+    "zkey": {
+      "cid": "QmaV16DLNN5FbJGCwVt5JaRBenzu5A6ZZk2s9iiKj8pEr7",
+      "br_bytes": 18419823
+    },
+    "wasm": {
+      "cid": "QmXARv1QU9bcVxkfgRLRGQRYkQxU6uBWHdyCHefBS8P3iZ",
+      "br_bytes": 973924
+    }
+  },
+  "11x02": {
+    "zkey": {
+      "cid": "QmdfwRVb94zk9bzWUPuh3bQXXMaaxryTcvxpbhK1m6TBk9",
+      "br_bytes": 18537472
+    },
+    "wasm": {
+      "cid": "QmZHQRXaHPdeqPtathEpjDjGagaZRP5FDtRePejx5CidYF",
+      "br_bytes": 942322
+    }
+  },
+  "11x03": {
+    "zkey": {
+      "cid": "QmeX7uM78NRw2J54HADCHsb6bpySfffVGVbPkDJzsbtFdG",
+      "br_bytes": 18658608
+    },
+    "wasm": {
+      "cid": "QmbHQLvmgFYjPvF1YbbYaq5xhzUPSyabhGY6nFnZ56NX4L",
+      "br_bytes": 976670
+    }
+  },
+  "12x01": {
+    "zkey": {
+      "cid": "QmTUQUP5Wr9nrYFGgqdc7UkjNau9dC5ySqoMaoYdacmbZi",
+      "br_bytes": 19615388
+    },
+    "wasm": {
+      "cid": "QmPbSkxhB69UFSkcoDpmNPJBh5Xu37CnigvdjamfeCY4uy",
+      "br_bytes": 974500
+    }
+  },
+  "12x02": {
+    "zkey": {
+      "cid": "QmVmTkJTvwp4HXUzkycrokJXJtRJjZpdkCHkX6ManToQzP",
+      "br_bytes": 19736336
+    },
+    "wasm": {
+      "cid": "QmajQ92TRCzEUiG52j8HAbPARR9tNHECo3dvcXxJQVSPrb",
+      "br_bytes": 951744
+    }
+  },
+  "13x01": {
+    "zkey": {
+      "cid": "QmWQv8wkUxtQ1spEumfB2godkgcKp7HpYvQNffrcuPnft7",
+      "br_bytes": 20810572
+    },
+    "wasm": {
+      "cid": "QmZsYtJbkMgD7Djh6bmiU9ejwqN9mFBFdka5Ab5uYwJc15",
+      "br_bytes": 981294
+    }
+  },
+  "POI_13x13": {
+    "wasm": {
+      "cid": "QmQFajQFuNjNbRPV4Nuden9ve3ZmTgE2c7yVJ1i4f9474j",
+      "br_bytes": 966721
+    },
+    "zkey": {
+      "cid": "QmXE63puZpTVHjsrm4WxqxaGdhRNkbbpzF1713fRTdAUap",
+      "br_bytes": 27880141
+    }
+  },
+  "POI_3x3": {
+    "wasm": {
+      "cid": "QmfWcMX3b4GBseab9LpmPz8ozKoRJLqyS26sqhFELXSMqn",
+      "br_bytes": 911894
+    },
+    "zkey": {
+      "cid": "QmUcU98hmiWCysxoUbi2ogsm11Xgg9RcyNaRcYMzHiZ9zH",
+      "br_bytes": 7784805
+    }
+  }
+}

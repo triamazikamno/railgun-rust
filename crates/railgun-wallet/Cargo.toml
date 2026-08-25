@@ -25,11 +25,12 @@ hmac = { workspace = true }
 merkletree = { path = "../merkletree" }
 local-db = { path = "../local-db" }
 poi = { path = "../poi" }
+trustless-artifacts = { path = "../trustless-artifacts" }
 num-bigint = "0.4"
 num-traits = "0.2"
 tracing = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true }
 ruint = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,7 +38,6 @@ rmp-serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
-bytes = { workspace = true }
 byteorder = { workspace = true }
 wasmer = { version = "6.1", features = ["singlepass"] }
 wasmer-compiler-singlepass = "6.1"

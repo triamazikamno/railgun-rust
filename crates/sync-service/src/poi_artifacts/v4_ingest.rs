@@ -15,7 +15,6 @@ use super::{
     VerifiedCorpusCandidate,
 };
 use crate::chain::PoiArtifactPersistenceHandle;
-use crate::trustless_artifacts::TrustlessArtifactFetcher;
 use crate::types::{
     PoiArtifactCacheGraphProgress, PoiArtifactCachePhase, PoiArtifactManifestSource,
 };
@@ -80,7 +79,7 @@ impl PoiArtifactIngestor {
         F: Fn() -> SystemTime + Sync + ?Sized,
     {
         let name = ipns_name(&self.config.manifest_source)?;
-        let fetcher = TrustlessArtifactFetcher::new_poi(&self.client, &self.config.gateway_urls);
+        let fetcher = self.fetcher();
         let candidates = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
@@ -393,7 +392,7 @@ impl PoiArtifactIngestor {
         preferred_gateway_index: usize,
         cancel: &CancellationToken,
     ) -> Result<FetchedArtifact, PoiArtifactError> {
-        let fetcher = TrustlessArtifactFetcher::new_poi(&self.client, &self.config.gateway_urls);
+        let fetcher = self.fetcher();
         let fetched = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
@@ -943,6 +942,7 @@ mod tests {
                 trusted_publisher_pubkey: publisher,
                 manifest_source: PoiArtifactManifestSource::IpnsName(ipns_name),
                 gateway_urls: vec![gateway.into()],
+                gateway_pool: None,
                 max_manifest_age: Some(Duration::from_secs(1)),
             },
             reqwest::Client::new(),
@@ -1392,6 +1392,7 @@ mod tests {
                 trusted_publisher_pubkey: publisher,
                 manifest_source: PoiArtifactManifestSource::IpnsName(ipns_name),
                 gateway_urls: vec![gateway.into()],
+                gateway_pool: None,
                 max_manifest_age: Some(Duration::from_secs(1)),
             },
             reqwest::Client::new(),

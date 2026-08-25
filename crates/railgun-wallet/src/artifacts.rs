@@ -2,28 +2,24 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::Duration;
 
 use alloy::hex;
 use alloy::primitives::FixedBytes;
 use brotli::Decompressor;
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::warn;
+use trustless_artifacts::{
+    DEFAULT_GATEWAYS, GatewayPool, TrustlessArtifactError, TrustlessArtifactFetcher,
+};
 use url::Url;
 
-const DEFAULT_GATEWAY: &str = "https://ipfs-lb.com";
-const DEFAULT_IPFS_HASH: &str = "QmUsmnK4PFc7zDp2cmC4wBZxYLjNyRgWfs5GNcJJ2uLcpU";
-const DEFAULT_POI_IPFS_HASH: &str = "QmZrP9zaZw2LwErT2yA6VpMWm65UdToQiKj4DtStVsUJHr";
 const ARTIFACTS_DIR: &str = "db/railgun/blobs/artifacts";
 const ARTIFACTS_LIST_FILE: &str = "artifacts.json";
 const ARTIFACTS_HASHES_FILE: &str = "artifact-v2-hashes.json";
+const ARTIFACT_CIDS_FILE: &str = "artifact-cids.json";
 const POI_ARTIFACT_PREFIX: &str = "POI_";
 const POI_ARTIFACT_CACHE_DIR: &str = "artifacts-v2.1/poi-nov-2-23";
-const ARTIFACT_DOWNLOAD_ATTEMPTS: usize = 5;
 
 const ARTIFACTS_LIST_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -32,6 +28,10 @@ const ARTIFACTS_LIST_EMBED: &[u8] = include_bytes!(concat!(
 const ARTIFACTS_HASHES_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/resources/metadata/artifact-v2-hashes.json"
+));
+const ARTIFACT_CIDS_EMBED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/metadata/artifact-cids.json"
 ));
 
 #[derive(Debug, Error)]
@@ -54,15 +54,21 @@ pub enum ArtifactError {
     ArtifactHashes(#[source] std::io::Error),
     #[error("parse artifact hashes: {0}")]
     HashesParse(#[source] serde_json::Error),
+    #[error("read artifact CIDs {path}: {source}")]
+    ArtifactCids {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("parse artifact CIDs: {0}")]
+    CidsParse(#[source] serde_json::Error),
     #[error("missing artifact hash for {variant}")]
     MissingHash { variant: String },
-    #[error("invalid url {url}: {source}")]
-    InvalidUrl {
-        url: String,
-        source: url::ParseError,
-    },
-    #[error("download failed for {url}: {source}")]
-    Download { source: reqwest::Error, url: Url },
+    #[error("missing artifact CID entry for variant {variant}")]
+    MissingCid { variant: String },
+    #[error("trustless artifact fetch failed: {0}")]
+    Trustless(#[source] TrustlessArtifactError),
+    #[error("artifact materialization task failed: {0}")]
+    MaterializationTask(#[source] tokio::task::JoinError),
     #[error("brotli decompress failed: {0}")]
     Decompress(#[source] std::io::Error),
     #[error("hash mismatch for {label}: got {actual}, expected {expected}")]
@@ -88,6 +94,18 @@ struct ArtifactHashes {
     dat: Option<FixedBytes<32>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArtifactCid {
+    cid: String,
+    br_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactCidSet {
+    zkey: ArtifactCid,
+    wasm: ArtifactCid,
+}
+
 #[derive(Debug)]
 pub struct Artifacts {
     pub zkey: Vec<u8>,
@@ -96,38 +114,38 @@ pub struct Artifacts {
 
 #[derive(Debug, Clone)]
 pub struct ArtifactSource {
-    pub gateway: Url,
-    pub ipfs_hash: String,
-    pub poi_ipfs_hash: String,
+    pub gateways: Vec<Url>,
+    pub client: Option<reqwest::Client>,
+    pub gateway_pool: GatewayPool,
     pub out_dir: PathBuf,
     pub metadata_dir: Option<PathBuf>,
-    /// Optional proxy URL for artifact downloads (e.g. `socks5h://127.0.0.1:9050`).
-    pub proxy: Option<Url>,
 }
 
 impl Default for ArtifactSource {
     fn default() -> Self {
+        let gateways = DEFAULT_GATEWAYS
+            .iter()
+            .map(|gateway| Url::parse(gateway).expect("valid gateway url"))
+            .collect::<Vec<_>>();
         Self {
-            gateway: Url::parse(DEFAULT_GATEWAY).expect("valid gateway url"),
-            ipfs_hash: DEFAULT_IPFS_HASH.to_string(),
-            poi_ipfs_hash: DEFAULT_POI_IPFS_HASH.to_string(),
+            gateway_pool: GatewayPool::new(),
+            gateways,
+            client: None,
             out_dir: PathBuf::from(ARTIFACTS_DIR),
             metadata_dir: None,
-            proxy: None,
         }
     }
 }
 
 impl ArtifactSource {
     #[must_use]
-    pub fn new(gateway: Url, ipfs_hash: String, out_dir: PathBuf) -> Self {
+    pub fn new(gateways: Vec<Url>, out_dir: PathBuf) -> Self {
         Self {
-            gateway,
-            ipfs_hash,
-            poi_ipfs_hash: DEFAULT_POI_IPFS_HASH.to_string(),
+            gateways,
+            client: None,
+            gateway_pool: GatewayPool::new(),
             out_dir,
             metadata_dir: None,
-            proxy: None,
         }
     }
 
@@ -138,14 +156,20 @@ impl ArtifactSource {
     }
 
     #[must_use]
-    pub fn with_poi_ipfs_hash(mut self, ipfs_hash: String) -> Self {
-        self.poi_ipfs_hash = ipfs_hash;
+    pub fn with_gateways(mut self, gateways: Vec<Url>) -> Self {
+        self.gateways = gateways;
         self
     }
 
     #[must_use]
-    pub fn with_proxy(mut self, proxy: Url) -> Self {
-        self.proxy = Some(proxy);
+    pub fn with_gateway_pool(mut self, gateway_pool: GatewayPool) -> Self {
+        self.gateway_pool = gateway_pool;
+        self
+    }
+
+    #[must_use]
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = Some(client);
         self
     }
 
@@ -165,6 +189,20 @@ impl ArtifactSource {
         Ok(variants)
     }
 
+    pub(crate) fn list_variants_with_max_commitments(
+        &self,
+        max_commitments: usize,
+    ) -> Result<Vec<String>, ArtifactError> {
+        let specs = self.artifact_specs()?;
+        let mut variants: Vec<String> = specs
+            .into_iter()
+            .filter(|spec| spec.commitments <= max_commitments)
+            .map(|spec| variant_name(spec.nullifiers, spec.commitments))
+            .collect();
+        variants.sort();
+        Ok(variants)
+    }
+
     #[must_use]
     pub fn artifact_paths(&self, variant: &str) -> ArtifactPaths {
         let base = if is_poi_variant(variant) {
@@ -178,7 +216,7 @@ impl ArtifactSource {
         }
     }
 
-    pub fn ensure_artifacts(
+    pub async fn ensure_artifacts(
         &self,
         nullifiers: usize,
         commitments: usize,
@@ -189,11 +227,10 @@ impl ArtifactSource {
         if paths.zkey.exists() && paths.wasm.exists() {
             return Ok(paths);
         }
-        self.download_variant(&variant, false)?;
-        Ok(paths)
+        self.download_variant(&variant, false).await
     }
 
-    pub fn ensure_poi_artifacts(
+    pub async fn ensure_poi_artifacts(
         &self,
         max_inputs: usize,
         max_outputs: usize,
@@ -204,85 +241,60 @@ impl ArtifactSource {
         if paths.zkey.exists() && paths.wasm.exists() {
             return Ok(paths);
         }
-        self.download_variant(&variant, false)?;
-        Ok(paths)
+        self.download_variant(&variant, false).await
     }
 
-    pub fn download_variants(
+    pub async fn download_variants(
         &self,
         variants: &[String],
         force: bool,
     ) -> Result<Vec<ArtifactPaths>, ArtifactError> {
         let mut out = Vec::with_capacity(variants.len());
         for variant in variants {
-            out.push(self.download_variant(variant, force)?);
+            out.push(self.download_variant(variant, force).await?);
         }
         Ok(out)
     }
 
-    pub fn download_variant(
+    pub async fn download_variant(
         &self,
         variant: &str,
         force: bool,
     ) -> Result<ArtifactPaths, ArtifactError> {
-        let hashes = self.load_hashes()?;
-        let expected = hashes
-            .get(variant)
-            .ok_or_else(|| ArtifactError::MissingHash {
-                variant: variant.to_string(),
-            })?;
         let paths = self.artifact_paths(variant);
-
         if !force && paths.zkey.exists() && paths.wasm.exists() {
             return Ok(paths);
         }
 
-        let zkey_parent = paths
-            .zkey
-            .parent()
-            .ok_or_else(|| ArtifactError::ArtifactFile {
-                path: paths.zkey.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "zkey path missing parent",
-                ),
-            })?;
-        fs::create_dir_all(zkey_parent).map_err(|source| ArtifactError::ArtifactFile {
-            path: paths.zkey.clone(),
-            source,
-        })?;
-
-        let urls = self.artifact_urls(variant)?;
-        let client = {
-            let mut builder = Client::builder();
-            if let Some(proxy_url) = &self.proxy {
-                let proxy = reqwest::Proxy::all(proxy_url.as_str()).map_err(|source| {
-                    ArtifactError::Download {
-                        source,
-                        url: proxy_url.clone(),
-                    }
+        let expected =
+            self.load_hashes()?
+                .remove(variant)
+                .ok_or_else(|| ArtifactError::MissingHash {
+                    variant: variant.to_string(),
                 })?;
-                builder = builder.proxy(proxy);
-            }
-            builder.build().map_err(|source| ArtifactError::Download {
-                source,
-                url: urls.zkey.clone(),
-            })?
-        };
+        let cids = self
+            .load_cids()?
+            .remove(variant)
+            .ok_or_else(|| ArtifactError::MissingCid {
+                variant: variant.to_string(),
+            })?;
 
-        let zkey_br = fetch_bytes(&client, &urls.zkey)?;
-        let wasm_br = fetch_bytes(&client, &urls.wasm)?;
+        let zkey_br = self.fetch_artifact(&cids.zkey).await?;
+        let wasm_br = self.fetch_artifact(&cids.wasm).await?;
 
-        let zkey = brotli_decompress(&zkey_br)?;
-        let wasm = brotli_decompress(&wasm_br)?;
+        tokio::task::spawn_blocking(move || {
+            materialize_artifacts(&zkey_br, &wasm_br, &expected, paths, force)
+        })
+        .await
+        .map_err(ArtifactError::MaterializationTask)?
+    }
 
-        validate_hash("zkey", &zkey, expected.zkey.as_slice())?;
-        validate_hash("wasm", &wasm, expected.wasm.as_slice())?;
-
-        write_if_needed(&paths.zkey, &zkey, force)?;
-        write_if_needed(&paths.wasm, &wasm, force)?;
-
-        Ok(paths)
+    async fn fetch_artifact(&self, artifact: &ArtifactCid) -> Result<Vec<u8>, ArtifactError> {
+        let client = self.client.clone().unwrap_or_default();
+        TrustlessArtifactFetcher::new_with_pool(&client, &self.gateways, self.gateway_pool.clone())
+            .fetch_artifact_cid(&artifact.cid, artifact.br_bytes)
+            .await
+            .map_err(ArtifactError::Trustless)
     }
 
     pub fn load_artifacts(
@@ -356,41 +368,17 @@ impl ArtifactSource {
         }
     }
 
-    fn artifact_urls(&self, variant: &str) -> Result<ArtifactUrls, ArtifactError> {
-        let base_suffix = if is_poi_variant(variant) {
-            assert_supported_poi_variant(variant)?;
-            format!("ipfs/{}/", self.poi_ipfs_hash)
+    fn load_cids(&self) -> Result<HashMap<String, ArtifactCidSet>, ArtifactError> {
+        if let Some(dir) = self.metadata_dir.as_ref() {
+            let path = dir.join(ARTIFACT_CIDS_FILE);
+            let data = fs::read(&path).map_err(|source| ArtifactError::ArtifactCids {
+                path: path.clone(),
+                source,
+            })?;
+            serde_json::from_slice(&data).map_err(ArtifactError::CidsParse)
         } else {
-            format!("ipfs/{}/", self.ipfs_hash)
-        };
-        let base = self
-            .gateway
-            .join(&base_suffix)
-            .map_err(|source| ArtifactError::InvalidUrl {
-                url: base_suffix,
-                source,
-            })?;
-        let (zkey_path, wasm_path) = if is_poi_variant(variant) {
-            (format!("{variant}/zkey.br"), format!("{variant}/wasm.br"))
-        } else {
-            (
-                format!("circuits/{variant}/zkey.br"),
-                format!("prover/snarkjs/{variant}.wasm.br"),
-            )
-        };
-        let zkey = base
-            .join(&zkey_path)
-            .map_err(|source| ArtifactError::InvalidUrl {
-                url: zkey_path,
-                source,
-            })?;
-        let wasm = base
-            .join(&wasm_path)
-            .map_err(|source| ArtifactError::InvalidUrl {
-                url: wasm_path,
-                source,
-            })?;
-        Ok(ArtifactUrls { zkey, wasm })
+            serde_json::from_slice(ARTIFACT_CIDS_EMBED).map_err(ArtifactError::CidsParse)
+        }
     }
 }
 
@@ -413,22 +401,22 @@ pub fn poi_variant_name(max_inputs: usize, max_outputs: usize) -> String {
 fn validate_metadata_dir(path: &Path) -> Result<(), ArtifactError> {
     let list_path = path.join(ARTIFACTS_LIST_FILE);
     let hashes_path = path.join(ARTIFACTS_HASHES_FILE);
+    let cids_path = path.join(ARTIFACT_CIDS_FILE);
     fs::read(&list_path).map_err(|source| ArtifactError::ArtifactFile {
         path: list_path,
         source,
     })?;
     fs::read(&hashes_path).map_err(ArtifactError::ArtifactHashes)?;
+    fs::read(&cids_path).map_err(|source| ArtifactError::ArtifactCids {
+        path: cids_path,
+        source,
+    })?;
     Ok(())
 }
 
 pub fn load_artifacts(nullifiers: usize, commitments: usize) -> Result<Artifacts, ArtifactError> {
     let source = ArtifactSource::default();
     source.load_artifacts(nullifiers, commitments)
-}
-
-struct ArtifactUrls {
-    zkey: Url,
-    wasm: Url,
 }
 
 fn is_poi_variant(variant: &str) -> bool {
@@ -443,52 +431,6 @@ fn assert_supported_poi_variant(variant: &str) -> Result<(), ArtifactError> {
             variant: variant.to_string(),
         })
     }
-}
-
-fn fetch_bytes(client: &Client, url: &Url) -> Result<bytes::Bytes, ArtifactError> {
-    for attempt in 1..=ARTIFACT_DOWNLOAD_ATTEMPTS {
-        match fetch_bytes_once(client, url) {
-            Ok(bytes) => return Ok(bytes),
-            Err(error) if attempt == ARTIFACT_DOWNLOAD_ATTEMPTS => return Err(error),
-            Err(error) => {
-                let delay = artifact_download_retry_delay(attempt);
-                warn!(
-                    %error,
-                    url = %url,
-                    attempt,
-                    max_attempts = ARTIFACT_DOWNLOAD_ATTEMPTS,
-                    retry_delay_ms = delay.as_millis(),
-                    "artifact download failed; retrying"
-                );
-                thread::sleep(delay);
-            }
-        }
-    }
-    unreachable!("artifact download retry loop must return")
-}
-
-fn fetch_bytes_once(client: &Client, url: &Url) -> Result<bytes::Bytes, ArtifactError> {
-    client
-        .get(url.clone())
-        .send()
-        .map_err(|source| ArtifactError::Download {
-            source,
-            url: url.clone(),
-        })?
-        .error_for_status()
-        .map_err(|source| ArtifactError::Download {
-            source,
-            url: url.clone(),
-        })?
-        .bytes()
-        .map_err(|source| ArtifactError::Download {
-            source,
-            url: url.clone(),
-        })
-}
-
-fn artifact_download_retry_delay(attempt: usize) -> Duration {
-    Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(3))
 }
 
 fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, ArtifactError> {
@@ -514,6 +456,37 @@ fn validate_hash(label: &str, data: &[u8], expected: &[u8]) -> Result<(), Artifa
     Ok(())
 }
 
+fn materialize_artifacts(
+    zkey_br: &[u8],
+    wasm_br: &[u8],
+    expected: &ArtifactHashes,
+    paths: ArtifactPaths,
+    force: bool,
+) -> Result<ArtifactPaths, ArtifactError> {
+    let zkey = brotli_decompress(zkey_br)?;
+    let wasm = brotli_decompress(wasm_br)?;
+    validate_hash("zkey", &zkey, expected.zkey.as_slice())?;
+    validate_hash("wasm", &wasm, expected.wasm.as_slice())?;
+
+    let zkey_parent = paths
+        .zkey
+        .parent()
+        .ok_or_else(|| ArtifactError::ArtifactFile {
+            path: paths.zkey.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "zkey path missing parent",
+            ),
+        })?;
+    fs::create_dir_all(zkey_parent).map_err(|source| ArtifactError::ArtifactFile {
+        path: paths.zkey.clone(),
+        source,
+    })?;
+    write_if_needed(&paths.zkey, &zkey, force)?;
+    write_if_needed(&paths.wasm, &wasm, force)?;
+    Ok(paths)
+}
+
 fn write_if_needed(path: &Path, data: &[u8], force: bool) -> Result<(), ArtifactError> {
     if path.exists() && !force {
         return Ok(());
@@ -527,9 +500,18 @@ fn write_if_needed(path: &Path, data: &[u8], force: bool) -> Result<(), Artifact
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
 
-    use super::{ArtifactSource, poi_variant_name};
+    use alloy::primitives::FixedBytes;
+    use sha2::{Digest, Sha256};
+
+    use super::{
+        ARTIFACT_CIDS_FILE, ARTIFACTS_HASHES_EMBED, ARTIFACTS_HASHES_FILE, ARTIFACTS_LIST_EMBED,
+        ARTIFACTS_LIST_FILE, ArtifactError, ArtifactHashes, ArtifactPaths, ArtifactSource,
+        materialize_artifacts, poi_variant_name,
+    };
 
     #[test]
     fn poi_variant_name_matches_expected_shape() {
@@ -552,6 +534,66 @@ mod tests {
     }
 
     #[test]
+    fn embedded_cid_table_includes_known_variant() {
+        let cids = ArtifactSource::default()
+            .load_cids()
+            .expect("embedded CIDs should parse");
+        let variant = cids.get("01x01").expect("known variant");
+        assert_eq!(variant.zkey.br_bytes, 3_447_484);
+        assert_eq!(variant.wasm.br_bytes, 895_378);
+    }
+
+    #[tokio::test]
+    async fn missing_cid_variant_fails_before_network() {
+        let dir = std::env::temp_dir().join(format!(
+            "railgun-missing-artifact-cid-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create metadata dir");
+        fs::write(dir.join(ARTIFACTS_LIST_FILE), ARTIFACTS_LIST_EMBED).expect("write list");
+        fs::write(dir.join(ARTIFACTS_HASHES_FILE), ARTIFACTS_HASHES_EMBED).expect("write hashes");
+        fs::write(dir.join(ARTIFACT_CIDS_FILE), b"{}").expect("write CIDs");
+        let source = ArtifactSource::default()
+            .with_gateways(Vec::new())
+            .with_metadata_dir(dir.clone())
+            .expect("metadata override");
+        let error = source
+            .download_variant("01x01", true)
+            .await
+            .expect_err("missing CID should fail");
+        assert!(matches!(error, ArtifactError::MissingCid { ref variant } if variant == "01x01"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metadata_directory_override_reads_cid_table() {
+        let dir =
+            std::env::temp_dir().join(format!("railgun-artifact-cids-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create metadata dir");
+        fs::write(dir.join(ARTIFACTS_LIST_FILE), b"[]").expect("write list");
+        fs::write(dir.join(ARTIFACTS_HASHES_FILE), b"{}").expect("write hashes");
+        fs::write(
+            dir.join(ARTIFACT_CIDS_FILE),
+            br#"{"custom":{"zkey":{"cid":"Qmfoo","br_bytes":1},"wasm":{"cid":"Qmbar","br_bytes":2}}}"#,
+        )
+        .expect("write CIDs");
+        let source = ArtifactSource::default()
+            .with_metadata_dir(dir.clone())
+            .expect("metadata override");
+        assert_eq!(
+            source
+                .load_cids()
+                .expect("override CIDs")
+                .get("custom")
+                .expect("custom variant")
+                .zkey
+                .cid,
+            "Qmfoo"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn poi_artifact_paths_use_poi_cache_dir() {
         let source = ArtifactSource::default().with_cache_dir(PathBuf::from("cache"));
 
@@ -567,30 +609,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn poi_artifact_urls_use_poi_ipfs_hash_and_flat_paths() {
-        let source = ArtifactSource::default().with_poi_ipfs_hash("poi-hash".to_string());
-
-        let urls = source.artifact_urls("POI_13x13").expect("poi urls");
-
-        assert_eq!(
-            urls.zkey.as_str(),
-            "https://ipfs-lb.com/ipfs/poi-hash/POI_13x13/zkey.br"
-        );
-        assert_eq!(
-            urls.wasm.as_str(),
-            "https://ipfs-lb.com/ipfs/poi-hash/POI_13x13/wasm.br"
-        );
-    }
-
-    #[test]
-    fn unsupported_poi_variant_is_rejected_before_download() {
+    #[tokio::test]
+    async fn unsupported_poi_variant_is_rejected_before_download() {
         let source = ArtifactSource::default();
 
         let error = source
             .ensure_poi_artifacts(4, 4)
+            .await
             .expect_err("unsupported poi variant should fail");
 
         assert!(error.to_string().contains("POI_4x4"));
+    }
+
+    fn brotli_compress(data: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            writer.write_all(data).expect("compress test data");
+        }
+        compressed
+    }
+
+    #[test]
+    fn materialization_validates_both_artifacts_before_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "railgun-artifact-materialization-{}",
+            std::process::id()
+        ));
+        let paths = ArtifactPaths {
+            zkey: dir.join("nested/zkey"),
+            wasm: dir.join("nested/wasm"),
+        };
+        let zkey = b"valid zkey";
+        let wasm = b"valid wasm";
+        let zkey_hash: [u8; 32] = Sha256::digest(zkey).into();
+        let wasm_hash: [u8; 32] = Sha256::digest(wasm).into();
+        let expected = ArtifactHashes {
+            zkey: FixedBytes::from(zkey_hash),
+            wasm: FixedBytes::from(wasm_hash),
+            dat: None,
+        };
+        materialize_artifacts(
+            &brotli_compress(zkey),
+            &brotli_compress(wasm),
+            &expected,
+            paths.clone(),
+            false,
+        )
+        .expect("valid artifacts should materialize");
+        assert_eq!(fs::read(&paths.zkey).expect("zkey output"), zkey);
+        assert_eq!(fs::read(&paths.wasm).expect("wasm output"), wasm);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn materialization_hash_mismatch_leaves_both_outputs_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "railgun-artifact-materialization-mismatch-{}",
+            std::process::id()
+        ));
+        let paths = ArtifactPaths {
+            zkey: dir.join("nested/zkey"),
+            wasm: dir.join("nested/wasm"),
+        };
+        let zkey_hash: [u8; 32] = Sha256::digest(b"valid zkey").into();
+        let wasm_hash: [u8; 32] = Sha256::digest(b"wrong wasm").into();
+        let expected = ArtifactHashes {
+            zkey: FixedBytes::from(zkey_hash),
+            wasm: FixedBytes::from(wasm_hash),
+            dat: None,
+        };
+        let error = materialize_artifacts(
+            &brotli_compress(b"valid zkey"),
+            &brotli_compress(b"valid wasm"),
+            &expected,
+            paths.clone(),
+            false,
+        )
+        .expect_err("wasm mismatch should fail");
+        assert!(matches!(error, ArtifactError::HashMismatch { ref label, .. } if label == "wasm"));
+        assert!(!paths.zkey.exists());
+        assert!(!paths.wasm.exists());
+        assert!(!dir.exists());
     }
 }
