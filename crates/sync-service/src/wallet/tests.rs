@@ -390,6 +390,7 @@ fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> TestWalletHandle {
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
+        chain_poi_submitter: Arc::default(),
         cache_key: test_cache_key("cache-key"),
         chain: ChainKey {
             chain_id: 1,
@@ -11755,6 +11756,7 @@ async fn wallet_handle_manual_poi_refresh_sends_forced_recovery_request() {
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let (indexed_catch_up_status_tx, _indexed_catch_up_status_rx) = mpsc::unbounded_channel();
     let handle = WalletHandle {
+        chain_poi_submitter: Arc::default(),
         cache_key: test_cache_key("cache-key"),
         chain: ChainKey {
             chain_id: 1,

@@ -59,7 +59,9 @@ mod forest_db;
 mod indexed_wallet;
 mod logs;
 mod merkle_artifacts;
+mod poi_submitter;
 mod service;
+pub(crate) use poi_submitter::ChainPoiSubmitter;
 mod types;
 mod workers;
 

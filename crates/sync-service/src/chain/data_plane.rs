@@ -926,6 +926,7 @@ impl PublicDataPlaneHandle {
     }
 
     pub async fn reset_public_cache(&self) -> Result<PublicSyncCacheReset, PublicDataPlaneError> {
+        self.service.poi_submitter.reset().await;
         self.service.public_data_plane.reset_public_cache().await
     }
 

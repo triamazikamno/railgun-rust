@@ -843,7 +843,17 @@ impl ChainService {
             public_data_plane =
                 public_data_plane.with_poi_cache_service(Arc::new(poi_cache_service));
         }
+        let poi_submitter = Arc::new(super::ChainPoiSubmitter::new(
+            chain.chain_id,
+            chain.contract,
+            Arc::new(crate::wallet::wallet_poi_status_client(
+                poi_policy.rpc_url(),
+                chain.http_client.as_ref(),
+            )),
+            cancel.clone(),
+        ));
         let service = Arc::new(Self {
+            poi_submitter,
             chain,
             poi_policy,
             db,
@@ -1248,6 +1258,11 @@ impl ChainService {
                 last_scanned,
             )
             .await?;
+        prepared
+            .handle()
+            .chain_poi_submitter
+            .set(Arc::clone(&self.poi_submitter))
+            .expect("prepared wallet has no submission owner");
 
         let worker = prepared.take_worker();
         if self.cancel.is_cancelled() {
@@ -2897,11 +2912,13 @@ impl ChainService {
                 warn!(?err, cache_key = %cache_key, "wallet shutdown cleanup failed");
             }
         }
+        self.poi_submitter.reset().await;
         self.public_data_plane.shutdown().await;
         await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        self.poi_submitter.cancel();
         self.cancel.cancel();
         self.public_data_plane.begin_shutdown();
     }

@@ -22,6 +22,10 @@ impl fmt::Display for PoiRpcTransportPhase {
 
 #[derive(Debug, Error)]
 pub enum PoiError {
+    #[error("chain PPOI submission cancelled")]
+    SubmissionCancelled,
+    #[error("chain PPOI submission timed out; wallet recovery remains available")]
+    SubmissionTimedOut,
     #[error("POI validation failed for listKey={list_key}: {source}")]
     ValidateList {
         list_key: FixedBytes<32>,

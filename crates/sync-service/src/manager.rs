@@ -580,6 +580,7 @@ impl SyncManager {
                 .then_with(|| left.contract.as_slice().cmp(right.contract.as_slice()))
         });
         let permits = join_all(services.into_iter().map(|(chain, service)| async move {
+            service.poi_submitter.reset().await;
             (
                 chain,
                 service

@@ -340,7 +340,12 @@ async fn commit_pending_output_contexts(
         )?;
         Ok::<(), WalletCacheError>(())
     }) {
-        Ok(Ok(())) => Ok(new_records.len()),
+        Ok(Ok(())) => {
+            if let Some(submitter) = handle.chain_poi_submitter.get() {
+                submitter.retain(&new_records);
+            }
+            Ok(new_records.len())
+        }
         Ok(Err(_)) => Err(WalletPrivateRequestError::PersistenceFailed),
         Err(reason) => Err(wallet_private_request_error(&reason)),
     }
@@ -603,7 +608,13 @@ impl PoiMaintenanceJob {
         let private_poi = WalletPrivatePoiClients::from_rpc(
             authority.remote_authority(),
             self.poi_client.clone(),
-        );
+        )
+        .with_chain_submitter(&self.handle);
+        if self.force_output_poi_recovery
+            && let Some(submitter) = self.handle.chain_poi_submitter.get()
+        {
+            submitter.retry_completed();
+        }
         // Reconstruct runtime view for authorized helpers.
         let poi_runtime = if self.poi_is_indexed {
             WalletPoiRuntime::IndexedArtifacts {
@@ -771,7 +782,8 @@ fn spawn_pending_output_poi_tentative_job(
         let authority =
             WalletPrivateMutationAuthority::new(&handle, credential.reset_generation, &cancel);
         let private_poi =
-            WalletPrivatePoiClients::from_rpc(authority.remote_authority(), poi_client);
+            WalletPrivatePoiClients::from_rpc(authority.remote_authority(), poi_client)
+                .with_chain_submitter(&handle);
         let result = submit_pending_output_poi_tentative_candidates(
             &authority,
             cache_store.as_ref(),
@@ -2314,6 +2326,7 @@ pub(crate) async fn prepare_wallet_worker(
     let (poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let (indexed_catch_up_tx, indexed_catch_up_rx) = watch::channel(None);
     let handle = WalletHandle {
+        chain_poi_submitter: Arc::default(),
         cache_key: cfg.cache_key.clone(),
         chain: cfg.chain,
         actor_id,
@@ -12119,6 +12132,114 @@ mod tests {
         assert_eq!(final_snapshot.revision, revision.wrapping_add(2));
 
         cancel.cancel();
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn committed_sender_context_survives_actor_retirement_before_observation() {
+        use crate::chain::ChainPoiSubmitter;
+        use crate::wallet::PendingOutputPoiSubmitter;
+        use alloy::sol_types::SolEvent;
+        use broadcaster_core::contracts::railgun::{CommitmentCiphertext, Transact};
+        use poi::{error::PoiError, poi::SingleCommitmentProofContext};
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Default)]
+        struct Submitter(AtomicUsize);
+        #[async_trait::async_trait]
+        impl PendingOutputPoiSubmitter for Submitter {
+            async fn submit_single_commitment_proofs(
+                &self,
+                _: &str,
+                _: u8,
+                _: u64,
+                _: &SingleCommitmentProofContext,
+                tree: u64,
+                position: u64,
+            ) -> Result<(), PoiError> {
+                assert_eq!((tree, position), (2, 7));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn submit_transact_proof(
+                &self,
+                _: &str,
+                _: u8,
+                _: u64,
+                _: &FixedBytes<32>,
+                _: u64,
+                _: &broadcaster_core::transact::PreTxPoi,
+            ) -> Result<(), PoiError> {
+                unreachable!("fresh sender proof")
+            }
+        }
+        let output = test_wallet_utxo(105, 7);
+        let (root_dir, db, _cache_store, handle, cancel, _backfill_tx, _live_tx) =
+            spawn_consumer_api_wallet("sender-context-chain-handoff", vec![]).await;
+        let cfg = wallet_config();
+        let transport = Arc::new(Submitter::default());
+        let submitter = Arc::new(ChainPoiSubmitter::new(
+            cfg.chain.chain_id,
+            cfg.chain.contract,
+            transport.clone(),
+            CancellationToken::new(),
+        ));
+        handle.chain_poi_submitter.set(submitter.clone()).unwrap();
+        let mut context = pending_output_context_intent_for_wallet_utxo(&output);
+        let list = default_active_poi_list_keys()[0];
+        context.required_poi_list_keys = vec![list];
+        context.pre_transaction_pois_per_txid_leaf_per_list =
+            BTreeMap::from([(list, BTreeMap::new())]);
+        assert_eq!(
+            handle
+                .create_pending_output_poi_contexts(vec![context.clone()])
+                .await,
+            Ok(1)
+        );
+        handle.retire_actor();
+        cancel.cancel();
+        drop(handle);
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        let event = Transact {
+            treeNumber: U256::from(2),
+            startPosition: U256::from(7),
+            hash: vec![context.output_commitment],
+            ciphertext: vec![CommitmentCiphertext {
+                ciphertext: [FixedBytes::ZERO; 4],
+                blindedSenderViewingKey: FixedBytes::ZERO,
+                blindedReceiverViewingKey: FixedBytes::ZERO,
+                annotationData: alloy::primitives::Bytes::new(),
+                memo: alloy::primitives::Bytes::new(),
+            }],
+        }
+        .encode_log_data();
+        submitter.observe_logs(&[alloy_rpc_types_eth::Log {
+            inner: alloy::primitives::Log {
+                address: cfg.chain.contract,
+                data: event,
+            },
+            block_number: Some(105),
+            ..Default::default()
+        }]);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.0.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("chain submits after the wallet actor retires");
+        assert!(
+            db.get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &context.output_commitment
+            )
+            .unwrap()
+            .is_some()
+        );
+        submitter.cancel();
+        submitter.reset().await;
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }

@@ -327,6 +327,7 @@ pub(super) struct WalletRegistration {
 }
 
 pub struct ChainService {
+    pub(crate) poi_submitter: Arc<super::ChainPoiSubmitter>,
     pub(super) chain: ChainConfig,
     pub(super) poi_policy: GlobalPoiPolicy,
     pub(super) db: Arc<DbStore>,

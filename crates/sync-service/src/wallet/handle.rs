@@ -104,6 +104,8 @@ use crate::types::{ChainKey, SyncProgressSender, WalletSyncTargetLease};
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
+    /// Bound by the chain before actor activation, shared by all handle clones.
+    pub(crate) chain_poi_submitter: Arc<std::sync::OnceLock<Arc<crate::chain::ChainPoiSubmitter>>>,
     pub cache_key: WalletCacheKey,
     pub(super) chain: ChainKey,
     pub(super) actor_id: u64,

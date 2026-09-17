@@ -136,7 +136,7 @@ use poi_maintenance::PoiMaintenanceController;
 use poi_refresh::{
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
 };
-use poi_sources::PendingOutputPoiSubmitter;
+pub(crate) use poi_sources::PendingOutputPoiSubmitter;
 pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
 use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
 use sender_candidate_recovery::{

@@ -869,6 +869,7 @@ pub(super) fn spawn_live_log_loop(
                                     );
                                 }
                             }
+                            service.poi_submitter.observe_logs(&batch.logs);
                             if service.live_log_tx.send(batch).is_err() {
                                 debug!(
                                     from_block,

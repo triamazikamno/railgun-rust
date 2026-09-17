@@ -123,6 +123,7 @@ pub(crate) struct WalletPrivatePoiClients {
     effects: WalletPrivateRemoteEffects,
     status: Arc<dyn PoiStatusReader>,
     submit: Arc<dyn PendingOutputPoiSubmitter>,
+    chain_submitter: Option<Arc<crate::chain::ChainPoiSubmitter>>,
 }
 
 impl WalletPrivatePoiClients {
@@ -131,7 +132,13 @@ impl WalletPrivatePoiClients {
             effects: WalletPrivateRemoteEffects::new(authority),
             status: Arc::new(client.clone()),
             submit: Arc::new(client),
+            chain_submitter: None,
         }
+    }
+
+    pub(crate) fn with_chain_submitter(mut self, handle: &super::WalletHandle) -> Self {
+        self.chain_submitter = handle.chain_poi_submitter.get().cloned();
+        self
     }
 
     pub(crate) async fn pois_per_list<Check, CheckFuture, CheckError>(
@@ -179,15 +186,22 @@ impl WalletPrivatePoiClients {
         CheckFuture: std::future::Future<Output = Result<bool, CheckError>>,
     {
         self.effects
-            .run(check_subject, || {
-                self.submit.submit_single_commitment_proofs(
-                    txid_version,
-                    chain_type,
-                    chain_id,
-                    context,
-                    utxo_tree_out,
-                    utxo_position_out,
-                )
+            .run(check_subject, || async {
+                if let Some(submitter) = &self.chain_submitter {
+                    return submitter
+                        .submit_single(context, utxo_tree_out, utxo_position_out)
+                        .await;
+                }
+                self.submit
+                    .submit_single_commitment_proofs(
+                        txid_version,
+                        chain_type,
+                        chain_id,
+                        context,
+                        utxo_tree_out,
+                        utxo_position_out,
+                    )
+                    .await
             })
             .await
     }
@@ -208,15 +222,22 @@ impl WalletPrivatePoiClients {
         CheckFuture: std::future::Future<Output = Result<bool, CheckError>>,
     {
         self.effects
-            .run(check_subject, || {
-                self.submit.submit_transact_proof(
-                    txid_version,
-                    chain_type,
-                    chain_id,
-                    list_key,
-                    txid_merkleroot_index,
-                    poi,
-                )
+            .run(check_subject, || async {
+                if let Some(submitter) = &self.chain_submitter {
+                    return submitter
+                        .submit_transact(txid_version, *list_key, txid_merkleroot_index, poi)
+                        .await;
+                }
+                self.submit
+                    .submit_transact_proof(
+                        txid_version,
+                        chain_type,
+                        chain_id,
+                        list_key,
+                        txid_merkleroot_index,
+                        poi,
+                    )
+                    .await
             })
             .await
     }
@@ -233,6 +254,7 @@ impl WalletPrivatePoiClients {
             effects: WalletPrivateRemoteEffects::new(authority),
             status,
             submit,
+            chain_submitter: None,
         }
     }
 
