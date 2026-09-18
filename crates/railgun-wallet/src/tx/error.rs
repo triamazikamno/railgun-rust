@@ -30,6 +30,14 @@ pub enum BuildError {
     EmptyMixedPrivateActionRequest,
     #[error("RelayAdapt composite legs require at least one RelayAdapt action")]
     MissingCompositeRelayActions,
+    #[error("executor context does not match the chain or adapter operation")]
+    InvalidExecutorContext,
+    #[error("executor calls cannot be combined with RelayAdapt helper actions")]
+    ConflictingExecutorActions,
+    #[error("executor call does not match its prepared context")]
+    InvalidExecutorCall,
+    #[error("executor owner signature does not match the prepared call")]
+    InvalidExecutorSignature,
     #[error(
         "composite unshield plan exceeds batch transaction limit: {requested} requested, max {max}"
     )]
@@ -49,8 +57,8 @@ pub enum BuildError {
     },
     #[error("mixed action plan shape changed from {expected:?} to {actual:?}")]
     CompositePlanShapeChanged {
-        expected: CompositePlanShape,
-        actual: CompositePlanShape,
+        expected: Box<CompositePlanShape>,
+        actual: Box<CompositePlanShape>,
     },
     #[error("missing merkle proof for tree {tree} position {position}")]
     MissingProof { tree: u32, position: u64 },

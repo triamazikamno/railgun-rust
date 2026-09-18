@@ -111,6 +111,13 @@ sol! {
     function transact(Transaction[] _transactions) payable;
     function relay(Transaction[] _transactions, ActionData _actionData) payable;
     function execute(Transaction[] _transactions, RelayAdapt7702ActionData _actionData, bytes _signature) payable;
+
+    // Keep the historical three-argument executeCall above for old requests.
+    interface RelayAdapt7702 {
+        function execute(Transaction[] _transactions, RelayAdapt7702ActionData _actionData, uint256 _nonce, bytes _signature) payable;
+        function multicall(bool _requireSuccess, Call[] _calls, uint256 _nonce, bytes _signature) payable;
+        function nonce() external view returns (uint256);
+    }
     function shield(ShieldRequest[] _shieldRequests);
 
     function unwrapBase(uint256 _amount);

@@ -7411,6 +7411,7 @@ dependencies = [
  "broadcaster-core",
  "brotli",
  "byteorder",
+ "coins-bip32",
  "color-eyre",
  "curve25519-dalek 5.0.0",
  "hmac 0.13.0",

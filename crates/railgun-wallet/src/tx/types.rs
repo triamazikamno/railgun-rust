@@ -1,6 +1,10 @@
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, Signature, U256};
+use alloy::sol_types::SolCall;
 
-use broadcaster_core::contracts::railgun::{ActionData, TokenTransfer, Transaction};
+use broadcaster_core::contracts::executor::{execute_signing_hash, is_executor_signature};
+use broadcaster_core::contracts::railgun::{
+    ActionData, Call, RelayAdapt7702, TokenTransfer, Transaction,
+};
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::notes::Note;
@@ -27,6 +31,91 @@ pub const MAX_BATCH_TRANSACTIONS: usize = 8;
 pub struct TransactionCall {
     pub to: Address,
     pub data: Bytes,
+}
+
+/// The executor identity fixed before quoting and private proof generation.
+///
+/// `execution_nonce` is contract storage state, separate from the outer sender
+/// and delegation authority's Ethereum account nonces. Wallet owners admit the
+/// delegate profile and reconcile all nonce state before signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutorContext {
+    pub chain_id: u64,
+    pub executor: Address,
+    pub delegate: Address,
+    pub execution_nonce: U256,
+}
+
+impl ExecutorContext {
+    fn decode_prepared_call(
+        &self,
+        call: &TransactionCall,
+    ) -> Result<RelayAdapt7702::executeCall, BuildError> {
+        let decoded = RelayAdapt7702::executeCall::abi_decode(&call.data)
+            .map_err(|_| BuildError::InvalidExecutorCall)?;
+        if call.to != self.executor
+            || decoded._nonce != self.execution_nonce
+            || !decoded._signature.is_empty()
+            || !decoded._actionData.requireSuccess
+            || decoded._transactions.is_empty()
+            || decoded._transactions.iter().any(|transaction| {
+                transaction.boundParams.chainID != self.chain_id
+                    || transaction.boundParams.adaptContract != self.executor
+                    || transaction.boundParams.adaptParams != UNRELAYED_ADAPT_PARAMS
+            })
+        {
+            return Err(BuildError::InvalidExecutorCall);
+        }
+        Ok(decoded)
+    }
+
+    /// Hash a proved, unsigned call for signing under the wallet's spend grant.
+    pub fn signing_hash(&self, call: &TransactionCall) -> Result<B256, BuildError> {
+        let decoded = self.decode_prepared_call(call)?;
+        Ok(execute_signing_hash(
+            &decoded._transactions,
+            &decoded._actionData,
+            self.execution_nonce,
+            self.chain_id,
+            self.executor,
+        ))
+    }
+
+    /// Attach the owner's signature after proofs, without changing the prepared payload.
+    /// The wallet must persist the issued payload identity before handing off this call.
+    pub fn authorize_call(
+        &self,
+        call: &TransactionCall,
+        signature: Signature,
+    ) -> Result<TransactionCall, BuildError> {
+        let signing_hash = self.signing_hash(call)?;
+        if !is_executor_signature(&signature, &signing_hash, self.executor) {
+            return Err(BuildError::InvalidExecutorSignature);
+        }
+        let mut decoded = self.decode_prepared_call(call)?;
+        decoded._signature = signature.as_bytes().into();
+        Ok(TransactionCall {
+            to: self.executor,
+            data: decoded.abi_encode().into(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeExecution {
+    Direct(Address),
+    RelayAdapt(Address),
+    Executor(ExecutorContext),
+}
+
+impl CompositeExecution {
+    #[must_use]
+    pub const fn account(self) -> Address {
+        match self {
+            Self::Direct(account) | Self::RelayAdapt(account) => account,
+            Self::Executor(context) => context.executor,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +196,7 @@ pub struct UnshieldPlan {
 
 #[derive(Debug, Clone)]
 pub struct CompositeUnshieldPlan {
+    /// Executor calls are unsigned until `ExecutorContext::authorize_call` succeeds.
     pub call: TransactionCall,
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<Note>,
@@ -121,6 +211,7 @@ pub struct CompositeUnshieldPlan {
 
 #[derive(Debug, Clone)]
 pub struct MixedPrivateActionPlan {
+    /// Executor calls are unsigned until `ExecutorContext::authorize_call` succeeds.
     pub call: TransactionCall,
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<Note>,
@@ -383,6 +474,7 @@ pub struct CompositeRelayActions {
 
 #[derive(Debug, Clone)]
 pub struct CompositeUnshieldRequest {
+    pub executor: Option<ExecutorContext>,
     pub legs: Vec<CompositeUnshieldLeg>,
     pub relay_actions: Option<CompositeRelayActions>,
     pub broadcaster_fee: Option<BroadcasterFeeOutput>,
@@ -429,6 +521,10 @@ pub struct MixedPrivateActionRebuildConstraint {
 
 #[derive(Debug, Clone)]
 pub struct MixedPrivateActionRequest {
+    pub executor: Option<ExecutorContext>,
+    /// Reviewed calls for an executor operation, authenticated after proof generation.
+    /// Requires executor context and cannot be combined with legacy helper actions.
+    pub executor_calls: Vec<Call>,
     pub private_sends: Vec<MixedPrivateSend>,
     pub public_unshields: Vec<CompositeUnshieldLeg>,
     pub relay_actions: Option<CompositeRelayActions>,
@@ -440,6 +536,7 @@ pub struct MixedPrivateActionRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositePlanShape {
+    pub execution: CompositeExecution,
     pub transaction_count: usize,
     pub input_count: usize,
     pub private_output_count: usize,

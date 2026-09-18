@@ -6,12 +6,16 @@ use std::fmt;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
+use alloy::eips::eip7702::{Authorization, SignedAuthorization};
 use alloy::hex;
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, Signature, U256};
+use alloy::serde::{OtherFields, WithOtherFields};
 use alloy::sol_types::SolCall;
 use ruint::uint;
 
-use crate::contracts::railgun::{ActionData, Transaction, executeCall, relayCall, transactCall};
+use crate::contracts::railgun::{
+    ActionData, RelayAdapt7702, Transaction, executeCall, relayCall, transactCall,
+};
 use crate::crypto::aes_gcm::{
     AesGcmError, decrypt_in_place_16b_iv, encrypt_in_place_16b_iv, split_iv_tag,
 };
@@ -54,6 +58,8 @@ pub enum TransactError {
     MissingPreTransactionPoiForAssurance,
     #[error("unsupported txid version: {txid_version}")]
     UnsupportedTxidVersion { txid_version: String },
+    #[error("authorization nonce exceeds the Ethereum account nonce range")]
+    AuthorizationNonceOutOfRange,
 }
 
 /// Ed25519 pubkey (compressed Edwards Y) -> Montgomery u
@@ -109,6 +115,8 @@ pub struct BroadcasterRawParamsTransact {
     pub fees_id: Option<String>,
     pub to: Address,
     pub data: Bytes,
+    // SDK receivers compare this to unprefixed ByteUtils.hexlify output.
+    #[serde(serialize_with = "serialize_broadcaster_viewing_key")]
     pub broadcaster_viewing_key: FixedBytes<32>,
 
     // pub use_relay_adapt: bool,
@@ -119,9 +127,50 @@ pub struct BroadcasterRawParamsTransact {
 
     #[serde(default)]
     #[serde(rename = "preTransactionPOIsPerTxidLeafPerList")]
+    #[serde(serialize_with = "serialize_broadcaster_pois")]
     pub pre_transaction_pois_per_txid_leaf_per_list:
         BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
+    #[serde(flatten)]
+    pub other: OtherFields,
     // pub dev_log: Option<serde_json::Value>,
+}
+
+fn serialize_broadcaster_viewing_key<S: serde::Serializer>(
+    key: &FixedBytes<32>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    crate::serde_helpers::hex_string::serialize(key.as_slice(), serializer)
+}
+
+// Alloy's FixedBytes serializer adds 0x, but SDK POI validation uses exact
+// unprefixed list/leaf lookups, dummy-root equality, and POI-root lookups. Adapt
+// this request only: canonical PreTxPoi serialization is also used by stored records.
+// Derive the proof object from that serializer to preserve every other field.
+fn serialize_broadcaster_pois<S: serde::Serializer>(
+    pois: &BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut lists = serializer.serialize_map(Some(pois.len()))?;
+    for (list_key, per_leaf) in pois {
+        let leaves = per_leaf
+            .iter()
+            .map(|(leaf, poi)| {
+                let mut value = serde_json::to_value(poi).map_err(serde::ser::Error::custom)?;
+                value["txidMerkleroot"] = hex::encode(poi.txid_merkleroot).into();
+                value["poiMerkleroots"] = poi
+                    .poi_merkleroots
+                    .iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+                    .into();
+                Ok((hex::encode(leaf), value))
+            })
+            .collect::<Result<BTreeMap<_, _>, S::Error>>()?;
+        lists.serialize_entry(&hex::encode(list_key), &leaves)?;
+    }
+    lists.end()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -138,14 +187,51 @@ pub struct BroadcasterAuthorization {
     pub address: Address,
     pub nonce: U256,
     pub chain_id: U256,
+    #[serde(serialize_with = "serialize_broadcaster_authorization_signature")]
     pub signature: BroadcasterAuthorizationSignature,
+    #[serde(flatten)]
+    pub other: OtherFields,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub struct BroadcasterAuthorizationSignature {
-    pub v: u64,
-    pub r: U256,
-    pub s: U256,
+/// Alloy accepts SDK `yParity` and normalizes historical `v` encodings.
+pub type BroadcasterAuthorizationSignature = WithOtherFields<Signature>;
+
+// Alloy 2's Signature serializer emits RPC hex quantities for v/yParity, but
+// released broadcasters and ethers' Signature.toJSON use a numeric v. Keep
+// Alloy's input parsing and adapt only this nested broadcaster output format.
+fn serialize_broadcaster_authorization_signature<S: serde::Serializer>(
+    signature: &BroadcasterAuthorizationSignature,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(3 + signature.other.len()))?;
+    map.serialize_entry("r", &signature.r())?;
+    map.serialize_entry("s", &signature.s())?;
+    map.serialize_entry("v", &(27 + u64::from(signature.v())))?;
+    for (key, value) in &signature.other {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
+}
+
+impl BroadcasterAuthorization {
+    /// Adapt the existing nested broadcaster wire format to Alloy's flat tuple.
+    ///
+    /// The wire nonce remains U256 for historical request compatibility. Alloy
+    /// requires a u64 account nonce when constructing the transaction envelope.
+    pub fn signed_authorization(&self) -> Result<SignedAuthorization, TransactError> {
+        let nonce = self
+            .nonce
+            .try_into()
+            .map_err(|_| TransactError::AuthorizationNonceOutOfRange)?;
+        Ok(Authorization {
+            chain_id: self.chain_id,
+            address: self.address,
+            nonce,
+        }
+        .into_signed(self.signature.inner))
+    }
 }
 
 #[derive(Clone)]
@@ -204,6 +290,8 @@ struct TransactEnvelope<'a> {
 
 #[derive(Debug, Serialize)]
 struct TransactEnvelopeParams<'a> {
+    // Noble's Ed25519 decoder rejects 0x on this outer key.
+    #[serde(serialize_with = "serialize_broadcaster_viewing_key")]
     pubkey: FixedBytes<32>,
     #[serde(rename = "encryptedData")]
     encrypted_data: &'a [Bytes; 2],
@@ -300,7 +388,6 @@ fn decrypt<T: serde::de::DeserializeOwned>(
         Err(err) => return Err(err.into()),
     }
 
-    tracing::debug!(ct=%String::from_utf8_lossy(&ct), "deserializing plaintext");
     let params: T = serde_json::from_slice(&ct)?;
 
     Ok(Some(params))
@@ -527,14 +614,20 @@ pub fn parse_transact_calldata(
         (call._transactions, None)
     } else if let Ok(call) = relayCall::abi_decode(calldata) {
         (call._transactions, Some(call._actionData))
-    } else if let Ok(call) = executeCall::abi_decode(calldata) {
+    } else if let Ok((transactions, action_data)) =
+        RelayAdapt7702::executeCall::abi_decode(calldata)
+            .map(|call| (call._transactions, call._actionData))
+            .or_else(|_| {
+                executeCall::abi_decode(calldata).map(|call| (call._transactions, call._actionData))
+            })
+    {
         let action_data = ActionData {
             random: FixedBytes::ZERO,
-            requireSuccess: call._actionData.requireSuccess,
-            minGasLimit: call._actionData.minGasLimit,
-            calls: call._actionData.calls,
+            requireSuccess: action_data.requireSuccess,
+            minGasLimit: action_data.minGasLimit,
+            calls: action_data.calls,
         };
-        (call._transactions, Some(action_data))
+        (transactions, Some(action_data))
     } else {
         return Err(TransactError::UnknownFunctionCall {
             selector: hex::encode(&calldata[..4]),
@@ -617,18 +710,19 @@ pub fn parse_transact_calldata(
 mod tests {
     use super::{
         BroadcasterRawParamsTransact, BroadcasterTransactRequestType, DEFAULT_TXID_VERSION,
-        PreTxPoi, SnarkJsProof, TransactError, compute_railgun_txid, parse_transact_calldata,
-        railgun_txid_leaf_hash,
+        EncryptedTransactRequest, PreTxPoi, SnarkJsProof, TransactError, compute_railgun_txid,
+        parse_transact_calldata, railgun_txid_leaf_hash, try_decrypt_transact_request,
     };
     use crate::contracts::railgun::{
-        BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702ActionData,
-        SnarkProof, TokenData, Transaction, executeCall, transactCall,
+        BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702,
+        RelayAdapt7702ActionData, SnarkProof, TokenData, Transaction, executeCall, transactCall,
     };
     use crate::crypto::aes_gcm::encrypt_in_place_16b_iv;
     use crate::crypto::railgun::{ViewingKeyData, derive_viewing_public_key};
     use crate::crypto::shared_key::shared_symmetric_key;
     use crate::notes::Note;
     use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+    use alloy::serde::OtherFields;
     use alloy::sol_types::SolCall;
     use ruint::uint;
     use std::collections::BTreeMap;
@@ -759,6 +853,7 @@ mod tests {
             broadcaster_viewing_key: FixedBytes::ZERO,
             txid_version: txid_version.map(str::to_string),
             pre_transaction_pois_per_txid_leaf_per_list: per_list,
+            other: OtherFields::default(),
         };
 
         (
@@ -787,6 +882,40 @@ mod tests {
             txid_version,
             viewing_key_data.master_public_key,
         )
+    }
+
+    #[test]
+    fn encrypted_envelope_uses_unprefixed_public_key() {
+        let broadcaster = sample_viewing_key_data();
+        let (_, _, params, _, _) = sample_transaction_and_params(None);
+        let encrypted = EncryptedTransactRequest::encrypt_with_seed(
+            derive_viewing_public_key(&broadcaster.viewing_private_key),
+            &params,
+            [8; 32],
+        )
+        .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&encrypted.to_transact_payload().unwrap()).unwrap();
+        // Noble decodes the outer public key before decrypting the request.
+        assert_eq!(
+            envelope["params"]["pubkey"],
+            alloy::hex::encode(encrypted.pubkey)
+        );
+        assert_eq!(
+            envelope["params"]["encryptedData"],
+            serde_json::to_value(&encrypted.encrypted_data).unwrap()
+        );
+        let pubkey: FixedBytes<32> =
+            serde_json::from_value(envelope["params"]["pubkey"].clone()).unwrap();
+        let data = serde_json::from_value(envelope["params"]["encryptedData"].clone()).unwrap();
+        let decrypted =
+            try_decrypt_transact_request(&broadcaster.viewing_private_key, pubkey.0, &data)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(decrypted.params).unwrap(),
+            serde_json::to_value(params).unwrap()
+        );
     }
 
     #[test]
@@ -842,37 +971,46 @@ mod tests {
     fn parse_transact_decodes_relay_adapt_7702_execute_wrapper() {
         let viewing_key_data = sample_viewing_key_data();
         let (_, transaction, _, fee_commitment, _) = sample_transaction_and_params(None);
-        let calldata = executeCall {
-            _transactions: vec![transaction],
+        let historical = executeCall {
+            _transactions: vec![transaction.clone(), transaction],
             _actionData: RelayAdapt7702ActionData {
                 requireSuccess: true,
                 minGasLimit: uint!(123_U256),
                 calls: vec![],
             },
             _signature: Bytes::from(vec![0x12, 0x34]),
+        };
+        let current = RelayAdapt7702::executeCall {
+            _transactions: historical._transactions.clone(),
+            _actionData: historical._actionData.clone(),
+            _nonce: uint!(9_U256),
+            _signature: historical._signature.clone(),
+        };
+        for calldata in [historical.abi_encode(), current.abi_encode()] {
+            let parsed = parse_transact_calldata(
+                &calldata,
+                &viewing_key_data.viewing_private_key,
+                viewing_key_data.master_public_key,
+                None,
+            )
+            .expect("parse current or historical 7702 execute calldata");
+
+            let action_data = parsed.action_data.expect("action data");
+            assert_eq!(parsed.fee_commitment, fee_commitment);
+            assert_eq!(parsed.transactions.len(), 2);
+            assert_eq!(
+                parsed.transactions[0].railgun_txid,
+                parsed.transactions[1].railgun_txid
+            );
+            assert!(action_data.requireSuccess);
+            assert_eq!(action_data.minGasLimit, uint!(123_U256));
+            assert!(action_data.calls.is_empty());
         }
-        .abi_encode();
-
-        assert_eq!(&calldata[..4], &[0xc6, 0x1e, 0x6b, 0x9d]);
-
-        let parsed = parse_transact_calldata(
-            &calldata,
-            &viewing_key_data.viewing_private_key,
-            viewing_key_data.master_public_key,
-            None,
-        )
-        .expect("parse 7702 execute calldata");
-
-        let action_data = parsed.action_data.expect("action data");
-        assert_eq!(parsed.fee_commitment, fee_commitment);
-        assert!(action_data.requireSuccess);
-        assert_eq!(action_data.minGasLimit, uint!(123_U256));
-        assert!(action_data.calls.is_empty());
     }
 
     #[test]
     fn raw_params_deserializes_tx7702_fields() {
-        let params: BroadcasterRawParamsTransact = serde_json::from_value(serde_json::json!({
+        let mut params: BroadcasterRawParamsTransact = serde_json::from_value(serde_json::json!({
             "chainType": 0,
             "chainID": 1,
             "transactType": "TX7702",
@@ -881,7 +1019,7 @@ mod tests {
             "feesID": null,
             "to": "0x56daCb58fD9C6f654047908B573FcCd51652a33C",
             "data": "0x",
-            "broadcasterViewingKey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "broadcasterViewingKey": format!("0x00{}", "aB".repeat(31)),
             "txidVersion": null,
             "preTransactionPOIsPerTxidLeafPerList": {},
             "authorization": {
@@ -903,10 +1041,70 @@ mod tests {
         );
         assert_eq!(params.max_fee_per_gas, Some(uint!(134943801_U256)));
         assert_eq!(params.max_priority_fee_per_gas, Some(uint!(10329316_U256)));
+        let list_key = FixedBytes::from(U256::from(0xab));
+        let leaf = FixedBytes::from(U256::from(0xcd));
+        let poi = PreTxPoi {
+            snark_proof: SnarkJsProof::zero(),
+            txid_merkleroot: FixedBytes::from(U256::from(0xef)),
+            poi_merkleroots: vec![FixedBytes::from(U256::ONE), FixedBytes::repeat_byte(0x12)],
+            blinded_commitments_out: vec![FixedBytes::repeat_byte(0x34)],
+            railgun_txid_if_has_unshield: Bytes::from(vec![0x56; 32]),
+        };
+        let canonical_poi = serde_json::to_value(&poi).unwrap();
+        params.pre_transaction_pois_per_txid_leaf_per_list =
+            BTreeMap::from([(list_key, BTreeMap::from([(leaf, poi)]))]);
+        let canonical_pois =
+            serde_json::to_value(&params.pre_transaction_pois_per_txid_leaf_per_list).unwrap();
+        params
+            .other
+            .insert("futureField".to_owned(), serde_json::json!({"keep": true}));
+        // Node.js compares this field to ByteUtils.hexlify(publicKey), which
+        // emits lowercase hex without 0x. Retain both forms on input.
+        let serialized = serde_json::to_value(&params).expect("serialize tx7702 params");
+        assert_eq!(
+            serialized["broadcasterViewingKey"],
+            format!("00{}", "ab".repeat(31))
+        );
+        // The SDK uses exact string keys and compares the dummy Merkle root.
+        // Both identifiers retain all 32 bytes, including their leading zeros.
+        let wire_poi = &serialized["preTransactionPOIsPerTxidLeafPerList"]
+            [format!("{}ab", "00".repeat(31))][format!("{}cd", "00".repeat(31))];
+        let mut expected_poi = canonical_poi.clone();
+        expected_poi["txidMerkleroot"] = format!("{}ef", "00".repeat(31)).into();
+        expected_poi["poiMerkleroots"] =
+            serde_json::json!([format!("{}01", "00".repeat(31)), "12".repeat(32)]);
+        assert_eq!(wire_poi, &expected_poi);
+        assert_eq!(
+            canonical_poi["poiMerkleroots"],
+            serde_json::json!([
+                format!("0x{}01", "00".repeat(31)),
+                format!("0x{}", "12".repeat(32))
+            ])
+        );
+        assert_eq!(
+            canonical_poi["txidMerkleroot"],
+            format!("0x{}ef", "00".repeat(31))
+        );
+        let mut historical = serialized.clone();
+        historical["preTransactionPOIsPerTxidLeafPerList"] = canonical_pois.clone();
+        for input in [historical, serialized.clone()] {
+            let decoded: BroadcasterRawParamsTransact = serde_json::from_value(input).unwrap();
+            assert_eq!(
+                serde_json::to_value(&decoded.pre_transaction_pois_per_txid_leaf_per_list).unwrap(),
+                canonical_pois
+            );
+            assert_eq!(decoded.other, params.other);
+        }
+        let decoded: BroadcasterRawParamsTransact =
+            serde_json::from_value(serialized).expect("deserialize unprefixed viewing key");
+        assert_eq!(
+            decoded.broadcaster_viewing_key,
+            params.broadcaster_viewing_key
+        );
         let authorization = params.authorization.expect("authorization");
         assert_eq!(authorization.nonce, U256::ZERO);
         assert_eq!(authorization.chain_id, U256::from(1));
-        assert_eq!(authorization.signature.v, 27);
+        assert!(!authorization.signature.v());
     }
 
     #[test]

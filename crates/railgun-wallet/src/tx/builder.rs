@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use alloy::primitives::{Address, FixedBytes, U256, Uint};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use broadcaster_core::contracts::railgun::{
-    ActionData, BoundParams, CommitmentCiphertext, CommitmentPreimage, SnarkProof, Transaction,
-    relayCall, transactCall,
+    ActionData, BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702,
+    RelayAdapt7702ActionData, SnarkProof, Transaction, relayCall, transactCall,
 };
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
@@ -21,13 +21,14 @@ use crate::notes::{Note, NoteCiphertext};
 use crate::prover::{ProverError, ProverService};
 
 use super::{
-    BroadcasterFeeOutput, BuildError, CompositePlanShape, CompositePrivateOutputRole,
-    CompositePrivateOutputRoleKind, CompositeUnshieldLeg, CompositeUnshieldLegMetadata,
-    CompositeUnshieldPlan, CompositeUnshieldPlannedOutput, CompositeUnshieldRequest, InputWitness,
-    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan,
-    MixedPrivateActionPreview, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    MixedPrivateOutputSource, MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs,
-    PublicInputs, SelectedInputIdentity, SendPlan, SendRequest, TransactPlan, TransactionBuilder,
+    BroadcasterFeeOutput, BuildError, CompositeExecution, CompositePlanShape,
+    CompositePrivateOutputRole, CompositePrivateOutputRoleKind, CompositeUnshieldLeg,
+    CompositeUnshieldLegMetadata, CompositeUnshieldPlan, CompositeUnshieldPlannedOutput,
+    CompositeUnshieldRequest, ExecutorContext, InputWitness, MAX_BATCH_TRANSACTIONS,
+    MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan, MixedPrivateActionPreview,
+    MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource,
+    MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs, PublicInputs,
+    SelectedInputIdentity, SendPlan, SendRequest, TransactPlan, TransactionBuilder,
     TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan,
     UnshieldRequest,
 };
@@ -59,6 +60,21 @@ struct MixedPrivateActionSelectionPlan {
 }
 
 impl TransactionBuilder {
+    const fn composite_execution(
+        &self,
+        uses_adapter: bool,
+        executor: Option<ExecutorContext>,
+    ) -> Result<CompositeExecution, BuildError> {
+        match (uses_adapter, executor) {
+            (true, Some(context)) if self.chain_type == 0 && context.chain_id == self.chain_id => {
+                Ok(CompositeExecution::Executor(context))
+            }
+            (_, Some(_)) => Err(BuildError::InvalidExecutorContext),
+            (true, None) => Ok(CompositeExecution::RelayAdapt(self.relay_adapt_contract)),
+            (false, None) => Ok(CompositeExecution::Direct(self.railgun_contract)),
+        }
+    }
+
     /// Build an unshield plan using token selection from available UTXOs.
     pub async fn build_unshield_plan(
         &self,
@@ -187,6 +203,7 @@ impl TransactionBuilder {
             return Err(BuildError::MissingCompositeRelayActions);
         }
         let uses_relay_adapt = has_relay_adapt_leg || relay_call_count > 0;
+        let execution = self.composite_execution(uses_relay_adapt, request.executor)?;
         let mut remaining_utxos = utxos.to_vec();
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
         let receiver = viewing.address_data();
@@ -277,7 +294,7 @@ impl TransactionBuilder {
                 leg_fee,
                 request.spend_up_to,
             )?;
-            let unshield_to = leg.recipient.unshield_to(self.relay_adapt_contract);
+            let unshield_to = leg.recipient.unshield_to(execution.account());
 
             for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
                 let transaction_index = unproven_plans.len();
@@ -364,18 +381,19 @@ impl TransactionBuilder {
                 .relay_actions
                 .clone()
                 .ok_or(BuildError::MissingCompositeRelayActions)?;
-            let action_data = actions.action_data(
-                self.relay_adapt_contract,
-                FixedBytes::<31>::from(rand_array()),
-            )?;
+            let action_data =
+                actions.action_data(execution.account(), FixedBytes::<31>::from(rand_array()))?;
             debug_assert!(action_data.requireSuccess);
             let transactions = unproven_plans
                 .iter()
                 .map(|plan| &plan.transaction)
                 .collect::<Vec<_>>();
-            let adapt_params = action_data.adapt_params(&transactions);
+            let adapt_params = match execution {
+                CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
+                _ => action_data.adapt_params(&transactions),
+            };
             for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
+                plan.transaction.boundParams.adaptContract = execution.account();
                 plan.transaction.boundParams.adaptParams = adapt_params;
             }
             Some(action_data)
@@ -392,26 +410,7 @@ impl TransactionBuilder {
             chunks.push(proven.chunk);
         }
 
-        let call = if let Some(action_data) = action_data.as_ref() {
-            let data = relayCall {
-                _transactions: transactions,
-                _actionData: action_data.clone(),
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.relay_adapt_contract,
-                data: data.into(),
-            }
-        } else {
-            let data = transactCall {
-                _transactions: transactions,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.railgun_contract,
-                data: data.into(),
-            }
-        };
+        let call = composite_call(execution, transactions, action_data.as_ref())?;
         let inputs = chunks
             .iter()
             .flat_map(|chunk| chunk.inputs.clone())
@@ -421,6 +420,7 @@ impl TransactionBuilder {
             .flat_map(|chunk| chunk.outputs.clone())
             .collect::<Vec<_>>();
         let shape = CompositePlanShape {
+            execution,
             transaction_count: chunks.len(),
             input_count: inputs.len(),
             private_output_count: private_output_roles.len(),
@@ -449,28 +449,41 @@ impl TransactionBuilder {
         utxos: &[Utxo],
         request: &MixedPrivateActionRequest,
     ) -> Result<MixedPrivateActionPreview, BuildError> {
-        Ok(Self::select_mixed_private_action_plan(utxos, request)?.preview)
+        Ok(self
+            .select_mixed_private_action_plan(utxos, request)?
+            .preview)
     }
 
     fn select_mixed_private_action_plan(
+        &self,
         utxos: &[Utxo],
         request: &MixedPrivateActionRequest,
     ) -> Result<MixedPrivateActionSelectionPlan, BuildError> {
         if request.private_sends.is_empty() && request.public_unshields.is_empty() {
             return Err(BuildError::EmptyMixedPrivateActionRequest);
         }
+        if !request.executor_calls.is_empty() {
+            if request.executor.is_none() {
+                return Err(BuildError::InvalidExecutorContext);
+            }
+            if request.relay_actions.is_some() {
+                return Err(BuildError::ConflictingExecutorActions);
+            }
+        }
         let has_relay_adapt_leg = request
             .public_unshields
             .iter()
             .any(|leg| leg.recipient.uses_relay_adapt());
-        let relay_call_count = request
-            .relay_actions
-            .as_ref()
-            .map_or(0, |actions| actions.calls.len());
+        let relay_call_count = request.executor_calls.len()
+            + request
+                .relay_actions
+                .as_ref()
+                .map_or(0, |actions| actions.calls.len());
         if has_relay_adapt_leg && relay_call_count == 0 {
             return Err(BuildError::MissingCompositeRelayActions);
         }
         let uses_relay_adapt = has_relay_adapt_leg || relay_call_count > 0;
+        let execution = self.composite_execution(uses_relay_adapt, request.executor)?;
         let candidate_utxos = request.rebuild.as_ref().map_or_else(
             || Ok(utxos.to_vec()),
             |constraint| resolve_pinned_utxos(utxos, &constraint.selected_inputs),
@@ -544,6 +557,7 @@ impl TransactionBuilder {
             .collect::<Vec<_>>();
         selected_inputs.sort_unstable();
         let shape = CompositePlanShape {
+            execution,
             transaction_count: selections
                 .iter()
                 .map(|selection| selection.chunks.len())
@@ -565,8 +579,8 @@ impl TransactionBuilder {
             }
             if shape != constraint.expected_shape {
                 return Err(BuildError::CompositePlanShapeChanged {
-                    expected: constraint.expected_shape,
-                    actual: shape,
+                    expected: Box::new(constraint.expected_shape),
+                    actual: Box::new(shape),
                 });
             }
         }
@@ -626,9 +640,10 @@ impl TransactionBuilder {
         let MixedPrivateActionSelectionPlan {
             selections,
             preview,
-        } = Self::select_mixed_private_action_plan(utxos, &request)?;
+        } = self.select_mixed_private_action_plan(utxos, &request)?;
         let relay_call_count = preview.shape.relay_call_count;
         let uses_relay_adapt = preview.shape.uses_relay_adapt;
+        let execution = preview.shape.execution;
 
         let sender = viewing.address_data();
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
@@ -712,7 +727,7 @@ impl TransactionBuilder {
         for (unshield_index, leg) in request.public_unshields.iter().copied().enumerate() {
             let selection = &selections[unshield_index];
             let allocations = spend_allocations(selection, leg.amount, U256::ZERO, None, false)?;
-            let unshield_to = leg.recipient.unshield_to(self.relay_adapt_contract);
+            let unshield_to = leg.recipient.unshield_to(execution.account());
 
             for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
                 let transaction_index = unproven_plans.len();
@@ -783,6 +798,7 @@ impl TransactionBuilder {
 
         let actual_selected_inputs = selected_input_identities_from_unproven(&unproven_plans);
         let actual_shape = CompositePlanShape {
+            execution,
             transaction_count: unproven_plans.len(),
             input_count: actual_selected_inputs.len(),
             private_output_count: private_outputs.len(),
@@ -796,22 +812,31 @@ impl TransactionBuilder {
         let shape = preview.shape;
 
         let action_data = if uses_relay_adapt {
-            let actions = request
-                .relay_actions
-                .clone()
-                .ok_or(BuildError::MissingCompositeRelayActions)?;
-            let action_data = actions.action_data(
-                self.relay_adapt_contract,
-                FixedBytes::<31>::from(rand_array()),
-            )?;
+            let action_data = if request.executor_calls.is_empty() {
+                request
+                    .relay_actions
+                    .as_ref()
+                    .ok_or(BuildError::MissingCompositeRelayActions)?
+                    .action_data(execution.account(), FixedBytes::<31>::from(rand_array()))?
+            } else {
+                ActionData {
+                    random: FixedBytes::<31>::from(rand_array()),
+                    requireSuccess: true,
+                    minGasLimit: U256::ZERO,
+                    calls: request.executor_calls.clone(),
+                }
+            };
             debug_assert!(action_data.requireSuccess);
             let transactions = unproven_plans
                 .iter()
                 .map(|plan| &plan.transaction)
                 .collect::<Vec<_>>();
-            let adapt_params = action_data.adapt_params(&transactions);
+            let adapt_params = match execution {
+                CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
+                _ => action_data.adapt_params(&transactions),
+            };
             for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
+                plan.transaction.boundParams.adaptContract = execution.account();
                 plan.transaction.boundParams.adaptParams = adapt_params;
             }
             Some(action_data)
@@ -827,26 +852,7 @@ impl TransactionBuilder {
             transactions.push(proven.transaction);
             chunks.push(proven.chunk);
         }
-        let call = if let Some(action_data) = action_data.as_ref() {
-            let data = relayCall {
-                _transactions: transactions,
-                _actionData: action_data.clone(),
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.relay_adapt_contract,
-                data: data.into(),
-            }
-        } else {
-            let data = transactCall {
-                _transactions: transactions,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.railgun_contract,
-                data: data.into(),
-            }
-        };
+        let call = composite_call(execution, transactions, action_data.as_ref())?;
         let inputs = chunks
             .iter()
             .flat_map(|chunk| chunk.inputs.clone())
@@ -2743,3 +2749,39 @@ fn rand_array<const N: usize>() -> [u8; N] {
 
 #[cfg(test)]
 mod tests;
+
+fn composite_call(
+    execution: CompositeExecution,
+    transactions: Vec<Transaction>,
+    action_data: Option<&ActionData>,
+) -> Result<TransactionCall, BuildError> {
+    let data = match (execution, action_data) {
+        (CompositeExecution::Direct(_), None) => transactCall {
+            _transactions: transactions,
+        }
+        .abi_encode(),
+        (CompositeExecution::RelayAdapt(_), Some(actions)) => relayCall {
+            _transactions: transactions,
+            _actionData: actions.clone(),
+        }
+        .abi_encode(),
+        (CompositeExecution::Executor(context), Some(actions)) if actions.requireSuccess => {
+            RelayAdapt7702::executeCall {
+                _transactions: transactions,
+                _actionData: RelayAdapt7702ActionData {
+                    requireSuccess: true,
+                    minGasLimit: actions.minGasLimit,
+                    calls: actions.calls.clone(),
+                },
+                _nonce: context.execution_nonce,
+                _signature: Bytes::new(),
+            }
+            .abi_encode()
+        }
+        _ => return Err(BuildError::InvalidExecutorCall),
+    };
+    Ok(TransactionCall {
+        to: execution.account(),
+        data: data.into(),
+    })
+}

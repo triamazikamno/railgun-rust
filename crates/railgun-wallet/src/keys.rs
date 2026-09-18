@@ -1,9 +1,11 @@
 use std::sync::LazyLock;
 
 use alloy::primitives::U256;
+use alloy::signers::local::PrivateKeySigner;
 use ark_ed_on_bn254::Fq;
 use ark_ff::{AdditiveGroup, Field, MontFp};
 use bloock_blake_rs::Blake512;
+use coins_bip32::xkeys::XPriv;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::scalar::Scalar;
 use hmac::{Hmac, KeyInit, Mac};
@@ -48,6 +50,8 @@ pub enum KeyError {
     InvalidMnemonic,
     #[error("invalid derivation path")]
     InvalidPath,
+    #[error("executor key derivation failed")]
+    ExecutorDerivation,
     #[error("ed25519 pubkey invalid")]
     InvalidEd25519Pubkey,
 }
@@ -170,6 +174,32 @@ pub fn bip39_entropy_from_mnemonic(mnemonic: &str) -> Result<Vec<u8>, KeyError> 
 pub fn bip39_mnemonic_from_entropy(entropy: &[u8]) -> Result<String, KeyError> {
     let mnemonic = bip39::Mnemonic::from_entropy(entropy).map_err(|_| KeyError::InvalidMnemonic)?;
     Ok(mnemonic.to_string())
+}
+
+/// Derive a software executor from the wallet's authorized BIP-39 seed.
+///
+/// The caller must supply the original seed, including its BIP-39 passphrase.
+/// This is separate from ordinary public-account and RAILGUN key derivation.
+pub fn derive_executor_signer(
+    seed: &[u8; 64],
+    railgun_index: u32,
+    chain_id: u64,
+    index: u32,
+) -> Result<PrivateKeySigner, KeyError> {
+    if railgun_index >= HARDENED_OFFSET
+        || chain_id >= u64::from(HARDENED_OFFSET)
+        || index >= HARDENED_OFFSET
+    {
+        return Err(KeyError::InvalidPath);
+    }
+    let path = [44, 60, 0, 7702, railgun_index, chain_id as u32, index]
+        .map(|segment| segment + HARDENED_OFFSET);
+    let root = XPriv::root_from_seed(seed, None).map_err(|_| KeyError::ExecutorDerivation)?;
+    let child = root
+        .derive_path(path.as_slice())
+        .map_err(|_| KeyError::ExecutorDerivation)?;
+    let credential: &coins_bip32::ecdsa::SigningKey = child.as_ref();
+    Ok(PrivateKeySigner::from_signing_key(credential.clone()))
 }
 
 impl EddsaSignature {

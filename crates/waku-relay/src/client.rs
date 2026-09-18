@@ -369,7 +369,7 @@ impl Client {
                     .await
                     .and_then(reqwest::Response::error_for_status)
             {
-                tracing::warn!(%error, "failed to subscribe on nwaku");
+                tracing::warn!(error = %error.without_url(), "failed to subscribe on nwaku");
             }
         }
 
@@ -510,12 +510,12 @@ impl Client {
                                                 }
                                             }
                                             Err(error) => {
-                                                tracing::warn!(%error, "failed to decode messages from nwaku");
+                                                tracing::warn!(error = %error.without_url(), "failed to decode messages from nwaku");
                                             }
                                         }
                                     }
                                     Err(error) => {
-                                        tracing::warn!(?error, "failed to poll messages from nwaku");
+                                        tracing::warn!(error = %error.without_url(), "failed to poll messages from nwaku");
                                     }
                                 }
                             }
@@ -588,7 +588,6 @@ impl Client {
         };
         let url = format!("{nwaku_url}/relay/v1/messages/{pubsub_path}");
         tracing::debug!(
-            url = %url,
             content_topic,
             payload_len = json_payload_utf8.len(),
             "publishing Waku message to nwaku"
@@ -596,10 +595,11 @@ impl Client {
         let res = nwaku_request(self.http_client.post(url), self.nwaku_request_timeout)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         let status = res.status();
         if status != reqwest::StatusCode::OK {
-            let body = res.text().await?;
+            let body = res.text().await.map_err(reqwest::Error::without_url)?;
             tracing::warn!(
                 %status,
                 body_len = body.len(),
@@ -921,7 +921,7 @@ mod tests {
         let client = Client {
             http_client: reqwest::Client::new(),
             nwaku_request_timeout,
-            nwaku_url: Some(format!("http://{address}")),
+            nwaku_url: Some(format!("http://{address}/private-endpoint-token")),
             pubsub_path: relay_shard_pubsub_path(DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID),
             waku_fleet: None,
             network_mode: super::RelayNetworkMode::Direct,
@@ -940,9 +940,13 @@ mod tests {
         release_tx.send(()).expect("release stalled endpoint");
         server.join().expect("stalled endpoint thread exits");
 
-        assert!(matches!(
-            result,
-            Err(ClientError::Http(error)) if error.is_timeout()
-        ));
+        let Err(ClientError::Http(error)) = result else {
+            panic!("stalled publication should fail with an HTTP timeout");
+        };
+        assert!(error.is_timeout());
+        assert!(
+            error.url().is_none(),
+            "endpoint credentials must not escape in errors"
+        );
     }
 }

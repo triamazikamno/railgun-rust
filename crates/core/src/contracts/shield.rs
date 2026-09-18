@@ -36,6 +36,30 @@ pub fn build_shield_calldata(
     amount: U256,
     shield_private_key: &[u8; 32],
 ) -> Result<Vec<u8>, ShieldError> {
+    let request = build_shield_request(
+        master_public_key,
+        viewing_public_key,
+        TokenData::erc20(token_address),
+        Uint::<120, 2>::from(amount),
+        shield_private_key,
+    )?;
+    Ok(shieldCall {
+        _shieldRequests: vec![request],
+    }
+    .abi_encode())
+}
+
+/// Build an encrypted shield request for the supplied protocol token and value.
+///
+/// Callers select the token standards supported by their execution route. Keeping
+/// the typed request also lets them track its commitment before transaction handoff.
+pub fn build_shield_request(
+    master_public_key: U256,
+    viewing_public_key: &[u8; 32],
+    token: TokenData,
+    value: Uint<120, 2>,
+    shield_private_key: &[u8; 32],
+) -> Result<ShieldRequest, ShieldError> {
     let mut random = [0u8; 16];
     fill(&mut random).map_err(|_| ShieldError::RandomFailed)?;
 
@@ -43,25 +67,16 @@ pub fn build_shield_calldata(
 
     let preimage = CommitmentPreimage {
         npk: FixedBytes::from(npk.to_be_bytes::<32>()),
-        token: TokenData {
-            tokenType: 0,
-            tokenAddress: token_address,
-            tokenSubID: U256::ZERO,
-        },
-        value: Uint::<120, 2>::from(amount),
+        token,
+        value,
     };
 
     let ciphertext = encrypt_shield_random(random, shield_private_key, viewing_public_key)?;
 
-    let request = ShieldRequest {
+    Ok(ShieldRequest {
         preimage,
         ciphertext,
-    };
-
-    Ok(shieldCall {
-        _shieldRequests: vec![request],
-    }
-    .abi_encode())
+    })
 }
 
 /// Build ABI-encoded calldata for ERC-20 `approve(spender, amount)`.

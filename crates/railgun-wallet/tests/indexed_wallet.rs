@@ -2,7 +2,7 @@ use alloy::primitives::{Address, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
 use alloy::uint;
 use broadcaster_core::contracts::railgun::{LegacyCommitmentPreimage, TokenData, shieldCall};
-use broadcaster_core::contracts::shield::build_shield_calldata;
+use broadcaster_core::contracts::shield::{build_shield_calldata, build_shield_request};
 use broadcaster_core::crypto::aes_gcm::encrypt_in_place_16b_iv;
 use broadcaster_core::crypto::shared_key::shared_symmetric_key_legacy;
 use broadcaster_core::notes::Note;
@@ -145,22 +145,42 @@ fn indexed_shield_commitment_decrypts_wallet_utxo() {
         .into_iter()
         .next()
         .expect("shield request");
-    let input = IndexedShieldCommitmentInput {
-        tree_number: 4,
-        tree_position: 15,
-        preimage: request.preimage,
-        shield_ciphertext: request.ciphertext,
-        source: source(3),
+    let nft = TokenData {
+        tokenType: 1,
+        tokenAddress: Address::repeat_byte(0x77),
+        tokenSubID: U256::from(123_456),
     };
+    let nft_request = build_shield_request(
+        keys.master_public_key,
+        &keys.viewing_public_key,
+        nft.clone(),
+        Uint::<120, 2>::from(1),
+        &[3u8; 32],
+    )
+    .expect("NFT shield request");
+    for (request, expected_token, expected_amount) in [
+        (request, U256::ZERO, amount),
+        (nft_request, nft.id(), U256::ONE),
+    ] {
+        let expected_commitment = request.preimage.hash();
+        let input = IndexedShieldCommitmentInput {
+            tree_number: 4,
+            tree_position: 15,
+            preimage: request.preimage,
+            shield_ciphertext: request.ciphertext,
+            source: source(3),
+        };
 
-    let delta = parse_delta(&[], &[input], &[], &[], &[], &keys);
+        let delta = parse_delta(&[], &[input], &[], &[], &[], &keys);
 
-    assert_eq!(delta.utxos.len(), 1);
-    assert_eq!(delta.utxos[0].tree, 4);
-    assert_eq!(delta.utxos[0].position, 15);
-    assert_eq!(delta.utxos[0].note.value, amount);
-    assert_eq!(delta.utxos[0].note.token_hash, U256::ZERO);
-    assert_eq!(delta.utxos[0].source, source(3));
+        assert_eq!(delta.utxos.len(), 1);
+        assert_eq!(delta.utxos[0].tree, 4);
+        assert_eq!(delta.utxos[0].position, 15);
+        assert_eq!(delta.utxos[0].note.value, expected_amount);
+        assert_eq!(delta.utxos[0].note.token_hash, expected_token);
+        assert_eq!(delta.utxos[0].note.commitment(), expected_commitment);
+        assert_eq!(delta.utxos[0].source, source(3));
+    }
 }
 
 #[test]

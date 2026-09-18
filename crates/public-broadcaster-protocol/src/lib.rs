@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Infer executor capability from the advertised, accepted nonce-bearing delegate.
+///
+/// This advertisement is a compatibility heuristic, not proof of server behavior.
+/// Callers must separately check wire-protocol compatibility, fee-row signature,
+/// expiry, availability, chain profile, and required POIs.
+#[must_use]
+pub fn supports_nonce_bearing_executor(
+    advertised_delegate: Option<Address>,
+    accepted_delegate: Address,
+) -> bool {
+    advertised_delegate == Some(accepted_delegate)
+}
+
 #[derive(Debug, Error)]
 pub enum PayloadError {
     #[error("serialize payload")]
@@ -95,6 +108,7 @@ mod tests {
     fn signed_payload_roundtrips_and_rejects_tampering() {
         let seed = [7_u8; 32];
         let viewing_public_key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let delegate = Address::repeat_byte(0x22);
         let body = Body {
             fees: HashMap::new(),
             fee_expiration: 1_800_000_000,
@@ -106,17 +120,24 @@ mod tests {
             )
             .expect("test Railgun address"),
             available_wallets: 1,
-            version: "1.0.0".to_string(),
+            version: "8.2.3".to_string(),
             relay_adapt: Address::ZERO,
-            relay_adapt_7702: None,
+            relay_adapt_7702: Some(delegate),
             required_poi_list_keys: Vec::new(),
             reliability: 1.0,
             identifier: None,
         };
         let mut payload = body.into_signed_payload(seed).expect("signed payload");
 
-        let (_, verified) = payload.decode_and_verify().expect("decoded payload");
+        let (body, verified) = payload.decode_and_verify().expect("decoded payload");
         assert!(verified);
+        assert!(supports_nonce_bearing_executor(
+            body.relay_adapt_7702,
+            delegate,
+        ));
+        for advertised in [None, Some(Address::repeat_byte(0x23))] {
+            assert!(!supports_nonce_bearing_executor(advertised, delegate));
+        }
 
         payload.signature[0] ^= 1;
         let (_, verified) = payload
