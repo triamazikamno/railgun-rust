@@ -292,18 +292,21 @@ impl ChainService {
         last_processed: u64,
     ) -> Result<u64, ChainError> {
         let mut forest = self.forest.write().await;
-        let mut reset_block = self.chain.deployment_block.saturating_sub(1);
+        let mut reset_block = self.chain.deployment.deployment_block.saturating_sub(1);
 
         if let Ok(Some((anchor_path, anchor_block))) = self.db.find_latest_anchor(&self.chain) {
-            match MerkleForestSnapshot::load(&anchor_path, self.chain.chain_id, self.chain.contract)
-            {
+            match MerkleForestSnapshot::load(
+                &anchor_path,
+                self.chain.deployment.chain_id,
+                self.chain.deployment.contract,
+            ) {
                 Ok(Some(snapshot)) => {
                     *forest = snapshot.forest;
                     reset_block = snapshot.last_processed_block;
                     MerkleForestSnapshot::write(
                         snapshot_path,
-                        self.chain.chain_id,
-                        self.chain.contract,
+                        self.chain.deployment.chain_id,
+                        self.chain.deployment.contract,
                         reset_block,
                         &forest,
                     )?;
@@ -332,15 +335,15 @@ impl ChainService {
 
         MerkleForestSnapshot::write(
             snapshot_path,
-            self.chain.chain_id,
-            self.chain.contract,
+            self.chain.deployment.chain_id,
+            self.chain.deployment.contract,
             reset_block,
             &forest,
         )?;
 
         self.db.update_merkle_forest_meta(
-            self.chain.chain_id,
-            &self.chain.contract.to_string(),
+            self.chain.deployment.chain_id,
+            &self.chain.deployment.contract.to_string(),
             snapshot_path,
             reset_block,
             SNAPSHOT_VERSION,
@@ -411,12 +414,13 @@ impl ChainService {
         safe_head: u64,
         last_processed: u64,
     ) -> Result<(), ChainError> {
-        if last_processed < self.chain.deployment_block {
+        if last_processed < self.chain.deployment.deployment_block {
             return Ok(());
         }
-        let meta = self
-            .db
-            .get_merkle_forest_meta(self.chain.chain_id, &self.chain.contract.to_string())?;
+        let meta = self.db.get_merkle_forest_meta(
+            self.chain.deployment.chain_id,
+            &self.chain.deployment.contract.to_string(),
+        )?;
         let Some(meta) = meta else {
             return Ok(());
         };
@@ -426,8 +430,8 @@ impl ChainService {
 
         if meta.last_block != last_processed {
             warn!(
-                chain_id = self.chain.chain_id,
-                contract = %self.chain.contract,
+                chain_id = self.chain.deployment.chain_id,
+                contract = %self.chain.deployment.contract,
                 rpc = rpc_url,
                 safe_head,
                 last_processed,
@@ -450,8 +454,8 @@ impl ChainService {
         ) {
             ForestReorgDecision::Skip => {
                 debug!(
-                    chain_id = self.chain.chain_id,
-                    contract = %self.chain.contract,
+                    chain_id = self.chain.deployment.chain_id,
+                    contract = %self.chain.deployment.contract,
                     rpc = rpc_url,
                     safe_head,
                     last_processed,
@@ -463,8 +467,8 @@ impl ChainService {
             ForestReorgDecision::Mismatch => {
                 let current_hash = current_hash.expect("mismatch requires confirmed hash");
                 warn!(
-                    chain_id = self.chain.chain_id,
-                    contract = %self.chain.contract,
+                    chain_id = self.chain.deployment.chain_id,
+                    contract = %self.chain.deployment.contract,
                     rpc = rpc_url,
                     safe_head,
                     last_processed,
@@ -492,15 +496,15 @@ impl ChainService {
         let forest = self.forest.read().await;
         MerkleForestSnapshot::write(
             snapshot_path,
-            self.chain.chain_id,
-            self.chain.contract,
+            self.chain.deployment.chain_id,
+            self.chain.deployment.contract,
             last_block,
             &forest,
         )?;
 
         self.db.update_merkle_forest_meta(
-            self.chain.chain_id,
-            &self.chain.contract.to_string(),
+            self.chain.deployment.chain_id,
+            &self.chain.deployment.contract.to_string(),
             snapshot_path,
             last_block,
             SNAPSHOT_VERSION,
@@ -518,7 +522,7 @@ impl ChainService {
         last_block: u64,
         forest: &MerkleForest,
     ) -> Result<(), PersistError> {
-        let interval = self.chain.anchor_interval;
+        let interval = self.chain.sync.anchor_interval;
         if interval == 0 {
             return Ok(());
         }
@@ -528,13 +532,17 @@ impl ChainService {
         }
         let anchor_dir = self.db.anchor_dir();
         std::fs::create_dir_all(&anchor_dir)?;
-        let file_name = anchor_file_name(self.chain.chain_id, self.chain.contract, last_block);
+        let file_name = anchor_file_name(
+            self.chain.deployment.chain_id,
+            self.chain.deployment.contract,
+            last_block,
+        );
         let relative = DbStore::relative_blob_path("merkle_forest/anchors", &file_name);
         let path = self.db.resolve_path(&relative);
         MerkleForestSnapshot::write(
             &path,
-            self.chain.chain_id,
-            self.chain.contract,
+            self.chain.deployment.chain_id,
+            self.chain.deployment.contract,
             last_block,
             forest,
         )?;
@@ -549,7 +557,7 @@ impl ChainService {
     }
 
     pub(super) fn prune_anchor_snapshots(&self, snapshot_path: &Path) -> Result<(), PersistError> {
-        let retention = self.chain.anchor_retention;
+        let retention = self.chain.sync.anchor_retention;
         if retention == 0 {
             return Ok(());
         }
@@ -564,8 +572,11 @@ impl ChainService {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if let Some(block) = parse_anchor_block(self.chain.chain_id, self.chain.contract, name)
-            {
+            if let Some(block) = parse_anchor_block(
+                self.chain.deployment.chain_id,
+                self.chain.deployment.contract,
+                name,
+            ) {
                 anchors.push((entry.path(), block));
             }
         }
@@ -603,11 +614,11 @@ impl ChainConfig {
         from_block: u64,
         to_block: u64,
     ) -> Option<u64> {
-        if self.archive_until_block > 0
-            && from_block <= self.archive_until_block
-            && to_block > self.archive_until_block
+        if self.sync.archive_until_block > 0
+            && from_block <= self.sync.archive_until_block
+            && to_block > self.sync.archive_until_block
         {
-            Some(self.archive_until_block)
+            Some(self.sync.archive_until_block)
         } else {
             None
         }
@@ -656,11 +667,12 @@ impl ChainConfig {
         archive_provider: Option<&DynProvider>,
         block_number: u64,
     ) -> Result<Option<[u8; 32]>, ChainError> {
-        let provider = if self.archive_until_block > 0 && block_number <= self.archive_until_block {
-            archive_provider.unwrap_or(provider)
-        } else {
-            provider
-        };
+        let provider =
+            if self.sync.archive_until_block > 0 && block_number <= self.sync.archive_until_block {
+                archive_provider.unwrap_or(provider)
+            } else {
+                provider
+            };
         let block = provider
             .get_block_by_number(BlockNumberOrTag::Number(block_number))
             .await?;
@@ -673,11 +685,12 @@ impl ChainConfig {
         archive_provider: Option<&DynProvider>,
         block_number: u64,
     ) -> Result<Option<u64>, ChainError> {
-        let provider = if self.archive_until_block > 0 && block_number <= self.archive_until_block {
-            archive_provider.unwrap_or(provider)
-        } else {
-            provider
-        };
+        let provider =
+            if self.sync.archive_until_block > 0 && block_number <= self.sync.archive_until_block {
+                archive_provider.unwrap_or(provider)
+            } else {
+                provider
+            };
         let block = provider
             .get_block_by_number(BlockNumberOrTag::Number(block_number))
             .await?;
@@ -717,18 +730,18 @@ impl ChainConfig {
         to_block: u64,
     ) -> Result<Vec<Log>, ChainError> {
         let mut logs = Vec::new();
-        let archive_until_block = self.archive_until_block;
+        let archive_until_block = self.sync.archive_until_block;
 
         if archive_until_block > 0 && from_block <= archive_until_block {
             let archive_end = to_block.min(archive_until_block);
             let archive_provider = archive_provider.unwrap_or(provider);
             let archive_logs = fetch_logs_for_range_with_provider(
                 archive_provider,
-                self.contract,
+                self.deployment.contract,
                 from_block,
                 archive_end,
-                self.v2_start_block,
-                self.legacy_shield_block,
+                self.deployment.v2_start_block,
+                self.deployment.legacy_shield_block,
             )
             .await?;
             logs.extend(archive_logs);
@@ -742,11 +755,11 @@ impl ChainConfig {
             };
             let standard_logs = fetch_logs_for_range_with_provider(
                 provider,
-                self.contract,
+                self.deployment.contract,
                 standard_start,
                 to_block,
-                self.v2_start_block,
-                self.legacy_shield_block,
+                self.deployment.v2_start_block,
+                self.deployment.legacy_shield_block,
             )
             .await?;
             logs.extend(standard_logs);
@@ -782,10 +795,10 @@ mod tests {
             .await
             .expect("provider");
         let mut chain = chain_config(mock.url.clone());
-        chain.deployment_block = 100;
-        chain.archive_until_block = 150;
-        chain.v2_start_block = 200;
-        chain.legacy_shield_block = 250;
+        chain.deployment.deployment_block = 100;
+        chain.sync.archive_until_block = 150;
+        chain.deployment.v2_start_block = 200;
+        chain.deployment.legacy_shield_block = 250;
 
         let logs = chain
             .fetch_logs_for_range(&provider, None, 100, 120)
@@ -798,24 +811,30 @@ mod tests {
 
     fn chain_config(rpc_url: Url) -> ChainConfig {
         ChainConfig {
-            chain_id: 1,
-            contract: Address::ZERO,
+            deployment: broadcaster_core::deployment::RailgunDeployment {
+                chain_id: 1,
+                contract: Address::ZERO,
+                deployment_block: 1,
+                v2_start_block: 1,
+                legacy_shield_block: 1,
+                relay_adapt_contract: Address::ZERO,
+                relay_adapt_7702_contract: Address::ZERO,
+            },
+            sync: crate::RailgunSyncOptions {
+                archive_until_block: 0,
+                block_range: 100,
+                indexed_wallet_block_range: 100,
+                poll_interval: Duration::from_secs(1),
+                quick_sync_endpoint: None,
+                indexed_artifact_source: None,
+                anchor_interval: 100,
+                anchor_retention: 2,
+            },
             rpcs: Arc::new(QueryRpcPool::new(vec![rpc_url], Duration::from_secs(1))),
             archive_rpc_url: None,
-            archive_until_block: 0,
-            deployment_block: 1,
-            v2_start_block: 1,
-            legacy_shield_block: 1,
-            block_range: 100,
-            indexed_wallet_block_range: 100,
             block_time: Duration::from_secs(12),
-            poll_interval: Duration::from_secs(1),
             finality_depth: 1,
-            quick_sync_endpoint: None,
-            indexed_artifact_source: None,
-            anchor_interval: 100,
-            anchor_retention: 2,
-            http_client: None,
+            http_client: reqwest::Client::new(),
             progress_tx: None,
         }
     }

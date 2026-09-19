@@ -154,11 +154,11 @@ impl MerkleArtifactSession {
         to_block: u64,
         progress_tx: Option<&SyncProgressSender>,
     ) -> Result<Option<Self>, SyncError> {
-        let Some(config) = chain.indexed_artifact_source.clone() else {
+        let Some(config) = chain.sync.indexed_artifact_source.clone() else {
             return Ok(None);
         };
         let scope = chain.indexed_artifact_scope();
-        let http_client = chain.http_client.clone().unwrap_or_default();
+        let http_client = chain.http_client.clone();
         let client = IndexedArtifactManifestClient::new(config, http_client);
         send_merkle_artifact_preparation_progress(
             progress_tx,
@@ -201,7 +201,7 @@ impl MerkleArtifactSession {
             Err(err) => {
                 warn!(
                     ?err,
-                    chain_id = chain.chain_id,
+                    chain_id = chain.deployment.chain_id,
                     from_block,
                     target_block,
                     "merkle checkpoint artifact descriptors unavailable; reconstructing from commitments"
@@ -214,7 +214,7 @@ impl MerkleArtifactSession {
             MERKLE_ARTIFACT_CHECKPOINT_DESCRIPTORS_DONE_PROGRESS,
         );
         debug!(
-            chain_id = chain.chain_id,
+            chain_id = chain.deployment.chain_id,
             from_block,
             target_block,
             commitment_catalogs = probe.commitment_catalog_count,
@@ -227,7 +227,7 @@ impl MerkleArtifactSession {
         } else {
             match client.fetch_chunks_bounded(&checkpoint_descriptors).await {
                 Ok(chunks) => Self::decode_checkpoint_pages_best_effort(
-                    chain.chain_id,
+                    chain.deployment.chain_id,
                     from_block,
                     target_block,
                     chunks,
@@ -235,7 +235,7 @@ impl MerkleArtifactSession {
                 Err(err) => {
                     warn!(
                         ?err,
-                        chain_id = chain.chain_id,
+                        chain_id = chain.deployment.chain_id,
                         from_block,
                         target_block,
                         checkpoint_descriptors = checkpoint_descriptors.len(),
@@ -264,7 +264,7 @@ impl MerkleArtifactSession {
             MERKLE_ARTIFACT_COMMITMENT_DESCRIPTORS_DONE_PROGRESS,
         );
         debug!(
-            chain_id = chain.chain_id,
+            chain_id = chain.deployment.chain_id,
             from_block,
             target_block,
             commitment_descriptors = commitment_descriptors.len(),

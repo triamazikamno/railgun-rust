@@ -213,14 +213,17 @@ impl SquidIndexedWalletReadSession {
 
 impl PublicScanPagePlan {
     fn new(range: PublicScanRange, chain: &ChainConfig) -> Self {
-        let rpc_to = Self::bounded_to_block(range.from_block, range.to_block, chain.block_range);
-        let indexed_page_kind =
-            IndexedWalletPageKind::for_from_block(range.from_block, chain.v2_start_block);
+        let rpc_to =
+            Self::bounded_to_block(range.from_block, range.to_block, chain.sync.block_range);
+        let indexed_page_kind = IndexedWalletPageKind::for_from_block(
+            range.from_block,
+            chain.deployment.v2_start_block,
+        );
         let indexed_to = indexed_page_kind.to_block(
             range.from_block,
             range.to_block,
-            chain.v2_start_block,
-            chain.indexed_wallet_block_range.max(1),
+            chain.deployment.v2_start_block,
+            chain.sync.indexed_wallet_block_range.max(1),
         );
         Self {
             source_range: PublicScanRange::new(range.from_block, rpc_to.min(indexed_to)),
@@ -251,7 +254,7 @@ pub(super) enum IndexedWalletCatchUpOutcome {
 
 impl ChainService {
     pub(super) const fn chain_id(&self) -> u64 {
-        self.chain.chain_id
+        self.chain.deployment.chain_id
     }
 
     pub(super) fn next_wallet_reset_intent(&self) -> u64 {
@@ -456,7 +459,7 @@ impl ChainService {
             }
         }
 
-        let squid_probe_configured = self.chain.quick_sync_endpoint.is_some();
+        let squid_probe_configured = self.chain.sync.quick_sync_endpoint.is_some();
         if let Some(session) = self
             .probe_squid_indexed_wallet_source_for_label("public_scan_rows")
             .await
@@ -466,13 +469,13 @@ impl ChainService {
             if source_range.from_block <= target {
                 let page_kind = IndexedWalletPageKind::for_from_block(
                     source_range.from_block,
-                    self.chain.v2_start_block,
+                    self.chain.deployment.v2_start_block,
                 );
                 let to_block = page_kind.to_block(
                     source_range.from_block,
                     target,
-                    self.chain.v2_start_block,
-                    self.chain.indexed_wallet_block_range,
+                    self.chain.deployment.v2_start_block,
+                    self.chain.sync.indexed_wallet_block_range,
                 );
                 if let Some(reason) = artifact_fallback_reason.take() {
                     self.record_public_scan_fallback(
@@ -583,7 +586,7 @@ impl ChainService {
                 WalletStartupSyncError::Chain(err) => err,
                 WalletStartupSyncError::Indexed(err) => ChainError::IndexedCatchUpUnavailable {
                     from_block: source_range.from_block,
-                    archive_until_block: self.chain.archive_until_block,
+                    archive_until_block: self.chain.sync.archive_until_block,
                     reason: err.to_string(),
                 },
             })?;
@@ -612,7 +615,9 @@ impl ChainService {
     }
 
     pub(super) const fn rpc_scan_source_for_range(&self, from_block: u64) -> PublicScanSource {
-        if self.chain.archive_until_block > 0 && from_block <= self.chain.archive_until_block {
+        if self.chain.sync.archive_until_block > 0
+            && from_block <= self.chain.sync.archive_until_block
+        {
             PublicScanSource::ArchiveRpc
         } else {
             PublicScanSource::Rpc
@@ -777,13 +782,13 @@ impl ChainService {
         runtime_lease: DbRuntimeLease,
         rpc_http_client: Option<reqwest::Client>,
     ) -> Result<PreparedChainService, ChainError> {
-        if chain.archive_until_block > 0
+        if chain.sync.archive_until_block > 0
             && chain.archive_rpc_url.is_none()
-            && chain.deployment_block <= chain.archive_until_block
+            && chain.deployment.deployment_block <= chain.sync.archive_until_block
         {
             warn!(
-                chain_id = chain.chain_id,
-                archive_until_block = chain.archive_until_block,
+                chain_id = chain.deployment.chain_id,
+                archive_until_block = chain.sync.archive_until_block,
                 "archive RPC URL not configured; using regular RPC providers for archive-range fallback"
             );
         }
@@ -791,7 +796,7 @@ impl ChainService {
             Some(url) => Some(
                 build_provider_with_http_client(
                     url,
-                    rpc_http_client.as_ref().or(chain.http_client.as_ref()),
+                    Some(rpc_http_client.as_ref().unwrap_or(&chain.http_client)),
                 )
                 .await
                 .map_err(ChainError::ProviderBuild)?,
@@ -834,9 +839,9 @@ impl ChainService {
             let poi_artifact_persistence = public_data_plane.poi_artifact_persistence();
             let poi_cache_service = crate::poi_cache::PoiCacheService::new_with_persistence(
                 Arc::clone(&db),
-                chain.chain_id,
+                chain.deployment.chain_id,
                 artifact_source.clone(),
-                chain.http_client.clone(),
+                Some(chain.http_client.clone()),
                 poi_artifact_persistence,
             )?
             .with_poi_rpc_url(rpc_url.clone());
@@ -1175,7 +1180,9 @@ impl ChainService {
         }
 
         let mut cfg = cfg;
-        let start_block = cfg.start_block.unwrap_or(self.chain.deployment_block);
+        let start_block = cfg
+            .start_block
+            .unwrap_or(self.chain.deployment.deployment_block);
         cfg.start_block = Some(start_block);
 
         let mut last_scanned = start_block.saturating_sub(1);
@@ -1205,7 +1212,7 @@ impl ChainService {
             sync_to_block = ?cfg.sync_to_block,
             sync_target,
             indexed_wallet_catch_up = cfg.use_indexed_wallet_catch_up,
-            indexed_artifact_source = self.chain.indexed_artifact_source.is_some(),
+            indexed_artifact_source = self.chain.sync.indexed_artifact_source.is_some(),
             "registering wallet sync"
         );
 
@@ -1228,11 +1235,11 @@ impl ChainService {
             crate::wallet::prepare_wallet_worker(
                 WalletWorkerServices {
                     db: self.db.clone(),
-                    http_client: self.chain.http_client.clone(),
-                    indexed_artifact_source: self.chain.indexed_artifact_source.clone(),
+                    http_client: Some(self.chain.http_client.clone()),
+                    indexed_artifact_source: self.chain.sync.indexed_artifact_source.clone(),
                     poi_runtime: WalletPoiRuntime::from_policy(
                         &self.poi_policy,
-                        self.chain.http_client.as_ref(),
+                        Some(&self.chain.http_client),
                     ),
                     forest: self.forest.clone(),
                     backfill_tx: self.backfill_tx.clone(),
@@ -1380,7 +1387,7 @@ impl ChainService {
                 start_block,
                 startup.last_scanned,
                 sync_target,
-                service.chain.block_range,
+                service.chain.sync.block_range,
             );
             let short_window_is_cached = if let Some(plan) = short_startup_plan {
                 service
@@ -1833,7 +1840,7 @@ impl ChainService {
             start_block,
             last_scanned,
             sync_target,
-            block_range = self.chain.block_range,
+            block_range = self.chain.sync.block_range,
             "wallet startup hedge started"
         );
 
@@ -2109,13 +2116,11 @@ impl ChainService {
         let source_read_scope = self.begin_public_scan_read();
         let endpoint = self
             .chain
+            .sync
             .quick_sync_endpoint
             .clone()
             .ok_or(WalletStartupSyncError::Cancelled)?;
-        let client = match self.chain.http_client.clone() {
-            Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
-            None => QuickSyncClient::new(endpoint),
-        };
+        let client = QuickSyncClient::with_http_client(endpoint, self.chain.http_client.clone());
         let probe_started = Instant::now();
         let probe = wait_or_cancel(&cancel, client.probe_indexed_wallet_support()).await??;
         debug!(
@@ -2155,7 +2160,7 @@ impl ChainService {
             remote_target,
             from_block,
             target,
-            indexed_block_range = self.chain.indexed_wallet_block_range,
+            indexed_block_range = self.chain.sync.indexed_wallet_block_range,
             "indexed wallet hedge target"
         );
 
@@ -2165,13 +2170,15 @@ impl ChainService {
             }
             let read_scope = source_read_scope;
             let page_started = Instant::now();
-            let page_kind =
-                IndexedWalletPageKind::for_from_block(from_block, self.chain.v2_start_block);
+            let page_kind = IndexedWalletPageKind::for_from_block(
+                from_block,
+                self.chain.deployment.v2_start_block,
+            );
             let to_block = page_kind.to_block(
                 from_block,
                 target,
-                self.chain.v2_start_block,
-                self.chain.indexed_wallet_block_range,
+                self.chain.deployment.v2_start_block,
+                self.chain.sync.indexed_wallet_block_range,
             );
             let fetch_started = Instant::now();
             let page = wait_or_cancel(
@@ -2319,13 +2326,15 @@ impl ChainService {
             if cancel.is_cancelled() {
                 return Err(WalletStartupSyncError::Cancelled);
             }
-            let page_kind =
-                IndexedWalletPageKind::for_from_block(from_block, self.chain.v2_start_block);
+            let page_kind = IndexedWalletPageKind::for_from_block(
+                from_block,
+                self.chain.deployment.v2_start_block,
+            );
             let to_block = page_kind.to_block(
                 from_block,
                 target,
-                self.chain.v2_start_block,
-                self.chain.indexed_wallet_block_range,
+                self.chain.deployment.v2_start_block,
+                self.chain.sync.indexed_wallet_block_range,
             );
             let page = match session.page_for_block_range(from_block, to_block)? {
                 IndexedWalletArtifactPageOutcome::Page(page) => page,
@@ -2601,14 +2610,11 @@ impl ChainService {
         &self,
         cache_key: &str,
     ) -> Option<SquidIndexedWalletReadSession> {
-        let Some(endpoint) = self.chain.quick_sync_endpoint.clone() else {
+        let Some(endpoint) = self.chain.sync.quick_sync_endpoint.clone() else {
             debug!(cache_key = %cache_key, "no indexed endpoint configured; using RPC wallet backfill");
             return None;
         };
-        let client = match self.chain.http_client.clone() {
-            Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
-            None => QuickSyncClient::new(endpoint),
-        };
+        let client = QuickSyncClient::with_http_client(endpoint, self.chain.http_client.clone());
         let read_scope = self.begin_public_scan_read();
         let probe_started = Instant::now();
         let probe = match client.probe_indexed_wallet_support().await {
@@ -2677,7 +2683,7 @@ impl ChainService {
         safe_head: u64,
         progress_tx: Option<&SyncProgressSender>,
     ) -> Option<IndexedWalletArtifactSession> {
-        self.chain.indexed_artifact_source.as_ref()?;
+        self.chain.sync.indexed_artifact_source.as_ref()?;
         let read_scope = self.begin_public_scan_read();
         let range = PublicScanRange::new(from_block, safe_head);
         self.public_data_plane
@@ -2824,7 +2830,7 @@ impl ChainService {
         cache_key: &str,
         registration: WalletRegistration,
     ) -> Result<(), ChainError> {
-        let chain_id = self.chain.chain_id;
+        let chain_id = self.chain.deployment.chain_id;
         let actor_id = registration.handle.actor_id();
         let (response_tx, response_rx) = oneshot::channel();
         let backfill_started = Instant::now();
@@ -2898,7 +2904,7 @@ impl ChainService {
             }
         }
         self.public_data_plane.shutdown().await;
-        await_live_log_task_shutdown(&self.live_log_task, self.chain.chain_id).await;
+        await_live_log_task_shutdown(&self.live_log_task, self.chain.deployment.chain_id).await;
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -3171,7 +3177,7 @@ impl ChainService {
             catch_up_ceiling = safe_head,
             from_block,
             target,
-            indexed_block_range = self.chain.indexed_wallet_block_range,
+            indexed_block_range = self.chain.sync.indexed_wallet_block_range,
             "indexed wallet catch-up target"
         );
         if from_block > target {
@@ -3215,7 +3221,7 @@ impl ChainService {
                     from_block,
                     artifact_target,
                     target,
-                    indexed_block_range = self.chain.indexed_wallet_block_range,
+                    indexed_block_range = self.chain.sync.indexed_wallet_block_range,
                     "indexed wallet artifact tail target"
                 );
             } else {
@@ -3287,7 +3293,7 @@ impl ChainService {
                     from_block,
                     artifact_target,
                     target,
-                    indexed_block_range = self.chain.indexed_wallet_block_range,
+                    indexed_block_range = self.chain.sync.indexed_wallet_block_range,
                     "indexed wallet artifact tail target"
                 );
                 continue;
@@ -3297,13 +3303,15 @@ impl ChainService {
                 return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
             }
             let page_started = Instant::now();
-            let page_kind =
-                IndexedWalletPageKind::for_from_block(from_block, self.chain.v2_start_block);
+            let page_kind = IndexedWalletPageKind::for_from_block(
+                from_block,
+                self.chain.deployment.v2_start_block,
+            );
             let to_block = page_kind.to_block(
                 from_block,
                 target,
-                self.chain.v2_start_block,
-                self.chain.indexed_wallet_block_range,
+                self.chain.deployment.v2_start_block,
+                self.chain.sync.indexed_wallet_block_range,
             );
             let fetch_started = Instant::now();
             let read_scope = if using_artifact {
@@ -3407,7 +3415,7 @@ impl ChainService {
                             safe_head,
                             from_block,
                             target,
-                            indexed_block_range = self.chain.indexed_wallet_block_range,
+                            indexed_block_range = self.chain.sync.indexed_wallet_block_range,
                             "indexed wallet fallback target"
                         );
                         if from_block > target {
@@ -3483,7 +3491,7 @@ impl ChainService {
                             safe_head,
                             from_block,
                             target,
-                            indexed_block_range = self.chain.indexed_wallet_block_range,
+                            indexed_block_range = self.chain.sync.indexed_wallet_block_range,
                             "indexed wallet fallback target"
                         );
                         if from_block > target {
@@ -3696,7 +3704,7 @@ async fn fetch_initial_head(
             Ok(head) => {
                 let safe_head = head
                     .saturating_sub(chain.finality_depth)
-                    .max(chain.deployment_block);
+                    .max(chain.deployment.deployment_block);
                 return Some((rpc, head, safe_head));
             }
             Err(err) => {

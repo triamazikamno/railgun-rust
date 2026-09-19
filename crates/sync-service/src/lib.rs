@@ -45,17 +45,17 @@ pub use sender_candidate::{
 };
 pub use trustless_artifacts::{VerifiedCidError, fetch_verified_cid, fetch_verified_cid_with_pool};
 pub use types::{
-    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
-    GlobalPoiPolicy, IndexedArtifactManifestSource, IndexedArtifactSourceConfig,
-    PendingOutputPoiContextIntent, PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind,
-    PoiArtifactCacheGraphProgress, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
-    PoiArtifactCacheProgress, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
-    PublicScanSource, SyncProgressSender, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
-    WalletCacheStore, WalletConfig, WalletCurrentSnapshot, WalletInactiveReason,
-    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletObservation,
-    WalletPendingSpentMarkOutcome, WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus,
-    WalletPrivateRequestError, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
-    WalletSchedulableProgress, WalletViewState,
+    ChainConfig, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, GlobalPoiPolicy,
+    IndexedArtifactManifestSource, IndexedArtifactSourceConfig, PendingOutputPoiContextIntent,
+    PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind, PoiArtifactCacheGraphProgress,
+    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource,
+    RailgunSyncOptions, SyncProgressSender, SyncProgressStage, SyncProgressUnit,
+    SyncProgressUpdate, WalletCacheStore, WalletConfig, WalletCurrentSnapshot,
+    WalletInactiveReason, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+    WalletObservation, WalletPendingSpentMarkOutcome, WalletPpoiSubmissionStatus,
+    WalletPpoiWorkflowStatus, WalletPrivateRequestError, WalletReadiness, WalletReadinessError,
+    WalletReadinessWaitError, WalletSchedulableProgress, WalletViewState,
 };
 pub use wallet::{
     LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,

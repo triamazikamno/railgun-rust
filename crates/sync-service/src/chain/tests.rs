@@ -712,27 +712,33 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
     };
     let rpc_url = Url::parse("http://127.0.0.1:1").expect("rpc url");
     let chain = ChainConfig {
-        chain_id: scope.chain_id,
-        contract: scope.railgun_contract,
+        deployment: broadcaster_core::deployment::RailgunDeployment {
+            chain_id: scope.chain_id,
+            contract: scope.railgun_contract,
+            deployment_block: 0,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            relay_adapt_contract: Address::ZERO,
+            relay_adapt_7702_contract: Address::ZERO,
+        },
+        sync: crate::RailgunSyncOptions {
+            archive_until_block: 0,
+            block_range: 100,
+            indexed_wallet_block_range: 100,
+            poll_interval: Duration::from_millis(1),
+            quick_sync_endpoint: None,
+            indexed_artifact_source: None,
+            anchor_interval: 1000,
+            anchor_retention: 5,
+        },
         rpcs: Arc::new(QueryRpcPool::new(
             vec![rpc_url.clone()],
             Duration::from_secs(1),
         )),
         archive_rpc_url: None,
-        archive_until_block: 0,
-        deployment_block: 0,
-        v2_start_block: 0,
-        legacy_shield_block: 0,
-        block_range: 100,
-        indexed_wallet_block_range: 100,
         block_time: Duration::from_secs(12),
-        poll_interval: Duration::from_millis(1),
         finality_depth: 0,
-        quick_sync_endpoint: None,
-        indexed_artifact_source: None,
-        anchor_interval: 1000,
-        anchor_retention: 5,
-        http_client: None,
+        http_client: reqwest::Client::new(),
         progress_tx: None,
     };
     let (head_tx, _head_rx) = watch::channel(0);
@@ -1707,8 +1713,8 @@ async fn manager_resets_persisted_cache_once_and_every_registered_public_data_pl
             None,
         );
         let key = ChainKey {
-            chain_id: chain.chain_id,
-            contract: chain.contract,
+            chain_id: chain.deployment.chain_id,
+            contract: chain.deployment.contract,
         };
         let public_data_plane = ChainPublicDataPlane::new(
             Arc::clone(&db),
@@ -1850,12 +1856,12 @@ async fn session_removal_routes_by_handle_and_rejects_cross_service_actor_collis
         None,
     );
     let chain_a_key = ChainKey {
-        chain_id: chain_a.chain_id,
-        contract: chain_a.contract,
+        chain_id: chain_a.deployment.chain_id,
+        contract: chain_a.deployment.contract,
     };
     let chain_b_key = ChainKey {
-        chain_id: chain_b.chain_id,
-        contract: chain_b.contract,
+        chain_id: chain_b.deployment.chain_id,
+        contract: chain_b.deployment.contract,
     };
     let service_a = test_chain_service(
         Arc::clone(&db_a),
@@ -2113,7 +2119,7 @@ async fn wallet_startup_reuses_recent_rows_before_short_tail_hedge() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.quick_sync_endpoint = Some(rpc_url.clone());
+    chain.sync.quick_sync_endpoint = Some(rpc_url.clone());
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2245,9 +2251,9 @@ async fn indexed_disabled_short_startup_warms_and_reuses_full_rpc_window() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = None;
+    chain.sync.quick_sync_endpoint = None;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2358,9 +2364,9 @@ async fn wallet_startup_reuses_sliding_cached_prefix_and_retains_new_tail() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = None;
+    chain.sync.quick_sync_endpoint = None;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2498,9 +2504,9 @@ async fn wallet_startup_warms_pre_cursor_gap_before_cached_suffix() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = None;
+    chain.sync.quick_sync_endpoint = None;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2593,9 +2599,9 @@ async fn historical_catch_up_delivers_captured_suffix_after_cache_eviction() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = None;
+    chain.sync.quick_sync_endpoint = None;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2710,7 +2716,7 @@ async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() 
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
@@ -2832,7 +2838,7 @@ async fn wallet_startup_rpc_candidate_rejects_zero_provider_coverage() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
@@ -2890,7 +2896,7 @@ async fn wallet_startup_rpc_candidate_rejects_missing_endpoint_block() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
@@ -2946,8 +2952,8 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.archive_until_block = 105;
-    chain.block_range = 10;
+    chain.sync.archive_until_block = 105;
+    chain.sync.block_range = 10;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
@@ -3027,10 +3033,10 @@ async fn multi_page_squid_startup_retains_leading_rows_for_replacement_wallet() 
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 6;
-    chain.indexed_wallet_block_range = 1;
+    chain.sync.block_range = 6;
+    chain.sync.indexed_wallet_block_range = 1;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = Some(squid.url.clone());
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3199,10 +3205,10 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 6;
-    chain.indexed_wallet_block_range = 1;
+    chain.sync.block_range = 6;
+    chain.sync.indexed_wallet_block_range = 1;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = Some(squid.url.clone());
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3349,10 +3355,10 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
-    chain.block_range = 10;
-    chain.indexed_wallet_block_range = 10;
+    chain.sync.block_range = 10;
+    chain.sync.indexed_wallet_block_range = 10;
     chain.finality_depth = 0;
-    chain.quick_sync_endpoint = Some(squid.url.clone());
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4474,8 +4480,8 @@ async fn wallet_backfill_loop_rebases_non_contiguous_cursor_to_actor_progress() 
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.poll_interval = Duration::from_millis(1);
+    chain.sync.block_range = 100;
+    chain.sync.poll_interval = Duration::from_millis(1);
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4596,8 +4602,8 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.poll_interval = Duration::from_millis(1);
+    chain.sync.block_range = 100;
+    chain.sync.poll_interval = Duration::from_millis(1);
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4790,8 +4796,8 @@ async fn wallet_backfill_loop_reuses_cached_prefix_before_fetching_delivery_tail
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.poll_interval = Duration::from_millis(1);
+    chain.sync.block_range = 100;
+    chain.sync.poll_interval = Duration::from_millis(1);
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4930,8 +4936,8 @@ async fn wallet_backfill_loop_reacquires_prefix_invalidated_before_tail_commit()
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.poll_interval = Duration::from_millis(1);
+    chain.sync.block_range = 100;
+    chain.sync.poll_interval = Duration::from_millis(1);
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5080,8 +5086,8 @@ async fn wallet_backfill_loop_reacquires_full_window_after_stale_cached_delivery
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.poll_interval = Duration::from_millis(1);
+    chain.sync.block_range = 100;
+    chain.sync.poll_interval = Duration::from_millis(1);
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5341,8 +5347,8 @@ async fn wallet_backfill_loop_abandons_malformed_warm_gap_before_delivering_tail
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.poll_interval = Duration::from_millis(1);
+    chain.sync.block_range = 100;
+    chain.sync.poll_interval = Duration::from_millis(1);
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5479,24 +5485,30 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         Duration::from_secs(1),
     ));
     let chain = ChainConfig {
-        chain_id: scope.chain_id,
-        contract: scope.railgun_contract,
+        deployment: broadcaster_core::deployment::RailgunDeployment {
+            chain_id: scope.chain_id,
+            contract: scope.railgun_contract,
+            deployment_block: 0,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            relay_adapt_contract: Address::ZERO,
+            relay_adapt_7702_contract: Address::ZERO,
+        },
+        sync: crate::RailgunSyncOptions {
+            archive_until_block: 0,
+            block_range: 100,
+            indexed_wallet_block_range: 100,
+            poll_interval: Duration::from_millis(1),
+            quick_sync_endpoint: Some(squid.url.clone()),
+            indexed_artifact_source: Some(artifact_source.config),
+            anchor_interval: 1000,
+            anchor_retention: 5,
+        },
         rpcs: Arc::clone(&rpcs),
         archive_rpc_url: None,
-        archive_until_block: 0,
-        deployment_block: 0,
-        v2_start_block: 0,
-        legacy_shield_block: 0,
-        block_range: 100,
-        indexed_wallet_block_range: 100,
         block_time: Duration::from_secs(12),
-        poll_interval: Duration::from_millis(1),
         finality_depth: 0,
-        quick_sync_endpoint: Some(squid.url.clone()),
-        indexed_artifact_source: Some(artifact_source.config),
-        anchor_interval: 1000,
-        anchor_retention: 5,
-        http_client: None,
+        http_client: reqwest::Client::new(),
         progress_tx: None,
     };
     let (head_tx, _head_rx) = watch::channel(0);
@@ -5629,24 +5641,30 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         Duration::from_secs(1),
     ));
     let chain = ChainConfig {
-        chain_id: scope.chain_id,
-        contract: scope.railgun_contract,
+        deployment: broadcaster_core::deployment::RailgunDeployment {
+            chain_id: scope.chain_id,
+            contract: scope.railgun_contract,
+            deployment_block: 0,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            relay_adapt_contract: Address::ZERO,
+            relay_adapt_7702_contract: Address::ZERO,
+        },
+        sync: crate::RailgunSyncOptions {
+            archive_until_block: 0,
+            block_range: 100,
+            indexed_wallet_block_range: 100,
+            poll_interval: Duration::from_millis(1),
+            quick_sync_endpoint: Some(Url::parse("http://127.0.0.1:1").expect("squid url")),
+            indexed_artifact_source: Some(artifact_source.config),
+            anchor_interval: 1000,
+            anchor_retention: 5,
+        },
         rpcs: Arc::clone(&rpcs),
         archive_rpc_url: None,
-        archive_until_block: 0,
-        deployment_block: 0,
-        v2_start_block: 0,
-        legacy_shield_block: 0,
-        block_range: 100,
-        indexed_wallet_block_range: 100,
         block_time: Duration::from_secs(12),
-        poll_interval: Duration::from_millis(1),
         finality_depth: 0,
-        quick_sync_endpoint: Some(Url::parse("http://127.0.0.1:1").expect("squid url")),
-        indexed_artifact_source: Some(artifact_source.config),
-        anchor_interval: 1000,
-        anchor_retention: 5,
-        http_client: None,
+        http_client: reqwest::Client::new(),
         progress_tx: None,
     };
     let (head_tx, _head_rx) = watch::channel(0);
@@ -5801,7 +5819,7 @@ async fn wallet_retirement_interrupts_active_rpc_backfill_and_reuses_coordinator
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 10;
+    chain.sync.block_range = 10;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6739,8 +6757,8 @@ async fn public_scan_rows_rpc_fallback_returns_only_bounded_proven_range() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.block_range = 100;
-    chain.indexed_wallet_block_range = 1_000;
+    chain.sync.block_range = 100;
+    chain.sync.indexed_wallet_block_range = 1_000;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
@@ -6841,8 +6859,8 @@ async fn public_scan_rows_rpc_fallback_does_not_reuse_missing_endpoint_coverage(
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.block_range = 100;
-    chain.indexed_wallet_block_range = 1_000;
+    chain.sync.block_range = 100;
+    chain.sync.indexed_wallet_block_range = 1_000;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
@@ -6913,9 +6931,9 @@ async fn public_scan_rows_records_squid_to_rpc_fallback_diagnostic() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.quick_sync_endpoint = Some(squid.url.clone());
-    chain.block_range = 100;
-    chain.indexed_wallet_block_range = 100;
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    chain.sync.block_range = 100;
+    chain.sync.indexed_wallet_block_range = 100;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6986,10 +7004,10 @@ async fn public_scan_rows_records_archive_rpc_fallback_diagnostic_at_boundary() 
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
-    chain.quick_sync_endpoint = Some(squid.url.clone());
-    chain.archive_until_block = 100;
-    chain.block_range = 100;
-    chain.indexed_wallet_block_range = 100;
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    chain.sync.archive_until_block = 100;
+    chain.sync.block_range = 100;
+    chain.sync.indexed_wallet_block_range = 100;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -7065,9 +7083,9 @@ async fn public_scan_rows_rejects_missing_archive_boundary_without_recording_cov
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.archive_until_block = 100;
-    chain.block_range = 100;
-    chain.indexed_wallet_block_range = 100;
+    chain.sync.archive_until_block = 100;
+    chain.sync.block_range = 100;
+    chain.sync.indexed_wallet_block_range = 100;
     let public_data_plane = ChainPublicDataPlane::new(
         Arc::clone(&db),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -7565,24 +7583,30 @@ fn test_chain_config(
     indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
 ) -> ChainConfig {
     ChainConfig {
-        chain_id: scope.chain_id,
-        contract: scope.railgun_contract,
+        deployment: broadcaster_core::deployment::RailgunDeployment {
+            chain_id: scope.chain_id,
+            contract: scope.railgun_contract,
+            deployment_block: 0,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            relay_adapt_contract: Address::ZERO,
+            relay_adapt_7702_contract: Address::ZERO,
+        },
+        sync: crate::RailgunSyncOptions {
+            archive_until_block: 0,
+            block_range: 100,
+            indexed_wallet_block_range: 100,
+            poll_interval: Duration::from_millis(1),
+            quick_sync_endpoint: None,
+            indexed_artifact_source,
+            anchor_interval: 1000,
+            anchor_retention: 5,
+        },
         rpcs,
         archive_rpc_url: None,
-        archive_until_block: 0,
-        deployment_block: 0,
-        v2_start_block: 0,
-        legacy_shield_block: 0,
-        block_range: 100,
-        indexed_wallet_block_range: 100,
         block_time: Duration::from_secs(12),
-        poll_interval: Duration::from_millis(1),
         finality_depth: 0,
-        quick_sync_endpoint: None,
-        indexed_artifact_source,
-        anchor_interval: 1000,
-        anchor_retention: 5,
-        http_client: None,
+        http_client: reqwest::Client::new(),
         progress_tx: None,
     }
 }
@@ -7629,8 +7653,8 @@ impl IndexedCatchUpTestContext {
             Duration::from_secs(1),
         ));
         let mut chain = test_chain_config(scope, Arc::clone(&rpcs), indexed_artifact_source);
-        chain.quick_sync_endpoint = Some(quick_sync_endpoint.clone());
-        chain.indexed_wallet_block_range = indexed_wallet_block_range;
+        chain.sync.quick_sync_endpoint = Some(quick_sync_endpoint.clone());
+        chain.sync.indexed_wallet_block_range = indexed_wallet_block_range;
         let public_data_plane = ChainPublicDataPlane::new(
             Arc::clone(&db),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),

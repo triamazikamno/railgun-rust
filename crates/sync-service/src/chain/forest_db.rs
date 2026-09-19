@@ -30,18 +30,26 @@ impl MerkleForestDbExt for DbStore {
         archive_provider: Option<&DynProvider>,
     ) -> Result<(Arc<RwLock<MerkleForest>>, u64, PathBuf, u64), ChainError> {
         let mut forest = MerkleForest::new();
-        let mut last_processed = chain.deployment_block.saturating_sub(1);
-        let file_name = format!("forest-{}-{}.msgpack", chain.chain_id, chain.contract);
+        let mut last_processed = chain.deployment.deployment_block.saturating_sub(1);
+        let file_name = format!(
+            "forest-{}-{}.msgpack",
+            chain.deployment.chain_id, chain.deployment.contract
+        );
         self.ensure_blob_dir("merkle_forest")?;
         let relative = Self::relative_blob_path("merkle_forest", &file_name);
         let mut snapshot_path = self.resolve_path(&relative);
         let mut last_anchor = 0;
 
-        if let Ok(Some(meta)) =
-            self.get_merkle_forest_meta(chain.chain_id, &chain.contract.to_string())
-        {
+        if let Ok(Some(meta)) = self.get_merkle_forest_meta(
+            chain.deployment.chain_id,
+            &chain.deployment.contract.to_string(),
+        ) {
             let path = self.resolve_path(&meta.relative_path);
-            match MerkleForestSnapshot::load(&path, chain.chain_id, chain.contract) {
+            match MerkleForestSnapshot::load(
+                &path,
+                chain.deployment.chain_id,
+                chain.deployment.contract,
+            ) {
                 Ok(Some(snapshot)) => {
                     forest = snapshot.forest;
                     last_processed = snapshot.last_processed_block;
@@ -57,7 +65,11 @@ impl MerkleForestDbExt for DbStore {
         if let Ok(Some((anchor_path, anchor_block))) = self.find_latest_anchor(chain) {
             last_anchor = anchor_block;
             if last_processed < anchor_block {
-                match MerkleForestSnapshot::load(&anchor_path, chain.chain_id, chain.contract) {
+                match MerkleForestSnapshot::load(
+                    &anchor_path,
+                    chain.deployment.chain_id,
+                    chain.deployment.contract,
+                ) {
                     Ok(Some(snapshot)) => {
                         forest = snapshot.forest;
                         last_processed = snapshot.last_processed_block;
@@ -71,18 +83,20 @@ impl MerkleForestDbExt for DbStore {
             }
         }
 
-        let mut from_block = last_processed.saturating_add(1).max(chain.deployment_block);
+        let mut from_block = last_processed
+            .saturating_add(1)
+            .max(chain.deployment.deployment_block);
         let mut artifact_catch_up_applied = false;
         if chain.should_skip_merkle_artifact_catch_up(from_block, safe_head) {
             debug!(
-                chain_id = chain.chain_id,
+                chain_id = chain.deployment.chain_id,
                 from_block,
                 safe_head,
-                block_range = chain.block_range,
+                block_range = chain.sync.block_range,
                 tail_blocks = safe_head.saturating_sub(from_block).saturating_add(1),
                 "skipping merkle artifact catch-up for small tail"
             );
-        } else if chain.indexed_artifact_source.is_some() && from_block <= safe_head {
+        } else if chain.sync.indexed_artifact_source.is_some() && from_block <= safe_head {
             let artifact_started = Instant::now();
             let artifact_start_block = from_block;
             let mut candidate = forest.clone();
@@ -132,8 +146,9 @@ impl MerkleForestDbExt for DbStore {
                         Ok(true) => {
                             forest = candidate;
                             last_processed = target;
-                            from_block =
-                                last_processed.saturating_add(1).max(chain.deployment_block);
+                            from_block = last_processed
+                                .saturating_add(1)
+                                .max(chain.deployment.deployment_block);
                             artifact_catch_up_applied = true;
                             send_sync_progress(
                                 progress_tx.as_ref(),
@@ -142,7 +157,7 @@ impl MerkleForestDbExt for DbStore {
                                 ),
                             );
                             info!(
-                                chain_id = chain.chain_id,
+                                chain_id = chain.deployment.chain_id,
                                 from_block = artifact_start_block,
                                 target,
                                 commitments = catch_up.progress.commitments,
@@ -152,7 +167,7 @@ impl MerkleForestDbExt for DbStore {
                         }
                         Ok(false) => {
                             warn!(
-                                chain_id = chain.chain_id,
+                                chain_id = chain.deployment.chain_id,
                                 target,
                                 artifact_block_hash = %FixedBytes::<32>::from(catch_up.target_block_hash),
                                 provider_block_hash = ?provider_block_hash.map(FixedBytes::<32>::from),
@@ -170,7 +185,7 @@ impl MerkleForestDbExt for DbStore {
                 }
                 Ok(None) => {
                     debug!(
-                        chain_id = chain.chain_id,
+                        chain_id = chain.deployment.chain_id,
                         from_block = artifact_start_block,
                         safe_head,
                         elapsed_ms = artifact_started.elapsed().as_millis(),
@@ -180,7 +195,7 @@ impl MerkleForestDbExt for DbStore {
                 Err(err) => {
                     warn!(
                         ?err,
-                        chain_id = chain.chain_id,
+                        chain_id = chain.deployment.chain_id,
                         from_block = artifact_start_block,
                         safe_head,
                         elapsed_ms = artifact_started.elapsed().as_millis(),
@@ -190,18 +205,14 @@ impl MerkleForestDbExt for DbStore {
             }
         }
 
-        if let Some(endpoint) = chain.quick_sync_endpoint.clone() {
-            let client = match chain.http_client.clone() {
-                Some(http_client) => {
-                    QuickSyncClient::with_http_client(endpoint.clone(), http_client)
-                }
-                None => QuickSyncClient::new(endpoint.clone()),
-            };
+        if let Some(endpoint) = chain.sync.quick_sync_endpoint.clone() {
+            let client =
+                QuickSyncClient::with_http_client(endpoint.clone(), chain.http_client.clone());
             match client.fetch_squid_height().await {
                 Ok(indexed_height) => {
                     let target = indexed_height.min(safe_head);
                     info!(
-                        chain_id = chain.chain_id,
+                        chain_id = chain.deployment.chain_id,
                         indexed_height,
                         safe_head,
                         current_block = last_processed,
@@ -217,7 +228,7 @@ impl MerkleForestDbExt for DbStore {
                                 start_block,
                                 end_block: Some(target),
                                 page_size: DEFAULT_PAGE_SIZE,
-                                http_client: chain.http_client.clone(),
+                                http_client: Some(chain.http_client.clone()),
                             };
                             let progress_tx = chain.progress_tx.clone();
                             send_sync_progress(
@@ -286,7 +297,7 @@ impl MerkleForestDbExt for DbStore {
                                                 ),
                                             );
                                             info!(
-                                                chain_id = chain.chain_id,
+                                                chain_id = chain.deployment.chain_id,
                                                 from_block = start_block,
                                                 target,
                                                 commitments = progress.commitments,
@@ -349,7 +360,9 @@ impl MerkleForestDbExt for DbStore {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if let Some(block) = parse_anchor_block(chain.chain_id, chain.contract, name) {
+            if let Some(block) =
+                parse_anchor_block(chain.deployment.chain_id, chain.deployment.contract, name)
+            {
                 let path = entry.path();
                 match &latest {
                     Some((_, latest_block)) if *latest_block >= block => {}
@@ -371,14 +384,14 @@ fn persist_indexed_forest_snapshot(
 ) -> Result<(), ChainError> {
     MerkleForestSnapshot::write(
         snapshot_path,
-        chain.chain_id,
-        chain.contract,
+        chain.deployment.chain_id,
+        chain.deployment.contract,
         last_block,
         forest,
     )?;
     db.update_merkle_forest_meta(
-        chain.chain_id,
-        &chain.contract.to_string(),
+        chain.deployment.chain_id,
+        &chain.deployment.contract.to_string(),
         snapshot_path,
         last_block,
         SNAPSHOT_VERSION,
@@ -439,8 +452,8 @@ mod tests {
     use merkletree::tree::MerkleTreeUpdate;
     use url::Url;
 
-    #[test]
-    fn persist_indexed_forest_snapshot_writes_reorg_metadata() {
+    #[tokio::test]
+    async fn persist_indexed_forest_snapshot_writes_reorg_metadata() {
         let root_dir = temp_db_root("persist-indexed-forest-snapshot");
         let db = DbStore::open(DbConfig {
             root_dir: root_dir.clone(),
@@ -448,10 +461,22 @@ mod tests {
         .expect("open db");
         db.ensure_blob_dir("merkle_forest")
             .expect("create merkle forest blob dir");
-        let chain = chain_config();
+        let mut chain = chain_config();
+        // A caller-supplied deployment must retain its scan start and cache identity.
+        chain.deployment.chain_id = 999_999;
+        chain.deployment.contract = Address::from([0x42; 20]);
+        chain.deployment.deployment_block = 100;
+        let (_, last_processed, _, _) = db
+            .load_or_initialize_forest(&chain, 0, None, None)
+            .await
+            .expect("initialize custom deployment");
+        assert_eq!(last_processed, 99);
         let relative = DbStore::relative_blob_path(
             "merkle_forest",
-            &format!("forest-{}-{}.msgpack", chain.chain_id, chain.contract),
+            &format!(
+                "forest-{}-{}.msgpack",
+                chain.deployment.chain_id, chain.deployment.contract
+            ),
         );
         let snapshot_path = db.resolve_path(&relative);
         let mut forest = MerkleForest::new();
@@ -476,16 +501,43 @@ mod tests {
         .expect("persist snapshot");
 
         let meta = db
-            .get_merkle_forest_meta(chain.chain_id, &chain.contract.to_string())
+            .get_merkle_forest_meta(
+                chain.deployment.chain_id,
+                &chain.deployment.contract.to_string(),
+            )
             .expect("read forest meta")
             .expect("forest meta present");
         assert_eq!(meta.last_block, 123);
         assert_eq!(meta.hash, block_hash);
-        let snapshot = MerkleForestSnapshot::load(&snapshot_path, chain.chain_id, chain.contract)
-            .expect("load snapshot")
-            .expect("snapshot present");
+        let snapshot = MerkleForestSnapshot::load(
+            &snapshot_path,
+            chain.deployment.chain_id,
+            chain.deployment.contract,
+        )
+        .expect("load snapshot")
+        .expect("snapshot present");
         assert_eq!(snapshot.last_processed_block, 123);
 
+        drop(db);
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("reopen db");
+        let (_, last_processed, _, _) = db
+            .load_or_initialize_forest(&chain, 123, None, None)
+            .await
+            .expect("restore custom deployment");
+        assert_eq!(last_processed, 123);
+        assert!(
+            db.get_merkle_forest_meta(1, &chain.deployment.contract.to_string())
+                .expect("read different chain")
+                .is_none()
+        );
+        assert!(
+            db.get_merkle_forest_meta(chain.deployment.chain_id, &Address::ZERO.to_string())
+                .expect("read different contract")
+                .is_none()
+        );
         drop(db);
         std::fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
@@ -502,7 +554,10 @@ mod tests {
         let chain = chain_config();
         let relative = DbStore::relative_blob_path(
             "merkle_forest",
-            &format!("forest-{}-{}.msgpack", chain.chain_id, chain.contract),
+            &format!(
+                "forest-{}-{}.msgpack",
+                chain.deployment.chain_id, chain.deployment.contract
+            ),
         );
         let snapshot_path = db.resolve_path(&relative);
         let mut forest = MerkleForest::new();
@@ -537,7 +592,10 @@ mod tests {
 
         assert!(!persisted);
         let meta = db
-            .get_merkle_forest_meta(chain.chain_id, &chain.contract.to_string())
+            .get_merkle_forest_meta(
+                chain.deployment.chain_id,
+                &chain.deployment.contract.to_string(),
+            )
             .expect("read forest meta")
             .expect("forest meta present");
         assert_eq!(meta.last_block, 100);
@@ -550,8 +608,8 @@ mod tests {
     #[test]
     fn skips_merkle_artifact_catch_up_for_small_tail() {
         let mut chain = chain_config();
-        chain.indexed_artifact_source = Some(indexed_artifact_source());
-        chain.block_range = 100;
+        chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
+        chain.sync.block_range = 100;
 
         assert!(chain.should_skip_merkle_artifact_catch_up(101, 200));
         assert!(chain.should_skip_merkle_artifact_catch_up(200, 200));
@@ -560,8 +618,8 @@ mod tests {
     #[test]
     fn uses_merkle_artifact_catch_up_for_large_tail() {
         let mut chain = chain_config();
-        chain.indexed_artifact_source = Some(indexed_artifact_source());
-        chain.block_range = 100;
+        chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
+        chain.sync.block_range = 100;
 
         assert!(!chain.should_skip_merkle_artifact_catch_up(100, 200));
     }
@@ -569,37 +627,43 @@ mod tests {
     #[test]
     fn uses_merkle_artifact_catch_up_without_source_or_when_past_safe_head() {
         let mut chain = chain_config();
-        chain.block_range = 100;
+        chain.sync.block_range = 100;
 
         assert!(!chain.should_skip_merkle_artifact_catch_up(101, 200));
 
-        chain.indexed_artifact_source = Some(indexed_artifact_source());
+        chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
         assert!(!chain.should_skip_merkle_artifact_catch_up(201, 200));
     }
 
     fn chain_config() -> ChainConfig {
         ChainConfig {
-            chain_id: 1,
-            contract: Address::ZERO,
+            deployment: broadcaster_core::deployment::RailgunDeployment {
+                chain_id: 1,
+                contract: Address::ZERO,
+                deployment_block: 1,
+                v2_start_block: 1,
+                legacy_shield_block: 1,
+                relay_adapt_contract: Address::ZERO,
+                relay_adapt_7702_contract: Address::ZERO,
+            },
+            sync: crate::RailgunSyncOptions {
+                archive_until_block: 0,
+                block_range: 100,
+                indexed_wallet_block_range: 100,
+                poll_interval: Duration::from_secs(1),
+                quick_sync_endpoint: None,
+                indexed_artifact_source: None,
+                anchor_interval: 0,
+                anchor_retention: 0,
+            },
             rpcs: Arc::new(QueryRpcPool::new(
                 vec![Url::parse("http://127.0.0.1:8545").expect("rpc url")],
                 Duration::from_secs(1),
             )),
             archive_rpc_url: None,
-            archive_until_block: 0,
-            deployment_block: 1,
-            v2_start_block: 1,
-            legacy_shield_block: 1,
-            block_range: 100,
-            indexed_wallet_block_range: 100,
             block_time: Duration::from_secs(12),
-            poll_interval: Duration::from_secs(1),
             finality_depth: 0,
-            quick_sync_endpoint: None,
-            indexed_artifact_source: None,
-            anchor_interval: 0,
-            anchor_retention: 0,
-            http_client: None,
+            http_client: reqwest::Client::new(),
             progress_tx: None,
         }
     }

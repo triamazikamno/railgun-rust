@@ -367,11 +367,11 @@ impl IndexedWalletArtifactSession {
         public_data_plane: &ChainPublicDataPlane,
         progress_tx: Option<&SyncProgressSender>,
     ) -> Result<Option<Self>, SyncError> {
-        let Some(config) = chain.indexed_artifact_source.clone() else {
+        let Some(config) = chain.sync.indexed_artifact_source.clone() else {
             return Ok(None);
         };
         let scope = chain.indexed_artifact_scope();
-        let http_client = chain.http_client.clone().unwrap_or_default();
+        let http_client = chain.http_client.clone();
         let client = IndexedArtifactManifestClient::new(config, http_client);
         let started = Instant::now();
         let manifest_started = Instant::now();

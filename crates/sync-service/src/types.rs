@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, FixedBytes, U256, address};
+use alloy::primitives::{Address, FixedBytes, U256};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::PreTxPoi;
@@ -593,26 +593,14 @@ pub struct ChainKey {
 
 #[derive(Clone)]
 pub struct ChainConfig {
-    pub chain_id: u64,
-    pub contract: Address,
+    pub deployment: broadcaster_core::deployment::RailgunDeployment,
+    pub sync: RailgunSyncOptions,
     pub rpcs: Arc<QueryRpcPool>,
     pub archive_rpc_url: Option<Url>,
-    pub archive_until_block: u64,
-    pub deployment_block: u64,
-    pub v2_start_block: u64,
-    pub legacy_shield_block: u64,
-    pub block_range: u64,
-    pub indexed_wallet_block_range: u64,
     pub block_time: Duration,
-    pub poll_interval: Duration,
     pub finality_depth: u64,
-    pub quick_sync_endpoint: Option<Url>,
-    pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
-    pub anchor_interval: u64,
-    pub anchor_retention: usize,
-    /// Optional pre-configured HTTP client (e.g. with proxy support) for
-    /// quick-sync and other internal HTTP requests.
-    pub http_client: Option<reqwest::Client>,
+    /// Caller-configured transport for quick-sync and other internal HTTP requests.
+    pub http_client: reqwest::Client,
     pub progress_tx: Option<SyncProgressSender>,
 }
 
@@ -620,8 +608,8 @@ impl ChainConfig {
     pub(crate) const fn indexed_artifact_scope(&self) -> ChainScope {
         ChainScope {
             chain_type: ChainType::Evm,
-            chain_id: self.chain_id,
-            railgun_contract: self.contract,
+            chain_id: self.deployment.chain_id,
+            railgun_contract: self.deployment.contract,
         }
     }
 
@@ -630,156 +618,85 @@ impl ChainConfig {
         from_block: u64,
         safe_head: u64,
     ) -> bool {
-        self.indexed_artifact_source.is_some()
+        self.sync.indexed_artifact_source.is_some()
             && from_block <= safe_head
-            && safe_head.saturating_sub(from_block).saturating_add(1) <= self.block_range
+            && safe_head.saturating_sub(from_block).saturating_add(1) <= self.sync.block_range
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ChainConfigDefaults {
-    pub chain_id: u64,
-    pub contract: Address,
-    pub relay_adapt_contract: Address,
-    pub relay_adapt_7702_contract: Address,
-    pub multicall_contract: Address,
-    pub rpc_urls: Vec<Url>,
-    pub quick_sync_endpoint: Option<Url>,
-    pub indexed_wallet_block_range: u64,
-    pub deployment_block: u64,
-    pub v2_start_block: u64,
-    pub legacy_shield_block: u64,
+/// Resolved synchronization policy, independent of deployment identity and EVM defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RailgunSyncOptions {
     pub archive_until_block: u64,
-    pub block_time: Duration,
-    pub finality_depth: u64,
+    pub block_range: u64,
+    pub indexed_wallet_block_range: u64,
+    pub poll_interval: Duration,
+    pub quick_sync_endpoint: Option<Url>,
+    pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     pub anchor_interval: u64,
     pub anchor_retention: usize,
 }
 
-impl ChainConfigDefaults {
+impl RailgunSyncOptions {
+    /// Known sync sources and scan policy, with caller-supplied RPC batch size and polling.
     #[must_use]
-    pub fn for_chain(chain_id: u64) -> Option<Self> {
+    pub fn for_chain(chain_id: u64, block_range: u64, poll_interval: Duration) -> Option<Self> {
         match chain_id {
             1 => Some(Self {
-                chain_id,
-                contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
-                relay_adapt_contract: address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405"),
-                relay_adapt_7702_contract: address!("0x05ae73c5925d843864ae6f261f3175de2ebcd963"),
-                multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_urls: default_rpc_urls(&[
-                    "https://ethereum-public.nodies.app",
-                    "https://ethereum-rpc.publicnode.com",
-                    "https://rpc.eth.gateway.fm",
-                    "https://public-eth.nownodes.io",
-                    "https://eth.api.pocket.network",
-                    "https://mainnet.rpc.sentio.xyz",
-                    "https://eth.drpc.org",
-                ])?,
+                block_range,
+                poll_interval,
+                indexed_artifact_source: None,
+                archive_until_block: 15_537_393,
+                indexed_wallet_block_range: 300_000,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql")
                         .ok()?,
                 ),
-                indexed_wallet_block_range: 300_000,
-                deployment_block: 14_737_691,
-                v2_start_block: 16_076_750,
-                legacy_shield_block: 16_790_263,
-                archive_until_block: 15_537_393,
-                block_time: Duration::from_secs(12),
-                finality_depth: 12,
                 anchor_interval: 1000,
                 anchor_retention: 5,
             }),
             56 => Some(Self {
-                chain_id,
-                contract: address!("0x590162bf4b50f6576a459b75309ee21d92178a10"),
-                relay_adapt_contract: address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd"),
-                relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
-                multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_urls: default_rpc_urls(&[
-                    "https://bsc.publicnode.com",
-                    "https://binance-smart-chain-public.nodies.app",
-                    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
-                    "https://bsc.rpc.blxrbdn.com",
-                    "https://bsc.drpc.org",
-                ])?,
+                block_range,
+                poll_interval,
+                indexed_artifact_source: None,
+                archive_until_block: 0,
+                indexed_wallet_block_range: 1_000_000,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql")
                         .ok()?,
                 ),
-                indexed_wallet_block_range: 1_000_000,
-                deployment_block: 17_633_701,
-                v2_start_block: 23_478_204,
-                legacy_shield_block: 26_313_947,
-                archive_until_block: 0,
-                block_time: Duration::from_millis(450),
-                finality_depth: 15,
                 anchor_interval: 1000,
                 anchor_retention: 5,
             }),
             137 => Some(Self {
-                chain_id,
-                contract: address!("0x19b620929f97b7b990801496c3b361ca5def8c71"),
-                relay_adapt_contract: address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd"),
-                relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
-                multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_urls: default_rpc_urls(&[
-                    "https://rpc-mainnet.matic.quiknode.pro",
-                    "https://polygon-public.nodies.app",
-                    "https://polygon-bor-rpc.publicnode.com",
-                    "https://poly.api.pocket.network",
-                    "https://polygon.drpc.org",
-                ])?,
+                block_range,
+                poll_interval,
+                indexed_artifact_source: None,
+                archive_until_block: 0,
+                indexed_wallet_block_range: 1_000_000,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql")
                         .ok()?,
                 ),
-                indexed_wallet_block_range: 1_000_000,
-                deployment_block: 28_083_766,
-                v2_start_block: 36_219_104,
-                legacy_shield_block: 40_143_539,
-                archive_until_block: 0,
-                block_time: Duration::from_secs(1),
-                finality_depth: 256,
                 anchor_interval: 1000,
                 anchor_retention: 5,
             }),
             42161 => Some(Self {
-                chain_id,
-                contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
-                relay_adapt_contract: address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
-                relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
-                multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_urls: default_rpc_urls(&[
-                    "https://arbitrum-one-public.nodies.app",
-                    "https://arb1.arbitrum.io/rpc",
-                    "https://arbitrum-one.public.blastapi.io",
-                    "https://arbitrum-one-rpc.publicnode.com",
-                    "https://api.zan.top/arb-one",
-                    "https://arbitrum.rpc.subquery.network/public",
-                    "https://arb1.lava.build",
-                    "https://arbitrum.gateway.tenderly.co",
-                ])?,
+                block_range,
+                poll_interval,
+                indexed_artifact_source: None,
+                archive_until_block: 0,
+                indexed_wallet_block_range: 5_000_000,
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql")
                         .ok()?,
                 ),
-                indexed_wallet_block_range: 5_000_000,
-                deployment_block: 56_109_834,
-                v2_start_block: 0,
-                legacy_shield_block: 68_196_853,
-                archive_until_block: 0,
-                block_time: Duration::from_millis(250),
-                finality_depth: 64,
                 anchor_interval: 1000,
                 anchor_retention: 5,
             }),
             _ => None,
         }
     }
-}
-
-fn default_rpc_urls(urls: &[&str]) -> Option<Vec<Url>> {
-    urls.iter().map(|url| Url::parse(url).ok()).collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2887,10 +2804,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ChainConfigDefaults, GlobalPoiPolicy, LocalPoiCaches, PoiArtifactCacheFailureKind,
+        GlobalPoiPolicy, LocalPoiCaches, PoiArtifactCacheFailureKind,
         PoiArtifactCacheGraphProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
         PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCorpusRevision, PoiProxyFallback,
-        PublicScanSource, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
+        PublicScanSource, RailgunSyncOptions, SyncProgressStage, SyncProgressUnit,
+        SyncProgressUpdate,
     };
     use alloy::primitives::FixedBytes;
     use poi::SensitiveUrl;
@@ -2974,46 +2892,28 @@ mod tests {
     #[test]
     fn default_indexed_wallet_ranges_are_chain_specific() {
         assert_eq!(
-            ChainConfigDefaults::for_chain(1)
+            RailgunSyncOptions::for_chain(1, 100, std::time::Duration::from_secs(1))
                 .unwrap()
                 .indexed_wallet_block_range,
             300_000
         );
         assert_eq!(
-            ChainConfigDefaults::for_chain(56)
+            RailgunSyncOptions::for_chain(56, 100, std::time::Duration::from_secs(1))
                 .unwrap()
                 .indexed_wallet_block_range,
             1_000_000
         );
         assert_eq!(
-            ChainConfigDefaults::for_chain(137)
+            RailgunSyncOptions::for_chain(137, 100, std::time::Duration::from_secs(1))
                 .unwrap()
                 .indexed_wallet_block_range,
             1_000_000
         );
         assert_eq!(
-            ChainConfigDefaults::for_chain(42161)
+            RailgunSyncOptions::for_chain(42161, 100, std::time::Duration::from_secs(1))
                 .unwrap()
                 .indexed_wallet_block_range,
             5_000_000
-        );
-    }
-
-    #[test]
-    fn default_rpc_urls_include_fallbacks() {
-        assert_eq!(
-            ChainConfigDefaults::for_chain(1).unwrap().rpc_urls[0].as_str(),
-            "https://ethereum-public.nodies.app/"
-        );
-        assert!(ChainConfigDefaults::for_chain(1).unwrap().rpc_urls.len() > 1);
-        assert!(ChainConfigDefaults::for_chain(56).unwrap().rpc_urls.len() > 1);
-        assert!(ChainConfigDefaults::for_chain(137).unwrap().rpc_urls.len() > 1);
-        assert!(
-            ChainConfigDefaults::for_chain(42161)
-                .unwrap()
-                .rpc_urls
-                .len()
-                > 1
         );
     }
 

@@ -1,5 +1,6 @@
 pub mod contracts;
 pub mod crypto;
+pub mod deployment;
 pub mod notes;
 pub mod provider;
 pub mod query_rpc_pool;

@@ -257,8 +257,8 @@ impl SyncManager {
         rpc_http_client: Option<reqwest::Client>,
     ) -> Result<Arc<ChainService>, SyncManagerError> {
         let key = ChainKey {
-            chain_id: cfg.chain_id,
-            contract: cfg.contract,
+            chain_id: cfg.deployment.chain_id,
+            contract: cfg.deployment.contract,
         };
         loop {
             let admission = {
@@ -1209,7 +1209,7 @@ mod tests {
         let contract = Address::from([0x13; 20]);
         let cfg = chain_config_with_rpc(1, contract, stalled.url.clone());
         let key = ChainKey {
-            chain_id: cfg.chain_id,
+            chain_id: cfg.deployment.chain_id,
             contract,
         };
         let start = tokio::spawn({
@@ -1401,8 +1401,8 @@ mod tests {
             .expect("add initial chain");
         manager
             .remove_chain(&ChainKey {
-                chain_id: cfg.chain_id,
-                contract: cfg.contract,
+                chain_id: cfg.deployment.chain_id,
+                contract: cfg.deployment.contract,
             })
             .await;
         let replacement = manager
@@ -1453,27 +1453,33 @@ mod tests {
 
     fn chain_config(chain_id: u64, contract: Address) -> ChainConfig {
         ChainConfig {
-            chain_id,
-            contract,
+            deployment: broadcaster_core::deployment::RailgunDeployment {
+                chain_id,
+                contract,
+                deployment_block: 0,
+                v2_start_block: 0,
+                legacy_shield_block: 0,
+                relay_adapt_contract: Address::ZERO,
+                relay_adapt_7702_contract: Address::ZERO,
+            },
+            sync: crate::RailgunSyncOptions {
+                archive_until_block: 0,
+                block_range: 100,
+                indexed_wallet_block_range: 100,
+                poll_interval: Duration::from_mins(1),
+                quick_sync_endpoint: None,
+                indexed_artifact_source: None,
+                anchor_interval: 1000,
+                anchor_retention: 5,
+            },
             rpcs: Arc::new(QueryRpcPool::new(
                 vec![Url::parse("http://127.0.0.1:1").expect("RPC URL")],
                 Duration::from_millis(1),
             )),
             archive_rpc_url: None,
-            archive_until_block: 0,
-            deployment_block: 0,
-            v2_start_block: 0,
-            legacy_shield_block: 0,
-            block_range: 100,
-            indexed_wallet_block_range: 100,
             block_time: Duration::from_secs(12),
-            poll_interval: Duration::from_mins(1),
             finality_depth: 0,
-            quick_sync_endpoint: None,
-            indexed_artifact_source: None,
-            anchor_interval: 1000,
-            anchor_retention: 5,
-            http_client: None,
+            http_client: reqwest::Client::new(),
             progress_tx: None,
         }
     }

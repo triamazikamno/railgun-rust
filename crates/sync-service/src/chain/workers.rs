@@ -17,7 +17,7 @@ const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_mins(1);
 
 pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
     let cancel = service.cancel.clone();
-    let chain_id = service.chain.chain_id;
+    let chain_id = service.chain.deployment.chain_id;
     tokio::spawn(
         async move {
             loop {
@@ -28,14 +28,14 @@ pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPo
                     warn!("no healthy rpc providers available");
                     tokio::select! {
                         () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.poll_interval) => { continue; }
+                        () = tokio::time::sleep(service.chain.sync.poll_interval) => { continue; }
                     }
                 };
                 match rpc.provider.get_block_number().await {
                     Ok(head) => {
                         let safe_head = head
                             .saturating_sub(service.chain.finality_depth)
-                            .max(service.chain.deployment_block);
+                            .max(service.chain.deployment.deployment_block);
                         if service.head_tx.receiver_count() > 0 {
                             let _ = service.head_tx.send(head);
                         }
@@ -50,7 +50,7 @@ pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPo
                 }
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(service.chain.poll_interval) => {}
+                    () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
                 }
             }
         }
@@ -66,7 +66,7 @@ pub(super) fn spawn_pending_tip_loop(
     mut safe_head_rx: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
-    let chain_id = service.chain.chain_id;
+    let chain_id = service.chain.deployment.chain_id;
     tokio::spawn(
         async move {
             loop {
@@ -85,7 +85,7 @@ pub(super) fn spawn_pending_tip_loop(
                     () = cancel.cancelled() => break,
                     _ = head_rx.changed() => {},
                     _ = safe_head_rx.changed() => {},
-                    () = tokio::time::sleep(service.chain.poll_interval) => {},
+                    () = tokio::time::sleep(service.chain.sync.poll_interval) => {},
                 }
             }
         }
@@ -107,8 +107,11 @@ pub(super) async fn refresh_pending_tip_overlays(
             let handle = registration.handle.clone();
             // One view snapshot: cursor + generation (never authority gen alone).
             let progress = handle.schedulable_progress()?;
-            let from_block =
-                pending_tip_from_block(safe_head, progress.last_scanned, service.chain.block_range);
+            let from_block = pending_tip_from_block(
+                safe_head,
+                progress.last_scanned,
+                service.chain.sync.block_range,
+            );
             let target_block = registration
                 .sync_to_block
                 .map_or(head, |limit| limit.min(head));
@@ -306,7 +309,7 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
     mut safe_head_rx: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
-    let chain_id = service.chain.chain_id;
+    let chain_id = service.chain.deployment.chain_id;
     tokio::spawn(
         async move {
             let mut state: Option<(String, u64, WalletTailFallbackState)> = None;
@@ -518,7 +521,7 @@ pub(super) fn spawn_wallet_lag_fallback_loop(
                             break;
                         }
                     }
-                    () = tokio::time::sleep(service.chain.poll_interval) => {}
+                    () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
                 }
             }
         }
@@ -626,14 +629,14 @@ pub(super) const fn pending_tip_provider_covers_target(
 }
 
 pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: CancellationToken) {
-    let endpoint = service.chain.quick_sync_endpoint.clone();
-    let indexed_artifact_source = service.chain.indexed_artifact_source.clone();
+    let endpoint = service.chain.sync.quick_sync_endpoint.clone();
+    let indexed_artifact_source = service.chain.sync.indexed_artifact_source.clone();
     if endpoint.is_none() && indexed_artifact_source.is_none() {
         return;
     }
-    let chain_id = service.chain.chain_id;
-    let railgun_contract = service.chain.contract;
-    let http_client = service.chain.http_client.clone();
+    let chain_id = service.chain.deployment.chain_id;
+    let railgun_contract = service.chain.deployment.contract;
+    let http_client = Some(service.chain.http_client.clone());
     let db = service.db.clone();
     tokio::spawn(
         async move {
@@ -687,10 +690,10 @@ pub(super) fn spawn_live_log_loop(
                 }
 
                 let safe_head = *safe_head_rx.borrow();
-                if safe_head == 0 && service.chain.deployment_block > 0 {
+                if safe_head == 0 && service.chain.deployment.deployment_block > 0 {
                     tokio::select! {
                         () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.poll_interval) => {}
+                        () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
                     }
                     continue;
                 }
@@ -698,7 +701,7 @@ pub(super) fn spawn_live_log_loop(
                 if last_processed >= safe_head {
                     tokio::select! {
                         () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.poll_interval) => {}
+                        () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
                     }
                     continue;
                 }
@@ -706,7 +709,7 @@ pub(super) fn spawn_live_log_loop(
                     warn!("no healthy rpc providers available");
                     tokio::select! {
                         () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.poll_interval) => {}
+                        () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
                     }
                     continue;
                 };
@@ -733,7 +736,7 @@ pub(super) fn spawn_live_log_loop(
                 }
 
                 let from_block = last_processed.saturating_add(1);
-                let to_block = min(from_block + service.chain.block_range - 1, safe_head);
+                let to_block = min(from_block + service.chain.sync.block_range - 1, safe_head);
                 let read_scope = service.begin_public_scan_read();
                 let logs_result = tokio::select! {
                     () = cancel.cancelled() => break,
@@ -1040,8 +1043,10 @@ pub(super) fn spawn_backfill_loop(
                 } else if let Some(slot) = cursor.as_mut() {
                     slot.cursor.retry_after_rejected_finish(committed_to);
                     if persistence_failed {
-                        slot.cursor
-                            .defer_persistence_retry(Instant::now(), service.chain.poll_interval);
+                        slot.cursor.defer_persistence_retry(
+                            Instant::now(),
+                            service.chain.sync.poll_interval,
+                        );
                     }
                 }
             }
@@ -1168,7 +1173,10 @@ pub(super) fn spawn_backfill_loop(
                 }
                 continue;
             }
-            let requested_to_block = min(from_block + service.chain.block_range - 1, target_block);
+            let requested_to_block = min(
+                from_block + service.chain.sync.block_range - 1,
+                target_block,
+            );
             let cached_suffix_from = service
                 .public_data_plane
                 .cached_wallet_scan_suffix(from_block, target_block)
@@ -1191,7 +1199,7 @@ pub(super) fn spawn_backfill_loop(
                 warn!("no healthy rpc providers available");
                 let _ = await_wallet_cancellation(
                     &cancellation,
-                    tokio::time::sleep(service.chain.poll_interval),
+                    tokio::time::sleep(service.chain.sync.poll_interval),
                 )
                 .await;
                 continue;
@@ -1245,7 +1253,7 @@ pub(super) fn spawn_backfill_loop(
                             } else {
                                 let _ = await_wallet_cancellation(
                                     &cancellation,
-                                    tokio::time::sleep(service.chain.poll_interval),
+                                    tokio::time::sleep(service.chain.sync.poll_interval),
                                 )
                                 .await;
                             }
@@ -1298,7 +1306,7 @@ pub(super) fn spawn_backfill_loop(
                                 } else {
                                     let _ = await_wallet_cancellation(
                                         &cancellation,
-                                        tokio::time::sleep(service.chain.poll_interval),
+                                        tokio::time::sleep(service.chain.sync.poll_interval),
                                     )
                                     .await;
                                 }
@@ -1337,7 +1345,7 @@ pub(super) fn spawn_backfill_loop(
                             } else {
                                 let _ = await_wallet_cancellation(
                                     &cancellation,
-                                    tokio::time::sleep(service.chain.poll_interval),
+                                    tokio::time::sleep(service.chain.sync.poll_interval),
                                 )
                                 .await;
                             }
@@ -1536,7 +1544,7 @@ pub(super) fn spawn_backfill_loop(
                                         cursor.retry_after_rejected_apply(committed_to);
                                         cursor.defer_persistence_retry(
                                             Instant::now(),
-                                            service.chain.poll_interval,
+                                            service.chain.sync.poll_interval,
                                         );
                                     }
                                     WalletBackfillApplyResult::Rejected {
@@ -1578,7 +1586,7 @@ pub(super) fn spawn_backfill_loop(
                     } else {
                         let _ = await_wallet_cancellation(
                             &cancellation,
-                            tokio::time::sleep(service.chain.poll_interval),
+                            tokio::time::sleep(service.chain.sync.poll_interval),
                         )
                         .await;
                     }
@@ -1697,7 +1705,10 @@ async fn apply_cached_backfill_row(
                         reason: WalletBackfillRejectReason::PersistenceFailed,
                     } => {
                         cursor.retry_after_rejected_apply(committed_to);
-                        cursor.defer_persistence_retry(Instant::now(), service.chain.poll_interval);
+                        cursor.defer_persistence_retry(
+                            Instant::now(),
+                            service.chain.sync.poll_interval,
+                        );
                     }
                     WalletBackfillApplyResult::Rejected {
                         reason:
