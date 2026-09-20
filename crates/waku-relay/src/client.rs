@@ -6,8 +6,9 @@ use lru::LruCache;
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use waku::proto::{HashKey, WakuMessage};
 use waku::{
     DEFAULT_CLEARNET_DOH_ENDPOINT, DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions,
@@ -19,6 +20,7 @@ pub const DEFAULT_SHARD_ID: u32 = 1;
 const FEE_HISTORY_LOOKBACK: Duration = Duration::from_mins(2);
 const FEE_HISTORY_PAGE_LIMIT: u64 = 500;
 const DEFAULT_NWAKU_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKUP_PEER_DELAY: Duration = Duration::from_mins(1);
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
     Some(n) => n,
     None => panic!("cache size must be non-zero"),
@@ -29,6 +31,7 @@ pub struct ClientConfig {
     pub nwaku_url: Option<String>,
     pub shard_id: Option<u32>,
     pub direct_peers: Vec<AdditionalPeer>,
+    pub backup_peers: Vec<AdditionalPeer>,
     pub dns_enr_trees: Option<Vec<String>>,
     pub doh_endpoint: Option<String>,
     pub doh_fallback_endpoints: Option<Vec<String>>,
@@ -155,18 +158,77 @@ fn nwaku_request(request: reqwest::RequestBuilder, timeout: Duration) -> reqwest
     request.timeout(timeout)
 }
 
+fn parse_peers(peers: &[AdditionalPeer]) -> Result<Vec<DiscoveredPeer>, ClientError> {
+    peers
+        .iter()
+        .map(|peer| {
+            Ok(DiscoveredPeer {
+                peer_id: parse_peer_id(&peer.peer_id).map_err(|_| ClientError::ParsePeerId)?,
+                addrs: peer
+                    .addrs
+                    .iter()
+                    .map(|addr| parse_multiaddr(addr).map_err(|_| ClientError::ParseMultiaddr))
+                    .collect::<Result<Vec<_>, ClientError>>()?,
+            })
+        })
+        .collect()
+}
+
+fn backup_peers_due(
+    disconnected_since: &mut Option<Instant>,
+    now: Instant,
+    connected: bool,
+) -> bool {
+    if connected {
+        *disconnected_since = None;
+        return false;
+    }
+    now.duration_since(*disconnected_since.get_or_insert(now)) >= BACKUP_PEER_DELAY
+}
+
+async fn observe_backup_peers(node: Arc<WakuNode>, peers: Vec<DiscoveredPeer>) {
+    let mut disconnected_since = None;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        if node.is_shutdown() {
+            return;
+        }
+        if backup_peers_due(
+            &mut disconnected_since,
+            Instant::now(),
+            !node.connected_peers().is_empty(),
+        ) {
+            // A connection observed at the deadline starts a fresh grace period.
+            if !node.connected_peers().is_empty() {
+                disconnected_since = None;
+                continue;
+            }
+            if !node.is_shutdown() {
+                node.add_additional_peers(peers);
+            }
+            return;
+        }
+    }
+}
+
 pub struct Client {
     http_client: reqwest::Client,
     nwaku_request_timeout: Duration,
     nwaku_url: Option<String>,
     pubsub_path: String,
     waku_fleet: Option<Arc<WakuNode>>,
+    backup_peer_task: Option<JoinHandle<()>>,
     network_mode: RelayNetworkMode,
     disabled_reason: Option<Arc<str>>,
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
+        if let Some(task) = self.backup_peer_task.as_ref() {
+            task.abort();
+        }
         if let Some(waku_fleet) = self.waku_fleet.as_ref() {
             waku_fleet.shutdown();
         }
@@ -192,6 +254,7 @@ impl Client {
         let http_client = http_client.unwrap_or_default();
         let disabled_reason = (mode == RelayNetworkMode::Proxy)
             .then(|| Arc::<str>::from("proxy mode does not support Waku libp2p transports"));
+        let mut backup_peer_task = None;
         let waku = if let Some(reason) = disabled_reason.as_ref() {
             tracing::warn!(%reason, "Waku disabled by network policy");
             None
@@ -205,25 +268,16 @@ impl Client {
                 config.network =
                     WakuNetworkConfig::tor_with_client_provider(tor_client, http_client.clone());
             }
+            let direct_peers = parse_peers(&cfg.direct_peers)?;
+            let backup_peers = parse_peers(&cfg.backup_peers)?;
             let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
-            waku.add_additional_peers(
-                cfg.direct_peers
-                    .iter()
-                    .map(|peer| {
-                        Ok(DiscoveredPeer {
-                            peer_id: parse_peer_id(&peer.peer_id)
-                                .map_err(|_| ClientError::ParsePeerId)?,
-                            addrs: peer
-                                .addrs
-                                .iter()
-                                .map(|addr| {
-                                    parse_multiaddr(addr).map_err(|_| ClientError::ParseMultiaddr)
-                                })
-                                .collect::<Result<Vec<_>, ClientError>>()?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, ClientError>>()?,
-            );
+            waku.add_additional_peers(direct_peers);
+            if !backup_peers.is_empty() {
+                backup_peer_task = Some(tokio::spawn(observe_backup_peers(
+                    Arc::clone(&waku),
+                    backup_peers,
+                )));
+            }
             Some(waku)
         };
         Ok(Self {
@@ -232,6 +286,7 @@ impl Client {
             nwaku_url: cfg.nwaku_url.clone(),
             pubsub_path: relay_shard_pubsub_path(cluster_id, shard_id),
             waku_fleet: waku,
+            backup_peer_task,
             network_mode: mode,
             disabled_reason,
         })
@@ -751,7 +806,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc as std_mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
     use waku::proto::WakuMessage;
     use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
@@ -812,6 +867,7 @@ mod tests {
             nwaku_url: None,
             shard_id: Some(3),
             direct_peers: Vec::new(),
+            backup_peers: Vec::new(),
             dns_enr_trees: Some(vec!["enrtree://example".to_string()]),
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
             doh_fallback_endpoints: Some(vec![
@@ -845,6 +901,7 @@ mod tests {
             nwaku_url: None,
             shard_id: None,
             direct_peers: Vec::new(),
+            backup_peers: Vec::new(),
             dns_enr_trees: None,
             doh_endpoint: None,
             doh_fallback_endpoints: None,
@@ -885,25 +942,93 @@ mod tests {
 
     #[tokio::test]
     async fn client_drop_shuts_down_embedded_waku_node() {
-        let cfg = ClientConfig {
-            nwaku_url: None,
-            shard_id: None,
-            direct_peers: Vec::new(),
-            dns_enr_trees: Some(Vec::new()),
-            doh_endpoint: None,
-            doh_fallback_endpoints: None,
-            cluster_id: None,
-            max_peers: None,
-            peer_connection_timeout: None,
+        let direct = super::AdditionalPeer {
+            peer_id: "12D3KooWPZAXp2aXSq7hh5iy8pxziTv1bxU8cg4pc4YEgkFiiixv".to_string(),
+            addrs: vec!["/ip4/127.0.0.1/tcp/1".to_string()],
         };
-        let client = Client::new(&cfg).expect("client starts");
-        let node = Arc::clone(client.waku_fleet.as_ref().expect("Waku node enabled"));
-        assert!(!node.is_shutdown());
+        let backup = super::AdditionalPeer {
+            peer_id: "12D3KooWPZAXp2aXSq7hh5iy8pxziTv1bxU8cg4pc4YEgkFiiixw".to_string(),
+            addrs: vec!["/ip4/127.0.0.1/tcp/2".to_string()],
+        };
+        for backup_peers in [Vec::new(), vec![backup]] {
+            let cfg = ClientConfig {
+                direct_peers: vec![direct.clone()],
+                backup_peers,
+                dns_enr_trees: Some(Vec::new()),
+                max_peers: Some(0),
+                ..Default::default()
+            };
+            let client = Client::new(&cfg).expect("client starts");
+            let node = Arc::clone(client.waku_fleet.as_ref().expect("Waku node enabled"));
+            tokio::task::yield_now().await;
+            assert!(!node.is_shutdown());
+            let peers = node.peer_snapshots();
+            assert_eq!(
+                peers.len(),
+                1,
+                "only immediate peers enter the initial pool"
+            );
+            assert_eq!(peers[0].peer_id.to_string(), direct.peer_id);
+            let observer = client
+                .backup_peer_task
+                .as_ref()
+                .map(tokio::task::JoinHandle::abort_handle);
+            assert_eq!(observer.is_none(), cfg.backup_peers.is_empty());
 
-        drop(client);
+            drop(client);
 
-        assert!(node.is_shutdown());
-        tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(node.is_shutdown());
+            if let Some(observer) = observer {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !observer.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("client drop must retire backup observation");
+            }
+            assert_eq!(node.peer_snapshots().len(), 1);
+        }
+    }
+
+    #[test]
+    fn backup_delay_restarts_after_an_observed_connection() {
+        let start = Instant::now();
+        let mut since = None;
+        for seconds in [0, 1, 30, 59] {
+            assert!(!super::backup_peers_due(
+                &mut since,
+                start + Duration::from_secs(seconds),
+                false
+            ));
+        }
+        assert!(super::backup_peers_due(
+            &mut since,
+            start + Duration::from_mins(1),
+            false
+        ));
+        assert!(!super::backup_peers_due(
+            &mut since,
+            start + Duration::from_secs(61),
+            true
+        ));
+        assert!(!super::backup_peers_due(
+            &mut since,
+            start + Duration::from_mins(2),
+            true
+        ));
+        for seconds in [121, 150, 180] {
+            assert!(!super::backup_peers_due(
+                &mut since,
+                start + Duration::from_secs(seconds),
+                false
+            ));
+        }
+        assert!(super::backup_peers_due(
+            &mut since,
+            start + Duration::from_secs(181),
+            false
+        ));
     }
 
     #[tokio::test]
@@ -924,6 +1049,7 @@ mod tests {
             nwaku_url: Some(format!("http://{address}/private-endpoint-token")),
             pubsub_path: relay_shard_pubsub_path(DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID),
             waku_fleet: None,
+            backup_peer_task: None,
             network_mode: super::RelayNetworkMode::Direct,
             disabled_reason: None,
         };
