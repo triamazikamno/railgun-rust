@@ -1,11 +1,11 @@
 use super::service::send_wallet_reset;
 use super::{
-    BlockNumberOrTag, ChainConfig, ChainError, ChainService, DbStore, DynProvider, FixedBytes,
-    ForestReorgDecision, HashMap, HashSet, Instant, Log, MerkleForest, MerkleForestDbExt,
-    MerkleForestSnapshot, Ordering, Path, PersistError, Provider, SNAPSHOT_VERSION, SharedLogBatch,
-    WalletBackfillDriver, WalletResetReplayPlan, anchor_file_name, debug,
-    fetch_logs_for_range_with_provider, info, parse_anchor_block, wallet_reorg_backfill_from_block,
-    wallet_sync_target, warn,
+    BlockNumberOrTag, CancellationToken, ChainConfig, ChainError, ChainService, DbStore,
+    DynProvider, FixedBytes, ForestReorgDecision, HashMap, HashSet, Instant, Log, LogRangeFetch,
+    LogSpanEndpoint, MerkleForest, MerkleForestDbExt, MerkleForestSnapshot, Ordering, Path,
+    PersistError, Provider, ProviderHandle, SNAPSHOT_VERSION, SharedLogBatch, WalletBackfillDriver,
+    WalletResetReplayPlan, anchor_file_name, debug, fetch_logs_for_range_with_provider, info,
+    parse_anchor_block, wallet_reorg_backfill_from_block, wallet_sync_target, warn,
 };
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ pub(super) struct WalletBackfill {
     acquisition_range: Option<(u64, u64)>,
     retained_acquisition_range: Option<(u64, u64)>,
     retained_acquisition_restoration_used: bool,
+    startup_warm_range: Option<(u64, u64)>,
     pub(super) driver: WalletBackfillDriver,
     pub(super) last_advanced_at: Instant,
     pub(super) last_indexed_tail_attempt_at: Option<Instant>,
@@ -105,6 +106,7 @@ impl WalletBackfill {
             acquisition_range,
             retained_acquisition_range: None,
             retained_acquisition_restoration_used: false,
+            startup_warm_range: None,
             driver,
             last_advanced_at: now,
             last_indexed_tail_attempt_at: None,
@@ -125,6 +127,21 @@ impl WalletBackfill {
 
     pub(super) const fn acquisition_range(&self) -> Option<(u64, u64)> {
         self.acquisition_range
+    }
+
+    #[must_use]
+    pub(super) const fn with_startup_warm_range(
+        mut self,
+        startup_warm_range: Option<(u64, u64)>,
+    ) -> Self {
+        self.startup_warm_range = startup_warm_range;
+        self
+    }
+
+    /// Hands out the startup warm range once, when the cursor is about to
+    /// finish after delivering its target.
+    pub(super) const fn take_startup_warm_range(&mut self) -> Option<(u64, u64)> {
+        self.startup_warm_range.take()
     }
 
     pub(super) const fn retained_acquisition_range(&self) -> Option<(u64, u64)> {
@@ -624,6 +641,20 @@ impl ChainConfig {
         }
     }
 
+    /// Returns the archive provider that serves reads at or below
+    /// `archive_until_block`, or `None` when no archive endpoint is configured
+    /// and the regular provider serves them. A configured archive endpoint the
+    /// pool has not admitted fails the read without contacting any endpoint.
+    fn admitted_archive_provider<'a>(
+        &self,
+        archive_provider: Option<&'a DynProvider>,
+    ) -> Result<Option<&'a DynProvider>, ChainError> {
+        match archive_provider {
+            Some(_) if !self.rpcs.archive_admitted() => Err(ChainError::ArchiveRpcUnverified),
+            archive_provider => Ok(archive_provider),
+        }
+    }
+
     pub(super) async fn fetch_confirmed_block_hash(
         &self,
         provider: &DynProvider,
@@ -669,7 +700,8 @@ impl ChainConfig {
     ) -> Result<Option<[u8; 32]>, ChainError> {
         let provider =
             if self.sync.archive_until_block > 0 && block_number <= self.sync.archive_until_block {
-                archive_provider.unwrap_or(provider)
+                self.admitted_archive_provider(archive_provider)?
+                    .unwrap_or(provider)
             } else {
                 provider
             };
@@ -687,7 +719,8 @@ impl ChainConfig {
     ) -> Result<Option<u64>, ChainError> {
         let provider =
             if self.sync.archive_until_block > 0 && block_number <= self.sync.archive_until_block {
-                archive_provider.unwrap_or(provider)
+                self.admitted_archive_provider(archive_provider)?
+                    .unwrap_or(provider)
             } else {
                 provider
             };
@@ -697,21 +730,33 @@ impl ChainConfig {
         Ok(block.map(|block| block.header.timestamp))
     }
 
+    /// Maps each log block to its timestamp, preferring timestamps supplied
+    /// with the logs and requesting headers only for blocks without one.
     pub(super) async fn fetch_log_block_timestamps(
         &self,
         provider: &DynProvider,
         archive_provider: Option<&DynProvider>,
         logs: &[Log],
     ) -> Result<HashMap<u64, u64>, ChainError> {
-        let mut block_numbers = logs
+        let started = Instant::now();
+        let mut timestamps = HashMap::new();
+        for log in logs {
+            if let (Some(block_number), Some(timestamp)) = (log.block_number, log.block_timestamp) {
+                timestamps.entry(block_number).or_insert(timestamp);
+            }
+        }
+        let blocks_from_logs = timestamps.len();
+
+        let mut missing_blocks = logs
             .iter()
             .filter_map(|log| log.block_number)
+            .filter(|block_number| !timestamps.contains_key(block_number))
             .collect::<Vec<_>>();
-        block_numbers.sort_unstable();
-        block_numbers.dedup();
+        missing_blocks.sort_unstable();
+        missing_blocks.dedup();
+        let headers_requested = missing_blocks.len();
 
-        let mut timestamps = HashMap::with_capacity(block_numbers.len());
-        for block_number in block_numbers {
+        for block_number in missing_blocks {
             if let Some(timestamp) = self
                 .fetch_block_timestamp(provider, archive_provider, block_number)
                 .await?
@@ -719,24 +764,76 @@ impl ChainConfig {
                 timestamps.insert(block_number, timestamp);
             }
         }
+        debug!(
+            logs = logs.len(),
+            blocks_from_logs,
+            headers_requested,
+            elapsed_ms = started.elapsed().as_millis(),
+            "log block timestamp coverage"
+        );
         Ok(timestamps)
     }
 
+    /// Fetches the logical range `from_block..=to_block` from `rpc`, and from
+    /// the archive provider for blocks at or below `archive_until_block`.
+    ///
+    /// Physical `eth_getLogs` requests adapt to each endpoint's range limits;
+    /// the returned log set is that of the whole logical range.
     pub(super) async fn fetch_logs_for_range(
         &self,
-        provider: &DynProvider,
+        rpc: &ProviderHandle,
         archive_provider: Option<&DynProvider>,
         from_block: u64,
         to_block: u64,
+        cancel: &CancellationToken,
     ) -> Result<Vec<Log>, ChainError> {
+        let started = Instant::now();
+        let mut fetch = LogRangeFetch {
+            spans: self.rpcs.as_ref(),
+            max_span: self.sync.block_range,
+            cancel,
+            logical_from: from_block,
+            logical_to: to_block,
+            get_logs_requests: 0,
+        };
+        let result = self
+            .fetch_logs_for_logical_range(&mut fetch, rpc, archive_provider)
+            .await;
+        debug!(
+            from_block,
+            to_block,
+            rpc_index = rpc.index,
+            get_logs_requests = fetch.get_logs_requests,
+            logs = result.as_ref().map_or(0, Vec::len),
+            ok = result.is_ok(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "logical log range fetch finished"
+        );
+        result
+    }
+
+    async fn fetch_logs_for_logical_range(
+        &self,
+        fetch: &mut LogRangeFetch<'_>,
+        rpc: &ProviderHandle,
+        archive_provider: Option<&DynProvider>,
+    ) -> Result<Vec<Log>, ChainError> {
+        let (from_block, to_block) = (fetch.logical_from, fetch.logical_to);
+        let rpc_endpoint = LogSpanEndpoint::Provider(rpc.index);
         let mut logs = Vec::new();
         let archive_until_block = self.sync.archive_until_block;
 
         if archive_until_block > 0 && from_block <= archive_until_block {
             let archive_end = to_block.min(archive_until_block);
-            let archive_provider = archive_provider.unwrap_or(provider);
+            let (archive_provider, archive_endpoint) = self
+                .admitted_archive_provider(archive_provider)?
+                .map_or((&rpc.provider, rpc_endpoint), |provider| {
+                    (provider, LogSpanEndpoint::Archive)
+                });
             let archive_logs = fetch_logs_for_range_with_provider(
+                fetch,
                 archive_provider,
+                archive_endpoint,
                 self.deployment.contract,
                 from_block,
                 archive_end,
@@ -754,7 +851,9 @@ impl ChainConfig {
                 from_block
             };
             let standard_logs = fetch_logs_for_range_with_provider(
-                provider,
+                fetch,
+                &rpc.provider,
+                rpc_endpoint,
                 self.deployment.contract,
                 standard_start,
                 to_block,
@@ -773,7 +872,8 @@ impl ChainConfig {
 mod tests {
     use super::*;
 
-    use super::super::{Address, Arc, QueryRpcPool, build_provider_with_http_client};
+    use super::super::{Address, Arc, QueryRpcPool};
+    use broadcaster_core::query_rpc_pool::RpcAdmission;
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -791,22 +891,85 @@ mod tests {
     #[tokio::test]
     async fn archive_range_log_fetch_uses_regular_rpc_when_archive_provider_missing() {
         let mock = spawn_json_rpc_server(1);
-        let provider = build_provider_with_http_client(&mock.url, None)
-            .await
-            .expect("provider");
         let mut chain = chain_config(mock.url.clone());
         chain.deployment.deployment_block = 100;
         chain.sync.archive_until_block = 150;
         chain.deployment.v2_start_block = 200;
         chain.deployment.legacy_shield_block = 250;
 
+        let rpc = chain.rpcs.random_provider().expect("rpc provider");
+
         let logs = chain
-            .fetch_logs_for_range(&provider, None, 100, 120)
+            .fetch_logs_for_range(&rpc, None, 100, 120, &CancellationToken::new())
             .await
             .expect("regular RPC should be used for archive range");
 
         assert!(logs.is_empty());
         assert_eq!(mock.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn archive_range_reads_wait_for_archive_admission_without_fallback() {
+        let regular = spawn_json_rpc_server(1);
+        let archive_mock = spawn_json_rpc_server(3);
+        let mut chain = chain_config(regular.url.clone());
+        chain.rpcs = Arc::new(
+            QueryRpcPool::new(vec![regular.url.clone()], Duration::from_secs(1))
+                .with_pending_archive(),
+        );
+        chain.deployment.deployment_block = 100;
+        chain.sync.archive_until_block = 150;
+        chain.deployment.v2_start_block = 200;
+        chain.deployment.legacy_shield_block = 250;
+
+        let rpc = chain.rpcs.random_provider().expect("rpc provider");
+        let archive = broadcaster_core::provider::build_provider(&archive_mock.url)
+            .await
+            .expect("archive provider");
+        let cancel = CancellationToken::new();
+
+        let logs = chain
+            .fetch_logs_for_range(&rpc, Some(&archive), 100, 120, &cancel)
+            .await;
+        assert!(
+            matches!(logs, Err(ChainError::ArchiveRpcUnverified)),
+            "{logs:?}"
+        );
+        let hash = chain
+            .fetch_block_hash(&rpc.provider, Some(&archive), 120)
+            .await;
+        assert!(
+            matches!(hash, Err(ChainError::ArchiveRpcUnverified)),
+            "{hash:?}"
+        );
+        let timestamp = chain
+            .fetch_block_timestamp(&rpc.provider, Some(&archive), 120)
+            .await;
+        assert!(
+            matches!(timestamp, Err(ChainError::ArchiveRpcUnverified)),
+            "{timestamp:?}"
+        );
+        assert_eq!(archive_mock.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(regular.requests.load(Ordering::SeqCst), 0);
+
+        chain.rpcs.set_archive_admission(RpcAdmission::Admitted);
+        let logs = chain
+            .fetch_logs_for_range(&rpc, Some(&archive), 100, 120, &cancel)
+            .await
+            .expect("admitted archive serves archive-range logs");
+        assert!(logs.is_empty());
+        let hash = chain
+            .fetch_block_hash(&rpc.provider, Some(&archive), 120)
+            .await
+            .expect("admitted archive serves archive-range block hash");
+        assert_eq!(hash, None);
+        let timestamp = chain
+            .fetch_block_timestamp(&rpc.provider, Some(&archive), 120)
+            .await
+            .expect("admitted archive serves archive-range block timestamp");
+        assert_eq!(timestamp, None);
+        assert_eq!(archive_mock.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(regular.requests.load(Ordering::SeqCst), 0);
     }
 
     fn chain_config(rpc_url: Url) -> ChainConfig {
@@ -859,14 +1022,25 @@ mod tests {
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 let body_start = request.find("\r\n\r\n").map_or(read, |index| index + 4);
                 let request_body = &request[body_start..];
-                let id = serde_json::from_str::<serde_json::Value>(request_body)
-                    .ok()
+                let parsed = serde_json::from_str::<serde_json::Value>(request_body).ok();
+                let id = parsed
+                    .as_ref()
                     .and_then(|value| value.get("id").cloned())
                     .unwrap_or_else(|| json!(1));
+                let method = parsed
+                    .as_ref()
+                    .and_then(|value| value.get("method"))
+                    .and_then(serde_json::Value::as_str);
+                // An unknown block reads as `null`; every other call gets no logs.
+                let result = if method == Some("eth_getBlockByNumber") {
+                    serde_json::Value::Null
+                } else {
+                    json!([])
+                };
                 let body = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": [],
+                    "result": result,
                 })
                 .to_string();
                 let response = format!(

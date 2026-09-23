@@ -1,15 +1,16 @@
 use super::{
-    Arc, BackfillEvent, BackfillRequest, CancellationToken, ChainService, DEFAULT_TXID_VERSION,
-    Duration, DynProvider, EVM_CHAIN_TYPE, HashMap, Instant, Instrument, JoinHandle, LogBatch,
-    PathBuf, PendingTipWalletRegistration, Provider, PublicDataPlaneDiagnosticKind,
-    PublicScanRange, PublicScanSource, QueryRpcPool, TXID_PUBLIC_CACHE_SYNC_INTERVAL,
-    TxidPublicCache, TxidPublicCacheKey, WalletBackfill, WalletBackfillApplyResult,
-    WalletBackfillDriver, WalletBackfillFinishResult, WalletBackfillRejectReason,
-    WalletBackfillStartResult, WalletHandle, WalletReadinessError, WalletScanAcquisitionCandidate,
-    WalletScanAcquisitionOutcome, WalletScanApply, WalletScanInputRows, WalletScanRows,
-    WalletScanRowsPayload, WalletTailFallbackState, await_wallet_cancellation, debug, info, min,
-    mpsc, sort_logs, wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_sync_target,
-    warn, watch,
+    Arc, BackfillEvent, BackfillRequest, CancellationToken, ChainError, ChainService,
+    DEFAULT_TXID_VERSION, Duration, DynProvider, EVM_CHAIN_TYPE, HashMap, Instant, Instrument,
+    JoinHandle, LogBatch, Path, PathBuf, PendingTipWalletRegistration, Provider, ProviderHandle,
+    PublicDataPlaneDiagnosticKind, PublicScanRange, PublicScanSource, QueryRpcPool,
+    TXID_PUBLIC_CACHE_SYNC_INTERVAL, TxidPublicCache, TxidPublicCacheKey, WalletBackfill,
+    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    WalletBackfillRejectReason, WalletBackfillStartResult, WalletHandle, WalletReadinessError,
+    WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome, WalletScanApply,
+    WalletScanInputRows, WalletScanRows, WalletScanRowsPayload, WalletTailFallbackState,
+    await_wallet_cancellation, debug, info, min, mpsc, run_squid_forest_catch_up, sort_logs,
+    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_sync_target,
+    wallet_tail_fallback_stale_timeout, warn, watch,
 };
 
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
@@ -78,6 +79,7 @@ pub(super) fn spawn_pending_tip_loop(
                     archive_provider.as_ref(),
                     safe_head,
                     head,
+                    &cancel,
                 )
                 .await;
 
@@ -99,6 +101,7 @@ pub(super) async fn refresh_pending_tip_overlays(
     archive_provider: Option<&DynProvider>,
     safe_head: u64,
     head: u64,
+    cancel: &CancellationToken,
 ) {
     let registration = {
         let wallet = service.wallet.read().await;
@@ -147,8 +150,8 @@ pub(super) async fn refresh_pending_tip_overlays(
         Ok(provider_head) => provider_head,
         Err(err) => {
             warn!(
-                ?err,
-                rpc = rpc.url.as_str(),
+                err = %ChainError::from(err).without_url(),
+                rpc_index = rpc.index,
                 "failed to fetch pending wallet tip provider head"
             );
             rpcs.mark_bad_provider(&rpc);
@@ -157,7 +160,7 @@ pub(super) async fn refresh_pending_tip_overlays(
     };
     if !pending_tip_provider_covers_target(provider_head, fetch_to_block) {
         debug!(
-            rpc = rpc.url.as_str(),
+            rpc_index = rpc.index,
             provider_head,
             fetch_to_block,
             "pending wallet tip provider is behind; preserving existing overlay"
@@ -168,18 +171,20 @@ pub(super) async fn refresh_pending_tip_overlays(
     let from_block = registration.from_block;
     let mut logs = match service
         .chain
-        .fetch_logs_for_range(&rpc.provider, archive_provider, from_block, fetch_to_block)
+        .fetch_logs_for_range(&rpc, archive_provider, from_block, fetch_to_block, cancel)
         .await
     {
         Ok(logs) => logs,
         Err(err) => {
+            let mark_unhealthy =
+                err.should_mark_rpc_unhealthy() && !err.is_block_range_beyond_current_head();
             warn!(
-                ?err,
+                err = %err.without_url(),
                 from_block,
                 to_block = fetch_to_block,
                 "failed to fetch pending wallet tip logs"
             );
-            if err.should_mark_rpc_unhealthy() && !err.is_block_range_beyond_current_head() {
+            if mark_unhealthy {
                 rpcs.mark_bad_provider(&rpc);
             }
             return;
@@ -194,13 +199,14 @@ pub(super) async fn refresh_pending_tip_overlays(
     {
         Ok(block_timestamps) => block_timestamps,
         Err(err) => {
+            let mark_unhealthy = err.should_mark_rpc_unhealthy();
             warn!(
-                ?err,
+                err = %err.without_url(),
                 from_block,
                 to_block = fetch_to_block,
                 "failed to fetch pending wallet tip timestamps"
             );
-            if err.should_mark_rpc_unhealthy() {
+            if mark_unhealthy {
                 rpcs.mark_bad_provider(&rpc);
             }
             return;
@@ -682,11 +688,26 @@ pub(super) fn spawn_live_log_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(
         async move {
+            let squid_configured = service.chain.sync.quick_sync_endpoint.is_some();
+            let mut stall = ForestStallTracker::new(wallet_tail_fallback_stale_timeout(
+                service.chain.block_time,
+            ));
             loop {
+                stall.observe(
+                    *forest_last_rx.borrow(),
+                    *safe_head_rx.borrow(),
+                    tokio::time::Instant::now(),
+                );
+                let squid_deadline = if squid_configured {
+                    stall.deadline()
+                } else {
+                    None
+                };
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     _ = safe_head_rx.changed() => {},
                     _ = forest_last_rx.changed() => {},
+                    () = sleep_until_stall_deadline(squid_deadline) => {},
                 }
 
                 let safe_head = *safe_head_rx.borrow();
@@ -698,6 +719,8 @@ pub(super) fn spawn_live_log_loop(
                     continue;
                 }
                 let last_processed = *forest_last_rx.borrow();
+                let now = tokio::time::Instant::now();
+                stall.observe(last_processed, safe_head, now);
                 if last_processed >= safe_head {
                     tokio::select! {
                         () = cancel.cancelled() => break,
@@ -705,7 +728,62 @@ pub(super) fn spawn_live_log_loop(
                     }
                     continue;
                 }
-                let Some(rpc) = rpcs.random_provider() else {
+                // The reorg check runs before the stall fallback so a Squid
+                // catch-up never builds on a forest block that has reorged.
+                let rpc = rpcs.random_provider();
+                if let Some(rpc) = rpc.as_ref() {
+                    let reorg_check = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = service.check_forest_reorg(
+                            &rpc.provider,
+                            archive_provider.as_ref(),
+                            rpc.url.as_str(),
+                            &snapshot_path,
+                            safe_head,
+                            last_processed,
+                        ) => result,
+                    };
+                    if let Err(err) = reorg_check {
+                        debug!(err = %err.without_url(), rpc_index = rpc.index, "reorg check failed");
+                    }
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                }
+                let last_processed = *forest_last_rx.borrow();
+                if last_processed >= safe_head {
+                    continue;
+                }
+                if squid_configured && stall.is_due(now) {
+                    let stalled_ms = stall.stalled_for(now).as_millis();
+                    let installed = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        installed = run_live_squid_forest_fallback(
+                            &service,
+                            rpc.as_ref(),
+                            archive_provider.as_ref(),
+                            &snapshot_path,
+                            last_processed,
+                            safe_head,
+                        ) => installed,
+                    };
+                    let outcome = if installed.is_some() {
+                        "applied"
+                    } else {
+                        stall.defer_next_attempt(tokio::time::Instant::now());
+                        "not_applied"
+                    };
+                    debug!(
+                        stalled_ms,
+                        forest_block = last_processed,
+                        safe_head,
+                        target = ?installed,
+                        outcome,
+                        "live merkle forest stall fallback to Squid finished"
+                    );
+                    continue;
+                }
+                let Some(rpc) = rpc else {
                     warn!("no healthy rpc providers available");
                     tokio::select! {
                         () = cancel.cancelled() => break,
@@ -713,27 +791,6 @@ pub(super) fn spawn_live_log_loop(
                     }
                     continue;
                 };
-                let reorg_check = tokio::select! {
-                    () = cancel.cancelled() => break,
-                    result = service.check_forest_reorg(
-                        &rpc.provider,
-                        archive_provider.as_ref(),
-                        rpc.url.as_str(),
-                        &snapshot_path,
-                        safe_head,
-                        last_processed,
-                    ) => result,
-                };
-                if let Err(err) = reorg_check {
-                    debug!(?err, rpc = rpc.url.as_str(), "reorg check failed");
-                }
-                if cancel.is_cancelled() {
-                    break;
-                }
-                let last_processed = *forest_last_rx.borrow();
-                if last_processed >= safe_head {
-                    continue;
-                }
 
                 let from_block = last_processed.saturating_add(1);
                 let to_block = min(from_block + service.chain.sync.block_range - 1, safe_head);
@@ -741,10 +798,11 @@ pub(super) fn spawn_live_log_loop(
                 let logs_result = tokio::select! {
                     () = cancel.cancelled() => break,
                     result = service.chain.fetch_logs_for_range(
-                        &rpc.provider,
+                        &rpc,
                         archive_provider.as_ref(),
                         from_block,
                         to_block,
+                        &cancel,
                     ) => result,
                 };
                 match logs_result {
@@ -786,7 +844,7 @@ pub(super) fn spawn_live_log_loop(
                                 Ok(Some(_)) => {}
                                 Ok(None) => {
                                     warn!(
-                                        rpc = rpc.url.as_str(),
+                                        rpc_index = rpc.index,
                                         archive_endpoint,
                                         "live RPC range does not prove its archive boundary"
                                     );
@@ -817,7 +875,7 @@ pub(super) fn spawn_live_log_loop(
                             Ok(Some(hash)) => Some(hash),
                             Ok(None) => {
                                 warn!(
-                                    rpc = rpc.url.as_str(),
+                                    rpc_index = rpc.index,
                                     to_block, "live RPC range does not prove its endpoint"
                                 );
                                 rpcs.mark_bad_provider(&rpc);
@@ -893,19 +951,20 @@ pub(super) fn spawn_live_log_loop(
                         }
                     }
                     Err(err) => {
+                        let mark_unhealthy = err.should_mark_rpc_unhealthy();
                         if err.is_rpc_throttled() {
                             warn!(
-                                rpc = rpc.url.as_str(),
+                                rpc_index = rpc.index,
                                 "rpc is throttled, will retry with another..."
                             );
                         } else {
                             warn!(
-                                ?err,
-                                rpc = rpc.url.as_str(),
+                                err = %err.without_url(),
+                                rpc_index = rpc.index,
                                 "failed to fetch logs, retrying..."
                             );
                         }
-                        if err.should_mark_rpc_unhealthy() {
+                        if mark_unhealthy {
                             rpcs.mark_bad_provider(&rpc);
                         }
                     }
@@ -914,6 +973,116 @@ pub(super) fn spawn_live_log_loop(
         }
         .instrument(tracing::info_span!("sync_live")),
     )
+}
+
+/// Tracks how long the live forest has lagged the safe head without advancing,
+/// and when the next Squid stall fallback may start.
+struct ForestStallTracker {
+    stall_period: Duration,
+    forest_block: u64,
+    lagging_since: Option<tokio::time::Instant>,
+    next_attempt_not_before: Option<tokio::time::Instant>,
+}
+
+impl ForestStallTracker {
+    const fn new(stall_period: Duration) -> Self {
+        Self {
+            stall_period,
+            forest_block: 0,
+            lagging_since: None,
+            next_attempt_not_before: None,
+        }
+    }
+
+    /// Restarts the stall period when the forest advances or starts lagging,
+    /// and clears it while the forest has reached the safe head.
+    const fn observe(&mut self, forest_block: u64, safe_head: u64, now: tokio::time::Instant) {
+        if forest_block >= safe_head {
+            self.lagging_since = None;
+        } else if forest_block > self.forest_block || self.lagging_since.is_none() {
+            self.lagging_since = Some(now);
+        }
+        self.forest_block = forest_block;
+    }
+
+    /// When the Squid fallback becomes due, if the forest is lagging.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        let deadline = self.lagging_since? + self.stall_period;
+        Some(
+            self.next_attempt_not_before
+                .map_or(deadline, |not_before| deadline.max(not_before)),
+        )
+    }
+
+    fn is_due(&self, now: tokio::time::Instant) -> bool {
+        self.deadline().is_some_and(|deadline| deadline <= now)
+    }
+
+    fn stalled_for(&self, now: tokio::time::Instant) -> Duration {
+        self.lagging_since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+
+    /// Holds off the next attempt for one stall period after a failed or
+    /// unproductive one.
+    fn defer_next_attempt(&mut self, now: tokio::time::Instant) {
+        self.next_attempt_not_before = Some(now + self.stall_period);
+    }
+}
+
+async fn sleep_until_stall_deadline(deadline: Option<tokio::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Runs Squid forest catch-up for a stalled live forest and installs the
+/// result as the live forest, returning the new forest block.
+///
+/// Runs inside the live loop, so the live loop stays the only forest writer.
+async fn run_live_squid_forest_fallback(
+    service: &ChainService,
+    rpc: Option<&ProviderHandle>,
+    archive_provider: Option<&DynProvider>,
+    snapshot_path: &Path,
+    forest_block: u64,
+    safe_head: u64,
+) -> Option<u64> {
+    let mut candidate = service.forest.read().await.clone();
+    let target = run_squid_forest_catch_up(
+        &service.db,
+        &service.chain,
+        &mut candidate,
+        forest_block,
+        forest_block.saturating_add(1),
+        safe_head,
+        rpc.map(|rpc| &rpc.provider),
+        archive_provider,
+        snapshot_path,
+        false,
+    )
+    .await?;
+    let mut forest = service.forest.write().await;
+    let current_block = *service.forest_last_tx.borrow();
+    if current_block != forest_block {
+        drop(forest);
+        warn!(
+            forest_block,
+            current_block, target, "live forest moved during Squid stall fallback; discarding"
+        );
+        return None;
+    }
+    *forest = candidate;
+    if let Err(err) = service.maybe_write_anchor_snapshot(snapshot_path, target, &forest) {
+        warn!(?err, target, "failed to write anchor snapshot");
+    }
+    drop(forest);
+    if let Err(err) = service.forest_last_tx.send(target) {
+        debug!(?err, target, "failed to send forest progress update");
+    }
+    Some(target)
 }
 
 pub(super) fn spawn_backfill_loop(
@@ -1014,6 +1183,16 @@ pub(super) fn spawn_backfill_loop(
                 .as_ref()
                 .is_some_and(|slot| slot.cursor.is_runnable(now) && slot.cursor.can_finish())
             {
+                // The cursor delivered its target, so the startup window's
+                // leading blocks can now be warmed without delaying the wallet.
+                if let Some((from_block, to_block)) = cursor
+                    .as_mut()
+                    .and_then(|slot| slot.cursor.take_startup_warm_range())
+                {
+                    service
+                        .start_public_scan_window_warm(PublicScanRange::new(from_block, to_block))
+                        .await;
+                }
                 let slot = cursor.as_ref().expect("cursor installed");
                 let key = slot.cache_key.clone();
                 let cancellation = slot.cursor.driver.cancellation_token();
@@ -1209,10 +1388,11 @@ pub(super) fn spawn_backfill_loop(
             let Some(logs_result) = await_wallet_cancellation(
                 &cancellation,
                 service.chain.fetch_logs_for_range(
-                    &rpc.provider,
+                    &rpc,
                     archive_provider.as_ref(),
                     from_block,
                     to_block,
+                    &cancellation,
                 ),
             )
             .await
@@ -1288,7 +1468,7 @@ pub(super) fn spawn_backfill_loop(
                             Ok(Some(_)) => {}
                             Ok(None) => {
                                 warn!(
-                                    rpc = rpc.url.as_str(),
+                                    rpc_index = rpc.index,
                                     archive_endpoint,
                                     "backfill RPC range does not prove its archive boundary"
                                 );
@@ -1332,7 +1512,7 @@ pub(super) fn spawn_backfill_loop(
                         Ok(Some(hash)) => Some(hash),
                         Ok(None) => {
                             warn!(
-                                rpc = rpc.url.as_str(),
+                                rpc_index = rpc.index,
                                 to_block, "backfill RPC does not cover requested endpoint"
                             );
                             rpcs.mark_bad_provider(&rpc);
@@ -1574,14 +1754,15 @@ pub(super) fn spawn_backfill_loop(
                     }
                 }
                 Err(err) => {
+                    let mark_unhealthy = err.should_mark_rpc_unhealthy();
                     warn!(
-                        ?err,
-                        rpc = rpc.url.as_str(),
+                        err = %err.without_url(),
+                        rpc_index = rpc.index,
                         from_block,
                         to_block,
                         "failed to fetch backfill logs"
                     );
-                    if err.should_mark_rpc_unhealthy() {
+                    if mark_unhealthy {
                         rpcs.mark_bad_provider(&rpc);
                     } else {
                         let _ = await_wallet_cancellation(
@@ -1970,6 +2151,7 @@ async fn apply_backfill_request(
             follow_safe_head,
             progress_start_block,
             acquisition_range,
+            startup_warm_range,
             driver,
         } => {
             let incoming_token = driver.token();
@@ -2016,7 +2198,8 @@ async fn apply_backfill_request(
                     acquisition_range,
                     driver,
                     now,
-                ),
+                )
+                .with_startup_warm_range(startup_warm_range),
             });
             if let Some(previous) = previous {
                 previous.cursor.driver.retire(&previous.cache_key).await;

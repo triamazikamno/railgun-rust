@@ -32,8 +32,10 @@ const MERKLE_ARTIFACT_APPLY_START_PROGRESS: u64 = 95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MerkleArtifactProbe {
-    latest_commitment_block: u64,
-    latest_commitment_block_hash: [u8; 32],
+    /// The manifest's latest indexed Commitments height at or below the requested target.
+    /// Commitment artifacts are complete through this block even when no commitment is in it.
+    indexed_through_block: u64,
+    indexed_through_block_hash: [u8; 32],
     commitment_catalog_count: usize,
     checkpoint_catalog_count: usize,
 }
@@ -46,13 +48,13 @@ impl MerkleArtifactProbe {
         to_block: u64,
     ) -> Option<Self> {
         let chain = manifest.chains.iter().find(|entry| entry.scope == *scope)?;
-        let latest_commitment = chain
+        let indexed_through = chain
             .latest_indexed
             .iter()
             .filter(|height| height.dataset_kind == IndexedDatasetKind::Commitments)
             .filter(|height| height.block_number <= to_block)
             .max_by_key(|height| height.block_number)?;
-        if latest_commitment.block_number < from_block {
+        if indexed_through.block_number < from_block {
             return None;
         }
 
@@ -79,15 +81,15 @@ impl MerkleArtifactProbe {
             })
             .count();
         Some(Self {
-            latest_commitment_block: latest_commitment.block_number,
-            latest_commitment_block_hash: latest_commitment.block_hash.into(),
+            indexed_through_block: indexed_through.block_number,
+            indexed_through_block_hash: indexed_through.block_hash.into(),
             commitment_catalog_count,
             checkpoint_catalog_count,
         })
     }
 
     const fn catch_up_target(self) -> u64 {
-        self.latest_commitment_block
+        self.indexed_through_block
     }
 }
 
@@ -130,9 +132,6 @@ pub(super) async fn run_merkle_artifact_catch_up_into(
     };
 
     let progress = session.apply_into(forest)?;
-    if progress.latest_commitment_block < session.target_block {
-        return Ok(None);
-    }
     Ok(Some(MerkleArtifactCatchUp {
         target_block: session.target_block,
         target_block_hash: session.target_block_hash,
@@ -309,7 +308,7 @@ impl MerkleArtifactSession {
 
         Ok(Some(Self {
             target_block,
-            target_block_hash: probe.latest_commitment_block_hash,
+            target_block_hash: probe.indexed_through_block_hash,
             checkpoint_pages,
             commitment_pages,
         }))
@@ -933,8 +932,8 @@ mod tests {
         let probe = MerkleArtifactProbe::from_manifest(&manifest, &scope, 120, 200)
             .expect("merkle artifacts available");
 
-        assert_eq!(probe.latest_commitment_block, 200);
-        assert_eq!(probe.latest_commitment_block_hash, [0x22; 32]);
+        assert_eq!(probe.indexed_through_block, 200);
+        assert_eq!(probe.indexed_through_block_hash, [0x22; 32]);
         assert_eq!(probe.catch_up_target(), 200);
         assert_eq!(probe.commitment_catalog_count, 1);
         assert_eq!(probe.checkpoint_catalog_count, 1);

@@ -613,13 +613,15 @@ impl ChainConfig {
         }
     }
 
-    pub(crate) const fn should_skip_merkle_artifact_catch_up(
+    /// Whether startup should leave the Merkle forest tail from `from_block`
+    /// to `safe_head` to live RPC sync instead of indexed catch-up, whichever
+    /// indexed sources are configured.
+    pub(crate) const fn should_skip_indexed_forest_catch_up(
         &self,
         from_block: u64,
         safe_head: u64,
     ) -> bool {
-        self.sync.indexed_artifact_source.is_some()
-            && from_block <= safe_head
+        from_block <= safe_head
             && safe_head.saturating_sub(from_block).saturating_add(1) <= self.sync.block_range
     }
 }
@@ -2646,6 +2648,9 @@ pub(crate) enum BackfillRequest {
         follow_safe_head: bool,
         progress_start_block: u64,
         acquisition_range: Option<(u64, u64)>,
+        /// Leading startup-window blocks at or before the cursor, warmed in
+        /// the background once the cursor has delivered its target.
+        startup_warm_range: Option<(u64, u64)>,
         driver: WalletBackfillDriver,
     },
     Remove {
@@ -2671,6 +2676,7 @@ impl BackfillRequest {
             follow_safe_head,
             progress_start_block,
             acquisition_range: None,
+            startup_warm_range: None,
             driver,
         }
     }
@@ -2691,8 +2697,24 @@ impl BackfillRequest {
             follow_safe_head,
             progress_start_block,
             acquisition_range: Some(acquisition_range),
+            startup_warm_range: None,
             driver,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn with_startup_warm_range(
+        mut self,
+        startup_warm_range: Option<(u64, u64)>,
+    ) -> Self {
+        if let Self::Add {
+            startup_warm_range: range,
+            ..
+        } = &mut self
+        {
+            *range = startup_warm_range;
+        }
+        self
     }
 }
 

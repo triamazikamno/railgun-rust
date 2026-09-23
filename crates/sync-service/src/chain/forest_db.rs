@@ -87,14 +87,18 @@ impl MerkleForestDbExt for DbStore {
             .saturating_add(1)
             .max(chain.deployment.deployment_block);
         let mut artifact_catch_up_applied = false;
-        if chain.should_skip_merkle_artifact_catch_up(from_block, safe_head) {
+        let skip_indexed_catch_up =
+            chain.should_skip_indexed_forest_catch_up(from_block, safe_head);
+        if skip_indexed_catch_up {
             debug!(
                 chain_id = chain.deployment.chain_id,
                 from_block,
                 safe_head,
                 block_range = chain.sync.block_range,
                 tail_blocks = safe_head.saturating_sub(from_block).saturating_add(1),
-                "skipping merkle artifact catch-up for small tail"
+                artifact_source_skipped = chain.sync.indexed_artifact_source.is_some(),
+                squid_skipped = chain.sync.quick_sync_endpoint.is_some(),
+                "skipping indexed merkle forest catch-up for small tail"
             );
         } else if chain.sync.indexed_artifact_source.is_some() && from_block <= safe_head {
             let artifact_started = Instant::now();
@@ -205,132 +209,22 @@ impl MerkleForestDbExt for DbStore {
             }
         }
 
-        if let Some(endpoint) = chain.sync.quick_sync_endpoint.clone() {
-            let client =
-                QuickSyncClient::with_http_client(endpoint.clone(), chain.http_client.clone());
-            match client.fetch_squid_height().await {
-                Ok(indexed_height) => {
-                    let target = indexed_height.min(safe_head);
-                    info!(
-                        chain_id = chain.deployment.chain_id,
-                        indexed_height,
-                        safe_head,
-                        current_block = last_processed,
-                        target,
-                        "indexed forest catch-up target"
-                    );
-                    if target > last_processed {
-                        let start_block = from_block;
-                        if start_block <= target {
-                            let mut candidate = forest.clone();
-                            let config = QuickSyncConfig {
-                                endpoint,
-                                start_block,
-                                end_block: Some(target),
-                                page_size: DEFAULT_PAGE_SIZE,
-                                http_client: Some(chain.http_client.clone()),
-                            };
-                            let progress_tx = chain.progress_tx.clone();
-                            send_sync_progress(
-                                progress_tx.as_ref(),
-                                commitment_sync_progress_update(
-                                    artifact_catch_up_applied,
-                                    start_block,
-                                    start_block,
-                                    target,
-                                ),
-                            );
-                            match run_quick_sync_into_with_progress(
-                                &mut candidate,
-                                config,
-                                |progress| {
-                                    send_sync_progress(
-                                        progress_tx.as_ref(),
-                                        commitment_sync_progress_update(
-                                            artifact_catch_up_applied,
-                                            progress.start_block,
-                                            progress.latest_block,
-                                            target,
-                                        ),
-                                    );
-                                },
-                            )
-                            .await
-                            {
-                                Ok(progress) => {
-                                    let block_hash = match provider {
-                                        Some(provider) => chain
-                                            .fetch_confirmed_block_hash(
-                                                provider,
-                                                archive_provider,
-                                                target,
-                                            )
-                                            .await
-                                            .unwrap_or_else(|err| {
-                                                warn!(
-                                                    ?err,
-                                                    target,
-                                                    "failed to fetch confirmed indexed forest target block hash"
-                                                );
-                                                None
-                                            }),
-                                        None => None,
-                                    };
-                                    match persist_indexed_forest_snapshot(
-                                        self,
-                                        chain,
-                                        &snapshot_path,
-                                        target,
-                                        block_hash,
-                                        &candidate,
-                                    ) {
-                                        Ok(()) => {
-                                            forest = candidate;
-                                            last_processed = target;
-                                            send_sync_progress(
-                                                progress_tx.as_ref(),
-                                                commitment_sync_progress_update(
-                                                    artifact_catch_up_applied,
-                                                    start_block,
-                                                    target,
-                                                    target,
-                                                ),
-                                            );
-                                            info!(
-                                                chain_id = chain.deployment.chain_id,
-                                                from_block = start_block,
-                                                target,
-                                                commitments = progress.commitments,
-                                                "indexed forest catch-up complete"
-                                            );
-                                        }
-                                        Err(err) => {
-                                            warn!(
-                                                ?err,
-                                                fallback_from = last_processed,
-                                                "indexed forest catch-up persistence failed; falling back to RPC"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        fallback_from = last_processed,
-                                        "indexed forest catch-up failed; falling back to RPC"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "indexed forest status query failed; falling back to RPC"
-                    );
-                }
-            }
+        if !skip_indexed_catch_up
+            && let Some(target) = run_squid_forest_catch_up(
+                self,
+                chain,
+                &mut forest,
+                last_processed,
+                from_block,
+                safe_head,
+                provider,
+                archive_provider,
+                &snapshot_path,
+                artifact_catch_up_applied,
+            )
+            .await
+        {
+            last_processed = target;
         }
 
         Ok((
@@ -372,6 +266,123 @@ impl MerkleForestDbExt for DbStore {
         }
         Ok(latest)
     }
+}
+
+/// Catches `forest` up from the configured Squid endpoint to the lesser of the
+/// Squid indexed height and `safe_head`, starting at `from_block`.
+///
+/// The catch-up runs against a copy of `forest`. When it completes and the
+/// snapshot and metadata are persisted at `snapshot_path`, the copy replaces
+/// `forest` and the new forest block is returned. Otherwise `forest` is left
+/// unchanged and `None` is returned; failures are logged.
+pub(super) async fn run_squid_forest_catch_up(
+    db: &DbStore,
+    chain: &ChainConfig,
+    forest: &mut MerkleForest,
+    last_processed: u64,
+    from_block: u64,
+    safe_head: u64,
+    provider: Option<&DynProvider>,
+    archive_provider: Option<&DynProvider>,
+    snapshot_path: &Path,
+    artifact_catch_up_applied: bool,
+) -> Option<u64> {
+    let endpoint = chain.sync.quick_sync_endpoint.clone()?;
+    let client = QuickSyncClient::with_http_client(endpoint.clone(), chain.http_client.clone());
+    let indexed_height = match client.fetch_squid_height().await {
+        Ok(indexed_height) => indexed_height,
+        Err(err) => {
+            warn!(
+                ?err,
+                "indexed forest status query failed; falling back to RPC"
+            );
+            return None;
+        }
+    };
+    let target = indexed_height.min(safe_head);
+    info!(
+        chain_id = chain.deployment.chain_id,
+        indexed_height,
+        safe_head,
+        current_block = last_processed,
+        target,
+        "indexed forest catch-up target"
+    );
+    if target <= last_processed || from_block > target {
+        return None;
+    }
+    let mut candidate = forest.clone();
+    let config = QuickSyncConfig {
+        endpoint,
+        start_block: from_block,
+        end_block: Some(target),
+        page_size: DEFAULT_PAGE_SIZE,
+        http_client: Some(chain.http_client.clone()),
+    };
+    let progress_tx = chain.progress_tx.clone();
+    send_sync_progress(
+        progress_tx.as_ref(),
+        commitment_sync_progress_update(artifact_catch_up_applied, from_block, from_block, target),
+    );
+    let progress = match run_quick_sync_into_with_progress(&mut candidate, config, |progress| {
+        send_sync_progress(
+            progress_tx.as_ref(),
+            commitment_sync_progress_update(
+                artifact_catch_up_applied,
+                progress.start_block,
+                progress.latest_block,
+                target,
+            ),
+        );
+    })
+    .await
+    {
+        Ok(progress) => progress,
+        Err(err) => {
+            warn!(
+                ?err,
+                fallback_from = last_processed,
+                "indexed forest catch-up failed; falling back to RPC"
+            );
+            return None;
+        }
+    };
+    let block_hash = match provider {
+        Some(provider) => chain
+            .fetch_confirmed_block_hash(provider, archive_provider, target)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    ?err,
+                    target, "failed to fetch confirmed indexed forest target block hash"
+                );
+                None
+            }),
+        None => None,
+    };
+    if let Err(err) =
+        persist_indexed_forest_snapshot(db, chain, snapshot_path, target, block_hash, &candidate)
+    {
+        warn!(
+            ?err,
+            fallback_from = last_processed,
+            "indexed forest catch-up persistence failed; falling back to RPC"
+        );
+        return None;
+    }
+    *forest = candidate;
+    send_sync_progress(
+        progress_tx.as_ref(),
+        commitment_sync_progress_update(artifact_catch_up_applied, from_block, target, target),
+    );
+    info!(
+        chain_id = chain.deployment.chain_id,
+        from_block,
+        target,
+        commitments = progress.commitments,
+        "indexed forest catch-up complete"
+    );
+    Some(target)
 }
 
 fn persist_indexed_forest_snapshot(
@@ -606,33 +617,25 @@ mod tests {
     }
 
     #[test]
-    fn skips_merkle_artifact_catch_up_for_small_tail() {
+    fn skips_indexed_forest_catch_up_for_small_tail_with_or_without_sources() {
         let mut chain = chain_config();
-        chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
         chain.sync.block_range = 100;
 
-        assert!(chain.should_skip_merkle_artifact_catch_up(101, 200));
-        assert!(chain.should_skip_merkle_artifact_catch_up(200, 200));
+        assert!(chain.should_skip_indexed_forest_catch_up(101, 200));
+        assert!(chain.should_skip_indexed_forest_catch_up(200, 200));
+
+        chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
+        chain.sync.quick_sync_endpoint = Some(Url::parse("https://squid.example").expect("url"));
+        assert!(chain.should_skip_indexed_forest_catch_up(101, 200));
     }
 
     #[test]
-    fn uses_merkle_artifact_catch_up_for_large_tail() {
+    fn uses_indexed_forest_catch_up_for_large_tail() {
         let mut chain = chain_config();
         chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
         chain.sync.block_range = 100;
 
-        assert!(!chain.should_skip_merkle_artifact_catch_up(100, 200));
-    }
-
-    #[test]
-    fn uses_merkle_artifact_catch_up_without_source_or_when_past_safe_head() {
-        let mut chain = chain_config();
-        chain.sync.block_range = 100;
-
-        assert!(!chain.should_skip_merkle_artifact_catch_up(101, 200));
-
-        chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
-        assert!(!chain.should_skip_merkle_artifact_catch_up(201, 200));
+        assert!(!chain.should_skip_indexed_forest_catch_up(100, 200));
     }
 
     fn chain_config() -> ChainConfig {

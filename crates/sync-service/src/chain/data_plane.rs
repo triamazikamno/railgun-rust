@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{FixedBytes, U256};
@@ -19,6 +19,7 @@ use poi::cache::{PoiCache, PoiCacheIdentity, PoiCacheJournalDelta, PoiCacheRootV
 use poi::poi::{BlockedShield, PoiStatus};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedMutexGuard, watch};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -1501,12 +1502,39 @@ pub(crate) struct ChainPublicDataPlane {
     indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler,
     poi_cache_service: Option<Arc<PoiCacheService>>,
     runtime_lease: Option<DbRuntimeLease>,
+    window_warm: Arc<StdMutex<PublicWindowWarmSlot>>,
+}
+
+/// The chain's single background task that warms the leading part of a
+/// short-startup window after the wallet's own range was delivered.
+#[derive(Default)]
+struct PublicWindowWarmSlot {
+    /// Set while a public-cache reset permit is held.
+    reset_blocked: bool,
+    /// Set once the data plane shuts down.
+    closed: bool,
+    next_id: u64,
+    active: Option<PublicWindowWarmTask>,
+}
+
+struct PublicWindowWarmTask {
+    id: u64,
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+fn clear_finished_public_window_warm(slot: &StdMutex<PublicWindowWarmSlot>, id: u64) {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.active.as_ref().is_some_and(|active| active.id == id) {
+        slot.active = None;
+    }
 }
 
 pub(crate) struct PublicCacheResetPermit {
     data_plane: ChainPublicDataPlane,
     commit_guard: Option<OwnedMutexGuard<()>>,
     poi_reset_lease: Option<PoiPublicCacheResetLease>,
+    window_warm_blocked: bool,
 }
 
 impl PublicCacheResetPermit {
@@ -1517,6 +1545,9 @@ impl PublicCacheResetPermit {
     }
 
     fn release(&mut self) {
+        if std::mem::take(&mut self.window_warm_blocked) {
+            self.data_plane.unblock_public_window_warm();
+        }
         drop(self.commit_guard.take());
         drop(self.poi_reset_lease.take());
     }
@@ -1539,6 +1570,7 @@ impl ChainPublicDataPlane {
             indexed_artifact_maintenance: IndexedArtifactMaintenanceScheduler::new(),
             poi_cache_service: None,
             runtime_lease: None,
+            window_warm: Arc::new(StdMutex::new(PublicWindowWarmSlot::default())),
         }
     }
 
@@ -1581,6 +1613,7 @@ impl ChainPublicDataPlane {
 
     pub(crate) async fn shutdown(&self) {
         self.begin_shutdown();
+        self.quiesce_public_window_warm().await;
         self.indexed_artifact_maintenance.shutdown().await;
         if let Some(service) = self.poi_cache_service.as_ref() {
             service.shutdown().await;
@@ -1589,10 +1622,91 @@ impl ChainPublicDataPlane {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        {
+            let mut slot = self
+                .window_warm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.closed = true;
+            if let Some(active) = slot.active.as_ref() {
+                active.cancel.cancel();
+            }
+        }
         self.indexed_artifact_maintenance.begin_shutdown();
         if let Some(service) = self.poi_cache_service.as_ref() {
             service.begin_shutdown();
         }
+    }
+
+    /// Starts the chain's background window-warm task unless one is already
+    /// running or starts are blocked by a public-cache reset or shutdown.
+    ///
+    /// The task receives a child of `parent`, so cancelling the chain service
+    /// also stops it. Returns whether a task was started.
+    pub(crate) fn try_start_public_window_warm<F, Fut>(
+        &self,
+        parent: &CancellationToken,
+        warm: F,
+    ) -> bool
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut slot = self
+            .window_warm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slot.reset_blocked || slot.closed || slot.active.is_some() || parent.is_cancelled() {
+            return false;
+        }
+        let id = slot.next_id;
+        slot.next_id = slot.next_id.wrapping_add(1);
+        let cancel = parent.child_token();
+        let task = warm(cancel.clone());
+        let window_warm = Arc::clone(&self.window_warm);
+        // The slot lock is held until the task is recorded, so its exit
+        // cleanup cannot run before the task is visible to resets.
+        let handle = tokio::spawn(async move {
+            task.await;
+            clear_finished_public_window_warm(&window_warm, id);
+        });
+        slot.active = Some(PublicWindowWarmTask { id, cancel, handle });
+        true
+    }
+
+    /// Blocks new window-warm starts, cancels the running task, and waits for
+    /// it to exit.
+    async fn quiesce_public_window_warm(&self) {
+        let active = {
+            let mut slot = self
+                .window_warm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.reset_blocked = true;
+            slot.active.take()
+        };
+        if let Some(active) = active {
+            active.cancel.cancel();
+            if let Err(err) = active.handle.await {
+                debug!(?err, "public window warm task ended abnormally");
+            }
+        }
+    }
+
+    fn unblock_public_window_warm(&self) {
+        self.window_warm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reset_blocked = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn public_window_warm_running(&self) -> bool {
+        self.window_warm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active
+            .is_some()
     }
 
     pub(crate) fn schedule_indexed_artifact_maintenance<F>(
@@ -1700,11 +1814,20 @@ impl ChainPublicDataPlane {
         } else {
             None
         };
-        PublicCacheResetPermit {
+        let commit_guard = Arc::clone(&self.commit_fence).lock_owned().await;
+        // Window warming is quiesced under the commit fence, so concurrent
+        // resets take turns and each one waits for the task it cancelled. The
+        // warm task never takes the fence, so waiting here cannot deadlock.
+        // The permit exists first so that dropping this future mid-wait
+        // unblocks warm starts again.
+        let permit = PublicCacheResetPermit {
             data_plane: self.clone(),
-            commit_guard: Some(Arc::clone(&self.commit_fence).lock_owned().await),
+            commit_guard: Some(commit_guard),
             poi_reset_lease,
-        }
+            window_warm_blocked: true,
+        };
+        permit.data_plane.quiesce_public_window_warm().await;
+        permit
     }
 
     async fn invalidate_public_cache_state(&self) -> ChainPublicSyncCacheReset {

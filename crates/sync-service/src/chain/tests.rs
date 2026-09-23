@@ -8,8 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, FixedBytes, U256, hex};
 use alloy::sol_types::SolEvent;
+use alloy_rpc_types_eth::Log;
 use broadcaster_core::notes::Note;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::query_rpc_pool::{LogSpanEndpoint, QueryRpcPool};
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 use cid::Cid;
@@ -18,7 +19,7 @@ use local_db::{
     BlobMeta, DbConfig, DbStore, WalletCacheKey, WalletMeta, WalletPendingResetRecord,
     WalletSyncActorStateRecord,
 };
-use merkletree::tree::MerkleForest;
+use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
 use multihash_codetable::{Code, MultihashDigest};
 use poi::cache::{PoiCache, PoiCacheIdentity};
 use poi::poi::{PoiEventType, PoiStatus};
@@ -36,10 +37,12 @@ fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
 
 use super::backfill::{
     WalletBackfill, WalletTailFallbackState, wallet_tail_fallback_lag_threshold_blocks,
+    wallet_tail_fallback_stale_timeout,
 };
 use super::data_plane::{PublicScanCoverageWrite, PublicScanRows};
 use super::indexed_wallet::{complete_stream_checkpoint, wallet_startup_hedge_block_count};
 use super::logs::combined_log_event_signatures_for_range;
+use super::merkle_artifacts::run_merkle_artifact_catch_up_into;
 use super::service::{
     IndexedWalletCatchUpOutcome, WalletShortStartupPlan, await_live_log_task_shutdown,
     wait_for_startup_sync_target, wait_for_wallet_ready,
@@ -52,13 +55,15 @@ use super::workers::{
 use super::{
     ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
     GeneratedCommitmentBatch, IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
-    IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind, Nullified, Nullifiers,
-    PublicCoverageAnswer, PublicDataPlaneDiagnosticKind, PublicDataPlaneError, PublicPoiCorpusKey,
-    PublicScanRange, PublicScanRowsAnswer, PublicScanSource, RailgunLegacyShieldEvents, Shield,
-    Transact, WalletIndexedCatchUpStatusGuard, WalletStartupSyncError, WalletWorkerServices,
+    IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind, LogRangeLimit, MerkleForestDbExt,
+    Nullified, Nullifiers, PublicCoverageAnswer, PublicDataPlaneDiagnosticKind,
+    PublicDataPlaneError, PublicPoiCorpusKey, PublicScanRange, PublicScanRowsAnswer,
+    PublicScanSource, RailgunLegacyShieldEvents, Shield, Transact, TransportError,
+    WalletIndexedCatchUpStatusGuard, WalletStartupSyncError, WalletWorkerServices,
     artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
-    should_hedge_wallet_startup, spawn_backfill_loop, squid_tail_target_after_artifact,
-    wallet_backfill_from_block, wallet_finish_result_removes_cursor, wallet_finish_retry_request,
+    should_hedge_wallet_startup, sort_logs, spawn_backfill_loop, spawn_live_log_loop,
+    squid_tail_target_after_artifact, wallet_backfill_from_block,
+    wallet_finish_result_removes_cursor, wallet_finish_retry_request,
     wallet_remote_target_before_cached_suffix, wallet_reorg_backfill_from_block,
     wallet_startup_warm_from_block, wallet_sync_target,
 };
@@ -68,6 +73,7 @@ use crate::indexed_artifacts::{
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
     INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION, INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION,
     INDEXED_ARTIFACT_CHUNK_MAGIC, IndexedArtifactCatalog, IndexedArtifactChainEntry,
+    IndexedArtifactChunkEnvelope, IndexedArtifactChunkEnvelopeHeader, IndexedArtifactChunkSection,
     IndexedArtifactDescriptor, IndexedArtifactManifest, IndexedArtifactRange,
     IndexedArtifactRangeKind, IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity,
 };
@@ -2232,20 +2238,19 @@ async fn indexed_disabled_short_startup_warms_and_reuses_full_rpc_window() {
         .expect("open db"),
     );
     let scope = test_scope();
-    let log_block = 105;
     let target_block = 110;
-    let log_response = serde_json::json!([rpc_nullifiers_log(scope.railgun_contract, log_block,)]);
-    let responses = [
-        serde_json::json!(format!("{target_block:#x}")),
-        log_response.clone(),
-        rpc_block(log_block, 1_700_000_105, 0x11),
-        rpc_block(target_block, 1_700_000_110, 0x22),
-        serde_json::json!(format!("{target_block:#x}")),
-        log_response,
-        rpc_block(log_block, 1_700_000_105, 0x11),
-        rpc_block(target_block, 1_700_000_110, 0x22),
-    ];
-    let rpc = JsonRpcServer::spawn(responses.into());
+    let (release_warm, warm_gate) = std_mpsc::channel();
+    let rpc = JsonRpcServer::spawn_handler(gated_get_logs_handler(
+        log_range_rpc_handler(
+            vec![rpc_nullifiers_log_with_timestamp(
+                scope.railgun_contract,
+                105,
+            )],
+            target_block,
+            |_, _, _| None,
+        ),
+        vec![((101, 105), warm_gate)],
+    ));
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![rpc.url.clone()],
         Duration::from_secs(1),
@@ -2266,6 +2271,7 @@ async fn indexed_disabled_short_startup_warms_and_reuses_full_rpc_window() {
     first_cfg.start_block = Some(101);
     first_cfg.sync_to_block = Some(target_block);
     first_cfg.use_indexed_wallet_catch_up = false;
+    let first_cache_key = first_cfg.cache_key.clone();
     db.put_wallet_meta(
         &first_cfg.cache_key,
         &WalletMeta {
@@ -2285,24 +2291,47 @@ async fn indexed_disabled_short_startup_warms_and_reuses_full_rpc_window() {
         .expect("wallet readiness succeeded");
     assert_eq!(first.last_scanned(), Some(target_block));
 
-    let first_requests = (0..4)
-        .map(|_| {
-            rpc.requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("first wallet RPC request")
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        first_requests
-            .iter()
-            .any(|request| request.contains("eth_getLogs"))
+    // The warm request for the pre-cursor blocks is still held by the mock,
+    // so readiness did not wait for it.
+    let mut bodies = Vec::new();
+    yield_until("held background warm request", || {
+        bodies.extend(rpc.drain_request_bodies());
+        get_logs_ranges(&bodies).contains(&(101, 105))
+    })
+    .await;
+    assert!(service.public_data_plane.public_window_warm_running());
+    service
+        .start_public_scan_window_warm(PublicScanRange::new(101, 105))
+        .await;
+
+    release_warm.send(()).expect("release warm request");
+    yield_until("background warm finished", || {
+        !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
+    bodies.extend(rpc.drain_request_bodies());
+    assert_eq!(
+        get_logs_ranges(&bodies),
+        vec![(106, 110), (101, 105)],
+        "delivery fetches only blocks after the cursor; one warm task fetches the rest"
     );
-    let get_logs = first_requests
-        .iter()
-        .find(|request| request.contains("eth_getLogs"))
-        .expect("first wallet eth_getLogs request");
-    assert!(get_logs.contains(r#""fromBlock":"0x65""#));
-    assert!(get_logs.contains(r#""toBlock":"0x6e""#));
+    assert!(
+        service
+            .public_data_plane
+            .cached_wallet_scan_exact(101, target_block)
+            .await
+            .is_some(),
+        "warming makes the whole window reusable"
+    );
+    assert_eq!(first.last_scanned(), Some(target_block));
+    assert_eq!(
+        db.get_wallet_meta(&first_cache_key)
+            .expect("read first wallet cursor")
+            .expect("first wallet cursor present")
+            .last_scanned_block,
+        target_block,
+        "warming does not move the wallet cursor"
+    );
 
     service.unregister_all_wallets().await;
 
@@ -2331,7 +2360,7 @@ async fn indexed_disabled_short_startup_warms_and_reuses_full_rpc_window() {
 
     assert_eq!(second.last_scanned(), Some(target_block));
     assert!(
-        rpc.requests.try_recv().is_err(),
+        rpc.drain_request_bodies().is_empty(),
         "replacement wallet must not issue another RPC request"
     );
     service.unregister_all_wallets().await;
@@ -2355,6 +2384,9 @@ async fn wallet_startup_reuses_sliding_cached_prefix_and_retains_new_tail() {
         serde_json::json!("0x6e"),
         serde_json::json!([]),
         rpc_block(110, 1_700_000_110, 0x11),
+        serde_json::json!("0x6e"),
+        serde_json::json!([]),
+        rpc_block(105, 1_700_000_105, 0x33),
         serde_json::json!("0x6f"),
         serde_json::json!([]),
         rpc_block(111, 1_700_000_111, 0x22),
@@ -2398,19 +2430,17 @@ async fn wallet_startup_reuses_sliding_cached_prefix_and_retains_new_tail() {
         .expect("first wallet readiness succeeded");
     assert_eq!(first.last_scanned(), Some(110));
 
-    let first_requests = (0..3)
-        .map(|_| {
-            rpc.requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("first wallet RPC request")
-        })
-        .collect::<Vec<_>>();
-    let first_get_logs = first_requests
-        .iter()
-        .find(|request| request.contains("eth_getLogs"))
-        .expect("first wallet eth_getLogs request");
-    assert!(first_get_logs.contains(r#""fromBlock":"0x65""#));
-    assert!(first_get_logs.contains(r#""toBlock":"0x6e""#));
+    let mut first_bodies = Vec::new();
+    yield_until("first wallet delivery and window warm", || {
+        first_bodies.extend(rpc.drain_request_bodies());
+        first_bodies.len() == 6 && !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
+    assert_eq!(
+        get_logs_ranges(&first_bodies),
+        vec![(106, 110), (101, 105)],
+        "delivery precedes warming of the pre-cursor blocks"
+    );
 
     service.unregister_all_wallets().await;
     service.safe_head_tx.send_replace(111);
@@ -2482,7 +2512,7 @@ async fn wallet_startup_reuses_sliding_cached_prefix_and_retains_new_tail() {
 }
 
 #[tokio::test]
-async fn wallet_startup_warms_pre_cursor_gap_before_cached_suffix() {
+async fn wallet_startup_fetches_cursor_gap_before_cached_suffix_then_warms_prefix() {
     let root_dir = temp_db_root("wallet-startup-leading-gap");
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -2498,6 +2528,9 @@ async fn wallet_startup_warms_pre_cursor_gap_before_cached_suffix() {
         serde_json::json!([rpc_nullifiers_log(scope.railgun_contract, gap_block)]),
         rpc_block(gap_block, 1_700_000_105, 0x11),
         rpc_block(gap_block, 1_700_000_105, 0x11),
+        serde_json::json!(format!("{target_block:#x}")),
+        serde_json::json!([]),
+        rpc_block(104, 1_700_000_104, 0x44),
     ]);
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![rpc.url.clone()],
@@ -2556,19 +2589,24 @@ async fn wallet_startup_warms_pre_cursor_gap_before_cached_suffix() {
         .expect("wallet readiness succeeded");
     assert_eq!(handle.last_scanned(), Some(target_block));
 
-    let requests = (0..4)
-        .map(|_| {
-            rpc.requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("RPC gap request")
-        })
-        .collect::<Vec<_>>();
-    let get_logs = requests
-        .iter()
-        .find(|request| request.contains("eth_getLogs"))
-        .expect("eth_getLogs request");
-    assert!(get_logs.contains(r#""fromBlock":"0x65""#));
-    assert!(get_logs.contains(r#""toBlock":"0x69""#));
+    let mut bodies = Vec::new();
+    yield_until("gap delivery and window warm", || {
+        bodies.extend(rpc.drain_request_bodies());
+        bodies.len() == 7 && !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
+    assert_eq!(
+        get_logs_ranges(&bodies),
+        vec![(105, 105), (101, 104)],
+        "only the gap after the cursor is fetched before delivery"
+    );
+    assert!(
+        service
+            .public_data_plane
+            .cached_wallet_scan_exact(101, target_block)
+            .await
+            .is_some()
+    );
 
     service.unregister_all_wallets().await;
     service.shutdown().await;
@@ -2697,7 +2735,7 @@ async fn historical_catch_up_delivers_captured_suffix_after_cache_eviction() {
 }
 
 #[tokio::test]
-async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() {
+async fn wallet_startup_rpc_candidate_skips_pre_cursor_blocks_when_delivery_is_cached() {
     let root_dir = temp_db_root("wallet-startup-exact-delivery-boundary");
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -2706,11 +2744,9 @@ async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() 
         .expect("open db"),
     );
     let scope = test_scope();
-    let rpc = JsonRpcServer::spawn(vec![
-        serde_json::json!("0x6e"),
-        serde_json::json!([]),
-        rpc_block(105, 1_700_000_105, 0x11),
-    ]);
+    let rpc = JsonRpcServer::spawn_handler(
+        |_| serde_json::json!({ "error": rpc_error(-32601, "unexpected request") }),
+    );
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![rpc.url.clone()],
         Duration::from_secs(1),
@@ -2732,13 +2768,6 @@ async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() 
         })
         .await
         .expect("seed exact-boundary cached suffix");
-    let coverage_events_before_candidate = public_data_plane
-        .diagnostics()
-        .await
-        .events
-        .iter()
-        .filter(|event| event.kind == PublicDataPlaneDiagnosticKind::CoverageRecorded)
-        .count();
     let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
     let mut cfg = test_wallet_config(&scope, rpc.url.clone());
     cfg.start_block = Some(101);
@@ -2752,68 +2781,26 @@ async fn wallet_startup_rpc_candidate_acquires_before_exact_delivery_boundary() 
         .await
         .expect("RPC startup candidate");
 
-    assert_eq!(candidate.applies.len(), 1);
     assert_eq!(
-        (
-            candidate.applies[0].from_block,
-            candidate.applies[0].to_block
-        ),
-        (106, 110),
+        candidate
+            .applies
+            .iter()
+            .map(|apply| (apply.from_block, apply.to_block))
+            .collect::<Vec<_>>(),
+        vec![(106, 110)],
         "only the delivery suffix is returned to the wallet",
     );
-    let requests = (0..3)
-        .map(|_| {
-            rpc.requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("RPC acquisition request")
-        })
-        .collect::<Vec<_>>();
-    let get_logs = requests
-        .iter()
-        .find(|request| request.contains("eth_getLogs"))
-        .expect("eth_getLogs request");
-    assert!(get_logs.contains(r#""fromBlock":"0x65""#));
-    assert!(get_logs.contains(r#""toBlock":"0x69""#));
-    let retained_before_selection = service
-        .public_data_plane
-        .cached_wallet_scan_suffix(101, 110)
-        .await
-        .expect("pre-existing delivery suffix remains cached");
     assert_eq!(
-        retained_before_selection
+        candidate
+            .acquisition_applies
             .first()
-            .expect("cached delivery suffix")
-            .from_block,
-        106,
-        "an unselected candidate must not publish the missing acquisition prefix",
+            .map(|apply| apply.from_block),
+        Some(106),
+        "the candidate holds no blocks at or before the cursor",
     );
-    assert_eq!(
-        service
-            .public_data_plane
-            .diagnostics()
-            .await
-            .events
-            .iter()
-            .filter(|event| event.kind == PublicDataPlaneDiagnosticKind::CoverageRecorded)
-            .count(),
-        coverage_events_before_candidate,
-        "candidate acquisition must not mutate row or coverage state",
-    );
-    service
-        .public_data_plane
-        .commit_completed_wallet_scan_acquisition(
-            PublicScanRange::new(101, 110),
-            &candidate.acquisition_applies,
-        )
-        .await
-        .expect("commit selected RPC acquisition");
     assert!(
-        service
-            .public_data_plane
-            .cached_wallet_scan_suffix(101, 110)
-            .await
-            .is_some(),
-        "explicit winner commit must retain the full acquisition window",
+        rpc.requests.try_recv().is_err(),
+        "a cached delivery range needs no RPC request before delivery"
     );
 
     service.shutdown().await;
@@ -2952,7 +2939,8 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.sync.archive_until_block = 105;
+    // The delivery range 106..=110 crosses this archive boundary.
+    chain.sync.archive_until_block = 107;
     chain.sync.block_range = 10;
     chain.finality_depth = 0;
     let public_data_plane = ChainPublicDataPlane::new(
@@ -2973,7 +2961,7 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
 
     assert!(matches!(
         result,
-        Err(WalletStartupSyncError::UnprovenRpcEndpoint { block_number: 105 })
+        Err(WalletStartupSyncError::UnprovenRpcEndpoint { block_number: 107 })
     ));
     assert!(
         service
@@ -2982,165 +2970,6 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
             .await
             .is_none()
     );
-    service.shutdown().await;
-    drop(service);
-    drop(db);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[tokio::test]
-async fn multi_page_squid_startup_retains_leading_rows_for_replacement_wallet() {
-    let root_dir = temp_db_root("indexed-wallet-warm-window");
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
-        })
-        .expect("open db"),
-    );
-    let scope = test_scope();
-    let replacement_wallet_utxo = WalletUtxo::new(Utxo::new(
-        Note {
-            token_hash: U256::from(1),
-            value: U256::from(10),
-            random: [0x11; 16],
-            npk: U256::from(2),
-        },
-        1,
-        7,
-        UtxoSource {
-            tx_hash: FixedBytes::from([0x55; 32]),
-            block_number: 100,
-            block_timestamp: 1_700_000_100,
-        },
-        UtxoCommitmentKind::Transact,
-    ));
-    let replacement_nullifier = replacement_wallet_utxo.utxo.nullifier(U256::ZERO);
-    let mut squid_responses = vec![
-        r#"{"data":{"squidStatus":{"height":"106"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#
-            .to_string(),
-    ];
-    squid_responses.extend((101..=106).map(|block_number| {
-        let nullifier = if block_number == 101 {
-            replacement_nullifier
-        } else {
-            U256::from(block_number)
-        };
-        indexed_wallet_nullifier_page(block_number, nullifier)
-    }));
-    let squid = GraphqlServer::spawn_owned(squid_responses);
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![Url::parse("http://127.0.0.1:1").expect("RPC URL")],
-        Duration::from_secs(1),
-    ));
-    let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.sync.block_range = 6;
-    chain.sync.indexed_wallet_block_range = 1;
-    chain.finality_depth = 0;
-    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
-    let public_data_plane = ChainPublicDataPlane::new(
-        Arc::clone(&db),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    service.safe_head_tx.send_replace(106);
-
-    let mut first_cfg = test_wallet_config(&scope, squid.url.clone());
-    first_cfg.cache_key = test_cache_key("indexed-wallet-a");
-    first_cfg.start_block = Some(101);
-    first_cfg.sync_to_block = Some(106);
-    db.put_wallet_meta(
-        &first_cfg.cache_key,
-        &WalletMeta {
-            last_scanned_block: 105,
-            updated_at: 1,
-            last_scanned_block_hash: None,
-        },
-    )
-    .expect("seed first wallet cursor");
-    let mut first = service
-        .register_wallet(first_cfg)
-        .await
-        .expect("register first wallet");
-    tokio::time::timeout(Duration::from_secs(2), first.wait_until_ready())
-        .await
-        .expect("indexed warm startup completed")
-        .expect("wallet readiness succeeded");
-    assert_eq!(first.last_scanned(), Some(106));
-    let first_requests = (0..7)
-        .map(|_| {
-            squid
-                .requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("first wallet indexed request")
-        })
-        .collect::<Vec<_>>();
-    for block_number in 101..=106 {
-        assert!(first_requests.iter().any(|request| {
-            request.contains(&format!("\"fromBlock\":\"{block_number}\""))
-                && request.contains(&format!("\"toBlock\":\"{block_number}\""))
-        }));
-    }
-    let replay = service
-        .public_data_plane
-        .cached_wallet_scan_suffix(101, 106)
-        .await
-        .expect("full multi-page Squid acquisition is replayable");
-    assert_eq!(
-        replay.len(),
-        1,
-        "six Squid pages should compact into one run"
-    );
-    let WalletScanRowsPayload::Rows(rows) = &replay[0].rows.payload else {
-        panic!("compacted Squid rows expected");
-    };
-    assert_eq!(rows.nullifiers.len(), 6);
-    assert_eq!(rows.nullifiers[0].source.block_number, 101);
-    assert_eq!(rows.nullifiers[0].nullifier, replacement_nullifier);
-
-    service.unregister_all_wallets().await;
-
-    let mut second_cfg = test_wallet_config(&scope, squid.url.clone());
-    second_cfg.cache_key = test_cache_key("indexed-wallet-b");
-    second_cfg.start_block = Some(101);
-    second_cfg.sync_to_block = Some(106);
-    db.put_wallet_meta(
-        &second_cfg.cache_key,
-        &WalletMeta {
-            last_scanned_block: 100,
-            updated_at: 1,
-            last_scanned_block_hash: None,
-        },
-    )
-    .expect("seed replacement wallet cursor");
-    db.put_wallet_utxo(
-        &second_cfg.cache_key,
-        "1:7",
-        &serialize_wallet_utxo(&replacement_wallet_utxo).expect("serialize replacement UTXO"),
-    )
-    .expect("seed replacement wallet UTXO");
-    let mut second = service
-        .register_wallet(second_cfg)
-        .await
-        .expect("register replacement wallet");
-    tokio::time::timeout(Duration::from_secs(1), second.wait_until_ready())
-        .await
-        .expect("replacement wallet reused indexed warm window")
-        .expect("wallet readiness succeeded");
-    assert_eq!(second.last_scanned(), Some(106));
-    let replacement_snapshot = second
-        .utxos_snapshot()
-        .expect("replacement wallet snapshot");
-    let spent = replacement_snapshot[0]
-        .spent
-        .as_ref()
-        .expect("leading cached nullifier marks replacement UTXO spent");
-    assert_eq!(spent.block_number, 101);
-    assert!(
-        squid.requests.try_recv().is_err(),
-        "replacement wallet must not issue another indexed request"
-    );
-
-    service.unregister_all_wallets().await;
     service.shutdown().await;
     drop(service);
     drop(db);
@@ -3223,7 +3052,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
     db.put_wallet_meta(
         &first_cfg.cache_key,
         &WalletMeta {
-            last_scanned_block: 105,
+            last_scanned_block: 100,
             updated_at: 1,
             last_scanned_block_hash: None,
         },
@@ -3251,6 +3080,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         .await
         .expect("Squid winner delivered while RPC response remained blocked")
         .expect("wallet readiness succeeded");
+    assert_eq!(first.last_scanned(), Some(106));
     rpc_release
         .send(())
         .expect("release terminated RPC request for fixture cleanup");
@@ -3259,10 +3089,16 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         .cached_wallet_scan_suffix(101, 106)
         .await
         .expect("complete Squid acquisition remains replayable");
+    assert_eq!(
+        replay.len(),
+        1,
+        "six Squid pages should compact into one run"
+    );
     let WalletScanRowsPayload::Rows(rows) = &replay[0].rows.payload else {
         panic!("Squid winner rows expected");
     };
     assert_eq!(rows.nullifiers.len(), 6);
+    assert_eq!(rows.nullifiers[0].source.block_number, 101);
     assert_eq!(rows.nullifiers[0].nullifier, replacement_nullifier);
     let first_rpc_requests = (0..2)
         .map(|_| {
@@ -3284,7 +3120,12 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
                 .expect("Squid winner request")
         })
         .collect::<Vec<_>>();
-    assert_eq!(squid_requests.len(), 7);
+    for block_number in 101..=106 {
+        assert!(squid_requests.iter().any(|request| {
+            request.contains(&format!("\"fromBlock\":\"{block_number}\""))
+                && request.contains(&format!("\"toBlock\":\"{block_number}\""))
+        }));
+    }
 
     service.unregister_all_wallets().await;
     let mut second_cfg = test_wallet_config(&scope, squid.url.clone());
@@ -3314,6 +3155,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
         .await
         .expect("replacement wallet replayed Squid winner acquisition")
         .expect("wallet readiness succeeded");
+    assert_eq!(second.last_scanned(), Some(106));
     let replacement_snapshot = second
         .utxos_snapshot()
         .expect("replacement wallet snapshot");
@@ -3336,7 +3178,7 @@ async fn multi_page_squid_winner_aborts_blocked_rpc_loser_before_publication() {
 }
 
 #[tokio::test]
-async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
+async fn failed_short_startup_hedge_uses_artifact_chunk_spanning_cursor_and_reuses_it() {
     let root_dir = temp_db_root("wallet-startup-artifact-fallback-window");
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -3345,11 +3187,14 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
         .expect("open db"),
     );
     let scope = test_scope();
+    // One chunk covers 101..=110, across the first wallet's cursor at 105.
     let artifact_source = checkpointed_wallet_artifact_source(&scope, 101, 110, 110);
     let squid = GraphqlServer::spawn(vec![
         r#"{"errors":[{"message":"indexed source unavailable"}]}"#,
     ]);
-    let rpc = JsonRpcServer::spawn(vec![serde_json::json!("0x64")]);
+    // The RPC head stays below every requested target, so the standalone
+    // candidate and the background warm both fail before any data request.
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 100, |_, _, _| None));
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![rpc.url.clone()],
         Duration::from_secs(1),
@@ -3388,12 +3233,10 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
         .expect("artifact fallback startup completed")
         .expect("wallet readiness succeeded");
     assert_eq!(first.last_scanned(), Some(110));
-    assert_eq!(artifact_source.server.request_count(), 3);
-    assert!(
-        rpc.requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("failed RPC hedge request")
-            .contains("eth_blockNumber")
+    assert_eq!(
+        artifact_source.server.request_count(),
+        3,
+        "manifest, catalog, and the whole chunk spanning the cursor"
     );
     assert!(
         squid
@@ -3401,6 +3244,28 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
             .recv_timeout(Duration::from_secs(1))
             .expect("failed Squid hedge request")
             .contains("query WalletProbe")
+    );
+
+    let mut bodies = Vec::new();
+    yield_until("failed hedge RPC and background warm head reads", || {
+        bodies.extend(rpc.drain_request_bodies());
+        bodies.len() == 2 && !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body["method"] == "eth_blockNumber"),
+        "neither RPC path issued a data request"
+    );
+    assert_eq!(
+        service
+            .public_data_plane
+            .cached_wallet_scan_suffix(101, 110)
+            .await
+            .and_then(|applies| applies.first().map(|apply| apply.from_block)),
+        Some(106),
+        "chunk rows before the cursor are neither delivered nor recorded"
     );
 
     service.unregister_all_wallets().await;
@@ -3412,7 +3277,7 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
     db.put_wallet_meta(
         &second_cfg.cache_key,
         &WalletMeta {
-            last_scanned_block: 104,
+            last_scanned_block: 105,
             updated_at: 1,
             last_scanned_block_hash: None,
         },
@@ -3424,15 +3289,15 @@ async fn failed_short_startup_hedge_uses_artifact_window_and_reuses_it() {
         .expect("register replacement wallet");
     tokio::time::timeout(Duration::from_secs(1), second.wait_until_ready())
         .await
-        .expect("replacement wallet reused artifact warm window")
+        .expect("replacement wallet reused artifact rows")
         .expect("wallet readiness succeeded");
     assert_eq!(second.last_scanned(), Some(110));
     assert_eq!(
         artifact_source.server.request_count(),
         3,
-        "replacement wallet should reuse the cached acquisition window without HTTP"
+        "replacement wallet should reuse the cached delivery range without HTTP"
     );
-    assert!(rpc.requests.try_recv().is_err());
+    assert!(rpc.drain_request_bodies().is_empty());
     assert!(squid.requests.try_recv().is_err());
 
     service.unregister_all_wallets().await;
@@ -3651,6 +3516,7 @@ async fn active_backfill_drains_reset_replacement_request() {
             follow_safe_head: true,
             progress_start_block: 80,
             acquisition_range: None,
+            startup_warm_range: None,
             driver: test_backfill_driver(new_sender, 1, 2),
         })
         .expect("queue reset replacement backfill");
@@ -3732,6 +3598,7 @@ async fn active_backfill_ignores_stale_replacement_request() {
             follow_safe_head: true,
             progress_start_block: 80,
             acquisition_range: None,
+            startup_warm_range: None,
             driver: test_backfill_driver(stale_sender, 0, 1),
         })
         .expect("queue stale replacement backfill");
@@ -3774,6 +3641,7 @@ async fn active_backfill_ignores_same_key_stale_token_request() {
             follow_safe_head: true,
             progress_start_block: 80,
             acquisition_range: None,
+            startup_warm_range: None,
             driver: stale_driver,
         })
         .expect("queue same-key stale request");
@@ -3837,6 +3705,7 @@ async fn old_backfill_add_after_remove_cannot_replace_successor() {
             follow_safe_head: false,
             progress_start_block: 200,
             acquisition_range: None,
+            startup_warm_range: None,
             driver: test_backfill_driver_for_actor(successor_sender, 2, 1, 3),
         })
         .expect("queue successor add");
@@ -3848,6 +3717,7 @@ async fn old_backfill_add_after_remove_cannot_replace_successor() {
             follow_safe_head: false,
             progress_start_block: 150,
             acquisition_range: None,
+            startup_warm_range: None,
             driver: stale_driver,
         })
         .expect("queue stale old add");
@@ -4417,6 +4287,7 @@ async fn backfill_slot_rejects_different_wallet_without_changing_active_target()
             follow_safe_head: false,
             progress_start_block: 120,
             acquisition_range: None,
+            startup_warm_range: None,
             driver: other_driver,
         })
         .await
@@ -4581,7 +4452,7 @@ async fn wallet_backfill_loop_rebases_non_contiguous_cursor_to_actor_progress() 
 }
 
 #[tokio::test]
-async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
+async fn wallet_backfill_loop_delivers_tail_before_warming_startup_gap_once() {
     let root_dir = temp_db_root("wallet-backfill-cached-suffix");
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -4591,11 +4462,12 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
     );
     let scope = test_scope();
     let rpc = JsonRpcServer::spawn(vec![
+        serde_json::json!([]),
+        rpc_block(110, 1_700_000_110, 0x22),
+        serde_json::json!("0x6e"),
         serde_json::json!([rpc_nullifiers_log(scope.railgun_contract, 103)]),
         rpc_block(103, 1_700_000_103, 0x13),
         rpc_block(105, 1_700_000_105, 0x11),
-        serde_json::json!([]),
-        rpc_block(110, 1_700_000_110, 0x22),
     ]);
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![rpc.url.clone()],
@@ -4702,20 +4574,23 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
 
     assert_test_backfill_actor_current(&service, &registered).await;
     backfill_request_tx
-        .send(BackfillRequest::add_with_acquisition(
-            &cache_key,
-            106,
-            110,
-            false,
-            106,
-            (100, 105),
-            test_backfill_driver_for_actor(
-                wallet_tx,
-                registered.actor_id(),
-                0,
-                SYNTHETIC_BACKFILL_JOB_ID,
-            ),
-        ))
+        .send(
+            BackfillRequest::add_with_acquisition(
+                &cache_key,
+                106,
+                110,
+                false,
+                106,
+                (106, 110),
+                test_backfill_driver_for_actor(
+                    wallet_tx,
+                    registered.actor_id(),
+                    0,
+                    SYNTHETIC_BACKFILL_JOB_ID,
+                ),
+            )
+            .with_startup_warm_range(Some((100, 105))),
+        )
         .await
         .expect("send wallet backfill request");
     tokio::time::timeout(Duration::from_secs(2), actor)
@@ -4723,51 +4598,24 @@ async fn wallet_backfill_loop_acquires_warm_gap_once_before_delivering_tail() {
         .expect("cached suffix backfill completed")
         .expect("actor response task completed");
 
-    let mut requests: Vec<String> = Vec::new();
-    while requests
-        .iter()
-        .filter(|request| request.contains("eth_getLogs"))
-        .count()
-        < 2
-    {
-        requests.push(
-            rpc.requests
-                .recv_timeout(Duration::from_secs(1))
-                .expect("RPC backfill request"),
-        );
-    }
-    let get_logs = requests
-        .iter()
-        .filter(|request| request.contains("eth_getLogs"))
-        .collect::<Vec<_>>();
-    assert_eq!(get_logs.len(), 2);
+    let mut bodies = Vec::new();
+    yield_until("delivery tail and startup gap warm", || {
+        bodies.extend(rpc.drain_request_bodies());
+        bodies.len() == 6 && !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
     assert_eq!(
-        get_logs
-            .iter()
-            .filter(|request| request.contains(r#""fromBlock":"0x64""#))
-            .count(),
-        1,
-        "warm acquisition range must be fetched exactly once"
-    );
-    assert!(
-        get_logs
-            .iter()
-            .any(|request| request.contains(r#""fromBlock":"0x64""#)
-                && request.contains(r#""toBlock":"0x69""#))
-    );
-    assert!(
-        get_logs
-            .iter()
-            .any(|request| request.contains(r#""fromBlock":"0x6a""#)
-                && request.contains(r#""toBlock":"0x6e""#))
+        get_logs_ranges(&bodies),
+        vec![(106, 110), (100, 105)],
+        "the tail is delivered first and the gap is warmed exactly once"
     );
     assert!(
         service
             .public_data_plane
-            .cached_wallet_scan_exact(106, 110)
+            .cached_wallet_scan_exact(100, 110)
             .await
             .is_some(),
-        "successful delivery must remain replayable"
+        "delivery and warming together leave the window replayable"
     );
 
     service.unregister_wallet(&registered).await;
@@ -7869,6 +7717,42 @@ async fn install_test_backfill_actor(
         .expect("register matching backfill actor")
 }
 
+#[tokio::test]
+async fn merkle_artifact_catch_up_targets_indexed_height_past_last_commitment() {
+    let scope = test_scope();
+    let indexed_through_hash = [0x44; 32];
+    let leaves = [(0, U256::from(11)), (1, U256::from(12))];
+    // Commitments are indexed through block 120, but the newest commitment is at block 110.
+    let artifact_source =
+        commitment_artifact_source(&scope, 120, indexed_through_hash, 110, &leaves);
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+
+    let mut forest = MerkleForest::new();
+    let catch_up = run_merkle_artifact_catch_up_into(&mut forest, &chain, 100, 150, None)
+        .await
+        .expect("merkle artifact catch-up")
+        .expect("commitment artifacts are complete through the indexed height");
+
+    assert_eq!(catch_up.target_block, 120);
+    assert_eq!(catch_up.target_block_hash, indexed_through_hash);
+    let mut expected = MerkleForest::new();
+    for (tree_position, hash) in leaves {
+        expected
+            .insert_leaf(MerkleTreeUpdate {
+                tree_number: 0,
+                tree_position,
+                hash,
+            })
+            .expect("insert expected leaf");
+    }
+    expected.compute_roots();
+    assert_eq!(forest.roots(), expected.roots());
+}
+
 struct TestArtifactSource {
     config: IndexedArtifactSourceConfig,
     server: PathServer,
@@ -7899,6 +7783,7 @@ struct PathServerBlock {
 struct PathServer {
     url: Url,
     requests: Arc<AtomicU64>,
+    paths: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl PathServer {
@@ -7944,26 +7829,38 @@ impl PathServer {
         .expect("path server url");
         let routes = Arc::new(routes);
         let requests = Arc::new(AtomicU64::new(0));
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
         std::thread::spawn({
             let routes = Arc::clone(&routes);
             let requests = Arc::clone(&requests);
+            let paths = Arc::clone(&paths);
             move || {
                 for _ in 0..request_count {
                     let (stream, _) = listener.accept().expect("accept path request");
                     requests.fetch_add(1, Ordering::AcqRel);
                     let routes = Arc::clone(&routes);
                     let block = block.clone();
+                    let paths = Arc::clone(&paths);
                     std::thread::spawn(move || {
-                        handle_path_request(stream, &routes, block.as_deref());
+                        handle_path_request(stream, &routes, block.as_deref(), &paths);
                     });
                 }
             }
         });
-        Self { url, requests }
+        Self {
+            url,
+            requests,
+            paths,
+        }
     }
 
     fn request_count(&self) -> u64 {
         self.requests.load(Ordering::Acquire)
+    }
+
+    /// Paths of the requests read so far, in arrival order.
+    fn requested_paths(&self) -> Vec<String> {
+        self.paths.lock().expect("path server paths lock").clone()
     }
 }
 
@@ -7985,10 +7882,6 @@ struct JsonRpcServer {
 impl GraphqlServer {
     fn spawn(responses: Vec<&'static str>) -> Self {
         Self::spawn_controlled(responses.into_iter().map(str::to_owned).collect(), None)
-    }
-
-    fn spawn_owned(responses: Vec<String>) -> Self {
-        Self::spawn_controlled(responses, None)
     }
 
     fn spawn_with_blocked_response(
@@ -8172,8 +8065,13 @@ fn handle_path_request(
     mut stream: std::net::TcpStream,
     routes: &HashMap<String, Vec<u8>>,
     block: Option<&PathServerBlock>,
+    paths: &std::sync::Mutex<Vec<String>>,
 ) {
     let path = read_request_path(&mut stream);
+    paths
+        .lock()
+        .expect("path server paths lock")
+        .push(path.clone());
     if let Some(block) = block.as_ref()
         && block.path == path
     {
@@ -8685,6 +8583,141 @@ fn empty_wallet_scan_chunk_bytes(scope: &ChainScope, start: u64, end: u64) -> Ve
     bytes
 }
 
+/// Serves a signed manifest with one Commitments catalog holding one chunk. Every leaf is in
+/// tree 0 and sits at `commitment_block`; the manifest reports Commitments indexed through
+/// `indexed_through_block`. The server answers one full catch-up (manifest, catalog, chunk).
+fn commitment_artifact_source(
+    scope: &ChainScope,
+    indexed_through_block: u64,
+    indexed_through_hash: [u8; 32],
+    commitment_block: u64,
+    leaves: &[(u64, U256)],
+) -> TestArtifactSource {
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let start = leaves.first().map_or(0, |leaf| leaf.0);
+    let end = leaves.last().map_or(0, |leaf| leaf.0);
+    let row_count = u64::try_from(leaves.len()).expect("commitment row count");
+    let range = IndexedArtifactRange {
+        kind: IndexedArtifactRangeKind::TreePosition,
+        start,
+        end,
+    };
+    let mut payload = Vec::new();
+    write_u64(&mut payload, row_count);
+    for (tree_position, hash) in leaves {
+        write_u64(&mut payload, *tree_position);
+        write_u64(&mut payload, commitment_block);
+        payload.push(0);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        write_u64(&mut payload, *tree_position);
+        payload.extend_from_slice(&hash.to_be_bytes::<32>());
+    }
+    let payload_len = u64::try_from(payload.len()).expect("commitment payload len");
+    let chunk_bytes = IndexedArtifactChunkEnvelope::new(
+        IndexedArtifactChunkEnvelopeHeader::new(
+            IndexedDatasetKind::Commitments,
+            scope.clone(),
+            range.clone(),
+            row_count,
+            payload_len,
+            vec![IndexedArtifactChunkSection {
+                section_id: 1,
+                offset: 0,
+                byte_length: payload_len,
+            }],
+        ),
+        payload,
+    )
+    .encode()
+    .expect("encode commitment chunk");
+    let chunk_cid = raw_cid(&chunk_bytes);
+    let chunk_descriptor = IndexedArtifactDescriptor {
+        dataset_kind: IndexedDatasetKind::Commitments,
+        range: range.clone(),
+        ..wallet_artifact_descriptor(
+            scope.clone(),
+            start,
+            end,
+            row_count,
+            chunk_cid,
+            &chunk_bytes,
+            DatasetDescriptorMetadata {
+                checkpoint_block: Some(commitment_block),
+                start_block: Some(commitment_block),
+                end_block: Some(commitment_block),
+                ..Default::default()
+            },
+            CompressionAlgorithm::None,
+        )
+    };
+    let catalog = IndexedArtifactCatalog {
+        format_version: INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION,
+        dataset_kind: IndexedDatasetKind::Commitments,
+        scope: scope.clone(),
+        chunks: vec![chunk_descriptor.clone()],
+    };
+    let catalog_bytes = serde_json::to_vec(&catalog).expect("catalog json");
+    let catalog_cid = raw_cid(&catalog_bytes);
+    let catalog_descriptor = IndexedArtifactDescriptor {
+        dataset_kind: IndexedDatasetKind::Commitments,
+        range,
+        ..wallet_artifact_descriptor(
+            scope.clone(),
+            start,
+            end,
+            row_count,
+            catalog_cid,
+            &catalog_bytes,
+            DatasetDescriptorMetadata::default(),
+            CompressionAlgorithm::None,
+        )
+    };
+    let mut manifest = IndexedArtifactManifest::new(
+        1_700_000_000_000,
+        1,
+        PublisherIdentity::ed25519(FixedBytes::from(signing_key.verifying_key().to_bytes())),
+        vec![IndexedArtifactChainEntry {
+            scope: scope.clone(),
+            latest_indexed: vec![LatestIndexedHeight {
+                dataset_kind: IndexedDatasetKind::Commitments,
+                block_number: indexed_through_block,
+                block_hash: FixedBytes::from(indexed_through_hash),
+            }],
+            catalogs: vec![catalog_descriptor],
+        }],
+    );
+    manifest.sign_manifest(&signing_key).expect("sign manifest");
+    let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest json");
+    let routes = HashMap::from([
+        ("/manifest.json".to_string(), manifest_bytes),
+        (
+            format!("/ipfs/{catalog_cid}?format=car&dag-scope=entity"),
+            car_bytes(catalog_cid, &[(catalog_cid, catalog_bytes)]),
+        ),
+        (
+            format!("/ipfs/{chunk_cid}?format=car&dag-scope=entity"),
+            car_bytes(chunk_cid, &[(chunk_cid, chunk_bytes)]),
+        ),
+    ]);
+    let server = PathServer::spawn(routes, 3);
+    let config = IndexedArtifactSourceConfig {
+        trusted_publisher_pubkey: FixedBytes::from(signing_key.verifying_key().to_bytes()),
+        manifest_source: IndexedArtifactManifestSource::Url(
+            server.url.join("/manifest.json").expect("manifest url"),
+        ),
+        gateway_urls: vec![server.url.clone()],
+        gateway_pool: None,
+        max_manifest_age: None,
+        concurrency: 1,
+        max_in_flight_bytes: 1024 * 1024,
+    };
+    TestArtifactSource {
+        config,
+        server,
+        chunk_descriptors: vec![chunk_descriptor],
+    }
+}
+
 fn test_wallet_config(scope: &ChainScope, quick_sync_endpoint: Url) -> WalletConfig {
     WalletConfig {
         chain: ChainKey {
@@ -8793,4 +8826,1549 @@ fn temp_db_root(name: &str) -> PathBuf {
         .as_nanos();
     let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("sync-service-{name}-{unique}-{counter}"))
+}
+
+fn rpc_error_response(code: i64, message: &str) -> ChainError {
+    let payload = serde_json::json!({ "code": code, "message": message }).to_string();
+    ChainError::Rpc(TransportError::ErrorResp(
+        serde_json::from_str(&payload).expect("JSON-RPC error payload"),
+    ))
+}
+
+#[test]
+fn log_range_limit_classifies_only_observed_provider_rejections() {
+    let block_span = |max_blocks| Some(LogRangeLimit::BlockSpan { max_blocks });
+    for (code, message, expected) in [
+        (
+            -32001,
+            "Block range too large: maximum allowed is 50 blocks",
+            block_span(Some(50)),
+        ),
+        (
+            -32000,
+            "log query range must not exceed 25 blocks",
+            block_span(Some(25)),
+        ),
+        (
+            -32000,
+            "eth_getLogs is limited to 0 - 50 blocks range",
+            block_span(Some(50)),
+        ),
+        (
+            35,
+            "ranges over 10000 blocks are not supported on freemium",
+            block_span(Some(10_000)),
+        ),
+        (
+            -32600,
+            "You can make eth_getLogs requests with up to a 10 block range. Based on your parameters, this block range should work: [0x1e4a1c8e, 0x1e4a1c97]",
+            block_span(Some(10)),
+        ),
+        (
+            -32005,
+            "query returned more than 10000 results",
+            Some(LogRangeLimit::ResultSize),
+        ),
+        (
+            -32005,
+            "Query returned more than 10000 results. Try with this block range [0x1, 0x2].",
+            Some(LogRangeLimit::ResultSize),
+        ),
+        (
+            -32000,
+            "log query range must not exceed the plan's blocks",
+            block_span(None),
+        ),
+        (-32000, "header not found", None),
+    ] {
+        assert_eq!(
+            rpc_error_response(code, message).log_range_limit(),
+            expected,
+            "{message}"
+        );
+    }
+
+    // A cancelled log fetch is not an endpoint failure.
+    assert!(!ChainError::LogFetchCancelled.should_mark_rpc_unhealthy());
+    assert!(matches!(
+        WalletStartupSyncError::from(ChainError::LogFetchCancelled),
+        WalletStartupSyncError::Cancelled
+    ));
+    // An unverified archive endpoint says nothing about the regular endpoint.
+    assert!(!ChainError::ArchiveRpcUnverified.should_mark_rpc_unhealthy());
+}
+
+#[tokio::test]
+async fn startup_and_chain_errors_without_url_remove_endpoint_from_display() {
+    use alloy_provider::Provider as _;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+    let port = listener.local_addr().expect("listener addr").port();
+    drop(listener);
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/key-abc")).expect("rpc url");
+    let squid_err = reqwest::Client::new()
+        .get(url.as_str())
+        .send()
+        .await
+        .expect_err("closed port refuses the request");
+    let err = WalletStartupSyncError::Indexed(merkletree::errors::SyncError::Request(squid_err));
+
+    let unredacted = err.to_string();
+    assert!(unredacted.contains("key-abc"), "{unredacted}");
+    let redacted = err.without_url().to_string();
+    assert!(
+        !redacted.contains("key-abc") && !redacted.contains("127.0.0.1"),
+        "{redacted}"
+    );
+
+    let rpcs = QueryRpcPool::new(vec![url], Duration::from_secs(1));
+    let rpc = rpcs.random_provider().expect("rpc provider");
+    let err = ChainError::from(
+        rpc.provider
+            .get_block_number()
+            .await
+            .expect_err("closed port refuses the request"),
+    );
+
+    let unredacted = err.to_string();
+    assert!(unredacted.contains("key-abc"), "{unredacted}");
+    let redacted = err.without_url().to_string();
+    assert!(
+        !redacted.contains("key-abc") && !redacted.contains("127.0.0.1"),
+        "{redacted}"
+    );
+}
+
+impl JsonRpcServer {
+    /// Serves every request with `handler`, which maps the parsed request body
+    /// to the response's `result` or `error` member.
+    fn spawn_handler(
+        handler: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind json-rpc server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("json-rpc server url");
+        let (request_tx, requests) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("accept json-rpc request");
+                let request = read_http_request(&mut stream);
+                let body = json_rpc_request_body(&request);
+                if request_tx.send(request).is_err() {
+                    break;
+                }
+                let mut response = handler(&body);
+                response["jsonrpc"] = serde_json::json!("2.0");
+                response["id"] = body["id"].clone();
+                let response = response.to_string();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                let _ = stream
+                    .write_all(headers.as_bytes())
+                    .and_then(|()| stream.write_all(response.as_bytes()));
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn drain_request_bodies(&self) -> Vec<serde_json::Value> {
+        self.requests
+            .try_iter()
+            .map(|request| json_rpc_request_body(&request))
+            .collect()
+    }
+}
+
+fn json_rpc_request_body(request: &str) -> serde_json::Value {
+    let body_start = request
+        .find("\r\n\r\n")
+        .map_or(request.len(), |index| index + 4);
+    serde_json::from_str(&request[body_start..]).expect("json-rpc request body")
+}
+
+fn hex_quantity(value: &serde_json::Value) -> u64 {
+    let hex = value.as_str().expect("hex quantity");
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16).expect("hex quantity")
+}
+
+const fn test_block_timestamp(block_number: u64) -> u64 {
+    1_700_000_000 + block_number
+}
+
+fn rpc_nullifiers_log_with_timestamp(contract: Address, block_number: u64) -> serde_json::Value {
+    let mut log = rpc_nullifiers_log(contract, block_number);
+    log["blockTimestamp"] = serde_json::json!(format!("{:#x}", test_block_timestamp(block_number)));
+    log
+}
+
+fn rpc_error(code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({ "code": code, "message": message })
+}
+
+fn reject_spans_over_25(
+    from_block: u64,
+    to_block: u64,
+    _log_count: usize,
+) -> Option<serde_json::Value> {
+    (to_block - from_block + 1 > 25)
+        .then(|| rpc_error(-32000, "log query range must not exceed 25 blocks"))
+}
+
+/// Serves `eth_getLogs` from `logs` unless `reject` returns an error for the
+/// requested range and its log count, plus block-number and header reads.
+fn log_range_rpc_handler(
+    logs: Vec<serde_json::Value>,
+    head: u64,
+    reject: impl Fn(u64, u64, usize) -> Option<serde_json::Value> + Send + 'static,
+) -> impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static {
+    move |request: &serde_json::Value| {
+        let params = &request["params"];
+        match request["method"].as_str() {
+            Some("eth_getLogs") => {
+                let from_block = hex_quantity(&params[0]["fromBlock"]);
+                let to_block = hex_quantity(&params[0]["toBlock"]);
+                let matching = logs
+                    .iter()
+                    .filter(|log| {
+                        (from_block..=to_block).contains(&hex_quantity(&log["blockNumber"]))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                reject(from_block, to_block, matching.len()).map_or_else(
+                    || serde_json::json!({ "result": matching }),
+                    |error| serde_json::json!({ "error": error }),
+                )
+            }
+            Some("eth_blockNumber") => serde_json::json!({ "result": format!("{head:#x}") }),
+            Some("eth_getBlockByNumber") => {
+                let block_number = hex_quantity(&params[0]);
+                serde_json::json!({
+                    "result": rpc_block(block_number, test_block_timestamp(block_number), 0x11),
+                })
+            }
+            _ => serde_json::json!({ "error": rpc_error(-32601, "method not found") }),
+        }
+    }
+}
+
+/// Serves requests through `serve`, holding each listed `eth_getLogs` range,
+/// in order, until its receiver yields.
+fn gated_get_logs_handler(
+    serve: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
+    gates: Vec<((u64, u64), std_mpsc::Receiver<()>)>,
+) -> impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static {
+    let gates = std::sync::Mutex::new(std::collections::VecDeque::from(gates));
+    move |request: &serde_json::Value| {
+        if request["method"] == "eth_getLogs" {
+            let range = (
+                hex_quantity(&request["params"][0]["fromBlock"]),
+                hex_quantity(&request["params"][0]["toBlock"]),
+            );
+            let gate = {
+                let mut gates = gates.lock().expect("gate lock");
+                if gates.front().is_some_and(|(gated, _)| *gated == range) {
+                    gates.pop_front()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, release)) = gate {
+                let _ = release.recv();
+            }
+        }
+        serve(request)
+    }
+}
+
+fn get_logs_ranges(bodies: &[serde_json::Value]) -> Vec<(u64, u64)> {
+    bodies
+        .iter()
+        .filter(|body| body["method"] == "eth_getLogs")
+        .map(|body| {
+            (
+                hex_quantity(&body["params"][0]["fromBlock"]),
+                hex_quantity(&body["params"][0]["toBlock"]),
+            )
+        })
+        .collect()
+}
+
+fn header_blocks(bodies: &[serde_json::Value]) -> Vec<u64> {
+    bodies
+        .iter()
+        .filter(|body| body["method"] == "eth_getBlockByNumber")
+        .map(|body| hex_quantity(&body["params"][0]))
+        .collect()
+}
+
+fn log_fetch_chain(scope: &ChainScope, rpc_url: Url, block_range: u64) -> ChainConfig {
+    let rpcs = Arc::new(QueryRpcPool::new(vec![rpc_url], Duration::from_secs(1)));
+    let mut chain = test_chain_config(scope, rpcs, None);
+    chain.sync.block_range = block_range;
+    chain
+}
+
+async fn fetch_sorted_logs(
+    chain: &ChainConfig,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<Log>, ChainError> {
+    let rpc = chain.rpcs.random_provider().expect("rpc provider");
+    let mut logs = chain
+        .fetch_logs_for_range(&rpc, None, from_block, to_block, &CancellationToken::new())
+        .await?;
+    sort_logs(&mut logs);
+    Ok(logs)
+}
+
+#[tokio::test]
+async fn log_fetch_narrows_to_endpoint_span_limit_and_reuses_it() {
+    let scope = test_scope();
+    let logs = [1003, 1100, 1250, 1499, 1520]
+        .into_iter()
+        .map(|block| rpc_nullifiers_log(scope.railgun_contract, block))
+        .collect::<Vec<_>>();
+    let unlimited =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(logs.clone(), 1600, |_, _, _| None));
+    let limited =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(logs, 1600, reject_spans_over_25));
+    let mut unlimited_chain = log_fetch_chain(&scope, unlimited.url.clone(), 500);
+    let limited_chain = log_fetch_chain(&scope, limited.url.clone(), 500);
+
+    let expected = fetch_sorted_logs(&unlimited_chain, 1001, 1500)
+        .await
+        .expect("unlimited endpoint logs");
+    let fetched = fetch_sorted_logs(&limited_chain, 1001, 1500)
+        .await
+        .expect("span-limited endpoint completes the logical range");
+
+    assert_eq!(expected.len(), 4);
+    assert_eq!(fetched, expected);
+    let expected_ranges = std::iter::once((1001, 1500))
+        .chain((0..20).map(|chunk| (1001 + chunk * 25, 1025 + chunk * 25)))
+        .collect::<Vec<(u64, u64)>>();
+    assert_eq!(
+        get_logs_ranges(&limited.drain_request_bodies()),
+        expected_ranges,
+        "one rejected request, then contiguous spans of the parsed limit"
+    );
+
+    let second = fetch_sorted_logs(&limited_chain, 1501, 1550)
+        .await
+        .expect("second range on the same pool");
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        get_logs_ranges(&limited.drain_request_bodies()),
+        vec![(1501, 1525), (1526, 1550)],
+        "later ranges reuse the learned span without a wide request"
+    );
+
+    // Through an archive provider, the archive learns its own span while the
+    // regular provider's slot keeps the full range.
+    unlimited_chain.sync.archive_until_block = 1250;
+    let archive = broadcaster_core::provider::build_provider(&limited.url)
+        .await
+        .expect("archive provider");
+    let rpc = unlimited_chain
+        .rpcs
+        .random_provider()
+        .expect("rpc provider");
+    let mut through_archive = unlimited_chain
+        .fetch_logs_for_range(&rpc, Some(&archive), 1001, 1500, &CancellationToken::new())
+        .await
+        .expect("archive and regular providers complete the logical range");
+    sort_logs(&mut through_archive);
+    assert_eq!(through_archive, expected);
+    assert_eq!(
+        get_logs_ranges(&limited.drain_request_bodies()),
+        std::iter::once((1001, 1250))
+            .chain((0..10).map(|chunk| (1001 + chunk * 25, 1025 + chunk * 25)))
+            .collect::<Vec<(u64, u64)>>(),
+        "the archive range narrows on the archive's own rejection"
+    );
+    assert_eq!(
+        unlimited_chain.rpcs.log_span(LogSpanEndpoint::Archive, 500),
+        25
+    );
+    assert_eq!(
+        unlimited_chain
+            .rpcs
+            .log_span(LogSpanEndpoint::Provider(0), 500),
+        500
+    );
+}
+
+#[tokio::test]
+async fn log_fetch_splits_result_size_rejection_without_narrowing_span() {
+    let scope = test_scope();
+    let logs = [1003, 1100, 1250, 1499]
+        .into_iter()
+        .map(|block| rpc_nullifiers_log(scope.railgun_contract, block))
+        .collect::<Vec<_>>();
+    let server =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(logs, 1600, |_, _, log_count| {
+            (log_count > 3).then(|| rpc_error(-32005, "query returned more than 10000 results"))
+        }));
+    let chain = log_fetch_chain(&scope, server.url.clone(), 500);
+
+    let fetched = fetch_sorted_logs(&chain, 1001, 1500)
+        .await
+        .expect("result-size rejection is split");
+
+    assert_eq!(fetched.len(), 4);
+    assert_eq!(
+        get_logs_ranges(&server.drain_request_bodies()),
+        vec![(1001, 1500), (1001, 1250), (1251, 1500)],
+        "only the rejected request is split"
+    );
+    assert_eq!(
+        chain.rpcs.log_span(LogSpanEndpoint::Provider(0), 500),
+        500,
+        "result-size rejections leave the learned span unchanged"
+    );
+}
+
+#[tokio::test]
+async fn log_fetch_returns_unrecognized_and_single_block_rejections() {
+    let scope = test_scope();
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let unrecognized =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 1600, |_, _, _| {
+            Some(rpc_error(-32000, "header not found"))
+        }));
+    let chain = log_fetch_chain(&scope, unrecognized.url.clone(), 500);
+
+    let err = fetch_sorted_logs(&chain, 1001, 1500)
+        .await
+        .expect_err("unrecognized error is returned");
+
+    assert!(matches!(err, ChainError::Rpc(_)) && err.log_range_limit().is_none());
+    assert_eq!(
+        get_logs_ranges(&unrecognized.drain_request_bodies()),
+        vec![(1001, 1500)],
+        "unrecognized errors are not retried"
+    );
+    assert_eq!(chain.rpcs.log_span(LogSpanEndpoint::Provider(0), 500), 500);
+    let unmatched = events.find("eth_getLogs error is not a recognized range limit");
+    assert_eq!(unmatched.get("code").map(String::as_str), Some("-32000"));
+
+    let saturated =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 1600, |_, _, _| {
+            Some(rpc_error(-32005, "query returned more than 10000 results"))
+        }));
+    let chain = log_fetch_chain(&scope, saturated.url.clone(), 500);
+
+    let err = fetch_sorted_logs(&chain, 1001, 1004)
+        .await
+        .expect_err("single-block rejection is an endpoint failure");
+
+    assert_eq!(err.log_range_limit(), Some(LogRangeLimit::ResultSize));
+    assert!(err.should_mark_rpc_unhealthy());
+    assert_eq!(
+        get_logs_ranges(&saturated.drain_request_bodies()),
+        vec![(1001, 1004), (1001, 1002), (1001, 1001)]
+    );
+}
+
+#[tokio::test]
+async fn log_block_timestamps_request_headers_only_for_blocks_without_log_timestamps() {
+    let scope = test_scope();
+    let contract = scope.railgun_contract;
+    let server =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 1600, |_, _, _| None));
+    let chain = log_fetch_chain(&scope, server.url.clone(), 100);
+    let rpc = chain.rpcs.random_provider().expect("rpc provider");
+    let log = |block_number, with_timestamp| {
+        serde_json::from_value::<Log>(if with_timestamp {
+            rpc_nullifiers_log_with_timestamp(contract, block_number)
+        } else {
+            rpc_nullifiers_log(contract, block_number)
+        })
+        .expect("RPC log")
+    };
+    let partial = [
+        log(1003, true),
+        log(1050, false),
+        log(1070, true),
+        log(1070, false),
+    ];
+    let without_timestamps = [log(1003, false), log(1050, false), log(1070, false)];
+
+    let from_logs = chain
+        .fetch_log_block_timestamps(&rpc.provider, None, &partial)
+        .await
+        .expect("partial log timestamps");
+    assert_eq!(
+        header_blocks(&server.drain_request_bodies()),
+        vec![1050],
+        "headers are requested only for blocks whose logs all lack a timestamp"
+    );
+    let from_headers = chain
+        .fetch_log_block_timestamps(&rpc.provider, None, &without_timestamps)
+        .await
+        .expect("header timestamps");
+    assert_eq!(
+        header_blocks(&server.drain_request_bodies()),
+        vec![1003, 1050, 1070]
+    );
+
+    assert_eq!(from_logs, from_headers);
+}
+
+#[tokio::test]
+async fn wallet_startup_rpc_candidate_completes_on_span_limited_endpoint() {
+    let root_dir = temp_db_root("wallet-startup-span-limited-rpc");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(
+        vec![rpc_nullifiers_log_with_timestamp(
+            scope.railgun_contract,
+            190,
+        )],
+        200,
+        reject_spans_over_25,
+    ));
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.sync.block_range = 100;
+    chain.finality_depth = 0;
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    let mut cfg = test_wallet_config(&scope, rpc.url.clone());
+    cfg.start_block = Some(1);
+
+    let candidate = Arc::clone(&service)
+        .wallet_startup_rpc_candidate(
+            &cfg,
+            WalletShortStartupPlan::new(1, 150, 200, 100).expect("short startup plan"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("RPC startup candidate completes through narrower requests");
+
+    assert_eq!(candidate.applies.len(), 1);
+    let WalletScanRowsPayload::Rows(rows) = &candidate.applies[0].rows.payload else {
+        panic!("RPC delivery rows expected");
+    };
+    assert_eq!(rows.nullifiers.len(), 1);
+    assert_eq!(
+        rows.nullifiers[0].source.block_timestamp,
+        test_block_timestamp(190)
+    );
+    let bodies = rpc.drain_request_bodies();
+    assert_eq!(
+        get_logs_ranges(&bodies),
+        vec![(151, 200), (151, 175), (176, 200)],
+        "the delivery range after the cursor completes through narrower requests"
+    );
+    assert_eq!(
+        header_blocks(&bodies),
+        vec![200],
+        "log timestamps replace header reads; the endpoint confirmation read still runs"
+    );
+    assert_eq!(
+        rpcs.available_providers().len(),
+        1,
+        "a range-limited endpoint stays eligible"
+    );
+
+    service.shutdown().await;
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn log_fetch_diagnostics_record_adaptation_without_endpoint_url() {
+    let scope = test_scope();
+    let server = JsonRpcServer::spawn_handler(log_range_rpc_handler(
+        vec![
+            rpc_nullifiers_log_with_timestamp(scope.railgun_contract, 1003),
+            rpc_nullifiers_log(scope.railgun_contract, 1050),
+        ],
+        1600,
+        reject_spans_over_25,
+    ));
+    let port = server.url.port().expect("mock RPC port");
+    let credential_url = Url::parse(&format!("http://user:secret@127.0.0.1:{port}/key-abc"))
+        .expect("credential-bearing RPC URL");
+    let chain = log_fetch_chain(&scope, credential_url.clone(), 100);
+    let rpc = chain.rpcs.random_provider().expect("rpc provider");
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+
+    let logs = chain
+        .fetch_logs_for_range(&rpc, None, 1001, 1100, &CancellationToken::new())
+        .await
+        .expect("span-limited logs");
+    let timestamps = chain
+        .fetch_log_block_timestamps(&rpc.provider, None, &logs)
+        .await
+        .expect("log block timestamps");
+    drop(guard);
+    assert_eq!(timestamps.len(), 2);
+
+    let field = |event: &BTreeMap<String, String>, name: &str| {
+        event
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing {name} field"))
+    };
+    let adaptation = events.find("narrowed eth_getLogs request after provider range limit");
+    for (name, value) in [
+        ("logical_from", "1001"),
+        ("logical_to", "1100"),
+        ("rejected_span", "100"),
+        ("next_span", "25"),
+        ("endpoint", "0"),
+        ("kind", "block_span"),
+    ] {
+        assert_eq!(field(&adaptation, name), value, "{name}");
+    }
+    let range = events.find("logical log range fetch finished");
+    assert_eq!(field(&range, "get_logs_requests"), "5");
+    assert_eq!(field(&range, "rpc_index"), "0");
+    let coverage = events.find("log block timestamp coverage");
+    assert_eq!(field(&coverage, "blocks_from_logs"), "1");
+    assert_eq!(field(&coverage, "headers_requested"), "1");
+    assert!(coverage.contains_key("elapsed_ms"));
+
+    let forbidden = [
+        credential_url.as_str(),
+        "127.0.0.1",
+        "user",
+        "secret",
+        "key-abc",
+    ];
+    for event in events.events() {
+        for value in event.values() {
+            assert!(
+                forbidden.iter().all(|needle| !value.contains(needle)),
+                "diagnostic value {value:?} exposes the endpoint"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn wallet_startup_hedge_failure_logs_omit_endpoint_url() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind refused RPC port");
+    let port = listener.local_addr().expect("refused RPC addr").port();
+    drop(listener);
+    let credential_url = Url::parse(&format!("http://user:secret@127.0.0.1:{port}/key-abc"))
+        .expect("credential-bearing RPC URL");
+    let root_dir = temp_db_root("wallet-startup-hedge-url-redaction");
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![credential_url],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, None);
+    chain.sync.block_range = 10;
+    chain.sync.indexed_wallet_block_range = 10;
+    chain.finality_depth = 0;
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    service.safe_head_tx.send_replace(110);
+
+    // Only the RPC candidate runs, and its head read is refused.
+    let mut cfg = test_wallet_config(
+        &scope,
+        Url::parse("http://127.0.0.1:1").expect("unused Squid URL"),
+    );
+    cfg.cache_key = test_cache_key("hedge-url-redaction");
+    cfg.start_block = Some(101);
+    cfg.sync_to_block = Some(110);
+    cfg.use_indexed_wallet_catch_up = false;
+    db.put_wallet_meta(
+        &cfg.cache_key,
+        &WalletMeta {
+            last_scanned_block: 105,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("seed wallet cursor");
+    let _handle = service.register_wallet(cfg).await.expect("register wallet");
+    let hedge_failed = |event: &BTreeMap<String, String>| {
+        event
+            .get("message")
+            .is_some_and(|message| message == "wallet startup hedge candidate failed")
+    };
+    yield_until("failed wallet startup hedge candidate", || {
+        events.events().iter().any(hedge_failed)
+    })
+    .await;
+
+    service.unregister_all_wallets().await;
+    service.shutdown().await;
+    drop(guard);
+
+    let failure = events.find("wallet startup hedge candidate failed");
+    let err = failure.get("err").expect("hedge failure err field");
+    assert!(
+        err.starts_with("rpc error"),
+        "the candidate failed on the transport error: {err:?}"
+    );
+    let endpoint = format!("127.0.0.1:{port}");
+    let forbidden = ["secret", "user:", "key-abc", endpoint.as_str()];
+    for event in events.events() {
+        for value in event.values() {
+            assert!(
+                forbidden.iter().all(|needle| !value.contains(needle)),
+                "log value {value:?} exposes the endpoint"
+            );
+        }
+    }
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+/// Records `sync_service` tracing events as field-name to value maps.
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+impl CapturedEvents {
+    fn capture(&self) -> CaptureGuard {
+        // With one registered dispatcher, tracing-core resolves a callsite first
+        // hit on another test thread against that thread's empty default and
+        // caches it as disabled. A second live dispatcher keeps interest computed
+        // across every registered dispatcher, including this thread's capture.
+        let registered = tracing::Dispatch::new(CaptureSubscriber(self.clone()));
+        CaptureGuard {
+            _default: tracing::subscriber::set_default(CaptureSubscriber(self.clone())),
+            _registered: registered,
+        }
+    }
+
+    fn events(&self) -> Vec<BTreeMap<String, String>> {
+        self.0.lock().expect("captured events lock").clone()
+    }
+
+    fn find(&self, message: &str) -> BTreeMap<String, String> {
+        self.events()
+            .into_iter()
+            .find(|event| event.get("message").is_some_and(|value| value == message))
+            .unwrap_or_else(|| panic!("missing {message:?} event"))
+    }
+}
+
+struct CaptureGuard {
+    _default: tracing::subscriber::DefaultGuard,
+    _registered: tracing::Dispatch,
+}
+
+struct CaptureSubscriber(CapturedEvents);
+
+struct CapturedFields<'a>(&'a mut BTreeMap<String, String>);
+
+impl tracing::field::Visit for CapturedFields<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target().starts_with("sync_service")
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = BTreeMap::new();
+        event.record(&mut CapturedFields(&mut fields));
+        self.0.0.lock().expect("captured events lock").push(fields);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+const SQUID_EMPTY_COMMITMENTS: &str = r#"{"data":{"commitments":[]}}"#;
+
+/// Loads the startup forest from block 1 with an artifact source and a Squid
+/// endpoint (height 300) configured, and returns the forest block plus the
+/// artifact and Squid request counts.
+async fn load_startup_forest_with_indexed_sources(name: &str, safe_head: u64) -> (u64, u64, usize) {
+    let scope = test_scope();
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 1, 50, 50);
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"300"}}}"#,
+        SQUID_EMPTY_COMMITMENTS,
+    ]);
+    let root_dir = temp_db_root(name);
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let rpcs = Arc::new(QueryRpcPool::new(Vec::new(), Duration::from_secs(1)));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+
+    let (_, forest_block, _, _) = db
+        .load_or_initialize_forest(&chain, safe_head, None, None)
+        .await
+        .expect("load startup forest");
+
+    let requests = (
+        forest_block,
+        artifact_source.server.request_count(),
+        squid.requests.try_iter().count(),
+    );
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    requests
+}
+
+#[tokio::test]
+async fn startup_forest_catch_up_skips_indexed_sources_only_for_short_tails() {
+    // From block 1, safe head 100 leaves a tail of exactly `block_range` blocks.
+    let (forest_block, artifact_requests, squid_requests) =
+        load_startup_forest_with_indexed_sources("startup-forest-short-tail", 100).await;
+    assert_eq!(forest_block, 0, "live RPC sync owns the short tail");
+    assert_eq!(artifact_requests, 0, "no artifact request for a short tail");
+    assert_eq!(squid_requests, 0, "no Squid request for a short tail");
+
+    let (forest_block, artifact_requests, squid_requests) =
+        load_startup_forest_with_indexed_sources("startup-forest-long-tail", 500).await;
+    assert!(artifact_requests > 0, "artifact catch-up is tried first");
+    assert_eq!(squid_requests, 2, "Squid height and commitments");
+    assert_eq!(forest_block, 300, "Squid catches up to its indexed height");
+}
+
+struct LiveForestFixture {
+    root_dir: PathBuf,
+    service: Arc<ChainService>,
+    forest_rx: watch::Receiver<u64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LiveForestFixture {
+    /// Starts the live forest loop at `forest_block` behind a fixed
+    /// `safe_head`, with the given RPC endpoints and a Squid endpoint.
+    async fn spawn(
+        name: &str,
+        rpc_urls: Vec<Url>,
+        squid_url: Url,
+        forest_block: u64,
+        safe_head: u64,
+    ) -> Self {
+        let root_dir = temp_db_root(name);
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        db.ensure_blob_dir("merkle_forest")
+            .expect("create merkle forest blob dir");
+        let snapshot_path = db.resolve_path(&DbStore::relative_blob_path(
+            "merkle_forest",
+            "live-forest.msgpack",
+        ));
+        let rpcs = Arc::new(QueryRpcPool::new(rpc_urls, Duration::from_secs(1)));
+        let mut chain = test_chain_config(&test_scope(), Arc::clone(&rpcs), None);
+        chain.sync.quick_sync_endpoint = Some(squid_url);
+        let public_data_plane =
+            ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+        let service = test_chain_service(db, chain, public_data_plane);
+        service.forest_last_tx.send_replace(forest_block);
+        service.safe_head_tx.send_replace(safe_head);
+        let forest_rx = service.forest_last_tx.subscribe();
+        let task = spawn_live_log_loop(
+            Arc::clone(&service),
+            rpcs,
+            None,
+            service.forest_last_tx.subscribe(),
+            service.safe_head_tx.subscribe(),
+            snapshot_path,
+            service.cancel.clone(),
+        );
+        // Let the loop start its stall period at the current paused instant.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        Self {
+            root_dir,
+            service,
+            forest_rx,
+            task,
+        }
+    }
+
+    fn stall_period(&self) -> Duration {
+        wallet_tail_fallback_stale_timeout(self.service.chain.block_time)
+    }
+
+    async fn stop(self) {
+        let Self {
+            root_dir,
+            service,
+            task,
+            ..
+        } = self;
+        service.cancel.cancel();
+        task.await.expect("live forest loop exits");
+        drop(service);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+/// Yields until `ready` holds. Busy-yielding keeps a paused clock from
+/// auto-advancing while mock servers answer on OS threads.
+async fn yield_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !ready() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for {what}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_live_forest_catches_up_from_squid_without_rpc_providers() {
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"150"}}}"#,
+        SQUID_EMPTY_COMMITMENTS,
+    ]);
+    let fixture = LiveForestFixture::spawn(
+        "live-forest-stall-squid",
+        Vec::new(),
+        squid.url.clone(),
+        50,
+        200,
+    )
+    .await;
+    let stall = fixture.stall_period();
+
+    tokio::time::advance(stall.saturating_sub(Duration::from_secs(1))).await;
+    assert_eq!(
+        squid.requests.try_iter().count(),
+        0,
+        "no Squid request before the stall period"
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    yield_until("Squid stall fallback", || {
+        *fixture.forest_rx.borrow() == 150
+    })
+    .await;
+    assert_eq!(
+        squid.requests.try_iter().count(),
+        2,
+        "Squid height and commitments"
+    );
+    let chain = &fixture.service.chain;
+    let meta = fixture
+        .service
+        .db
+        .get_merkle_forest_meta(
+            chain.deployment.chain_id,
+            &chain.deployment.contract.to_string(),
+        )
+        .expect("read forest meta")
+        .expect("forest meta persisted");
+    assert_eq!(meta.last_block, 150);
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn advancing_live_forest_issues_no_squid_requests() {
+    let squid = GraphqlServer::spawn(vec![r#"{"data":{"squidStatus":{"height":"400"}}}"#]);
+    let (release_page, page_gate) = std_mpsc::channel::<()>();
+    let serve = log_range_rpc_handler(Vec::new(), 400, |_, _, _| None);
+    let rpc = JsonRpcServer::spawn_handler(move |request| {
+        if request["method"] == "eth_getLogs" {
+            // Hold each page until the test has advanced the paused clock.
+            let _ = page_gate.recv();
+        }
+        serve(request)
+    });
+    let fixture = LiveForestFixture::spawn(
+        "live-forest-advancing",
+        vec![rpc.url.clone()],
+        squid.url.clone(),
+        0,
+        400,
+    )
+    .await;
+    let stall = fixture.stall_period();
+    fixture
+        .service
+        .safe_head_tx
+        .send(400)
+        .expect("wake live loop");
+
+    // Each page lands within the stall period; together they span more than it.
+    for page in 1..=3_u64 {
+        tokio::time::advance(stall.saturating_sub(Duration::from_secs(20))).await;
+        release_page.send(()).expect("release live page");
+        yield_until("live forest page", || {
+            *fixture.forest_rx.borrow() == page * 100
+        })
+        .await;
+    }
+    assert_eq!(squid.requests.try_iter().count(), 0);
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_live_squid_fallback_waits_for_cooldown() {
+    let failure = r#"{"errors":[{"message":"indexer unavailable"}]}"#;
+    let squid = GraphqlServer::spawn(vec![failure, failure]);
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn(
+        "live-forest-squid-cooldown",
+        Vec::new(),
+        squid.url.clone(),
+        50,
+        200,
+    )
+    .await;
+    let stall = fixture.stall_period();
+    let attempts = || {
+        events
+            .events()
+            .iter()
+            .filter(|event| {
+                event.get("message").is_some_and(|message| {
+                    message == "live merkle forest stall fallback to Squid finished"
+                })
+            })
+            .count()
+    };
+
+    tokio::time::advance(stall).await;
+    yield_until("first Squid attempt", || attempts() == 1).await;
+    assert_eq!(squid.requests.try_iter().count(), 1);
+
+    tokio::time::advance(stall.saturating_sub(Duration::from_secs(1))).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts(), 1, "no retry before the cooldown elapses");
+    assert_eq!(squid.requests.try_iter().count(), 0);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    yield_until("second Squid attempt", || attempts() == 2).await;
+    assert_eq!(squid.requests.try_iter().count(), 1);
+    assert_eq!(*fixture.forest_rx.borrow(), 50);
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_live_forest_checks_reorg_before_squid_fallback() {
+    let (squid, commitments) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"150"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ],
+        1,
+    );
+    // Block headers carry hash 0xbb; getLogs fails so RPC cannot advance.
+    let rpc = JsonRpcServer::spawn_handler(|request| match request["method"].as_str() {
+        Some("eth_getBlockByNumber") => {
+            let block_number = hex_quantity(&request["params"][0]);
+            serde_json::json!({
+                "result": rpc_block(block_number, test_block_timestamp(block_number), 0xbb),
+            })
+        }
+        _ => serde_json::json!({ "error": rpc_error(-32000, "unavailable") }),
+    });
+    let fixture = LiveForestFixture::spawn(
+        "live-forest-stall-reorg",
+        vec![rpc.url.clone()],
+        squid.url.clone(),
+        50,
+        200,
+    )
+    .await;
+    let service = &fixture.service;
+    let chain = &service.chain;
+    service
+        .db
+        .update_merkle_forest_meta(
+            chain.deployment.chain_id,
+            &chain.deployment.contract.to_string(),
+            &service.db.resolve_path(&DbStore::relative_blob_path(
+                "merkle_forest",
+                "live-forest.msgpack",
+            )),
+            50,
+            merkletree::persist::SNAPSHOT_VERSION,
+            [0xaa; 32],
+        )
+        .expect("persist forest meta for block 50");
+
+    tokio::time::advance(fixture.stall_period()).await;
+    yield_until("Squid commitments request", || {
+        commitments.request_started.try_recv().is_ok()
+    })
+    .await;
+    assert_eq!(
+        *fixture.forest_rx.borrow(),
+        0,
+        "the reorged forest resets before the Squid catch-up"
+    );
+    let requests = squid.requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2, "Squid height and commitments");
+    assert_eq!(
+        json_rpc_request_body(&requests[1])["variables"]["blockNumber"],
+        "1",
+        "Squid catches up from the reset block"
+    );
+
+    commitments
+        .release
+        .send(())
+        .expect("release Squid commitments");
+    yield_until("Squid stall fallback", || {
+        *fixture.forest_rx.borrow() == 150
+    })
+    .await;
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn short_startup_with_indexed_sources_behind_cursor_delivers_from_rpc_after_cursor() {
+    let root_dir = temp_db_root("short-startup-indexed-behind-cursor");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    // Both indexed sources stop at block 103, below the wallet cursor at 105.
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 101, 103, 103);
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"103"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+    ]);
+    // A head below the target fails the standalone RPC candidate, the Squid
+    // tail, and the background warm, while the backfill loop's range fetch
+    // (which does not read the head) still succeeds.
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(
+        vec![rpc_nullifiers_log_with_timestamp(
+            scope.railgun_contract,
+            108,
+        )],
+        100,
+        |_, _, _| None,
+    ));
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(
+        &scope,
+        Arc::clone(&rpcs),
+        Some(artifact_source.config.clone()),
+    );
+    chain.sync.block_range = 10;
+    chain.sync.indexed_wallet_block_range = 10;
+    chain.finality_depth = 0;
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    let public_data_plane = ChainPublicDataPlane::new(
+        Arc::clone(&db),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let (service, backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    service.safe_head_tx.send_replace(110);
+    spawn_backfill_loop(
+        Arc::clone(&service),
+        backfill_rx,
+        rpcs,
+        None,
+        service.safe_head_tx.subscribe(),
+        service.cancel.clone(),
+    );
+
+    let mut cfg = test_wallet_config(&scope, squid.url.clone());
+    cfg.cache_key = test_cache_key("indexed-behind-cursor");
+    cfg.start_block = Some(101);
+    cfg.sync_to_block = Some(110);
+    db.put_wallet_meta(
+        &cfg.cache_key,
+        &WalletMeta {
+            last_scanned_block: 105,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("seed wallet cursor");
+    let mut handle = service.register_wallet(cfg).await.expect("register wallet");
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_until_ready())
+        .await
+        .expect("RPC delivery after the cursor completed")
+        .expect("wallet readiness succeeded");
+    assert_eq!(handle.last_scanned(), Some(110));
+
+    // Head reads: the standalone candidate, the Squid tail, and the warm.
+    let mut bodies = Vec::new();
+    yield_until("startup requests and failed background warm", || {
+        bodies.extend(rpc.drain_request_bodies());
+        bodies
+            .iter()
+            .filter(|body| body["method"] == "eth_blockNumber")
+            .count()
+            == 3
+            && !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
+    assert_eq!(
+        get_logs_ranges(&bodies),
+        vec![(106, 110)],
+        "delivery comes from one RPC range that starts after the cursor"
+    );
+    let squid_requests = squid.requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(squid_requests.len(), 1);
+    assert!(
+        squid_requests[0].contains("query WalletProbe"),
+        "Squid is probed for its height but no rows are requested"
+    );
+    // Manifest and catalog reads are metadata and may run (the TXID cache
+    // loop also reads the manifest once the wallet is ready); chunks are data.
+    let artifact_paths = artifact_source.server.requested_paths();
+    assert!(artifact_paths.iter().any(|path| path == "/manifest.json"));
+    assert!(
+        artifact_source.chunk_descriptors.iter().all(|chunk| {
+            let chunk_path = format!("/ipfs/{}?format=car&dag-scope=entity", chunk.cid);
+            !artifact_paths.contains(&chunk_path)
+        }),
+        "the artifacts end before the cursor, so no chunk is fetched: {artifact_paths:?}"
+    );
+    assert_eq!(
+        service
+            .public_data_plane
+            .cached_wallet_scan_suffix(101, 110)
+            .await
+            .and_then(|applies| applies.first().map(|apply| apply.from_block)),
+        Some(106)
+    );
+
+    service.unregister_all_wallets().await;
+    service.shutdown().await;
+    drop(service);
+    drop(artifact_source.server);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn short_startup_squid_tail_below_cursor_starts_at_delivery_boundary() {
+    let root_dir = temp_db_root("short-startup-squid-tail-below-cursor");
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let hedge_winner = || {
+        events
+            .events()
+            .into_iter()
+            .find(|event| {
+                event
+                    .get("message")
+                    .is_some_and(|message| message == "wallet startup hedge complete")
+            })
+            .and_then(|event| event.get("winner").cloned())
+    };
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    // Squid stops at block 103, below the wallet cursor at 105.
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"103"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+    ]);
+    // The standalone RPC candidate reads the head first, before the Squid
+    // probe completes, and fails on a head below the target. The Squid
+    // candidate's RPC tail and the background warm see a head that covers it.
+    // The winner assertion below fails the test if that order ever changes.
+    let serve = log_range_rpc_handler(
+        vec![rpc_nullifiers_log_with_timestamp(
+            scope.railgun_contract,
+            108,
+        )],
+        110,
+        |_, _, _| None,
+    );
+    let head_reads = AtomicU64::new(0);
+    let rpc = JsonRpcServer::spawn_handler(move |request| {
+        if request["method"] == "eth_blockNumber" && head_reads.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            serde_json::json!({ "result": "0x64" })
+        } else {
+            serve(request)
+        }
+    });
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, None);
+    chain.sync.block_range = 10;
+    chain.sync.indexed_wallet_block_range = 10;
+    chain.finality_depth = 0;
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    service.safe_head_tx.send_replace(110);
+
+    let mut cfg = test_wallet_config(&scope, squid.url.clone());
+    cfg.cache_key = test_cache_key("squid-tail-below-cursor");
+    cfg.start_block = Some(101);
+    cfg.sync_to_block = Some(110);
+    db.put_wallet_meta(
+        &cfg.cache_key,
+        &WalletMeta {
+            last_scanned_block: 105,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("seed wallet cursor");
+    let mut handle = service.register_wallet(cfg).await.expect("register wallet");
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_until_ready())
+        .await
+        .expect("Squid RPC tail delivery completed")
+        .expect("wallet readiness succeeded");
+    assert_eq!(handle.last_scanned(), Some(110));
+
+    // Endpoint-block reads: the Squid tail's and the warm's.
+    let mut bodies = Vec::new();
+    yield_until("Squid tail delivery and background warm", || {
+        bodies.extend(rpc.drain_request_bodies());
+        header_blocks(&bodies).len() == 2
+            && !service.public_data_plane.public_window_warm_running()
+            && hedge_winner().is_some()
+    })
+    .await;
+    assert_eq!(
+        hedge_winner().as_deref(),
+        Some("indexed"),
+        "the Squid candidate delivered through its RPC tail"
+    );
+    assert_eq!(
+        get_logs_ranges(&bodies),
+        vec![(106, 110), (101, 105)],
+        "the RPC tail starts at the delivery boundary, not after the Squid height; \
+         the prefix is fetched by the warm after delivery"
+    );
+
+    service.unregister_all_wallets().await;
+    service.shutdown().await;
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn startup_window_warm_stops_on_public_cache_reset_and_shutdown() {
+    let root_dir = temp_db_root("startup-window-warm-reset");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let (release_first, first_gate) = std_mpsc::channel();
+    let (release_second, second_gate) = std_mpsc::channel();
+    let (release_third, third_gate) = std_mpsc::channel();
+    let rpc = JsonRpcServer::spawn_handler(gated_get_logs_handler(
+        log_range_rpc_handler(Vec::new(), 200, reject_spans_over_25),
+        vec![
+            ((1, 25), first_gate),
+            ((26, 50), second_gate),
+            ((101, 125), third_gate),
+        ],
+    ));
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, None);
+    chain.sync.block_range = 100;
+    chain.finality_depth = 0;
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    let window = PublicScanRange::new(1, 100);
+    let mut bodies = Vec::new();
+
+    // The first split request completes, then the reset lands before the
+    // warm task can issue the next one.
+    service.start_public_scan_window_warm(window).await;
+    yield_until("first split request", || {
+        bodies.extend(rpc.drain_request_bodies());
+        get_logs_ranges(&bodies).contains(&(1, 25))
+    })
+    .await;
+    release_first.send(()).expect("release first split request");
+    service
+        .public_data_plane
+        .reset_public_cache()
+        .await
+        .expect("reset between split requests");
+    assert!(!service.public_data_plane.public_window_warm_running());
+    bodies.extend(rpc.drain_request_bodies());
+    assert_eq!(get_logs_ranges(&bodies), vec![(1, 100), (1, 25)]);
+
+    // A later warm starts, and a reset cancels its in-flight request.
+    service.start_public_scan_window_warm(window).await;
+    assert!(
+        service.public_data_plane.public_window_warm_running(),
+        "the slot is free after a reset"
+    );
+    yield_until("second split request in flight", || {
+        bodies.extend(rpc.drain_request_bodies());
+        get_logs_ranges(&bodies).contains(&(26, 50))
+    })
+    .await;
+    service
+        .public_data_plane
+        .reset_public_cache()
+        .await
+        .expect("reset during an in-flight request");
+    assert!(!service.public_data_plane.public_window_warm_running());
+    release_second.send(()).expect("release cancelled request");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    bodies.extend(rpc.drain_request_bodies());
+    assert_eq!(
+        get_logs_ranges(&bodies),
+        vec![(1, 100), (1, 25), (1, 25), (26, 50)],
+        "no request follows either reset"
+    );
+    assert!(
+        header_blocks(&bodies).is_empty(),
+        "cancelled warms never prove an endpoint block"
+    );
+
+    // A held reset permit blocks new starts; after its release a warm runs
+    // uninterrupted and proves its range end.
+    let permit = service
+        .public_data_plane()
+        .acquire_public_cache_reset_permit()
+        .await;
+    service.start_public_scan_window_warm(window).await;
+    assert!(
+        !service.public_data_plane.public_window_warm_running(),
+        "no warm starts while a reset permit is held"
+    );
+    drop(permit);
+    service.start_public_scan_window_warm(window).await;
+    yield_until("warm after resets", || {
+        !service.public_data_plane.public_window_warm_running()
+    })
+    .await;
+    bodies.extend(rpc.drain_request_bodies());
+    assert_eq!(
+        get_logs_ranges(&bodies)[4..],
+        [(1, 25), (26, 50), (51, 75), (76, 100)]
+    );
+    assert_eq!(
+        header_blocks(&bodies),
+        vec![100],
+        "the uninterrupted warm reads its endpoint block"
+    );
+    assert!(
+        service
+            .public_data_plane
+            .cached_wallet_scan_exact(1, 100)
+            .await
+            .is_some(),
+        "an uninterrupted warm records the window as reusable coverage"
+    );
+
+    // Chain-service shutdown stops a warm whose request is in flight and
+    // closes the slot to later starts.
+    let later_window = PublicScanRange::new(101, 200);
+    service.start_public_scan_window_warm(later_window).await;
+    yield_until("warm request in flight at shutdown", || {
+        bodies.extend(rpc.drain_request_bodies());
+        get_logs_ranges(&bodies).contains(&(101, 125))
+    })
+    .await;
+    service.shutdown().await;
+    assert!(!service.public_data_plane.public_window_warm_running());
+    service.start_public_scan_window_warm(later_window).await;
+    assert!(
+        !service.public_data_plane.public_window_warm_running(),
+        "no warm starts after shutdown"
+    );
+    release_third.send(()).expect("release cancelled request");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    bodies.extend(rpc.drain_request_bodies());
+    assert_eq!(
+        get_logs_ranges(&bodies)[8..],
+        [(101, 125)],
+        "no request follows shutdown"
+    );
+    assert_eq!(header_blocks(&bodies), vec![100]);
+
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

@@ -7,6 +7,7 @@ use super::{
     WalletIndexedCatchUpStatus, WalletObservationPublisher, WalletScanApply, WalletScanError,
     broadcast, debug, mpsc, watch,
 };
+use alloy_transport::{RpcError, TransportErrorKind};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -166,9 +167,27 @@ impl std::fmt::Display for WalletStartupSyncError {
     }
 }
 
+impl WalletStartupSyncError {
+    /// Returns this error with any reqwest request URL removed, for logging.
+    /// Covers `Chain` transport errors (see `ChainError::without_url`) and
+    /// Squid request errors (`SyncError::Request`).
+    pub(super) fn without_url(self) -> Self {
+        match self {
+            Self::Chain(err) => Self::Chain(err.without_url()),
+            Self::Indexed(SyncError::Request(err)) => {
+                Self::Indexed(SyncError::Request(err.without_url()))
+            }
+            other => other,
+        }
+    }
+}
+
 impl From<ChainError> for WalletStartupSyncError {
     fn from(err: ChainError) -> Self {
-        Self::Chain(err)
+        match err {
+            ChainError::LogFetchCancelled => Self::Cancelled,
+            err => Self::Chain(err),
+        }
     }
 }
 
@@ -205,6 +224,8 @@ pub enum ChainError {
     Rpc(#[from] TransportError),
     #[error("archive rpc url required for blocks <= {0}")]
     ArchiveRpcRequired(u64),
+    #[error("archive RPC endpoint is not verified")]
+    ArchiveRpcUnverified,
     #[error(
         "indexed catch-up unavailable from block {from_block}; archive RPC fallback required through block {archive_until_block}: {reason}"
     )]
@@ -227,6 +248,8 @@ pub enum ChainError {
     WalletCache(#[from] WalletCacheError),
     #[error("no healthy rpc available")]
     NoHealthyRpc,
+    #[error("log fetch cancelled")]
+    LogFetchCancelled,
     #[error("wallet not found")]
     WalletNotFound,
     #[error("a different wallet is already registered")]
@@ -271,7 +294,101 @@ impl From<mpsc::error::SendError<BackfillRequest>> for ChainError {
     }
 }
 
+/// Provider limit named by a rejected `eth_getLogs` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogRangeLimit {
+    /// The requested block span exceeded the endpoint's limit, which the
+    /// message states as `max_blocks` when it parses.
+    BlockSpan { max_blocks: Option<u64> },
+    /// The request matched more logs than the endpoint returns at once.
+    ResultSize,
+}
+
+fn leading_block_count(text: &str) -> Option<u64> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// Removes the request URL from a reqwest transport failure.
+///
+/// Alloy's reqwest transport boxes the `reqwest::Error` inside
+/// [`TransportErrorKind::Custom`], and that error's `Display` appends the full
+/// request URL with only userinfo stripped, so credentials in the path or query
+/// reach logs. Alloy exposes the boxed source only by reference, so the
+/// redaction must take ownership to call `reqwest::Error::without_url`. The
+/// downcast only matches when alloy-transport-http and this crate resolve the
+/// same `reqwest` version, which the unit test enforces. Any other error is
+/// returned unchanged.
+pub(super) fn transport_error_without_url(err: TransportError) -> TransportError {
+    match err {
+        RpcError::Transport(TransportErrorKind::Custom(source)) => {
+            match source.downcast::<reqwest::Error>() {
+                Ok(err) => TransportErrorKind::custom((*err).without_url()),
+                Err(source) => RpcError::Transport(TransportErrorKind::Custom(source)),
+            }
+        }
+        other => other,
+    }
+}
+
 impl ChainError {
+    /// Returns this error with any reqwest request URL removed from transport
+    /// failures, for logging. See `transport_error_without_url`.
+    pub(super) fn without_url(self) -> Self {
+        match self {
+            Self::Rpc(err) => Self::Rpc(transport_error_without_url(err)),
+            Self::ProviderBuild(err) => Self::ProviderBuild(transport_error_without_url(err)),
+            other => other,
+        }
+    }
+
+    /// Classifies an `eth_getLogs` rejection caused by a provider's range limit.
+    ///
+    /// JSON-RPC has no standard code for these rejections, and Alloy exposes
+    /// only the error payload's code and message. This adapter therefore
+    /// matches the observed message shapes narrowly; anything else stays
+    /// unclassified and keeps the existing error handling.
+    pub(crate) fn log_range_limit(&self) -> Option<LogRangeLimit> {
+        let Self::Rpc(TransportError::ErrorResp(resp)) = self else {
+            return None;
+        };
+        let message = resp.message.as_ref();
+        let block_span = |count: &str| LogRangeLimit::BlockSpan {
+            max_blocks: leading_block_count(count),
+        };
+        if let Some((_, rest)) = message.split_once("Block range too large: maximum allowed is ") {
+            return Some(block_span(rest));
+        }
+        if let Some((_, rest)) = message.split_once("log query range must not exceed ") {
+            return Some(block_span(rest));
+        }
+        if let Some((_, rest)) = message.split_once("ranges over ")
+            && rest.contains(" blocks are not supported")
+        {
+            return Some(block_span(rest));
+        }
+        if let Some((_, rest)) = message.split_once("eth_getLogs requests with up to a ")
+            && rest.contains(" block range")
+        {
+            return Some(block_span(rest));
+        }
+        if let Some((_, rest)) = message.split_once("eth_getLogs is limited to ")
+            && rest.contains("blocks range")
+        {
+            return Some(block_span(
+                rest.split_once(" - ").map_or("", |(_, count)| count),
+            ));
+        }
+        let lowercase = message.to_ascii_lowercase();
+        if let Some((_, rest)) = lowercase.split_once("query returned more than ")
+            && rest.contains("results")
+        {
+            return Some(LogRangeLimit::ResultSize);
+        }
+        None
+    }
+
     pub(crate) fn is_rpc_throttled(&self) -> bool {
         match self {
             Self::Rpc(TransportError::ErrorResp(resp)) => resp.message.contains("limit exceeded"),
@@ -286,8 +403,10 @@ impl ChainError {
         !matches!(
             self,
             Self::ArchiveRpcRequired(_)
+                | Self::ArchiveRpcUnverified
                 | Self::IndexedCatchUpUnavailable { .. }
                 | Self::NoHealthyRpc
+                | Self::LogFetchCancelled
         )
     }
 

@@ -20,7 +20,7 @@ use alloy_rpc_types_eth::{Filter, Log};
 use alloy_transport::TransportError;
 use async_trait::async_trait;
 use broadcaster_core::provider::build_provider_with_http_client;
-use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
+use broadcaster_core::query_rpc_pool::{LogSpanEndpoint, ProviderHandle, QueryRpcPool};
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use local_db::DbStore;
 use merkletree::errors::SyncError;
@@ -64,7 +64,10 @@ mod types;
 mod workers;
 
 pub(crate) use crate::txid_cache::TxidPublicProof;
-use backfill::{WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks};
+use backfill::{
+    WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks,
+    wallet_tail_fallback_stale_timeout,
+};
 #[cfg(test)]
 pub(crate) use data_plane::commit_artifact_after_admission;
 pub(crate) use data_plane::{
@@ -73,7 +76,7 @@ pub(crate) use data_plane::{
     PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest, PublicTxidTransaction,
     WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome,
 };
-use forest_db::MerkleForestDbExt;
+use forest_db::{MerkleForestDbExt, run_squid_forest_catch_up};
 use indexed_wallet::{
     IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession, IndexedWalletPage,
     artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
@@ -81,15 +84,18 @@ use indexed_wallet::{
     wallet_backfill_from_block, wallet_remote_target_before_cached_suffix,
     wallet_reorg_backfill_from_block, wallet_startup_warm_from_block, wallet_sync_target,
 };
-use logs::{anchor_file_name, fetch_logs_for_range_with_provider, parse_anchor_block, sort_logs};
+use logs::{
+    LogRangeFetch, anchor_file_name, fetch_logs_for_range_with_provider, parse_anchor_block,
+    sort_logs,
+};
 use merkle_artifacts::run_merkle_artifact_catch_up_into;
 pub(crate) use service::PreparedChainService;
 use service::WalletIndexedTailFallbackResult;
 use types::{
     EVM_CHAIN_TYPE, ForestReorgDecision, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind,
-    PendingTipWalletRegistration, TXID_PUBLIC_CACHE_SYNC_INTERVAL, WalletIndexedCatchUpStatusGuard,
-    WalletRegistration, WalletStartupSyncCandidate, WalletStartupSyncError,
-    WalletStartupSyncStrategy, send_sync_progress,
+    LogRangeLimit, PendingTipWalletRegistration, TXID_PUBLIC_CACHE_SYNC_INTERVAL,
+    WalletIndexedCatchUpStatusGuard, WalletRegistration, WalletStartupSyncCandidate,
+    WalletStartupSyncError, WalletStartupSyncStrategy, send_sync_progress,
 };
 use workers::{
     spawn_backfill_loop, spawn_head_poller, spawn_live_log_loop, spawn_pending_tip_loop,

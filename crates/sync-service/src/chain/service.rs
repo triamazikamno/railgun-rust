@@ -167,10 +167,6 @@ impl WalletShortStartupPlan {
         })
     }
 
-    const fn acquisition_tuple(self) -> (u64, u64) {
-        (self.acquisition.from_block, self.acquisition.to_block)
-    }
-
     fn acquisition_prefix_before_delivery(self) -> Option<PublicScanRange> {
         let to_block = self.delivery.from_block.checked_sub(1)?;
         (self.acquisition.from_block <= to_block)
@@ -1735,24 +1731,23 @@ impl ChainService {
                 WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
                 WalletBackfillStartResult::Rejected { .. } => return,
             };
-            let request = if let Some(plan) = short_startup_plan {
-                let acquisition_range = if self
-                    .cached_wallet_startup_acquisition_prefix(plan)
-                    .await
-                    .is_some()
-                {
-                    (plan.delivery.from_block, plan.acquisition.to_block)
-                } else {
-                    plan.acquisition_tuple()
-                };
+            let request = if let Some(plan) = short_startup_plan
+                && from_block <= plan.acquisition.to_block
+            {
+                // Acquire only blocks after the cursor before delivery; the
+                // loop warms the window's leading part once it delivered.
                 BackfillRequest::add_with_acquisition(
                     cfg.cache_key.clone(),
                     from_block,
                     sync_target,
                     follow_safe_head,
                     from_block,
-                    acquisition_range,
+                    (from_block, plan.acquisition.to_block),
                     driver,
+                )
+                .with_startup_warm_range(
+                    plan.acquisition_prefix_before_delivery()
+                        .map(|range| (range.from_block, range.to_block)),
                 )
             } else {
                 BackfillRequest::add(
@@ -1884,7 +1879,7 @@ impl ChainService {
                 Ok((strategy, Err(err))) => {
                     failures = failures.saturating_add(1);
                     debug!(
-                        err = %err,
+                        err = %err.without_url(),
                         cache_key = %cfg.cache_key,
                         strategy = strategy.as_str(),
                         failures,
@@ -1911,7 +1906,7 @@ impl ChainService {
             match joined {
                 Ok((_, Err(WalletStartupSyncError::Cancelled))) => cancelled_loser = true,
                 Ok((strategy, Err(err))) => {
-                    debug!(?err, strategy = strategy.as_str(), cache_key = %cfg.cache_key, "wallet startup hedge loser candidate failed");
+                    debug!(err = %err.without_url(), strategy = strategy.as_str(), cache_key = %cfg.cache_key, "wallet startup hedge loser candidate failed");
                 }
                 Ok((_, Ok(_))) => {}
                 Err(err) => {
@@ -1991,7 +1986,7 @@ impl ChainService {
     }
 
     async fn commit_and_deliver_short_startup_candidate(
-        &self,
+        self: &Arc<Self>,
         cfg: &WalletConfig,
         progress: crate::types::WalletSchedulableProgress,
         sync_target: u64,
@@ -2005,12 +2000,20 @@ impl ChainService {
             return None;
         }
         let progress = handle.revalidate_schedulable_progress(progress)?;
+        // Candidates acquire from the delivery start, or from the window start
+        // when they reuse an exact cached prefix. Commit only what they hold.
+        let acquisition = PublicScanRange::new(
+            candidate
+                .acquisition_applies
+                .first()
+                .map_or(plan.delivery.from_block, |apply| {
+                    apply.from_block.min(plan.delivery.from_block)
+                }),
+            plan.acquisition.to_block,
+        );
         if let Err(err) = self
             .public_data_plane
-            .commit_completed_wallet_scan_acquisition(
-                plan.acquisition,
-                &candidate.acquisition_applies,
-            )
+            .commit_completed_wallet_scan_acquisition(acquisition, &candidate.acquisition_applies)
             .await
         {
             debug!(
@@ -2021,7 +2024,7 @@ impl ChainService {
             );
             return None;
         }
-        send_wallet_startup_events(
+        let delivered = send_wallet_startup_events(
             &cfg.cache_key,
             candidate.applies,
             Some(sync_target),
@@ -2029,8 +2032,96 @@ impl ChainService {
             backfill_sender,
             handle,
         )
-        .await
-        .then_some(progress)
+        .await;
+        if delivered && let Some(prefix) = plan.acquisition_prefix_before_delivery() {
+            self.start_public_scan_window_warm(prefix).await;
+        }
+        delivered.then_some(progress)
+    }
+
+    /// Warms the uncovered leading part of `prefix`, the startup window's
+    /// blocks at or before a delivered wallet cursor, in the background.
+    ///
+    /// Blocks already covered by a contiguous cached run that ends at the
+    /// prefix's end are skipped. At most one warm task runs per chain.
+    pub(super) async fn start_public_scan_window_warm(self: &Arc<Self>, prefix: PublicScanRange) {
+        let cached_from = self
+            .public_data_plane
+            .cached_wallet_scan_suffix(prefix.from_block, prefix.to_block)
+            .await
+            .and_then(|applies| applies.first().map(|apply| apply.from_block));
+        let warm_to = cached_from.map_or(Some(prefix.to_block), |cached_from| {
+            cached_from.checked_sub(1)
+        });
+        let Some(warm_to) = warm_to.filter(|warm_to| *warm_to >= prefix.from_block) else {
+            return;
+        };
+        let range = PublicScanRange::new(prefix.from_block, warm_to);
+        let service = Arc::clone(self);
+        let started = self
+            .public_data_plane
+            .try_start_public_window_warm(&self.cancel, move |cancel| {
+                service.warm_public_scan_window(range, cancel)
+            });
+        debug!(
+            from_block = range.from_block,
+            to_block = range.to_block,
+            started,
+            "public scan window warm requested"
+        );
+    }
+
+    /// Acquires `range` through the adaptive RPC fetch under its own read
+    /// scope and records it as reusable public rows. It never touches wallet
+    /// state, and a failure ends the task without retrying.
+    async fn warm_public_scan_window(
+        self: Arc<Self>,
+        range: PublicScanRange,
+        cancel: CancellationToken,
+    ) {
+        let started = Instant::now();
+        let read_scope = self.begin_public_scan_read();
+        let outcome = match self
+            .fetch_wallet_rpc_backfill_events(
+                range.from_block,
+                range.to_block.saturating_add(1),
+                range.to_block,
+                RpcTargetPolicy::RequireRequestedTarget,
+                &cancel,
+                read_scope,
+            )
+            .await
+        {
+            Ok(fetched) => match self
+                .public_data_plane
+                .commit_completed_wallet_scan_acquisition(range, &fetched.acquisition_applies)
+                .await
+            {
+                Ok(_) => "committed",
+                Err(err) => {
+                    debug!(?err, "public scan window warm commit rejected");
+                    "commit_rejected"
+                }
+            },
+            Err(WalletStartupSyncError::Cancelled) => "cancelled",
+            Err(WalletStartupSyncError::Chain(err)) => {
+                debug!(err = %err.without_url(), "public scan window warm fetch failed");
+                "failed"
+            }
+            // The RPC-only fetch never returns `Indexed`, so only `Chain` can
+            // carry a transport error.
+            Err(err) => {
+                debug!(err = %err, "public scan window warm fetch failed");
+                "failed"
+            }
+        };
+        debug!(
+            from_block = range.from_block,
+            to_block = range.to_block,
+            elapsed_ms = started.elapsed().as_millis(),
+            outcome,
+            "public scan window warm finished"
+        );
     }
 
     async fn cached_wallet_startup_acquisition_prefix(
@@ -2053,9 +2144,6 @@ impl ChainService {
         let deliver_from_block = plan.delivery.from_block;
         let sync_target = plan.acquisition.to_block;
         let cached_prefix = self.cached_wallet_startup_acquisition_prefix(plan).await;
-        let fetch_from_block = cached_prefix
-            .as_ref()
-            .map_or(plan.acquisition.from_block, |_| deliver_from_block);
         let mut cached_suffix = self
             .public_data_plane
             .cached_wallet_scan_suffix(deliver_from_block, sync_target)
@@ -2066,10 +2154,10 @@ impl ChainService {
             .map(|apply| apply.from_block);
         let remote_to_block =
             wallet_remote_target_before_cached_suffix(sync_target, cached_suffix_from);
-        let (mut fetched_applies, mut events) = if fetch_from_block <= remote_to_block {
+        let (mut fetched_applies, mut events) = if deliver_from_block <= remote_to_block {
             let fetched = self
                 .fetch_wallet_rpc_backfill_events(
-                    fetch_from_block,
+                    deliver_from_block,
                     deliver_from_block,
                     remote_to_block,
                     RpcTargetPolicy::RequireRequestedTarget,
@@ -2089,7 +2177,6 @@ impl ChainService {
         }
         debug!(
             cache_key = %cfg.cache_key,
-            fetch_from_block,
             deliver_from_block,
             remote_to_block,
             cached_suffix_from,
@@ -2142,11 +2229,10 @@ impl ChainService {
             .map(|apply| apply.from_block);
         let remote_target =
             wallet_remote_target_before_cached_suffix(sync_target, cached_suffix_from);
-        let warm_from_block = plan.acquisition.from_block;
+        // Pages start at the delivery boundary. When the indexed height is
+        // below it, no page is requested and the RPC tail covers the range.
         let target = probe.height.min(remote_target);
-        let mut from_block = cached_prefix
-            .as_ref()
-            .map_or(warm_from_block, |_| deliver_from_block);
+        let mut from_block = deliver_from_block;
         let mut checkpoint = from_block.saturating_sub(1);
         let mut acquisition_applies = cached_prefix.unwrap_or_default();
         let mut events = Vec::new();
@@ -2155,7 +2241,6 @@ impl ChainService {
             indexed_height = probe.height,
             sync_target,
             deliver_from_block,
-            warm_from_block,
             cached_suffix_from,
             remote_target,
             from_block,
@@ -2241,12 +2326,11 @@ impl ChainService {
         }
 
         if checkpoint < remote_target {
-            let tail_fetch_from = checkpoint.saturating_add(1).max(warm_from_block);
-            let tail_deliver_from = tail_fetch_from.max(deliver_from_block);
+            let tail_from = checkpoint.saturating_add(1).max(deliver_from_block);
             let mut tail_events = self
                 .fetch_wallet_rpc_backfill_events(
-                    tail_fetch_from,
-                    tail_deliver_from,
+                    tail_from,
+                    tail_from,
                     remote_target,
                     RpcTargetPolicy::RequireRequestedTarget,
                     &cancel,
@@ -2279,15 +2363,17 @@ impl ChainService {
             return Err(WalletStartupSyncError::Cancelled);
         }
         let cached_prefix = self.cached_wallet_startup_acquisition_prefix(plan).await;
-        let acquisition_from = cached_prefix
-            .as_ref()
-            .map_or(plan.acquisition.from_block, |_| plan.delivery.from_block);
+        let deliver_from_block = plan.delivery.from_block;
+        let sync_target = plan.acquisition.to_block;
+        // Chunks are selected for the delivery range only. A selected chunk is
+        // fetched whole even when it also covers blocks before the cursor, and
+        // no chunk is fetched when the artifact target is below the range.
         let Some(session) = wait_or_cancel(
             cancel,
             self.prepare_indexed_wallet_artifact_session(
                 cfg,
-                acquisition_from,
-                plan.acquisition.to_block,
+                deliver_from_block,
+                sync_target,
                 cfg.progress_tx.as_ref(),
             ),
         )
@@ -2300,14 +2386,12 @@ impl ChainService {
             .record_source_decision(
                 PublicDataPlaneDiagnosticKind::SourceFallback,
                 PublicScanSource::IndexedArtifacts,
-                plan.acquisition,
+                plan.delivery,
                 read_scope,
                 "short wallet startup hedge failed; attempting indexed artifacts",
             )
             .await;
 
-        let deliver_from_block = plan.delivery.from_block;
-        let sync_target = plan.acquisition.to_block;
         let mut cached_suffix = self
             .public_data_plane
             .cached_wallet_scan_suffix(deliver_from_block, sync_target)
@@ -2318,7 +2402,7 @@ impl ChainService {
             .map(|apply| apply.from_block);
         let remote_target =
             wallet_remote_target_before_cached_suffix(sync_target, cached_suffix_from);
-        let mut from_block = acquisition_from;
+        let mut from_block = deliver_from_block;
         let target = session.target_block().min(remote_target);
         let mut acquisition_applies = cached_prefix.unwrap_or_default();
         let mut events = Vec::new();
@@ -2350,7 +2434,7 @@ impl ChainService {
                 WalletIndexedCatchUpSource::IndexedArtifacts,
             );
             acquisition_applies.push(fetched_apply);
-            let delivery_from = from_block.max(plan.delivery.from_block);
+            let delivery_from = from_block.max(deliver_from_block);
             if delivery_from <= checkpoint {
                 page_rows.retain_block_range(delivery_from, checkpoint);
                 events.push(WalletScanApply::indexed_rows(
@@ -2364,12 +2448,11 @@ impl ChainService {
             from_block = checkpoint.saturating_add(1);
         }
         if target < remote_target {
-            let tail_fetch_from = target.saturating_add(1).max(acquisition_from);
-            let tail_deliver_from = tail_fetch_from.max(deliver_from_block);
+            let tail_from = target.saturating_add(1).max(deliver_from_block);
             let mut tail_events = self
                 .fetch_wallet_rpc_backfill_events(
-                    tail_fetch_from,
-                    tail_deliver_from,
+                    tail_from,
+                    tail_from,
                     remote_target,
                     RpcTargetPolicy::RequireRequestedTarget,
                     cancel,
@@ -2385,8 +2468,7 @@ impl ChainService {
         }
         debug!(
             cache_key = %cfg.cache_key,
-            acquisition_from = plan.acquisition.from_block,
-            delivery_from = plan.delivery.from_block,
+            delivery_from = deliver_from_block,
             target,
             events = events.len(),
             elapsed_ms = started.elapsed().as_millis(),
@@ -2467,10 +2549,11 @@ impl ChainService {
         let mut logs = match wait_or_cancel(
             cancel,
             self.chain.fetch_logs_for_range(
-                &rpc.provider,
+                &rpc,
                 self.archive_provider.as_ref(),
                 fetch_from_block,
                 to_block,
+                cancel,
             ),
         )
         .await?
@@ -3709,9 +3792,9 @@ async fn fetch_initial_head(
             }
             Err(err) => {
                 warn!(
-                    ?err,
+                    err = %ChainError::from(err).without_url(),
                     attempt,
-                    rpc = rpc.url.as_str(),
+                    rpc_index = rpc.index,
                     "failed to fetch initial block number, retrying..."
                 );
                 rpcs.mark_bad_provider(&rpc);
