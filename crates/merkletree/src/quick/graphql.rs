@@ -1,11 +1,11 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 use url::Url;
 
@@ -19,6 +19,16 @@ use crate::quick::types::{
 pub const DEFAULT_PAGE_SIZE: NonZeroUsize =
     NonZeroUsize::new(10_000).expect("default page size is non-zero");
 const GRAPHQL_MAX_ATTEMPTS: usize = 4;
+// A stream that stops without closing never errors on its own, so these bound
+// stalls rather than total duration and hand them to the retry policy.
+#[cfg(not(test))]
+const SQUID_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SQUID_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const SQUID_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SQUID_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) const COMMITMENTS_QUERY: &str = r"
 query Commitments($blockNumber: BigInt = 0, $limit: Int = 10000) {
@@ -583,12 +593,13 @@ where
             Ok(data) => return Ok(data),
             Err(error) if attempt < GRAPHQL_MAX_ATTEMPTS && error.is_retryable() => {
                 let delay = graphql_retry_delay(attempt);
+                // Custom endpoints may carry credentials, and transport error
+                // text embeds the URL, so only the error class is logged.
                 warn!(
-                    endpoint = %endpoint,
                     attempt,
                     max_attempts = GRAPHQL_MAX_ATTEMPTS,
                     delay_ms = delay.as_millis(),
-                    error = %error,
+                    error_class = error.class(),
                     "quick-sync GraphQL request failed; retrying"
                 );
                 sleep(delay).await;
@@ -610,16 +621,23 @@ where
     V: Serialize,
 {
     let request = GraphRequest { query, variables };
-    let response = client
-        .post(endpoint.clone())
-        .json(&request)
-        .send()
-        .await
-        .map_err(GraphPostError::Request)?;
+    let response = timeout(
+        SQUID_HEADER_TIMEOUT,
+        client.post(endpoint.clone()).json(&request).send(),
+    )
+    .await
+    .map_err(|_| GraphPostError::Timeout {
+        phase: GraphTimeoutPhase::Headers,
+    })?
+    .map_err(GraphPostError::Request)?;
     let status = response.status();
-    let body = response.text().await.map_err(GraphPostError::ReadBody)?;
+    let body = read_body_with_idle_timeout(response).await?;
+    let body = String::from_utf8_lossy(&body);
     if !status.is_success() {
-        return Err(GraphPostError::HttpStatus { status, body });
+        return Err(GraphPostError::HttpStatus {
+            status,
+            body: body.into_owned(),
+        });
     }
     let parsed: GraphResponse<T> = serde_json::from_str(&body).map_err(GraphPostError::Json)?;
     if let Some(errors) = parsed.errors {
@@ -631,6 +649,22 @@ where
         return Err(GraphPostError::Graphql(message));
     }
     parsed.data.ok_or(GraphPostError::MissingData)
+}
+
+/// Reads the body chunk by chunk, failing when no bytes arrive for
+/// `SQUID_BODY_IDLE_TIMEOUT`; a slow body that keeps arriving completes.
+async fn read_body_with_idle_timeout(mut response: Response) -> Result<Vec<u8>, GraphPostError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = timeout(SQUID_BODY_IDLE_TIMEOUT, response.chunk())
+        .await
+        .map_err(|_| GraphPostError::Timeout {
+            phase: GraphTimeoutPhase::Body,
+        })?
+        .map_err(GraphPostError::ReadBody)?
+    {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(not(test))]
@@ -649,6 +683,8 @@ pub enum GraphPostError {
     Request(reqwest::Error),
     #[error("read graphql response failed: {0}")]
     ReadBody(reqwest::Error),
+    #[error("graphql response {phase} timed out")]
+    Timeout { phase: GraphTimeoutPhase },
     #[error("graphql request failed with status {status}: {body}")]
     HttpStatus { status: StatusCode, body: String },
     #[error("invalid graphql response: {0}")]
@@ -659,12 +695,28 @@ pub enum GraphPostError {
     MissingData,
 }
 
+/// The response stage that stalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphTimeoutPhase {
+    Headers,
+    Body,
+}
+
+impl std::fmt::Display for GraphTimeoutPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Headers => "headers",
+            Self::Body => "body",
+        })
+    }
+}
+
 impl GraphPostError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Request(error) => error.is_timeout() || error.is_connect() || error.is_request(),
-            Self::ReadBody(_) => true,
+            Self::ReadBody(_) | Self::Timeout { .. } => true,
             Self::HttpStatus { status, .. } => matches!(
                 *status,
                 StatusCode::REQUEST_TIMEOUT
@@ -677,6 +729,27 @@ impl GraphPostError {
             Self::Json(_) | Self::Graphql(_) | Self::MissingData => false,
         }
     }
+
+    /// Names the failure kind without the endpoint or error text, for
+    /// diagnostics that must not expose endpoint credentials.
+    #[must_use]
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Request(error) if error.is_connect() => "connect",
+            Self::Request(_) => "request",
+            Self::ReadBody(_) => "read_body",
+            Self::Timeout {
+                phase: GraphTimeoutPhase::Headers,
+            } => "timeout_headers",
+            Self::Timeout {
+                phase: GraphTimeoutPhase::Body,
+            } => "timeout_body",
+            Self::HttpStatus { .. } => "status",
+            Self::Json(_) => "decode",
+            Self::Graphql(_) => "graphql",
+            Self::MissingData => "missing_data",
+        }
+    }
 }
 
 impl From<GraphPostError> for SyncError {
@@ -686,7 +759,8 @@ impl From<GraphPostError> for SyncError {
                 Self::Request(error)
             }
             GraphPostError::MissingData => Self::MissingData,
-            GraphPostError::HttpStatus { .. }
+            GraphPostError::Timeout { .. }
+            | GraphPostError::HttpStatus { .. }
             | GraphPostError::Json(_)
             | GraphPostError::Graphql(_) => Self::UnexpectedFormat(error.to_string()),
         }
@@ -856,16 +930,20 @@ impl GraphList for IndexedNullifiersData {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
-    use std::time::Duration as StdDuration;
+    use std::time::{Duration as StdDuration, Instant};
 
     use reqwest::Client;
     use serde::Deserialize;
 
-    use super::{EmptyVariables, post_graphql_data};
+    use super::{
+        EmptyVariables, GraphPostError, GraphTimeoutPhase, SQUID_BODY_IDLE_TIMEOUT,
+        post_graphql_data, post_graphql_data_once,
+    };
 
     #[derive(Debug, Deserialize)]
     struct TestData {
@@ -915,6 +993,262 @@ mod tests {
             .recv_timeout(StdDuration::from_secs(5))
             .expect("server should observe retry request");
         server.join().expect("server thread should finish");
+    }
+
+    /// A response whose headers never arrive times out and is retried, and
+    /// retry warnings carry the error class but not the credential-bearing
+    /// endpoint, even for a transport error whose text embeds the URL.
+    #[tokio::test]
+    async fn post_graphql_data_retries_header_stall_without_logging_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener
+            .local_addr()
+            .expect("read test server address")
+            .port();
+        let endpoint = url::Url::parse(&format!(
+            "http://user:secret@127.0.0.1:{port}/graphql?key=secret"
+        ))
+        .expect("parse test server URL");
+
+        let server = thread::spawn(move || {
+            // Reads the first request and never answers it.
+            let (mut stalled_stream, _) = listener.accept().expect("accept stalled request");
+            stalled_stream
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .expect("set stalled read timeout");
+            read_http_request(&mut stalled_stream);
+
+            let (dropped_stream, _) = listener.accept().expect("accept dropped request");
+            drop(dropped_stream);
+
+            let (mut stream, _) = listener.accept().expect("accept final retry");
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .expect("set retry read timeout");
+            read_http_request(&mut stream);
+            let body = r#"{"data":{"ok":true}}"#;
+            stream
+                .write_all(format!("{}{body}", json_response_head(body.len())).as_bytes())
+                .expect("write retry response");
+            drop(stalled_stream);
+        });
+
+        let events = CapturedEvents::default();
+        let guard = events.capture();
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let data: TestData =
+            post_graphql_data(&client, &endpoint, "query Test { ok }", &EmptyVariables {})
+                .await
+                .expect("request should succeed after retries");
+        drop(guard);
+
+        assert!(data.ok);
+        server.join().expect("server thread should finish");
+
+        let retries = events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event
+                    .get("message")
+                    .is_some_and(|message| message == "quick-sync GraphQL request failed; retrying")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retries.len(),
+            2,
+            "one retry per failed attempt: {retries:?}"
+        );
+        assert_eq!(retries[0].get("attempt").map(String::as_str), Some("1"));
+        assert_eq!(
+            retries[0].get("error_class").map(String::as_str),
+            Some("timeout_headers")
+        );
+        assert!(
+            retries
+                .iter()
+                .all(|retry| retry.contains_key("delay_ms") && retry.contains_key("error_class")),
+            "retry warnings carry the delay and error class: {retries:?}"
+        );
+        let forbidden = ["127.0.0.1", "user", "secret"];
+        for event in events.events() {
+            for value in event.values() {
+                assert!(
+                    forbidden.iter().all(|needle| !value.contains(needle)),
+                    "log value {value:?} exposes the endpoint"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_graphql_data_once_times_out_stalled_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = url::Url::parse(&format!(
+            "http://{}/graphql",
+            listener.local_addr().expect("read test server address")
+        ))
+        .expect("parse test server URL");
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .expect("set read timeout");
+            read_http_request(&mut stream);
+            let body = r#"{"data":{"ok":true}}"#;
+            stream
+                .write_all(format!("{}{}", json_response_head(body.len()), &body[..8]).as_bytes())
+                .expect("write partial response");
+            // Holds the connection open without sending the rest of the body.
+            let _ = done_rx.recv();
+        });
+
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let error = post_graphql_data_once::<TestData, _>(
+            &client,
+            &endpoint,
+            "query Test { ok }",
+            &EmptyVariables {},
+        )
+        .await
+        .expect_err("stalled body should time out");
+        drop(done_tx);
+
+        assert!(
+            matches!(
+                error,
+                GraphPostError::Timeout {
+                    phase: GraphTimeoutPhase::Body
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(error.is_retryable());
+        server.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn post_graphql_data_once_completes_body_that_keeps_arriving() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = url::Url::parse(&format!(
+            "http://{}/graphql",
+            listener.local_addr().expect("read test server address")
+        ))
+        .expect("parse test server URL");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .expect("set read timeout");
+            stream.set_nodelay(true).expect("disable Nagle");
+            read_http_request(&mut stream);
+            let body = r#"{"data":{"ok":true}}"#;
+            stream
+                .write_all(json_response_head(body.len()).as_bytes())
+                .expect("write response head");
+            // Seven gaps of a fifth of the idle timeout outlast it in total.
+            for piece in body.as_bytes().chunks(3) {
+                thread::sleep(SQUID_BODY_IDLE_TIMEOUT / 5);
+                stream.write_all(piece).expect("write body piece");
+            }
+        });
+
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let started = Instant::now();
+        let data = post_graphql_data_once::<TestData, _>(
+            &client,
+            &endpoint,
+            "query Test { ok }",
+            &EmptyVariables {},
+        )
+        .await
+        .expect("a body that keeps arriving should complete");
+
+        assert!(data.ok);
+        assert!(started.elapsed() > SQUID_BODY_IDLE_TIMEOUT);
+        server.join().expect("server thread should finish");
+    }
+
+    fn json_response_head(content_length: usize) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// Records `merkletree` tracing events as field-name to value maps.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl CapturedEvents {
+        fn capture(&self) -> CaptureGuard {
+            // With one registered dispatcher, tracing-core resolves a callsite
+            // first hit on another test thread against that thread's empty
+            // default and caches it as disabled. A second live dispatcher keeps
+            // interest computed across every registered dispatcher, including
+            // this thread's capture.
+            let registered = tracing::Dispatch::new(CaptureSubscriber(self.clone()));
+            CaptureGuard {
+                _default: tracing::subscriber::set_default(CaptureSubscriber(self.clone())),
+                _registered: registered,
+            }
+        }
+
+        fn events(&self) -> Vec<BTreeMap<String, String>> {
+            self.0.lock().expect("captured events lock").clone()
+        }
+    }
+
+    struct CaptureGuard {
+        _default: tracing::subscriber::DefaultGuard,
+        _registered: tracing::Dispatch,
+    }
+
+    struct CaptureSubscriber(CapturedEvents);
+
+    struct CapturedFields<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for CapturedFields<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("merkletree")
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut CapturedFields(&mut fields));
+            self.0.0.lock().expect("captured events lock").push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     fn read_http_request(stream: &mut TcpStream) {

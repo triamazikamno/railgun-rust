@@ -1,12 +1,18 @@
+use super::logs::{
+    LogPage, LogRequestBudget, ParallelLogStats, ProviderLogStats, log_filter_count_for_range,
+};
 use super::service::send_wallet_reset;
 use super::{
     BlockNumberOrTag, CancellationToken, ChainConfig, ChainError, ChainService, DbStore,
-    DynProvider, FixedBytes, ForestReorgDecision, HashMap, HashSet, Instant, Log, LogRangeFetch,
-    LogSpanEndpoint, MerkleForest, MerkleForestDbExt, MerkleForestSnapshot, Ordering, Path,
-    PersistError, Provider, ProviderHandle, SNAPSHOT_VERSION, SharedLogBatch, WalletBackfillDriver,
-    WalletResetReplayPlan, anchor_file_name, debug, fetch_logs_for_range_with_provider, info,
-    parse_anchor_block, wallet_reorg_backfill_from_block, wallet_sync_target, warn,
+    DynProvider, FixedBytes, ForestMetaCheck, ForestReorgDecision, HashMap, HashSet, Instant, Log,
+    LogRangeFetch, LogSpanEndpoint, MerkleForest, MerkleForestDbExt, MerkleForestSnapshot,
+    Ordering, Path, PersistError, Provider, ProviderHandle, SNAPSHOT_VERSION, SharedLogBatch,
+    WalletBackfillDriver, WalletResetReplayPlan, anchor_file_name, debug,
+    fetch_logs_for_range_with_provider, info, parse_anchor_block, wallet_reorg_backfill_from_block,
+    wallet_sync_target, warn,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 pub(super) struct WalletBackfill {
@@ -21,6 +27,7 @@ pub(super) struct WalletBackfill {
     pub(super) driver: WalletBackfillDriver,
     pub(super) last_advanced_at: Instant,
     pub(super) last_indexed_tail_attempt_at: Option<Instant>,
+    started_at: Instant,
     run_state: WalletBackfillRunState,
 }
 
@@ -110,6 +117,7 @@ impl WalletBackfill {
             driver,
             last_advanced_at: now,
             last_indexed_tail_attempt_at: None,
+            started_at: now,
             run_state: WalletBackfillRunState::Runnable,
         }
     }
@@ -250,9 +258,13 @@ impl WalletBackfill {
         self.last_indexed_tail_attempt_at = Some(now);
     }
 
+    /// Fires when RPC backfill has stalled, or when it is still advancing but
+    /// more than `rpc_crawl_lag_blocks` behind its target and `cooldown` has
+    /// passed since the backfill started or since the last indexed attempt.
     pub(super) fn should_try_indexed_tail_fallback(
         &self,
         block_time: Duration,
+        rpc_crawl_lag_blocks: u64,
         now: Instant,
         min_stall: Duration,
         cooldown: Duration,
@@ -267,11 +279,20 @@ impl WalletBackfill {
         if lag_blocks <= wallet_tail_fallback_lag_threshold_blocks(block_time) {
             return false;
         }
-        if now.duration_since(self.last_advanced_at) < min_stall {
+        if now.duration_since(self.last_advanced_at) >= min_stall {
+            return self
+                .last_indexed_tail_attempt_at
+                .is_none_or(|attempted_at| now.duration_since(attempted_at) >= cooldown);
+        }
+        if lag_blocks <= rpc_crawl_lag_blocks {
             return false;
         }
-        self.last_indexed_tail_attempt_at
-            .is_none_or(|attempted_at| now.duration_since(attempted_at) >= cooldown)
+        let cooldown_from = self
+            .last_indexed_tail_attempt_at
+            .map_or(self.started_at, |attempted_at| {
+                attempted_at.max(self.started_at)
+            });
+        now.duration_since(cooldown_from) >= cooldown
     }
 }
 
@@ -426,7 +447,7 @@ impl ChainService {
         &self,
         provider: &DynProvider,
         archive_provider: Option<&DynProvider>,
-        rpc_url: &str,
+        rpc_index: usize,
         snapshot_path: &Path,
         safe_head: u64,
         last_processed: u64,
@@ -441,52 +462,47 @@ impl ChainService {
         let Some(meta) = meta else {
             return Ok(());
         };
-        if meta.hash == [0u8; 32] {
-            return Ok(());
-        }
 
-        if meta.last_block != last_processed {
-            warn!(
-                chain_id = self.chain.deployment.chain_id,
-                contract = %self.chain.deployment.contract,
-                rpc = rpc_url,
-                safe_head,
-                last_processed,
-                meta_last_block = meta.last_block,
-                stored_hash = %FixedBytes::<32>::from(meta.hash),
-                "skipping reorg check because forest metadata block does not match progress"
-            );
-            return Ok(());
-        }
-
-        let current_hash = self
+        match self
             .chain
-            .fetch_confirmed_block_hash(provider, archive_provider, last_processed)
-            .await?;
-        match ForestReorgDecision::from_confirmed_hash(
-            last_processed,
-            meta.last_block,
-            meta.hash,
-            current_hash,
-        ) {
-            ForestReorgDecision::Skip => {
+            .check_forest_meta(
+                provider,
+                archive_provider,
+                meta.last_block,
+                meta.hash,
+                last_processed,
+            )
+            .await?
+        {
+            ForestMetaCheck::Unchecked | ForestMetaCheck::Match => {}
+            ForestMetaCheck::StaleMeta => {
+                warn!(
+                    chain_id = self.chain.deployment.chain_id,
+                    contract = %self.chain.deployment.contract,
+                    rpc_index,
+                    safe_head,
+                    last_processed,
+                    meta_last_block = meta.last_block,
+                    stored_hash = %FixedBytes::<32>::from(meta.hash),
+                    "skipping reorg check because forest metadata block does not match progress"
+                );
+            }
+            ForestMetaCheck::Unconfirmed => {
                 debug!(
                     chain_id = self.chain.deployment.chain_id,
                     contract = %self.chain.deployment.contract,
-                    rpc = rpc_url,
+                    rpc_index,
                     safe_head,
                     last_processed,
                     meta_last_block = meta.last_block,
                     "skipping reorg check without a confirmed block hash"
                 );
             }
-            ForestReorgDecision::Match => {}
-            ForestReorgDecision::Mismatch => {
-                let current_hash = current_hash.expect("mismatch requires confirmed hash");
+            ForestMetaCheck::Mismatch { current_hash } => {
                 warn!(
                     chain_id = self.chain.deployment.chain_id,
                     contract = %self.chain.deployment.contract,
-                    rpc = rpc_url,
+                    rpc_index,
                     safe_head,
                     last_processed,
                     meta_last_block = meta.last_block,
@@ -655,6 +671,42 @@ impl ChainConfig {
         }
     }
 
+    /// Checks the forest metadata `(meta_last_block, stored_hash)` against the
+    /// confirmed hash of `last_processed`. Reads the hash only when the forest
+    /// is past deployment and the metadata records a hash for `last_processed`.
+    /// Shared by the reorg check and the startup catch-up gate.
+    pub(super) async fn check_forest_meta(
+        &self,
+        provider: &DynProvider,
+        archive_provider: Option<&DynProvider>,
+        meta_last_block: u64,
+        stored_hash: [u8; 32],
+        last_processed: u64,
+    ) -> Result<ForestMetaCheck, ChainError> {
+        if last_processed < self.deployment.deployment_block || stored_hash == [0u8; 32] {
+            return Ok(ForestMetaCheck::Unchecked);
+        }
+        if meta_last_block != last_processed {
+            return Ok(ForestMetaCheck::StaleMeta);
+        }
+        let current_hash = self
+            .fetch_confirmed_block_hash(provider, archive_provider, last_processed)
+            .await?;
+        let decision = ForestReorgDecision::from_confirmed_hash(
+            last_processed,
+            meta_last_block,
+            stored_hash,
+            current_hash,
+        );
+        Ok(match decision {
+            ForestReorgDecision::Skip => ForestMetaCheck::Unconfirmed,
+            ForestReorgDecision::Match => ForestMetaCheck::Match,
+            ForestReorgDecision::Mismatch => ForestMetaCheck::Mismatch {
+                current_hash: current_hash.expect("mismatch requires confirmed hash"),
+            },
+        })
+    }
+
     pub(super) async fn fetch_confirmed_block_hash(
         &self,
         provider: &DynProvider,
@@ -795,6 +847,7 @@ impl ChainConfig {
             logical_from: from_block,
             logical_to: to_block,
             get_logs_requests: 0,
+            budget: None,
         };
         let result = self
             .fetch_logs_for_logical_range(&mut fetch, rpc, archive_provider)
@@ -866,6 +919,330 @@ impl ChainConfig {
 
         Ok(logs)
     }
+
+    /// Estimates the physical `eth_getLogs` requests needed for
+    /// `from_block..=to_block` without issuing any request: one request per
+    /// span and filter, using the widest span learned for any available
+    /// provider, capped at `block_range`.
+    pub(super) fn estimate_log_requests(&self, from_block: u64, to_block: u64) -> u64 {
+        if from_block > to_block {
+            return 0;
+        }
+        let span = self
+            .rpcs
+            .available_providers()
+            .iter()
+            .map(|rpc| {
+                self.rpcs
+                    .log_span(LogSpanEndpoint::Provider(rpc.index), self.sync.block_range)
+            })
+            .max()
+            .unwrap_or_else(|| self.sync.block_range.max(1));
+        let filters = log_filter_count_for_range(
+            from_block,
+            to_block,
+            self.deployment.v2_start_block,
+            self.deployment.legacy_shield_block,
+        );
+        ((to_block - from_block) / span + 1).saturating_mul(filters)
+    }
+
+    /// Fetches `from_block..=to_block` as consecutive pages of `block_range`
+    /// blocks from up to `parallelism` providers at a time, passing each page
+    /// to `deliver` in block order.
+    ///
+    /// Each available provider is tried at most once. It reads its head first
+    /// and fetches pages only when the head, less the finality depth, covers
+    /// `to_block`, one page at a time. A provider whose head lags, whose head
+    /// read fails, or that fails a page stops, and the next untried available
+    /// provider takes its place. A failed page goes back to the queue and the
+    /// endpoint failure rules apply to its provider. At most `2 * parallelism`
+    /// pages are fetched ahead of the next page to deliver.
+    ///
+    /// Physical requests are reserved on the caller's `budget`, and the
+    /// returned `get_logs_requests` is its issued count afterwards. The
+    /// acquisition fails with `NoHealthyRpc` once pages remain but no provider
+    /// is running and none is left to try, once `budget` is exhausted, or when
+    /// `cancel` fires. The range must lie above `archive_until_block`.
+    pub(super) async fn fetch_logs_in_parallel(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        parallelism: usize,
+        budget: &LogRequestBudget,
+        cancel: &CancellationToken,
+        mut deliver: impl FnMut(LogPage) -> Result<(), ChainError>,
+    ) -> (Result<(), ChainError>, ParallelLogStats) {
+        let started = Instant::now();
+        let mut stats = ParallelLogStats::default();
+        let result = self
+            .run_parallel_log_fetch(
+                from_block,
+                to_block,
+                parallelism,
+                budget,
+                cancel,
+                &mut deliver,
+                &mut stats,
+            )
+            .await;
+        stats.get_logs_requests = budget.issued();
+        stats.elapsed = started.elapsed();
+        let outcome = match &result {
+            Ok(()) => "complete",
+            Err(ChainError::LogFetchCancelled) => "cancelled",
+            Err(ChainError::LogRequestBudgetExceeded(_)) => "over_budget",
+            Err(ChainError::NoHealthyRpc) => "no_provider",
+            Err(_) => "failed",
+        };
+        // Per provider index: fetched pages / physical requests.
+        let providers = stats
+            .providers
+            .iter()
+            .map(|provider| {
+                format!(
+                    "{}:{}/{}",
+                    provider.rpc_index, provider.pages, provider.get_logs_requests
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        debug!(
+            from_block,
+            to_block,
+            pages = stats.pages,
+            delivered_pages = stats.delivered_pages,
+            eligible_providers = stats.eligible_providers,
+            get_logs_requests = stats.get_logs_requests,
+            request_budget = budget.limit(),
+            retries = stats.retries,
+            providers = %providers,
+            outcome,
+            elapsed_ms = stats.elapsed.as_millis(),
+            "parallel log range fetch finished"
+        );
+        (result, stats)
+    }
+
+    async fn run_parallel_log_fetch<F>(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        parallelism: usize,
+        budget: &LogRequestBudget,
+        cancel: &CancellationToken,
+        deliver: &mut F,
+        stats: &mut ParallelLogStats,
+    ) -> Result<(), ChainError>
+    where
+        F: FnMut(LogPage) -> Result<(), ChainError>,
+    {
+        let archive_until_block = self.sync.archive_until_block;
+        if archive_until_block > 0 && from_block <= archive_until_block {
+            return Err(ChainError::ArchiveRpcRequired(archive_until_block));
+        }
+        if from_block > to_block {
+            return Ok(());
+        }
+        let page_span = self.sync.block_range.max(1);
+        let page_bounds = |page: u64| {
+            let start = from_block + page * page_span;
+            (start, start.saturating_add(page_span - 1).min(to_block))
+        };
+        stats.pages = (to_block - from_block) / page_span + 1;
+        let parallelism = parallelism.max(1);
+        let window = u64::try_from(parallelism)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2);
+
+        let mut tasks = FuturesUnordered::new();
+        // Provider indexes that were given a slot; none is tried twice.
+        let mut tried = BTreeSet::new();
+        let mut idle = Vec::new();
+        let mut failed_pages = BTreeSet::new();
+        let mut next_page = 0;
+        let mut completed = BTreeMap::new();
+
+        loop {
+            while let Some(logs) = completed.remove(&stats.delivered_pages) {
+                let (_, to_block) = page_bounds(stats.delivered_pages);
+                deliver(LogPage { to_block, logs })?;
+                stats.delivered_pages += 1;
+            }
+            if stats.delivered_pages == stats.pages {
+                return Ok(());
+            }
+            if cancel.is_cancelled() {
+                return Err(ChainError::LogFetchCancelled);
+            }
+            // Fill free slots, including those of stopped providers, with
+            // untried providers.
+            while tasks.len() + idle.len() < parallelism {
+                let Some(rpc) = self
+                    .rpcs
+                    .available_providers()
+                    .into_iter()
+                    .find(|rpc| !tried.contains(&rpc.index))
+                else {
+                    break;
+                };
+                tried.insert(rpc.index);
+                stats.providers.push(ProviderLogStats {
+                    rpc_index: rpc.index,
+                    pages: 0,
+                    get_logs_requests: 0,
+                });
+                tasks.push(self.run_log_pager_task(rpc, LogPagerTask::Head, budget, cancel));
+            }
+            while let Some(rpc) = idle.pop() {
+                let page = if let Some(page) = failed_pages.pop_first() {
+                    page
+                } else if next_page < stats.pages
+                    && next_page < stats.delivered_pages.saturating_add(window)
+                {
+                    next_page += 1;
+                    next_page - 1
+                } else {
+                    idle.push(rpc);
+                    break;
+                };
+                let (from_block, to_block) = page_bounds(page);
+                let task = LogPagerTask::Page {
+                    page,
+                    from_block,
+                    to_block,
+                };
+                tasks.push(self.run_log_pager_task(rpc, task, budget, cancel));
+            }
+
+            let Some((rpc, outcome)) = tasks.next().await else {
+                return Err(ChainError::NoHealthyRpc);
+            };
+            let (err, failed_page) = match outcome {
+                LogPagerOutcome::Head(Ok(head)) => {
+                    if head.saturating_sub(self.finality_depth) >= to_block {
+                        stats.eligible_providers += 1;
+                        idle.push(rpc);
+                    } else {
+                        debug!(
+                            rpc_index = rpc.index,
+                            head,
+                            to_block,
+                            "log provider head does not cover the parallel fetch range"
+                        );
+                    }
+                    continue;
+                }
+                LogPagerOutcome::Head(Err(err)) => (err, None),
+                LogPagerOutcome::Page {
+                    page,
+                    get_logs_requests,
+                    result,
+                } => {
+                    let provider = stats
+                        .providers
+                        .iter_mut()
+                        .find(|provider| provider.rpc_index == rpc.index);
+                    if let Some(provider) = provider {
+                        provider.get_logs_requests += get_logs_requests;
+                        provider.pages += u64::from(result.is_ok());
+                    }
+                    match result {
+                        Ok(logs) => {
+                            completed.insert(page, logs);
+                            idle.push(rpc);
+                            continue;
+                        }
+                        Err(err) => (err, Some(page)),
+                    }
+                }
+            };
+            if matches!(
+                err,
+                ChainError::LogFetchCancelled | ChainError::LogRequestBudgetExceeded(_)
+            ) {
+                return Err(err);
+            }
+            let marked_bad = err.should_mark_rpc_unhealthy();
+            if marked_bad {
+                self.rpcs.mark_bad_provider(&rpc);
+            }
+            if let Some(page) = failed_page {
+                failed_pages.insert(page);
+                stats.retries += 1;
+            }
+            debug!(
+                rpc_index = rpc.index,
+                page = ?failed_page,
+                marked_bad,
+                err = %err.without_url(),
+                "parallel log fetch provider failed; its page returns to the queue"
+            );
+        }
+    }
+
+    /// Runs one step of a parallel log fetch on `rpc` and hands the provider
+    /// back with the outcome.
+    async fn run_log_pager_task(
+        &self,
+        rpc: ProviderHandle,
+        task: LogPagerTask,
+        budget: &LogRequestBudget,
+        cancel: &CancellationToken,
+    ) -> (ProviderHandle, LogPagerOutcome) {
+        let outcome = match task {
+            LogPagerTask::Head => LogPagerOutcome::Head(tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(ChainError::LogFetchCancelled),
+                head = rpc.provider.get_block_number() => head.map_err(ChainError::from),
+            }),
+            LogPagerTask::Page {
+                page,
+                from_block,
+                to_block,
+            } => {
+                let mut fetch = LogRangeFetch {
+                    spans: self.rpcs.as_ref(),
+                    max_span: self.sync.block_range,
+                    cancel,
+                    logical_from: from_block,
+                    logical_to: to_block,
+                    get_logs_requests: 0,
+                    budget: Some(budget),
+                };
+                let result = self
+                    .fetch_logs_for_logical_range(&mut fetch, &rpc, None)
+                    .await;
+                LogPagerOutcome::Page {
+                    page,
+                    get_logs_requests: fetch.get_logs_requests,
+                    result,
+                }
+            }
+        };
+        (rpc, outcome)
+    }
+}
+
+/// One step a provider takes in a parallel log fetch.
+#[derive(Clone, Copy)]
+enum LogPagerTask {
+    /// Read the head once, before any page.
+    Head,
+    Page {
+        page: u64,
+        from_block: u64,
+        to_block: u64,
+    },
+}
+
+enum LogPagerOutcome {
+    Head(Result<u64, ChainError>),
+    Page {
+        page: u64,
+        get_logs_requests: u64,
+        result: Result<Vec<Log>, ChainError>,
+    },
 }
 
 #[cfg(test)]
@@ -880,6 +1257,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    use super::super::logs::{FOREST_RPC_PARALLELISM, FOREST_RPC_REQUEST_BUDGET, sort_logs};
     use serde_json::json;
     use url::Url;
 
@@ -1055,5 +1433,579 @@ mod tests {
         });
 
         MockJsonRpc { url, requests }
+    }
+
+    #[test]
+    fn log_request_estimate_uses_widest_learned_span_without_requests() {
+        let servers = [
+            spawn_rpc_handler(log_rpc_handler(2000, Vec::new(), |_, _| None)),
+            spawn_rpc_handler(log_rpc_handler(2000, Vec::new(), |_, _| None)),
+        ];
+        let mut chain = pool_chain_config(servers.iter().map(|server| server.url.clone()));
+
+        assert_eq!(
+            chain.estimate_log_requests(1001, 1400),
+            4,
+            "unlimited providers use block_range"
+        );
+        chain.rpcs.narrow_log_span(LogSpanEndpoint::Provider(0), 25);
+        assert_eq!(
+            chain.estimate_log_requests(1001, 1400),
+            4,
+            "the wider provider's span counts"
+        );
+        chain.rpcs.narrow_log_span(LogSpanEndpoint::Provider(1), 25);
+        assert_eq!(chain.estimate_log_requests(1001, 1400), 16);
+
+        // Legacy commitments, transact, legacy shield, modern shield and
+        // nullifiers each need their own filter.
+        chain.deployment.v2_start_block = 1100;
+        chain.deployment.legacy_shield_block = 1200;
+        let estimate = chain.estimate_log_requests(1001, 1400);
+        assert_eq!(estimate, 16 * 5);
+        assert!(estimate > FOREST_RPC_REQUEST_BUDGET);
+        for server in &servers {
+            assert!(server.bodies().is_empty(), "estimation issues no request");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_log_fetch_matches_one_provider_in_order_and_skips_lagging_provider() {
+        let log_blocks = vec![1001, 1050, 1100, 1101, 1234, 1333, 1480, 1555, 1600];
+        let serving = (0..3)
+            .map(|_| {
+                spawn_rpc_handler(delayed(
+                    "eth_getLogs",
+                    Duration::from_millis(25),
+                    log_rpc_handler(2000, log_blocks.clone(), |_, _| None),
+                ))
+            })
+            .collect::<Vec<_>>();
+        // Head 1600 less finality depth 1 does not cover block 1600.
+        let lagging = spawn_rpc_handler(log_rpc_handler(1600, log_blocks.clone(), |_, _| None));
+        let chain = pool_chain_config(
+            serving
+                .iter()
+                .chain([&lagging])
+                .map(|server| server.url.clone()),
+        );
+
+        let mut pages = Vec::new();
+        let (result, stats) = chain
+            .fetch_logs_in_parallel(
+                1001,
+                1600,
+                FOREST_RPC_PARALLELISM,
+                &LogRequestBudget::new(FOREST_RPC_REQUEST_BUDGET),
+                &CancellationToken::new(),
+                |page| {
+                    pages.push(page);
+                    Ok(())
+                },
+            )
+            .await;
+        result.expect("parallel fetch succeeds");
+
+        assert_eq!(
+            pages.iter().map(|page| page.to_block).collect::<Vec<_>>(),
+            (0..6).map(|page| 1100 + page * 100).collect::<Vec<_>>(),
+            "pages arrive contiguous and in block order"
+        );
+        assert!(
+            serving
+                .iter()
+                .filter(|server| server.count("eth_getLogs") > 0)
+                .count()
+                > 1,
+            "pages are spread across providers"
+        );
+        assert_eq!(lagging.count("eth_blockNumber"), 1);
+        assert_eq!(
+            lagging.count("eth_getLogs"),
+            0,
+            "lagging provider fetches no page"
+        );
+        assert_eq!(stats.eligible_providers, 3);
+
+        // With one slot, the lagging provider listed first hands its slot to
+        // the next provider.
+        let lagging_first = pool_chain_config(
+            std::iter::once(&lagging)
+                .chain(&serving)
+                .map(|server| server.url.clone()),
+        );
+        let mut lagging_first_pages = 0;
+        let (result, _) = lagging_first
+            .fetch_logs_in_parallel(
+                1001,
+                1600,
+                1,
+                &LogRequestBudget::new(FOREST_RPC_REQUEST_BUDGET),
+                &CancellationToken::new(),
+                |_| {
+                    lagging_first_pages += 1;
+                    Ok(())
+                },
+            )
+            .await;
+        result.expect("a later provider fetches every page");
+        assert_eq!(lagging_first_pages, 6);
+        assert_eq!(lagging.count("eth_blockNumber"), 2);
+        assert_eq!(
+            lagging.count("eth_getLogs"),
+            0,
+            "lagging provider fetches no page"
+        );
+
+        let parallel_logs = pages
+            .into_iter()
+            .flat_map(|page| {
+                let mut logs = page.logs;
+                sort_logs(&mut logs);
+                logs
+            })
+            .collect::<Vec<_>>();
+        let single = pool_chain_config([serving[0].url.clone()]);
+        let rpc = single.rpcs.random_provider().expect("rpc provider");
+        let mut single_logs = single
+            .fetch_logs_for_range(&rpc, None, 1001, 1600, &CancellationToken::new())
+            .await
+            .expect("single-provider fetch succeeds");
+        sort_logs(&mut single_logs);
+        assert_eq!(single_logs.len(), log_blocks.len());
+        assert_eq!(parallel_logs, single_logs);
+    }
+
+    #[tokio::test]
+    async fn failed_log_page_is_retried_elsewhere_and_diagnostics_hide_endpoints() {
+        let events = CapturedEvents::default();
+        let _guard = events.capture();
+        let log_blocks = vec![1010, 1150, 1290];
+        let refused_port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind refused port")
+            .local_addr()
+            .expect("local addr")
+            .port();
+        let failing = spawn_rpc_handler(log_rpc_handler(2000, log_blocks.clone(), |_, _| {
+            Some(json!({ "code": -32000, "message": "header not found" }))
+        }));
+        // The slow head lets the failing provider take the first page.
+        let working = spawn_rpc_handler(delayed(
+            "eth_blockNumber",
+            Duration::from_millis(200),
+            log_rpc_handler(2000, log_blocks.clone(), |_, _| None),
+        ));
+        let chain = pool_chain_config([
+            credential_url(refused_port),
+            failing.url.clone(),
+            working.url.clone(),
+        ]);
+
+        let mut pages = Vec::new();
+        let (result, stats) = chain
+            .fetch_logs_in_parallel(
+                1001,
+                1300,
+                FOREST_RPC_PARALLELISM,
+                &LogRequestBudget::new(FOREST_RPC_REQUEST_BUDGET),
+                &CancellationToken::new(),
+                |page| {
+                    pages.push((page.to_block, page.logs.len()));
+                    Ok(())
+                },
+            )
+            .await;
+        result.expect("working provider fetches every page");
+
+        assert_eq!(pages, vec![(1100, 1), (1200, 1), (1300, 1)]);
+        assert_eq!(failing.count("eth_getLogs"), 1);
+        assert_eq!(stats.retries, 1, "the failed page is retried");
+        assert_eq!(
+            stats
+                .providers
+                .iter()
+                .map(|provider| (provider.rpc_index, provider.pages))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 0), (2, 3)]
+        );
+        assert_eq!(
+            chain
+                .rpcs
+                .available_providers()
+                .iter()
+                .map(|rpc| rpc.index)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "failing providers cool down"
+        );
+
+        let finished = events.find("parallel log range fetch finished");
+        assert_eq!(
+            finished.get("outcome").map(String::as_str),
+            Some("complete")
+        );
+        assert_eq!(finished.get("retries").map(String::as_str), Some("1"));
+        assert!(finished.contains_key("providers"));
+        events.find("parallel log fetch provider failed; its page returns to the queue");
+        for event in events.events() {
+            for value in event.values() {
+                assert!(
+                    ["secret", "user", "apikey", "127.0.0.1"]
+                        .iter()
+                        .all(|needle| !value.contains(needle)),
+                    "log value {value:?} exposes an endpoint"
+                );
+            }
+        }
+
+        let only_failing = pool_chain_config([failing.url.clone()]);
+        let mut delivered = 0;
+        let (result, _) = only_failing
+            .fetch_logs_in_parallel(
+                1001,
+                1300,
+                FOREST_RPC_PARALLELISM,
+                &LogRequestBudget::new(FOREST_RPC_REQUEST_BUDGET),
+                &CancellationToken::new(),
+                |_| {
+                    delivered += 1;
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ChainError::NoHealthyRpc)),
+            "{result:?}"
+        );
+        assert_eq!(delivered, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_log_fetch_stops_when_narrowing_exceeds_request_budget() {
+        let server = spawn_rpc_handler(log_rpc_handler(2000, Vec::new(), |from, to| {
+            (to - from + 1 > 25).then(|| {
+                json!({ "code": -32000, "message": "log query range must not exceed 25 blocks" })
+            })
+        }));
+        let chain = pool_chain_config([server.url.clone()]);
+        assert_eq!(chain.estimate_log_requests(1001, 1200), 2);
+
+        let budget = LogRequestBudget::new(4);
+        let (result, stats) =
+            chain
+                .fetch_logs_in_parallel(1001, 1200, 4, &budget, &CancellationToken::new(), |_| {
+                    Ok(())
+                })
+                .await;
+
+        assert!(
+            matches!(result, Err(ChainError::LogRequestBudgetExceeded(4))),
+            "{result:?}"
+        );
+        assert_eq!(server.count("eth_getLogs"), 4);
+        assert_eq!(stats.get_logs_requests, 4);
+        assert_eq!(
+            chain.rpcs.available_providers().len(),
+            1,
+            "exceeding the budget is not a provider failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_parallel_log_fetch_issues_no_further_requests() {
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let (release_first, first_gate) = std::sync::mpsc::channel::<()>();
+        let (release_second, second_gate) = std::sync::mpsc::channel::<()>();
+        let servers = [
+            spawn_rpc_handler(gated_get_logs(started_tx.clone(), first_gate)),
+            spawn_rpc_handler(gated_get_logs(started_tx, second_gate)),
+        ];
+        let chain = pool_chain_config(servers.iter().map(|server| server.url.clone()));
+        let cancel = CancellationToken::new();
+        let budget = LogRequestBudget::new(FOREST_RPC_REQUEST_BUDGET);
+
+        let fetch = chain.fetch_logs_in_parallel(
+            1001,
+            1600,
+            FOREST_RPC_PARALLELISM,
+            &budget,
+            &cancel,
+            |_| Ok(()),
+        );
+        let cancel_once_both_fetch = async {
+            for _ in 0..2 {
+                started.recv().await.expect("page request started");
+            }
+            cancel.cancel();
+        };
+        let ((result, _), ()) = tokio::join!(fetch, cancel_once_both_fetch);
+        assert!(
+            matches!(result, Err(ChainError::LogFetchCancelled)),
+            "{result:?}"
+        );
+
+        // Released servers answer anything queued behind the held requests.
+        drop((release_first, release_second));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for server in &servers {
+            assert_eq!(server.count("eth_blockNumber"), 1);
+            assert_eq!(
+                server.count("eth_getLogs"),
+                1,
+                "no request after cancellation"
+            );
+        }
+        assert_eq!(
+            chain.rpcs.available_providers().len(),
+            2,
+            "cancellation marks no provider bad"
+        );
+    }
+
+    fn pool_chain_config(urls: impl IntoIterator<Item = Url>) -> ChainConfig {
+        let urls = urls.into_iter().collect::<Vec<_>>();
+        let mut chain = chain_config(urls[0].clone());
+        chain.rpcs = Arc::new(QueryRpcPool::new(urls, Duration::from_mins(1)));
+        chain
+    }
+
+    fn credential_url(port: u16) -> Url {
+        Url::parse(&format!(
+            "http://user:secret@127.0.0.1:{port}/?apikey=secret"
+        ))
+        .expect("mock RPC URL")
+    }
+
+    struct HandlerRpc {
+        url: Url,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl HandlerRpc {
+        fn bodies(&self) -> Vec<serde_json::Value> {
+            self.bodies.lock().expect("request bodies lock").clone()
+        }
+
+        fn count(&self, method: &str) -> usize {
+            self.bodies()
+                .iter()
+                .filter(|body| body["method"] == method)
+                .count()
+        }
+    }
+
+    /// Serves every request, one connection at a time, with `handler`, which
+    /// maps the request body to the response's `result` or `error` member.
+    /// The URL carries credentials in its userinfo and query.
+    fn spawn_rpc_handler(
+        handler: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> HandlerRpc {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock RPC");
+        let url = credential_url(listener.local_addr().expect("local addr").port());
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_bodies = Arc::clone(&bodies);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some(body) = read_json_rpc_body(&mut stream) else {
+                    continue;
+                };
+                server_bodies
+                    .lock()
+                    .expect("request bodies lock")
+                    .push(body.clone());
+                let mut response = handler(&body);
+                response["jsonrpc"] = json!("2.0");
+                response["id"] = body["id"].clone();
+                let response = response.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len(),
+                );
+            }
+        });
+        HandlerRpc { url, bodies }
+    }
+
+    fn read_json_rpc_body(stream: &mut std::net::TcpStream) -> Option<serde_json::Value> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).ok().filter(|read| *read > 0)?;
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if request.len() >= body_start + content_length {
+                return serde_json::from_slice(&request[body_start..body_start + content_length])
+                    .ok();
+            }
+        }
+    }
+
+    fn hex_quantity(value: &serde_json::Value) -> u64 {
+        let hex = value.as_str().expect("hex quantity");
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16).expect("hex quantity")
+    }
+
+    /// Answers `eth_blockNumber` with `head`, and `eth_getLogs` with one log
+    /// per listed block in the requested range unless `reject` returns an
+    /// error for that range.
+    fn log_rpc_handler(
+        head: u64,
+        log_blocks: Vec<u64>,
+        reject: impl Fn(u64, u64) -> Option<serde_json::Value> + Send + 'static,
+    ) -> impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static {
+        move |request: &serde_json::Value| match request["method"].as_str() {
+            Some("eth_blockNumber") => json!({ "result": format!("{head:#x}") }),
+            Some("eth_getLogs") => {
+                let from_block = hex_quantity(&request["params"][0]["fromBlock"]);
+                let to_block = hex_quantity(&request["params"][0]["toBlock"]);
+                reject(from_block, to_block).map_or_else(
+                    || {
+                        let logs = log_blocks
+                            .iter()
+                            .filter(|block| (from_block..=to_block).contains(block))
+                            .map(|block| {
+                                json!({
+                                    "address": format!("{:#x}", Address::ZERO),
+                                    "topics": [],
+                                    "data": "0x",
+                                    "blockHash": format!("{:#x}", FixedBytes::<32>::from([0x11; 32])),
+                                    "blockNumber": format!("{block:#x}"),
+                                    "transactionHash": format!("{:#x}", FixedBytes::<32>::from([0x33; 32])),
+                                    "transactionIndex": "0x0",
+                                    "logIndex": "0x0",
+                                    "removed": false,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({ "result": logs })
+                    },
+                    |error| json!({ "error": error }),
+                )
+            }
+            _ => json!({ "error": { "code": -32601, "message": "method not found" } }),
+        }
+    }
+
+    /// Delays every `method` request by `delay` before `serve` answers it.
+    fn delayed(
+        method: &'static str,
+        delay: Duration,
+        serve: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static {
+        move |request: &serde_json::Value| {
+            if request["method"] == method {
+                thread::sleep(delay);
+            }
+            serve(request)
+        }
+    }
+
+    /// Reports each `eth_getLogs` request on `started` and holds it until
+    /// `release` yields or disconnects.
+    fn gated_get_logs(
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static {
+        let serve = log_rpc_handler(2000, Vec::new(), |_, _| None);
+        move |request: &serde_json::Value| {
+            if request["method"] == "eth_getLogs" {
+                let _ = started.send(());
+                let _ = release.recv();
+            }
+            serve(request)
+        }
+    }
+
+    /// Records `sync_service` tracing events as field-name to value maps.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl CapturedEvents {
+        fn capture(&self) -> CaptureGuard {
+            // With one registered dispatcher, tracing-core resolves a callsite
+            // first hit on another test thread against that thread's empty
+            // default and caches it as disabled. A second live dispatcher keeps
+            // interest computed across every registered dispatcher.
+            let registered = tracing::Dispatch::new(CaptureSubscriber(self.clone()));
+            CaptureGuard {
+                _default: tracing::subscriber::set_default(CaptureSubscriber(self.clone())),
+                _registered: registered,
+            }
+        }
+
+        fn events(&self) -> Vec<BTreeMap<String, String>> {
+            self.0.lock().expect("captured events lock").clone()
+        }
+
+        fn find(&self, message: &str) -> BTreeMap<String, String> {
+            self.events()
+                .into_iter()
+                .find(|event| event.get("message").is_some_and(|value| value == message))
+                .unwrap_or_else(|| panic!("missing {message:?} event"))
+        }
+    }
+
+    struct CaptureGuard {
+        _default: tracing::subscriber::DefaultGuard,
+        _registered: tracing::Dispatch,
+    }
+
+    struct CaptureSubscriber(CapturedEvents);
+
+    struct CapturedFields<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for CapturedFields<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("sync_service")
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut CapturedFields(&mut fields));
+            self.0.0.lock().expect("captured events lock").push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 }

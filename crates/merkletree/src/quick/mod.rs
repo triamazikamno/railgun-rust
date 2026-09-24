@@ -15,7 +15,9 @@ use url::Url;
 
 use crate::tree::{MerkleForest, MerkleTreeUpdate};
 
-pub use graphql::{DEFAULT_PAGE_SIZE, GraphPostError, QuickSyncClient, post_graphql_data};
+pub use graphql::{
+    DEFAULT_PAGE_SIZE, GraphPostError, GraphTimeoutPhase, QuickSyncClient, post_graphql_data,
+};
 pub use types::{
     IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment, IndexedNullifier,
     IndexedRailgunTransaction, IndexedShieldCommitment, IndexedTransactCommitment,

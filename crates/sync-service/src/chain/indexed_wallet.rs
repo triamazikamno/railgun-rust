@@ -108,6 +108,14 @@ pub(super) struct IndexedWalletPage {
 }
 
 impl IndexedWalletPage {
+    pub(super) const fn row_count(&self) -> usize {
+        self.transact_commitments.len()
+            + self.shield_commitments.len()
+            + self.legacy_encrypted_commitments.len()
+            + self.legacy_generated_commitments.len()
+            + self.nullifiers.len()
+    }
+
     pub(super) fn into_scan_rows(self) -> WalletScanInputRows {
         WalletScanInputRows {
             transact_commitments: self.transact_commitments,

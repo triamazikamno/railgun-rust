@@ -42,6 +42,22 @@ impl ForestReorgDecision {
     }
 }
 
+/// Stored forest metadata checked against the confirmed chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForestMetaCheck {
+    /// Nothing to compare: the forest precedes deployment or the metadata
+    /// records no hash.
+    Unchecked,
+    /// The metadata records a block other than the forest's progress.
+    StaleMeta,
+    /// No confirmed hash was read for the block.
+    Unconfirmed,
+    Match,
+    Mismatch {
+        current_hash: [u8; 32],
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IndexedWalletPageKind {
     Legacy,
@@ -250,6 +266,8 @@ pub enum ChainError {
     NoHealthyRpc,
     #[error("log fetch cancelled")]
     LogFetchCancelled,
+    #[error("log request budget of {0} exceeded")]
+    LogRequestBudgetExceeded(u64),
     #[error("wallet not found")]
     WalletNotFound,
     #[error("a different wallet is already registered")]
@@ -407,6 +425,7 @@ impl ChainError {
                 | Self::IndexedCatchUpUnavailable { .. }
                 | Self::NoHealthyRpc
                 | Self::LogFetchCancelled
+                | Self::LogRequestBudgetExceeded(_)
         )
     }
 

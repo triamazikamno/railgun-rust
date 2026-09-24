@@ -80,6 +80,18 @@ pub(crate) enum TxidPublicCacheError {
     StalePublicCacheGeneration { expected: u64, actual: u64 },
 }
 
+impl TxidPublicCacheError {
+    /// Returns this error with any Squid request URL removed, for logging.
+    pub(crate) fn without_url(self) -> Self {
+        match self {
+            Self::Sync(SyncError::Request(err)) => {
+                Self::Sync(SyncError::Request(err.without_url()))
+            }
+            other => other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TxidPublicCacheKey<'a> {
     pub chain_type: u8,

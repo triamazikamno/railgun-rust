@@ -41,6 +41,8 @@ const INDEXED_ARTIFACT_MAINTENANCE_CAPACITY: usize = 8;
 const INDEXED_ARTIFACT_MAINTENANCE_MAX_RETAINED_PAYLOAD_BYTES: u64 =
     INDEXED_ARTIFACT_MAX_DECODED_ENVELOPE_BYTES;
 const SLOW_INDEXED_ARTIFACT_CHUNK_FETCH: Duration = Duration::from_secs(3);
+/// How long consumers of one source config reuse a verified manifest instead of fetching it again.
+const MANIFEST_REUSE_WINDOW: Duration = Duration::from_mins(2);
 type IndexedArtifactMaintenanceJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type IndexedArtifactMaintenanceWorker = Shared<IndexedArtifactMaintenanceJob>;
 
@@ -306,9 +308,74 @@ pub struct VerifiedIndexedArtifactCatalog {
     pub catalog: IndexedArtifactCatalog,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct IndexedArtifactManifestFetchResult {
     pub(crate) manifest: IndexedArtifactManifest,
     pub(crate) preferred_gateway_index: Option<usize>,
+}
+
+/// Verified manifests shared by every consumer built from clones of one
+/// `IndexedArtifactSourceConfig`. Clones share the stored manifests for as
+/// long as the configuration lives. The handle is runtime cache state, so it
+/// is excluded from configuration equality: any two handles compare equal.
+#[derive(Clone, Default)]
+pub struct IndexedArtifactManifestReuse {
+    slots: std::sync::Arc<std::sync::Mutex<Vec<ManifestReuseSlot>>>,
+}
+
+type ManifestReuseEntry = std::sync::Arc<tokio::sync::Mutex<Option<StoredManifest>>>;
+
+struct ManifestReuseSlot {
+    manifest_source: IndexedArtifactManifestSource,
+    scope: ChainScope,
+    entry: ManifestReuseEntry,
+}
+
+struct StoredManifest {
+    result: IndexedArtifactManifestFetchResult,
+    verified_at: tokio::time::Instant,
+}
+
+impl IndexedArtifactManifestReuse {
+    fn entry(
+        &self,
+        manifest_source: &IndexedArtifactManifestSource,
+        scope: &ChainScope,
+    ) -> ManifestReuseEntry {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = slots
+            .iter()
+            .find(|slot| slot.manifest_source == *manifest_source && slot.scope == *scope)
+        {
+            return std::sync::Arc::clone(&slot.entry);
+        }
+        let entry = ManifestReuseEntry::default();
+        slots.push(ManifestReuseSlot {
+            manifest_source: manifest_source.clone(),
+            scope: scope.clone(),
+            entry: std::sync::Arc::clone(&entry),
+        });
+        entry
+    }
+}
+
+impl PartialEq for IndexedArtifactManifestReuse {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for IndexedArtifactManifestReuse {}
+
+impl std::fmt::Debug for IndexedArtifactManifestReuse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexedArtifactManifestReuse")
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedIndexedArtifactCatalog {
@@ -348,7 +415,86 @@ struct FetchedIndexedArtifactChunk {
     preferred_gateway_index: usize,
     gateway_index: usize,
     gateway_count: usize,
+    hedged: bool,
     elapsed_ms: u128,
+}
+
+/// Compressed gateway bytes in flight for one chunk batch. First attempts and
+/// hedge attempts draw from the same budget.
+struct ChunkByteBudget {
+    max_in_flight_bytes: u64,
+    state: std::sync::Mutex<ChunkByteBudgetState>,
+}
+
+#[derive(Default)]
+struct ChunkByteBudgetState {
+    in_flight_bytes: u64,
+    max_observed_in_flight_bytes: u64,
+}
+
+impl ChunkByteBudget {
+    fn new(max_in_flight_bytes: u64) -> Self {
+        Self {
+            max_in_flight_bytes,
+            state: std::sync::Mutex::default(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ChunkByteBudgetState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Charges `bytes` if they fit under the budget now.
+    fn try_charge(&self, bytes: u64) -> bool {
+        let mut state = self.state();
+        let next_in_flight_bytes = state.in_flight_bytes.saturating_add(bytes);
+        if next_in_flight_bytes > self.max_in_flight_bytes {
+            return false;
+        }
+        state.in_flight_bytes = next_in_flight_bytes;
+        state.max_observed_in_flight_bytes =
+            state.max_observed_in_flight_bytes.max(next_in_flight_bytes);
+        true
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut state = self.state();
+        state.in_flight_bytes = state.in_flight_bytes.saturating_sub(bytes);
+    }
+
+    /// Charges a hedge attempt's `bytes` if they fit now. The charge lasts as
+    /// long as the returned guard.
+    fn try_charge_hedge(&self, bytes: u64) -> Option<HedgeByteCharge<'_>> {
+        if !self.try_charge(bytes) {
+            return None;
+        }
+        Some(HedgeByteCharge {
+            budget: self,
+            bytes,
+        })
+    }
+
+    fn in_flight_bytes(&self) -> u64 {
+        self.state().in_flight_bytes
+    }
+
+    fn max_observed_in_flight_bytes(&self) -> u64 {
+        self.state().max_observed_in_flight_bytes
+    }
+}
+
+/// Releases a hedge attempt's byte charge when the attempt ends.
+struct HedgeByteCharge<'a> {
+    budget: &'a ChunkByteBudget,
+    bytes: u64,
+}
+
+impl Drop for HedgeByteCharge<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -554,7 +700,52 @@ impl IndexedArtifactManifestClient {
             .map(|result| result.manifest)
     }
 
+    /// Returns a manifest verified for this source and scope less than
+    /// `MANIFEST_REUSE_WINDOW` ago if it still validates for this caller;
+    /// otherwise fetches and verifies one. The entry lock is held across the
+    /// fetch so concurrent callers share it; dropping the future releases it.
     pub(crate) async fn fetch_manifest_with_metadata(
+        &self,
+        expected_scope: &ChainScope,
+        last_accepted_sequence: Option<u64>,
+        now: SystemTime,
+    ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
+        let entry = self
+            .config
+            .manifest_reuse
+            .entry(&self.config.manifest_source, expected_scope);
+        let mut reuse = entry.lock().await;
+        if let Some(stored) = reuse.as_ref() {
+            let age = stored.verified_at.elapsed();
+            if age < MANIFEST_REUSE_WINDOW
+                && validate_manifest(
+                    &stored.result.manifest,
+                    &self.config,
+                    expected_scope,
+                    last_accepted_sequence,
+                    now,
+                )
+                .is_ok()
+            {
+                debug!(
+                    manifest_sequence = stored.result.manifest.sequence,
+                    age_ms = age.as_millis(),
+                    "reused verified indexed artifact manifest"
+                );
+                return Ok(stored.result.clone());
+            }
+        }
+        let result = self
+            .fetch_verified_manifest(expected_scope, last_accepted_sequence, now)
+            .await?;
+        *reuse = Some(StoredManifest {
+            result: result.clone(),
+            verified_at: tokio::time::Instant::now(),
+        });
+        Ok(result)
+    }
+
+    async fn fetch_verified_manifest(
         &self,
         expected_scope: &ChainScope,
         last_accepted_sequence: Option<u64>,
@@ -749,12 +940,11 @@ impl IndexedArtifactManifestClient {
             .map(|descriptor| descriptor.byte_size)
             .collect::<Vec<_>>();
         let fetcher = self.fetcher();
+        let byte_budget = ChunkByteBudget::new(max_in_flight_bytes);
         let mut results = Vec::with_capacity(descriptors.len());
         let mut next_index = 0;
         let mut completed_chunks = 0;
-        let mut in_flight_bytes = 0_u64;
         let mut max_observed_in_flight_chunks = 0_usize;
-        let mut max_observed_in_flight_bytes = 0_u64;
         let mut byte_budget_waits = 0_u64;
         let mut slowest_chunk_elapsed_ms = 0_u128;
         let mut in_flight = FuturesUnordered::new();
@@ -770,8 +960,7 @@ impl IndexedArtifactManifestClient {
                         max_in_flight_bytes,
                     });
                 }
-                let next_in_flight_bytes = in_flight_bytes.saturating_add(in_flight_byte_charge);
-                if next_in_flight_bytes > max_in_flight_bytes {
+                if !byte_budget.try_charge(in_flight_byte_charge) {
                     byte_budget_waits = byte_budget_waits.saturating_add(1);
                     debug!(
                         dataset_kind = ?descriptor.dataset_kind,
@@ -781,7 +970,7 @@ impl IndexedArtifactManifestClient {
                         next_byte_size = descriptor.byte_size,
                         next_in_flight_byte_charge = in_flight_byte_charge,
                         in_flight_chunks = in_flight.len(),
-                        in_flight_bytes,
+                        in_flight_bytes = byte_budget.in_flight_bytes(),
                         max_in_flight_bytes,
                         configured_concurrency = concurrency,
                         "indexed artifact chunk in-flight byte budget saturated"
@@ -795,19 +984,27 @@ impl IndexedArtifactManifestClient {
                 let dataset_kind = descriptor.dataset_kind;
                 let range_start = descriptor.range.start;
                 let range_end = descriptor.range.end;
-                in_flight_bytes = next_in_flight_bytes;
                 next_index += 1;
                 let fetcher = &fetcher;
+                let byte_budget = &byte_budget;
                 in_flight.push(async move {
                     let started = Instant::now();
-                    let fetched = match fetcher
-                        .fetch_artifact_cid_with_metadata_from_gateway(
+                    let mut hedged = false;
+                    let result = fetcher
+                        .fetch_artifact_cid_with_metadata_hedged(
                             &descriptor.cid,
                             descriptor.byte_size,
                             preferred_gateway_index,
+                            || {
+                                // A hedge starts only if its bytes fit the batch budget now;
+                                // otherwise the first attempt continues alone.
+                                let charge = byte_budget.try_charge_hedge(in_flight_byte_charge);
+                                hedged = charge.is_some();
+                                charge
+                            },
                         )
-                        .await
-                    {
+                        .await;
+                    let fetched = match result {
                         Ok(fetched) => fetched,
                         Err(err) => {
                             debug!(
@@ -819,6 +1016,7 @@ impl IndexedArtifactManifestClient {
                                 byte_size,
                                 index,
                                 preferred_gateway_index,
+                                hedged,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 "indexed artifact chunk fetch failed"
                             );
@@ -853,18 +1051,18 @@ impl IndexedArtifactManifestClient {
                         preferred_gateway_index,
                         gateway_index,
                         gateway_count,
+                        hedged,
                         elapsed_ms: started.elapsed().as_millis(),
                     })
                 });
                 max_observed_in_flight_chunks = max_observed_in_flight_chunks.max(in_flight.len());
-                max_observed_in_flight_bytes = max_observed_in_flight_bytes.max(in_flight_bytes);
             }
 
             let Some(completed) = in_flight.next().await else {
                 continue;
             };
             let fetched = completed?;
-            in_flight_bytes = in_flight_bytes.saturating_sub(fetched.in_flight_byte_charge);
+            byte_budget.release(fetched.in_flight_byte_charge);
             completed_chunks += 1;
             on_chunk_verified(&fetched.chunk, completed_chunks, total_chunks);
             slowest_chunk_elapsed_ms = slowest_chunk_elapsed_ms.max(fetched.elapsed_ms);
@@ -880,6 +1078,7 @@ impl IndexedArtifactManifestClient {
                     total_chunks,
                     gateway_index = fetched.gateway_index,
                     gateway_count = fetched.gateway_count,
+                    hedged = fetched.hedged,
                     elapsed_ms = fetched.elapsed_ms,
                     "slow indexed artifact chunk fetch verified"
                 );
@@ -897,6 +1096,7 @@ impl IndexedArtifactManifestClient {
                     total_chunks,
                     gateway_index = fetched.gateway_index,
                     gateway_count = fetched.gateway_count,
+                    hedged = fetched.hedged,
                     elapsed_ms = fetched.elapsed_ms,
                     "indexed artifact chunk fetch verified"
                 );
@@ -904,6 +1104,7 @@ impl IndexedArtifactManifestClient {
             results.push((fetched.index, fetched.chunk));
         }
 
+        let max_observed_in_flight_bytes = byte_budget.max_observed_in_flight_bytes();
         debug!(
             total_chunks,
             configured_concurrency = concurrency,
@@ -1774,6 +1975,8 @@ mod tests {
 
     const LIBP2P_KEY_CODEC: u64 = 0x72;
     const RAW_CODEC: u64 = 0x55;
+    /// The chunk hedge delay private to `trustless-artifacts`.
+    const CHUNK_HEDGE_DELAY: Duration = Duration::from_secs(5);
 
     #[tokio::test]
     async fn maintenance_shutdown_cancels_running_work_and_rejects_admission() {
@@ -2108,6 +2311,159 @@ mod tests {
             .expect("fallback manifest accepted");
 
         assert_eq!(fetched.sequence, valid_manifest.sequence);
+    }
+
+    #[tokio::test]
+    async fn manifest_reuse_serves_second_consumer_without_gateway_requests() {
+        let ipns_keypair = test_ipns_keypair();
+        let ipns_name = ipns_name(&ipns_keypair);
+        let scope = scope();
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let (manifest, manifest_bytes) = signed_manifest(&signing_key, &scope);
+        let manifest_cid = raw_cid(&manifest_bytes);
+        let ipns_path = format!("/ipns/{ipns_name}?format=ipns-record");
+        let gateway = ManifestGateway::spawn(
+            HashMap::from([
+                (
+                    ipns_path.clone(),
+                    ipns_record(&ipns_keypair, format!("/ipfs/{manifest_cid}"), 1),
+                ),
+                (format!("/ipfs/{manifest_cid}?format=raw"), manifest_bytes),
+            ]),
+            0,
+        );
+        let mut config = config(signing_key.verifying_key().to_bytes(), None);
+        config.manifest_source = IndexedArtifactManifestSource::IpnsName(ipns_name);
+        config.gateway_urls = vec![gateway.url.clone()];
+        let forest = IndexedArtifactManifestClient::new(config.clone(), reqwest::Client::new());
+        let wallet = IndexedArtifactManifestClient::new(config, reqwest::Client::new());
+
+        let fetched = forest
+            .fetch_manifest_with_metadata(&scope, None, SystemTime::now())
+            .await
+            .expect("forest manifest verifies");
+        let requests = gateway.request_paths();
+        assert!(
+            requests.contains(&ipns_path),
+            "first consumer resolves IPNS"
+        );
+        let reused = wallet
+            .fetch_manifest_with_metadata(&scope, None, SystemTime::now())
+            .await
+            .expect("wallet manifest reused");
+
+        assert_eq!(
+            gateway.request_paths(),
+            requests,
+            "second consumer should make no IPNS or CID request"
+        );
+        assert_eq!(reused.manifest, manifest);
+        assert!(reused.preferred_gateway_index.is_some());
+        assert_eq!(
+            reused.preferred_gateway_index,
+            fetched.preferred_gateway_index
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_reuse_refetches_after_failure_failed_revalidation_or_window() {
+        let scope = scope();
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let (_, manifest_bytes) = signed_manifest(&signing_key, &scope);
+        let (config, gateway) = recorded_cid_manifest_source(
+            &signing_key,
+            manifest_bytes,
+            Some(Duration::from_mins(1)),
+            0,
+        );
+        let client = IndexedArtifactManifestClient::new(config, reqwest::Client::new());
+        let fresh = UNIX_EPOCH + Duration::from_millis(now_ms());
+        let stale = fresh + Duration::from_mins(2);
+
+        client
+            .fetch_manifest_with_metadata(&scope, None, stale)
+            .await
+            .expect_err("stale manifest rejected");
+        client
+            .fetch_manifest_with_metadata(&scope, None, fresh)
+            .await
+            .expect("fresh manifest verifies");
+        assert_eq!(gateway.request_count(), 2, "a failed fetch is not stored");
+
+        client
+            .fetch_manifest_with_metadata(&scope, None, stale)
+            .await
+            .expect_err("stored manifest is stale at the new time");
+        assert_eq!(
+            gateway.request_count(),
+            3,
+            "a stored manifest that fails validation is fetched again"
+        );
+        client
+            .fetch_manifest_with_metadata(&scope, None, fresh)
+            .await
+            .expect("stored manifest reused");
+        assert_eq!(gateway.request_count(), 3);
+
+        tokio::time::pause();
+        tokio::time::advance(MANIFEST_REUSE_WINDOW).await;
+        tokio::time::resume();
+        client
+            .fetch_manifest_with_metadata(&scope, None, fresh)
+            .await
+            .expect("manifest verifies after the window");
+        assert_eq!(
+            gateway.request_count(),
+            4,
+            "a manifest older than the window is fetched again"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_reuse_shares_one_fetch_between_concurrent_consumers() {
+        let scope = scope();
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let (manifest, manifest_bytes) = signed_manifest(&signing_key, &scope);
+        let (config, gateway) = recorded_cid_manifest_source(&signing_key, manifest_bytes, None, 0);
+        let first = IndexedArtifactManifestClient::new(config.clone(), reqwest::Client::new());
+        let second = IndexedArtifactManifestClient::new(config, reqwest::Client::new());
+        let now = SystemTime::now();
+
+        let (first, second) = tokio::join!(
+            first.fetch_manifest_with_metadata(&scope, None, now),
+            second.fetch_manifest_with_metadata(&scope, None, now),
+        );
+
+        assert_eq!(first.expect("first manifest").manifest, manifest);
+        assert_eq!(second.expect("second manifest").manifest, manifest);
+        assert_eq!(gateway.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn manifest_reuse_fetches_again_after_cancelled_fetch() {
+        let scope = scope();
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let (manifest, manifest_bytes) = signed_manifest(&signing_key, &scope);
+        let (config, gateway) = recorded_cid_manifest_source(&signing_key, manifest_bytes, None, 1);
+        let client = IndexedArtifactManifestClient::new(config, reqwest::Client::new());
+        let now = SystemTime::now();
+
+        tokio::select! {
+            _ = client.fetch_manifest_with_metadata(&scope, None, now) => {
+                panic!("stalled manifest fetch finished");
+            }
+            () = gateway.wait_for_requests(1) => {}
+        }
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.fetch_manifest_with_metadata(&scope, None, now),
+        )
+        .await
+        .expect("cancelled fetch released the manifest entry")
+        .expect("manifest verifies after cancellation");
+
+        assert_eq!(fetched.manifest, manifest);
+        assert_eq!(gateway.request_count(), 2);
     }
 
     #[test]
@@ -2701,6 +3057,80 @@ mod tests {
             server.max_active() <= 2,
             "byte budget should cap active 5-byte chunks at two"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_chunk_fetch_skips_hedge_without_byte_budget_room() {
+        let (task, stalled, serving, byte_size) =
+            spawn_chunk_fetch_with_stalled_preferred_gateway(1);
+
+        yield_until("the stalled gateway receives the chunk request", || {
+            stalled.request_count() == 1
+        })
+        .await;
+        tokio::time::advance(CHUNK_HEDGE_DELAY).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            serving.request_count(),
+            0,
+            "no hedge starts without budget room"
+        );
+        // The first attempt continues until its header timeout, then falls back as before.
+        tokio::time::advance(Duration::from_mins(5)).await;
+        yield_until("the chunk fetch finishes", || task.is_finished()).await;
+        let batch = task
+            .await
+            .expect("join fetch task")
+            .expect("fallback gateway serves the chunk");
+
+        assert_eq!(batch.chunks.len(), 1);
+        assert_eq!(serving.request_count(), 1);
+        assert_eq!(
+            batch.metrics.max_observed_in_flight_bytes, byte_size,
+            "a skipped hedge takes no byte charge"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_chunk_fetch_charges_hedge_to_byte_budget() {
+        let (task, stalled, serving, byte_size) =
+            spawn_chunk_fetch_with_stalled_preferred_gateway(2);
+
+        yield_until("the stalled gateway receives the chunk request", || {
+            stalled.request_count() == 1
+        })
+        .await;
+        tokio::time::advance(CHUNK_HEDGE_DELAY).await;
+        yield_until("the chunk fetch finishes", || task.is_finished()).await;
+        let batch = task
+            .await
+            .expect("join fetch task")
+            .expect("hedge gateway serves the chunk");
+
+        assert_eq!(batch.chunks.len(), 1);
+        assert_eq!(serving.request_count(), 1);
+        assert_eq!(
+            batch.metrics.max_observed_in_flight_bytes,
+            byte_size * 2,
+            "the hedge is charged to the byte budget"
+        );
+    }
+
+    #[test]
+    fn chunk_byte_budget_releases_hedge_charge_on_drop() {
+        let budget = ChunkByteBudget::new(10);
+        assert!(budget.try_charge(6));
+        assert!(budget.try_charge_hedge(5).is_none());
+        let hedge = budget.try_charge_hedge(4).expect("hedge fits the budget");
+        assert!(!budget.try_charge(1));
+
+        drop(hedge);
+        assert_eq!(budget.in_flight_bytes(), 6);
+        budget.release(6);
+        assert_eq!(budget.in_flight_bytes(), 0);
+        assert_eq!(budget.max_observed_in_flight_bytes(), 10);
     }
 
     #[test]
@@ -3309,6 +3739,144 @@ mod tests {
         }
     }
 
+    /// Serves `routes` on every connection and records each request path. The
+    /// first `stalled` connections get no response until the client drops them.
+    struct ManifestGateway {
+        url: Url,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ManifestGateway {
+        fn spawn(routes: HashMap<String, Vec<u8>>, stalled: usize) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+            let url = Url::parse(&format!(
+                "http://{}",
+                listener.local_addr().expect("local addr")
+            ))
+            .expect("server URL");
+            let routes = Arc::new(routes);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            std::thread::spawn({
+                let requests = Arc::clone(&requests);
+                move || {
+                    for (index, stream) in listener.incoming().enumerate() {
+                        let Ok(mut stream) = stream else {
+                            return;
+                        };
+                        let routes = Arc::clone(&routes);
+                        let requests = Arc::clone(&requests);
+                        std::thread::spawn(move || {
+                            let path = read_request_path(&mut stream);
+                            requests.lock().expect("requests lock").push(path.clone());
+                            if index < stalled {
+                                // Hold the request until the client drops the connection.
+                                let _ = std::io::copy(&mut stream, &mut std::io::sink());
+                            } else {
+                                write_path_response(&mut stream, &routes, &path);
+                            }
+                        });
+                    }
+                }
+            });
+
+            Self { url, requests }
+        }
+
+        fn request_paths(&self) -> Vec<String> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().expect("requests lock").len()
+        }
+
+        async fn wait_for_requests(&self, count: usize) {
+            while self.request_count() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    fn signed_manifest(
+        signing_key: &SigningKey,
+        scope: &ChainScope,
+    ) -> (IndexedArtifactManifest, Vec<u8>) {
+        let mut manifest = manifest_for_scope(scope.clone(), now_ms());
+        manifest.sign_manifest(signing_key).expect("sign manifest");
+        let bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
+        (manifest, bytes)
+    }
+
+    /// A manifest CID source with one recording gateway that serves `manifest_bytes`.
+    fn recorded_cid_manifest_source(
+        signing_key: &SigningKey,
+        manifest_bytes: Vec<u8>,
+        max_manifest_age: Option<Duration>,
+        stalled: usize,
+    ) -> (IndexedArtifactSourceConfig, ManifestGateway) {
+        let manifest_cid = raw_cid(&manifest_bytes);
+        let gateway = ManifestGateway::spawn(
+            HashMap::from([(format!("/ipfs/{manifest_cid}?format=raw"), manifest_bytes)]),
+            stalled,
+        );
+        let mut config = config(signing_key.verifying_key().to_bytes(), max_manifest_age);
+        config.manifest_source = IndexedArtifactManifestSource::Cid(manifest_cid.to_string());
+        config.gateway_urls = vec![gateway.url.clone()];
+        (config, gateway)
+    }
+
+    /// Spawns a one-chunk fetch whose preferred gateway never answers and whose
+    /// other gateway serves the chunk. The byte budget holds `budget_charges`
+    /// charges of the chunk's size.
+    fn spawn_chunk_fetch_with_stalled_preferred_gateway(
+        budget_charges: u64,
+    ) -> (
+        tokio::task::JoinHandle<
+            Result<IndexedArtifactChunkFetchBatch, IndexedArtifactManifestError>,
+        >,
+        ManifestGateway,
+        ManifestGateway,
+        u64,
+    ) {
+        let bytes = b"hedged indexed artifact chunk".to_vec();
+        let descriptor = descriptors_for_bytes(&scope(), std::slice::from_ref(&bytes)).remove(0);
+        let cid = raw_cid(&bytes);
+        let routes = HashMap::from([(
+            format!("/ipfs/{cid}?format=car&dag-scope=entity"),
+            car_bytes(cid, &[(cid, bytes)]),
+        )]);
+        let stalled = ManifestGateway::spawn(routes.clone(), 1);
+        let serving = ManifestGateway::spawn(routes, 0);
+        let mut gateway_urls = vec![serving.url.clone()];
+        gateway_urls.insert(
+            preferred_artifact_gateway_index(&descriptor) % 2,
+            stalled.url.clone(),
+        );
+        let byte_size = descriptor.byte_size;
+        let mut config = config([7_u8; 32], None);
+        config.gateway_urls = gateway_urls;
+        config.concurrency = 1;
+        config.max_in_flight_bytes = byte_size * budget_charges;
+        let client = IndexedArtifactManifestClient::new(config, reqwest::Client::new());
+        let task = tokio::spawn(async move {
+            client
+                .fetch_chunks_bounded_with_verified_progress(&[descriptor], |_, _, _| {})
+                .await
+        });
+        (task, stalled, serving, byte_size)
+    }
+
+    /// Yields until `condition` holds, without letting paused time advance.
+    async fn yield_until(what: &str, mut condition: impl FnMut() -> bool) {
+        for _ in 0..100_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
     struct PathServer {
         url: Url,
     }
@@ -3381,8 +3949,16 @@ mod tests {
 
     fn handle_path_request(mut stream: std::net::TcpStream, routes: &HashMap<String, Vec<u8>>) {
         let path = read_request_path(&mut stream);
+        write_path_response(&mut stream, routes, &path);
+    }
+
+    fn write_path_response(
+        stream: &mut std::net::TcpStream,
+        routes: &HashMap<String, Vec<u8>>,
+        path: &str,
+    ) {
         let (status, reason, body) = routes
-            .get(&path)
+            .get(path)
             .map_or((404_u16, "NOT FOUND", Vec::new()), |body| {
                 (200_u16, "OK", body.clone())
             });
@@ -3451,6 +4027,7 @@ mod tests {
             manifest_source: IndexedArtifactManifestSource::Cid("bafymanifest".to_string()),
             gateway_urls: Vec::new(),
             gateway_pool: None,
+            manifest_reuse: IndexedArtifactManifestReuse::default(),
             max_manifest_age,
             concurrency: 6,
             max_in_flight_bytes: 64 * 1024 * 1024,

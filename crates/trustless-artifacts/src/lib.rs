@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -48,8 +49,10 @@ const ARTIFACT_CAR_FIXED_OVERHEAD_BYTES: usize = 64 * 1024;
 const ARTIFACT_HTTP_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 const ARTIFACT_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CONCURRENT_IPNS_GATEWAY_REQUESTS: usize = 8;
-const MAX_CONCURRENT_MANIFEST_CID_REQUESTS: usize = 3;
 const MANIFEST_CID_HEDGE_DELAY: Duration = Duration::from_millis(750);
+/// Time without response headers after which an indexed-artifact chunk
+/// attempt gets a concurrent attempt on another gateway.
+const CHUNK_HEDGE_DELAY: Duration = Duration::from_secs(5);
 const GATEWAY_FAILURE_COOLDOWN: Duration = Duration::from_mins(5);
 const GATEWAY_FAILURE_COOLDOWN_CAP: Duration = Duration::from_mins(15);
 const CARV2_PRAGMA: [u8; 11] = [
@@ -806,6 +809,154 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         .await
     }
 
+    /// Fetches an indexed-artifact chunk, hedging a gateway that stalls before
+    /// responding.
+    ///
+    /// Attempts fall back sequentially across the same gateways as
+    /// [`Self::fetch_artifact_cid_with_metadata_from_gateway`], except that when
+    /// the sole running attempt has not received response headers within
+    /// `CHUNK_HEDGE_DELAY`, one concurrent attempt starts on another gateway.
+    /// At most one hedge starts per chunk, so at most two attempts run at once.
+    /// The first body that verifies against `cid` wins; the other attempt is
+    /// cancelled and its gateway released without a recorded failure.
+    ///
+    /// `admit_hedge` is called at most once, after a hedge gateway has been
+    /// reserved and immediately before the hedge starts. Returning `None`
+    /// vetoes the hedge and the running attempt continues alone. A returned
+    /// guard is held for the hedge attempt's lifetime and dropped when that
+    /// attempt succeeds, fails or is cancelled, so a caller can charge the
+    /// hedge to a byte budget.
+    pub async fn fetch_artifact_cid_with_metadata_hedged<G>(
+        &self,
+        cid: &str,
+        byte_size: u64,
+        preferred_gateway_index: usize,
+        admit_hedge: impl FnOnce() -> Option<G>,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
+        let cid = parse_cid(cid)?;
+        let limits = RetrievalLimits::artifact(byte_size)?;
+        if self.gateways.is_empty() {
+            return Err(TrustlessArtifactError::NoGateways);
+        }
+
+        let gateway_count = self.gateways.len();
+        let preferred_gateway_index = preferred_gateway_index % gateway_count;
+        let started = tokio::time::Instant::now();
+        let mut admit_hedge = Some(admit_hedge);
+        let mut reserved_identities = HashSet::with_capacity(gateway_count);
+        let mut attempts = FuturesUnordered::new();
+        // Hedge deadline, gateway index and headers flag of the sole running
+        // attempt, armed while the hedge is unused.
+        let mut hedge_watch: Option<(tokio::time::Instant, usize, Arc<AtomicBool>)> = None;
+        let mut hedged_gateways = None;
+        let mut last_error = None;
+        loop {
+            if attempts.is_empty() {
+                let Some(gateway_attempt) = self.pool.select_excluding(
+                    &self.gateway_ids,
+                    GatewayCapability::ArtifactCar,
+                    reserved_identities
+                        .is_empty()
+                        .then_some(preferred_gateway_index),
+                    &reserved_identities,
+                ) else {
+                    break;
+                };
+                reserved_identities.insert(gateway_attempt.identity);
+                let headers_received = Arc::new(AtomicBool::new(false));
+                if admit_hedge.is_some() {
+                    hedge_watch = Some((
+                        tokio::time::Instant::now() + CHUNK_HEDGE_DELAY,
+                        gateway_attempt.index,
+                        Arc::clone(&headers_received),
+                    ));
+                }
+                attempts.push(self.chunk_attempt(
+                    cid,
+                    limits,
+                    gateway_attempt,
+                    headers_received,
+                    None::<G>,
+                ));
+            }
+
+            let hedge_at = hedge_watch.as_ref().map(|(hedge_at, _, _)| *hedge_at);
+            tokio::select! {
+                biased;
+                result = attempts.next() => {
+                    let Some((gateway_index, result)) = result else { continue };
+                    match result {
+                        Ok(bytes) => {
+                            if let Some((first_gateway_index, hedge_gateway_index)) = hedged_gateways {
+                                debug!(
+                                    cid = %cid,
+                                    first_gateway_index,
+                                    hedge_gateway_index,
+                                    winner_gateway_index = gateway_index,
+                                    gateway_count,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    "hedged artifact chunk fetch completed"
+                                );
+                            }
+                            return Ok(TrustlessArtifactFetchResult {
+                                verified_cid: cid.to_string(),
+                                bytes,
+                                gateway_index,
+                                gateway_count,
+                            });
+                        }
+                        // Any other running attempt continues; once none is
+                        // left, the loop falls back to the next gateway.
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                () = tokio::time::sleep_until(hedge_at.unwrap_or(started)), if hedge_at.is_some() => {
+                    let Some((_, first_gateway_index, headers_received)) = hedge_watch.take() else {
+                        continue;
+                    };
+                    // An attempt that has received headers is progressing and is
+                    // never duplicated.
+                    if headers_received.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let Some(gateway_attempt) = self.pool.select_excluding(
+                        &self.gateway_ids,
+                        GatewayCapability::ArtifactCar,
+                        None,
+                        &reserved_identities,
+                    ) else {
+                        continue;
+                    };
+                    // A vetoed hedge drops its reservation without a recorded failure.
+                    let Some(hedge_guard) = admit_hedge.take().and_then(|admit_hedge| admit_hedge())
+                    else {
+                        continue;
+                    };
+                    reserved_identities.insert(gateway_attempt.identity);
+                    let hedge_gateway_index = gateway_attempt.index;
+                    debug!(
+                        cid = %cid,
+                        first_gateway_index,
+                        hedge_gateway_index,
+                        gateway_count,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "artifact chunk hedge started"
+                    );
+                    hedged_gateways = Some((first_gateway_index, hedge_gateway_index));
+                    attempts.push(self.chunk_attempt(
+                        cid,
+                        limits,
+                        gateway_attempt,
+                        Arc::new(AtomicBool::new(false)),
+                        Some(hedge_guard),
+                    ));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(TrustlessArtifactError::NoGateways))
+    }
+
     pub async fn resolve_ipns_manifest_candidates(
         &self,
         name: &str,
@@ -1023,7 +1174,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 count: gateway_count,
             };
             match self
-                .fetch_cid_bytes_from_url(cid, &url, source, limits)
+                .fetch_cid_bytes_from_url(cid, &url, source, limits, None)
                 .await
             {
                 Ok(bytes) => {
@@ -1066,20 +1217,61 @@ impl<'a> TrustlessArtifactFetcher<'a> {
         Err(last_error.unwrap_or(TrustlessArtifactError::NoGateways))
     }
 
+    /// Runs one indexed-artifact chunk attempt and records its gateway outcome.
+    /// `_hedge_guard` is held until the attempt completes or is cancelled.
+    async fn chunk_attempt<G>(
+        &self,
+        cid: Cid,
+        limits: RetrievalLimits,
+        gateway_attempt: GatewayAttempt,
+        headers_received: Arc<AtomicBool>,
+        _hedge_guard: Option<G>,
+    ) -> (usize, Result<Vec<u8>, TrustlessArtifactError>) {
+        let gateway_index = gateway_attempt.index;
+        let gateway_count = self.gateways.len();
+        let url = car_gateway_url(self.gateways.expose(gateway_index), &cid);
+        let source = TrustlessHttpSource::Gateway {
+            index: gateway_index,
+            count: gateway_count,
+        };
+        let attempt_started = Instant::now();
+        let result = self
+            .fetch_cid_bytes_from_url(cid, &url, source, limits, Some(&headers_received))
+            .await;
+        match &result {
+            Ok(_) => gateway_attempt.success(),
+            Err(err) => {
+                debug!(
+                    ?err,
+                    gateway_index,
+                    gateway_count,
+                    resource = "artifact",
+                    cid = %cid,
+                    elapsed_ms = attempt_started.elapsed().as_millis(),
+                    "POI artifact CID gateway fetch failed"
+                );
+                gateway_attempt.failure();
+            }
+        }
+        (gateway_index, result)
+    }
+
     async fn fetch_cid_bytes_from_url(
         &self,
         cid: Cid,
         url: &Url,
         source: TrustlessHttpSource,
         limits: RetrievalLimits,
+        headers_received: Option<&AtomicBool>,
     ) -> Result<Vec<u8>, TrustlessArtifactError> {
-        let car_bytes = fetch_response_bytes_with_timeouts(
+        let car_bytes = fetch_response_bytes_reporting_headers(
             self.client,
             url,
             source,
             Some(CAR_ACCEPT),
             limits.response_bytes,
             self.timeouts,
+            headers_received,
         )
         .await?;
         let blocks = decode_car_blocks(&car_bytes, cid, limits.block_count).await?;
@@ -1170,9 +1362,9 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                 continue;
             }
 
-            if next_gateway_index < gateway_count
-                && requests.len() < MAX_CONCURRENT_MANIFEST_CID_REQUESTS
-            {
+            // Every eligible gateway may start an attempt, one hedge delay apart,
+            // while earlier attempts are still pending.
+            if next_gateway_index < gateway_count {
                 tokio::select! {
                     biased;
                     result = requests.next() => {
@@ -1208,7 +1400,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
                                     "verified CID gateway fetch failed"
                                 );
                                 last_error = Some(error);
-                                // A failed request frees a slot immediately; do not wait for the hedge timer.
+                                // A failed request launches the next gateway immediately; do not wait for the hedge timer.
                                 next_launch_at = tokio::time::Instant::now();
                             }
                         }
@@ -1336,7 +1528,7 @@ impl<'a> TrustlessArtifactFetcher<'a> {
             verify_raw_cid_bytes(cid, &bytes)?;
             Ok(bytes)
         } else {
-            self.fetch_cid_bytes_from_url(cid, url, source, limits)
+            self.fetch_cid_bytes_from_url(cid, url, source, limits, None)
                 .await
         }
     }
@@ -1450,10 +1642,32 @@ async fn fetch_response_bytes_with_timeouts(
     limit: usize,
     timeouts: HttpAttemptTimeouts,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
+    fetch_response_bytes_reporting_headers(client, url, source, accept, limit, timeouts, None).await
+}
+
+/// Like [`fetch_response_bytes_with_timeouts`], and sets `headers_received`
+/// once the response headers have arrived.
+async fn fetch_response_bytes_reporting_headers(
+    client: &reqwest::Client,
+    url: &Url,
+    source: TrustlessHttpSource,
+    accept: Option<HeaderValue>,
+    limit: usize,
+    timeouts: HttpAttemptTimeouts,
+    headers_received: Option<&AtomicBool>,
+) -> Result<Vec<u8>, TrustlessArtifactError> {
     let deadline = tokio::time::Instant::now() + timeouts.total;
     tokio::time::timeout_at(
         deadline,
-        fetch_response_bytes_with_idle_timeout(client, url, source, accept, limit, timeouts.idle),
+        fetch_response_bytes_with_idle_timeout(
+            client,
+            url,
+            source,
+            accept,
+            limit,
+            timeouts.idle,
+            headers_received,
+        ),
     )
     .await
     .map_err(|_| TrustlessArtifactError::HttpAttemptDeadline { origin: source })?
@@ -1466,6 +1680,7 @@ async fn fetch_response_bytes_with_idle_timeout(
     accept: Option<HeaderValue>,
     limit: usize,
     idle_timeout: Duration,
+    headers_received: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, TrustlessArtifactError> {
     let mut request = client.get(url.clone());
     if let Some(accept) = accept {
@@ -1482,6 +1697,9 @@ async fn fetch_response_bytes_with_idle_timeout(
             phase: TrustlessHttpPhase::ResponseHeaders,
             error: error.without_url(),
         })?;
+    if let Some(headers_received) = headers_received {
+        headers_received.store(true, Ordering::Relaxed);
+    }
     let status = response.status();
     if !status.is_success() {
         return Err(TrustlessArtifactError::HttpStatus {
@@ -2606,6 +2824,7 @@ mod tests {
         drop(current);
     }
 
+    use std::collections::BTreeMap;
     use std::error::Error as StdError;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -4084,6 +4303,437 @@ mod tests {
         // Release the stalled server threads after the successful request cancels their futures.
         servers[0].send_headers(500);
         servers[1].send_headers(500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manifest_cid_fetch_starts_every_gateway_while_earlier_attempts_stall() {
+        let bytes = b"fourth gateway manifest".to_vec();
+        let cid = raw_cid(&bytes);
+        let servers = (0..4)
+            .map(|_| spawn_controlled_chunk_server())
+            .collect::<Vec<_>>();
+        let gateways = servers
+            .iter()
+            .map(|server| server.url.clone())
+            .collect::<Vec<_>>();
+        let pool = pool_for_gateway_order(&gateways, &[0, 1, 2, 3]);
+        let task = {
+            let gateways = gateways.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                TrustlessArtifactFetcher::new_with_pool(&reqwest::Client::new(), &gateways, pool)
+                    .fetch_manifest_cid_with_metadata(&cid.to_string())
+                    .await
+            })
+        };
+
+        let expected_path = format!("/ipfs/{cid}?format=raw");
+        assert_eq!(servers[0].wait_for_request().await, expected_path);
+        tokio::time::advance(MANIFEST_CID_HEDGE_DELAY).await;
+        assert_eq!(servers[1].wait_for_request().await, expected_path);
+        tokio::time::advance(MANIFEST_CID_HEDGE_DELAY).await;
+        assert_eq!(servers[2].wait_for_request().await, expected_path);
+        servers[3].assert_no_request();
+        tokio::time::advance(MANIFEST_CID_HEDGE_DELAY).await;
+        assert_eq!(servers[3].wait_for_request().await, expected_path);
+        servers[3].send_headers(200);
+        servers[3].send_chunk(bytes.clone());
+        servers[3].finish();
+
+        let fetched = join_without_auto_advance(task)
+            .await
+            .expect("fourth gateway succeeds");
+        assert_eq!(fetched.bytes(), bytes);
+        assert_eq!(fetched.gateway_index(), 3);
+        for gateway in &gateways {
+            assert_eq!(
+                gateway_health(&pool, gateway, GatewayCapability::ManifestCid),
+                (0, 0),
+                "attempts are released without recorded failures"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_fetch_hedges_stalled_gateway_and_logs_indices_only() {
+        let events = CapturedEvents::default();
+        let _capture = events.capture();
+        let artifact_bytes = b"hedged chunk artifact".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let stalled = spawn_controlled_chunk_server();
+        let hedge = spawn_controlled_chunk_server();
+        let gateways = vec![
+            sensitive_server_url(stalled.url.clone()),
+            sensitive_server_url(hedge.url.clone()),
+        ];
+        let pool = GatewayPool::new();
+        let budget = Arc::new(());
+        let task = spawn_hedged_chunk_fetch(gateways.clone(), pool.clone(), &artifact_bytes, {
+            let budget = Arc::clone(&budget);
+            move || Some(budget)
+        });
+
+        stalled.wait_for_request().await;
+        tokio::time::advance(CHUNK_HEDGE_DELAY).await;
+        hedge.wait_for_request().await;
+        hedge.send_headers(200);
+        hedge.send_chunk(car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        hedge.finish();
+
+        let fetched = join_without_auto_advance(task)
+            .await
+            .expect("hedged gateway succeeds");
+        assert_eq!(fetched.bytes(), artifact_bytes);
+        assert_eq!(fetched.gateway_index(), 1);
+        assert_eq!(Arc::strong_count(&budget), 1, "hedge guard is released");
+        assert_eq!(
+            gateway_health(
+                &pool,
+                gateways[0].expose_url(),
+                GatewayCapability::ArtifactCar
+            ),
+            (0, 0),
+            "the cancelled attempt is released without a recorded failure"
+        );
+
+        let started = events.find("artifact chunk hedge started");
+        assert_eq!(started["cid"], cid.to_string());
+        assert_eq!(started["first_gateway_index"], "0");
+        assert_eq!(started["hedge_gateway_index"], "1");
+        assert_eq!(
+            started["elapsed_ms"],
+            CHUNK_HEDGE_DELAY.as_millis().to_string()
+        );
+        let completed = events.find("hedged artifact chunk fetch completed");
+        assert_eq!(completed["cid"], cid.to_string());
+        assert_eq!(completed["first_gateway_index"], "0");
+        assert_eq!(completed["hedge_gateway_index"], "1");
+        assert_eq!(completed["winner_gateway_index"], "1");
+        assert!(completed.contains_key("elapsed_ms"));
+        let mut forbidden = vec!["endpoint-sentinel".to_owned()];
+        for gateway in &gateways {
+            let url = gateway.expose_url();
+            forbidden.push(format!("127.0.0.1:{}", url.port().expect("server port")));
+            forbidden.push(opaque_gateway_id(url).to_string());
+        }
+        for event in events.events() {
+            for value in event.values() {
+                assert!(
+                    forbidden
+                        .iter()
+                        .all(|needle| !value.contains(needle.as_str())),
+                    "log value {value:?} exposes a gateway"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_fetch_does_not_hedge_gateway_that_sent_headers() {
+        let artifact_bytes = b"slow but progressing chunk".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let body = car_bytes(cid, &[(cid, artifact_bytes.clone())]);
+        let (body_head, body_tail) = body.split_at(body.len() / 2);
+        let prompt = spawn_controlled_chunk_server();
+        let spare = spawn_controlled_chunk_server();
+        let gateways = vec![
+            sensitive_server_url(prompt.url.clone()),
+            sensitive_server_url(spare.url.clone()),
+        ];
+        let task = spawn_hedged_chunk_fetch(
+            gateways,
+            GatewayPool::new(),
+            &artifact_bytes,
+            || -> Option<()> { panic!("a gateway that sent headers must not be hedged") },
+        );
+
+        prompt.wait_for_request().await;
+        prompt.send_headers(200);
+        prompt.send_chunk(body_head.to_vec());
+        // Let the client read the headers before the hedge delay elapses.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(CHUNK_HEDGE_DELAY * 2).await;
+        prompt.send_chunk(body_tail.to_vec());
+        prompt.finish();
+
+        let fetched = join_without_auto_advance(task)
+            .await
+            .expect("prompt gateway succeeds");
+        assert_eq!(fetched.bytes(), artifact_bytes);
+        assert_eq!(fetched.gateway_index(), 0);
+        spare.assert_no_request();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_fetch_falls_back_immediately_after_early_failure() {
+        let artifact_bytes = b"early fallback chunk".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let failing = spawn_controlled_chunk_server();
+        let healthy = spawn_controlled_chunk_server();
+        let gateways = vec![
+            sensitive_server_url(failing.url.clone()),
+            sensitive_server_url(healthy.url.clone()),
+        ];
+        let pool = GatewayPool::new();
+        let task =
+            spawn_hedged_chunk_fetch(gateways.clone(), pool.clone(), &artifact_bytes, || Some(()));
+
+        failing.wait_for_request().await;
+        let failure_at = tokio::time::Instant::now();
+        failing.send_headers(503);
+        failing.finish();
+        healthy.wait_for_request().await;
+        assert_eq!(tokio::time::Instant::now(), failure_at);
+        healthy.send_headers(200);
+        healthy.send_chunk(car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        healthy.finish();
+
+        let fetched = join_without_auto_advance(task)
+            .await
+            .expect("fallback gateway succeeds");
+        assert_eq!(fetched.gateway_index(), 1);
+        assert_eq!(
+            gateway_health(
+                &pool,
+                gateways[0].expose_url(),
+                GatewayCapability::ArtifactCar
+            ),
+            (1, 0),
+            "the early failure updates gateway health"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_fetch_rejects_mismatched_hedge_body_as_gateway_failure() {
+        let artifact_bytes = b"verified chunk".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let slow = spawn_controlled_chunk_server();
+        let tampered = spawn_controlled_chunk_server();
+        let gateways = vec![
+            sensitive_server_url(slow.url.clone()),
+            sensitive_server_url(tampered.url.clone()),
+        ];
+        let pool = GatewayPool::new();
+        let task =
+            spawn_hedged_chunk_fetch(gateways.clone(), pool.clone(), &artifact_bytes, || Some(()));
+
+        slow.wait_for_request().await;
+        tokio::time::advance(CHUNK_HEDGE_DELAY).await;
+        tampered.wait_for_request().await;
+        tampered.send_headers(200);
+        tampered.send_chunk(car_bytes(cid, &[(cid, b"tampered".to_vec())]));
+        tampered.finish();
+        yield_until("hedge failure is recorded", || {
+            gateway_health(
+                &pool,
+                gateways[1].expose_url(),
+                GatewayCapability::ArtifactCar,
+            )
+            .0 == 1
+        })
+        .await;
+        slow.send_headers(200);
+        slow.send_chunk(car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        slow.finish();
+
+        let fetched = join_without_auto_advance(task)
+            .await
+            .expect("first gateway still succeeds");
+        assert_eq!(fetched.bytes(), artifact_bytes);
+        assert_eq!(fetched.gateway_index(), 0);
+        assert_eq!(
+            gateway_health(
+                &pool,
+                gateways[1].expose_url(),
+                GatewayCapability::ArtifactCar
+            ),
+            (1, 0)
+        );
+        assert_eq!(
+            gateway_health(
+                &pool,
+                gateways[0].expose_url(),
+                GatewayCapability::ArtifactCar
+            ),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_fetch_vetoed_hedge_starts_no_attempt() {
+        let artifact_bytes = b"vetoed hedge chunk".to_vec();
+        let cid = raw_cid(&artifact_bytes);
+        let slow = spawn_controlled_chunk_server();
+        let spare = spawn_controlled_chunk_server();
+        let gateways = vec![
+            sensitive_server_url(slow.url.clone()),
+            sensitive_server_url(spare.url.clone()),
+        ];
+        let pool = GatewayPool::new();
+        let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = spawn_hedged_chunk_fetch(gateways.clone(), pool.clone(), &artifact_bytes, {
+            let admissions = Arc::clone(&admissions);
+            move || {
+                admissions.fetch_add(1, Ordering::SeqCst);
+                None::<()>
+            }
+        });
+
+        slow.wait_for_request().await;
+        tokio::time::advance(CHUNK_HEDGE_DELAY).await;
+        yield_until("hedge admission is requested", || {
+            admissions.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        spare.assert_no_request();
+        slow.send_headers(200);
+        slow.send_chunk(car_bytes(cid, &[(cid, artifact_bytes.clone())]));
+        slow.finish();
+
+        let fetched = join_without_auto_advance(task)
+            .await
+            .expect("first gateway continues after veto");
+        assert_eq!(fetched.gateway_index(), 0);
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gateway_health(
+                &pool,
+                gateways[1].expose_url(),
+                GatewayCapability::ArtifactCar
+            ),
+            (0, 0),
+            "the vetoed hedge reservation is released"
+        );
+    }
+
+    fn spawn_hedged_chunk_fetch<G: Send + 'static>(
+        gateways: Vec<SensitiveUrl>,
+        pool: GatewayPool,
+        artifact_bytes: &[u8],
+        admit_hedge: impl FnOnce() -> Option<G> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<TrustlessArtifactFetchResult, TrustlessArtifactError>> {
+        let cid = raw_cid(artifact_bytes).to_string();
+        let byte_size = artifact_bytes.len() as u64;
+        tokio::spawn(async move {
+            TrustlessArtifactFetcher::new_poi_with_pool(&reqwest::Client::new(), &gateways, pool)
+                .fetch_artifact_cid_with_metadata_hedged(&cid, byte_size, 0, admit_hedge)
+                .await
+        })
+    }
+
+    /// Joins by yielding instead of parking: a parked paused-time runtime
+    /// auto-advances to the next timer, which would expire stalled attempts'
+    /// idle timeouts before a ready body is read.
+    async fn join_without_auto_advance<T>(task: tokio::task::JoinHandle<T>) -> T {
+        yield_until("fetch task finishes", || task.is_finished()).await;
+        task.await.expect("join fetch task")
+    }
+
+    /// Yields until `condition` holds, without letting paused time advance.
+    async fn yield_until(what: &str, mut condition: impl FnMut() -> bool) {
+        for _ in 0..100_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// Returns the recorded failure count and in-flight reservations.
+    fn gateway_health(
+        pool: &GatewayPool,
+        gateway: &Url,
+        capability: GatewayCapability,
+    ) -> (u32, usize) {
+        recover_mutex(&pool.state)
+            .health
+            .get(&(opaque_gateway_id(gateway), capability))
+            .map_or((0, 0), |health| (health.failures, health.in_flight))
+    }
+
+    /// Records `trustless_artifacts` tracing events as field-name to value maps.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl CapturedEvents {
+        fn capture(&self) -> CaptureGuard {
+            // With one registered dispatcher, tracing-core resolves a callsite first
+            // hit on another test thread against that thread's empty default and
+            // caches it as disabled. A second live dispatcher keeps interest computed
+            // across every registered dispatcher, including this thread's capture.
+            let registered = tracing::Dispatch::new(CaptureSubscriber(self.clone()));
+            CaptureGuard {
+                _default: tracing::subscriber::set_default(CaptureSubscriber(self.clone())),
+                _registered: registered,
+            }
+        }
+
+        fn events(&self) -> Vec<BTreeMap<String, String>> {
+            recover_mutex(&self.0).clone()
+        }
+
+        fn find(&self, message: &str) -> BTreeMap<String, String> {
+            self.events()
+                .into_iter()
+                .find(|event| event.get("message").is_some_and(|value| value == message))
+                .unwrap_or_else(|| panic!("missing {message:?} event"))
+        }
+    }
+
+    struct CaptureGuard {
+        _default: tracing::subscriber::DefaultGuard,
+        _registered: tracing::Dispatch,
+    }
+
+    struct CaptureSubscriber(CapturedEvents);
+
+    struct CapturedFields<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for CapturedFields<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("trustless_artifacts")
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut CapturedFields(&mut fields));
+            recover_mutex(&self.0.0).push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     #[tokio::test]

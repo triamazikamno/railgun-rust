@@ -30,7 +30,7 @@ use trustless_artifacts::GatewayPool;
 use url::Url;
 
 use crate::SenderTransactionCandidate;
-use crate::indexed_artifacts::{ChainScope, ChainType};
+use crate::indexed_artifacts::{ChainScope, ChainType, IndexedArtifactManifestReuse};
 use crate::wallet::WalletActorTokenAuthority;
 
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
@@ -573,6 +573,9 @@ pub struct IndexedArtifactSourceConfig {
     pub manifest_source: IndexedArtifactManifestSource,
     pub gateway_urls: Vec<Url>,
     pub gateway_pool: Option<GatewayPool>,
+    /// Shared by clones, so consumers built from one session's config reuse verified manifests.
+    /// Runtime cache state, excluded from configuration equality.
+    pub manifest_reuse: IndexedArtifactManifestReuse,
     pub max_manifest_age: Option<Duration>,
     pub concurrency: usize,
     pub max_in_flight_bytes: u64,

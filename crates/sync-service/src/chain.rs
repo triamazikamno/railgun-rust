@@ -2,7 +2,7 @@ use crate::txid_cache::{TxidPublicCache, TxidPublicCacheKey};
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, GlobalPoiPolicy, LogBatch, PublicDataPlaneEpoch,
     PublicScanReadScope, PublicScanSource, SharedLogBatch, SyncProgressSender, SyncProgressStage,
-    SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillDriver,
+    SyncProgressUnit, SyncProgressUpdate, WalletBackfillApplyResult, WalletBackfillDriver,
     WalletBackfillFinishResult, WalletBackfillRejectReason, WalletBackfillResetResult,
     WalletBackfillStartResult, WalletConfig, WalletIndexedCatchUpSource,
     WalletIndexedCatchUpStatus, WalletObservation, WalletReadiness, WalletReadinessError,
@@ -76,7 +76,9 @@ pub(crate) use data_plane::{
     PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest, PublicTxidTransaction,
     WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome,
 };
-use forest_db::{MerkleForestDbExt, run_squid_forest_catch_up};
+use forest_db::{
+    ForestProgressReporter, MerkleForestDbExt, persist_forest_candidate, squid_forest_candidate,
+};
 use indexed_wallet::{
     IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession, IndexedWalletPage,
     artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
@@ -92,10 +94,11 @@ use merkle_artifacts::run_merkle_artifact_catch_up_into;
 pub(crate) use service::PreparedChainService;
 use service::WalletIndexedTailFallbackResult;
 use types::{
-    EVM_CHAIN_TYPE, ForestReorgDecision, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind,
-    LogRangeLimit, PendingTipWalletRegistration, TXID_PUBLIC_CACHE_SYNC_INTERVAL,
-    WalletIndexedCatchUpStatusGuard, WalletRegistration, WalletStartupSyncCandidate,
-    WalletStartupSyncError, WalletStartupSyncStrategy, send_sync_progress,
+    EVM_CHAIN_TYPE, ForestMetaCheck, ForestReorgDecision, IndexedWalletCatchUpSourceOrder,
+    IndexedWalletPageKind, LogRangeLimit, PendingTipWalletRegistration,
+    TXID_PUBLIC_CACHE_SYNC_INTERVAL, WalletIndexedCatchUpStatusGuard, WalletRegistration,
+    WalletStartupSyncCandidate, WalletStartupSyncError, WalletStartupSyncStrategy,
+    send_sync_progress,
 };
 use workers::{
     spawn_backfill_loop, spawn_head_poller, spawn_live_log_loop, spawn_pending_tip_loop,

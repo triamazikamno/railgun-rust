@@ -1,20 +1,23 @@
 use super::{
     Arc, BackfillEvent, BackfillRequest, CancellationToken, ChainError, ChainService,
-    DEFAULT_TXID_VERSION, Duration, DynProvider, EVM_CHAIN_TYPE, HashMap, Instant, Instrument,
-    JoinHandle, LogBatch, Path, PathBuf, PendingTipWalletRegistration, Provider, ProviderHandle,
-    PublicDataPlaneDiagnosticKind, PublicScanRange, PublicScanSource, QueryRpcPool,
-    TXID_PUBLIC_CACHE_SYNC_INTERVAL, TxidPublicCache, TxidPublicCacheKey, WalletBackfill,
-    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    DEFAULT_TXID_VERSION, Duration, DynProvider, EVM_CHAIN_TYPE, ForestProgressReporter, HashMap,
+    Instant, Instrument, JoinHandle, LogBatch, Path, PathBuf, PendingTipWalletRegistration,
+    Provider, ProviderHandle, PublicDataPlaneDiagnosticKind, PublicScanRange, PublicScanSource,
+    QueryRpcPool, TXID_PUBLIC_CACHE_SYNC_INTERVAL, TxidPublicCache, TxidPublicCacheKey,
+    WalletBackfill, WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletHandle, WalletReadinessError,
     WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome, WalletScanApply,
     WalletScanInputRows, WalletScanRows, WalletScanRowsPayload, WalletTailFallbackState,
-    await_wallet_cancellation, debug, info, min, mpsc, run_squid_forest_catch_up, sort_logs,
-    wallet_backfill_from_block, wallet_backfill_lag_blocks, wallet_sync_target,
-    wallet_tail_fallback_stale_timeout, warn, watch,
+    await_wallet_cancellation, debug, info, min, mpsc, persist_forest_candidate, sort_logs,
+    squid_forest_candidate, wallet_backfill_from_block, wallet_backfill_lag_blocks,
+    wallet_sync_target, wallet_tail_fallback_stale_timeout, warn, watch,
 };
 
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
 const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_mins(1);
+/// Remaining RPC backfill pages above which the indexed tail fallback is
+/// retried even while backfill keeps advancing.
+const INDEXED_TAIL_FALLBACK_RPC_PAGES: u64 = 50;
 
 pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
     let cancel = service.cancel.clone();
@@ -45,7 +48,11 @@ pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPo
                         }
                     }
                     Err(err) => {
-                        warn!(?err, "failed to fetch latest block");
+                        warn!(
+                            err = %ChainError::from(err).without_url(),
+                            rpc_index = rpc.index,
+                            "failed to fetch latest block"
+                        );
                         rpcs.mark_bad_provider(&rpc);
                     }
                 }
@@ -180,6 +187,7 @@ pub(super) async fn refresh_pending_tip_overlays(
                 err.should_mark_rpc_unhealthy() && !err.is_block_range_beyond_current_head();
             warn!(
                 err = %err.without_url(),
+                rpc_index = rpc.index,
                 from_block,
                 to_block = fetch_to_block,
                 "failed to fetch pending wallet tip logs"
@@ -202,6 +210,7 @@ pub(super) async fn refresh_pending_tip_overlays(
             let mark_unhealthy = err.should_mark_rpc_unhealthy();
             warn!(
                 err = %err.without_url(),
+                rpc_index = rpc.index,
                 from_block,
                 to_block = fetch_to_block,
                 "failed to fetch pending wallet tip timestamps"
@@ -665,7 +674,7 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
                     )
                     .await
                 {
-                    warn!(?err, chain_id, "TXID public cache background sync failed");
+                    warn!(err = %err.without_url(), chain_id, "TXID public cache background sync failed");
                 }
                 tokio::select! {
                     () = cancel.cancelled() => break,
@@ -737,7 +746,7 @@ pub(super) fn spawn_live_log_loop(
                         result = service.check_forest_reorg(
                             &rpc.provider,
                             archive_provider.as_ref(),
-                            rpc.url.as_str(),
+                            rpc.index,
                             &snapshot_path,
                             safe_head,
                             last_processed,
@@ -821,8 +830,13 @@ pub(super) fn spawn_live_log_loop(
                             } {
                                 Ok(block_timestamps) => block_timestamps,
                                 Err(err) => {
-                                    warn!(?err, "failed to fetch log block timestamps");
-                                    if err.should_mark_rpc_unhealthy() {
+                                    let mark_unhealthy = err.should_mark_rpc_unhealthy();
+                                    warn!(
+                                        err = %err.without_url(),
+                                        rpc_index = rpc.index,
+                                        "failed to fetch log block timestamps"
+                                    );
+                                    if mark_unhealthy {
                                         rpcs.mark_bad_provider(&rpc);
                                     }
                                     continue;
@@ -852,12 +866,14 @@ pub(super) fn spawn_live_log_loop(
                                     continue;
                                 }
                                 Err(err) => {
+                                    let mark_unhealthy = err.should_mark_rpc_unhealthy();
                                     warn!(
-                                        ?err,
+                                        err = %err.without_url(),
+                                        rpc_index = rpc.index,
                                         archive_endpoint,
                                         "failed to fetch live RPC archive-boundary hash"
                                     );
-                                    if err.should_mark_rpc_unhealthy() {
+                                    if mark_unhealthy {
                                         rpcs.mark_bad_provider(&rpc);
                                     }
                                     continue;
@@ -882,8 +898,14 @@ pub(super) fn spawn_live_log_loop(
                                 continue;
                             }
                             Err(err) => {
-                                warn!(?err, to_block, "failed to fetch confirmed block hash");
-                                if err.should_mark_rpc_unhealthy() {
+                                let mark_unhealthy = err.should_mark_rpc_unhealthy();
+                                warn!(
+                                    err = %err.without_url(),
+                                    rpc_index = rpc.index,
+                                    to_block,
+                                    "failed to fetch confirmed block hash"
+                                );
+                                if mark_unhealthy {
                                     rpcs.mark_bad_provider(&rpc);
                                 }
                                 continue;
@@ -1050,20 +1072,32 @@ async fn run_live_squid_forest_fallback(
     forest_block: u64,
     safe_head: u64,
 ) -> Option<u64> {
-    let mut candidate = service.forest.read().await.clone();
-    let target = run_squid_forest_catch_up(
-        &service.db,
+    let base = service.forest.read().await.clone();
+    let progress = ForestProgressReporter::new(service.chain.progress_tx.as_ref());
+    let candidate = squid_forest_candidate(
         &service.chain,
-        &mut candidate,
+        std::borrow::Cow::Owned(base),
         forest_block,
         forest_block.saturating_add(1),
         safe_head,
-        rpc.map(|rpc| &rpc.provider),
+        rpc,
         archive_provider,
-        snapshot_path,
         false,
+        &progress,
     )
     .await?;
+    if let Err(err) =
+        persist_forest_candidate(&service.db, &service.chain, snapshot_path, &candidate)
+    {
+        warn!(
+            err = %err.without_url(),
+            fallback_from = forest_block,
+            "indexed forest catch-up persistence failed; falling back to RPC"
+        );
+        return None;
+    }
+    candidate.publish_completion(service.chain.deployment.chain_id, &progress);
+    let target = candidate.target;
     let mut forest = service.forest.write().await;
     let current_block = *service.forest_last_tx.borrow();
     if current_block != forest_block {
@@ -1074,7 +1108,7 @@ async fn run_live_squid_forest_fallback(
         );
         return None;
     }
-    *forest = candidate;
+    *forest = candidate.forest;
     if let Err(err) = service.maybe_write_anchor_snapshot(snapshot_path, target, &forest) {
         warn!(?err, target, "failed to write anchor snapshot");
     }
@@ -1236,6 +1270,8 @@ pub(super) fn spawn_backfill_loop(
                 if !cursor.is_runnable(now)
                     || !cursor.should_try_indexed_tail_fallback(
                         service.chain.block_time,
+                        INDEXED_TAIL_FALLBACK_RPC_PAGES
+                            .saturating_mul(service.chain.sync.block_range),
                         now,
                         INDEXED_TAIL_FALLBACK_MIN_STALL,
                         INDEXED_TAIL_FALLBACK_COOLDOWN,
@@ -1248,6 +1284,7 @@ pub(super) fn spawn_backfill_loop(
                     cursor.from_block,
                     cursor.target_block,
                     wallet_backfill_lag_blocks(cursor.from_block, cursor.target_block),
+                    now.duration_since(cursor.last_advanced_at),
                     cursor.driver.sender().clone(),
                     crate::types::WalletSchedulableProgress {
                         last_scanned: cursor.from_block.saturating_sub(1),
@@ -1257,7 +1294,21 @@ pub(super) fn spawn_backfill_loop(
                 cursor.mark_indexed_tail_attempt(now);
                 Some(attempt)
             });
-            if let Some((key, from_block, target_block, lag_blocks, sender, progress)) =
+            let indexed_tail_attempt = match indexed_tail_attempt {
+                Some(attempt) => {
+                    // Short-lived read; the service call below takes the same lock.
+                    let enabled = {
+                        let wallet = service.wallet.read().await;
+                        wallet.as_ref().is_some_and(|registration| {
+                            registration.cfg.cache_key.as_str() == attempt.0.as_str()
+                                && registration.cfg.use_indexed_wallet_catch_up
+                        })
+                    };
+                    enabled.then_some(attempt)
+                }
+                None => None,
+            };
+            if let Some((key, from_block, target_block, lag_blocks, idle, sender, progress)) =
                 indexed_tail_attempt
             {
                 info!(
@@ -1265,7 +1316,7 @@ pub(super) fn spawn_backfill_loop(
                     from_block,
                     target_block,
                     lag_blocks,
-                    stalled_secs = INDEXED_TAIL_FALLBACK_MIN_STALL.as_secs(),
+                    idle_secs = idle.as_secs(),
                     "indexed wallet tail fallback triggered"
                 );
                 let cancellation = cursor
@@ -1284,6 +1335,9 @@ pub(super) fn spawn_backfill_loop(
                         &cancellation,
                     )
                     .await;
+                if let Some(slot) = cursor.as_mut() {
+                    slot.cursor.mark_indexed_tail_attempt(Instant::now());
+                }
                 let checkpoint = match tail_result {
                     super::WalletIndexedTailFallbackResult::Completed(checkpoint) => checkpoint,
                     super::WalletIndexedTailFallbackResult::Cancelled => {
@@ -1427,8 +1481,13 @@ pub(super) fn spawn_backfill_loop(
                     let block_timestamps = match timestamps_result {
                         Ok(block_timestamps) => block_timestamps,
                         Err(err) => {
-                            warn!(?err, "failed to fetch backfill log block timestamps");
-                            if err.should_mark_rpc_unhealthy() {
+                            let mark_unhealthy = err.should_mark_rpc_unhealthy();
+                            warn!(
+                                err = %err.without_url(),
+                                rpc_index = rpc.index,
+                                "failed to fetch backfill log block timestamps"
+                            );
+                            if mark_unhealthy {
                                 rpcs.mark_bad_provider(&rpc);
                             } else {
                                 let _ = await_wallet_cancellation(
@@ -1476,12 +1535,14 @@ pub(super) fn spawn_backfill_loop(
                                 continue;
                             }
                             Err(err) => {
+                                let mark_unhealthy = err.should_mark_rpc_unhealthy();
                                 warn!(
-                                    ?err,
+                                    err = %err.without_url(),
+                                    rpc_index = rpc.index,
                                     archive_endpoint,
                                     "failed to fetch backfill RPC archive-boundary hash"
                                 );
-                                if err.should_mark_rpc_unhealthy() {
+                                if mark_unhealthy {
                                     rpcs.mark_bad_provider(&rpc);
                                 } else {
                                     let _ = await_wallet_cancellation(
@@ -1519,8 +1580,14 @@ pub(super) fn spawn_backfill_loop(
                             continue;
                         }
                         Err(err) => {
-                            warn!(?err, to_block, "failed to fetch backfill block hash");
-                            if err.should_mark_rpc_unhealthy() {
+                            let mark_unhealthy = err.should_mark_rpc_unhealthy();
+                            warn!(
+                                err = %err.without_url(),
+                                rpc_index = rpc.index,
+                                to_block,
+                                "failed to fetch backfill block hash"
+                            );
+                            if mark_unhealthy {
                                 rpcs.mark_bad_provider(&rpc);
                             } else {
                                 let _ = await_wallet_cancellation(

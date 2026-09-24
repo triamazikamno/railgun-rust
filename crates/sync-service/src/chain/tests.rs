@@ -49,7 +49,7 @@ use super::service::{
 };
 use super::workers::{
     WalletBackfillSlot, drain_pending_backfill_requests, pending_tip_from_block,
-    pending_tip_provider_covers_target, reconcile_retained_acquisition,
+    pending_tip_provider_covers_target, reconcile_retained_acquisition, spawn_head_poller,
     wallet_lag_fallback_state_for_test,
 };
 use super::{
@@ -3776,6 +3776,7 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
 
     assert!(!cursor.should_try_indexed_tail_fallback(
         Duration::from_millis(250),
+        25_000,
         now,
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -3783,6 +3784,7 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
     cursor.target_block = 280;
     assert!(cursor.should_try_indexed_tail_fallback(
         Duration::from_millis(250),
+        25_000,
         now,
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -3791,12 +3793,14 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
     cursor.mark_indexed_tail_attempt(now);
     assert!(!cursor.should_try_indexed_tail_fallback(
         Duration::from_millis(250),
+        25_000,
         now + std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
     ));
     assert!(cursor.should_try_indexed_tail_fallback(
         Duration::from_millis(250),
+        25_000,
         now + std::time::Duration::from_mins(1),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
@@ -3806,9 +3810,79 @@ fn wallet_tail_fallback_requires_lag_stall_and_cooldown() {
     cursor.target_block = 331;
     assert!(!cursor.should_try_indexed_tail_fallback(
         Duration::from_millis(250),
+        25_000,
         now + std::time::Duration::from_secs(70),
         std::time::Duration::from_secs(15),
         std::time::Duration::from_mins(1),
+    ));
+}
+
+#[test]
+fn wallet_tail_fallback_retries_while_rpc_backfill_crawls_far_behind() {
+    let now = std::time::Instant::now();
+    let block_time = Duration::from_millis(250);
+    let rpc_crawl_lag_blocks = 50 * 500;
+    let min_stall = std::time::Duration::from_secs(15);
+    let cooldown = std::time::Duration::from_mins(1);
+    let (sender, _receiver) = mpsc::channel(1);
+    let mut cursor = WalletBackfill::new(
+        100,
+        200 + rpc_crawl_lag_blocks,
+        true,
+        100,
+        None,
+        test_backfill_driver(sender, 0, 1),
+        now,
+    );
+
+    // Steady progress keeps the stall rule quiet; the far-behind rule waits
+    // for the cooldown since the backfill started.
+    let at = now + std::time::Duration::from_secs(59);
+    cursor.mark_progress(150, at);
+    assert!(!cursor.should_try_indexed_tail_fallback(
+        block_time,
+        rpc_crawl_lag_blocks,
+        at,
+        min_stall,
+        cooldown,
+    ));
+    let at = now + std::time::Duration::from_mins(1);
+    cursor.mark_progress(199, at);
+    assert!(cursor.should_try_indexed_tail_fallback(
+        block_time,
+        rpc_crawl_lag_blocks,
+        at,
+        min_stall,
+        cooldown,
+    ));
+    cursor.mark_progress(201, at);
+    assert!(!cursor.should_try_indexed_tail_fallback(
+        block_time,
+        rpc_crawl_lag_blocks,
+        at,
+        min_stall,
+        cooldown,
+    ));
+
+    cursor.target_block += rpc_crawl_lag_blocks;
+    cursor.mark_indexed_tail_attempt(at);
+    let at = now + std::time::Duration::from_secs(119);
+    cursor.mark_progress(250, at);
+    assert!(!cursor.should_try_indexed_tail_fallback(
+        block_time,
+        rpc_crawl_lag_blocks,
+        at,
+        min_stall,
+        cooldown,
+    ));
+    let at = now + std::time::Duration::from_mins(2);
+    cursor.mark_progress(300, at);
+    assert!(cursor.should_try_indexed_tail_fallback(
+        block_time,
+        rpc_crawl_lag_blocks,
+        at,
+        min_stall,
+        cooldown,
     ));
 }
 
@@ -5323,11 +5397,21 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         chain_id: 1,
         railgun_contract: Address::from([0xbb; 20]),
     };
-    let artifact_source = checkpointed_wallet_artifact_source(&scope, 100, 200, 150);
-    let squid = GraphqlServer::spawn(vec![
-        r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
-        r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
-    ]);
+    let (artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 100, 200, 150);
+    // The startup race's Squid candidate holds its first page and stalls on
+    // its second while the artifact session wins; the tail probe follows.
+    let (squid, race_page_block) = GraphqlServer::spawn_owned_with_blocked_response(
+        vec![
+            squid_wallet_probe(200),
+            squid_wallet_page_with_nullifier(120),
+            squid_wallet_page_with_nullifier(170),
+            squid_wallet_probe(200),
+            r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#
+                .to_owned(),
+        ],
+        2,
+    );
     let rpcs = Arc::new(QueryRpcPool::new(
         vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
         Duration::from_secs(1),
@@ -5345,7 +5429,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         sync: crate::RailgunSyncOptions {
             archive_until_block: 0,
             block_range: 100,
-            indexed_wallet_block_range: 100,
+            indexed_wallet_block_range: 50,
             poll_interval: Duration::from_millis(1),
             quick_sync_endpoint: Some(squid.url.clone()),
             indexed_artifact_source: Some(artifact_source.config),
@@ -5415,25 +5499,43 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
     .await
     .expect("spawn wallet worker");
 
-    let checkpoint = service
-        .indexed_wallet_catch_up(
-            &wallet_cfg,
-            0,
-            100,
-            200,
-            &handle,
-            &worker_cancel,
-            IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
-            true,
-            (
-                &wallet_backfill_tx,
-                crate::types::WalletSchedulableProgress {
-                    last_scanned: 100,
-                    reset_generation: 0,
-                },
-            ),
+    let catch_up = service.indexed_wallet_catch_up(
+        &wallet_cfg,
+        0,
+        100,
+        200,
+        &handle,
+        &worker_cancel,
+        IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
+        true,
+        (
+            &wallet_backfill_tx,
+            crate::types::WalletSchedulableProgress {
+                last_scanned: 100,
+                reset_generation: 0,
+            },
+        ),
+    );
+    let release_race_page = async {
+        wait_for_std_signal(
+            race_page_block.request_started,
+            "race Squid page request started",
         )
         .await;
+        manifest_block
+            .release
+            .send(())
+            .expect("release artifact manifest");
+        yield_until("artifact pages committed", || {
+            handle.last_scanned() == Some(150)
+        })
+        .await;
+        race_page_block
+            .release
+            .send(())
+            .expect("release race Squid page");
+    };
+    let (checkpoint, ()) = tokio::join!(catch_up, release_race_page);
 
     assert_eq!(checkpoint, 200);
     assert_eq!(handle.last_scanned(), Some(200));
@@ -5445,15 +5547,27 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             .map(|status| status.source),
         Some(WalletIndexedCatchUpSource::Squid)
     );
-    let probe_request = squid
-        .requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("squid probe request");
+    assert!(
+        matches!(
+            service
+                .public_data_plane
+                .cached_public_scan_coverage(PublicScanRange::new(101, 150))
+                .await,
+            PublicCoverageAnswer::ReplayableEmpty {
+                source: PublicScanSource::IndexedArtifacts,
+                ..
+            }
+        ),
+        "the held Squid row at block 120 is discarded"
+    );
+    let requests = squid.requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[0].contains("query WalletProbe"));
+    assert!(requests[1].contains(r#""fromBlock":"101""#));
+    assert!(requests[2].contains(r#""fromBlock":"151""#));
+    let probe_request = &requests[3];
     assert!(probe_request.contains("query WalletProbe"));
-    let page_request = squid
-        .requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("squid tail page request");
+    let page_request = &requests[4];
     assert!(page_request.contains("query IndexedWalletPage"));
     assert!(page_request.contains(r#""fromBlock":"151""#));
     assert!(page_request.contains(r#""toBlock":"200""#));
@@ -6026,8 +6140,8 @@ async fn wallet_artifact_prepare_reuses_retained_chunks() {
     .expect("warm wallet artifact session");
     assert_eq!(
         artifact_source.server.request_count(),
-        6,
-        "warm preparation should reuse stable history and the unchanged transient tail"
+        5,
+        "warm preparation should reuse the manifest, stable history and the unchanged transient tail"
     );
 
     public_data_plane.shutdown().await;
@@ -6212,12 +6326,15 @@ async fn indexed_wallet_squid_transition_probe_keeps_pre_probe_read_scope() {
         railgun_contract: Address::from([0xbb; 20]),
     };
     let artifact_source = checkpointed_wallet_artifact_source(&scope, 100, 200, 150);
+    // The startup race's Squid candidate sees Squid behind the wallet, so
+    // the blocked response is the transition probe after the artifact pages.
     let (squid, block) = GraphqlServer::spawn_with_blocked_response(
         vec![
+            r#"{"data":{"squidStatus":{"height":"100"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
             r#"{"data":{"squidStatus":{"height":"200"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
             r#"{"data":{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[]}}"#,
         ],
-        0,
+        1,
     );
     let context = IndexedCatchUpTestContext::new(
         &scope,
@@ -6305,6 +6422,281 @@ async fn indexed_wallet_squid_session_is_not_restamped_between_pages() {
     }));
 
     context.cleanup();
+}
+
+fn squid_wallet_probe(height: u64) -> String {
+    format!(
+        r#"{{"data":{{"squidStatus":{{"height":"{height}"}},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}}}"#
+    )
+}
+
+/// A modern Squid wallet page holding one nullifier at `block`.
+fn squid_wallet_page_with_nullifier(block: u64) -> String {
+    format!(
+        r#"{{"data":{{"transactCommitments":[],"shieldCommitments":[],"nullifiers":[{{"id":"0x{id}","transactionHash":"0x{tx}","blockNumber":"{block}","blockTimestamp":"{timestamp}","treeNumber":0,"nullifier":"0x{block:x}"}}]}}}}"#,
+        id = "33".repeat(64),
+        tx = "aa".repeat(32),
+        timestamp = 1_700_000_000 + block,
+    )
+}
+
+#[tokio::test]
+async fn squid_wallet_candidate_holds_ordered_pages_within_row_budget() {
+    use super::service::SquidWalletCandidateOutcome;
+
+    let scope = test_scope();
+    let squid = GraphqlServer::spawn_controlled(
+        vec![
+            squid_wallet_probe(200),
+            squid_wallet_page_with_nullifier(120),
+            squid_wallet_page_with_nullifier(170),
+            squid_wallet_probe(200),
+            squid_wallet_page_with_nullifier(120),
+            squid_wallet_probe(100),
+        ],
+        None,
+    );
+    let context = IndexedCatchUpTestContext::new(&scope, squid.url.clone(), None, 100, 50).await;
+    let service = &context.service;
+    let cfg = &context.wallet_cfg;
+
+    let SquidWalletCandidateOutcome::Ready(candidate) =
+        service.squid_wallet_candidate(cfg, 101, 180, 2).await
+    else {
+        panic!("the Squid candidate holds every page through its target");
+    };
+    assert_eq!(candidate.target, 180);
+    assert_eq!(candidate.rows, 2);
+    let pages = candidate
+        .pages
+        .iter()
+        .map(|(from_block, page)| (*from_block, page.checkpoint_block, page.nullifiers.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(pages, vec![(101, 150, 1), (151, 180, 1)]);
+    assert!(matches!(
+        service.squid_wallet_candidate(cfg, 101, 180, 0).await,
+        SquidWalletCandidateOutcome::OverBudget {
+            target: 180,
+            rows: 1
+        }
+    ));
+    assert!(
+        matches!(
+            service.squid_wallet_candidate(cfg, 101, 180, 2).await,
+            SquidWalletCandidateOutcome::NoResult
+        ),
+        "a Squid source behind the wallet yields no result"
+    );
+
+    let requests = squid.requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        6,
+        "neither the over-budget nor the behind candidate requests another page"
+    );
+    assert!(requests[1].contains(r#""fromBlock":"101""#));
+    assert!(requests[1].contains(r#""toBlock":"150""#));
+    assert!(requests[2].contains(r#""fromBlock":"151""#));
+    assert!(requests[2].contains(r#""toBlock":"180""#));
+    assert!(requests[3].contains("query WalletProbe"));
+    assert!(requests[5].contains("query WalletProbe"));
+
+    context.cleanup();
+}
+
+#[tokio::test]
+async fn stalled_artifact_manifest_lets_squid_win_wallet_catch_up() {
+    let scope = test_scope();
+    let (mut artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 100, 250, 250);
+    let gateway_port = artifact_source.server.url.port().expect("gateway port");
+    artifact_source.config.manifest_source = IndexedArtifactManifestSource::Url(
+        credential_url(gateway_port)
+            .join("/manifest.json")
+            .expect("manifest url"),
+    );
+    artifact_source.config.gateway_urls = vec![credential_url(gateway_port)];
+    // The first Squid page waits until the manifest request is in flight.
+    let (squid, squid_page_block) = GraphqlServer::spawn_owned_with_blocked_response(
+        vec![
+            squid_wallet_probe(200),
+            squid_wallet_page_with_nullifier(120),
+            squid_wallet_page_with_nullifier(170),
+        ],
+        1,
+    );
+    let squid_port = squid.url.port().expect("Squid port");
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+    let context = IndexedCatchUpTestContext::new(
+        &scope,
+        credential_url(squid_port),
+        Some(artifact_source.config.clone()),
+        100,
+        50,
+    )
+    .await;
+
+    let catch_up = context.spawn_catch_up(250, IndexedWalletCatchUpSourceOrder::ArtifactsFirst);
+    wait_for_std_signal(
+        manifest_block.request_started,
+        "artifact manifest request started",
+    )
+    .await;
+    squid_page_block
+        .release
+        .send(())
+        .expect("release first Squid page");
+    let checkpoint = catch_up.await.expect("indexed catch-up task");
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+    // Give a request from the dropped artifact candidate time to arrive.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(guard);
+
+    assert_eq!(checkpoint, 200, "Squid commits through its indexed height");
+    assert_eq!(context.handle.last_scanned(), Some(200));
+    assert!(matches!(
+        context
+            .public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(101, 200))
+            .await,
+        PublicCoverageAnswer::CoveredWithRows {
+            range,
+            source: PublicScanSource::Squid,
+            ..
+        } if range == PublicScanRange::new(101, 200)
+    ));
+    assert!(
+        matches!(
+            context
+                .public_data_plane
+                .cached_public_scan_coverage(PublicScanRange::new(201, 250))
+                .await,
+            PublicCoverageAnswer::Missing { .. }
+        ),
+        "blocks past the Squid target are left for the RPC tail"
+    );
+    assert_eq!(
+        squid.requests.try_iter().count(),
+        3,
+        "held pages are committed without being fetched again"
+    );
+    assert_eq!(
+        artifact_source.server.request_count(),
+        1,
+        "the dropped artifact candidate issues no request after the manifest"
+    );
+
+    let started = events.find("wallet catch-up race started");
+    for (field, value) in [
+        ("from_block", "101"),
+        ("safe_head", "250"),
+        ("gap_blocks", "150"),
+        ("candidates", "indexed_artifacts,squid"),
+    ] {
+        assert_eq!(
+            started.get(field).map(String::as_str),
+            Some(value),
+            "{field}"
+        );
+    }
+    let candidate_end = |source: &str| {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event
+                    .get("message")
+                    .is_some_and(|message| message == "wallet catch-up race candidate finished")
+                    && event.get("source").is_some_and(|value| value == source)
+            })
+            .collect::<Vec<_>>()
+    };
+    let squid_end = candidate_end("squid");
+    assert_eq!(squid_end.len(), 1);
+    for (field, value) in [("outcome", "ready"), ("target", "200"), ("squid_rows", "2")] {
+        assert_eq!(
+            squid_end[0].get(field).map(String::as_str),
+            Some(value),
+            "{field}"
+        );
+    }
+    assert!(squid_end[0].contains_key("elapsed_ms"));
+    let artifact_end = candidate_end("indexed_artifacts");
+    assert_eq!(artifact_end.len(), 1);
+    assert_eq!(
+        artifact_end[0].get("outcome").map(String::as_str),
+        Some("cancelled")
+    );
+    let winner = events.find("wallet catch-up race won");
+    assert_eq!(winner.get("source").map(String::as_str), Some("squid"));
+    assert_eq!(winner.get("target").map(String::as_str), Some("200"));
+    assert!(winner.contains_key("elapsed_ms"));
+    let endpoints = [squid_port, gateway_port].map(|port| format!("127.0.0.1:{port}"));
+    for event in events.events() {
+        for value in event.values() {
+            assert!(
+                ["secret", "user:", "key-abc"]
+                    .into_iter()
+                    .chain(endpoints.iter().map(String::as_str))
+                    .all(|needle| !value.contains(needle)),
+                "log value {value:?} exposes an endpoint"
+            );
+        }
+    }
+
+    context.cleanup();
+}
+
+#[tokio::test]
+async fn wallet_catch_up_race_without_a_source_falls_back_to_rpc() {
+    let scope = test_scope();
+    // Artifacts end at block 50, below the wallet's next block, and the
+    // Squid probe fails.
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 1, 50, 50);
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"errors":[{"message":"indexed source unavailable"}]}"#,
+    ]);
+    let context = IndexedCatchUpTestContext::new(
+        &scope,
+        squid.url.clone(),
+        Some(artifact_source.config.clone()),
+        100,
+        50,
+    )
+    .await;
+
+    let checkpoint = context
+        .spawn_catch_up(200, IndexedWalletCatchUpSourceOrder::ArtifactsFirst)
+        .await
+        .expect("indexed catch-up task");
+
+    assert_eq!(checkpoint, 100);
+    assert_eq!(context.handle.last_scanned(), Some(100));
+    assert!(matches!(
+        context
+            .public_data_plane
+            .cached_public_scan_coverage(PublicScanRange::new(101, 200))
+            .await,
+        PublicCoverageAnswer::Missing { .. }
+    ));
+    assert_eq!(
+        squid.requests.try_iter().count(),
+        1,
+        "only the race probe reaches Squid"
+    );
+    let diagnostics = context.public_data_plane.diagnostics().await;
+    assert!(diagnostics.events.iter().any(|event| {
+        event.kind == PublicDataPlaneDiagnosticKind::SourceFallback
+            && event.source == Some(PublicScanSource::Rpc)
+            && event.range == Some(PublicScanRange::new(101, 200))
+    }));
+
+    context.cleanup();
+    drop(artifact_source.server);
 }
 
 #[tokio::test]
@@ -8344,6 +8736,7 @@ fn blocked_wallet_optional_maintenance_fixture(
         ),
         gateway_urls: vec![server.url.clone()],
         gateway_pool: None,
+        manifest_reuse: crate::IndexedArtifactManifestReuse::default(),
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
@@ -8518,6 +8911,7 @@ fn checkpointed_wallet_artifact_source_controlled_with_requests(
         manifest_source: IndexedArtifactManifestSource::Url(manifest_url),
         gateway_urls: vec![server.url.clone()],
         gateway_pool: None,
+        manifest_reuse: crate::IndexedArtifactManifestReuse::default(),
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
@@ -8707,6 +9101,7 @@ fn commitment_artifact_source(
         ),
         gateway_urls: vec![server.url.clone()],
         gateway_pool: None,
+        manifest_reuse: crate::IndexedArtifactManifestReuse::default(),
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
@@ -9551,6 +9946,92 @@ async fn wallet_startup_hedge_failure_logs_omit_endpoint_url() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
+#[tokio::test]
+async fn chain_rpc_failure_logs_omit_endpoint_url() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind refused RPC port");
+    let port = listener.local_addr().expect("refused RPC addr").port();
+    drop(listener);
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+    let fixture = LiveForestFixture::spawn(
+        "chain-rpc-failure-url-redaction",
+        vec![credential_url(port)],
+        Url::parse("http://127.0.0.1:1").expect("unused Squid URL"),
+        50,
+        200,
+    )
+    .await;
+    let service = &fixture.service;
+    let chain = &service.chain;
+    // A recorded hash for the forest block makes the live loop read it back.
+    service
+        .db
+        .update_merkle_forest_meta(
+            chain.deployment.chain_id,
+            &chain.deployment.contract.to_string(),
+            &service.db.resolve_path(&DbStore::relative_blob_path(
+                "merkle_forest",
+                "live-forest.msgpack",
+            )),
+            50,
+            merkletree::persist::SNAPSHOT_VERSION,
+            [0xaa; 32],
+        )
+        .expect("persist forest meta for block 50");
+    service.safe_head_tx.send(200).expect("wake live loop");
+    yield_until("failed reorg check", || {
+        events.events().iter().any(|event| {
+            event
+                .get("message")
+                .is_some_and(|m| m == "reorg check failed")
+        })
+    })
+    .await;
+
+    // A separate pool keeps the live loop's cooldown from hiding the head read.
+    spawn_head_poller(
+        Arc::clone(service),
+        Arc::new(QueryRpcPool::new(
+            vec![credential_url(port)],
+            Duration::from_secs(1),
+        )),
+    );
+    yield_until("failed head read", || {
+        events.events().iter().any(|event| {
+            event
+                .get("message")
+                .is_some_and(|m| m == "failed to fetch latest block")
+        })
+    })
+    .await;
+    fixture.stop().await;
+    drop(guard);
+
+    for message in ["reorg check failed", "failed to fetch latest block"] {
+        let event = events.find(message);
+        assert_eq!(
+            event.get("rpc_index").map(String::as_str),
+            Some("0"),
+            "{message}"
+        );
+        let err = event.get("err").expect("err field");
+        assert!(
+            err.starts_with("rpc error"),
+            "{message} logs the transport error: {err:?}"
+        );
+    }
+    let endpoint = format!("127.0.0.1:{port}");
+    let forbidden = ["secret", "user:", "key-abc", endpoint.as_str()];
+    for event in events.events() {
+        for value in event.values() {
+            assert!(
+                forbidden.iter().all(|needle| !value.contains(needle)),
+                "log value {value:?} exposes the endpoint"
+            );
+        }
+    }
+}
+
 /// Records `sync_service` tracing events as field-name to value maps.
 #[derive(Clone, Default)]
 struct CapturedEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
@@ -9680,6 +10161,670 @@ async fn startup_forest_catch_up_skips_indexed_sources_only_for_short_tails() {
     assert!(artifact_requests > 0, "artifact catch-up is tried first");
     assert_eq!(squid_requests, 2, "Squid height and commitments");
     assert_eq!(forest_block, 300, "Squid catches up to its indexed height");
+}
+
+/// A `Transact` log that adds one commitment at `tree_position` of tree 0.
+fn rpc_transact_log(contract: Address, block_number: u64, tree_position: u64) -> serde_json::Value {
+    let encoded = Transact {
+        treeNumber: U256::ZERO,
+        startPosition: U256::from(tree_position),
+        hash: vec![FixedBytes::from(
+            U256::from(tree_position + 1_000).to_be_bytes::<32>(),
+        )],
+        ciphertext: Vec::new(),
+    }
+    .encode_log_data();
+    let topics = encoded
+        .topics()
+        .iter()
+        .map(|topic| format!("{topic:#x}"))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "address": format!("{contract:#x}"),
+        "topics": topics,
+        "data": format!("0x{}", hex::encode(encoded.data)),
+        "blockHash": format!("{:#x}", FixedBytes::<32>::from([0x11; 32])),
+        "blockNumber": format!("{block_number:#x}"),
+        "transactionHash": format!("{:#x}", FixedBytes::<32>::from([0x33; 32])),
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "removed": false,
+    })
+}
+
+/// Binds a listener that never accepts: connections complete in the backlog,
+/// and requests on them never receive response headers.
+fn silent_server() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent server");
+    let port = listener.local_addr().expect("silent server addr").port();
+    (listener, port)
+}
+
+/// Accepts and closes every connection waiting on `listener`, returning how
+/// many there were.
+fn drain_backlog_connections(listener: &std::net::TcpListener) -> usize {
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking silent server");
+    std::iter::from_fn(|| listener.accept().ok()).count()
+}
+
+fn credential_url(port: u16) -> Url {
+    Url::parse(&format!("http://user:secret@127.0.0.1:{port}/key-abc"))
+        .expect("credential-bearing URL")
+}
+
+fn forest_meta(db: &DbStore, chain: &ChainConfig) -> Option<(u64, [u8; 32])> {
+    db.get_merkle_forest_meta(
+        chain.deployment.chain_id,
+        &chain.deployment.contract.to_string(),
+    )
+    .expect("read forest meta")
+    .map(|meta| (meta.last_block, meta.hash))
+}
+
+fn open_forest_db(name: &str) -> (PathBuf, Arc<DbStore>) {
+    let root_dir = temp_db_root(name);
+    let db = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    (root_dir, Arc::new(db))
+}
+
+/// Writes a one-leaf forest snapshot at `block`, with `hash` in its forest
+/// metadata, and returns the forest, the snapshot path, and its bytes.
+fn seed_loaded_forest(
+    db: &DbStore,
+    chain: &ChainConfig,
+    block: u64,
+    hash: [u8; 32],
+) -> (MerkleForest, PathBuf, Vec<u8>) {
+    db.ensure_blob_dir("merkle_forest")
+        .expect("create merkle forest blob dir");
+    let snapshot_path = db.resolve_path(&DbStore::relative_blob_path(
+        "merkle_forest",
+        &format!(
+            "forest-{}-{}.msgpack",
+            chain.deployment.chain_id, chain.deployment.contract
+        ),
+    ));
+    let mut loaded = MerkleForest::new();
+    loaded
+        .insert_leaf(MerkleTreeUpdate {
+            tree_number: 1,
+            tree_position: 0,
+            hash: U256::from(5),
+        })
+        .expect("insert loaded leaf");
+    loaded.compute_roots();
+    merkletree::persist::MerkleForestSnapshot::write(
+        &snapshot_path,
+        chain.deployment.chain_id,
+        chain.deployment.contract,
+        block,
+        &loaded,
+    )
+    .expect("seed loaded snapshot");
+    db.update_merkle_forest_meta(
+        chain.deployment.chain_id,
+        &chain.deployment.contract.to_string(),
+        &snapshot_path,
+        block,
+        merkletree::persist::SNAPSHOT_VERSION,
+        hash,
+    )
+    .expect("seed loaded forest meta");
+    let snapshot_bytes = fs::read(&snapshot_path).expect("read seeded snapshot");
+    (loaded, snapshot_path, snapshot_bytes)
+}
+
+fn race_finished_events(events: &CapturedEvents, candidate: &str) -> Vec<BTreeMap<String, String>> {
+    events
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event
+                .get("message")
+                .is_some_and(|message| message == "merkle forest catch-up candidate finished")
+                && event
+                    .get("candidate")
+                    .is_some_and(|value| value == candidate)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn startup_rpc_forest_candidate_matches_sequential_log_application() {
+    let scope = test_scope();
+    // A 963-block tail from block 1, ten pages of 100 blocks.
+    let logs = [
+        (1, 0),
+        (99, 1),
+        (100, 2),
+        (101, 3),
+        (250, 4),
+        (512, 5),
+        (963, 6),
+    ]
+    .into_iter()
+    .map(|(block_number, tree_position)| {
+        rpc_transact_log(scope.railgun_contract, block_number, tree_position)
+    })
+    .collect::<Vec<_>>();
+    let servers = (0..3)
+        .map(|_| {
+            JsonRpcServer::spawn_handler(log_range_rpc_handler(logs.clone(), 963, |_, _, _| None))
+        })
+        .collect::<Vec<_>>();
+    let (root_dir, db) = open_forest_db("startup-rpc-forest-candidate");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        servers.iter().map(|server| server.url.clone()).collect(),
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, rpcs, None);
+
+    let (forest, forest_block, snapshot_path, _) = db
+        .load_or_initialize_forest(&chain, 963, None, None)
+        .await
+        .expect("load startup forest");
+
+    let mut expected = MerkleForest::new();
+    expected
+        .apply_commitment_updates_from_logs(
+            &logs
+                .iter()
+                .map(|log| serde_json::from_value::<Log>(log.clone()).expect("rpc log"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("apply logs in order");
+    expected.compute_roots();
+    assert_eq!(forest_block, 963, "the RPC candidate reaches the safe head");
+    assert_eq!(forest.read().await.roots(), expected.roots());
+    assert_eq!(
+        forest_meta(&db, &chain),
+        Some((963, [0x11; 32])),
+        "the winner's target and confirmed hash are persisted"
+    );
+    let snapshot = merkletree::persist::MerkleForestSnapshot::load(
+        &snapshot_path,
+        chain.deployment.chain_id,
+        chain.deployment.contract,
+    )
+    .expect("load snapshot")
+    .expect("snapshot present");
+    assert_eq!(snapshot.last_processed_block, 963);
+    assert_eq!(snapshot.forest.roots(), expected.roots());
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn startup_forest_race_starts_no_rpc_candidate_over_budget_or_archive_boundary() {
+    for (name, archive_until_block, learned_span) in
+        [("over-budget", 0, Some(5)), ("archive-boundary", 10, None)]
+    {
+        let scope = test_scope();
+        let rpc =
+            JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+        let squid = GraphqlServer::spawn(vec![
+            r#"{"data":{"squidStatus":{"height":"300"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ]);
+        let (root_dir, db) = open_forest_db(&format!("startup-forest-race-{name}"));
+        let rpcs = Arc::new(QueryRpcPool::new(
+            vec![rpc.url.clone()],
+            Duration::from_secs(1),
+        ));
+        if let Some(span) = learned_span {
+            // 500 blocks in 5-block requests is over the 64-request budget.
+            rpcs.narrow_log_span(LogSpanEndpoint::Provider(0), span);
+        }
+        let mut chain = test_chain_config(&scope, rpcs, None);
+        chain.sync.archive_until_block = archive_until_block;
+        chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+        let events = CapturedEvents::default();
+        let guard = events.capture();
+
+        let (_, forest_block, _, _) = db
+            .load_or_initialize_forest(&chain, 500, None, None)
+            .await
+            .expect("load startup forest");
+        drop(guard);
+
+        assert_eq!(
+            forest_block, 300,
+            "{name}: Squid catch-up applies as before"
+        );
+        assert_eq!(squid.requests.try_iter().count(), 2, "{name}");
+        assert!(
+            rpc.drain_request_bodies().is_empty(),
+            "{name}: no RPC forest candidate request"
+        );
+        let started = events.find("merkle forest catch-up race started");
+        assert_eq!(
+            started.get("candidates").map(String::as_str),
+            Some("indexed"),
+            "{name}"
+        );
+        assert!(race_finished_events(&events, "rpc").is_empty(), "{name}");
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test]
+async fn stalled_artifact_gateway_lets_rpc_forest_candidate_win() {
+    let scope = test_scope();
+    let (gateway, gateway_port) = silent_server();
+    let (squid, squid_port) = silent_server();
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let rpc_port = rpc.url.port().expect("rpc port");
+    let mut artifact_config = checkpointed_wallet_artifact_source(&scope, 1, 50, 50).config;
+    let gateway_url = Url::parse(&format!("http://127.0.0.1:{gateway_port}")).expect("gateway url");
+    artifact_config.manifest_source =
+        IndexedArtifactManifestSource::Url(gateway_url.join("/manifest.json").expect("url"));
+    artifact_config.gateway_urls = vec![gateway_url];
+    let (root_dir, db) = open_forest_db("startup-forest-stalled-artifacts");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![credential_url(rpc_port)],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifact_config));
+    chain.sync.quick_sync_endpoint = Some(credential_url(squid_port));
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+
+    let (_, forest_block, _, _) = db
+        .load_or_initialize_forest(&chain, 500, None, None)
+        .await
+        .expect("load startup forest");
+    // Give a request from the dropped indexed candidate time to arrive.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(guard);
+
+    assert_eq!(forest_block, 500, "the RPC candidate wins at the safe head");
+    assert_eq!(forest_meta(&db, &chain), Some((500, [0x11; 32])));
+    assert_eq!(
+        drain_backlog_connections(&gateway),
+        1,
+        "only the stalled manifest request reaches the gateway"
+    );
+    assert_eq!(drain_backlog_connections(&squid), 0, "Squid is never asked");
+
+    let started = events.find("merkle forest catch-up race started");
+    for (field, value) in [
+        ("tail_blocks", "500"),
+        ("candidates", "indexed,rpc"),
+        ("estimated_rpc_requests", "5"),
+        ("rpc_request_budget", "64"),
+    ] {
+        assert_eq!(
+            started.get(field).map(String::as_str),
+            Some(value),
+            "{field}"
+        );
+    }
+    let rpc_end = race_finished_events(&events, "rpc");
+    assert_eq!(rpc_end.len(), 1);
+    for (field, value) in [
+        ("outcome", "confirmed"),
+        ("source", "rpc"),
+        ("target", "500"),
+        ("get_logs_requests", "5"),
+    ] {
+        assert_eq!(
+            rpc_end[0].get(field).map(String::as_str),
+            Some(value),
+            "{field}"
+        );
+    }
+    assert!(rpc_end[0].contains_key("elapsed_ms"));
+    let indexed_end = race_finished_events(&events, "indexed");
+    assert_eq!(indexed_end.len(), 1);
+    assert_eq!(
+        indexed_end[0].get("outcome").map(String::as_str),
+        Some("cancelled")
+    );
+    let winner = events.find("merkle forest catch-up race won");
+    assert_eq!(winner.get("source").map(String::as_str), Some("rpc"));
+    assert_eq!(winner.get("target").map(String::as_str), Some("500"));
+    assert!(winner.contains_key("elapsed_ms"));
+    let endpoints = [rpc_port, squid_port, gateway_port].map(|port| format!("127.0.0.1:{port}"));
+    for event in events.events() {
+        for value in event.values() {
+            assert!(
+                ["secret", "user:", "key-abc"]
+                    .into_iter()
+                    .chain(endpoints.iter().map(String::as_str))
+                    .all(|needle| !value.contains(needle)),
+                "log value {value:?} exposes an endpoint"
+            );
+        }
+    }
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn startup_forest_progress_stays_with_leading_rpc_candidate() {
+    let scope = test_scope();
+    let (artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 1, 50, 50);
+    let (release_last_page, last_page_gate) = std_mpsc::channel();
+    let rpc = JsonRpcServer::spawn_handler(gated_get_logs_handler(
+        log_range_rpc_handler(Vec::new(), 500, |_, _, _| None),
+        vec![((401, 500), last_page_gate)],
+    ));
+    let (root_dir, db) = open_forest_db("startup-forest-monotonic-progress");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let (progress_tx, progress_rx) = watch::channel(None);
+    chain.progress_tx = Some(progress_tx);
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let load = tokio::spawn({
+        let db = Arc::clone(&db);
+        async move {
+            db.load_or_initialize_forest(&chain, 500, None, None)
+                .await
+                .map(|(_, forest_block, _, _)| forest_block)
+        }
+    });
+
+    wait_for_std_signal(manifest_block.request_started, "artifact manifest request").await;
+    yield_until("RPC pages before the gated one", || {
+        progress_rx.borrow().is_some_and(|update| {
+            update.unit == SyncProgressUnit::Block && update.current_block == 400
+        })
+    })
+    .await;
+    let leading = *progress_rx.borrow();
+    // The lagging artifact candidate reports manifest progress, then yields nothing.
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+    yield_until("indexed candidate end", || {
+        !race_finished_events(&events, "indexed").is_empty()
+    })
+    .await;
+    assert_eq!(
+        *progress_rx.borrow(),
+        leading,
+        "artifact progress must not replace the leading block progress"
+    );
+
+    release_last_page.send(()).expect("release last RPC page");
+    let forest_block = load
+        .await
+        .expect("startup forest task")
+        .expect("load startup forest");
+    assert_eq!(forest_block, 500);
+    let last = progress_rx.borrow().expect("final progress");
+    assert_eq!(
+        (last.unit, last.current_block),
+        (SyncProgressUnit::Block, 500)
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn startup_forest_relays_artifact_preparation_progress() {
+    let scope = test_scope();
+    let (artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 1, 50, 50);
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let (root_dir, db) = open_forest_db("startup-forest-artifact-preparation");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    // The tail starts below the archive boundary, so no RPC candidate
+    // publishes block progress over the artifact preparation.
+    chain.sync.archive_until_block = 10;
+    let (progress_tx, progress_rx) = watch::channel(None);
+    chain.progress_tx = Some(progress_tx);
+    let load = tokio::spawn({
+        let db = Arc::clone(&db);
+        async move {
+            db.load_or_initialize_forest(&chain, 500, None, None)
+                .await
+                .map(|_| ())
+        }
+    });
+
+    wait_for_std_signal(manifest_block.request_started, "artifact manifest request").await;
+    yield_until("manifest start progress", || {
+        progress_rx.borrow().is_some_and(|update| {
+            update.unit == SyncProgressUnit::ArtifactPreparation && update.current_block == 5
+        })
+    })
+    .await;
+
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+    load.await
+        .expect("startup forest task")
+        .expect("load startup forest");
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn fast_artifact_forest_candidate_wins_and_stops_rpc_candidate() {
+    let scope = test_scope();
+    let leaves = [(0, U256::from(11)), (1, U256::from(12))];
+    // Indexed through block 120 with the hash the confirming provider serves.
+    // Confirmation waits until the RPC candidate has published its first page.
+    let artifact_source = commitment_artifact_source(&scope, 120, [0x11; 32], 110, &leaves);
+    let (release_confirmation, confirmation_gate) = std_mpsc::channel::<()>();
+    let serve_confirmer = log_range_rpc_handler(Vec::new(), 500, |_, _, _| None);
+    let confirmer = JsonRpcServer::spawn_handler(move |request: &serde_json::Value| {
+        if request["method"] == "eth_getBlockByNumber" {
+            let _ = confirmation_gate.recv();
+        }
+        serve_confirmer(request)
+    });
+    let (second_page_started_tx, second_page_started) = std_mpsc::channel();
+    let (release_second_page, second_page_gate) = std_mpsc::channel();
+    let serve_pool = gated_get_logs_handler(
+        log_range_rpc_handler(Vec::new(), 500, |_, _, _| None),
+        vec![((101, 200), second_page_gate)],
+    );
+    let pool_rpc = JsonRpcServer::spawn_handler(move |request: &serde_json::Value| {
+        if request["method"] == "eth_getLogs"
+            && hex_quantity(&request["params"][0]["fromBlock"]) == 101
+        {
+            let _ = second_page_started_tx.send(());
+        }
+        serve_pool(request)
+    });
+    let (root_dir, db) = open_forest_db("startup-forest-fast-artifacts");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![pool_rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let (progress_tx, progress_rx) = watch::channel(None);
+    chain.progress_tx = Some(progress_tx);
+    let provider = QueryRpcPool::new(vec![confirmer.url.clone()], Duration::from_secs(1))
+        .random_provider()
+        .expect("confirming provider");
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+
+    // The second page's request follows delivery of the first page.
+    let confirm_after_first_page = async move {
+        wait_for_std_signal(second_page_started, "second RPC page request").await;
+        drop(release_confirmation);
+    };
+    let (loaded, ()) = tokio::join!(
+        db.load_or_initialize_forest(&chain, 500, Some(&provider), None),
+        confirm_after_first_page
+    );
+    let (forest, forest_block, _, _) = loaded.expect("load startup forest");
+
+    assert_eq!(
+        forest_block, 120,
+        "the artifact candidate wins at its target"
+    );
+    assert_eq!(forest_meta(&db, &chain), Some((120, [0x11; 32])));
+    let mut expected = MerkleForest::new();
+    for (tree_position, hash) in leaves {
+        expected
+            .insert_leaf(MerkleTreeUpdate {
+                tree_number: 0,
+                tree_position,
+                hash,
+            })
+            .expect("insert expected leaf");
+    }
+    expected.compute_roots();
+    assert_eq!(forest.read().await.roots(), expected.roots());
+    let last = progress_rx.borrow().expect("final progress");
+    assert_eq!(
+        last.unit,
+        SyncProgressUnit::ArtifactApplied,
+        "the winner's completion follows the loser's block progress"
+    );
+    let rpc_end = race_finished_events(&events, "rpc");
+    assert_eq!(rpc_end.len(), 1);
+    assert_eq!(
+        rpc_end[0].get("outcome").map(String::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        rpc_end[0].get("get_logs_requests").map(String::as_str),
+        Some("2"),
+        "the held second page counts"
+    );
+    // The held page arrived before the win; free it.
+    pool_rpc.drain_request_bodies();
+    release_second_page
+        .send(())
+        .expect("release second RPC page");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        pool_rpc.drain_request_bodies().is_empty(),
+        "the cancelled RPC candidate sends no further request"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn failed_forest_race_keeps_loaded_forest_and_writes_nothing() {
+    let scope = test_scope();
+    let leaves = [(0, U256::from(11)), (1, U256::from(12))];
+    // The confirming provider serves hash 0x11 for the artifact target.
+    let artifact_source = commitment_artifact_source(&scope, 120, [0x44; 32], 110, &leaves);
+    let confirmer =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let failing =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| {
+            Some(rpc_error(-32000, "unavailable"))
+        }));
+    let (root_dir, db) = open_forest_db("startup-forest-race-fails");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![failing.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let provider = QueryRpcPool::new(vec![confirmer.url.clone()], Duration::from_secs(1))
+        .random_provider()
+        .expect("confirming provider");
+    // The loaded block's hash is canonical, so the race runs.
+    let (loaded, snapshot_path, snapshot_bytes) = seed_loaded_forest(&db, &chain, 10, [0x11; 32]);
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+
+    let (forest, forest_block, _, _) = db
+        .load_or_initialize_forest(&chain, 500, Some(&provider), None)
+        .await
+        .expect("load startup forest");
+    drop(guard);
+
+    events.find(
+        "artifact-backed merkle forest target hash mismatch; falling back to configured indexed sources",
+    );
+    assert!(
+        !get_logs_ranges(&failing.drain_request_bodies()).is_empty(),
+        "the RPC candidate ran and failed"
+    );
+    assert_eq!(forest_block, 10, "startup keeps the loaded forest");
+    assert_eq!(forest.read().await.roots(), loaded.roots());
+    assert_eq!(forest_meta(&db, &chain), Some((10, [0x11; 32])));
+    assert_eq!(
+        fs::read(&snapshot_path).expect("read snapshot"),
+        snapshot_bytes,
+        "no candidate writes the snapshot"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn reorged_loaded_forest_skips_startup_catch_up() {
+    let scope = test_scope();
+    let leaves = [(0, U256::from(11)), (1, U256::from(12))];
+    // Would win the race: indexed through block 120 with the served hash.
+    let artifact_source = commitment_artifact_source(&scope, 120, [0x11; 32], 110, &leaves);
+    // Serves hash 0x11 for every block, so the loaded block 10 has reorged.
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let (root_dir, db) = open_forest_db("startup-forest-reorged");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let provider = QueryRpcPool::new(vec![rpc.url.clone()], Duration::from_secs(1))
+        .random_provider()
+        .expect("provider");
+    let (loaded, snapshot_path, snapshot_bytes) = seed_loaded_forest(&db, &chain, 10, [0x10; 32]);
+
+    let (forest, forest_block, _, _) = db
+        .load_or_initialize_forest(&chain, 500, Some(&provider), None)
+        .await
+        .expect("load startup forest");
+
+    assert_eq!(forest_block, 10, "the live reorg check owns the rewind");
+    assert_eq!(forest.read().await.roots(), loaded.roots());
+    assert_eq!(
+        forest_meta(&db, &chain),
+        Some((10, [0x10; 32])),
+        "the metadata that shows the reorg is kept"
+    );
+    assert_eq!(
+        fs::read(&snapshot_path).expect("read snapshot"),
+        snapshot_bytes
+    );
+    assert!(
+        get_logs_ranges(&rpc.drain_request_bodies()).is_empty(),
+        "no RPC candidate"
+    );
+    assert_eq!(
+        artifact_source.server.request_count(),
+        0,
+        "no artifact candidate"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 struct LiveForestFixture {
@@ -9978,6 +11123,96 @@ async fn stalled_live_forest_checks_reorg_before_squid_fallback() {
         *fixture.forest_rx.borrow() == 150
     })
     .await;
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_squid_stall_fallback_times_out_and_live_rpc_resumes() {
+    let (squid, squid_port) = silent_server();
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve = log_range_rpc_handler(Vec::new(), 200, |_, _, _| None);
+    let rpc = JsonRpcServer::spawn_handler({
+        let recovered = Arc::clone(&recovered);
+        move |request| {
+            if request["method"] == "eth_getLogs" && !recovered.load(Ordering::Acquire) {
+                return serde_json::json!({ "error": rpc_error(-32000, "unavailable") });
+            }
+            serve(request)
+        }
+    });
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn(
+        "live-forest-hung-squid",
+        vec![rpc.url.clone()],
+        Url::parse(&format!("http://127.0.0.1:{squid_port}")).expect("squid url"),
+        50,
+        200,
+    )
+    .await;
+    let rpcs = Arc::clone(&fixture.service.chain.rpcs);
+    let finished = || {
+        events
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.get("message").is_some_and(|message| {
+                    message == "live merkle forest stall fallback to Squid finished"
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A live page fails and the only provider cools down.
+    fixture
+        .service
+        .safe_head_tx
+        .send(200)
+        .expect("wake live loop");
+    yield_until("failed live RPC page", || {
+        rpcs.available_providers().is_empty()
+    })
+    .await;
+
+    tokio::time::advance(fixture.stall_period()).await;
+    // Only the silent Squid's timers are pending during the fallback, so the
+    // paused clock may run through its header timeouts and retry delays.
+    let fallback_started = tokio::time::Instant::now();
+    while finished().is_empty() {
+        assert!(
+            fallback_started.elapsed() < Duration::from_mins(10),
+            "the Squid stall fallback never finished"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let elapsed = fallback_started.elapsed();
+    assert!(
+        (Duration::from_secs(127)..=Duration::from_secs(129)).contains(&elapsed),
+        "four 30 s header timeouts and 1, 2 and 4 s retry delays, got {elapsed:?}"
+    );
+    assert_eq!(
+        finished()[0].get("outcome").map(String::as_str),
+        Some("not_applied")
+    );
+    assert_eq!(*fixture.forest_rx.borrow(), 50);
+    drain_backlog_connections(&squid);
+
+    // Once the provider recovers, the live loop pages from RPC within the
+    // Squid cooldown.
+    recovered.store(true, Ordering::Release);
+    yield_until("provider cooldown", || {
+        !rpcs.available_providers().is_empty()
+    })
+    .await;
+    fixture
+        .service
+        .safe_head_tx
+        .send(200)
+        .expect("wake live loop");
+    yield_until("live RPC pages", || *fixture.forest_rx.borrow() == 200).await;
+    assert_eq!(finished().len(), 1, "no Squid retry within the cooldown");
+    assert_eq!(drain_backlog_connections(&squid), 0);
 
     fixture.stop().await;
 }

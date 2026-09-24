@@ -30,6 +30,7 @@ pub use chain::{
     PublicDataPlaneError, PublicDataPlaneHandle, PublicScanRange, PublicScanRows,
     PublicScanRowsAnswer, PublicSyncCacheReset,
 };
+pub use indexed_artifacts::IndexedArtifactManifestReuse;
 pub use manager::{
     ChainPublicSyncCacheResetResult, PublicSyncCachesResetReport, SyncManager, SyncManagerError,
 };

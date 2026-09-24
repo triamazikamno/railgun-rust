@@ -1,8 +1,84 @@
 use super::{
-    Address, CancellationToken, ChainError, CommitmentBatch, DynProvider, Filter, FixedBytes,
-    GeneratedCommitmentBatch, Log, LogRangeLimit, LogSpanEndpoint, Nullified, Nullifiers, Provider,
-    QueryRpcPool, RailgunLegacyShieldEvents, Shield, SolEvent, Transact, TransportError, debug,
+    Address, AtomicU64, CancellationToken, ChainError, CommitmentBatch, Duration, DynProvider,
+    Filter, FixedBytes, GeneratedCommitmentBatch, Log, LogRangeLimit, LogSpanEndpoint, Nullified,
+    Nullifiers, Ordering, Provider, QueryRpcPool, RailgunLegacyShieldEvents, Shield, SolEvent,
+    Transact, TransportError, debug,
 };
+
+/// Providers that fetch forest catch-up pages concurrently.
+pub(super) const FOREST_RPC_PARALLELISM: usize = 4;
+/// Physical `eth_getLogs` requests one forest catch-up acquisition may issue.
+pub(super) const FOREST_RPC_REQUEST_BUDGET: u64 = 64;
+
+/// Physical `eth_getLogs` request budget shared by every provider of one
+/// acquisition.
+pub(super) struct LogRequestBudget {
+    limit: u64,
+    issued: AtomicU64,
+}
+
+impl LogRequestBudget {
+    pub(super) const fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            issued: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserves one request, or fails once `limit` requests were reserved.
+    fn reserve(&self) -> Result<(), ChainError> {
+        self.issued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |issued| {
+                (issued < self.limit).then_some(issued + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| ChainError::LogRequestBudgetExceeded(self.limit))
+    }
+
+    /// Requests reserved so far. A reservation is made just before its
+    /// request is sent, so a fetch aborted in between leaves one reserved
+    /// request unsent.
+    pub(super) fn issued(&self) -> u64 {
+        self.issued.load(Ordering::Relaxed)
+    }
+
+    pub(super) const fn limit(&self) -> u64 {
+        self.limit
+    }
+}
+
+/// One logical page of a parallel log acquisition. Its logs are in provider
+/// order; `sort_logs` orders them by block and log index.
+pub(super) struct LogPage {
+    pub(super) to_block: u64,
+    pub(super) logs: Vec<Log>,
+}
+
+/// Counters of one parallel log acquisition.
+#[derive(Debug, Default)]
+pub(super) struct ParallelLogStats {
+    /// Logical pages in the range.
+    pub(super) pages: u64,
+    pub(super) delivered_pages: u64,
+    /// Providers whose head covered the range end.
+    pub(super) eligible_providers: usize,
+    /// Requests reserved on the budget. At most one per in-flight task
+    /// aborted when the acquisition ended may not have been sent.
+    pub(super) get_logs_requests: u64,
+    /// Pages put back on the queue after a provider failed them.
+    pub(super) retries: u64,
+    /// Per-provider counts, covering completed page tasks only.
+    pub(super) providers: Vec<ProviderLogStats>,
+    pub(super) elapsed: Duration,
+}
+
+/// Pages fetched and physical requests issued by one provider.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ProviderLogStats {
+    pub(super) rpc_index: usize,
+    pub(super) pages: u64,
+    pub(super) get_logs_requests: u64,
+}
 
 /// Adapts the physical `eth_getLogs` requests covering one logical range to
 /// each endpoint's block-span and result-size limits.
@@ -13,6 +89,8 @@ pub(super) struct LogRangeFetch<'a> {
     pub(super) logical_from: u64,
     pub(super) logical_to: u64,
     pub(super) get_logs_requests: u64,
+    /// Request budget shared with other fetches, if any.
+    pub(super) budget: Option<&'a LogRequestBudget>,
 }
 
 impl LogRangeFetch<'_> {
@@ -22,7 +100,8 @@ impl LogRangeFetch<'_> {
     /// A block-span rejection narrows the endpoint's learned span and retries
     /// the uncovered part. A result-size rejection splits only the rejected
     /// request. A rejected single-block request, or any other error, is
-    /// returned unchanged.
+    /// returned unchanged. A request beyond the shared budget fails with
+    /// `ChainError::LogRequestBudgetExceeded` without being issued.
     async fn get_logs(
         &mut self,
         provider: &DynProvider,
@@ -48,6 +127,9 @@ impl LogRangeFetch<'_> {
 
             if self.cancel.is_cancelled() {
                 return Err(ChainError::LogFetchCancelled);
+            }
+            if let Some(budget) = self.budget {
+                budget.reserve()?;
             }
             self.get_logs_requests += 1;
             let request = filter.clone().select(start..=request_end);
@@ -208,6 +290,46 @@ pub(super) async fn fetch_logs_for_range_with_provider(
     logs.extend(nullifier_logs);
 
     Ok(logs)
+}
+
+/// Number of `eth_getLogs` filters `fetch_logs_for_range_with_provider`
+/// issues for `from_block..=to_block`.
+pub(super) fn log_filter_count_for_range(
+    from_block: u64,
+    to_block: u64,
+    v2_start_block: u64,
+    legacy_shield_block: u64,
+) -> u64 {
+    if from_block > to_block {
+        return 0;
+    }
+    if combined_log_event_signatures_for_range(
+        from_block,
+        to_block,
+        v2_start_block,
+        legacy_shield_block,
+    )
+    .is_some()
+    {
+        return 1;
+    }
+
+    // Nullifiers, then legacy commitments, transact, legacy and modern shields.
+    let mut filters = 1;
+    if from_block <= v2_start_block {
+        filters += 1;
+    }
+    if to_block >= v2_start_block {
+        filters += 1;
+        let v2_start = from_block.max(v2_start_block);
+        if v2_start <= legacy_shield_block {
+            filters += 1;
+        }
+        if to_block > legacy_shield_block {
+            filters += 1;
+        }
+    }
+    filters
 }
 
 pub(super) fn combined_log_event_signatures_for_range(
