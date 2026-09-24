@@ -880,9 +880,11 @@ pub(super) fn spawn_live_log_loop(
                                 }
                             }
                         }
+                        // One read suffices: `to_block` is already `finality_depth`
+                        // deep, and the next iteration's reorg check confirms it.
                         let to_block_hash = match tokio::select! {
                             () = cancel.cancelled() => break,
-                            result = service.chain.fetch_confirmed_block_hash(
+                            result = service.chain.fetch_block_hash(
                                 &rpc.provider,
                                 archive_provider.as_ref(),
                                 to_block,
@@ -903,7 +905,7 @@ pub(super) fn spawn_live_log_loop(
                                     err = %err.without_url(),
                                     rpc_index = rpc.index,
                                     to_block,
-                                    "failed to fetch confirmed block hash"
+                                    "failed to fetch live RPC endpoint hash"
                                 );
                                 if mark_unhealthy {
                                     rpcs.mark_bad_provider(&rpc);
