@@ -1,7 +1,7 @@
 use super::{
     Arc, AtomicBool, AtomicU64, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig,
-    ChainError, ChainHandle, ChainPublicDataPlane, ChainService, DbStore, Duration,
-    GlobalPoiPolicy, IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
+    ChainError, ChainHandle, ChainPublicDataPlane, ChainService, DbStore, GlobalPoiPolicy,
+    IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
     IndexedWalletCatchUpSourceOrder, IndexedWalletPage, IndexedWalletPageKind, Instant, JoinHandle,
     JoinSet, LogBatch, MerkleForestDbExt, Mutex, Ordering, Provider, ProviderHandle,
     PublicCoverageAnswer, PublicDataPlaneDiagnosticKind, PublicDataPlaneEpoch,
@@ -23,8 +23,10 @@ use super::{
     warn, watch,
 };
 
+use super::logs::INDEXED_SQUID_STEP_DEADLINE;
+use super::workers::{read_head_bounded, untried_provider};
 use crate::runtime_admission::DbRuntimeLease;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 pub(in crate::chain) async fn send_wallet_reset(
     cache_key: &str,
@@ -211,6 +213,9 @@ impl SquidIndexedWalletReadSession {
 /// Most rows the Squid wallet candidate holds while it races artifact
 /// preparation. Long gaps past this bound are left to the artifact source.
 const WALLET_SQUID_RACE_ROW_BUDGET: usize = 20_000;
+/// Distinct providers one wallet RPC backfill read tries above the archive
+/// boundary before it reports failure.
+const WALLET_RPC_READ_MAX_PROVIDERS: usize = 3;
 
 /// Squid wallet pages fetched through `target` and held without committing.
 pub(super) struct SquidWalletCandidate {
@@ -2581,18 +2586,111 @@ impl ChainService {
                 delivery_applies: Vec::new(),
             });
         }
-        let rpc = self
+        // Reads at or below the archive boundary go to the archive endpoint
+        // whichever regular provider is chosen, so another regular provider
+        // would repeat the same failing request.
+        let archive_until_block = self.chain.sync.archive_until_block;
+        let max_providers = if archive_until_block > 0 && fetch_from_block <= archive_until_block {
+            1
+        } else {
+            WALLET_RPC_READ_MAX_PROVIDERS
+        };
+        let mut rpc = self
             .chain
             .rpcs
             .random_provider()
             .ok_or(ChainError::NoHealthyRpc)?;
+        let mut tried = BTreeSet::new();
         let started = Instant::now();
+        let batch = loop {
+            tried.insert(rpc.index);
+            let err = match self
+                .fetch_wallet_rpc_log_batch(
+                    &rpc,
+                    fetch_from_block,
+                    deliver_from_block,
+                    to_block,
+                    target_policy,
+                    cancel,
+                    read_scope,
+                )
+                .await
+            {
+                Ok(batch) => break batch,
+                Err(err) => err,
+            };
+            let next = if matches!(err, WalletStartupSyncError::Cancelled)
+                || tried.len() >= max_providers
+            {
+                None
+            } else {
+                untried_provider(&self.chain.rpcs, &tried)
+            };
+            let Some(next) = next else {
+                return Err(err);
+            };
+            debug!(
+                rpc_index = rpc.index,
+                next_rpc_index = next.index,
+                fetch_from_block,
+                to_block,
+                err = %err.without_url(),
+                "wallet RPC read failed; trying another provider"
+            );
+            rpc = next;
+        };
+        let Some(batch) = batch else {
+            return Ok(WalletRpcBackfillEvents {
+                acquisition_applies: Vec::new(),
+                delivery_applies: Vec::new(),
+            });
+        };
+        let to_block = batch.to_block;
+        let batch = Arc::new(batch);
+        debug!(
+            fetch_from_block,
+            deliver_from_block,
+            to_block,
+            elapsed_ms = started.elapsed().as_millis(),
+            "hedged wallet RPC backfill candidate complete"
+        );
+        let source = self.rpc_scan_source_for_range(fetch_from_block);
+        let fetched_apply =
+            WalletScanApply::rows_from_log_batch(fetch_from_block, to_block, &batch, source)
+                .map_err(ChainError::from)?;
+        let delivery_applies = if deliver_from_block > to_block {
+            Vec::new()
+        } else {
+            vec![
+                WalletScanApply::rows_from_log_batch(deliver_from_block, to_block, &batch, source)
+                    .map_err(ChainError::from)?,
+            ]
+        };
+        Ok(WalletRpcBackfillEvents {
+            acquisition_applies: vec![fetched_apply],
+            delivery_applies,
+        })
+    }
+
+    /// Reads `fetch_from_block..=to_block` from `rpc` for a wallet RPC
+    /// backfill read, as far as the provider's finalized head proves it.
+    /// Returns `None` when a prefix read has no proven coverage.
+    async fn fetch_wallet_rpc_log_batch(
+        &self,
+        rpc: &ProviderHandle,
+        fetch_from_block: u64,
+        deliver_from_block: u64,
+        to_block: u64,
+        target_policy: RpcTargetPolicy,
+        cancel: &CancellationToken,
+        read_scope: PublicScanReadScope,
+    ) -> Result<Option<LogBatch>, WalletStartupSyncError> {
         let provider_head = match wait_or_cancel(cancel, rpc.provider.get_block_number()).await? {
             Ok(provider_head) => provider_head,
             Err(err) => {
                 let err = ChainError::from(err);
                 if err.should_mark_rpc_unhealthy() {
-                    self.chain.rpcs.mark_bad_provider(&rpc);
+                    self.chain.rpcs.mark_bad_provider(rpc);
                 }
                 return Err(err.into());
             }
@@ -2623,17 +2721,14 @@ impl ChainService {
                 finality_depth = self.chain.finality_depth,
                 "RPC wallet scan source has no proven coverage for requested range"
             );
-            return Ok(WalletRpcBackfillEvents {
-                acquisition_applies: Vec::new(),
-                delivery_applies: Vec::new(),
-            });
+            return Ok(None);
         }
         let to_block = to_block.min(proven_to_block);
         let fetch_logs_started = Instant::now();
         let mut logs = match wait_or_cancel(
             cancel,
             self.chain.fetch_logs_for_range(
-                &rpc,
+                rpc,
                 self.archive_provider.as_ref(),
                 fetch_from_block,
                 to_block,
@@ -2645,7 +2740,7 @@ impl ChainService {
             Ok(logs) => logs,
             Err(err) => {
                 if err.should_mark_rpc_unhealthy() {
-                    self.chain.rpcs.mark_bad_provider(&rpc);
+                    self.chain.rpcs.mark_bad_provider(rpc);
                 }
                 return Err(err.into());
             }
@@ -2674,7 +2769,7 @@ impl ChainService {
             Ok(block_timestamps) => block_timestamps,
             Err(err) => {
                 if err.should_mark_rpc_unhealthy() {
-                    self.chain.rpcs.mark_bad_provider(&rpc);
+                    self.chain.rpcs.mark_bad_provider(rpc);
                 }
                 return Err(err.into());
             }
@@ -2732,37 +2827,14 @@ impl ChainService {
             "fetched hedged wallet RPC block hash"
         );
 
-        let batch = Arc::new(LogBatch {
+        Ok(Some(LogBatch {
             from_block: fetch_from_block,
             to_block,
             logs,
             block_timestamps,
             to_block_hash,
             read_scope,
-        });
-        debug!(
-            fetch_from_block,
-            deliver_from_block,
-            to_block,
-            elapsed_ms = started.elapsed().as_millis(),
-            "hedged wallet RPC backfill candidate complete"
-        );
-        let source = self.rpc_scan_source_for_range(fetch_from_block);
-        let fetched_apply =
-            WalletScanApply::rows_from_log_batch(fetch_from_block, to_block, &batch, source)
-                .map_err(ChainError::from)?;
-        let delivery_applies = if deliver_from_block > to_block {
-            Vec::new()
-        } else {
-            vec![
-                WalletScanApply::rows_from_log_batch(deliver_from_block, to_block, &batch, source)
-                    .map_err(ChainError::from)?,
-            ]
-        };
-        Ok(WalletRpcBackfillEvents {
-            acquisition_applies: vec![fetched_apply],
-            delivery_applies,
-        })
+        }))
     }
 
     async fn probe_squid_indexed_wallet_source(
@@ -2817,7 +2889,40 @@ impl ChainService {
         if artifact_target >= safe_head {
             return None;
         }
-        let session = self.probe_squid_indexed_wallet_source(cfg).await?;
+        let started = Instant::now();
+        let tail_blocks = safe_head - artifact_target;
+        // A one-page tail goes to RPC backfill without waiting on Squid.
+        if self
+            .chain
+            .should_skip_indexed_forest_catch_up(artifact_target + 1, safe_head)
+        {
+            debug!(
+                cache_key = %cfg.cache_key,
+                artifact_target,
+                safe_head,
+                tail_blocks,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Squid step skipped for one-page tail"
+            );
+            return None;
+        }
+        let Ok(session) = tokio::time::timeout(
+            INDEXED_SQUID_STEP_DEADLINE,
+            self.probe_squid_indexed_wallet_source(cfg),
+        )
+        .await
+        else {
+            debug!(
+                cache_key = %cfg.cache_key,
+                artifact_target,
+                safe_head,
+                tail_blocks,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Squid step deadline passed"
+            );
+            return None;
+        };
+        let session = session?;
         let target = squid_tail_target_after_artifact(
             from_block,
             artifact_target,
@@ -4103,41 +4208,15 @@ async fn fetch_initial_head(
     chain: &ChainConfig,
     rpcs: &QueryRpcPool,
 ) -> Option<(ProviderHandle, u64, u64)> {
-    let attempts = rpcs.len().max(3);
-    for attempt in 0..attempts {
-        let Some(rpc) = rpcs.random_provider() else {
-            warn!(
-                attempt,
-                "no healthy rpc providers available for initial block number"
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        };
-        match rpc.provider.get_block_number().await {
-            Ok(head) => {
-                let safe_head = head
-                    .saturating_sub(chain.finality_depth)
-                    .max(chain.deployment.deployment_block);
-                return Some((rpc, head, safe_head));
-            }
-            Err(err) => {
-                warn!(
-                    err = %ChainError::from(err).without_url(),
-                    attempt,
-                    rpc_index = rpc.index,
-                    "failed to fetch initial block number, retrying..."
-                );
-                rpcs.mark_bad_provider(&rpc);
-                if attempt + 1 < attempts {
-                    let backoff_power = match attempt {
-                        0 => 0,
-                        1 => 1,
-                        _ => 2,
-                    };
-                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(backoff_power))).await;
-                }
-            }
-        }
-    }
-    None
+    let Some((rpc, head)) = read_head_bounded(rpcs).await else {
+        warn!(
+            chain_id = chain.deployment.chain_id,
+            "no rpc provider returned the initial block number; starting without a safe head"
+        );
+        return None;
+    };
+    let safe_head = head
+        .saturating_sub(chain.finality_depth)
+        .max(chain.deployment.deployment_block);
+    Some((rpc, head, safe_head))
 }

@@ -45,8 +45,8 @@ impl ForestReorgDecision {
 /// Stored forest metadata checked against the confirmed chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForestMetaCheck {
-    /// Nothing to compare: the forest precedes deployment or the metadata
-    /// records no hash.
+    /// Nothing to compare: the forest precedes deployment, no forest metadata
+    /// is stored, or the metadata records no hash.
     Unchecked,
     /// The metadata records a block other than the forest's progress.
     StaleMeta,

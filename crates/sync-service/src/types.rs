@@ -616,16 +616,17 @@ impl ChainConfig {
         }
     }
 
-    /// Whether startup should leave the Merkle forest tail from `from_block`
-    /// to `safe_head` to live RPC sync instead of indexed catch-up, whichever
-    /// indexed sources are configured.
+    /// Whether the Merkle forest tail from `from_block` to `safe_head` is left
+    /// to live RPC sync instead of indexed catch-up, whichever indexed sources
+    /// are configured: it spans at most one `block_range` page, or is empty,
+    /// including when no safe head is known.
     pub(crate) const fn should_skip_indexed_forest_catch_up(
         &self,
         from_block: u64,
         safe_head: u64,
     ) -> bool {
-        from_block <= safe_head
-            && safe_head.saturating_sub(from_block).saturating_add(1) <= self.sync.block_range
+        from_block > safe_head
+            || safe_head.saturating_sub(from_block).saturating_add(1) <= self.sync.block_range
     }
 }
 

@@ -9,6 +9,8 @@ use super::{
 pub(super) const FOREST_RPC_PARALLELISM: usize = 4;
 /// Physical `eth_getLogs` requests one forest catch-up acquisition may issue.
 pub(super) const FOREST_RPC_REQUEST_BUDGET: u64 = 64;
+/// Longest wait on a Squid step that runs after artifacts already produced a result.
+pub(super) const INDEXED_SQUID_STEP_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Physical `eth_getLogs` request budget shared by every provider of one
 /// acquisition.

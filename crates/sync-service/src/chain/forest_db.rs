@@ -1,14 +1,18 @@
 use std::borrow::Cow;
 
-use super::logs::{FOREST_RPC_PARALLELISM, FOREST_RPC_REQUEST_BUDGET, LogRequestBudget};
+use super::logs::{
+    FOREST_RPC_PARALLELISM, FOREST_RPC_REQUEST_BUDGET, INDEXED_SQUID_STEP_DEADLINE,
+    LogRequestBudget,
+};
 use super::merkle_artifacts::MerkleArtifactCatchUp;
 use super::{
-    Arc, CancellationToken, ChainConfig, ChainError, DEFAULT_PAGE_SIZE, DbStore, DynProvider,
-    FixedBytes, ForestMetaCheck, Instant, MerkleForest, MerkleForestSnapshot, Path, PathBuf,
-    PersistError, ProviderHandle, QuickSyncClient, QuickSyncConfig, RwLock, SNAPSHOT_VERSION,
-    SyncError, SyncProgressSender, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
-    async_trait, debug, info, parse_anchor_block, run_merkle_artifact_catch_up_into,
-    run_quick_sync_into_with_progress, send_sync_progress, sort_logs, warn, watch,
+    Arc, CancellationToken, ChainConfig, ChainError, DEFAULT_PAGE_SIZE, DbStore, Duration,
+    DynProvider, FixedBytes, ForestMetaCheck, Instant, MerkleForest, MerkleForestSnapshot, Path,
+    PathBuf, PersistError, ProviderHandle, QuickSyncClient, QuickSyncConfig, RwLock,
+    SNAPSHOT_VERSION, SyncError, SyncProgressSender, SyncProgressStage, SyncProgressUnit,
+    SyncProgressUpdate, async_trait, debug, info, parse_anchor_block,
+    run_merkle_artifact_catch_up_into, run_quick_sync_into_with_progress, send_sync_progress,
+    sort_logs, warn, watch,
 };
 
 #[async_trait]
@@ -100,7 +104,7 @@ impl MerkleForestDbExt for DbStore {
                 from_block,
                 safe_head,
                 block_range = chain.sync.block_range,
-                tail_blocks = safe_head.saturating_sub(from_block).saturating_add(1),
+                tail_blocks = forest_tail_blocks(from_block, safe_head),
                 artifact_source_skipped = chain.sync.indexed_artifact_source.is_some(),
                 squid_skipped = chain.sync.quick_sync_endpoint.is_some(),
                 "skipping indexed merkle forest catch-up for small tail"
@@ -252,9 +256,9 @@ impl ForestCandidateSource {
 pub(super) struct ForestCandidate {
     pub(super) forest: MerkleForest,
     pub(super) target: u64,
-    /// Hash of `target`. Only a Squid target lacks one, when its provider read
-    /// fails; the metadata then records zeros, as before the race existed.
-    pub(super) target_hash: Option<[u8; 32]>,
+    /// Hash of `target`, as an RPC provider returned it. A source whose
+    /// target no provider confirms yields no candidate.
+    pub(super) target_hash: [u8; 32],
     pub(super) source: ForestCandidateSource,
     /// First block the candidate caught up from.
     from_block: u64,
@@ -502,10 +506,16 @@ fn log_forest_candidate_end(
     );
 }
 
+/// Time artifact catch-up runs alone before Squid catch-up from the loaded
+/// forest starts next to it.
+pub(super) const FOREST_SQUID_HEDGE_DELAY: Duration = Duration::from_secs(15);
+
 /// Runs indexed catch-up on copies of `forest`: indexed artifacts, then Squid
-/// on top of the artifact result, or Squid alone. Yields the furthest step
-/// that completed.
-async fn indexed_forest_candidate(
+/// on top of the artifact result, or Squid alone. When artifacts yield nothing
+/// or are still running after [`FOREST_SQUID_HEDGE_DELAY`], Squid catch-up
+/// from `forest` starts next to them, and the first confirmed result wins.
+/// Yields the furthest confirmed step.
+pub(super) async fn indexed_forest_candidate(
     chain: &ChainConfig,
     forest: &MerkleForest,
     last_processed: u64,
@@ -515,61 +525,155 @@ async fn indexed_forest_candidate(
     archive_provider: Option<&DynProvider>,
     progress: &ForestProgressReporter<'_>,
 ) -> Option<ForestCandidate> {
-    let artifact = if chain.sync.indexed_artifact_source.is_some() && from_block <= safe_head {
-        artifact_forest_candidate(
+    let started = Instant::now();
+    let squid_from_loaded = squid_forest_candidate(
+        chain,
+        Cow::Borrowed(forest),
+        last_processed,
+        from_block,
+        safe_head,
+        rpc,
+        archive_provider,
+        false,
+        progress,
+    );
+    if chain.sync.indexed_artifact_source.is_none() || from_block > safe_head {
+        return squid_from_loaded.await;
+    }
+    let artifact = artifact_forest_candidate(
+        chain,
+        forest,
+        from_block,
+        safe_head,
+        rpc,
+        archive_provider,
+        progress,
+    );
+    if chain.sync.quick_sync_endpoint.is_none() {
+        return artifact.await;
+    }
+    let artifact = {
+        let hedge_delay = tokio::time::sleep(FOREST_SQUID_HEDGE_DELAY);
+        tokio::pin!(artifact, squid_from_loaded, hedge_delay);
+        let mut artifact_running = true;
+        let mut squid_started = false;
+        let mut squid_running = true;
+        loop {
+            tokio::select! {
+                candidate = &mut artifact, if artifact_running => {
+                    artifact_running = false;
+                    if candidate.is_some() {
+                        break candidate;
+                    }
+                    if !squid_started {
+                        squid_started = true;
+                        log_forest_hedge_started(
+                            chain,
+                            from_block,
+                            safe_head,
+                            "artifact_no_result",
+                            started,
+                        );
+                    }
+                }
+                () = &mut hedge_delay, if !squid_started => {
+                    squid_started = true;
+                    log_forest_hedge_started(chain, from_block, safe_head, "hedge_delay", started);
+                }
+                candidate = &mut squid_from_loaded, if squid_started && squid_running => {
+                    squid_running = false;
+                    if candidate.is_some() {
+                        return candidate;
+                    }
+                }
+                else => break None,
+            }
+        }
+        // A Squid hedge still running is dropped here.
+    }?;
+    let tail_from = artifact
+        .target
+        .saturating_add(1)
+        .max(chain.deployment.deployment_block);
+    let tail_blocks = forest_tail_blocks(tail_from, safe_head);
+    if chain.should_skip_indexed_forest_catch_up(tail_from, safe_head) {
+        debug!(
+            chain_id = chain.deployment.chain_id,
+            artifact_target = artifact.target,
+            safe_head,
+            tail_blocks,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Squid step skipped for one-page tail"
+        );
+        return Some(artifact);
+    }
+    let step_started = Instant::now();
+    let squid = tokio::time::timeout(
+        INDEXED_SQUID_STEP_DEADLINE,
+        squid_forest_candidate(
             chain,
-            forest,
-            from_block,
+            Cow::Borrowed(&artifact.forest),
+            artifact.target,
+            tail_from,
             safe_head,
             rpc,
             archive_provider,
+            true,
             progress,
-        )
-        .await
+        ),
+    )
+    .await;
+    match squid {
+        Ok(Some(squid)) => Some(squid),
+        Ok(None) => Some(artifact),
+        Err(_) => {
+            debug!(
+                chain_id = chain.deployment.chain_id,
+                artifact_target = artifact.target,
+                safe_head,
+                tail_blocks,
+                elapsed_ms = step_started.elapsed().as_millis(),
+                "Squid step deadline passed"
+            );
+            Some(artifact)
+        }
+    }
+}
+
+fn log_forest_hedge_started(
+    chain: &ChainConfig,
+    from_block: u64,
+    safe_head: u64,
+    trigger: &'static str,
+    started: Instant,
+) {
+    debug!(
+        chain_id = chain.deployment.chain_id,
+        from_block,
+        safe_head,
+        tail_blocks = forest_tail_blocks(from_block, safe_head),
+        trigger,
+        elapsed_ms = started.elapsed().as_millis(),
+        "artifact forest hedge started"
+    );
+}
+
+/// Blocks from `from_block` through `safe_head`; zero for an empty tail.
+const fn forest_tail_blocks(from_block: u64, safe_head: u64) -> u64 {
+    if from_block <= safe_head {
+        safe_head - from_block + 1
     } else {
-        None
-    };
-    let squid = match &artifact {
-        Some(artifact) => {
-            squid_forest_candidate(
-                chain,
-                Cow::Borrowed(&artifact.forest),
-                artifact.target,
-                artifact
-                    .target
-                    .saturating_add(1)
-                    .max(chain.deployment.deployment_block),
-                safe_head,
-                rpc,
-                archive_provider,
-                true,
-                progress,
-            )
-            .await
-        }
-        None => {
-            squid_forest_candidate(
-                chain,
-                Cow::Borrowed(forest),
-                last_processed,
-                from_block,
-                safe_head,
-                rpc,
-                archive_provider,
-                false,
-                progress,
-            )
-            .await
-        }
-    };
-    squid.or(artifact)
+        0
+    }
 }
 
 /// Catches a copy of `forest` up from indexed artifacts, starting at
-/// `from_block`, and reads the artifact target's block hash from `rpc`.
+/// `from_block`, and confirms the artifact target's block hash on an available
+/// provider, preferring `rpc`.
 ///
-/// Yields no candidate when artifacts are unavailable or fail, or when the
-/// provider hash disagrees with the artifact hash; failures are logged.
+/// Yields no candidate when artifacts are unavailable or fail, when no provider
+/// confirms the target, or when the provider hash disagrees with the artifact
+/// hash; failures are logged.
 async fn artifact_forest_candidate(
     chain: &ChainConfig,
     forest: &MerkleForest,
@@ -619,28 +723,20 @@ async fn artifact_forest_candidate(
         }
     };
     let target = catch_up.target_block;
-    let provider_block_hash = match rpc {
-        Some(rpc) => chain
-            .fetch_confirmed_block_hash(&rpc.provider, archive_provider, target)
-            .await
-            .unwrap_or_else(|err| {
-                warn!(
-                    err = %err.without_url(),
-                    rpc_index = rpc.index,
-                    target,
-                    "failed to fetch confirmed artifact forest target block hash"
-                );
-                None
-            }),
-        None => None,
-    };
-    if provider_block_hash.is_some_and(|provider_hash| provider_hash != catch_up.target_block_hash)
-    {
+    let provider_block_hash = confirm_indexed_forest_target(
+        chain,
+        rpc,
+        archive_provider,
+        ForestCandidateSource::IndexedArtifacts,
+        target,
+    )
+    .await?;
+    if provider_block_hash != catch_up.target_block_hash {
         warn!(
             chain_id = chain.deployment.chain_id,
             target,
             artifact_block_hash = %FixedBytes::<32>::from(catch_up.target_block_hash),
-            provider_block_hash = ?provider_block_hash.map(FixedBytes::<32>::from),
+            provider_block_hash = %FixedBytes::<32>::from(provider_block_hash),
             "artifact-backed merkle forest target hash mismatch; falling back to configured indexed sources"
         );
         return None;
@@ -656,7 +752,7 @@ async fn artifact_forest_candidate(
     Some(ForestCandidate {
         forest: candidate,
         target,
-        target_hash: Some(catch_up.target_block_hash),
+        target_hash: provider_block_hash,
         source: ForestCandidateSource::IndexedArtifacts,
         from_block,
         commitments: Some(catch_up.progress.commitments),
@@ -768,7 +864,7 @@ async fn rpc_forest_candidate(
         Ok(Some(target_hash)) => Some(ForestCandidate {
             forest: candidate,
             target: safe_head,
-            target_hash: Some(target_hash),
+            target_hash,
             source: ForestCandidateSource::Rpc,
             from_block,
             commitments: None,
@@ -795,11 +891,12 @@ async fn rpc_forest_candidate(
 
 /// Catches `forest`, copied if borrowed, up from the configured Squid endpoint
 /// to the lesser of the Squid indexed height and `safe_head`, starting at
-/// `from_block`, and reads the target's block hash from `rpc`.
+/// `from_block`, and confirms the target's block hash on an available
+/// provider, preferring `rpc`.
 ///
 /// Yields no candidate when Squid is not configured, is not ahead of
-/// `last_processed`, or fails; failures are logged. A failed hash read leaves
-/// the candidate without a target hash.
+/// `last_processed`, or fails, or when no provider confirms the target;
+/// failures are logged.
 pub(super) async fn squid_forest_candidate(
     chain: &ChainConfig,
     forest: Cow<'_, MerkleForest>,
@@ -870,21 +967,14 @@ pub(super) async fn squid_forest_candidate(
                 return None;
             }
         };
-    let target_hash = match rpc {
-        Some(rpc) => chain
-            .fetch_confirmed_block_hash(&rpc.provider, archive_provider, target)
-            .await
-            .unwrap_or_else(|err| {
-                warn!(
-                    err = %err.without_url(),
-                    rpc_index = rpc.index,
-                    target,
-                    "failed to fetch confirmed indexed forest target block hash"
-                );
-                None
-            }),
-        None => None,
-    };
+    let target_hash = confirm_indexed_forest_target(
+        chain,
+        rpc,
+        archive_provider,
+        ForestCandidateSource::Squid,
+        target,
+    )
+    .await?;
     debug!(
         chain_id = chain.deployment.chain_id,
         from_block,
@@ -906,6 +996,60 @@ pub(super) async fn squid_forest_candidate(
             target,
         ),
     })
+}
+
+/// Reads the confirmed block hash of an indexed candidate's `target` from an
+/// available provider, preferring `rpc` while the pool still offers it. The
+/// provider is chosen at the read, since a long catch-up can outlast the
+/// provider it started with. Yields `None`, logged, when no provider is
+/// available or the read fails or returns no block.
+async fn confirm_indexed_forest_target(
+    chain: &ChainConfig,
+    rpc: Option<&ProviderHandle>,
+    archive_provider: Option<&DynProvider>,
+    source: ForestCandidateSource,
+    target: u64,
+) -> Option<[u8; 32]> {
+    let providers = chain.rpcs.available_providers();
+    let Some(rpc) = rpc
+        .filter(|rpc| providers.iter().any(|provider| provider.index == rpc.index))
+        .or_else(|| providers.first())
+    else {
+        debug!(
+            chain_id = chain.deployment.chain_id,
+            source = source.as_str(),
+            target,
+            "no provider available to confirm the indexed merkle forest target"
+        );
+        return None;
+    };
+    match chain
+        .fetch_confirmed_block_hash(&rpc.provider, archive_provider, target)
+        .await
+    {
+        Ok(Some(target_hash)) => Some(target_hash),
+        Ok(None) => {
+            debug!(
+                chain_id = chain.deployment.chain_id,
+                source = source.as_str(),
+                rpc_index = rpc.index,
+                target,
+                "indexed merkle forest target block hash unconfirmed"
+            );
+            None
+        }
+        Err(err) => {
+            warn!(
+                err = %err.without_url(),
+                chain_id = chain.deployment.chain_id,
+                source = source.as_str(),
+                rpc_index = rpc.index,
+                target,
+                "failed to fetch confirmed indexed merkle forest target block hash"
+            );
+            None
+        }
+    }
 }
 
 /// Writes `candidate` as the forest snapshot at `snapshot_path`, with its
@@ -931,7 +1075,7 @@ fn persist_indexed_forest_snapshot(
     chain: &ChainConfig,
     snapshot_path: &Path,
     last_block: u64,
-    block_hash: Option<[u8; 32]>,
+    block_hash: [u8; 32],
     forest: &MerkleForest,
 ) -> Result<(), ChainError> {
     MerkleForestSnapshot::write(
@@ -947,7 +1091,7 @@ fn persist_indexed_forest_snapshot(
         snapshot_path,
         last_block,
         SNAPSHOT_VERSION,
-        block_hash.unwrap_or([0u8; 32]),
+        block_hash,
     )?;
     Ok(())
 }
@@ -1027,15 +1171,8 @@ mod tests {
         forest.compute_roots();
         let block_hash = [0x44; 32];
 
-        persist_indexed_forest_snapshot(
-            &db,
-            &chain,
-            &snapshot_path,
-            123,
-            Some(block_hash),
-            &forest,
-        )
-        .expect("persist snapshot");
+        persist_indexed_forest_snapshot(&db, &chain, &snapshot_path, 123, block_hash, &forest)
+            .expect("persist snapshot");
 
         let meta = db
             .get_merkle_forest_meta(
@@ -1086,6 +1223,9 @@ mod tests {
 
         assert!(chain.should_skip_indexed_forest_catch_up(101, 200));
         assert!(chain.should_skip_indexed_forest_catch_up(200, 200));
+        // An empty tail, including a start without a safe head.
+        assert!(chain.should_skip_indexed_forest_catch_up(201, 200));
+        assert!(chain.should_skip_indexed_forest_catch_up(1, 0));
 
         chain.sync.indexed_artifact_source = Some(indexed_artifact_source());
         chain.sync.quick_sync_endpoint = Some(Url::parse("https://squid.example").expect("url"));

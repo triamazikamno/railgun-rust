@@ -1,5 +1,6 @@
 use super::logs::{
-    LogPage, LogRequestBudget, ParallelLogStats, ProviderLogStats, log_filter_count_for_range,
+    FOREST_RPC_REQUEST_BUDGET, LogPage, LogRequestBudget, ParallelLogStats, ProviderLogStats,
+    log_filter_count_for_range,
 };
 use super::service::send_wallet_reset;
 use super::{
@@ -314,7 +315,59 @@ pub(super) fn wallet_tail_fallback_lag_threshold_blocks(block_time: Duration) ->
     u64::try_from(threshold).unwrap_or(u64::MAX).max(2)
 }
 
+/// The live forest's lag behind the safe head, from
+/// [`ChainConfig::live_forest_lag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ForestLag {
+    pub(super) estimated_requests: u64,
+    pub(super) far_behind: bool,
+}
+
+/// Why the published live forest block changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiveForestProgressCause {
+    RpcApply,
+    IndexedInstall,
+    StallInstall,
+    ReorgReset,
+}
+
+impl LiveForestProgressCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RpcApply => "rpc_apply",
+            Self::IndexedInstall => "indexed_install",
+            Self::StallInstall => "stall_install",
+            Self::ReorgReset => "reorg_reset",
+        }
+    }
+}
+
 impl ChainService {
+    /// Publishes `forest_block` on `forest_last_tx`, the only way the live
+    /// forest block is published, with a "live forest progress" record. The
+    /// record measures the lag from the new block to the current safe head.
+    pub(super) fn publish_forest_progress(
+        &self,
+        forest_block: u64,
+        cause: LiveForestProgressCause,
+    ) {
+        let safe_head = *self.safe_head_tx.borrow();
+        let lag = self.chain.live_forest_lag(forest_block, safe_head);
+        debug!(
+            chain_id = self.chain.deployment.chain_id,
+            forest_block,
+            cause = cause.as_str(),
+            safe_head,
+            estimated_requests = lag.estimated_requests,
+            far_behind = lag.far_behind,
+            "live forest progress"
+        );
+        if let Err(err) = self.forest_last_tx.send(forest_block) {
+            debug!(?err, forest_block, "failed to send forest progress update");
+        }
+    }
+
     pub(super) async fn apply_forest_updates(
         &self,
         batch: &SharedLogBatch,
@@ -387,9 +440,7 @@ impl ChainService {
             SNAPSHOT_VERSION,
             [0u8; 32],
         )?;
-        if let Err(err) = self.forest_last_tx.send(reset_block) {
-            debug!(?err, reset_block, "failed to send forest reset update");
-        }
+        self.publish_forest_progress(reset_block, LiveForestProgressCause::ReorgReset);
         self.public_data_plane
             .invalidate_public_scan_coverage_from(reset_block.saturating_add(1))
             .await;
@@ -443,6 +494,14 @@ impl ChainService {
         debug!(?reset_result, cache_key = %cache_key, "wallet reorg reset accepted for actor-owned replay");
     }
 
+    /// Checks the forest metadata block against `provider`, and on a confirmed
+    /// reorg resets the forest and wallets.
+    ///
+    /// Returns the check's outcome. `Unchecked` also covers a forest below
+    /// deployment and missing metadata. `Unconfirmed` means no confirmed hash
+    /// was read, so a reorg can be neither ruled out nor detected. `Mismatch`
+    /// means the forest and wallet reset already ran; a failed forest reset
+    /// returns its error instead.
     pub(super) async fn check_forest_reorg(
         &self,
         provider: &DynProvider,
@@ -451,19 +510,19 @@ impl ChainService {
         snapshot_path: &Path,
         safe_head: u64,
         last_processed: u64,
-    ) -> Result<(), ChainError> {
+    ) -> Result<ForestMetaCheck, ChainError> {
         if last_processed < self.chain.deployment.deployment_block {
-            return Ok(());
+            return Ok(ForestMetaCheck::Unchecked);
         }
         let meta = self.db.get_merkle_forest_meta(
             self.chain.deployment.chain_id,
             &self.chain.deployment.contract.to_string(),
         )?;
         let Some(meta) = meta else {
-            return Ok(());
+            return Ok(ForestMetaCheck::Unchecked);
         };
 
-        match self
+        let check = self
             .chain
             .check_forest_meta(
                 provider,
@@ -472,8 +531,8 @@ impl ChainService {
                 meta.hash,
                 last_processed,
             )
-            .await?
-        {
+            .await?;
+        match check {
             ForestMetaCheck::Unchecked | ForestMetaCheck::Match => {}
             ForestMetaCheck::StaleMeta => {
                 warn!(
@@ -517,7 +576,7 @@ impl ChainService {
                     .await;
             }
         }
-        Ok(())
+        Ok(check)
     }
 
     pub(super) async fn persist_forest_snapshot(
@@ -945,6 +1004,18 @@ impl ChainConfig {
             self.deployment.legacy_shield_block,
         );
         ((to_block - from_block) / span + 1).saturating_mul(filters)
+    }
+
+    /// Measures the live forest's lag from `forest_block` to `safe_head` in
+    /// estimated `eth_getLogs` requests. The lag is far behind when the
+    /// estimate exceeds the forest RPC request budget.
+    pub(super) fn live_forest_lag(&self, forest_block: u64, safe_head: u64) -> ForestLag {
+        let estimated_requests =
+            self.estimate_log_requests(forest_block.saturating_add(1), safe_head);
+        ForestLag {
+            estimated_requests,
+            far_behind: estimated_requests > FOREST_RPC_REQUEST_BUDGET,
+        }
     }
 
     /// Fetches `from_block..=to_block` as consecutive pages of `block_range`

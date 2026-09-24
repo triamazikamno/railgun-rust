@@ -65,8 +65,8 @@ mod workers;
 
 pub(crate) use crate::txid_cache::TxidPublicProof;
 use backfill::{
-    WalletBackfill, WalletTailFallbackState, wallet_backfill_lag_blocks,
-    wallet_tail_fallback_stale_timeout,
+    ForestLag, LiveForestProgressCause, WalletBackfill, WalletTailFallbackState,
+    wallet_backfill_lag_blocks, wallet_tail_fallback_stale_timeout,
 };
 #[cfg(test)]
 pub(crate) use data_plane::commit_artifact_after_admission;
@@ -77,7 +77,8 @@ pub(crate) use data_plane::{
     WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome,
 };
 use forest_db::{
-    ForestProgressReporter, MerkleForestDbExt, persist_forest_candidate, squid_forest_candidate,
+    ForestCandidate, ForestProgressReporter, MerkleForestDbExt, indexed_forest_candidate,
+    persist_forest_candidate, squid_forest_candidate,
 };
 use indexed_wallet::{
     IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession, IndexedWalletPage,

@@ -36,7 +36,7 @@ fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
 }
 
 use super::backfill::{
-    WalletBackfill, WalletTailFallbackState, wallet_tail_fallback_lag_threshold_blocks,
+    ForestLag, WalletBackfill, WalletTailFallbackState, wallet_tail_fallback_lag_threshold_blocks,
     wallet_tail_fallback_stale_timeout,
 };
 use super::data_plane::{PublicScanCoverageWrite, PublicScanRows};
@@ -48,8 +48,10 @@ use super::service::{
     wait_for_startup_sync_target, wait_for_wallet_ready,
 };
 use super::workers::{
-    WalletBackfillSlot, drain_pending_backfill_requests, pending_tip_from_block,
-    pending_tip_provider_covers_target, reconcile_retained_acquisition, spawn_head_poller,
+    ForestStallTracker, HEAD_READ_STAGGER, INDEXED_TAIL_FALLBACK_COOLDOWN, INITIAL_HEAD_DEADLINE,
+    IndexedForestSources, IndexedForestTrigger, WalletBackfillSlot,
+    drain_pending_backfill_requests, pending_tip_from_block, pending_tip_provider_covers_target,
+    read_head_bounded, reconcile_retained_acquisition, spawn_head_poller,
     wallet_lag_fallback_state_for_test,
 };
 use super::{
@@ -2811,37 +2813,19 @@ async fn wallet_startup_rpc_candidate_skips_pre_cursor_blocks_when_delivery_is_c
 
 #[tokio::test]
 async fn wallet_startup_rpc_candidate_rejects_zero_provider_coverage() {
-    let root_dir = temp_db_root("wallet-startup-zero-rpc-coverage");
-    let db = Arc::new(
-        DbStore::open(DbConfig {
-            root_dir: root_dir.clone(),
+    // Every head is below the target. A lagging head doesn't mark a provider
+    // unhealthy, so only the read's tried set keeps it from asking one twice.
+    let servers = (0..4)
+        .map(|_| {
+            JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 100, |_, _, _| None))
         })
-        .expect("open db"),
-    );
-    let scope = test_scope();
-    let rpc = JsonRpcServer::spawn(vec![serde_json::json!("0x64")]);
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![rpc.url.clone()],
-        Duration::from_secs(1),
-    ));
-    let mut chain = test_chain_config(&scope, rpcs, None);
-    chain.sync.block_range = 10;
-    chain.finality_depth = 0;
-    let public_data_plane = ChainPublicDataPlane::new(
-        Arc::clone(&db),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
-    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    let mut cfg = test_wallet_config(&scope, rpc.url.clone());
-    cfg.start_block = Some(101);
+        .collect::<Vec<_>>();
 
-    let result = Arc::clone(&service)
-        .wallet_startup_rpc_candidate(
-            &cfg,
-            WalletShortStartupPlan::new(101, 105, 110, 10).expect("short startup plan"),
-            CancellationToken::new(),
-        )
-        .await;
+    let (result, _) = run_wallet_startup_rpc_candidate(
+        "wallet-startup-zero-rpc-coverage",
+        servers.iter().map(|server| server.url.clone()).collect(),
+    )
+    .await;
 
     assert!(matches!(
         result,
@@ -2850,17 +2834,173 @@ async fn wallet_startup_rpc_candidate_rejects_zero_provider_coverage() {
             proven_to: 100,
         })
     ));
-    assert!(
-        rpc.requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("RPC head request")
-            .contains("eth_blockNumber")
+    let mut head_reads = servers
+        .iter()
+        .map(|server| {
+            let bodies = server.drain_request_bodies();
+            assert!(
+                bodies
+                    .iter()
+                    .all(|body| body["method"] == "eth_blockNumber"),
+                "only head reads: {bodies:?}"
+            );
+            bodies.len()
+        })
+        .collect::<Vec<_>>();
+    head_reads.sort_unstable();
+    assert_eq!(
+        head_reads,
+        vec![0, 1, 1, 1],
+        "the read stops after three distinct providers"
     );
-    assert!(rpc.requests.try_recv().is_err());
+}
+
+/// Runs the short startup RPC candidate that delivers blocks 106..=110 on a
+/// pool of `rpc_urls`, and returns its delivery applies and the pool.
+async fn run_wallet_startup_rpc_candidate(
+    name: &str,
+    rpc_urls: Vec<Url>,
+) -> (
+    Result<Vec<WalletScanApply>, WalletStartupSyncError>,
+    Arc<QueryRpcPool>,
+) {
+    let root_dir = temp_db_root(name);
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    let rpcs = Arc::new(QueryRpcPool::new(rpc_urls, Duration::from_mins(1)));
+    let mut chain = test_chain_config(&scope, Arc::clone(&rpcs), None);
+    chain.sync.block_range = 10;
+    chain.finality_depth = 0;
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    let mut cfg = test_wallet_config(
+        &scope,
+        Url::parse("http://127.0.0.1:1").expect("unused Squid URL"),
+    );
+    cfg.start_block = Some(101);
+
+    let result = Arc::clone(&service)
+        .wallet_startup_rpc_candidate(
+            &cfg,
+            WalletShortStartupPlan::new(101, 105, 110, 10).expect("short startup plan"),
+            CancellationToken::new(),
+        )
+        .await
+        .map(|candidate| candidate.applies);
     service.shutdown().await;
     drop(service);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    (result, rpcs)
+}
+
+#[tokio::test]
+async fn wallet_startup_rpc_candidate_fails_over_after_provider_error() {
+    let scope = test_scope();
+    // The first range read, on whichever provider is picked first, gets HTTP 503.
+    let get_logs_reads = Arc::new(AtomicU64::new(0));
+    let servers = (0..2)
+        .map(|_| {
+            let get_logs_reads = Arc::clone(&get_logs_reads);
+            let serve = log_range_rpc_handler(
+                vec![rpc_nullifiers_log_with_timestamp(
+                    scope.railgun_contract,
+                    108,
+                )],
+                110,
+                |_, _, _| None,
+            );
+            JsonRpcServer::spawn_handler_with_status(move |request| {
+                if request["method"] == "eth_getLogs"
+                    && get_logs_reads.fetch_add(1, Ordering::AcqRel) == 0
+                {
+                    return Err(503);
+                }
+                Ok(serve(request))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let (result, rpcs) = run_wallet_startup_rpc_candidate(
+        "wallet-startup-rpc-failover-after-error",
+        servers.iter().map(|server| server.url.clone()).collect(),
+    )
+    .await;
+
+    let applies = result.expect("the second provider completes the read");
+    assert_eq!(applies.len(), 1);
+    let WalletScanRowsPayload::Rows(rows) = &applies[0].rows.payload else {
+        panic!("RPC delivery rows expected");
+    };
+    assert_eq!(rows.nullifiers.len(), 1);
+    for server in &servers {
+        assert_eq!(
+            get_logs_ranges(&server.drain_request_bodies()),
+            vec![(106, 110)],
+            "each provider is asked for the range once"
+        );
+    }
+    assert_eq!(
+        rpcs.available_providers().len(),
+        1,
+        "the failed provider cools down"
+    );
+}
+
+#[tokio::test]
+async fn wallet_startup_rpc_candidate_fails_over_when_provider_head_is_behind() {
+    // The first head read, on whichever provider is picked first, is below
+    // the required target 110.
+    let head_reads = Arc::new(AtomicU64::new(0));
+    let servers = (0..2)
+        .map(|_| {
+            let head_reads = Arc::clone(&head_reads);
+            let serve = log_range_rpc_handler(Vec::new(), 110, |_, _, _| None);
+            JsonRpcServer::spawn_handler(move |request| {
+                if request["method"] == "eth_blockNumber"
+                    && head_reads.fetch_add(1, Ordering::AcqRel) == 0
+                {
+                    return serde_json::json!({ "result": "0x64" });
+                }
+                serve(request)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let (result, rpcs) = run_wallet_startup_rpc_candidate(
+        "wallet-startup-rpc-failover-behind-head",
+        servers.iter().map(|server| server.url.clone()).collect(),
+    )
+    .await;
+
+    let applies = result.expect("the provider whose head covers the target completes the read");
+    assert_eq!(
+        applies
+            .iter()
+            .map(|apply| (apply.from_block, apply.to_block))
+            .collect::<Vec<_>>(),
+        vec![(106, 110)]
+    );
+    let mut ranges = servers
+        .iter()
+        .map(|server| get_logs_ranges(&server.drain_request_bodies()))
+        .collect::<Vec<_>>();
+    ranges.sort();
+    assert_eq!(
+        ranges,
+        vec![Vec::new(), vec![(106, 110)]],
+        "only the provider that covers the target reads the range"
+    );
+    assert_eq!(
+        rpcs.available_providers().len(),
+        2,
+        "a lagging head doesn't mark the provider unhealthy"
+    );
 }
 
 #[tokio::test]
@@ -2928,14 +3068,22 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
         .expect("open db"),
     );
     let scope = test_scope();
-    let rpc = JsonRpcServer::spawn(vec![
-        serde_json::json!("0x6e"),
-        serde_json::json!([]),
-        serde_json::json!([]),
-        serde_json::Value::Null,
-    ]);
+    // Either provider fails the same way; the read must not try the other.
+    let rpc_servers = (0..2)
+        .map(|_| {
+            JsonRpcServer::spawn(vec![
+                serde_json::json!("0x6e"),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::Value::Null,
+            ])
+        })
+        .collect::<Vec<_>>();
     let rpcs = Arc::new(QueryRpcPool::new(
-        vec![rpc.url.clone()],
+        rpc_servers
+            .iter()
+            .map(|server| server.url.clone())
+            .collect(),
         Duration::from_secs(1),
     ));
     let mut chain = test_chain_config(&scope, rpcs, None);
@@ -2948,7 +3096,7 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
-    let mut cfg = test_wallet_config(&scope, rpc.url.clone());
+    let mut cfg = test_wallet_config(&scope, rpc_servers[0].url.clone());
     cfg.start_block = Some(101);
 
     let result = Arc::clone(&service)
@@ -2963,6 +3111,16 @@ async fn wallet_startup_rpc_candidate_requires_archive_boundary_proof() {
         result,
         Err(WalletStartupSyncError::UnprovenRpcEndpoint { block_number: 107 })
     ));
+    let mut request_counts = rpc_servers
+        .iter()
+        .map(|server| server.requests.try_iter().count())
+        .collect::<Vec<_>>();
+    request_counts.sort_unstable();
+    assert_eq!(
+        request_counts,
+        vec![0, 4],
+        "a read that reaches the archive range stays on one provider"
+    );
     assert!(
         service
             .public_data_plane
@@ -5428,7 +5586,9 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         },
         sync: crate::RailgunSyncOptions {
             archive_until_block: 0,
-            block_range: 100,
+            // Shorter than the 50-block tail after the artifact checkpoint,
+            // so Squid is probed for it.
+            block_range: 25,
             indexed_wallet_block_range: 50,
             poll_interval: Duration::from_millis(1),
             quick_sync_endpoint: Some(squid.url.clone()),
@@ -6344,7 +6504,9 @@ async fn indexed_wallet_squid_transition_probe_keeps_pre_probe_read_scope() {
         100,
     )
     .await;
-    let catch_up = context.spawn_catch_up(200, IndexedWalletCatchUpSourceOrder::ArtifactsFirst);
+    // The tail 151..=300 after the artifact checkpoint is longer than one
+    // RPC page, so Squid is probed for it.
+    let catch_up = context.spawn_catch_up(300, IndexedWalletCatchUpSourceOrder::ArtifactsFirst);
 
     wait_for_std_signal(block.request_started, "Squid transition probe started").await;
     assert_eq!(context.handle.last_scanned(), Some(150));
@@ -6374,6 +6536,171 @@ async fn indexed_wallet_squid_transition_probe_keeps_pre_probe_read_scope() {
             && event.range == Some(PublicScanRange::new(151, 200))
     }));
 
+    context.cleanup();
+    drop(artifact_source.server);
+}
+
+#[tokio::test]
+async fn artifact_wallet_catch_up_sends_one_page_tail_to_rpc_without_squid() {
+    let root_dir = temp_db_root("artifact-wallet-one-page-tail");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let scope = test_scope();
+    // Artifacts reach block 150, one 50-block RPC page short of the target.
+    let (artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 100, 200, 150);
+    // The startup race's Squid candidate sees Squid behind the wallet. The
+    // second response would answer a tail probe.
+    let squid = GraphqlServer::spawn_controlled(
+        vec![squid_wallet_probe(100), squid_wallet_probe(200)],
+        None,
+    );
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 200, |_, _, _| None));
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(
+        &scope,
+        Arc::clone(&rpcs),
+        Some(artifact_source.config.clone()),
+    );
+    chain.sync.block_range = 50;
+    chain.sync.indexed_wallet_block_range = 50;
+    chain.finality_depth = 0;
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let (service, backfill_rx) = test_chain_service_with_backfill(
+        Arc::clone(&db),
+        chain,
+        public_data_plane,
+        test_proxy_poi_policy(),
+    );
+    service.safe_head_tx.send_replace(200);
+    spawn_backfill_loop(
+        Arc::clone(&service),
+        backfill_rx,
+        rpcs,
+        None,
+        service.safe_head_tx.subscribe(),
+        service.cancel.clone(),
+    );
+
+    let mut cfg = test_wallet_config(&scope, squid.url.clone());
+    cfg.cache_key = test_cache_key("artifact-one-page-tail");
+    cfg.start_block = Some(101);
+    cfg.sync_to_block = Some(200);
+    db.put_wallet_meta(
+        &cfg.cache_key,
+        &WalletMeta {
+            last_scanned_block: 100,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("seed wallet cursor");
+    let mut handle = service.register_wallet(cfg).await.expect("register wallet");
+    // Artifacts win the race once the race's Squid probe has been answered.
+    let mut squid_requests = Vec::new();
+    yield_until("race Squid probe", || {
+        squid_requests.extend(squid.requests.try_iter());
+        !squid_requests.is_empty()
+    })
+    .await;
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_until_ready())
+        .await
+        .expect("RPC backfill delivered the tail")
+        .expect("wallet readiness succeeded");
+
+    assert_eq!(handle.last_scanned(), Some(200));
+    assert_eq!(
+        get_logs_ranges(&rpc.drain_request_bodies()).first(),
+        Some(&(151, 200)),
+        "RPC backfill reads the tail after the artifact checkpoint"
+    );
+    // The TXID cache loop may query Squid once the wallet is ready, but it
+    // never sends a wallet probe.
+    squid_requests.extend(squid.requests.try_iter());
+    assert_eq!(
+        squid_requests
+            .iter()
+            .filter(|request| request.contains("query WalletProbe"))
+            .count(),
+        1,
+        "no Squid probe for the one-page tail"
+    );
+
+    service.unregister_all_wallets().await;
+    service.shutdown().await;
+    drop(service);
+    drop(artifact_source.server);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test(start_paused = true)]
+async fn artifact_wallet_catch_up_stops_waiting_for_hung_squid_tail_probe_at_deadline() {
+    let scope = test_scope();
+    let (artifact_source, manifest_block) =
+        checkpointed_wallet_artifact_source_with_blocked_manifest(&scope, 100, 200, 150);
+    // The race's Squid candidate sees Squid behind the wallet, and the tail
+    // probe after the artifact checkpoint gets no answer.
+    let (squid, tail_probe) = GraphqlServer::spawn_owned_with_blocked_response(
+        vec![squid_wallet_probe(100), squid_wallet_probe(300)],
+        1,
+    );
+    let context = IndexedCatchUpTestContext::new(
+        &scope,
+        squid.url.clone(),
+        Some(artifact_source.config.clone()),
+        100,
+        100,
+    )
+    .await;
+    // The tail 151..=300 is longer than one 100-block RPC page.
+    let catch_up = context.spawn_catch_up(300, IndexedWalletCatchUpSourceOrder::ArtifactsFirst);
+
+    // Busy-yielding keeps the paused clock still until the tail probe is held.
+    yield_until("race Squid probe", || squid.requests.try_recv().is_ok()).await;
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+    yield_until("Squid tail probe", || {
+        tail_probe.request_started.try_recv().is_ok()
+    })
+    .await;
+    assert_eq!(context.handle.last_scanned(), Some(150));
+
+    let deadline = super::logs::INDEXED_SQUID_STEP_DEADLINE;
+    tokio::time::advance(deadline.saturating_sub(Duration::from_millis(1))).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !catch_up.is_finished(),
+        "the probe is awaited until the deadline"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    yield_until("catch-up after the deadline", || catch_up.is_finished()).await;
+    assert_eq!(
+        catch_up.await.expect("indexed catch-up task"),
+        150,
+        "RPC backfill resumes from the artifact checkpoint"
+    );
+
+    tail_probe
+        .release
+        .send(())
+        .expect("release Squid tail probe");
     context.cleanup();
     drop(artifact_source.server);
 }
@@ -8987,6 +9314,44 @@ fn commitment_artifact_source(
     commitment_block: u64,
     leaves: &[(u64, U256)],
 ) -> TestArtifactSource {
+    commitment_artifact_source_controlled(
+        scope,
+        indexed_through_block,
+        indexed_through_hash,
+        commitment_block,
+        leaves,
+        false,
+    )
+    .0
+}
+
+/// Like [`commitment_artifact_source`], but holds the manifest request until released.
+fn commitment_artifact_source_with_blocked_manifest(
+    scope: &ChainScope,
+    indexed_through_block: u64,
+    indexed_through_hash: [u8; 32],
+    commitment_block: u64,
+    leaves: &[(u64, U256)],
+) -> (TestArtifactSource, PathServerBlockControl) {
+    let (source, block) = commitment_artifact_source_controlled(
+        scope,
+        indexed_through_block,
+        indexed_through_hash,
+        commitment_block,
+        leaves,
+        true,
+    );
+    (source, block.expect("blocked manifest control"))
+}
+
+fn commitment_artifact_source_controlled(
+    scope: &ChainScope,
+    indexed_through_block: u64,
+    indexed_through_hash: [u8; 32],
+    commitment_block: u64,
+    leaves: &[(u64, U256)],
+    block_manifest: bool,
+) -> (TestArtifactSource, Option<PathServerBlockControl>) {
     let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
     let start = leaves.first().map_or(0, |leaf| leaf.0);
     let end = leaves.last().map_or(0, |leaf| leaf.0);
@@ -9093,7 +9458,13 @@ fn commitment_artifact_source(
             car_bytes(chunk_cid, &[(chunk_cid, chunk_bytes)]),
         ),
     ]);
-    let server = PathServer::spawn(routes, 3);
+    let (server, block) = if block_manifest {
+        let (server, block) =
+            PathServer::spawn_with_blocked_path(routes, 3, "/manifest.json".to_string());
+        (server, Some(block))
+    } else {
+        (PathServer::spawn(routes, 3), None)
+    };
     let config = IndexedArtifactSourceConfig {
         trusted_publisher_pubkey: FixedBytes::from(signing_key.verifying_key().to_bytes()),
         manifest_source: IndexedArtifactManifestSource::Url(
@@ -9106,11 +9477,14 @@ fn commitment_artifact_source(
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
     };
-    TestArtifactSource {
-        config,
-        server,
-        chunk_descriptors: vec![chunk_descriptor],
-    }
+    (
+        TestArtifactSource {
+            config,
+            server,
+            chunk_descriptors: vec![chunk_descriptor],
+        },
+        block,
+    )
 }
 
 fn test_wallet_config(scope: &ChainScope, quick_sync_endpoint: Url) -> WalletConfig {
@@ -9340,6 +9714,14 @@ impl JsonRpcServer {
     fn spawn_handler(
         handler: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
     ) -> Self {
+        Self::spawn_handler_with_status(move |body| Ok(handler(body)))
+    }
+
+    /// Like `spawn_handler`, but a handler `Err(status)` answers with that
+    /// HTTP status and an empty body.
+    fn spawn_handler_with_status(
+        handler: impl Fn(&serde_json::Value) -> Result<serde_json::Value, u16> + Send + 'static,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind json-rpc server");
         let url = Url::parse(&format!(
             "http://{}",
@@ -9355,12 +9737,17 @@ impl JsonRpcServer {
                 if request_tx.send(request).is_err() {
                     break;
                 }
-                let mut response = handler(&body);
-                response["jsonrpc"] = serde_json::json!("2.0");
-                response["id"] = body["id"].clone();
-                let response = response.to_string();
+                let (status, response) = match handler(&body) {
+                    Ok(mut response) => {
+                        response["jsonrpc"] = serde_json::json!("2.0");
+                        response["id"] = body["id"].clone();
+                        (200, response.to_string())
+                    }
+                    Err(status) => (status, String::new()),
+                };
                 let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    if status == 200 { "OK" } else { "Error" },
                     response.len()
                 );
                 let _ = stream
@@ -10032,6 +10419,158 @@ async fn chain_rpc_failure_logs_omit_endpoint_url() {
     }
 }
 
+/// Starts `count` JSON-RPC endpoints with head `head`. The first `hung`
+/// block-number reads, counted across all of them, get no answer until the
+/// returned release flag is set.
+fn head_servers_with_hung_first_reads(
+    count: usize,
+    hung: u64,
+    head: u64,
+) -> (
+    Vec<JsonRpcServer>,
+    Arc<AtomicU64>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let head_reads = Arc::new(AtomicU64::new(0));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let servers = (0..count)
+        .map(|_| {
+            let head_reads = Arc::clone(&head_reads);
+            let release = Arc::clone(&release);
+            let serve = log_range_rpc_handler(Vec::new(), head, |_, _, _| None);
+            JsonRpcServer::spawn_handler(move |request| {
+                if request["method"] == "eth_blockNumber"
+                    && head_reads.fetch_add(1, Ordering::AcqRel) < hung
+                {
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                serve(request)
+            })
+        })
+        .collect();
+    (servers, head_reads, release)
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_head_read_uses_answering_provider_beside_hung_one() {
+    let (_hung, hung_port) = silent_server();
+    let answering =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 200, |_, _, _| None));
+    let rpcs = QueryRpcPool::new(
+        vec![
+            Url::parse(&format!("http://127.0.0.1:{hung_port}")).expect("hung RPC URL"),
+            answering.url.clone(),
+        ],
+        Duration::from_mins(1),
+    );
+    let started = tokio::time::Instant::now();
+    let read = tokio::spawn(async move {
+        read_head_bounded(&rpcs)
+            .await
+            .map(|(rpc, head)| (rpc.index, head))
+    });
+    // Busy-yielding keeps the paused clock still while the answer arrives.
+    yield_until("head read", || read.is_finished()).await;
+
+    assert_eq!(read.await.expect("head read task"), Some((1, 200)));
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "no stagger or deadline wait"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_head_read_gives_up_at_deadline_when_every_provider_hangs() {
+    let hung = (0..4).map(|_| silent_server()).collect::<Vec<_>>();
+    // Per-request timeouts as in production, longer than the deadline.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("RPC client");
+    let rpcs = QueryRpcPool::with_http_client(
+        hung.iter()
+            .map(|(_, port)| Url::parse(&format!("http://127.0.0.1:{port}")).expect("hung RPC URL"))
+            .collect(),
+        Duration::from_mins(1),
+        client,
+    );
+    let started = tokio::time::Instant::now();
+
+    // Nothing answers, so the paused clock runs forward through the read's
+    // timers.
+    assert!(read_head_bounded(&rpcs).await.is_none());
+    let elapsed = started.elapsed();
+    assert!(
+        (INITIAL_HEAD_DEADLINE..INITIAL_HEAD_DEADLINE + Duration::from_secs(1)).contains(&elapsed),
+        "the read ends at its deadline, got {elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_head_read_staggers_past_hung_providers() {
+    let (servers, head_reads, release) = head_servers_with_hung_first_reads(4, 3, 300);
+    let rpcs = QueryRpcPool::new(
+        servers.iter().map(|server| server.url.clone()).collect(),
+        Duration::from_mins(1),
+    );
+    let started = tokio::time::Instant::now();
+    let read = tokio::spawn(async move { read_head_bounded(&rpcs).await.map(|(_, head)| head) });
+
+    // Busy-yielding keeps the paused clock still between the steps.
+    yield_until("three hung head reads", || {
+        head_reads.load(Ordering::Acquire) >= 3
+    })
+    .await;
+    tokio::time::advance(HEAD_READ_STAGGER).await;
+    yield_until("staggered head read", || read.is_finished()).await;
+
+    assert_eq!(read.await.expect("head read task"), Some(300));
+    assert_eq!(
+        head_reads.load(Ordering::Acquire),
+        4,
+        "the fourth provider starts at the stagger"
+    );
+    assert!(started.elapsed() < INITIAL_HEAD_DEADLINE);
+    release.store(true, Ordering::Release);
+}
+
+#[tokio::test(start_paused = true)]
+async fn head_poller_publishes_first_safe_head_past_hung_providers() {
+    let (servers, head_reads, release) = head_servers_with_hung_first_reads(4, 3, 300);
+    let (root_dir, db) = open_forest_db("head-poller-hung-providers");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        servers.iter().map(|server| server.url.clone()).collect(),
+        Duration::from_mins(1),
+    ));
+    let chain = test_chain_config(&test_scope(), Arc::clone(&rpcs), None);
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+    let safe_head_rx = service.safe_head_tx.subscribe();
+    let started = tokio::time::Instant::now();
+
+    // A headless start: no safe head is known yet.
+    spawn_head_poller(Arc::clone(&service), rpcs);
+    yield_until("three hung head reads", || {
+        head_reads.load(Ordering::Acquire) >= 3
+    })
+    .await;
+    tokio::time::advance(HEAD_READ_STAGGER).await;
+    yield_until("first safe head", || *safe_head_rx.borrow() == 300).await;
+    assert!(
+        started.elapsed() < INITIAL_HEAD_DEADLINE,
+        "no hung provider's request is waited out"
+    );
+
+    service.cancel.cancel();
+    release.store(true, Ordering::Release);
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
 /// Records `sync_service` tracing events as field-name to value maps.
 #[derive(Clone, Default)]
 struct CapturedEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
@@ -10051,6 +10590,13 @@ impl CapturedEvents {
 
     fn events(&self) -> Vec<BTreeMap<String, String>> {
         self.0.lock().expect("captured events lock").clone()
+    }
+
+    fn with_message(&self, message: &str) -> Vec<BTreeMap<String, String>> {
+        self.events()
+            .into_iter()
+            .filter(|event| event.get("message").is_some_and(|value| value == message))
+            .collect()
     }
 
     fn find(&self, message: &str) -> BTreeMap<String, String> {
@@ -10128,7 +10674,9 @@ async fn load_startup_forest_with_indexed_sources(name: &str, safe_head: u64) ->
         root_dir: root_dir.clone(),
     })
     .expect("open db");
-    let rpcs = Arc::new(QueryRpcPool::new(Vec::new(), Duration::from_secs(1)));
+    let confirmer =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let rpcs = confirming_pool_without_rpc_candidate(&confirmer.url);
     let mut chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
     chain.sync.quick_sync_endpoint = Some(squid.url.clone());
 
@@ -10279,6 +10827,15 @@ fn seed_loaded_forest(
     (loaded, snapshot_path, snapshot_bytes)
 }
 
+/// A pool whose one provider, at `url`, confirms indexed forest targets, while
+/// its learned one-block log span puts every tail longer than one page over
+/// the RPC forest request budget, so no RPC forest candidate starts.
+fn confirming_pool_without_rpc_candidate(url: &Url) -> Arc<QueryRpcPool> {
+    let rpcs = Arc::new(QueryRpcPool::new(vec![url.clone()], Duration::from_secs(1)));
+    rpcs.narrow_log_span(LogSpanEndpoint::Provider(0), 1);
+    rpcs
+}
+
 fn race_finished_events(events: &CapturedEvents, candidate: &str) -> Vec<BTreeMap<String, String>> {
     events
         .events()
@@ -10398,8 +10955,9 @@ async fn startup_forest_race_starts_no_rpc_candidate_over_budget_or_archive_boun
             "{name}: Squid catch-up applies as before"
         );
         assert_eq!(squid.requests.try_iter().count(), 2, "{name}");
+        // The provider still confirms the Squid target.
         assert!(
-            rpc.drain_request_bodies().is_empty(),
+            get_logs_ranges(&rpc.drain_request_bodies()).is_empty(),
             "{name}: no RPC forest candidate request"
         );
         let started = events.find("merkle forest catch-up race started");
@@ -10739,10 +11297,9 @@ async fn failed_forest_race_keeps_loaded_forest_and_writes_nothing() {
             Some(rpc_error(-32000, "unavailable"))
         }));
     let (root_dir, db) = open_forest_db("startup-forest-race-fails");
-    let rpcs = Arc::new(QueryRpcPool::new(
-        vec![failing.url.clone()],
-        Duration::from_secs(1),
-    ));
+    // Without a cooldown, the failed provider's index stays available, so the
+    // artifact target is still confirmed on the passed-in provider.
+    let rpcs = Arc::new(QueryRpcPool::new(vec![failing.url.clone()], Duration::ZERO));
     let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
     let provider = QueryRpcPool::new(vec![confirmer.url.clone()], Duration::from_secs(1))
         .random_provider()
@@ -10827,10 +11384,506 @@ async fn reorged_loaded_forest_skips_startup_catch_up() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
+#[tokio::test(start_paused = true)]
+async fn headless_chain_start_skips_forest_catch_up_and_live_loop_rewinds_first() {
+    let scope = test_scope();
+    let (squid, squid_port) = silent_server();
+    let (gateway, gateway_port) = silent_server();
+    let gateway_url = Url::parse(&format!("http://127.0.0.1:{gateway_port}")).expect("gateway URL");
+    // Every provider hangs until `recovered`. It then serves hash 0x11 for
+    // every block and holds range reads until `logs_released`.
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let logs_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hung_reads = Arc::new(AtomicU64::new(0));
+    let rpc_servers = (0..3)
+        .map(|_| {
+            let recovered = Arc::clone(&recovered);
+            let logs_released = Arc::clone(&logs_released);
+            let hung_reads = Arc::clone(&hung_reads);
+            let serve = log_range_rpc_handler(Vec::new(), 200, |_, _, _| None);
+            JsonRpcServer::spawn_handler(move |request| {
+                if !recovered.load(Ordering::Acquire) {
+                    hung_reads.fetch_add(1, Ordering::AcqRel);
+                    while !recovered.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                if request["method"] == "eth_getLogs" {
+                    while !logs_released.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                serve(request)
+            })
+        })
+        .collect::<Vec<_>>();
+    let (root_dir, db) = open_forest_db("headless-chain-start");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        rpc_servers
+            .iter()
+            .map(|server| server.url.clone())
+            .collect(),
+        Duration::from_mins(1),
+    ));
+    let mut chain = test_chain_config(
+        &scope,
+        rpcs,
+        Some(IndexedArtifactSourceConfig {
+            trusted_publisher_pubkey: FixedBytes::ZERO,
+            manifest_source: IndexedArtifactManifestSource::Url(
+                gateway_url.join("/manifest.json").expect("manifest URL"),
+            ),
+            gateway_urls: vec![gateway_url],
+            gateway_pool: None,
+            manifest_reuse: crate::IndexedArtifactManifestReuse::default(),
+            max_manifest_age: None,
+            concurrency: 1,
+            max_in_flight_bytes: 1024 * 1024,
+        }),
+    );
+    chain.sync.quick_sync_endpoint =
+        Some(Url::parse(&format!("http://127.0.0.1:{squid_port}")).expect("Squid URL"));
+    seed_loaded_forest(&db, &chain, 50, [0xaa; 32]);
+    let lease = crate::runtime_admission::DbRuntimeLease::acquire(
+        &db,
+        crate::runtime_admission::DbRuntimeOwnerKind::SyncManager,
+    )
+    .expect("runtime lease");
+
+    let started = tokio::time::Instant::now();
+    let prepare = tokio::spawn(ChainService::prepare(
+        Arc::clone(&db),
+        chain,
+        test_proxy_poi_policy(),
+        lease,
+        None,
+    ));
+    // Busy-yielding keeps the paused clock still until every provider holds
+    // a head read. Each provider then stays blocked, so chain start could
+    // not finish if it sent any provider another request.
+    yield_until("hung head reads", || {
+        hung_reads.load(Ordering::Acquire) == 3
+    })
+    .await;
+    tokio::time::advance(INITIAL_HEAD_DEADLINE).await;
+    yield_until("chain start", || prepare.is_finished()).await;
+    let prepared = prepare
+        .await
+        .expect("chain start task")
+        .expect("chain start without a safe head");
+
+    assert_eq!(
+        started.elapsed(),
+        INITIAL_HEAD_DEADLINE,
+        "chain start waits only for the head deadline"
+    );
+    assert_eq!(drain_backlog_connections(&squid), 0, "no Squid request");
+    assert_eq!(drain_backlog_connections(&gateway), 0, "no gateway request");
+
+    // The providers recover and report a different hash for the loaded block.
+    let service = prepared.activate();
+    let forest_rx = service.forest_last_tx.subscribe();
+    assert_eq!(*forest_rx.borrow(), 50);
+    recovered.store(true, Ordering::Release);
+    // Range reads are held, so no log can apply before the rewind.
+    yield_until("reorg rewind", || *forest_rx.borrow() == 0).await;
+    assert_eq!(*service.safe_head_tx.borrow(), 200);
+
+    logs_released.store(true, Ordering::Release);
+    service.shutdown().await;
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+const SQUID_HEIGHT_300: &str = r#"{"data":{"squidStatus":{"height":"300"}}}"#;
+
+/// Two tree-0 leaves at block 110, served by the commitment artifact fixtures.
+fn artifact_forest_leaves() -> [(u64, U256); 2] {
+    [(0, U256::from(11)), (1, U256::from(12))]
+}
+
+/// Chain config with the artifact source and Squid endpoint configured, and a
+/// pool that confirms indexed targets through `confirmer` but starts no RPC
+/// forest candidate.
+fn indexed_forest_chain(
+    artifact_config: IndexedArtifactSourceConfig,
+    squid_url: Url,
+    confirmer: &Url,
+) -> ChainConfig {
+    let mut chain = test_chain_config(
+        &test_scope(),
+        confirming_pool_without_rpc_candidate(confirmer),
+        Some(artifact_config),
+    );
+    chain.sync.quick_sync_endpoint = Some(squid_url);
+    chain
+}
+
+/// Loads the startup forest on a separate task, returning the forest block.
+fn spawn_forest_load(
+    db: &Arc<DbStore>,
+    chain: &ChainConfig,
+    safe_head: u64,
+) -> tokio::task::JoinHandle<u64> {
+    let db = Arc::clone(db);
+    let chain = chain.clone();
+    tokio::spawn(async move {
+        db.load_or_initialize_forest(&chain, safe_head, None, None)
+            .await
+            .map(|(_, forest_block, _, _)| forest_block)
+            .expect("load startup forest")
+    })
+}
+
+#[tokio::test]
+async fn unconfirmed_artifact_forest_candidate_keeps_loaded_forest() {
+    let scope = test_scope();
+    // Carries its own hash for block 120, but no provider can confirm it.
+    let artifact_source =
+        commitment_artifact_source(&scope, 120, [0x11; 32], 110, &artifact_forest_leaves());
+    let (root_dir, db) = open_forest_db("startup-forest-unconfirmed-artifacts");
+    let rpcs = Arc::new(QueryRpcPool::new(Vec::new(), Duration::from_secs(1)));
+    let chain = test_chain_config(&scope, rpcs, Some(artifact_source.config.clone()));
+    let (loaded, snapshot_path, snapshot_bytes) = seed_loaded_forest(&db, &chain, 10, [0x10; 32]);
+    let events = CapturedEvents::default();
+    let guard = events.capture();
+
+    let (forest, forest_block, _, _) = db
+        .load_or_initialize_forest(&chain, 500, None, None)
+        .await
+        .expect("load startup forest");
+    drop(guard);
+
+    let unconfirmed =
+        events.find("no provider available to confirm the indexed merkle forest target");
+    assert_eq!(
+        unconfirmed.get("source").map(String::as_str),
+        Some("indexed_artifacts")
+    );
+    assert_eq!(unconfirmed.get("target").map(String::as_str), Some("120"));
+    assert_eq!(forest_block, 10, "startup keeps the loaded forest");
+    assert_eq!(forest.read().await.roots(), loaded.roots());
+    assert_eq!(forest_meta(&db, &chain), Some((10, [0x10; 32])));
+    assert_eq!(
+        fs::read(&snapshot_path).expect("read snapshot"),
+        snapshot_bytes,
+        "the unconfirmed artifact forest is not persisted"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn artifact_forest_squid_step_follows_tail_length_and_confirmation() {
+    // Artifacts confirm at block 120; Squid is indexed through 300.
+    for (name, safe_head, squid_target_confirmed, forest_target, squid_requests) in [
+        ("one-page-tail", 200, true, 120, 0),
+        ("long-tail", 500, true, 300, 2),
+        ("long-tail-unconfirmed-squid", 500, false, 120, 2),
+    ] {
+        let scope = test_scope();
+        let artifact_source =
+            commitment_artifact_source(&scope, 120, [0x11; 32], 110, &artifact_forest_leaves());
+        let squid = GraphqlServer::spawn(vec![SQUID_HEIGHT_300, SQUID_EMPTY_COMMITMENTS]);
+        let serve = log_range_rpc_handler(Vec::new(), 500, |_, _, _| None);
+        let confirmer = JsonRpcServer::spawn_handler(move |request: &serde_json::Value| {
+            if !squid_target_confirmed
+                && request["method"] == "eth_getBlockByNumber"
+                && hex_quantity(&request["params"][0]) == 300
+            {
+                return serde_json::json!({ "result": null });
+            }
+            serve(request)
+        });
+        let (root_dir, db) = open_forest_db(&format!("startup-forest-squid-step-{name}"));
+        let chain = indexed_forest_chain(
+            artifact_source.config.clone(),
+            squid.url.clone(),
+            &confirmer.url,
+        );
+        let events = CapturedEvents::default();
+        let guard = events.capture();
+
+        let (_, forest_block, _, _) = db
+            .load_or_initialize_forest(&chain, safe_head, None, None)
+            .await
+            .expect("load startup forest");
+        drop(guard);
+
+        assert_eq!(forest_block, forest_target, "{name}");
+        assert_eq!(
+            forest_meta(&db, &chain),
+            Some((forest_target, [0x11; 32])),
+            "{name}"
+        );
+        let requests = squid.requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), squid_requests, "{name}");
+        if let Some(commitments) = requests.get(1) {
+            assert_eq!(
+                json_rpc_request_body(commitments)["variables"]["blockNumber"],
+                "121",
+                "{name}: Squid runs on top of the artifact forest"
+            );
+        } else {
+            // Nor does a Squid hedge start while artifacts finish in time.
+            let skipped = events.find("Squid step skipped for one-page tail");
+            assert_eq!(skipped.get("tail_blocks").map(String::as_str), Some("80"));
+        }
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn artifact_forest_at_safe_head_does_not_wait_on_hung_squid() {
+    let scope = test_scope();
+    let artifact_source =
+        commitment_artifact_source(&scope, 120, [0x11; 32], 110, &artifact_forest_leaves());
+    let (squid, squid_port) = silent_server();
+    let confirmer =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let (root_dir, db) = open_forest_db("startup-forest-artifacts-at-safe-head");
+    let chain = indexed_forest_chain(
+        artifact_source.config.clone(),
+        Url::parse(&format!("http://127.0.0.1:{squid_port}")).expect("squid url"),
+        &confirmer.url,
+    );
+
+    // A 120-block tail from block 1 that artifacts close exactly.
+    let load = spawn_forest_load(&db, &chain, 120);
+    // The paused clock stands still, so the load cannot wait on Squid or a timer.
+    yield_until("artifact forest installed", || load.is_finished()).await;
+
+    assert_eq!(load.await.expect("startup forest task"), 120);
+    assert_eq!(forest_meta(&db, &chain), Some((120, [0x11; 32])));
+    assert_eq!(drain_backlog_connections(&squid), 0, "Squid is never asked");
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_squid_step_returns_artifact_forest_at_deadline() {
+    let scope = test_scope();
+    let artifact_source =
+        commitment_artifact_source(&scope, 120, [0x11; 32], 110, &artifact_forest_leaves());
+    let (squid, squid_status) =
+        GraphqlServer::spawn_with_blocked_response(vec![SQUID_HEIGHT_300], 0);
+    let confirmer =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let (root_dir, db) = open_forest_db("startup-forest-hung-squid-step");
+    let chain = indexed_forest_chain(
+        artifact_source.config.clone(),
+        squid.url.clone(),
+        &confirmer.url,
+    );
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+
+    let load = spawn_forest_load(&db, &chain, 500);
+    yield_until("Squid status request", || {
+        squid_status.request_started.try_recv().is_ok()
+    })
+    .await;
+    tokio::time::advance(
+        super::logs::INDEXED_SQUID_STEP_DEADLINE.saturating_sub(Duration::from_secs(1)),
+    )
+    .await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !load.is_finished(),
+        "the Squid step runs until its deadline"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    yield_until("artifact forest installed", || load.is_finished()).await;
+
+    assert_eq!(load.await.expect("startup forest task"), 120);
+    assert_eq!(forest_meta(&db, &chain), Some((120, [0x11; 32])));
+    let passed = events.find("Squid step deadline passed");
+    assert_eq!(passed.get("tail_blocks").map(String::as_str), Some("380"));
+    assert!(passed.contains_key("elapsed_ms"));
+    squid_status.release.send(()).expect("release Squid status");
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_artifacts_start_squid_hedge_after_delay() {
+    let hedge_delay = super::forest_db::FOREST_SQUID_HEDGE_DELAY;
+    let scope = test_scope();
+    let (artifact_source, manifest_block) = commitment_artifact_source_with_blocked_manifest(
+        &scope,
+        120,
+        [0x11; 32],
+        110,
+        &artifact_forest_leaves(),
+    );
+    let squid = GraphqlServer::spawn(vec![SQUID_HEIGHT_300, SQUID_EMPTY_COMMITMENTS]);
+    let confirmer =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let (root_dir, db) = open_forest_db("startup-forest-hung-artifacts");
+    let chain = indexed_forest_chain(
+        artifact_source.config.clone(),
+        squid.url.clone(),
+        &confirmer.url,
+    );
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+
+    let load = spawn_forest_load(&db, &chain, 500);
+    yield_until("artifact manifest request", || {
+        manifest_block.request_started.try_recv().is_ok()
+    })
+    .await;
+    tokio::time::advance(hedge_delay.saturating_sub(Duration::from_secs(1))).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        squid.requests.try_iter().count(),
+        0,
+        "no Squid request before the hedge delay"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    yield_until("Squid forest installed", || load.is_finished()).await;
+
+    assert_eq!(load.await.expect("startup forest task"), 300);
+    assert_eq!(forest_meta(&db, &chain), Some((300, [0x11; 32])));
+    let requests = squid.requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2, "Squid height and commitments");
+    assert_eq!(
+        json_rpc_request_body(&requests[1])["variables"]["blockNumber"],
+        "1",
+        "Squid catches up from the loaded forest"
+    );
+    assert_eq!(
+        artifact_source.server.request_count(),
+        1,
+        "the dropped artifact candidate sends nothing after the held manifest"
+    );
+    let hedge = events.find("artifact forest hedge started");
+    assert_eq!(
+        hedge.get("trigger").map(String::as_str),
+        Some("hedge_delay")
+    );
+    assert!(hedge.contains_key("elapsed_ms"));
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_artifacts_start_squid_hedge_without_delay() {
+    let scope = test_scope();
+    // Wallet-scan artifacts only, so forest artifact catch-up yields nothing.
+    let artifact_source = checkpointed_wallet_artifact_source(&scope, 1, 50, 50);
+    let squid = GraphqlServer::spawn(vec![SQUID_HEIGHT_300, SQUID_EMPTY_COMMITMENTS]);
+    let confirmer =
+        JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 500, |_, _, _| None));
+    let (root_dir, db) = open_forest_db("startup-forest-failed-artifacts");
+    let chain = indexed_forest_chain(
+        artifact_source.config.clone(),
+        squid.url.clone(),
+        &confirmer.url,
+    );
+
+    let load = spawn_forest_load(&db, &chain, 500);
+    // The paused clock stands still, so the hedge delay never elapses.
+    yield_until("Squid forest installed", || load.is_finished()).await;
+
+    assert_eq!(load.await.expect("startup forest task"), 300);
+    assert!(
+        artifact_source.server.request_count() > 0,
+        "artifacts ran first"
+    );
+    assert_eq!(squid.requests.try_iter().count(), 2);
+    assert_eq!(forest_meta(&db, &chain), Some((300, [0x11; 32])));
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unconfirmed_squid_hedge_leaves_artifact_candidate_running() {
+    let scope = test_scope();
+    let (artifact_source, manifest_block) = commitment_artifact_source_with_blocked_manifest(
+        &scope,
+        120,
+        [0x11; 32],
+        110,
+        &artifact_forest_leaves(),
+    );
+    // The hedge from the loaded forest, then the step on top of artifacts.
+    let squid = GraphqlServer::spawn(vec![
+        SQUID_HEIGHT_300,
+        SQUID_EMPTY_COMMITMENTS,
+        SQUID_HEIGHT_300,
+        SQUID_EMPTY_COMMITMENTS,
+    ]);
+    // Returns no block for the Squid target.
+    let serve = log_range_rpc_handler(Vec::new(), 500, |_, _, _| None);
+    let confirmer = JsonRpcServer::spawn_handler(move |request: &serde_json::Value| {
+        if request["method"] == "eth_getBlockByNumber" && hex_quantity(&request["params"][0]) == 300
+        {
+            return serde_json::json!({ "result": null });
+        }
+        serve(request)
+    });
+    let (root_dir, db) = open_forest_db("startup-forest-unconfirmed-squid-hedge");
+    let chain = indexed_forest_chain(
+        artifact_source.config.clone(),
+        squid.url.clone(),
+        &confirmer.url,
+    );
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let squid_unconfirmed = || {
+        events.events().iter().any(|event| {
+            event.get("message").is_some_and(|message| {
+                message == "indexed merkle forest target block hash unconfirmed"
+            }) && event.get("source").is_some_and(|source| source == "squid")
+        })
+    };
+
+    let load = spawn_forest_load(&db, &chain, 500);
+    yield_until("artifact manifest request", || {
+        manifest_block.request_started.try_recv().is_ok()
+    })
+    .await;
+    tokio::time::advance(super::forest_db::FOREST_SQUID_HEDGE_DELAY).await;
+    yield_until("unconfirmed Squid hedge", squid_unconfirmed).await;
+    manifest_block
+        .release
+        .send(())
+        .expect("release artifact manifest");
+    yield_until("artifact forest installed", || load.is_finished()).await;
+
+    assert_eq!(load.await.expect("startup forest task"), 120);
+    assert_eq!(
+        forest_meta(&db, &chain),
+        Some((120, [0x11; 32])),
+        "only the confirmed artifact forest is persisted"
+    );
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
 struct LiveForestFixture {
     root_dir: PathBuf,
     service: Arc<ChainService>,
     forest_rx: watch::Receiver<u64>,
+    snapshot_path: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -10843,6 +11896,40 @@ impl LiveForestFixture {
         squid_url: Url,
         forest_block: u64,
         safe_head: u64,
+    ) -> Self {
+        let rpcs = Arc::new(QueryRpcPool::new(rpc_urls, Duration::from_secs(1)));
+        Self::spawn_with(name, rpcs, forest_block, safe_head, |chain| {
+            chain.sync.quick_sync_endpoint = Some(squid_url);
+        })
+        .await
+    }
+
+    /// Starts the live forest loop with 10-block pages, so a lag of more than
+    /// 640 blocks is far behind, one provider that stays available after a
+    /// failed request, and a Squid endpoint.
+    async fn spawn_far_behind(
+        name: &str,
+        rpc_url: Url,
+        squid_url: Url,
+        forest_block: u64,
+        safe_head: u64,
+        progress_tx: Option<crate::types::SyncProgressSender>,
+    ) -> Self {
+        let rpcs = Arc::new(QueryRpcPool::new(vec![rpc_url], Duration::ZERO));
+        Self::spawn_with(name, rpcs, forest_block, safe_head, move |chain| {
+            chain.sync.block_range = 10;
+            chain.sync.quick_sync_endpoint = Some(squid_url);
+            chain.progress_tx = progress_tx;
+        })
+        .await
+    }
+
+    async fn spawn_with(
+        name: &str,
+        rpcs: Arc<QueryRpcPool>,
+        forest_block: u64,
+        safe_head: u64,
+        configure: impl FnOnce(&mut ChainConfig),
     ) -> Self {
         let root_dir = temp_db_root(name);
         let db = Arc::new(
@@ -10857,9 +11944,8 @@ impl LiveForestFixture {
             "merkle_forest",
             "live-forest.msgpack",
         ));
-        let rpcs = Arc::new(QueryRpcPool::new(rpc_urls, Duration::from_secs(1)));
         let mut chain = test_chain_config(&test_scope(), Arc::clone(&rpcs), None);
-        chain.sync.quick_sync_endpoint = Some(squid_url);
+        configure(&mut chain);
         let public_data_plane =
             ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
         let service = test_chain_service(db, chain, public_data_plane);
@@ -10872,7 +11958,7 @@ impl LiveForestFixture {
             None,
             service.forest_last_tx.subscribe(),
             service.safe_head_tx.subscribe(),
-            snapshot_path,
+            snapshot_path.clone(),
             service.cancel.clone(),
         );
         // Let the loop start its stall period at the current paused instant.
@@ -10883,8 +11969,25 @@ impl LiveForestFixture {
             root_dir,
             service,
             forest_rx,
+            snapshot_path,
             task,
         }
+    }
+
+    fn meta(&self) -> Option<(u64, [u8; 32])> {
+        forest_meta(&self.service.db, &self.service.chain)
+    }
+
+    /// Last block of the persisted forest snapshot, if one was written.
+    fn snapshot_block(&self) -> Option<u64> {
+        let deployment = &self.service.chain.deployment;
+        merkletree::persist::MerkleForestSnapshot::load(
+            &self.snapshot_path,
+            deployment.chain_id,
+            deployment.contract,
+        )
+        .expect("read forest snapshot")
+        .map(|snapshot| snapshot.last_processed_block)
     }
 
     fn stall_period(&self) -> Duration {
@@ -10919,14 +12022,26 @@ async fn yield_until(what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stalled_live_forest_catches_up_from_squid_without_rpc_providers() {
+async fn stalled_live_forest_catches_up_from_squid_when_rpc_pages_fail() {
     let squid = GraphqlServer::spawn(vec![
         r#"{"data":{"squidStatus":{"height":"150"}}}"#,
         SQUID_EMPTY_COMMITMENTS,
     ]);
+    // Confirms the Squid target; getLogs fails so RPC cannot advance.
+    let rpc = JsonRpcServer::spawn_handler(|request| match request["method"].as_str() {
+        Some("eth_getBlockByNumber") => {
+            let block_number = hex_quantity(&request["params"][0]);
+            serde_json::json!({
+                "result": rpc_block(block_number, test_block_timestamp(block_number), 0x11),
+            })
+        }
+        _ => serde_json::json!({ "error": rpc_error(-32000, "unavailable") }),
+    });
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
     let fixture = LiveForestFixture::spawn(
         "live-forest-stall-squid",
-        Vec::new(),
+        vec![rpc.url.clone()],
         squid.url.clone(),
         50,
         200,
@@ -10962,6 +12077,19 @@ async fn stalled_live_forest_catches_up_from_squid_without_rpc_providers() {
         .expect("read forest meta")
         .expect("forest meta persisted");
     assert_eq!(meta.last_block, 150);
+    let records = events.with_message("live forest progress");
+    assert_eq!(
+        records.len(),
+        1,
+        "one record per published block: {records:?}"
+    );
+    assert_eq!(
+        (
+            records[0].get("cause").map(String::as_str),
+            records[0].get("forest_block").map(String::as_str),
+        ),
+        (Some("stall_install"), Some("150"))
+    );
 
     fixture.stop().await;
 }
@@ -11013,9 +12141,11 @@ async fn failed_live_squid_fallback_waits_for_cooldown() {
     let squid = GraphqlServer::spawn(vec![failure, failure]);
     let events = CapturedEvents::default();
     let _guard = events.capture();
+    // The stall fallback needs an available provider to confirm a target;
+    // Squid fails first, so this one is never contacted.
     let fixture = LiveForestFixture::spawn(
         "live-forest-squid-cooldown",
-        Vec::new(),
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
         squid.url.clone(),
         50,
         200,
@@ -11062,16 +12192,26 @@ async fn stalled_live_forest_checks_reorg_before_squid_fallback() {
         ],
         1,
     );
-    // Block headers carry hash 0xbb; getLogs fails so RPC cannot advance.
-    let rpc = JsonRpcServer::spawn_handler(|request| match request["method"].as_str() {
-        Some("eth_getBlockByNumber") => {
-            let block_number = hex_quantity(&request["params"][0]);
-            serde_json::json!({
-                "result": rpc_block(block_number, test_block_timestamp(block_number), 0xbb),
-            })
+    // Block headers carry hash 0xbb, except that block 50 has none until
+    // `block_50_unconfirmed` clears; getLogs fails so RPC cannot advance.
+    let block_50_unconfirmed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let rpc = JsonRpcServer::spawn_handler({
+        let block_50_unconfirmed = Arc::clone(&block_50_unconfirmed);
+        move |request| match request["method"].as_str() {
+            Some("eth_getBlockByNumber") => {
+                let block_number = hex_quantity(&request["params"][0]);
+                if block_number == 50 && block_50_unconfirmed.load(Ordering::Acquire) {
+                    return serde_json::json!({ "result": null });
+                }
+                serde_json::json!({
+                    "result": rpc_block(block_number, test_block_timestamp(block_number), 0xbb),
+                })
+            }
+            _ => serde_json::json!({ "error": rpc_error(-32000, "unavailable") }),
         }
-        _ => serde_json::json!({ "error": rpc_error(-32000, "unavailable") }),
     });
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
     let fixture = LiveForestFixture::spawn(
         "live-forest-stall-reorg",
         vec![rpc.url.clone()],
@@ -11097,6 +12237,33 @@ async fn stalled_live_forest_checks_reorg_before_squid_fallback() {
         )
         .expect("persist forest meta for block 50");
 
+    // Without a confirmed hash for block 50, the stall fallback waits for
+    // another stall period.
+    tokio::time::advance(fixture.stall_period()).await;
+    yield_until("deferred stall fallback", || {
+        !events
+            .with_message(
+                "live merkle forest stall fallback deferred after an inconclusive reorg check",
+            )
+            .is_empty()
+    })
+    .await;
+    assert_eq!(squid.requests.try_iter().count(), 0);
+    assert_eq!(*fixture.forest_rx.borrow(), 50);
+    assert_eq!(fixture.meta(), Some((50, [0xaa; 32])));
+    // The live page after the deferral fails and cools the only provider down.
+    yield_until("failed live RPC page", || {
+        !events
+            .with_message("failed to fetch logs, retrying...")
+            .is_empty()
+    })
+    .await;
+    yield_until("provider cooldown", || {
+        !chain.rpcs.available_providers().is_empty()
+    })
+    .await;
+
+    block_50_unconfirmed.store(false, Ordering::Release);
     tokio::time::advance(fixture.stall_period()).await;
     yield_until("Squid commitments request", || {
         commitments.request_started.try_recv().is_ok()
@@ -11174,6 +12341,11 @@ async fn hung_squid_stall_fallback_times_out_and_live_rpc_resumes() {
         rpcs.available_providers().is_empty()
     })
     .await;
+    // The stall fallback starts only with a provider to confirm its target.
+    yield_until("provider cooldown", || {
+        !rpcs.available_providers().is_empty()
+    })
+    .await;
 
     tokio::time::advance(fixture.stall_period()).await;
     // Only the silent Squid's timers are pending during the fallback, so the
@@ -11215,6 +12387,738 @@ async fn hung_squid_stall_fallback_times_out_and_live_rpc_resumes() {
     assert_eq!(drain_backlog_connections(&squid), 0);
 
     fixture.stop().await;
+}
+
+const fn test_forest_lag(far_behind: bool) -> ForestLag {
+    ForestLag {
+        estimated_requests: if far_behind { 100 } else { 2 },
+        far_behind,
+    }
+}
+
+#[test]
+fn forest_stall_tracker_starts_far_behind_attempts_at_once() {
+    let squid = IndexedForestSources {
+        artifacts: false,
+        squid: true,
+    };
+    let artifacts = IndexedForestSources {
+        artifacts: true,
+        squid: false,
+    };
+    let stall_period = Duration::from_mins(2);
+    let start = tokio::time::Instant::now();
+
+    // An advancing forest whose lag exceeds the budget is due at once, from
+    // either indexed source, but only with a provider to confirm a target.
+    let mut tracker = ForestStallTracker::new(stall_period);
+    tracker.observe(100, 10_000, test_forest_lag(true), start);
+    let advanced = start + Duration::from_secs(1);
+    tracker.observe(110, 10_000, test_forest_lag(true), advanced);
+    assert_eq!(
+        tracker.due(advanced, squid, true),
+        Some(IndexedForestTrigger::FarBehind)
+    );
+    assert_eq!(
+        tracker.due(advanced, artifacts, true),
+        Some(IndexedForestTrigger::FarBehind)
+    );
+    assert_eq!(tracker.due(advanced, squid, false), None);
+
+    // A finished attempt defers the next one by the cooldown from its finish.
+    let finished = advanced + Duration::from_secs(30);
+    tracker.finish_far_behind_attempt(finished);
+    let retry = finished + INDEXED_TAIL_FALLBACK_COOLDOWN;
+    assert_eq!(tracker.deadline(squid), Some(retry));
+    let before_retry =
+        finished + INDEXED_TAIL_FALLBACK_COOLDOWN.saturating_sub(Duration::from_millis(1));
+    assert_eq!(tracker.due(before_retry, squid, true), None);
+    assert_eq!(
+        tracker.due(retry, squid, true),
+        Some(IndexedForestTrigger::FarBehind)
+    );
+
+    // A lag within the budget stays on the Squid-only stall rule.
+    let mut tracker = ForestStallTracker::new(stall_period);
+    tracker.observe(100, 200, test_forest_lag(false), start);
+    let before_stall = start + stall_period.saturating_sub(Duration::from_millis(1));
+    assert_eq!(tracker.due(before_stall, squid, true), None);
+    let stalled = start + stall_period;
+    assert_eq!(
+        tracker.due(stalled, squid, true),
+        Some(IndexedForestTrigger::Stall)
+    );
+    assert_eq!(tracker.due(stalled, squid, false), None);
+    assert_eq!(tracker.deadline(artifacts), None);
+    assert_eq!(tracker.due(stalled, artifacts, true), None);
+}
+
+#[test]
+fn short_lag_is_far_behind_with_restricted_log_spans() {
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let chain = test_chain_config(&test_scope(), Arc::clone(&rpcs), None);
+    assert_eq!(
+        chain.live_forest_lag(0, 200),
+        ForestLag {
+            estimated_requests: 2,
+            far_behind: false,
+        },
+        "two pages at the configured range"
+    );
+
+    rpcs.narrow_log_span(LogSpanEndpoint::Provider(0), 2);
+    assert_eq!(
+        chain.live_forest_lag(0, 200),
+        ForestLag {
+            estimated_requests: 100,
+            far_behind: true,
+        }
+    );
+}
+
+/// Advances the paused clock by `step`, then releases one held live page and
+/// waits until the loop applies it.
+async fn advance_and_apply_live_page(
+    fixture: &LiveForestFixture,
+    release_page: &std_mpsc::Sender<()>,
+    step: Duration,
+) {
+    let before = *fixture.forest_rx.borrow();
+    tokio::time::advance(step).await;
+    release_page.send(()).expect("release live page");
+    yield_until("live page", || *fixture.forest_rx.borrow() > before).await;
+}
+
+/// Serves `serve`, but fails every `eth_getLogs` after the first `pages`.
+/// `get_logs` counts the `eth_getLogs` requests.
+fn live_pages_then_fail(
+    pages: u64,
+    get_logs: Arc<AtomicU64>,
+    serve: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
+) -> impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static {
+    move |request: &serde_json::Value| {
+        if request["method"] == "eth_getLogs" && get_logs.fetch_add(1, Ordering::AcqRel) >= pages {
+            return serde_json::json!({ "error": rpc_error(-32000, "unavailable") });
+        }
+        serve(request)
+    }
+}
+
+fn progress_record(
+    cause: &str,
+    forest_block: u64,
+    safe_head: u64,
+    estimated_requests: u64,
+    far_behind: bool,
+) -> BTreeMap<String, String> {
+    [
+        ("message", "live forest progress".to_owned()),
+        ("chain_id", "1".to_owned()),
+        ("cause", cause.to_owned()),
+        ("forest_block", forest_block.to_string()),
+        ("safe_head", safe_head.to_string()),
+        ("estimated_requests", estimated_requests.to_string()),
+        ("far_behind", far_behind.to_string()),
+    ]
+    .into_iter()
+    .map(|(field, value)| (field.to_owned(), value))
+    .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_behind_live_forest_keeps_paging_through_hung_squid_attempts() {
+    let (squid, squid_port) = silent_server();
+    let (release_page, page_gate) = std_mpsc::channel::<()>();
+    let serve = log_range_rpc_handler(Vec::new(), 10_000, |_, _, _| None);
+    let rpc = JsonRpcServer::spawn_handler(move |request| {
+        if request["method"] == "eth_getLogs" {
+            // Hold each page until the test has advanced the paused clock.
+            let _ = page_gate.recv();
+        }
+        serve(request)
+    });
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let started = tokio::time::Instant::now();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-far-behind-hung-squid",
+        rpc.url.clone(),
+        Url::parse(&format!("http://127.0.0.1:{squid_port}")).expect("squid url"),
+        0,
+        10_000,
+        None,
+    )
+    .await;
+    let triggered = || {
+        events
+            .with_message("far-behind live forest catch-up triggered")
+            .len()
+    };
+    let finished = || events.with_message("far-behind live forest catch-up finished");
+    let step = Duration::from_secs(5);
+    // The attempt starts without waiting for a stall.
+    yield_until("far-behind attempt", || triggered() == 1).await;
+
+    // Pages keep applying while Squid's requests time out and retry.
+    let mut pages = 0;
+    while finished().is_empty() {
+        assert!(pages < 60, "the hung attempt never finished");
+        advance_and_apply_live_page(&fixture, &release_page, step).await;
+        pages += 1;
+    }
+    let attempt = finished().remove(0);
+    assert_eq!(
+        attempt.get("outcome").map(String::as_str),
+        Some("no_result")
+    );
+    assert!(pages >= 20, "live pages during the attempt: {pages}");
+    let elapsed_ms = attempt["elapsed_ms"].parse().expect("attempt elapsed ms");
+    let retry_at = started + Duration::from_millis(elapsed_ms) + INDEXED_TAIL_FALLBACK_COOLDOWN;
+
+    // The repeated attempt waits for the cooldown, and pages keep applying.
+    while triggered() == 1 {
+        let now = tokio::time::Instant::now();
+        assert!(now < retry_at + 2 * step, "no attempt after the cooldown");
+        advance_and_apply_live_page(&fixture, &release_page, step).await;
+        if tokio::time::Instant::now() < retry_at {
+            assert_eq!(triggered(), 1, "no attempt within the cooldown");
+        }
+    }
+    for _ in 0..3 {
+        advance_and_apply_live_page(&fixture, &release_page, step).await;
+    }
+    assert_eq!(triggered(), 2);
+    assert_eq!(finished().len(), 1, "the repeated attempt is still running");
+
+    fixture.stop().await;
+    drain_backlog_connections(&squid);
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_behind_attempt_is_installed_when_it_finishes() {
+    let squid = GraphqlServer::spawn(vec![
+        r#"{"data":{"squidStatus":{"height":"10000"}}}"#,
+        r#"{"errors":[{"message":"indexer unavailable"}]}"#,
+        r#"{"data":{"squidStatus":{"height":"10000"}}}"#,
+        SQUID_EMPTY_COMMITMENTS,
+    ]);
+    // Live pages fail, so only indexed attempts advance the forest.
+    let get_logs = Arc::new(AtomicU64::new(0));
+    let rpc = JsonRpcServer::spawn_handler(live_pages_then_fail(
+        0,
+        Arc::clone(&get_logs),
+        log_range_rpc_handler(Vec::new(), 10_000, |_, _, _| None),
+    ));
+    let (progress_tx, progress_rx) = watch::channel(None);
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-far-behind-install",
+        rpc.url.clone(),
+        squid.url.clone(),
+        0,
+        10_000,
+        Some(progress_tx),
+    )
+    .await;
+    let triggered = || {
+        events
+            .with_message("far-behind live forest catch-up triggered")
+            .len()
+    };
+
+    // The first attempt fails after Squid reports its height, past the point
+    // where a reporting catch-up publishes progress.
+    yield_until("failed attempt and a live page after it", || {
+        !events
+            .with_message("far-behind live forest catch-up finished")
+            .is_empty()
+            && get_logs.load(Ordering::Acquire) >= 2
+    })
+    .await;
+    assert_eq!(squid.requests.try_iter().count(), 2);
+    assert_eq!(
+        *progress_rx.borrow(),
+        None,
+        "a failed attempt publishes no progress"
+    );
+
+    tokio::time::advance(INDEXED_TAIL_FALLBACK_COOLDOWN.saturating_sub(Duration::from_secs(1)))
+        .await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(triggered(), 1, "no retry before the cooldown");
+    assert_eq!(squid.requests.try_iter().count(), 0);
+
+    // From here the clock and the safe head stay put: the finished attempt
+    // alone wakes the loop to install it.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    yield_until("indexed install", || *fixture.forest_rx.borrow() == 10_000).await;
+    assert_eq!(triggered(), 2);
+    assert_eq!(fixture.meta(), Some((10_000, [0x11; 32])));
+    let completion = progress_rx.borrow().expect("completion progress");
+    assert_eq!(
+        (completion.current_block, completion.target_block),
+        (10_000, 10_000)
+    );
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_behind_candidate_waits_for_a_conclusive_reorg_check() {
+    // Squid holds its commitments until the forest metadata is seeded, so no
+    // candidate exists before then.
+    let (squid, commitments) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"10000"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ],
+        1,
+    );
+    // Live pages fail, and block 50 has no header until
+    // `block_50_unconfirmed` clears.
+    let block_50_unconfirmed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let serve = live_pages_then_fail(
+        0,
+        Arc::new(AtomicU64::new(0)),
+        log_range_rpc_handler(Vec::new(), 10_000, |_, _, _| None),
+    );
+    let rpc = JsonRpcServer::spawn_handler({
+        let block_50_unconfirmed = Arc::clone(&block_50_unconfirmed);
+        move |request| {
+            if request["method"] == "eth_getBlockByNumber"
+                && hex_quantity(&request["params"][0]) == 50
+                && block_50_unconfirmed.load(Ordering::Acquire)
+            {
+                return serde_json::json!({ "result": null });
+            }
+            serve(request)
+        }
+    });
+    let (progress_tx, progress_rx) = watch::channel(None);
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-far-behind-unconfirmed-reorg-check",
+        rpc.url.clone(),
+        squid.url.clone(),
+        50,
+        10_000,
+        Some(progress_tx),
+    )
+    .await;
+    let results = || {
+        events
+            .with_message("far-behind live forest catch-up result")
+            .into_iter()
+            .filter_map(|record| record.get("outcome").cloned())
+            .collect::<Vec<_>>()
+    };
+
+    yield_until("Squid commitments request", || {
+        commitments.request_started.try_recv().is_ok()
+    })
+    .await;
+    let chain = &fixture.service.chain;
+    fixture
+        .service
+        .db
+        .update_merkle_forest_meta(
+            chain.deployment.chain_id,
+            &chain.deployment.contract.to_string(),
+            &fixture.snapshot_path,
+            50,
+            merkletree::persist::SNAPSHOT_VERSION,
+            [0x11; 32],
+        )
+        .expect("persist forest meta for block 50");
+    commitments
+        .release
+        .send(())
+        .expect("release Squid commitments");
+
+    // The attempt finishes with a candidate, and the loop runs a reorg check
+    // and a failed live page after it.
+    yield_until("finished attempt and a live page after it", || {
+        events
+            .with_message("far-behind live forest catch-up finished")
+            .iter()
+            .any(|record| record.get("target").map(String::as_str) == Some("10000"))
+            && events
+                .with_message("failed to fetch logs, retrying...")
+                .len()
+                >= 2
+    })
+    .await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *fixture.forest_rx.borrow(),
+        50,
+        "an unconfirmed forest block hash holds the candidate"
+    );
+    assert_eq!(fixture.meta(), Some((50, [0x11; 32])));
+    assert_eq!(fixture.snapshot_block(), None);
+    assert!(
+        !events
+            .with_message("live forest progress")
+            .iter()
+            .any(|record| record.get("cause").map(String::as_str) == Some("indexed_install"))
+    );
+    assert!(
+        results().is_empty(),
+        "no install outcome yet: {:?}",
+        results()
+    );
+    assert_eq!(*progress_rx.borrow(), None);
+
+    // Once block 50 confirms the stored hash, the next check installs the
+    // held candidate.
+    block_50_unconfirmed.store(false, Ordering::Release);
+    fixture
+        .service
+        .safe_head_tx
+        .send(10_000)
+        .expect("wake live loop");
+    yield_until("indexed install", || *fixture.forest_rx.borrow() == 10_000).await;
+    assert_eq!(fixture.meta(), Some((10_000, [0x11; 32])));
+    assert_eq!(fixture.snapshot_block(), Some(10_000));
+    let completion = progress_rx.borrow().expect("completion progress");
+    assert_eq!(
+        (completion.current_block, completion.target_block),
+        (10_000, 10_000)
+    );
+    // The first attempt's candidate installs, within its cooldown.
+    assert_eq!(results(), vec!["installed".to_owned()]);
+    assert_eq!(
+        events
+            .with_message("far-behind live forest catch-up triggered")
+            .len(),
+        1
+    );
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_forest_progress_records_each_published_block() {
+    // Squid holds its height answer until the test releases it.
+    let (squid, squid_height) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"10000"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ],
+        0,
+    );
+    // Two live pages succeed and later ones fail. The first read of block 10
+    // returns no block, so the first page fails its endpoint confirmation.
+    let get_logs = Arc::new(AtomicU64::new(0));
+    let serve = live_pages_then_fail(
+        2,
+        Arc::clone(&get_logs),
+        log_range_rpc_handler(Vec::new(), 10_000, |_, _, _| None),
+    );
+    let endpoint_unproven = std::sync::atomic::AtomicBool::new(true);
+    let rpc = JsonRpcServer::spawn_handler(move |request| {
+        if request["method"] == "eth_getBlockByNumber"
+            && hex_quantity(&request["params"][0]) == 10
+            && endpoint_unproven.swap(false, Ordering::AcqRel)
+        {
+            return serde_json::json!({ "result": null });
+        }
+        serve(request)
+    });
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-progress-records",
+        rpc.url.clone(),
+        squid.url.clone(),
+        0,
+        10_000,
+        None,
+    )
+    .await;
+    let records = || events.with_message("live forest progress");
+
+    yield_until("unproven live page", || {
+        !events
+            .with_message("live RPC range does not prove its endpoint")
+            .is_empty()
+    })
+    .await;
+    assert!(records().is_empty(), "an unapplied page has no record");
+
+    fixture
+        .service
+        .safe_head_tx
+        .send(10_000)
+        .expect("wake live loop");
+    yield_until("applied live page and a failed one", || {
+        *fixture.forest_rx.borrow() == 10 && get_logs.load(Ordering::Acquire) == 3
+    })
+    .await;
+    squid_height.release.send(()).expect("release Squid height");
+    yield_until("indexed install", || *fixture.forest_rx.borrow() == 10_000).await;
+
+    assert_eq!(
+        records(),
+        vec![
+            progress_record("rpc_apply", 10, 10_000, 999, true),
+            progress_record("indexed_install", 10_000, 10_000, 0, false),
+        ]
+    );
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_behind_result_is_dropped_once_live_rpc_passes_its_target() {
+    let (squid, commitments) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"30"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ],
+        1,
+    );
+    // Four live pages apply, through block 40; later pages fail.
+    let get_logs = Arc::new(AtomicU64::new(0));
+    let rpc = JsonRpcServer::spawn_handler(live_pages_then_fail(
+        4,
+        Arc::clone(&get_logs),
+        log_range_rpc_handler(Vec::new(), 10_000, |_, _, _| None),
+    ));
+    let (progress_tx, progress_rx) = watch::channel(None);
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-far-behind-passed",
+        rpc.url.clone(),
+        squid.url.clone(),
+        0,
+        10_000,
+        Some(progress_tx),
+    )
+    .await;
+
+    let mut attempt_running = false;
+    yield_until("live pages past the attempt's target", || {
+        attempt_running |= commitments.request_started.try_recv().is_ok();
+        attempt_running
+            && *fixture.forest_rx.borrow() == 40
+            && get_logs.load(Ordering::Acquire) >= 5
+    })
+    .await;
+    commitments
+        .release
+        .send(())
+        .expect("release Squid commitments");
+    yield_until("far-behind result", || {
+        !events
+            .with_message("far-behind live forest catch-up result")
+            .is_empty()
+    })
+    .await;
+
+    let result = events.find("far-behind live forest catch-up result");
+    assert_eq!(
+        (
+            result.get("target").map(String::as_str),
+            result.get("outcome").map(String::as_str),
+        ),
+        (Some("30"), Some("forest_at_target"))
+    );
+    assert_eq!(*fixture.forest_rx.borrow(), 40);
+    assert_eq!(fixture.meta(), Some((40, [0x11; 32])));
+    assert_eq!(fixture.snapshot_block(), Some(40));
+    assert_eq!(*progress_rx.borrow(), None, "no completion progress");
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reorg_during_far_behind_attempt_aborts_it() {
+    let (squid, commitments) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"10000"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ],
+        1,
+    );
+    // The first live page waits until the attempt is running. Block 60 proves
+    // that page with hash 0x11, then reorgs to 0xbb for the reorg check.
+    let (release_page, page_gate) = std_mpsc::channel::<()>();
+    let block_60_reads = AtomicU64::new(0);
+    let serve = live_pages_then_fail(
+        1,
+        Arc::new(AtomicU64::new(0)),
+        log_range_rpc_handler(Vec::new(), 10_000, |_, _, _| None),
+    );
+    let rpc = JsonRpcServer::spawn_handler(move |request| {
+        if request["method"] == "eth_getLogs" {
+            let _ = page_gate.recv();
+        }
+        if request["method"] == "eth_getBlockByNumber"
+            && hex_quantity(&request["params"][0]) == 60
+            && block_60_reads.fetch_add(1, Ordering::AcqRel) > 0
+        {
+            return serde_json::json!({
+                "result": rpc_block(60, test_block_timestamp(60), 0xbb),
+            });
+        }
+        serve(request)
+    });
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-far-behind-reorg",
+        rpc.url.clone(),
+        squid.url.clone(),
+        50,
+        10_000,
+        None,
+    )
+    .await;
+
+    yield_until("Squid commitments request", || {
+        commitments.request_started.try_recv().is_ok()
+    })
+    .await;
+    drop(release_page);
+    yield_until("aborted attempt", || {
+        !events
+            .with_message("far-behind live forest catch-up aborted by a reorg rewind")
+            .is_empty()
+    })
+    .await;
+    assert_eq!(
+        Arc::strong_count(&fixture.service),
+        2,
+        "the aborted attempt dropped its service handle"
+    );
+
+    // The held Squid answer now reaches no attempt.
+    commitments
+        .release
+        .send(())
+        .expect("release Squid commitments");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*fixture.forest_rx.borrow(), 0);
+    assert_eq!(fixture.meta(), Some((0, [0; 32])));
+    assert!(
+        events
+            .with_message("far-behind live forest catch-up finished")
+            .is_empty()
+    );
+    assert_eq!(
+        events.with_message("live forest progress"),
+        vec![
+            progress_record("rpc_apply", 60, 10_000, 994, true),
+            progress_record("reorg_reset", 0, 10_000, 1000, true),
+        ]
+    );
+
+    fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_behind_attempt_blocks_the_stall_trigger_and_ends_with_shutdown() {
+    let (squid, commitments) = GraphqlServer::spawn_with_blocked_response(
+        vec![
+            r#"{"data":{"squidStatus":{"height":"600"}}}"#,
+            SQUID_EMPTY_COMMITMENTS,
+        ],
+        1,
+    );
+    // One live page brings the lag within the request budget; later pages fail.
+    let get_logs = Arc::new(AtomicU64::new(0));
+    let rpc = JsonRpcServer::spawn_handler(live_pages_then_fail(
+        1,
+        Arc::clone(&get_logs),
+        log_range_rpc_handler(Vec::new(), 650, |_, _, _| None),
+    ));
+    let events = CapturedEvents::default();
+    let _guard = events.capture();
+    let fixture = LiveForestFixture::spawn_far_behind(
+        "live-forest-far-behind-stall-shutdown",
+        rpc.url.clone(),
+        squid.url.clone(),
+        0,
+        650,
+        None,
+    )
+    .await;
+
+    let mut attempt_running = false;
+    yield_until("far-behind attempt and live pages", || {
+        attempt_running |= commitments.request_started.try_recv().is_ok();
+        attempt_running
+            && *fixture.forest_rx.borrow() == 10
+            && get_logs.load(Ordering::Acquire) == 2
+    })
+    .await;
+
+    // The forest has stalled within the budget, so the stall trigger is due.
+    // A stall fallback would hang behind the held Squid answer; the loop pages
+    // instead.
+    tokio::time::advance(fixture.stall_period()).await;
+    fixture
+        .service
+        .safe_head_tx
+        .send(650)
+        .expect("wake live loop");
+    yield_until("live page after the stall period", || {
+        get_logs.load(Ordering::Acquire) == 3
+    })
+    .await;
+    assert!(
+        events
+            .with_message("live merkle forest stall fallback to Squid finished")
+            .is_empty()
+    );
+    assert_eq!(
+        Arc::strong_count(&fixture.service),
+        3,
+        "the fixture, the loop and the attempt hold the service"
+    );
+
+    // Shutdown during the attempt: `ChainService::shutdown` awaits this task.
+    let LiveForestFixture {
+        root_dir,
+        service,
+        task,
+        ..
+    } = fixture;
+    service.cancel.cancel();
+    task.await.expect("live forest loop exits");
+    assert_eq!(
+        Arc::strong_count(&service),
+        1,
+        "the attempt's service handle"
+    );
+    assert_eq!(
+        Arc::strong_count(&service.chain.rpcs),
+        1,
+        "the loop's and the attempt's pool handles"
+    );
+    assert_eq!(*service.forest_last_tx.borrow(), 10);
+    assert_eq!(
+        forest_meta(&service.db, &service.chain),
+        Some((10, [0x11; 32])),
+        "only the live page persisted"
+    );
+
+    drop(commitments);
+    drop(service);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]

@@ -1,23 +1,131 @@
 use super::{
-    Arc, BackfillEvent, BackfillRequest, CancellationToken, ChainError, ChainService,
-    DEFAULT_TXID_VERSION, Duration, DynProvider, EVM_CHAIN_TYPE, ForestProgressReporter, HashMap,
-    Instant, Instrument, JoinHandle, LogBatch, Path, PathBuf, PendingTipWalletRegistration,
-    Provider, ProviderHandle, PublicDataPlaneDiagnosticKind, PublicScanRange, PublicScanSource,
-    QueryRpcPool, TXID_PUBLIC_CACHE_SYNC_INTERVAL, TxidPublicCache, TxidPublicCacheKey,
-    WalletBackfill, WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    Arc, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig, ChainError, ChainService,
+    DEFAULT_TXID_VERSION, Duration, DynProvider, EVM_CHAIN_TYPE, ForestCandidate, ForestLag,
+    ForestMetaCheck, ForestProgressReporter, HashMap, Instant, Instrument, JoinHandle,
+    LiveForestProgressCause, LogBatch, Path, PathBuf, PendingTipWalletRegistration, Provider,
+    ProviderHandle, PublicDataPlaneDiagnosticKind, PublicScanRange, PublicScanSource, QueryRpcPool,
+    TXID_PUBLIC_CACHE_SYNC_INTERVAL, TxidPublicCache, TxidPublicCacheKey, WalletBackfill,
+    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletHandle, WalletReadinessError,
     WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome, WalletScanApply,
     WalletScanInputRows, WalletScanRows, WalletScanRowsPayload, WalletTailFallbackState,
-    await_wallet_cancellation, debug, info, min, mpsc, persist_forest_candidate, sort_logs,
-    squid_forest_candidate, wallet_backfill_from_block, wallet_backfill_lag_blocks,
-    wallet_sync_target, wallet_tail_fallback_stale_timeout, warn, watch,
+    await_wallet_cancellation, debug, indexed_forest_candidate, info, min, mpsc,
+    persist_forest_candidate, sort_logs, squid_forest_candidate, wallet_backfill_from_block,
+    wallet_backfill_lag_blocks, wallet_sync_target, wallet_tail_fallback_stale_timeout, warn,
+    watch,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::BTreeSet;
 
 const INDEXED_TAIL_FALLBACK_MIN_STALL: Duration = Duration::from_secs(15);
-const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_mins(1);
+/// Cooldown between wallet indexed tail fallbacks, also used between
+/// far-behind live forest attempts.
+pub(super) const INDEXED_TAIL_FALLBACK_COOLDOWN: Duration = Duration::from_mins(1);
 /// Remaining RPC backfill pages above which the indexed tail fallback is
 /// retried even while backfill keeps advancing.
 const INDEXED_TAIL_FALLBACK_RPC_PAGES: u64 = 50;
+/// Providers whose head is read at once while no safe head is known.
+pub(super) const INITIAL_HEAD_PARALLELISM: usize = 3;
+/// Interval after which a bounded head read also starts the next untried
+/// provider, so hung providers can't hold every slot.
+pub(super) const HEAD_READ_STAGGER: Duration = Duration::from_millis(1500);
+/// Bound on a head read while no safe head is known.
+pub(super) const INITIAL_HEAD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Returns an available provider that `tried` does not contain, chosen at
+/// random when possible.
+pub(super) fn untried_provider(
+    rpcs: &QueryRpcPool,
+    tried: &BTreeSet<usize>,
+) -> Option<ProviderHandle> {
+    rpcs.random_provider()
+        .filter(|rpc| !tried.contains(&rpc.index))
+        .or_else(|| {
+            rpcs.available_providers()
+                .into_iter()
+                .find(|rpc| !tried.contains(&rpc.index))
+        })
+}
+
+/// Reads the chain head from the first of several distinct providers to
+/// answer. Starts `INITIAL_HEAD_PARALLELISM` reads, then another untried
+/// provider every `HEAD_READ_STAGGER` and whenever a read fails. Returns
+/// `None` once `INITIAL_HEAD_DEADLINE` passes or every provider tried has
+/// failed. The reads are futures of this call, so dropping it cancels them.
+pub(super) async fn read_head_bounded(rpcs: &QueryRpcPool) -> Option<(ProviderHandle, u64)> {
+    let started = tokio::time::Instant::now();
+    let deadline = tokio::time::sleep(INITIAL_HEAD_DEADLINE);
+    tokio::pin!(deadline);
+    let mut next_stagger = started + HEAD_READ_STAGGER;
+    let mut tried = BTreeSet::new();
+    let mut in_flight = BTreeSet::new();
+    let mut reads = FuturesUnordered::new();
+    let mut starts = INITIAL_HEAD_PARALLELISM;
+    loop {
+        for _ in 0..starts {
+            let Some(rpc) = untried_provider(rpcs, &tried) else {
+                break;
+            };
+            tried.insert(rpc.index);
+            in_flight.insert(rpc.index);
+            reads.push(async move {
+                let result = rpc.provider.get_block_number().await;
+                (rpc, result)
+            });
+        }
+        if reads.is_empty() {
+            debug!(
+                providers_tried = tried.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "head read ran out of providers"
+            );
+            return None;
+        }
+        tokio::select! {
+            () = &mut deadline => {
+                debug!(
+                    providers_tried = tried.len(),
+                    unanswered = ?in_flight,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "head read deadline passed"
+                );
+                return None;
+            }
+            () = tokio::time::sleep_until(next_stagger) => {
+                next_stagger += HEAD_READ_STAGGER;
+                starts = 1;
+            }
+            Some((rpc, result)) = reads.next() => match result {
+                Ok(head) => {
+                    debug!(
+                        rpc_index = rpc.index,
+                        head,
+                        providers_tried = tried.len(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "head read answered"
+                    );
+                    return Some((rpc, head));
+                }
+                Err(err) => {
+                    in_flight.remove(&rpc.index);
+                    let err = ChainError::from(err);
+                    let marked_bad = err.should_mark_rpc_unhealthy();
+                    if marked_bad {
+                        rpcs.mark_bad_provider(&rpc);
+                    }
+                    debug!(
+                        rpc_index = rpc.index,
+                        marked_bad,
+                        err = %err.without_url(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "head read failed on provider"
+                    );
+                    starts = 1;
+                }
+            },
+        }
+    }
+}
 
 pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
     let cancel = service.cancel.clone();
@@ -28,32 +136,47 @@ pub(super) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPo
                 // Poll first, then sleep.  This ensures the very first poll
                 // happens immediately instead of after a full poll_interval
                 // delay, which is critical for fast safe_head availability.
-                let Some(rpc) = rpcs.random_provider() else {
-                    warn!("no healthy rpc providers available");
-                    tokio::select! {
+                let head = if *service.safe_head_tx.borrow() == 0 {
+                    // Until a safe head exists, hung providers must not delay
+                    // it by a request timeout each.
+                    let read = tokio::select! {
                         () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.sync.poll_interval) => { continue; }
+                        read = read_head_bounded(&rpcs) => read,
+                    };
+                    if read.is_none() {
+                        warn!("no rpc provider returned the latest block");
+                    }
+                    read.map(|(_, head)| head)
+                } else {
+                    let Some(rpc) = rpcs.random_provider() else {
+                        warn!("no healthy rpc providers available");
+                        tokio::select! {
+                            () = cancel.cancelled() => break,
+                            () = tokio::time::sleep(service.chain.sync.poll_interval) => { continue; }
+                        }
+                    };
+                    match rpc.provider.get_block_number().await {
+                        Ok(head) => Some(head),
+                        Err(err) => {
+                            warn!(
+                                err = %ChainError::from(err).without_url(),
+                                rpc_index = rpc.index,
+                                "failed to fetch latest block"
+                            );
+                            rpcs.mark_bad_provider(&rpc);
+                            None
+                        }
                     }
                 };
-                match rpc.provider.get_block_number().await {
-                    Ok(head) => {
-                        let safe_head = head
-                            .saturating_sub(service.chain.finality_depth)
-                            .max(service.chain.deployment.deployment_block);
-                        if service.head_tx.receiver_count() > 0 {
-                            let _ = service.head_tx.send(head);
-                        }
-                        if let Err(err) = service.safe_head_tx.send(safe_head) {
-                            debug!(?err, safe_head, "failed to send safe head update");
-                        }
+                if let Some(head) = head {
+                    let safe_head = head
+                        .saturating_sub(service.chain.finality_depth)
+                        .max(service.chain.deployment.deployment_block);
+                    if service.head_tx.receiver_count() > 0 {
+                        let _ = service.head_tx.send(head);
                     }
-                    Err(err) => {
-                        warn!(
-                            err = %ChainError::from(err).without_url(),
-                            rpc_index = rpc.index,
-                            "failed to fetch latest block"
-                        );
-                        rpcs.mark_bad_provider(&rpc);
+                    if let Err(err) = service.safe_head_tx.send(safe_head) {
+                        debug!(?err, safe_head, "failed to send safe head update");
                     }
                 }
                 tokio::select! {
@@ -697,26 +820,58 @@ pub(super) fn spawn_live_log_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(
         async move {
-            let squid_configured = service.chain.sync.quick_sync_endpoint.is_some();
+            let chain_id = service.chain.deployment.chain_id;
+            let sources = IndexedForestSources::of(&service.chain);
             let mut stall = ForestStallTracker::new(wallet_tail_fallback_stale_timeout(
                 service.chain.block_time,
             ));
+            // At most one far-behind attempt runs. Its slot is cleared when its
+            // result is taken, so a finished handle is never polled again.
+            let mut attempt: Option<FarBehindAttempt> = None;
+            // A finished attempt's candidate, installed only after a conclusive
+            // reorg check: one that confirms the stored forest block hash or
+            // finds none to compare.
+            let mut pending: Option<ForestCandidate> = None;
             loop {
+                let forest_block = *forest_last_rx.borrow();
+                let safe_head = *safe_head_rx.borrow();
                 stall.observe(
-                    *forest_last_rx.borrow(),
-                    *safe_head_rx.borrow(),
+                    forest_block,
+                    safe_head,
+                    service.chain.live_forest_lag(forest_block, safe_head),
                     tokio::time::Instant::now(),
                 );
-                let squid_deadline = if squid_configured {
-                    stall.deadline()
+                // A running attempt wakes the loop when it finishes, and no
+                // other attempt starts before then.
+                let attempt_deadline = if attempt.is_none() {
+                    stall.deadline(sources)
                 } else {
                     None
                 };
-                tokio::select! {
+                let finished = tokio::select! {
+                    biased;
                     () = cancel.cancelled() => break,
-                    _ = safe_head_rx.changed() => {},
-                    _ = forest_last_rx.changed() => {},
-                    () = sleep_until_stall_deadline(squid_deadline) => {},
+                    result = far_behind_attempt_finished(&mut attempt) => {
+                        attempt.take().map(|finished| (finished, result))
+                    }
+                    _ = safe_head_rx.changed() => None,
+                    _ = forest_last_rx.changed() => None,
+                    () = sleep_until_stall_deadline(attempt_deadline) => None,
+                };
+                if let Some((finished, result)) = finished {
+                    let (candidate, finished_at) =
+                        far_behind_attempt_result(chain_id, &finished, result);
+                    stall.finish_far_behind_attempt(finished_at);
+                    if let Some(candidate) = candidate
+                        && let Some(old) = pending.replace(candidate)
+                    {
+                        log_far_behind_result(
+                            chain_id,
+                            *forest_last_rx.borrow(),
+                            old.target,
+                            "superseded",
+                        );
+                    }
                 }
 
                 let safe_head = *safe_head_rx.borrow();
@@ -729,18 +884,35 @@ pub(super) fn spawn_live_log_loop(
                 }
                 let last_processed = *forest_last_rx.borrow();
                 let now = tokio::time::Instant::now();
-                stall.observe(last_processed, safe_head, now);
+                stall.observe(
+                    last_processed,
+                    safe_head,
+                    service.chain.live_forest_lag(last_processed, safe_head),
+                    now,
+                );
                 if last_processed >= safe_head {
+                    if let Some(candidate) = pending.take() {
+                        log_far_behind_result(
+                            chain_id,
+                            last_processed,
+                            candidate.target,
+                            "forest_at_safe_head",
+                        );
+                    }
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
                     }
                     continue;
                 }
-                // The reorg check runs before the stall fallback so a Squid
-                // catch-up never builds on a forest block that has reorged.
+                // The reorg check runs before any indexed attempt starts. A
+                // far-behind install or a stall fallback needs a conclusive
+                // check: one that confirms the stored forest block hash or
+                // finds none to compare. An attempt may still start after an
+                // inconclusive check, and a later rewind aborts it and
+                // discards its result.
                 let rpc = rpcs.random_provider();
-                if let Some(rpc) = rpc.as_ref() {
+                let reorg_check_conclusive = if let Some(rpc) = rpc.as_ref() {
                     let reorg_check = tokio::select! {
                         () = cancel.cancelled() => break,
                         result = service.check_forest_reorg(
@@ -752,45 +924,127 @@ pub(super) fn spawn_live_log_loop(
                             last_processed,
                         ) => result,
                     };
-                    if let Err(err) = reorg_check {
-                        debug!(err = %err.without_url(), rpc_index = rpc.index, "reorg check failed");
-                    }
+                    let conclusive = match reorg_check {
+                        Ok(
+                            ForestMetaCheck::Match
+                            | ForestMetaCheck::Unchecked
+                            | ForestMetaCheck::StaleMeta,
+                        ) => true,
+                        Ok(ForestMetaCheck::Mismatch { .. }) => {
+                            // The rewind invalidates whatever an attempt built on.
+                            if abort_far_behind_attempt(&mut attempt).await {
+                                stall.finish_far_behind_attempt(tokio::time::Instant::now());
+                                debug!(
+                                    chain_id,
+                                    forest_block = last_processed,
+                                    cooldown_ms = INDEXED_TAIL_FALLBACK_COOLDOWN.as_millis(),
+                                    "far-behind live forest catch-up aborted by a reorg rewind"
+                                );
+                            }
+                            if let Some(candidate) = pending.take() {
+                                log_far_behind_result(
+                                    chain_id,
+                                    last_processed,
+                                    candidate.target,
+                                    "reorg_reset",
+                                );
+                            }
+                            true
+                        }
+                        // `check_forest_reorg` already logs the missing hash.
+                        Ok(ForestMetaCheck::Unconfirmed) => false,
+                        Err(err) => {
+                            debug!(
+                                err = %err.without_url(),
+                                rpc_index = rpc.index,
+                                "reorg check failed"
+                            );
+                            false
+                        }
+                    };
                     if cancel.is_cancelled() {
                         break;
+                    }
+                    conclusive
+                } else {
+                    false
+                };
+                if reorg_check_conclusive && let Some(candidate) = pending.take() {
+                    let target = candidate.target;
+                    let progress = ForestProgressReporter::new(service.chain.progress_tx.as_ref());
+                    let outcome = install_live_forest_candidate(
+                        &service,
+                        &snapshot_path,
+                        candidate,
+                        &progress,
+                        LiveForestProgressCause::IndexedInstall,
+                    )
+                    .await;
+                    log_far_behind_result(chain_id, last_processed, target, outcome.as_str());
+                    if outcome == LiveForestInstall::Installed {
+                        continue;
                     }
                 }
                 let last_processed = *forest_last_rx.borrow();
                 if last_processed >= safe_head {
                     continue;
                 }
-                if squid_configured && stall.is_due(now) {
-                    let stalled_ms = stall.stalled_for(now).as_millis();
-                    let installed = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        installed = run_live_squid_forest_fallback(
-                            &service,
-                            rpc.as_ref(),
-                            archive_provider.as_ref(),
-                            &snapshot_path,
-                            last_processed,
-                            safe_head,
-                        ) => installed,
-                    };
-                    let outcome = if installed.is_some() {
-                        "applied"
-                    } else {
-                        stall.defer_next_attempt(tokio::time::Instant::now());
-                        "not_applied"
-                    };
-                    debug!(
-                        stalled_ms,
-                        forest_block = last_processed,
-                        safe_head,
-                        target = ?installed,
-                        outcome,
-                        "live merkle forest stall fallback to Squid finished"
-                    );
-                    continue;
+                if attempt.is_none() {
+                    match stall.due(now, sources, rpc.is_some()) {
+                        Some(IndexedForestTrigger::FarBehind) => {
+                            // Live RPC paging below continues while it runs.
+                            attempt = Some(
+                                spawn_far_behind_attempt(
+                                    &service,
+                                    rpc.as_ref(),
+                                    archive_provider.as_ref(),
+                                    last_processed,
+                                    safe_head,
+                                )
+                                .await,
+                            );
+                        }
+                        Some(IndexedForestTrigger::Stall) if !reorg_check_conclusive => {
+                            // Retry after another stall period; live RPC
+                            // paging below continues meanwhile.
+                            stall.defer_next_attempt(tokio::time::Instant::now());
+                            debug!(
+                                forest_block = last_processed,
+                                safe_head,
+                                "live merkle forest stall fallback deferred after an inconclusive reorg check"
+                            );
+                        }
+                        Some(IndexedForestTrigger::Stall) => {
+                            let stalled_ms = stall.stalled_for(now).as_millis();
+                            let installed = tokio::select! {
+                                () = cancel.cancelled() => break,
+                                installed = run_live_squid_forest_fallback(
+                                    &service,
+                                    rpc.as_ref(),
+                                    archive_provider.as_ref(),
+                                    &snapshot_path,
+                                    last_processed,
+                                    safe_head,
+                                ) => installed,
+                            };
+                            let outcome = if installed.is_some() {
+                                "applied"
+                            } else {
+                                stall.defer_next_attempt(tokio::time::Instant::now());
+                                "not_applied"
+                            };
+                            debug!(
+                                stalled_ms,
+                                forest_block = last_processed,
+                                safe_head,
+                                target = ?installed,
+                                outcome,
+                                "live merkle forest stall fallback to Squid finished"
+                            );
+                            continue;
+                        }
+                        None => {}
+                    }
                 }
                 let Some(rpc) = rpc else {
                     warn!("no healthy rpc providers available");
@@ -960,9 +1214,10 @@ pub(super) fn spawn_live_log_loop(
                                     to_block, log_count, "failed to broadcast live log batch"
                                 );
                             }
-                            if let Err(err) = service.forest_last_tx.send(to_block) {
-                                debug!(?err, to_block, "failed to send forest progress update");
-                            }
+                            service.publish_forest_progress(
+                                to_block,
+                                LiveForestProgressCause::RpcApply,
+                            );
                             if cancel.is_cancelled() {
                                 break;
                             }
@@ -994,52 +1249,121 @@ pub(super) fn spawn_live_log_loop(
                     }
                 }
             }
+            // Every exit leaves through here: the attempt is aborted and its
+            // task dropped before the loop's own task completes.
+            abort_far_behind_attempt(&mut attempt).await;
         }
         .instrument(tracing::info_span!("sync_live")),
     )
 }
 
+/// Indexed sources the live forest loop can catch up from.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IndexedForestSources {
+    pub(super) artifacts: bool,
+    pub(super) squid: bool,
+}
+
+impl IndexedForestSources {
+    pub(super) const fn of(chain: &ChainConfig) -> Self {
+        Self {
+            artifacts: chain.sync.indexed_artifact_source.is_some(),
+            squid: chain.sync.quick_sync_endpoint.is_some(),
+        }
+    }
+}
+
+/// What made an indexed live forest attempt due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexedForestTrigger {
+    /// The forest's lag exceeds the RPC request budget.
+    FarBehind,
+    /// The forest has not advanced for the stall period.
+    Stall,
+}
+
 /// Tracks how long the live forest has lagged the safe head without advancing,
-/// and when the next Squid stall fallback may start.
-struct ForestStallTracker {
+/// whether that lag is far behind, and when the next indexed attempt may
+/// start.
+pub(super) struct ForestStallTracker {
     stall_period: Duration,
     forest_block: u64,
+    far_behind: bool,
     lagging_since: Option<tokio::time::Instant>,
     next_attempt_not_before: Option<tokio::time::Instant>,
 }
 
 impl ForestStallTracker {
-    const fn new(stall_period: Duration) -> Self {
+    pub(super) const fn new(stall_period: Duration) -> Self {
         Self {
             stall_period,
             forest_block: 0,
+            far_behind: false,
             lagging_since: None,
             next_attempt_not_before: None,
         }
     }
 
     /// Restarts the stall period when the forest advances or starts lagging,
-    /// and clears it while the forest has reached the safe head.
-    const fn observe(&mut self, forest_block: u64, safe_head: u64, now: tokio::time::Instant) {
+    /// and clears it while the forest has reached the safe head. `lag` is the
+    /// current estimate for the lag from `forest_block` to `safe_head`.
+    pub(super) const fn observe(
+        &mut self,
+        forest_block: u64,
+        safe_head: u64,
+        lag: ForestLag,
+        now: tokio::time::Instant,
+    ) {
         if forest_block >= safe_head {
             self.lagging_since = None;
         } else if forest_block > self.forest_block || self.lagging_since.is_none() {
             self.lagging_since = Some(now);
         }
         self.forest_block = forest_block;
+        self.far_behind = lag.far_behind;
     }
 
-    /// When the Squid fallback becomes due, if the forest is lagging.
-    fn deadline(&self) -> Option<tokio::time::Instant> {
-        let deadline = self.lagging_since? + self.stall_period;
+    /// Whether the far-behind trigger applies: the forest is far behind and
+    /// artifacts or Squid are configured.
+    const fn far_behind_applies(&self, sources: IndexedForestSources) -> bool {
+        self.far_behind && (sources.artifacts || sources.squid)
+    }
+
+    /// When the next attempt becomes due, if the forest is lagging and a
+    /// trigger's sources are configured: at once while the forest is far
+    /// behind, otherwise after the stall period when Squid is configured.
+    /// Either waits for the previous attempt's deferral.
+    pub(super) fn deadline(&self, sources: IndexedForestSources) -> Option<tokio::time::Instant> {
+        let lagging_since = self.lagging_since?;
+        let due_from = if self.far_behind_applies(sources) {
+            lagging_since
+        } else if sources.squid {
+            lagging_since + self.stall_period
+        } else {
+            return None;
+        };
         Some(
             self.next_attempt_not_before
-                .map_or(deadline, |not_before| deadline.max(not_before)),
+                .map_or(due_from, |not_before| due_from.max(not_before)),
         )
     }
 
-    fn is_due(&self, now: tokio::time::Instant) -> bool {
-        self.deadline().is_some_and(|deadline| deadline <= now)
+    /// The trigger of the attempt due at `now`, if any. No attempt is due
+    /// while no RPC provider is available to confirm its target.
+    pub(super) fn due(
+        &self,
+        now: tokio::time::Instant,
+        sources: IndexedForestSources,
+        provider_available: bool,
+    ) -> Option<IndexedForestTrigger> {
+        if !provider_available || self.deadline(sources).is_none_or(|deadline| deadline > now) {
+            return None;
+        }
+        Some(if self.far_behind_applies(sources) {
+            IndexedForestTrigger::FarBehind
+        } else {
+            IndexedForestTrigger::Stall
+        })
     }
 
     fn stalled_for(&self, now: tokio::time::Instant) -> Duration {
@@ -1048,9 +1372,15 @@ impl ForestStallTracker {
     }
 
     /// Holds off the next attempt for one stall period after a failed or
-    /// unproductive one.
+    /// unproductive stall attempt.
     fn defer_next_attempt(&mut self, now: tokio::time::Instant) {
         self.next_attempt_not_before = Some(now + self.stall_period);
+    }
+
+    /// Holds off the next attempt for [`INDEXED_TAIL_FALLBACK_COOLDOWN`] from
+    /// when a far-behind attempt finished, whatever its outcome.
+    pub(super) fn finish_far_behind_attempt(&mut self, finished_at: tokio::time::Instant) {
+        self.next_attempt_not_before = Some(finished_at + INDEXED_TAIL_FALLBACK_COOLDOWN);
     }
 }
 
@@ -1060,6 +1390,208 @@ async fn sleep_until_stall_deadline(deadline: Option<tokio::time::Instant>) {
     } else {
         std::future::pending::<()>().await;
     }
+}
+
+/// A far-behind attempt's candidate and the time its task finished.
+type FarBehindOutput = (Option<ForestCandidate>, tokio::time::Instant);
+
+/// A far-behind indexed attempt running as a compute-only task.
+struct FarBehindAttempt {
+    task: AbortOnDropHandle<FarBehindOutput>,
+    forest_block: u64,
+    started: tokio::time::Instant,
+}
+
+/// Aborts its task when dropped. The live loop aborts and awaits its attempt
+/// on every exit, so this only covers a panic that unwinds the loop.
+struct AbortOnDropHandle<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Starts a far-behind indexed attempt on a copy of the live forest. The task
+/// only computes a candidate: it publishes no progress, persists nothing and
+/// never touches the live forest. The live loop installs its result.
+async fn spawn_far_behind_attempt(
+    service: &Arc<ChainService>,
+    rpc: Option<&ProviderHandle>,
+    archive_provider: Option<&DynProvider>,
+    forest_block: u64,
+    safe_head: u64,
+) -> FarBehindAttempt {
+    let chain = &service.chain;
+    let from_block = forest_block
+        .saturating_add(1)
+        .max(chain.deployment.deployment_block);
+    debug!(
+        chain_id = chain.deployment.chain_id,
+        forest_block,
+        safe_head,
+        lag_blocks = safe_head.saturating_sub(forest_block),
+        estimated_requests = chain
+            .live_forest_lag(forest_block, safe_head)
+            .estimated_requests,
+        from_block,
+        cooldown_ms = INDEXED_TAIL_FALLBACK_COOLDOWN.as_millis(),
+        "far-behind live forest catch-up triggered"
+    );
+    let base = service.forest.read().await.clone();
+    let task = tokio::spawn(
+        {
+            let service = Arc::clone(service);
+            let rpc = rpc.cloned();
+            let archive_provider = archive_provider.cloned();
+            async move {
+                let progress = ForestProgressReporter::new(None);
+                let candidate = indexed_forest_candidate(
+                    &service.chain,
+                    &base,
+                    forest_block,
+                    from_block,
+                    safe_head,
+                    rpc.as_ref(),
+                    archive_provider.as_ref(),
+                    &progress,
+                )
+                .await;
+                (candidate, tokio::time::Instant::now())
+            }
+        }
+        .in_current_span(),
+    );
+    FarBehindAttempt {
+        task: AbortOnDropHandle(task),
+        forest_block,
+        started: tokio::time::Instant::now(),
+    }
+}
+
+/// Waits for the in-flight far-behind attempt to finish, or forever when
+/// there is none.
+async fn far_behind_attempt_finished(
+    attempt: &mut Option<FarBehindAttempt>,
+) -> Result<FarBehindOutput, tokio::task::JoinError> {
+    match attempt {
+        Some(attempt) => (&mut attempt.task.0).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Logs a finished far-behind attempt and returns its candidate and the time
+/// it finished, from which the cooldown runs.
+fn far_behind_attempt_result(
+    chain_id: u64,
+    attempt: &FarBehindAttempt,
+    result: Result<FarBehindOutput, tokio::task::JoinError>,
+) -> FarBehindOutput {
+    let (candidate, finished_at, outcome) = match result {
+        Ok((Some(candidate), finished_at)) => (Some(candidate), finished_at, "confirmed"),
+        Ok((None, finished_at)) => (None, finished_at, "no_result"),
+        Err(err) => {
+            warn!(
+                chain_id,
+                is_panic = err.is_panic(),
+                "far-behind live forest catch-up task failed"
+            );
+            (None, tokio::time::Instant::now(), "failed")
+        }
+    };
+    debug!(
+        chain_id,
+        forest_block = attempt.forest_block,
+        target = candidate.as_ref().map(|candidate| candidate.target),
+        outcome,
+        elapsed_ms = finished_at
+            .saturating_duration_since(attempt.started)
+            .as_millis(),
+        cooldown_ms = INDEXED_TAIL_FALLBACK_COOLDOWN.as_millis(),
+        "far-behind live forest catch-up finished"
+    );
+    (candidate, finished_at)
+}
+
+fn log_far_behind_result(chain_id: u64, forest_block: u64, target: u64, outcome: &str) {
+    debug!(
+        chain_id,
+        forest_block, target, outcome, "far-behind live forest catch-up result"
+    );
+}
+
+/// Aborts the in-flight far-behind attempt, if any, and waits until its task
+/// has dropped its copy of the forest and its service handle. Returns whether
+/// an attempt was in flight.
+async fn abort_far_behind_attempt(attempt: &mut Option<FarBehindAttempt>) -> bool {
+    let Some(mut attempt) = attempt.take() else {
+        return false;
+    };
+    attempt.task.0.abort();
+    // A result that finished before the abort is discarded too.
+    let _ = (&mut attempt.task.0).await;
+    true
+}
+
+/// How [`install_live_forest_candidate`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveForestInstall {
+    Installed,
+    ForestAtTarget,
+    PersistFailed,
+}
+
+impl LiveForestInstall {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::ForestAtTarget => "forest_at_target",
+            Self::PersistFailed => "persist_failed",
+        }
+    }
+}
+
+/// Installs an indexed `candidate` as the live forest. It is dropped when the
+/// live forest already reached its target; otherwise it is persisted, swapped
+/// in under the write lock, and written as an anchor snapshot, then the
+/// forest block is published, and completion progress last.
+///
+/// Runs inside the live loop, the only forest writer, so the forest block
+/// read first stays current until the swap.
+async fn install_live_forest_candidate(
+    service: &ChainService,
+    snapshot_path: &Path,
+    mut candidate: ForestCandidate,
+    progress: &ForestProgressReporter<'_>,
+    cause: LiveForestProgressCause,
+) -> LiveForestInstall {
+    let target = candidate.target;
+    let forest_block = *service.forest_last_tx.borrow();
+    if forest_block >= target {
+        return LiveForestInstall::ForestAtTarget;
+    }
+    if let Err(err) =
+        persist_forest_candidate(&service.db, &service.chain, snapshot_path, &candidate)
+    {
+        warn!(
+            err = %err.without_url(),
+            source = candidate.source.as_str(),
+            fallback_from = forest_block,
+            target,
+            "indexed forest catch-up persistence failed; falling back to RPC"
+        );
+        return LiveForestInstall::PersistFailed;
+    }
+    let mut forest = service.forest.write().await;
+    // The replaced forest drops with `candidate`, after the lock is released.
+    std::mem::swap(&mut *forest, &mut candidate.forest);
+    if let Err(err) = service.maybe_write_anchor_snapshot(snapshot_path, target, &forest) {
+        warn!(?err, target, "failed to write anchor snapshot");
+    }
+    drop(forest);
+    service.publish_forest_progress(target, cause);
+    candidate.publish_completion(service.chain.deployment.chain_id, progress);
+    LiveForestInstall::Installed
 }
 
 /// Runs Squid forest catch-up for a stalled live forest and installs the
@@ -1088,37 +1620,16 @@ async fn run_live_squid_forest_fallback(
         &progress,
     )
     .await?;
-    if let Err(err) =
-        persist_forest_candidate(&service.db, &service.chain, snapshot_path, &candidate)
-    {
-        warn!(
-            err = %err.without_url(),
-            fallback_from = forest_block,
-            "indexed forest catch-up persistence failed; falling back to RPC"
-        );
-        return None;
-    }
-    candidate.publish_completion(service.chain.deployment.chain_id, &progress);
     let target = candidate.target;
-    let mut forest = service.forest.write().await;
-    let current_block = *service.forest_last_tx.borrow();
-    if current_block != forest_block {
-        drop(forest);
-        warn!(
-            forest_block,
-            current_block, target, "live forest moved during Squid stall fallback; discarding"
-        );
-        return None;
-    }
-    *forest = candidate.forest;
-    if let Err(err) = service.maybe_write_anchor_snapshot(snapshot_path, target, &forest) {
-        warn!(?err, target, "failed to write anchor snapshot");
-    }
-    drop(forest);
-    if let Err(err) = service.forest_last_tx.send(target) {
-        debug!(?err, target, "failed to send forest progress update");
-    }
-    Some(target)
+    let installed = install_live_forest_candidate(
+        service,
+        snapshot_path,
+        candidate,
+        &progress,
+        LiveForestProgressCause::StallInstall,
+    )
+    .await;
+    (installed == LiveForestInstall::Installed).then_some(target)
 }
 
 pub(super) fn spawn_backfill_loop(
