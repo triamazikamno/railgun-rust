@@ -883,6 +883,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_shutdown_aborts_pending_wallet_poi_jobs_before_releasing_ownership() {
+        let (db, root) = test_db("manager-tracked-poi-job");
+        let manager =
+            SyncManager::new(Arc::clone(&db), proxy_policy()).expect("acquire manager ownership");
+        let contract = Address::from([0x51; 20]);
+        let service = manager
+            .add_chain(chain_config(1, contract))
+            .await
+            .expect("add chain");
+        let wallet = service
+            .register_wallet(WalletConfig {
+                chain: ChainKey {
+                    chain_id: 1,
+                    contract,
+                },
+                cache_key: local_db::WalletCacheKey::from_opaque_bytes(b"tracked-poi-job")
+                    .expect("wallet cache key"),
+                start_block: Some(0),
+                sync_to_block: None,
+                quick_sync_endpoint: None,
+                scan_keys: broadcaster_core::crypto::railgun::ViewingKeyData {
+                    viewing_private_key: [0u8; 32],
+                    viewing_public_key: [0u8; 32],
+                    nullifying_key: alloy::primitives::U256::ZERO,
+                    master_public_key: alloy::primitives::U256::ZERO,
+                },
+                spending_public_key: None,
+                progress_tx: None,
+                cache_store: None,
+                poi_recovery_prover: None,
+                use_indexed_wallet_catch_up: false,
+            })
+            .await
+            .expect("register wallet");
+        // The job holds a data-plane clone, which carries the manager's runtime lease.
+        let sentinel = Arc::new(());
+        let job_sentinel = Arc::downgrade(&sentinel);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        service
+            .send_wallet_backfill_event_for_test(
+                crate::types::BackfillEvent::HoldTrackedPoiJobForTest {
+                    sentinel,
+                    started: started_tx,
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("tracked job starts")
+            .expect("tracked job start signal");
+
+        manager.shutdown().await;
+        assert!(
+            job_sentinel.upgrade().is_none(),
+            "manager shutdown returns only after the tracked job is gone"
+        );
+        drop(wallet);
+        drop(service);
+        // The wallet terminal reaper keeps its own data-plane clone until it takes the
+        // registration gate, which shutdown releases on return. The tracked job never
+        // completes, so without the abort this wait times out.
+        let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match SyncManager::new(Arc::clone(&db), proxy_policy()) {
+                    Ok(manager) => break manager,
+                    Err(SyncManagerError::DatabaseAlreadyOwned { .. }) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected replacement-manager error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("admit a new manager after shutdown with a pending POI job");
+        replacement.shutdown().await;
+
+        drop(replacement);
+        drop(manager);
+        drop(db);
+        fs::remove_dir_all(root).expect("remove tracked POI job db");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_manager_keeps_runtime_admission_until_chain_runtime_stops() {
         let (db, root) = test_db("dropped-manager-runtime-ownership");
         let manager =

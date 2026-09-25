@@ -206,6 +206,8 @@ impl PublicPoiCorpusHandle {
         self.local_caches.committed_revision_rx()
     }
 
+    /// See [`LocalPoiCaches::revision_read_fence`]: never hold the guard across an await served
+    /// by the wallet actor.
     pub(crate) async fn revision_read_fence(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.local_caches.revision_read_fence().await
     }
@@ -3142,6 +3144,11 @@ struct EmptyCoverageForRange {
 
 #[cfg(test)]
 impl PublicPoiCorpusHandle {
+    #[must_use]
+    pub(crate) const fn new_for_test(local_caches: LocalPoiCaches) -> Self {
+        Self { local_caches }
+    }
+
     #[must_use]
     pub(crate) fn local_caches(&self) -> LocalPoiCaches {
         self.local_caches.clone()

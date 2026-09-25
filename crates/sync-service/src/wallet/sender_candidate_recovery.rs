@@ -29,6 +29,8 @@ pub(crate) struct SenderCandidateRecoveryReport {
     pub(super) retrying: u64,
     pub(super) needs_attention: u64,
     pub(super) covered_by_pending_contexts: u64,
+    /// Materializations skipped because the POI corpus advanced after proof preparation.
+    pub(super) stale_revision_skips: u64,
     pub(super) expected_candidates: BTreeMap<FixedBytes<32>, Vec<u8>>,
 }
 
@@ -605,7 +607,10 @@ pub(super) async fn materialize_sender_transaction_candidates(
                     report.retired_locally_valid = report.retired_locally_valid.saturating_add(1);
                     report.expected_candidates.remove(&candidate_id);
                 }
-                Ok(PoiPrivateApplyOutcome::Skipped) => {}
+                Ok(
+                    PoiPrivateApplyOutcome::Skipped
+                    | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+                ) => {}
                 Err(_) => {
                     report.needs_attention = report.needs_attention.saturating_add(output_count);
                 }
@@ -799,7 +804,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
             recovery_updates,
             owned_substitutes,
             proof_outputs,
-            poi_corpus_revision_fence,
+            expected_corpus,
         } = prepared;
         let apply_result = apply_poi_private_delta(
             output_request.authority,
@@ -814,14 +819,18 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 recovery_updates,
                 owned_substitutes,
                 proof_outputs,
+                expected_corpus,
             },
         )
         .await;
-        drop(poi_corpus_revision_fence);
         match apply_result {
             Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
                 report.materialized = report.materialized.saturating_add(1);
                 report.expected_candidates.remove(&candidate_id);
+            }
+            Ok(PoiPrivateApplyOutcome::SkippedStaleCorpusRevision) => {
+                report.stale_revision_skips = report.stale_revision_skips.saturating_add(1);
+                report.retrying = report.retrying.saturating_add(output_count);
             }
             Ok(PoiPrivateApplyOutcome::Skipped) => {}
             Err(_) => report.needs_attention = report.needs_attention.saturating_add(output_count),
@@ -836,6 +845,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
         retrying = report.retrying,
         needs_attention = report.needs_attention,
         covered_by_pending_contexts = report.covered_by_pending_contexts,
+        stale_revision_skips = report.stale_revision_skips,
         expected_candidates = report.expected_candidates.len(),
         "sender candidate recovery scan complete"
     );
@@ -847,7 +857,7 @@ struct PreparedSenderCandidateMaterialization {
     recovery_updates: Vec<OutputPoiRecoveryRecord>,
     owned_substitutes: Vec<ExpectedWalletOutput>,
     proof_outputs: Vec<FixedBytes<32>>,
-    poi_corpus_revision_fence: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    expected_corpus: ExpectedPoiCorpusRevision,
 }
 
 async fn prepare_sender_candidate_materialization(
@@ -1062,16 +1072,15 @@ async fn prepare_sender_candidate_materialization(
             recovery_updates.push(recovery);
         }
     }
-    let poi_corpus_revision_fence = match proof_source_resolution {
-        OutputPoiProofSourceResolution::Local { revision_fence, .. } => Some(revision_fence),
-        OutputPoiProofSourceResolution::Unavailable => None,
+    let Some(expected_corpus) = proof_source_resolution.expected_corpus_revision() else {
+        return Ok(None);
     };
     Ok(Some(PreparedSenderCandidateMaterialization {
         pending_updates,
         recovery_updates,
         owned_substitutes,
         proof_outputs: proof_outputs.into_iter().collect(),
-        poi_corpus_revision_fence,
+        expected_corpus,
     }))
 }
 

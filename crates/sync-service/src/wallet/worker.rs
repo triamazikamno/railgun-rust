@@ -46,7 +46,7 @@ use futures::{FutureExt, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const fn wallet_private_request_error(
     reason: &WalletBackfillRejectReason,
@@ -402,6 +402,7 @@ fn request_poi_maintenance(
     controller: &mut PoiMaintenanceController,
     remote_done_tx: &mpsc::Sender<WalletRemoteDone>,
     private_apply: &WalletPrivateApplyClient,
+    poi_jobs: &WalletPoiJobTracker,
     poi_refreshing_tx: &watch::Sender<bool>,
     handle: &WalletHandle,
     cancel: &CancellationToken,
@@ -457,7 +458,7 @@ fn request_poi_maintenance(
         active_poi_list_keys: active_poi_list_keys.to_vec(),
         force_output_poi_recovery: spec.force_output_poi_recovery,
     }
-    .spawn();
+    .spawn(poi_jobs);
     debug!(
         cache_key = %handle.cache_key,
         force = spec.force_output_poi_recovery,
@@ -473,6 +474,7 @@ fn on_poi_maintenance_done(
     controller: &mut PoiMaintenanceController,
     remote_done_tx: &mpsc::Sender<WalletRemoteDone>,
     private_apply: &WalletPrivateApplyClient,
+    poi_jobs: &WalletPoiJobTracker,
     poi_refreshing_tx: &watch::Sender<bool>,
     handle: &WalletHandle,
     cancel: &CancellationToken,
@@ -499,6 +501,7 @@ fn on_poi_maintenance_done(
             controller,
             remote_done_tx,
             private_apply,
+            poi_jobs,
             poi_refreshing_tx,
             handle,
             cancel,
@@ -554,8 +557,8 @@ struct PoiMaintenanceOutcome {
 }
 
 impl PoiMaintenanceJob {
-    fn spawn(self) {
-        tokio::spawn(async move {
+    fn spawn(self, poi_jobs: &WalletPoiJobTracker) {
+        poi_jobs.spawn(async move {
             let done_tx = self.done_tx.clone();
             let credential = self.credential;
             let key = self.key;
@@ -750,6 +753,7 @@ impl PoiMaintenanceJob {
 }
 
 fn spawn_pending_output_poi_tentative_job(
+    poi_jobs: &WalletPoiJobTracker,
     handle: &WalletHandle,
     cancel: &CancellationToken,
     done_tx: &mpsc::Sender<WalletRemoteDone>,
@@ -767,7 +771,7 @@ fn spawn_pending_output_poi_tentative_job(
     let cfg = cfg.clone();
     let poi_client = poi_runtime.public_client().clone();
     let active_list_keys = active_list_keys.to_vec();
-    tokio::spawn(async move {
+    poi_jobs.spawn(async move {
         let authority =
             WalletPrivateMutationAuthority::new(&handle, credential.reset_generation, &cancel);
         let private_poi =
@@ -2144,6 +2148,7 @@ async fn refresh_tentative_pending_output_poi_statuses(
 }
 
 fn spawn_tentative_poi_corpus_refresh(
+    poi_jobs: &WalletPoiJobTracker,
     public_data_plane: &ChainPublicDataPlane,
     cancel: &CancellationToken,
     chain_id: u64,
@@ -2158,7 +2163,7 @@ fn spawn_tentative_poi_corpus_refresh(
     let public_data_plane = public_data_plane.clone();
     let cancel = cancel.clone();
     let refresh_guard = TentativePoiCorpusRefreshGuard(Arc::clone(refresh_in_flight));
-    tokio::spawn(async move {
+    poi_jobs.spawn(async move {
         let _refresh_guard = refresh_guard;
         let retry = tokio::select! {
             biased;
@@ -2186,6 +2191,40 @@ struct TentativePoiCorpusRefreshGuard(Arc<AtomicBool>);
 impl Drop for TentativePoiCorpusRefreshGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Background POI jobs started by the wallet actor.
+///
+/// The worker's supervising task owns the set, so it outlives the actor task even when the actor
+/// panics. Once the actor task ends, the supervisor aborts every job still running and waits for
+/// each to terminate, releasing the jobs' data-plane and runtime-lease clones.
+#[derive(Clone, Default)]
+struct WalletPoiJobTracker {
+    jobs: Arc<std::sync::Mutex<JoinSet<()>>>,
+}
+
+impl WalletPoiJobTracker {
+    fn spawn(&self, job: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Reap finished jobs so the set stays bounded by the jobs still running.
+        while jobs.try_join_next().is_some() {}
+        jobs.spawn(job);
+    }
+
+    /// Aborts every tracked job and waits for each to terminate. Called by the supervisor after
+    /// the actor task ends; the actor is the only spawner, so no job is added afterwards.
+    async fn shutdown(&self) {
+        let mut jobs = std::mem::take(
+            &mut *self
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        jobs.shutdown().await;
     }
 }
 
@@ -2354,6 +2393,8 @@ pub(crate) async fn prepare_wallet_worker(
     let maintenance_observation = Arc::clone(&observation);
     let worker_cache_key = cfg.cache_key.clone();
     let prepared_cancel = cancel.clone();
+    let poi_jobs = WalletPoiJobTracker::default();
+    let supervisor_poi_jobs = poi_jobs.clone();
     let actor_worker = tokio::spawn(async move {
         let mut startup_replay_tx = startup_replay_tx;
         let worker_started = Instant::now();
@@ -2860,6 +2901,7 @@ pub(crate) async fn prepare_wallet_worker(
                         &mut poi_maintenance,
                         &remote_done_tx,
                         &private_apply,
+                        &poi_jobs,
                         &poi_refreshing_tx,
                         &worker_handle,
                         &cancel,
@@ -3064,6 +3106,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 &mut poi_maintenance,
                                 &remote_done_tx,
                                 &private_apply,
+                                &poi_jobs,
                                 &poi_refreshing_tx,
                                 &worker_handle,
                                 &cancel,
@@ -3146,6 +3189,8 @@ pub(crate) async fn prepare_wallet_worker(
                                 candidate_needs_attention = candidate_report.needs_attention,
                                 candidate_covered_by_pending_contexts =
                                     candidate_report.covered_by_pending_contexts,
+                                candidate_stale_revision_skips =
+                                    candidate_report.stale_revision_skips,
                                 candidate_report_is_current,
                                 forced_pending_attempts,
                                 submitted,
@@ -3170,6 +3215,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 &mut poi_maintenance,
                                 &remote_done_tx,
                                 &private_apply,
+                                &poi_jobs,
                                 &poi_refreshing_tx,
                                 &worker_handle,
                                 &cancel,
@@ -3217,6 +3263,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 .release_retryable(credential.reset_generation, &retryable);
                             if !accepted_candidates.is_empty() {
                                 spawn_tentative_poi_corpus_refresh(
+                                    &poi_jobs,
                                     &public_data_plane,
                                     &cancel,
                                     cfg.chain.chain_id,
@@ -3317,6 +3364,7 @@ pub(crate) async fn prepare_wallet_worker(
                         &mut poi_maintenance,
                         &remote_done_tx,
                         &private_apply,
+                        &poi_jobs,
                         &poi_refreshing_tx,
                         &worker_handle,
                         &cancel,
@@ -3642,6 +3690,7 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                         if !tentative_candidates.is_empty() {
                             spawn_pending_output_poi_tentative_job(
+                                &poi_jobs,
                                 &worker_handle,
                                 &cancel,
                                 &remote_done_tx,
@@ -3840,6 +3889,7 @@ pub(crate) async fn prepare_wallet_worker(
                         &mut poi_maintenance,
                         &remote_done_tx,
                         &private_apply,
+                        &poi_jobs,
                         &poi_refreshing_tx,
                         &worker_handle,
                         &cancel,
@@ -3861,6 +3911,15 @@ pub(crate) async fn prepare_wallet_worker(
                         #[cfg(test)]
                         BackfillEvent::PanicForTest => {
                             panic!("test wallet actor panic");
+                        }
+                        #[cfg(test)]
+                        BackfillEvent::HoldTrackedPoiJobForTest { sentinel, started } => {
+                            let held_data_plane = public_data_plane.clone();
+                            poi_jobs.spawn(async move {
+                                let _held = (held_data_plane, sentinel);
+                                let _ = started.send(());
+                                std::future::pending::<()>().await;
+                            });
                         }
                         BackfillEvent::ReserveTarget { target_block, token, response } => {
                             if let Err(reason) = actor_state.validate_sync_token_current(
@@ -4047,6 +4106,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     &mut poi_maintenance,
                                     &remote_done_tx,
                                     &private_apply,
+                                    &poi_jobs,
                                     &poi_refreshing_tx,
                                     &worker_handle,
                                     &cancel,
@@ -4498,6 +4558,7 @@ pub(crate) async fn prepare_wallet_worker(
                                             &mut poi_maintenance,
                                             &remote_done_tx,
                                             &private_apply,
+                                            &poi_jobs,
                                             &poi_refreshing_tx,
                                             &worker_handle,
                                             &cancel,
@@ -4602,6 +4663,7 @@ pub(crate) async fn prepare_wallet_worker(
             warn!(?err, cache_key = %worker_cache_key, "wallet worker task failed");
             worker_panic_handle.terminalize_panicked_actor(&worker_observation);
         }
+        supervisor_poi_jobs.shutdown().await;
     });
 
     let prepared = PreparedWalletWorker {
@@ -10166,6 +10228,77 @@ mod tests {
                 ..
             }
         ));
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn wallet_actor_panic_aborts_tracked_poi_jobs_before_supervisor_completes() {
+        let root_dir = temp_db_root("wallet-panic-aborts-tracked-poi-jobs");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let (_live_tx, live_rx) = broadcast::channel(8);
+        let (backfill_tx, backfill_rx) = mpsc::channel(8);
+        let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let mut prepared = prepare_wallet_worker(
+            WalletWorkerServices {
+                db: Arc::clone(&db),
+                http_client: None,
+                indexed_artifact_source: None,
+                poi_runtime: test_wallet_poi_runtime(),
+                forest: Arc::new(RwLock::new(MerkleForest::new())),
+                backfill_tx: backfill_request_tx,
+                backfill_sender: backfill_tx.clone(),
+                public_data_plane: test_public_data_plane(&db),
+            },
+            wallet_config(),
+            1,
+            live_rx,
+            backfill_rx,
+            cancel,
+            Vec::new(),
+            0,
+        )
+        .await
+        .expect("prepare wallet worker");
+        let supervisor = prepared.take_worker();
+        let _handle = prepared.activate().expect("activate wallet worker");
+
+        let sentinel = Arc::new(());
+        let job_sentinel = Arc::downgrade(&sentinel);
+        let (started_tx, started_rx) = oneshot::channel();
+        backfill_tx
+            .send(BackfillEvent::HoldTrackedPoiJobForTest {
+                sentinel,
+                started: started_tx,
+            })
+            .await
+            .expect("deliver tracked job trigger");
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("tracked job starts")
+            .expect("tracked job start signal");
+        assert!(job_sentinel.upgrade().is_some(), "tracked job is running");
+
+        backfill_tx
+            .send(BackfillEvent::PanicForTest)
+            .await
+            .expect("deliver actor panic trigger");
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("supervisor completes after the actor panic")
+            .expect("supervisor task");
+
+        assert!(
+            job_sentinel.upgrade().is_none(),
+            "the supervisor aborts and awaits tracked jobs before it completes"
+        );
 
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

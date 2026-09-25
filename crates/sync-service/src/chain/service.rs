@@ -3389,6 +3389,22 @@ impl ChainService {
         self.cancel.is_cancelled()
     }
 
+    /// Delivers a backfill event to the registered wallet actor.
+    #[cfg(test)]
+    pub(crate) async fn send_wallet_backfill_event_for_test(&self, event: BackfillEvent) {
+        let sender = self
+            .wallet
+            .read()
+            .await
+            .as_ref()
+            .map(|registration| registration.backfill_sender.clone())
+            .expect("registered wallet");
+        sender
+            .send(event)
+            .await
+            .expect("deliver wallet backfill test event");
+    }
+
     pub(super) async fn indexed_wallet_catch_up(
         &self,
         cfg: &WalletConfig,

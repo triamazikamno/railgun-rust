@@ -5,12 +5,13 @@ use broadcaster_core::contracts::railgun::{
 use railgun_wallet::tx::PoiMerkleProofSource;
 
 use crate::txid_cache::TxidPublicCacheTransaction;
+use crate::types::PoiCorpusRevision;
 
 use super::{
     Arc, ChainPublicDataPlane, ChainScope, ChainType, DEFAULT_TXID_VERSION, DbStore,
-    DenseMerkleTree, Duration, EVM_CHAIN_TYPE, ExpectedPoiStatus, ExpectedWalletOutput, FixedBytes,
-    HashMap, IndexedArtifactSourceConfig, InputWitness, Instant, LocalPoiMerkleProofSource,
-    MerkleForest, Note, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+    DenseMerkleTree, Duration, EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision, ExpectedPoiStatus,
+    ExpectedWalletOutput, FixedBytes, HashMap, IndexedArtifactSourceConfig, InputWitness, Instant,
+    LocalPoiMerkleProofSource, MerkleForest, Note, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
     OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
@@ -18,13 +19,13 @@ use super::{
     PendingOutputPoiObservation, PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt,
     PendingOutputPoiRole, PendingOutputPoiSubmissionPlan, PoiPrivateApplyOutcome, PoiRpcClient,
     PoiStatus, PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
-    PreTransactionPoiMap, PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusKey,
-    PublicTxidCacheKey, PublicTxidLatestValidated, PublicTxidProofRequest, PublicTxidProofTarget,
-    PublicTxidSyncRequest, PublicTxidTransaction, RailgunSpendSigner, RwLock,
-    SenderTransactionCandidate, TREE_LEAF_COUNT, TransactionPlanChunk, TxidPublicCacheError,
-    TxidPublicProof, U256, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, ValidatedRailgunTxidStatus,
-    WalletCacheStore, WalletConfig, WalletPoiRuntime, WalletPrivateMutationAuthority,
-    WalletPrivatePoiClients, WalletUtxo, apply_poi_private_delta,
+    PreTransactionPoiMap, PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusHandle,
+    PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated, PublicTxidProofRequest,
+    PublicTxidProofTarget, PublicTxidSyncRequest, PublicTxidTransaction, RailgunSpendSigner,
+    RwLock, SenderTransactionCandidate, TREE_LEAF_COUNT, TransactionPlanChunk,
+    TxidPublicCacheError, TxidPublicProof, U256, Utxo, UtxoCommitmentKind, UtxoPoiMetadata,
+    ValidatedRailgunTxidStatus, WalletCacheStore, WalletConfig, WalletPoiRuntime,
+    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletUtxo, apply_poi_private_delta,
     current_pending_output_poi_subject, debug, expected_pending_context_state,
     expected_recovery_state, generate_post_transaction_pois, hex, log_local_poi_cache_unavailable,
     now_epoch_secs, pending_output_poi_context_fingerprint,
@@ -72,11 +73,28 @@ pub(super) struct OutputPoiRecoveryRequest<'a> {
 }
 
 pub(super) enum OutputPoiProofSourceResolution {
+    /// A ready local proof source and the corpus revision it was read at. No corpus fence is
+    /// held; a commit that consumes its proofs rechecks `revision` on the wallet actor.
     Local {
         source: LocalPoiMerkleProofSource,
-        revision_fence: tokio::sync::OwnedRwLockReadGuard<()>,
+        revision: PoiCorpusRevision,
+        corpus: PublicPoiCorpusHandle,
     },
     Unavailable,
+}
+
+impl OutputPoiProofSourceResolution {
+    pub(super) fn expected_corpus_revision(&self) -> Option<ExpectedPoiCorpusRevision> {
+        match self {
+            Self::Local {
+                revision, corpus, ..
+            } => Some(ExpectedPoiCorpusRevision {
+                corpus: corpus.clone(),
+                revision: *revision,
+            }),
+            Self::Unavailable => None,
+        }
+    }
 }
 
 impl OutputPoiRecoveryRequest<'_> {
@@ -85,7 +103,8 @@ impl OutputPoiRecoveryRequest<'_> {
         required_poi_list_keys: &[FixedBytes<32>],
     ) -> Option<(
         LocalPoiMerkleProofSource,
-        tokio::sync::OwnedRwLockReadGuard<()>,
+        PoiCorpusRevision,
+        PublicPoiCorpusHandle,
     )> {
         match self.poi_runtime {
             WalletPoiRuntime::IndexedArtifacts { .. } => {
@@ -94,12 +113,17 @@ impl OutputPoiRecoveryRequest<'_> {
                     .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(self.cfg.chain.chain_id))
                     .await
                     .ok()?;
+                // Read the revision and check readiness against the same published corpus. The
+                // fence is released before returning, so callers never hold it across proof
+                // generation or a wallet actor round trip.
                 let revision_fence = corpus.revision_read_fence().await;
+                let revision = *corpus.committed_revision_rx().borrow();
                 let source = corpus.merkle_proof_source();
-                source
+                let ready = source
                     .available_for_lists(self.cfg.chain.chain_id, required_poi_list_keys)
-                    .await
-                    .then_some((source, revision_fence))
+                    .await;
+                drop(revision_fence);
+                ready.then_some((source, revision, corpus))
             }
             WalletPoiRuntime::PoiProxy { .. } => None,
         }
@@ -109,13 +133,14 @@ impl OutputPoiRecoveryRequest<'_> {
         &self,
         required_poi_list_keys: &[FixedBytes<32>],
     ) -> OutputPoiProofSourceResolution {
-        if let Some((source, revision_fence)) = self
+        if let Some((source, revision, corpus)) = self
             .local_proof_source_if_ready(required_poi_list_keys)
             .await
         {
             OutputPoiProofSourceResolution::Local {
                 source,
-                revision_fence,
+                revision,
+                corpus,
             }
         } else {
             OutputPoiProofSourceResolution::Unavailable
@@ -425,6 +450,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
     let started = Instant::now();
     let now = now_epoch_secs();
     let mut recovered = 0usize;
+    let mut stale_revision_skips = 0usize;
     let candidates = output_poi_recovery_candidates(request.wallet_utxos, request.active_list_keys);
     let wallet_nullifiers = WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys);
     debug!(
@@ -767,11 +793,16 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                             }
                         },
                         now,
+                        expected_corpus: proof_source_resolution.expected_corpus_revision(),
                     },
                 )
                 .await
                 {
                     Ok(PoiPrivateApplyOutcome::Applied { .. }) => {}
+                    Ok(PoiPrivateApplyOutcome::SkippedStaleCorpusRevision) => {
+                        stale_revision_skips += 1;
+                        continue;
+                    }
                     Ok(PoiPrivateApplyOutcome::Skipped) => continue,
                     Err(_) => {
                         warn!(
@@ -873,6 +904,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
     debug!(
         chain_id = request.cfg.chain.chain_id,
         recovered,
+        stale_revision_skips,
         elapsed_ms = started.elapsed().as_millis(),
         "output POI recovery scan complete"
     );
@@ -1278,7 +1310,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_public_cache(
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
-    if let Some((local_proof_source, _revision_fence)) = request
+    if let Some((local_proof_source, ..)) = request
         .local_proof_source_if_ready(required_poi_list_keys)
         .await
     {
@@ -2538,6 +2570,7 @@ pub(super) async fn record_output_poi_recovery_failure(
                 increment_attempts: true,
             },
             now,
+            expected_corpus: None,
         },
     )
     .await
@@ -2599,6 +2632,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
                 expected_recovery,
                 action: OutputPoiRecoveryAction::Valid,
                 now,
+                expected_corpus: None,
             },
         )
         .await

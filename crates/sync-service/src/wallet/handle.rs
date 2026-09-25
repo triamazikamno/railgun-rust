@@ -100,7 +100,7 @@ use super::{
     WalletUtxo, WalletViewState, Weak, chain_pending_overlay_matches, debug, mpsc, now_epoch_secs,
     oneshot, wallet_utxo_stable_identity, warn, watch,
 };
-use crate::types::{ChainKey, SyncProgressSender, WalletSyncTargetLease};
+use crate::types::{ChainKey, PoiCorpusRevision, SyncProgressSender, WalletSyncTargetLease};
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
@@ -414,6 +414,16 @@ pub(crate) enum PendingOutputPoiValidationEvidence {
     OwnedStatusRefresh,
 }
 
+/// Chain POI corpus revision a local proof source was read at.
+///
+/// A commit that consumes a local proof carries this instead of a corpus fence guard, and the
+/// actor rechecks it under a short corpus read fence before writing.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedPoiCorpusRevision {
+    pub(crate) corpus: PublicPoiCorpusHandle,
+    pub(crate) revision: PoiCorpusRevision,
+}
+
 /// Owned semantic POI intent for actor re-entry (jobs never write mirrors or stale rows).
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
@@ -432,6 +442,8 @@ pub(crate) enum OwnedPoiPrivateDelta {
         recovery_updates: Vec<OutputPoiRecoveryRecord>,
         owned_substitutes: Vec<ExpectedWalletOutput>,
         proof_outputs: Vec<FixedBytes<32>>,
+        /// Corpus revision the candidate's proofs were built from.
+        expected_corpus: ExpectedPoiCorpusRevision,
     },
     /// Fold a recovery action into the exact predecessor, optionally replacing a pending
     /// context whose predecessor is also exact.
@@ -444,6 +456,8 @@ pub(crate) enum OwnedPoiPrivateDelta {
         expected_recovery: ExpectedRecordState,
         action: OutputPoiRecoveryAction,
         now: u64,
+        /// Set only when the commit consumes a proof built from the local corpus.
+        expected_corpus: Option<ExpectedPoiCorpusRevision>,
     },
     /// Apply a completed submission to the current context/recovery records.
     PendingSubmission {
@@ -510,8 +524,13 @@ pub(crate) enum OwnedPoiPrivateDelta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PoiPrivateApplyOutcome {
-    Applied { utxo_changed: bool },
+    Applied {
+        utxo_changed: bool,
+    },
     Skipped,
+    /// The chain POI corpus advanced after the commit's local proof source was read; nothing
+    /// was written and a later maintenance run prepares the work again.
+    SkippedStaleCorpusRevision,
 }
 
 /// Job → actor private apply request. Actor is the sole UTXO/durable private writer.

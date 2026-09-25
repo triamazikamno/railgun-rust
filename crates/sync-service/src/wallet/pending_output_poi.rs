@@ -6,20 +6,21 @@ use poi::error::PoiRpcError;
 
 use super::{
     BTreeMap, BlindedCommitmentData, CancellationToken, ChainPublicDataPlane,
-    CommitmentObservation, DEFAULT_TXID_VERSION, DbStore, EVM_CHAIN_TYPE, ExpectedPoiListState,
-    ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, FixedBytes, Instant,
-    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
-    OutputPoiRecoveryStatus, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-    PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
-    PendingOutputPoiSubject, PendingOutputPoiSubmissionPredicate,
-    PendingOutputPoiValidationEvidence, PoiError, PoiPrivateApplyOutcome, PoiStatus,
-    PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey, RecoveredOutgoingSubmissionSibling,
-    SingleCommitmentProofContext, UtxoPoiMetadata, WalletCacheError, WalletCacheKey,
-    WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletHandle, WalletPoiRuntime,
-    WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus, WalletPrivateCommit,
-    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
-    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug,
-    default_active_poi_list_keys, info, new_output_poi_recovery_record, now_epoch_secs, warn,
+    CommitmentObservation, DEFAULT_TXID_VERSION, DbStore, EVM_CHAIN_TYPE,
+    ExpectedPoiCorpusRevision, ExpectedPoiListState, ExpectedPoiStatus, ExpectedRecordState,
+    ExpectedWalletOutput, FixedBytes, Instant, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiContextRecord,
+    PendingOutputPoiObservation, PendingOutputPoiRole, PendingOutputPoiSubject,
+    PendingOutputPoiSubmissionPredicate, PendingOutputPoiValidationEvidence, PoiError,
+    PoiPrivateApplyOutcome, PoiStatus, PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey,
+    RecoveredOutgoingSubmissionSibling, SingleCommitmentProofContext, UtxoPoiMetadata,
+    WalletCacheError, WalletCacheKey, WalletCacheStore, WalletCheckpointMutation, WalletConfig,
+    WalletHandle, WalletPoiRuntime, WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus,
+    WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
+    WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo,
+    WalletUtxoMutation, debug, default_active_poi_list_keys, info, new_output_poi_recovery_record,
+    now_epoch_secs, warn,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1395,7 +1396,10 @@ async fn submit_observed_pending_output_pois_impl(
                         submitted_contexts += sibling_count;
                     }
                 }
-                Ok(PoiPrivateApplyOutcome::Skipped) => {}
+                Ok(
+                    PoiPrivateApplyOutcome::Skipped
+                    | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+                ) => {}
                 Err(_) => warn!(
                     chain_id,
                     "failed to atomically persist recovered outgoing POI submission state"
@@ -1528,7 +1532,10 @@ async fn submit_observed_pending_output_pois_impl(
                 .await
                 {
                     Ok(PoiPrivateApplyOutcome::Applied { .. }) => submitted_contexts += 1,
-                    Ok(PoiPrivateApplyOutcome::Skipped) => {}
+                    Ok(
+                        PoiPrivateApplyOutcome::Skipped
+                        | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+                    ) => {}
                     Err(_) => {
                         warn!(
                             chain_id,
@@ -1903,6 +1910,25 @@ pub(super) async fn apply_owned_poi_private_delta_on_actor_with_active_lists(
     apply_poi_private_delta_inline(&authority, db, cache_store, cfg, active_list_keys, delta).await
 }
 
+/// Holds the chain POI corpus read fence for a commit that consumes a local proof.
+///
+/// Call after the mutation permit and any public-data commit guard, and keep the returned guard
+/// through the durable commit. Returns the stale outcome, with the fence released, when the
+/// corpus revision changed after the proof source was read. A commit without an expected
+/// revision takes no corpus fence.
+async fn hold_expected_poi_corpus_revision(
+    expected: Option<&ExpectedPoiCorpusRevision>,
+) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, PoiPrivateApplyOutcome> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    let revision_fence = expected.corpus.revision_read_fence().await;
+    if *expected.corpus.committed_revision_rx().borrow() != expected.revision {
+        return Err(PoiPrivateApplyOutcome::SkippedStaleCorpusRevision);
+    }
+    Ok(Some(revision_fence))
+}
+
 /// Exclusive apply: acquire → fresh snapshot → fold → durable commit → mirrors → drop.
 /// Call only from the actor turn (or single-threaded tests without an apply client).
 async fn apply_poi_private_delta_inline(
@@ -2039,10 +2065,21 @@ async fn apply_poi_private_delta_inline(
             recovery_updates,
             owned_substitutes,
             proof_outputs,
+            expected_corpus,
         } => {
             // This is the final public authority acquisition. All actor/mailbox/network awaits
             // completed before it; reset cannot cross the synchronous validation/commit below.
             let _public_commit_guard = public_data_fence.acquire_commit_guard().await;
+            // The corpus fence comes last and is held through the commit, so the proofs were
+            // built from the corpus revision that is current when the candidate is consumed.
+            let _revision_fence =
+                match hold_expected_poi_corpus_revision(Some(&expected_corpus)).await {
+                    Ok(revision_fence) => revision_fence,
+                    Err(stale) => {
+                        drop(permit);
+                        return Ok(stale);
+                    }
+                };
             if active_list_keys.is_empty()
                 || pending_updates.len() != recovery_updates.len()
                 || (pending_updates.is_empty() && owned_substitutes.is_empty())
@@ -2236,7 +2273,17 @@ async fn apply_poi_private_delta_inline(
             expected_recovery,
             action,
             now,
+            expected_corpus,
         } => {
+            // Held through the commit when this record consumes a local proof.
+            let _revision_fence =
+                match hold_expected_poi_corpus_revision(expected_corpus.as_ref()).await {
+                    Ok(revision_fence) => revision_fence,
+                    Err(stale) => {
+                        drop(permit);
+                        return Ok(stale);
+                    }
+                };
             let Some(wallet_utxo) = snapshot
                 .iter()
                 .find(|wallet_utxo| expected_output.matches(wallet_utxo))
@@ -3909,7 +3956,10 @@ pub(super) async fn reconcile_pending_output_poi_local_statuses(
                     outcome.pending += 1;
                 }
             }
-            Ok(PoiPrivateApplyOutcome::Skipped) => {}
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => {}
             Err(_) => outcome.errors += 1,
         }
     }
@@ -4137,7 +4187,7 @@ async fn commit_verified_pending_output_poi_context(
     .await?
     {
         PoiPrivateApplyOutcome::Applied { .. } => Ok(true),
-        PoiPrivateApplyOutcome::Skipped => {
+        PoiPrivateApplyOutcome::Skipped | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision => {
             debug!(
                 chain_id = cfg.chain.chain_id,
                 "verified pending output POI commit skipped"

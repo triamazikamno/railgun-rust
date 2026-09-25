@@ -46,6 +46,7 @@ const POI_CACHE_FAILURE_RETRY_INTERVAL: Duration = Duration::from_mins(1);
 const POI_ARTIFACT_RPC_FAILURE_THRESHOLD: u32 = 3;
 const POI_ARTIFACT_RPC_STALE_AFTER: Duration = Duration::from_mins(5);
 const POI_CACHE_COMMAND_CAPACITY: usize = 16;
+const POI_CORPUS_WRITE_FENCE_SLOW_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PoiCacheDemand {
@@ -2171,7 +2172,7 @@ async fn reconcile_background_compaction_anchor(
         return false;
     }
 
-    let _revision_fence = task.local_caches.revision_write_fence().await;
+    let _revision_fence = acquire_corpus_write_fence(task).await;
     let publication = task
         .runtime
         .publication_fence
@@ -2303,6 +2304,21 @@ struct StagedPoiCacheCandidate {
     compaction: Option<PoiCorpusCompactionRequest>,
 }
 
+/// Acquires the chain POI corpus write fence, warning when readers held it unusually long.
+async fn acquire_corpus_write_fence(task: &ChainPoiCacheCoordinator) -> OwnedRwLockWriteGuard<()> {
+    let started = Instant::now();
+    let revision_fence = task.local_caches.revision_write_fence().await;
+    let waited = started.elapsed();
+    if waited >= POI_CORPUS_WRITE_FENCE_SLOW_AFTER {
+        warn!(
+            chain_id = task.chain_id,
+            wait_ms = waited.as_millis(),
+            "POI corpus write fence acquisition was slow"
+        );
+    }
+    revision_fence
+}
+
 async fn apply_staged_poi_cache_batch(
     task: &ChainPoiCacheCoordinator,
     attempt_id: PoiArtifactCacheAttemptId,
@@ -2310,7 +2326,7 @@ async fn apply_staged_poi_cache_batch(
     staged: Vec<StagedPoiCacheCandidate>,
     result: &Result<(), PoiCacheServiceError>,
 ) -> Result<Vec<PoiCorpusCompactionRequest>, PoiCacheServiceError> {
-    let _revision_fence = task.local_caches.revision_write_fence().await;
+    let _revision_fence = acquire_corpus_write_fence(task).await;
     let mut caches = task.local_caches.write().await;
     let publication = task
         .runtime
@@ -2623,7 +2639,7 @@ async fn apply_loaded_persisted_chain_poi_caches(
     if loaded_count == 0 {
         return loaded;
     }
-    let _revision_fence = task.local_caches.revision_write_fence().await;
+    let _revision_fence = acquire_corpus_write_fence(task).await;
     let lock_started = Instant::now();
     let mut caches = task.local_caches.write().await;
     let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();

@@ -42,11 +42,11 @@ use super::sender_candidate_recovery::{
 };
 use super::test_support::sync_live_poi_event_tail;
 use super::{
-    DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus,
-    ExpectedRecordState, ExpectedWalletOutput, LocalPoiMerkleProofSource, LocalPoiStatusReader,
-    OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OutputPoiRecoveryRequest, OutputPoiRecoveryRun, OwnedPoiPrivateDelta,
-    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,
+    DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision, ExpectedPoiListState,
+    ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, LocalPoiMerkleProofSource,
+    LocalPoiStatusReader, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryRequest, OutputPoiRecoveryRun,
+    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,
     PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter,
     PendingOutputPoiValidationEvidence, PoiPrivateApplyOutcome, PoiStatusReader,
     RecoveredOutgoingSubmissionSibling, WALLET_POI_STATUS_BATCH_SIZE, WalletActorLifecycleCell,
@@ -61,7 +61,7 @@ use super::{
     output_poi_recovery_candidates, pending_output_poi_context_fingerprint,
     pending_output_poi_context_matches_wallet_utxo, pending_overlay_from_delta,
     preflight_and_remote_submit_pending_output_poi,
-    process_pending_output_poi_observations_authorized,
+    process_pending_output_poi_observations_authorized, recover_missing_output_pois,
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
     rewind_wallet_utxos, submit_observed_pending_output_pois_inner,
     submit_pending_output_poi_tentative_candidates,
@@ -70,9 +70,10 @@ use super::{
 };
 use crate::chain::PublicTxidTransaction;
 use crate::chain::{
-    ChainPublicDataPlane, PublicPoiCorpusKey, PublicTxidCacheKey as DataPlanePublicTxidCacheKey,
-    PublicTxidDataAuthority, PublicTxidLatestValidated as DataPlanePublicTxidLatestValidated,
-    PublicTxidProofRequest, PublicTxidProofTarget, PublicTxidSyncRequest,
+    ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey,
+    PublicTxidCacheKey as DataPlanePublicTxidCacheKey, PublicTxidDataAuthority,
+    PublicTxidLatestValidated as DataPlanePublicTxidLatestValidated, PublicTxidProofRequest,
+    PublicTxidProofTarget, PublicTxidSyncRequest,
 };
 use crate::indexed_artifacts::{ChainScope, ChainType};
 use crate::txid_cache::TxidPublicCacheTransaction;
@@ -258,6 +259,13 @@ async fn sender_candidate_public_data_fence(
 
 fn test_cache_key(value: impl AsRef<[u8]>) -> WalletCacheKey {
     WalletCacheKey::from_opaque_bytes(value.as_ref()).expect("non-empty test wallet cache key")
+}
+
+/// Expected revision of a private corpus that nothing advances, so the actor-side recheck passes.
+fn current_poi_corpus_revision() -> ExpectedPoiCorpusRevision {
+    let corpus = PublicPoiCorpusHandle::new_for_test(WalletLocalPoiCaches::new());
+    let revision = *corpus.committed_revision_rx().borrow();
+    ExpectedPoiCorpusRevision { corpus, revision }
 }
 
 fn wallet_config(nullifying_key: U256) -> WalletConfig {
@@ -2518,6 +2526,69 @@ async fn automatic_recovery_policy_uses_local_proofs_only_and_retains_candidate(
             .await,
         OutputPoiProofSourceResolution::Unavailable
     ));
+    // A local resolution records its corpus revision instead of holding the corpus fence, so the
+    // corpus writer is never queued behind proof preparation.
+    let local_public_data_plane = test_public_data_plane_with_poi_service(&db);
+    for list_key in active_list_keys.iter().copied() {
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            cfg.chain.chain_id,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        ));
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x99; 32],
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("seed local POI event");
+        seed_data_plane_poi_cache(
+            &local_public_data_plane,
+            cfg.chain.chain_id,
+            list_key,
+            cache,
+        )
+        .await;
+    }
+    let local_runtime = test_artifact_poi_runtime();
+    let local_poi_client = local_runtime.public_client().clone();
+    let local_resolver_request = OutputPoiRecoveryRequest {
+        authority: &authority,
+        db: db.as_ref(),
+        cache_store: &cache_store,
+        cfg: &cfg,
+        public_data_plane: &local_public_data_plane,
+        http_client: None,
+        indexed_artifact_source: None,
+        forest: Arc::clone(&resolver_forest),
+        poi_client: &local_poi_client,
+        private_poi: &private_poi,
+        poi_runtime: &local_runtime,
+        active_list_keys: &active_list_keys,
+        wallet_utxos: resolver_wallet_utxos,
+        force_retry: false,
+    };
+    let local_resolution = local_resolver_request
+        .resolve_proof_source(&active_list_keys)
+        .await;
+    let OutputPoiProofSourceResolution::Local {
+        revision, corpus, ..
+    } = &local_resolution
+    else {
+        panic!("a ready local corpus resolves to a local proof source");
+    };
+    let corpus_caches = corpus.local_caches();
+    let write_fence =
+        tokio::time::timeout(Duration::from_secs(1), corpus_caches.revision_write_fence())
+            .await
+            .expect("corpus writer acquires the fence while a local resolution is alive");
+    corpus_caches.publish_committed_revision(false);
+    drop(write_fence);
+    assert_ne!(*corpus.committed_revision_rx().borrow(), *revision);
+    drop(local_resolution);
+    drop(local_public_data_plane);
     let recovered = (OutputPoiRecoveryRun {
         authority: &authority,
         db: db.as_ref(),
@@ -2605,6 +2676,194 @@ async fn automatic_recovery_policy_uses_local_proofs_only_and_retains_candidate(
 
     drop(public_data_plane);
     drop(cache_store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn output_poi_recovery_commit_round_trip_does_not_hold_the_corpus_fence() {
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let list_key = FixedBytes::from([0x61; 32]);
+    let spending_public_key = [uint!(4_U256), uint!(5_U256)];
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
+    cfg.cache_key = test_cache_key("corpus-fence-cycle");
+    cfg.spending_public_key = Some(spending_public_key);
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+
+    let mut input = test_wallet_utxo(0);
+    let mut output = test_wallet_utxo(8);
+    output
+        .utxo
+        .poi
+        .statuses
+        .insert(list_key, PoiStatus::Missing);
+    input.spent = Some(output.utxo.source.clone());
+    let mut forest = MerkleForest::new();
+    forest
+        .insert_leaf(MerkleTreeUpdate {
+            tree_number: input.utxo.tree,
+            tree_position: input.utxo.position,
+            hash: input.utxo.note.commitment(),
+        })
+        .expect("insert input leaf");
+    let merkle_root = forest
+        .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
+        .expect("input proof")
+        .root;
+    let graph_response = serde_json::json!({
+        "data": {
+            "transactions": [{
+                "id": "0x00",
+                "blockNumber": output.utxo.source.block_number.to_string(),
+                "blockTimestamp": output.utxo.source.block_timestamp.to_string(),
+                "transactionHash": hex::encode_prefixed(output.utxo.source.tx_hash),
+                "merkleRoot": hex::encode_prefixed(FixedBytes::from(merkle_root.to_be_bytes::<32>())),
+                "nullifiers": [hex::encode_prefixed(FixedBytes::from(
+                    input.utxo.nullifier(cfg.scan_keys.nullifying_key).to_be_bytes::<32>()
+                ))],
+                "commitments": [hex::encode_prefixed(output.utxo.poi.commitment)],
+                "boundParamsHash": "0x33",
+                "hasUnshield": false,
+                "utxoTreeIn": input.utxo.tree.to_string(),
+                "utxoTreeOut": output.utxo.tree.to_string(),
+                "utxoBatchStartPositionOut": output.utxo.position.to_string(),
+            }]
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let (graph_endpoint, _graph_requests) = spawn_http_response(graph_response).await;
+    cfg.quick_sync_endpoint = Some(graph_endpoint);
+    let poi_mock = spawn_poi_rpc_sequence(vec![
+        serde_json::json!({
+            "validatedTxidIndex": 0,
+            "validatedMerkleroot": null,
+        }),
+        serde_json::json!(true),
+    ])
+    .await;
+    let poi_client = PoiRpcClient::new(poi_mock.url.clone());
+
+    // The input is in the local corpus, so the proof source resolves locally and the preflight
+    // passes. Its roots are never validated, so proof generation fails before proving and the
+    // job commits a failure record through the actor.
+    let public_data_plane = test_public_data_plane_with_poi_service(&db);
+    let mut poi_cache = PoiCache::new(PoiCacheIdentity::new(
+        EVM_CHAIN_TYPE,
+        cfg.chain.chain_id,
+        DEFAULT_TXID_VERSION,
+        list_key,
+    ));
+    poi_cache
+        .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+            event_index: 0,
+            blinded_commitment: *input.utxo.poi.blinded_commitment,
+            signature: [0_u8; 64],
+            event_type: PoiEventType::Transact,
+        }])
+        .expect("seed input POI event");
+    seed_data_plane_poi_cache(&public_data_plane, cfg.chain.chain_id, list_key, poi_cache).await;
+    let corpus_caches = public_data_plane
+        .ensure_poi_corpus(PublicPoiCorpusKey::wallet_default(cfg.chain.chain_id))
+        .await
+        .expect("POI corpus")
+        .local_caches();
+
+    let output_commitment = output.utxo.poi.commitment;
+    let wallet_utxos = vec![input, output];
+    let mut handle = test_wallet_handle(wallet_utxos.clone());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let (apply_tx, mut apply_rx) = mpsc::channel(1);
+    let apply_client = WalletPrivateApplyClient::new(apply_tx);
+    let authority =
+        WalletPrivateMutationAuthority::new(&handle, 0, &cancel).with_apply_client(&apply_client);
+    let private_poi = WalletPrivatePoiClients::for_submit(
+        authority.remote_authority(),
+        Arc::new(RecordingPendingOutputPoiSubmitter::default()),
+    );
+    let poi_runtime = test_artifact_poi_runtime();
+    let active_list_keys = [list_key];
+
+    // The actor side of the round trip: a corpus writer runs first and must not queue behind a
+    // job-held corpus read guard. It publishes a new revision, which a failure record that
+    // consumes no local proof commits across.
+    let actor_handle = handle.clone();
+    let actor_db = Arc::clone(&db);
+    let actor_cancel = cancel.clone();
+    let actor_cfg = cfg.clone();
+    let actor = async move {
+        let request = apply_rx
+            .recv()
+            .await
+            .expect("output recovery commit request");
+        let write_fence =
+            tokio::time::timeout(Duration::from_secs(2), corpus_caches.revision_write_fence())
+                .await
+                .expect("corpus writer acquires while the job awaits the actor");
+        corpus_caches.publish_committed_revision(false);
+        drop(write_fence);
+        let result = apply_owned_poi_private_delta_on_actor_with_active_lists(
+            &actor_handle,
+            &actor_cancel,
+            request.reset_generation,
+            actor_db.as_ref(),
+            actor_db.as_ref(),
+            &actor_cfg,
+            &[list_key],
+            request.delta,
+        )
+        .await;
+        request.reply.send(result).expect("send actor result");
+    };
+    let recovery = recover_missing_output_pois(OutputPoiRecoveryRequest {
+        authority: &authority,
+        db: db.as_ref(),
+        cache_store: db.as_ref(),
+        cfg: &cfg,
+        public_data_plane: &public_data_plane,
+        http_client: None,
+        indexed_artifact_source: None,
+        forest: Arc::new(forest),
+        poi_client: &poi_client,
+        private_poi: &private_poi,
+        poi_runtime: &poi_runtime,
+        active_list_keys: &active_list_keys,
+        wallet_utxos: &wallet_utxos,
+        force_retry: false,
+    });
+    let (recovered, ()) = tokio::time::timeout(
+        Duration::from_secs(10),
+        Box::pin(async { tokio::join!(recovery, actor) }),
+    )
+    .await
+    .expect("output POI recovery finishes without the maintenance watchdog");
+
+    assert_eq!(recovered, 0);
+    let record = db
+        .get_output_poi_recovery(cfg.chain.chain_id, &cfg.cache_key, &output_commitment)
+        .expect("load recovery record")
+        .expect("failure record commits after the corpus revision changed");
+    assert_eq!(
+        record.status,
+        OutputPoiRecoveryStatus::ProofGenerationFailed
+    );
+    assert!(
+        record
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("root validation required")),
+        "the job reached proof generation from a local resolution: {record:?}"
+    );
+
+    drop(public_data_plane);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -3736,6 +3995,7 @@ async fn sender_unshield_submission_precedes_candidate_retirement() {
                 recovery_updates: vec![recovery],
                 owned_substitutes: Vec::new(),
                 proof_outputs: vec![private_output.poi.blinded_commitment],
+                expected_corpus: current_poi_corpus_revision(),
             },
         )
         .await
@@ -9740,6 +10000,7 @@ async fn output_recovery_mixed_statuses_request_and_persist_only_recoverable_lis
                     increment_attempts: false,
                 },
                 now: 10,
+                expected_corpus: None,
             },
         )
         .await
@@ -9883,6 +10144,7 @@ async fn assert_valid_output_recovery_recovers_new_active_list(force_retry: bool
                 increment_attempts: false,
             },
             now: 10,
+            expected_corpus: None,
         },
     )
     .await
@@ -10016,6 +10278,69 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
     let expected_recovery =
         super::expected_recovery_state(Some(&recovery)).expect("recovery fingerprint");
     let cancel = CancellationToken::new();
+    let extension_delta =
+        |expected_corpus: Option<ExpectedPoiCorpusRevision>| OwnedPoiPrivateDelta::OutputRecovery {
+            expected_output: ExpectedWalletOutput::new(&current_output),
+            active_list_keys: active_list_keys.to_vec(),
+            target_list_keys: new_list_keys.clone(),
+            required_poi_status: ExpectedPoiStatus::Recoverable,
+            pending_update: Box::new(Some((
+                ExpectedRecordState::Present(expected_context_fingerprint.clone()),
+                extended.clone(),
+            ))),
+            expected_recovery: expected_recovery.clone(),
+            action: OutputPoiRecoveryAction::ExtendContext,
+            now: 10,
+            expected_corpus,
+        };
+
+    let corpus_caches = WalletLocalPoiCaches::new();
+    let corpus = PublicPoiCorpusHandle::new_for_test(corpus_caches.clone());
+    let proof_revision = ExpectedPoiCorpusRevision {
+        corpus: corpus.clone(),
+        revision: *corpus.committed_revision_rx().borrow(),
+    };
+    {
+        let _write_fence = corpus_caches.revision_write_fence().await;
+        corpus_caches.publish_committed_revision(false);
+    }
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            &store,
+            &store,
+            &cfg,
+            extension_delta(Some(proof_revision)),
+        )
+        .await
+        .expect("reject extension proofs from an older corpus revision"),
+        PoiPrivateApplyOutcome::SkippedStaleCorpusRevision
+    );
+    let unchanged_context = store
+        .get_pending_output_poi_context(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            &pending.output_commitment,
+        )
+        .expect("load context after stale proof")
+        .expect("context present after stale proof");
+    assert_eq!(
+        pending_output_poi_context_fingerprint(&unchanged_context),
+        Some(expected_context_fingerprint.clone())
+    );
+    let unchanged_recovery = store
+        .get_output_poi_recovery(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            &pending.output_commitment,
+        )
+        .expect("load recovery after stale proof");
+    assert_eq!(
+        super::expected_recovery_state(unchanged_recovery.as_ref()),
+        Some(expected_recovery.clone())
+    );
 
     let extension_outcome = apply_owned_poi_private_delta_on_actor(
         &handle,
@@ -10024,19 +10349,7 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
-            expected_output: ExpectedWalletOutput::new(&current_output),
-            active_list_keys: active_list_keys.to_vec(),
-            target_list_keys: new_list_keys.clone(),
-            required_poi_status: ExpectedPoiStatus::Recoverable,
-            pending_update: Box::new(Some((
-                ExpectedRecordState::Present(expected_context_fingerprint),
-                extended,
-            ))),
-            expected_recovery,
-            action: OutputPoiRecoveryAction::ExtendContext,
-            now: 10,
-        },
+        extension_delta(None),
     )
     .await
     .expect("apply incremental recovery extension");
@@ -10201,6 +10514,7 @@ async fn output_recovery_extension_skips_concurrent_context_change() {
             expected_recovery,
             action: OutputPoiRecoveryAction::ExtendContext,
             now: 10,
+            expected_corpus: None,
         },
     )
     .await
@@ -10325,6 +10639,7 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
                 increment_attempts: false,
             },
             now: 999,
+            expected_corpus: None,
         },
     )
     .await
@@ -10447,6 +10762,7 @@ async fn force_terminal_regeneration_skips_concurrent_context_replacement() {
                 increment_attempts: false,
             },
             now: 999,
+            expected_corpus: None,
         },
     )
     .await
@@ -10630,6 +10946,7 @@ async fn recovery_actor_skips_when_output_becomes_valid_before_apply() {
                 increment_attempts: false,
             },
             now: 10,
+            expected_corpus: None,
         },
     )
     .await
@@ -12356,6 +12673,7 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
         recovery_updates: vec![recovery.clone()],
         owned_substitutes: Vec::new(),
         proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+        expected_corpus: current_poi_corpus_revision(),
     };
 
     assert!(
@@ -12497,6 +12815,7 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
         recovery_updates: vec![recovery.clone()],
         owned_substitutes: Vec::new(),
         proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+        expected_corpus: current_poi_corpus_revision(),
     };
     assert_eq!(current_public_data_plane.current_epoch().value, 0);
     assert_eq!(
@@ -12523,14 +12842,78 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
         candidate.source.block_timestamp + 1,
     )
     .await;
-    let final_delta = || OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-        expected_candidate: candidate.clone(),
-        public_data_fence: final_public_data_fence.clone(),
-        active_list_keys: vec![list_key],
-        pending_updates: vec![pending.clone()],
-        recovery_updates: vec![recovery.clone()],
-        owned_substitutes: Vec::new(),
-        proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+    let final_delta = |expected_corpus: ExpectedPoiCorpusRevision| {
+        OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+            expected_candidate: candidate.clone(),
+            public_data_fence: final_public_data_fence.clone(),
+            active_list_keys: vec![list_key],
+            pending_updates: vec![pending.clone()],
+            recovery_updates: vec![recovery.clone()],
+            owned_substitutes: Vec::new(),
+            proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+            expected_corpus,
+        }
+    };
+    let corpus_caches = WalletLocalPoiCaches::new();
+    let corpus = PublicPoiCorpusHandle::new_for_test(corpus_caches.clone());
+    let proof_revision = ExpectedPoiCorpusRevision {
+        corpus: corpus.clone(),
+        revision: *corpus.committed_revision_rx().borrow(),
+    };
+    {
+        let _write_fence = corpus_caches.revision_write_fence().await;
+        corpus_caches.publish_committed_revision(false);
+    }
+    assert_eq!(
+        apply_owned_poi_private_delta_on_actor(
+            &handle,
+            &cancel,
+            0,
+            store.as_ref(),
+            store.as_ref(),
+            &cfg,
+            final_delta(proof_revision),
+        )
+        .await
+        .expect("reject proofs from an older corpus revision"),
+        PoiPrivateApplyOutcome::SkippedStaleCorpusRevision
+    );
+    assert!(
+        store
+            .get_sender_transaction_candidate(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &candidate.semantic_id(),
+            )
+            .expect("load candidate after stale proof")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &output.poi.commitment,
+            )
+            .expect("load pending sibling after stale proof")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_output_poi_recovery(cfg.chain.chain_id, &cfg.cache_key, &output.poi.commitment)
+            .expect("load recovery sibling after stale proof")
+            .is_none()
+    );
+    {
+        let unchanged = handle.utxos.read().await;
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(wallet_utxo_stable_identity(&unchanged[0]), before);
+        assert_eq!(unchanged[0].spent, input.spent);
+    }
+
+    let current_revision = ExpectedPoiCorpusRevision {
+        corpus: corpus.clone(),
+        revision: *corpus.committed_revision_rx().borrow(),
     };
     let outcome = apply_owned_poi_private_delta_on_actor(
         &handle,
@@ -12539,7 +12922,7 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
         store.as_ref(),
         store.as_ref(),
         &cfg,
-        final_delta(),
+        final_delta(current_revision.clone()),
     )
     .await
     .expect("materialize candidate");
@@ -12589,7 +12972,7 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
             store.as_ref(),
             store.as_ref(),
             &cfg,
-            final_delta(),
+            final_delta(current_revision),
         )
         .await
         .expect("restart-style retry"),
@@ -12679,6 +13062,7 @@ async fn sender_materialization_consumes_exact_covered_and_mixed_candidates_with
                     recovery_updates: fixture.recoveries.clone(),
                     owned_substitutes: Vec::new(),
                     proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                    expected_corpus: current_poi_corpus_revision(),
                 },
             )
             .await
@@ -12714,6 +13098,7 @@ async fn sender_materialization_consumes_exact_covered_and_mixed_candidates_with
                     recovery_updates: fixture.recoveries.clone(),
                     owned_substitutes: Vec::new(),
                     proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                    expected_corpus: current_poi_corpus_revision(),
                 },
             )
             .await
@@ -12846,6 +13231,7 @@ async fn sender_materialization_persists_only_external_output_and_requires_exact
                 recovery_updates: vec![fixture.recoveries[0].clone()],
                 owned_substitutes: vec![expected_owned],
                 proof_outputs,
+                expected_corpus: current_poi_corpus_revision(),
             },
         )
         .await
@@ -12983,6 +13369,7 @@ async fn sender_materialization_partial_or_conflicting_pair_retains_everything()
                     recovery_updates: fixture.recoveries.clone(),
                     owned_substitutes: Vec::new(),
                     proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                    expected_corpus: current_poi_corpus_revision(),
                 },
             )
             .await
@@ -13062,6 +13449,7 @@ async fn sender_materialization_persistence_failure_retains_candidate_without_de
                 recovery_updates: fixture.recoveries,
                 owned_substitutes: Vec::new(),
                 proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                expected_corpus: current_poi_corpus_revision(),
             },
         )
         .await

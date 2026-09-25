@@ -87,8 +87,8 @@ use delta::{
     apply_wallet_delta_to_vec_with_outcome, chain_pending_overlay_matches, rewind_wallet_utxos,
 };
 use handle::{
-    EVM_CHAIN_TYPE, ExpectedPoiListState, ExpectedPoiStatus, ExpectedRecordState,
-    ExpectedWalletOutput, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+    EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision, ExpectedPoiListState, ExpectedPoiStatus,
+    ExpectedRecordState, ExpectedWalletOutput, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
     PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,

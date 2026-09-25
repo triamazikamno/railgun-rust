@@ -482,6 +482,12 @@ impl LocalPoiCaches {
         });
     }
 
+    /// Excludes corpus revision publication and cache installation while the guard is held.
+    ///
+    /// The fence is fair, so a queued writer blocks later readers, including the wallet actor.
+    /// The guard must not be held across any await served by the wallet actor (a private apply
+    /// round trip or its reply); record the committed revision instead and recheck it on the
+    /// actor.
     pub(crate) async fn revision_read_fence(&self) -> OwnedRwLockReadGuard<()> {
         Arc::clone(&self.inner.revision_access).read_owned().await
     }
@@ -2610,6 +2616,12 @@ impl Drop for WalletBackfillDriver {
 pub(crate) enum BackfillEvent {
     #[cfg(test)]
     PanicForTest,
+    /// Spawns a tracked POI job that holds `sentinel` and a data-plane clone until aborted.
+    #[cfg(test)]
+    HoldTrackedPoiJobForTest {
+        sentinel: Arc<()>,
+        started: oneshot::Sender<()>,
+    },
     ReserveTarget {
         target_block: u64,
         token: WalletSyncToken,
