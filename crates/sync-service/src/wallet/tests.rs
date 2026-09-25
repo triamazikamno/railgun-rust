@@ -69,8 +69,9 @@ use super::{
     wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
 };
 use crate::chain::PublicTxidTransaction;
+use crate::chain::poi_submitter_test_support::{RecordingPoiTransport, ScriptedSend};
 use crate::chain::{
-    ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey,
+    ChainPoiSubmitterHandle, ChainPublicDataPlane, PublicPoiCorpusHandle, PublicPoiCorpusKey,
     PublicTxidCacheKey as DataPlanePublicTxidCacheKey, PublicTxidDataAuthority,
     PublicTxidLatestValidated as DataPlanePublicTxidLatestValidated, PublicTxidProofRequest,
     PublicTxidProofTarget, PublicTxidSyncRequest,
@@ -4971,9 +4972,10 @@ async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
     handle.cache_key = cfg.cache_key.clone();
     let cancel = CancellationToken::new();
     let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
-    let private_poi = WalletPrivatePoiClients::from_rpc(
+    let private_poi = WalletPrivatePoiClients::new(
         authority.remote_authority(),
         PoiRpcClient::new(Url::parse("http://127.0.0.1:1").expect("unused POI endpoint")),
+        Arc::new(ChainPoiSubmitterHandle::detached_for_test()),
     );
     let forest = Arc::new(MerkleForest::new());
     let wallet_utxos = vec![input.clone()];
@@ -5529,9 +5531,10 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
     handle.cache_key = cfg.cache_key.clone();
     let cancel = CancellationToken::new();
     let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
-    let private_poi = WalletPrivatePoiClients::from_rpc(
+    let private_poi = WalletPrivatePoiClients::new(
         authority.remote_authority(),
         PoiRpcClient::new(Url::parse("http://127.0.0.1:1").expect("unused POI endpoint")),
+        Arc::new(ChainPoiSubmitterHandle::detached_for_test()),
     );
     let forest = Arc::new(MerkleForest::new());
     cfg.quick_sync_endpoint =
@@ -7834,6 +7837,145 @@ async fn authorized_external_pending_outputs_submit_without_sender_utxos() {
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
+}
+
+/// Maintenance hands single-commitment proofs to the chain submitter without
+/// waiting for the POI node, and a failed chain attempt reaches the wallet on
+/// its next handoff.
+#[tokio::test]
+async fn pending_output_handoff_does_not_wait_for_chain_send_and_reports_chain_failure() {
+    // Far below `POI_MAINTENANCE_WATCHDOG`; a run that waited on the stalled
+    // send would never finish.
+    const RUN_LIMIT: Duration = Duration::from_secs(10);
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let list_key = FixedBytes::from([0xb5; 32]);
+    let mut cfg = wallet_config(U256::ZERO);
+    cfg.cache_key = test_cache_key("wallet-chain-handoff-failure");
+    let pending =
+        external_pending_output_record(&cfg, 0xb4, list_key, PendingOutputPoiRole::Recipient);
+    store
+        .put_pending_output_poi_context(&pending)
+        .expect("store external pending context");
+    let transport = Arc::new(RecordingPoiTransport::default());
+    transport.script(ScriptedSend::Fail("POI node unavailable"));
+    transport.script(ScriptedSend::Stall);
+    let submitter_cancel = CancellationToken::new();
+    let (poi_submitter, submitter_task) = ChainPoiSubmitterHandle::spawn_for_test(
+        cfg.chain.chain_id,
+        Arc::clone(&transport) as Arc<dyn PendingOutputPoiSubmitter>,
+        submitter_cancel.clone(),
+    );
+    let mut handle = test_wallet_handle(Vec::new());
+    handle.cache_key = cfg.cache_key.clone();
+    let cancel = CancellationToken::new();
+    let authority = WalletPrivateMutationAuthority::new(&handle, 0, &cancel);
+    let private_poi = WalletPrivatePoiClients::for_handoff(
+        authority.remote_authority(),
+        Arc::new(poi_submitter.clone()),
+    );
+    let needs_attention = || {
+        wallet_ppoi_workflow_status_after_mutations(
+            &store,
+            &cfg,
+            &[list_key],
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("workflow status")
+        .status
+        .needs_attention
+    };
+
+    let submitted = tokio::time::timeout(
+        RUN_LIMIT,
+        process_pending_output_poi_observations_authorized(
+            &authority,
+            &store,
+            &store,
+            &cfg,
+            &[list_key],
+            Some(&private_poi),
+            false,
+        ),
+    )
+    .await
+    .expect("first handoff does not wait for the POI node");
+    assert_eq!(submitted, 1, "the handoff is recorded as a submission");
+    assert_eq!(needs_attention(), 0);
+    let started = std::time::Instant::now();
+    while transport.sends().is_empty() {
+        assert!(started.elapsed() < RUN_LIMIT, "chain send never started");
+        tokio::task::yield_now().await;
+    }
+    // Let the driver record the failed attempt before the next handoff.
+    poi_submitter
+        .prepare(Vec::new())
+        .await
+        .expect("chain submitter running");
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    let submitted = tokio::time::timeout(
+        RUN_LIMIT,
+        process_pending_output_poi_observations_authorized(
+            &authority,
+            &store,
+            &store,
+            &cfg,
+            &[list_key],
+            Some(&private_poi),
+            true,
+        ),
+    )
+    .await
+    .expect("retry handoff does not wait for the stalled chain send");
+    assert_eq!(submitted, 0);
+    let recovery = store
+        .get_output_poi_recovery(
+            cfg.chain.chain_id,
+            &cfg.cache_key,
+            &pending.output_commitment,
+        )
+        .expect("load recovery")
+        .expect("recovery present");
+    assert_eq!(recovery.status, OutputPoiRecoveryStatus::SubmitFailed);
+    assert_eq!(needs_attention(), 1);
+    while transport.sends().len() < 2 {
+        assert!(started.elapsed() < RUN_LIMIT, "chain retry never started");
+        tokio::task::yield_now().await;
+    }
+    let observation = pending.observation.as_ref().expect("observation");
+    assert_eq!(
+        transport
+            .sends()
+            .iter()
+            .map(|send| (send.commitment, send.tree, send.position))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                pending.output_commitment,
+                observation.output_tree,
+                observation.output_position,
+            );
+            2
+        ],
+        "the retry handoff resends the failed tuple"
+    );
+
+    submitter_cancel.cancel();
+    submitter_task.await.expect("chain submitter exits");
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
 #[tokio::test]

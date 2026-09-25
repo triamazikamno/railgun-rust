@@ -270,6 +270,32 @@ impl MerkleForest {
         self.trees.contains_key(&tree_number)
     }
 
+    /// Yields the leaves of `self` past `base`'s frontier, in ascending
+    /// (tree, position) order.
+    ///
+    /// Assumes `self` extends `base`: in each tree only positions after
+    /// `base`'s last position are yielded, and leaves at or below that
+    /// position are not compared. Trees missing from `base` yield every leaf.
+    pub fn leaves_beyond<'a>(
+        &'a self,
+        base: &'a Self,
+    ) -> impl Iterator<Item = MerkleTreeUpdate> + 'a {
+        self.trees.iter().flat_map(move |(&tree_number, tree)| {
+            let start = base
+                .trees
+                .get(&tree_number)
+                .and_then(|base_tree| base_tree.leaves.last_key_value())
+                .map_or(0, |(&last, _)| last + 1);
+            tree.leaves
+                .range(start..)
+                .map(move |(&tree_position, &hash)| MerkleTreeUpdate {
+                    tree_number,
+                    tree_position,
+                    hash,
+                })
+        })
+    }
+
     #[must_use]
     pub fn prove(&self, tree_number: u32, tree_position: u64) -> Option<MerkleProof> {
         let (tree_number, tree_position) = normalize_tree_position(tree_number, tree_position);
@@ -505,6 +531,39 @@ mod tests {
         assert_eq!(historical.root, expected.root);
         assert_eq!(historical.path_elements, expected.path_elements);
         assert_ne!(current.root, expected.root);
+    }
+
+    #[test]
+    fn leaves_beyond_yields_leaves_after_base_frontier() {
+        fn forest_with(leaves: &[(u32, u64)]) -> MerkleForest {
+            let mut forest = MerkleForest::new();
+            forest
+                .insert_updates(leaves.iter().map(|&(tree_number, tree_position)| {
+                    MerkleTreeUpdate {
+                        tree_number,
+                        tree_position,
+                        hash: U256::from(u64::from(tree_number) * 100 + tree_position + 1),
+                    }
+                }))
+                .unwrap();
+            forest
+        }
+        let base = forest_with(&[(0, 0), (0, 1), (1, 0)]);
+        let candidate = forest_with(&[(0, 0), (0, 1), (0, 2), (1, 0), (2, 0), (2, 1)]);
+
+        let beyond = candidate
+            .leaves_beyond(&base)
+            .map(|leaf| (leaf.tree_number, leaf.tree_position, leaf.hash))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            beyond,
+            vec![
+                (0, 2, uint!(3_U256)),
+                (2, 0, uint!(201_U256)),
+                (2, 1, uint!(202_U256)),
+            ]
+        );
     }
 
     #[test]

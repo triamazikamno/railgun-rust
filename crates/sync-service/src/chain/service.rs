@@ -24,6 +24,7 @@ use super::{
 };
 
 use super::logs::INDEXED_SQUID_STEP_DEADLINE;
+use super::poi_submitter::ChainPoiSubmitterDriver;
 use super::workers::{read_head_bounded, untried_provider};
 use crate::runtime_admission::DbRuntimeLease;
 use std::collections::{BTreeSet, VecDeque};
@@ -92,6 +93,7 @@ pub(crate) struct PreparedChainService {
     safe_head_rx: watch::Receiver<u64>,
     snapshot_path: std::path::PathBuf,
     backfill_rx: mpsc::Receiver<BackfillRequest>,
+    poi_submitter: ChainPoiSubmitterDriver,
     cancel: CancellationToken,
 }
 
@@ -105,8 +107,14 @@ impl PreparedChainService {
             safe_head_rx,
             snapshot_path,
             backfill_rx,
+            poi_submitter,
             cancel,
         } = self;
+        *service
+            .poi_submitter_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(poi_submitter.spawn(cancel.clone()));
         spawn_head_poller(Arc::clone(&service), Arc::clone(&rpcs));
         let live_log_task = spawn_live_log_loop(
             Arc::clone(&service),
@@ -933,6 +941,12 @@ impl ChainService {
             public_data_plane =
                 public_data_plane.with_poi_cache_service(Arc::new(poi_cache_service));
         }
+        let (poi_submitter, poi_submitter_driver) = ChainPoiSubmitterDriver::for_chain(
+            chain.deployment.chain_id,
+            &poi_policy,
+            &chain.http_client,
+            &public_data_plane,
+        );
         let service = Arc::new(Self {
             chain,
             poi_policy,
@@ -948,6 +962,8 @@ impl ChainService {
             wallet_registration_gate: Mutex::new(()),
             cancel: cancel.clone(),
             live_log_task: std::sync::Mutex::new(None),
+            poi_submitter,
+            poi_submitter_task: std::sync::Mutex::new(None),
             anchor_last: AtomicU64::new(last_anchor),
             txid_public_cache_started: AtomicBool::new(false),
             wallet_actor_next: AtomicU64::new(1),
@@ -963,6 +979,7 @@ impl ChainService {
             safe_head_rx,
             snapshot_path,
             backfill_rx,
+            poi_submitter: poi_submitter_driver,
             cancel,
         })
     }
@@ -1330,6 +1347,7 @@ impl ChainService {
                     backfill_tx: self.backfill_tx.clone(),
                     backfill_sender: backfill_sender.clone(),
                     public_data_plane: self.public_data_plane.clone(),
+                    poi_submitter: self.poi_submitter.clone(),
                 },
                 cfg.clone(),
                 actor_id,
@@ -3374,6 +3392,23 @@ impl ChainService {
             {
                 warn!(?err, cache_key = %cache_key, "wallet shutdown cleanup failed");
             }
+        }
+        // The submitter exits on cancel alone, aborting its sends and corpus
+        // refresh, so awaiting it first cannot wait on the data-plane
+        // shutdown, and no refresh it started overlaps that shutdown.
+        let poi_submitter_task = self
+            .poi_submitter_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = poi_submitter_task
+            && let Err(err) = task.await
+            && !err.is_cancelled()
+        {
+            warn!(
+                chain_id = self.chain.deployment.chain_id,
+                "chain PPOI submitter failed during shutdown"
+            );
         }
         self.public_data_plane.shutdown().await;
         await_live_log_task_shutdown(&self.live_log_task, self.chain.deployment.chain_id).await;

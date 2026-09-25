@@ -43,6 +43,8 @@ use super::data_plane::{PublicScanCoverageWrite, PublicScanRows};
 use super::indexed_wallet::{complete_stream_checkpoint, wallet_startup_hedge_block_count};
 use super::logs::combined_log_event_signatures_for_range;
 use super::merkle_artifacts::run_merkle_artifact_catch_up_into;
+use super::poi_submitter::test_support::{RecordedSend, RecordingPoiTransport};
+use super::poi_submitter::{ChainPoiSubmitterDriver, ChainPoiSubmitterHandle};
 use super::service::{
     IndexedWalletCatchUpOutcome, WalletShortStartupPlan, await_live_log_task_shutdown,
     wait_for_startup_sync_target, wait_for_wallet_ready,
@@ -787,6 +789,8 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         wallet_registration_gate: Mutex::new(()),
         cancel: CancellationToken::new(),
         live_log_task: std::sync::Mutex::new(None),
+        poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
+        poi_submitter_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -5627,6 +5631,8 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         wallet_registration_gate: Mutex::new(()),
         cancel: CancellationToken::new(),
         live_log_task: std::sync::Mutex::new(None),
+        poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
+        poi_submitter_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -5647,6 +5653,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             backfill_tx: backfill_request_tx,
             backfill_sender: wallet_backfill_tx.clone(),
             public_data_plane,
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         wallet_cfg.clone(),
         1,
@@ -5813,6 +5820,8 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         wallet_registration_gate: Mutex::new(()),
         cancel: CancellationToken::new(),
         live_log_task: std::sync::Mutex::new(None),
+        poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
+        poi_submitter_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -5838,6 +5847,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
             backfill_tx: backfill_request_tx,
             backfill_sender: wallet_backfill_tx.clone(),
             public_data_plane: public_data_plane.clone(),
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         wallet_cfg.clone(),
         1,
@@ -7070,6 +7080,7 @@ async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
             backfill_tx: backfill_request_tx,
             backfill_sender: backfill_tx.clone(),
             public_data_plane: public_data_plane.clone(),
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         cfg.clone(),
         1,
@@ -7734,6 +7745,7 @@ async fn wallet_startup_events_send_target_before_follow_safe_head_backfill_runs
                 Arc::clone(&db),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         test_wallet_config(
             &scope,
@@ -7860,6 +7872,7 @@ async fn wallet_startup_events_treat_leading_ready_as_success() {
                 Arc::clone(&db),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         test_wallet_config(
             &scope,
@@ -7966,6 +7979,7 @@ async fn wallet_startup_events_retire_token_on_apply_failure() {
                 Arc::clone(&db),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         test_wallet_config(
             &scope,
@@ -8070,6 +8084,7 @@ async fn wallet_startup_events_retire_partial_token_without_done_block() {
                 Arc::clone(&db),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
+            poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         test_wallet_config(
             &scope,
@@ -8241,6 +8256,7 @@ impl IndexedCatchUpTestContext {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: wallet_backfill_tx.clone(),
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_cfg.clone(),
             1,
@@ -8389,6 +8405,22 @@ fn test_chain_service_with_backfill(
     public_data_plane: ChainPublicDataPlane,
     poi_policy: GlobalPoiPolicy,
 ) -> (Arc<ChainService>, mpsc::Receiver<BackfillRequest>) {
+    test_chain_service_with_poi_submitter(
+        db,
+        chain,
+        public_data_plane,
+        poi_policy,
+        ChainPoiSubmitterHandle::detached_for_test(),
+    )
+}
+
+fn test_chain_service_with_poi_submitter(
+    db: Arc<DbStore>,
+    chain: ChainConfig,
+    public_data_plane: ChainPublicDataPlane,
+    poi_policy: GlobalPoiPolicy,
+    poi_submitter: ChainPoiSubmitterHandle,
+) -> (Arc<ChainService>, mpsc::Receiver<BackfillRequest>) {
     let (head_tx, _head_rx) = watch::channel(0);
     let (safe_head_tx, _safe_head_rx) = watch::channel(0);
     let (forest_last_tx, _forest_last_rx) = watch::channel(0);
@@ -8410,6 +8442,8 @@ fn test_chain_service_with_backfill(
             wallet_registration_gate: Mutex::new(()),
             cancel: CancellationToken::new(),
             live_log_task: std::sync::Mutex::new(None),
+            poi_submitter,
+            poi_submitter_task: std::sync::Mutex::new(None),
             anchor_last: std::sync::atomic::AtomicU64::new(0),
             txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
             wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
@@ -10713,15 +10747,53 @@ async fn startup_forest_catch_up_skips_indexed_sources_only_for_short_tails() {
 
 /// A `Transact` log that adds one commitment at `tree_position` of tree 0.
 fn rpc_transact_log(contract: Address, block_number: u64, tree_position: u64) -> serde_json::Value {
-    let encoded = Transact {
-        treeNumber: U256::ZERO,
-        startPosition: U256::from(tree_position),
-        hash: vec![FixedBytes::from(
-            U256::from(tree_position + 1_000).to_be_bytes::<32>(),
-        )],
-        ciphertext: Vec::new(),
-    }
-    .encode_log_data();
+    rpc_event_log(
+        contract,
+        block_number,
+        &Transact {
+            treeNumber: U256::ZERO,
+            startPosition: U256::from(tree_position),
+            hash: vec![FixedBytes::from(
+                U256::from(tree_position + 1_000).to_be_bytes::<32>(),
+            )],
+            ciphertext: Vec::new(),
+        }
+        .encode_log_data(),
+    )
+}
+
+/// A `Transact` log whose commitments, from position 0 of tree 0, carry
+/// ciphertext, so wallet scan rows decode them.
+fn rpc_transact_outputs_log(
+    contract: Address,
+    block_number: u64,
+    hashes: Vec<FixedBytes<32>>,
+) -> serde_json::Value {
+    let ciphertext = merkletree::slow::types::CommitmentCiphertext {
+        ciphertext: [FixedBytes::ZERO; 4],
+        blindedSenderViewingKey: FixedBytes::ZERO,
+        blindedReceiverViewingKey: FixedBytes::ZERO,
+        annotationData: alloy::primitives::Bytes::new(),
+        memo: alloy::primitives::Bytes::new(),
+    };
+    rpc_event_log(
+        contract,
+        block_number,
+        &Transact {
+            treeNumber: U256::ZERO,
+            startPosition: U256::ZERO,
+            ciphertext: vec![ciphertext; hashes.len()],
+            hash: hashes,
+        }
+        .encode_log_data(),
+    )
+}
+
+fn rpc_event_log(
+    contract: Address,
+    block_number: u64,
+    encoded: &alloy::primitives::LogData,
+) -> serde_json::Value {
     let topics = encoded
         .topics()
         .iter()
@@ -10730,7 +10802,7 @@ fn rpc_transact_log(contract: Address, block_number: u64, tree_position: u64) ->
     serde_json::json!({
         "address": format!("{contract:#x}"),
         "topics": topics,
-        "data": format!("0x{}", hex::encode(encoded.data)),
+        "data": format!("0x{}", hex::encode(&encoded.data)),
         "blockHash": format!("{:#x}", FixedBytes::<32>::from([0x11; 32])),
         "blockNumber": format!("{block_number:#x}"),
         "transactionHash": format!("{:#x}", FixedBytes::<32>::from([0x33; 32])),
@@ -11898,9 +11970,16 @@ impl LiveForestFixture {
         safe_head: u64,
     ) -> Self {
         let rpcs = Arc::new(QueryRpcPool::new(rpc_urls, Duration::from_secs(1)));
-        Self::spawn_with(name, rpcs, forest_block, safe_head, |chain| {
-            chain.sync.quick_sync_endpoint = Some(squid_url);
-        })
+        Self::spawn_with(
+            name,
+            rpcs,
+            forest_block,
+            safe_head,
+            ChainPoiSubmitterHandle::detached_for_test(),
+            |chain| {
+                chain.sync.quick_sync_endpoint = Some(squid_url);
+            },
+        )
         .await
     }
 
@@ -11916,11 +11995,18 @@ impl LiveForestFixture {
         progress_tx: Option<crate::types::SyncProgressSender>,
     ) -> Self {
         let rpcs = Arc::new(QueryRpcPool::new(vec![rpc_url], Duration::ZERO));
-        Self::spawn_with(name, rpcs, forest_block, safe_head, move |chain| {
-            chain.sync.block_range = 10;
-            chain.sync.quick_sync_endpoint = Some(squid_url);
-            chain.progress_tx = progress_tx;
-        })
+        Self::spawn_with(
+            name,
+            rpcs,
+            forest_block,
+            safe_head,
+            ChainPoiSubmitterHandle::detached_for_test(),
+            move |chain| {
+                chain.sync.block_range = 10;
+                chain.sync.quick_sync_endpoint = Some(squid_url);
+                chain.progress_tx = progress_tx;
+            },
+        )
         .await
     }
 
@@ -11929,6 +12015,7 @@ impl LiveForestFixture {
         rpcs: Arc<QueryRpcPool>,
         forest_block: u64,
         safe_head: u64,
+        poi_submitter: ChainPoiSubmitterHandle,
         configure: impl FnOnce(&mut ChainConfig),
     ) -> Self {
         let root_dir = temp_db_root(name);
@@ -11948,7 +12035,14 @@ impl LiveForestFixture {
         configure(&mut chain);
         let public_data_plane =
             ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
-        let service = test_chain_service(db, chain, public_data_plane);
+        let service = test_chain_service_with_poi_submitter(
+            db,
+            chain,
+            public_data_plane,
+            test_proxy_poi_policy(),
+            poi_submitter,
+        )
+        .0;
         service.forest_last_tx.send_replace(forest_block);
         service.safe_head_tx.send_replace(safe_head);
         let forest_rx = service.forest_last_tx.subscribe();
@@ -12023,10 +12117,14 @@ async fn yield_until(what: &str, mut ready: impl FnMut() -> bool) {
 
 #[tokio::test(start_paused = true)]
 async fn stalled_live_forest_catches_up_from_squid_when_rpc_pages_fail() {
+    let scope = test_scope();
+    // The one indexed commitment is a prepared output at tree 0, position 1.
     let squid = GraphqlServer::spawn(vec![
         r#"{"data":{"squidStatus":{"height":"150"}}}"#,
-        SQUID_EMPTY_COMMITMENTS,
+        r#"{"data":{"commitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","treeNumber":"0","treePosition":"1","batchStartTreePosition":"1","blockNumber":"100","hash":"77"}]}}"#,
     ]);
+    let prepared = FixedBytes::from(U256::from(77).to_be_bytes::<32>());
+    let list = FixedBytes::from([0x1a; 32]);
     // Confirms the Squid target; getLogs fails so RPC cannot advance.
     let rpc = JsonRpcServer::spawn_handler(|request| match request["method"].as_str() {
         Some("eth_getBlockByNumber") => {
@@ -12037,14 +12135,39 @@ async fn stalled_live_forest_catches_up_from_squid_when_rpc_pages_fail() {
         }
         _ => serde_json::json!({ "error": rpc_error(-32000, "unavailable") }),
     });
+    let transport = Arc::new(RecordingPoiTransport::default());
+    let submitter_cancel = CancellationToken::new();
+    let (poi_submitter, submitter_task) = ChainPoiSubmitterHandle::spawn_for_test(
+        scope.chain_id,
+        Arc::clone(&transport) as Arc<dyn crate::wallet::PendingOutputPoiSubmitter>,
+        submitter_cancel.clone(),
+    );
+    poi_submitter
+        .prepare(vec![poi::poi::SingleCommitmentProofContext {
+            txid_version: DEFAULT_TXID_VERSION.to_string(),
+            railgun_txid: U256::from(7),
+            utxo_tree_in: 0,
+            commitment: prepared,
+            npk: FixedBytes::from([0x22; 32]),
+            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(list, BTreeMap::new())]),
+        }])
+        .await
+        .expect("prepare output context");
     let events = CapturedEvents::default();
     let _guard = events.capture();
-    let fixture = LiveForestFixture::spawn(
+    let squid_url = squid.url.clone();
+    let fixture = LiveForestFixture::spawn_with(
         "live-forest-stall-squid",
-        vec![rpc.url.clone()],
-        squid.url.clone(),
+        Arc::new(QueryRpcPool::new(
+            vec![rpc.url.clone()],
+            Duration::from_secs(1),
+        )),
         50,
         200,
+        poi_submitter,
+        move |chain| {
+            chain.sync.quick_sync_endpoint = Some(squid_url);
+        },
     )
     .await;
     let stall = fixture.stall_period();
@@ -12090,8 +12213,20 @@ async fn stalled_live_forest_catches_up_from_squid_when_rpc_pages_fail() {
         ),
         (Some("stall_install"), Some("150"))
     );
+    yield_until("PPOI send", || !transport.sends().is_empty()).await;
+    assert_eq!(
+        transport.sends(),
+        vec![RecordedSend {
+            commitment: prepared,
+            tree: 0,
+            position: 1,
+            lists: vec![list],
+        }]
+    );
 
     fixture.stop().await;
+    submitter_cancel.cancel();
+    submitter_task.await.expect("submitter exits");
 }
 
 #[tokio::test(start_paused = true)]
@@ -12133,6 +12268,173 @@ async fn advancing_live_forest_issues_no_squid_requests() {
     assert_eq!(squid.requests.try_iter().count(), 0);
 
     fixture.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_batch_sends_prepared_output_ppoi_proofs() {
+    let scope = test_scope();
+    let prepared = FixedBytes::from([0xc2; 32]);
+    let list = FixedBytes::from([0x1a; 32]);
+    let log = rpc_transact_outputs_log(
+        scope.railgun_contract,
+        50,
+        vec![FixedBytes::from([0xc1; 32]), prepared],
+    );
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(vec![log], 100, |_, _, _| None));
+    let transport = Arc::new(RecordingPoiTransport::default());
+    let submitter_cancel = CancellationToken::new();
+    let (poi_submitter, submitter_task) = ChainPoiSubmitterHandle::spawn_for_test(
+        scope.chain_id,
+        Arc::clone(&transport) as Arc<dyn crate::wallet::PendingOutputPoiSubmitter>,
+        submitter_cancel.clone(),
+    );
+    poi_submitter
+        .prepare(vec![poi::poi::SingleCommitmentProofContext {
+            txid_version: DEFAULT_TXID_VERSION.to_string(),
+            railgun_txid: U256::from(7),
+            utxo_tree_in: 0,
+            commitment: prepared,
+            npk: FixedBytes::from([0x22; 32]),
+            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(list, BTreeMap::new())]),
+        }])
+        .await
+        .expect("prepare output context");
+    let fixture = LiveForestFixture::spawn_with(
+        "live-forest-ppoi-submit",
+        Arc::new(QueryRpcPool::new(
+            vec![rpc.url.clone()],
+            Duration::from_secs(1),
+        )),
+        0,
+        100,
+        poi_submitter,
+        |_| {},
+    )
+    .await;
+    fixture
+        .service
+        .safe_head_tx
+        .send(100)
+        .expect("wake live loop");
+
+    yield_until("live batch applied", || *fixture.forest_rx.borrow() == 100).await;
+    yield_until("PPOI send", || !transport.sends().is_empty()).await;
+    assert_eq!(
+        transport.sends(),
+        vec![RecordedSend {
+            commitment: prepared,
+            tree: 0,
+            position: 1,
+            lists: vec![list],
+        }]
+    );
+
+    fixture.stop().await;
+    submitter_cancel.cancel();
+    submitter_task.await.expect("submitter exits");
+}
+
+/// Reported bug: switching away from the sender wallet before its transaction
+/// finalizes left the outputs' PPOI proofs unsent.
+#[tokio::test(start_paused = true)]
+async fn created_output_ppoi_context_is_sent_after_sender_wallet_retires() {
+    let scope = test_scope();
+    let output = FixedBytes::from([0xc2; 32]);
+    let list = poi::poi::default_active_poi_list_keys()[0];
+    let log = rpc_transact_outputs_log(
+        scope.railgun_contract,
+        50,
+        vec![FixedBytes::from([0xc1; 32]), output],
+    );
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(vec![log], 100, |_, _, _| None));
+    let transport = Arc::new(RecordingPoiTransport::default());
+    let submitter_cancel = CancellationToken::new();
+    let (poi_submitter, driver) = ChainPoiSubmitterDriver::unspawned_for_test(
+        scope.chain_id,
+        Arc::clone(&transport) as Arc<dyn crate::wallet::PendingOutputPoiSubmitter>,
+    );
+    let fixture = LiveForestFixture::spawn_with(
+        "live-forest-ppoi-sender-retired",
+        Arc::new(QueryRpcPool::new(
+            vec![rpc.url.clone()],
+            Duration::from_secs(1),
+        )),
+        0,
+        100,
+        poi_submitter.clone(),
+        |_| {},
+    )
+    .await;
+    let mut cfg = test_wallet_config(
+        &scope,
+        Url::parse("http://127.0.0.1:1").expect("unused quick-sync url"),
+    );
+    cfg.cache_key = test_cache_key("ppoi-sender");
+    cfg.quick_sync_endpoint = None;
+    // No startup scan: the sender never observes its own output, so only the
+    // chain's live rows can place it.
+    cfg.sync_to_block = Some(0);
+    cfg.use_indexed_wallet_catch_up = false;
+    let sender = fixture
+        .service
+        .register_wallet(cfg)
+        .await
+        .expect("register sender wallet");
+
+    let create_sender = sender.clone();
+    let create = tokio::spawn(async move {
+        create_sender
+            .create_pending_output_poi_contexts(vec![crate::types::PendingOutputPoiContextIntent {
+                txid_version: DEFAULT_TXID_VERSION.to_string(),
+                output_commitment: output,
+                output_npk: FixedBytes::from([0x22; 32]),
+                utxo_tree_in: 0,
+                railgun_txid: U256::from(7),
+                pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(
+                    list,
+                    BTreeMap::new(),
+                )]),
+                required_poi_list_keys: vec![list],
+                output_role: local_db::PendingOutputPoiRole::Recipient,
+            }])
+            .await
+    });
+    // Nothing else enqueues while no context is pending, so the one queued
+    // command is the create's prepare.
+    yield_until("prepare queued", || driver.queued_commands_for_test() == 1).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !create.is_finished(),
+        "the create reply waits for the chain to hold the context"
+    );
+    let submitter_task = driver.spawn(submitter_cancel.clone());
+    assert_eq!(create.await.expect("create task"), Ok(1));
+
+    fixture.service.unregister_wallet(&sender).await;
+    assert!(fixture.service.wallet.read().await.is_none());
+    fixture
+        .service
+        .safe_head_tx
+        .send(100)
+        .expect("wake live loop");
+
+    yield_until("live batch applied", || *fixture.forest_rx.borrow() == 100).await;
+    yield_until("PPOI send", || !transport.sends().is_empty()).await;
+    assert_eq!(
+        transport.sends(),
+        vec![RecordedSend {
+            commitment: output,
+            tree: 0,
+            position: 1,
+            lists: vec![list],
+        }]
+    );
+
+    fixture.stop().await;
+    submitter_cancel.cancel();
+    submitter_task.await.expect("submitter exits");
 }
 
 #[tokio::test(start_paused = true)]

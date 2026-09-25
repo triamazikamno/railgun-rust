@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::SenderTransactionCandidate;
+use crate::chain::PendingOutputPoiSubmitIntent;
 use poi::error::PoiRpcError;
 
 use super::{
@@ -411,7 +412,7 @@ pub(super) async fn read_pending_output_poi_tentative_local_statuses(
     visible
 }
 
-fn is_missing_railgun_txid_error(error: &PoiError) -> bool {
+pub(crate) fn is_missing_railgun_txid_error(error: &PoiError) -> bool {
     let PoiError::RpcRequest {
         source: PoiRpcError::JsonRpc { message, .. },
     } = error
@@ -440,6 +441,38 @@ fn tentative_pending_output_poi_list_keys(
                     .contains_key(list_key)
         })
         .collect()
+}
+
+/// Send-ready copy of a newly created context for the chain PPOI submitter,
+/// holding the proofs of its required lists that are currently active. `None`
+/// when the context submits by transact proof or lacks one of those proofs,
+/// the same rule the missing-list preflight applies.
+pub(super) fn pending_output_poi_handoff_context(
+    record: &PendingOutputPoiContextRecord,
+    active_list_keys: &[FixedBytes<32>],
+) -> Option<SingleCommitmentProofContext> {
+    if record.txid_merkleroot_index.is_some()
+        || record.output_role == PendingOutputPoiRole::RecoveredOutgoing
+    {
+        return None;
+    }
+    let mut list_keys = record.list_keys();
+    list_keys.retain(|list_key| active_list_keys.contains(list_key));
+    if list_keys.is_empty() {
+        return None;
+    }
+    let pre_transaction_pois = record.retain_poi_lists(&list_keys);
+    if pre_transaction_pois.len() != list_keys.len() {
+        return None;
+    }
+    Some(SingleCommitmentProofContext {
+        txid_version: record.txid_version.clone(),
+        railgun_txid: record.railgun_txid,
+        utxo_tree_in: record.utxo_tree_in,
+        commitment: record.output_commitment,
+        npk: record.output_npk,
+        pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
+    })
 }
 
 fn tentative_pending_output_poi_context_matches(
@@ -585,10 +618,11 @@ pub(super) async fn submit_pending_output_poi_tentative_candidates(
                         )
                     }))
                 },
+                PendingOutputPoiSubmitIntent::Tentative,
                 &record.txid_version,
                 EVM_CHAIN_TYPE,
                 cfg.chain.chain_id,
-                &context,
+                context,
                 u64::from(candidate.observation.tree),
                 candidate.observation.position,
             )
@@ -615,9 +649,9 @@ pub(super) async fn submit_pending_output_poi_tentative_candidates(
                 result.retryable.push(key);
                 result.context_stale += 1;
             }
-            Err(WalletPrivateRemoteError::Remote(error)) => {
+            Err(WalletPrivateRemoteError::Remote(failure)) => {
                 result.retryable.push(key);
-                if is_missing_railgun_txid_error(&error) {
+                if failure.missing_txid {
                     result.missing_txid += 1;
                 } else {
                     result.remote_failure += 1;
@@ -713,8 +747,9 @@ pub(super) enum PendingOutputPoiRemoteAttempt {
     Succeeded {
         submitted_list_keys: Vec<FixedBytes<32>>,
     },
+    /// Remote failure; `error` is the text recorded in `SubmitFailed`.
     Failed {
-        error: PoiError,
+        error: String,
     },
 }
 
@@ -803,6 +838,18 @@ impl PendingOutputPoiSubmissionPlan {
             }
             PendingOutputPoiSubmissionKind::ForceMatching => {
                 PendingOutputPoiSubmissionPredicate::ForceMatching
+            }
+        }
+    }
+
+    const fn submit_intent(&self) -> PendingOutputPoiSubmitIntent {
+        match self.kind {
+            PendingOutputPoiSubmissionKind::Missing => PendingOutputPoiSubmitIntent::Missing,
+            PendingOutputPoiSubmissionKind::RetrySubmitted => {
+                PendingOutputPoiSubmitIntent::RetrySubmitted
+            }
+            PendingOutputPoiSubmissionKind::ForceMatching => {
+                PendingOutputPoiSubmitIntent::ForceMatching
             }
         }
     }
@@ -1227,7 +1274,9 @@ async fn submit_recovered_outgoing_submission_group(
             }
             Err(WalletPrivateRemoteError::Check(error)) => return Err(error),
             Err(WalletPrivateRemoteError::Remote(error)) => {
-                return Ok(PendingOutputPoiRemoteAttempt::Failed { error });
+                return Ok(PendingOutputPoiRemoteAttempt::Failed {
+                    error: error.to_string(),
+                });
             }
         }
     }
@@ -1344,7 +1393,7 @@ async fn submit_observed_pending_output_pois_impl(
                         group.proofs.iter().map(|(list_key, _)| *list_key).collect(),
                         false,
                         OutputPoiRecoveryAction::SubmitFailed {
-                            error: error.to_string(),
+                            error,
                             retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                         },
                         false,
@@ -1544,7 +1593,7 @@ async fn submit_observed_pending_output_pois_impl(
                     }
                 }
             }
-            PendingOutputPoiRemoteAttempt::Failed { error: err } => {
+            PendingOutputPoiRemoteAttempt::Failed { error } => {
                 if !pending_output_poi_submission_side_effect_current(
                     authority,
                     cache_store,
@@ -1572,7 +1621,7 @@ async fn submit_observed_pending_output_pois_impl(
                         predicate: plan.predicate(),
                         merge_submitted_list_keys: false,
                         action: OutputPoiRecoveryAction::SubmitFailed {
-                            error: err.to_string(),
+                            error,
                             retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                         },
                         now,
@@ -1606,7 +1655,7 @@ async fn submit_pending_output_poi_context_via_gateway(
     private_poi: &WalletPrivatePoiClients,
     chain_id: u64,
     record: &PendingOutputPoiContextRecord,
-    context: &SingleCommitmentProofContext,
+    context: SingleCommitmentProofContext,
     observation: &PendingOutputPoiObservation,
     submitted_list_keys: &[FixedBytes<32>],
 ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
@@ -1654,7 +1703,9 @@ async fn submit_pending_output_poi_context_via_gateway(
                     }
                     Err(WalletPrivateRemoteError::Check(error)) => return Err(error),
                     Err(WalletPrivateRemoteError::Remote(error)) => {
-                        return Ok(PendingOutputPoiRemoteAttempt::Failed { error });
+                        return Ok(PendingOutputPoiRemoteAttempt::Failed {
+                            error: error.to_string(),
+                        });
                     }
                 }
             }
@@ -1680,6 +1731,7 @@ async fn submit_pending_output_poi_context_via_gateway(
                         PendingOutputPoiPreflight::Ready
                     ))
                 },
+                plan.submit_intent(),
                 &record.txid_version,
                 EVM_CHAIN_TYPE,
                 chain_id,
@@ -1699,8 +1751,10 @@ async fn submit_pending_output_poi_context_via_gateway(
                 Ok(PendingOutputPoiRemoteAttempt::NotCurrent)
             }
             Err(WalletPrivateRemoteError::Check(error)) => Err(error),
-            Err(WalletPrivateRemoteError::Remote(error)) => {
-                Ok(PendingOutputPoiRemoteAttempt::Failed { error })
+            Err(WalletPrivateRemoteError::Remote(failure)) => {
+                Ok(PendingOutputPoiRemoteAttempt::Failed {
+                    error: failure.summary,
+                })
             }
         }
     }
@@ -3741,7 +3795,7 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
         private_poi,
         cfg.chain.chain_id,
         record,
-        &context,
+        context,
         observation,
         &submitted_list_keys,
     )

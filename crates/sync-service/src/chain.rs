@@ -59,6 +59,7 @@ mod forest_db;
 mod indexed_wallet;
 mod logs;
 mod merkle_artifacts;
+mod poi_submitter;
 mod service;
 mod types;
 mod workers;
@@ -92,6 +93,12 @@ use logs::{
     sort_logs,
 };
 use merkle_artifacts::run_merkle_artifact_catch_up_into;
+#[cfg(test)]
+pub(crate) use poi_submitter::test_support as poi_submitter_test_support;
+pub(crate) use poi_submitter::{
+    ChainPoiSubmitterHandle, PendingOutputPoiHandoff, PendingOutputPoiHandoffFailure,
+    PendingOutputPoiSubmitIntent,
+};
 pub(crate) use service::PreparedChainService;
 use service::WalletIndexedTailFallbackResult;
 use types::{

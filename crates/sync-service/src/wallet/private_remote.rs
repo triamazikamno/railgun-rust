@@ -3,6 +3,9 @@ use super::{
     PoiRpcClient, PoiStatus, PoiStatusReader, SingleCommitmentProofContext,
     WalletPrivateRemoteAuthority,
 };
+use crate::chain::{
+    PendingOutputPoiHandoff, PendingOutputPoiHandoffFailure, PendingOutputPoiSubmitIntent,
+};
 use std::convert::Infallible;
 
 /// Why a wallet-private remote effect was rejected before transport dispatch.
@@ -118,19 +121,27 @@ impl WalletPrivateRemoteGate {
 
 /// Remote POI clients available to a wallet job only through generation/subject gates.
 /// Raw transports are intentionally private so production call sites cannot bypass dispatch.
+/// Transact proofs go to the POI node directly; single-commitment proofs are handed off
+/// to the chain PPOI submitter.
 #[derive(Clone)]
 pub(crate) struct WalletPrivatePoiClients {
     effects: WalletPrivateRemoteEffects,
     status: Arc<dyn PoiStatusReader>,
     submit: Arc<dyn PendingOutputPoiSubmitter>,
+    handoff: Arc<dyn PendingOutputPoiHandoff>,
 }
 
 impl WalletPrivatePoiClients {
-    pub(crate) fn from_rpc(authority: WalletPrivateRemoteAuthority, client: PoiRpcClient) -> Self {
+    pub(crate) fn new(
+        authority: WalletPrivateRemoteAuthority,
+        client: PoiRpcClient,
+        handoff: Arc<dyn PendingOutputPoiHandoff>,
+    ) -> Self {
         Self {
             effects: WalletPrivateRemoteEffects::new(authority),
             status: Arc::new(client.clone()),
             submit: Arc::new(client),
+            handoff,
         }
     }
 
@@ -163,24 +174,28 @@ impl WalletPrivatePoiClients {
             .await
     }
 
+    /// Hands the context off to the chain PPOI submitter. Returns once the
+    /// submitter has recorded it, without waiting for the POI node.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_single_commitment_proofs<Check, CheckFuture, CheckError>(
         &self,
         check_subject: Check,
+        intent: PendingOutputPoiSubmitIntent,
         txid_version: &str,
         chain_type: u8,
         chain_id: u64,
-        context: &SingleCommitmentProofContext,
+        context: SingleCommitmentProofContext,
         utxo_tree_out: u64,
         utxo_position_out: u64,
-    ) -> Result<(), WalletPrivateRemoteError<PoiError, CheckError>>
+    ) -> Result<(), WalletPrivateRemoteError<PendingOutputPoiHandoffFailure, CheckError>>
     where
         Check: FnOnce() -> CheckFuture,
         CheckFuture: std::future::Future<Output = Result<bool, CheckError>>,
     {
         self.effects
             .run(check_subject, || {
-                self.submit.submit_single_commitment_proofs(
+                self.handoff.hand_off_single_commitment_proofs(
+                    intent,
                     txid_version,
                     chain_type,
                     chain_id,
@@ -224,15 +239,19 @@ impl WalletPrivatePoiClients {
 
 #[cfg(test)]
 impl WalletPrivatePoiClients {
+    /// `submit` serves transact proofs directly and, through
+    /// `test_support::SubmitterHandoff`, the single-commitment handoffs.
     pub(crate) fn for_test(
         authority: WalletPrivateRemoteAuthority,
         status: Arc<dyn PoiStatusReader>,
         submit: Arc<dyn PendingOutputPoiSubmitter>,
     ) -> Self {
+        let handoff = Arc::new(test_support::SubmitterHandoff(Arc::clone(&submit)));
         Self {
             effects: WalletPrivateRemoteEffects::new(authority),
             status,
             submit,
+            handoff,
         }
     }
 
@@ -251,14 +270,64 @@ impl WalletPrivatePoiClients {
         let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
         Self::for_test(authority, unavailable, submit)
     }
+
+    /// Single-commitment handoffs go to `handoff`; status reads and transact
+    /// proofs are unavailable.
+    pub(crate) fn for_handoff(
+        authority: WalletPrivateRemoteAuthority,
+        handoff: Arc<dyn PendingOutputPoiHandoff>,
+    ) -> Self {
+        let unavailable = Arc::new(test_support::UnavailablePrivatePoiTransport);
+        Self {
+            effects: WalletPrivateRemoteEffects::new(authority),
+            status: unavailable.clone(),
+            submit: unavailable,
+            handoff,
+        }
+    }
 }
 
 #[cfg(test)]
 mod test_support {
     use super::*;
-    use crate::wallet::async_trait;
+    use crate::wallet::{async_trait, is_missing_railgun_txid_error};
 
     pub(super) struct UnavailablePrivatePoiTransport;
+
+    /// Test handoff over a recording or scripted submitter mock: each handoff
+    /// is one single-commitment call, and a failed call becomes the handoff
+    /// failure the chain submitter would report for it.
+    pub(super) struct SubmitterHandoff(pub(super) Arc<dyn PendingOutputPoiSubmitter>);
+
+    #[async_trait]
+    impl PendingOutputPoiHandoff for SubmitterHandoff {
+        #[allow(clippy::too_many_arguments)]
+        async fn hand_off_single_commitment_proofs(
+            &self,
+            _intent: PendingOutputPoiSubmitIntent,
+            txid_version: &str,
+            chain_type: u8,
+            chain_id: u64,
+            context: SingleCommitmentProofContext,
+            utxo_tree_out: u64,
+            utxo_position_out: u64,
+        ) -> Result<(), PendingOutputPoiHandoffFailure> {
+            self.0
+                .submit_single_commitment_proofs(
+                    txid_version,
+                    chain_type,
+                    chain_id,
+                    &context,
+                    utxo_tree_out,
+                    utxo_position_out,
+                )
+                .await
+                .map_err(|error| PendingOutputPoiHandoffFailure {
+                    missing_txid: is_missing_railgun_txid_error(&error),
+                    summary: error.to_string(),
+                })
+        }
+    }
 
     #[async_trait]
     impl PoiStatusReader for UnavailablePrivatePoiTransport {

@@ -1,4 +1,5 @@
 use super::handle::LOCAL_PENDING_SPENT_TTL;
+use super::pending_output_poi::pending_output_poi_handoff_context;
 use super::{
     Arc, AtomicU64, BackfillEvent, CancellationToken, ChainError, ChainPublicDataPlane, DbStore,
     Duration, FixedBytes, FuturesUnordered, HashSet, IndexedArtifactSourceConfig, Instant,
@@ -40,12 +41,12 @@ use super::{
     wallet_utxo_stable_identity, warn, watch,
 };
 use crate::PublicScanSource;
+use crate::chain::ChainPoiSubmitterHandle;
 use crate::types::BackfillRequest;
 use crate::types::{PoiCorpusRevision, WalletSyncTargetLease};
 use futures::{FutureExt, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::{JoinHandle, JoinSet};
 
 const fn wallet_private_request_error(
@@ -290,6 +291,9 @@ async fn clear_local_pending_spent(
         .map_err(|reason| wallet_private_request_error(&reason))
 }
 
+/// Persists the new contexts, then hands their send-ready copies to the chain
+/// PPOI submitter and waits for it to record them, so the chain holds them
+/// before the caller broadcasts.
 async fn commit_pending_output_contexts(
     handle: &WalletHandle,
     cancel: &CancellationToken,
@@ -297,6 +301,8 @@ async fn commit_pending_output_contexts(
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     reset_generation: u64,
+    active_poi_list_keys: &[FixedBytes<32>],
+    poi_submitter: &ChainPoiSubmitterHandle,
     contexts: &[PendingOutputPoiContextIntent],
 ) -> Result<usize, WalletPrivateRequestError> {
     let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
@@ -340,10 +346,32 @@ async fn commit_pending_output_contexts(
         )?;
         Ok::<(), WalletCacheError>(())
     }) {
-        Ok(Ok(())) => Ok(new_records.len()),
-        Ok(Err(_)) => Err(WalletPrivateRequestError::PersistenceFailed),
-        Err(reason) => Err(wallet_private_request_error(&reason)),
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err(WalletPrivateRequestError::PersistenceFailed),
+        Err(reason) => return Err(wallet_private_request_error(&reason)),
     }
+    let handoff = new_records
+        .iter()
+        .filter_map(|record| pending_output_poi_handoff_context(record, active_poi_list_keys))
+        .collect::<Vec<_>>();
+    if handoff.is_empty() {
+        return Ok(new_records.len());
+    }
+    let handoff_count = handoff.len();
+    if permit.revalidate().is_err() {
+        debug!(
+            chain_id = cfg.chain.chain_id,
+            contexts = handoff_count,
+            "pending output POI handoff skipped; wallet actor inactive"
+        );
+    } else if poi_submitter.prepare(handoff).await.is_err() {
+        debug!(
+            chain_id = cfg.chain.chain_id,
+            contexts = handoff_count,
+            "pending output POI handoff skipped; chain PPOI submitter stopped"
+        );
+    }
+    Ok(new_records.len())
 }
 
 fn publish_poi_refreshing(
@@ -413,6 +441,7 @@ fn request_poi_maintenance(
     http_client: Option<&reqwest::Client>,
     indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     poi_runtime: &WalletPoiRuntime,
+    poi_submitter: &ChainPoiSubmitterHandle,
     forest: &Arc<RwLock<MerkleForest>>,
     utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
     active_poi_list_keys: &[FixedBytes<32>],
@@ -453,6 +482,7 @@ fn request_poi_maintenance(
         poi_client: client,
         poi_is_indexed: poi_runtime.is_indexed_artifacts(),
         poi_wallet_read_fallback: poi_runtime.wallet_read_fallback_enabled(),
+        poi_submitter: poi_submitter.clone(),
         forest: Arc::clone(forest),
         utxos: Arc::clone(utxos),
         active_poi_list_keys: active_poi_list_keys.to_vec(),
@@ -485,6 +515,7 @@ fn on_poi_maintenance_done(
     http_client: Option<&reqwest::Client>,
     indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     poi_runtime: &WalletPoiRuntime,
+    poi_submitter: &ChainPoiSubmitterHandle,
     forest: &Arc<RwLock<MerkleForest>>,
     utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
     active_poi_list_keys: &[FixedBytes<32>],
@@ -512,6 +543,7 @@ fn on_poi_maintenance_done(
             http_client,
             indexed_artifact_source,
             poi_runtime,
+            poi_submitter,
             forest,
             utxos,
             active_poi_list_keys,
@@ -539,6 +571,8 @@ struct PoiMaintenanceJob {
     poi_client: PoiRpcClient,
     poi_is_indexed: bool,
     poi_wallet_read_fallback: bool,
+    /// Receives the job's single-commitment PPOI handoffs.
+    poi_submitter: ChainPoiSubmitterHandle,
     forest: Arc<RwLock<MerkleForest>>,
     utxos: Arc<RwLock<Vec<WalletUtxo>>>,
     active_poi_list_keys: Vec<FixedBytes<32>>,
@@ -603,9 +637,10 @@ impl PoiMaintenanceJob {
             &self.cancel,
         )
         .with_apply_client(&self.apply_client);
-        let private_poi = WalletPrivatePoiClients::from_rpc(
+        let private_poi = WalletPrivatePoiClients::new(
             authority.remote_authority(),
             self.poi_client.clone(),
+            Arc::new(self.poi_submitter.clone()),
         );
         // Reconstruct runtime view for authorized helpers.
         let poi_runtime = if self.poi_is_indexed {
@@ -760,6 +795,7 @@ fn spawn_pending_output_poi_tentative_job(
     cache_store: &Arc<dyn WalletCacheStore>,
     cfg: &WalletConfig,
     poi_runtime: &WalletPoiRuntime,
+    poi_submitter: &ChainPoiSubmitterHandle,
     active_list_keys: &[FixedBytes<32>],
     candidates: Vec<PendingOutputPoiTentativeCandidate>,
 ) {
@@ -770,12 +806,16 @@ fn spawn_pending_output_poi_tentative_job(
     let cache_store = Arc::clone(cache_store);
     let cfg = cfg.clone();
     let poi_client = poi_runtime.public_client().clone();
+    let poi_submitter = poi_submitter.clone();
     let active_list_keys = active_list_keys.to_vec();
     poi_jobs.spawn(async move {
         let authority =
             WalletPrivateMutationAuthority::new(&handle, credential.reset_generation, &cancel);
-        let private_poi =
-            WalletPrivatePoiClients::from_rpc(authority.remote_authority(), poi_client);
+        let private_poi = WalletPrivatePoiClients::new(
+            authority.remote_authority(),
+            poi_client,
+            Arc::new(poi_submitter),
+        );
         let result = submit_pending_output_poi_tentative_candidates(
             &authority,
             cache_store.as_ref(),
@@ -2147,53 +2187,6 @@ async fn refresh_tentative_pending_output_poi_statuses(
     }
 }
 
-fn spawn_tentative_poi_corpus_refresh(
-    poi_jobs: &WalletPoiJobTracker,
-    public_data_plane: &ChainPublicDataPlane,
-    cancel: &CancellationToken,
-    chain_id: u64,
-    refresh_in_flight: &Arc<AtomicBool>,
-) {
-    if refresh_in_flight
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    let public_data_plane = public_data_plane.clone();
-    let cancel = cancel.clone();
-    let refresh_guard = TentativePoiCorpusRefreshGuard(Arc::clone(refresh_in_flight));
-    poi_jobs.spawn(async move {
-        let _refresh_guard = refresh_guard;
-        let retry = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            result = public_data_plane.retry_poi_artifact_cache_events(chain_id) => result,
-        };
-        let Ok(retry) = retry else {
-            debug!(chain_id, "tentative POI corpus refresh admission skipped");
-            return;
-        };
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {}
-            result = retry.wait() => {
-                if result.is_err() {
-                    debug!(chain_id, "tentative POI corpus refresh failed");
-                }
-            }
-        }
-    });
-}
-
-struct TentativePoiCorpusRefreshGuard(Arc<AtomicBool>);
-
-impl Drop for TentativePoiCorpusRefreshGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 /// Background POI jobs started by the wallet actor.
 ///
 /// The worker's supervising task owns the set, so it outlives the actor task even when the actor
@@ -2253,6 +2246,7 @@ pub(crate) async fn prepare_wallet_worker(
         backfill_tx,
         backfill_sender,
         public_data_plane,
+        poi_submitter,
     } = services;
     let mut poi_corpus_handle = None;
     let mut last_poi_corpus_revision = PoiCorpusRevision::default();
@@ -2441,7 +2435,6 @@ pub(crate) async fn prepare_wallet_worker(
         // Tentative attempts are actor-lifetime only; safe-head maintenance never consults this set.
         let mut pending_output_poi_tentative_attempts =
             PendingOutputPoiTentativeAttemptTracker::default();
-        let tentative_poi_corpus_refresh_in_flight = Arc::new(AtomicBool::new(false));
         let mut actor_state = actor_state;
         let mut accepted_backfill_liveness = FuturesUnordered::new();
         let mut accepted_indexed_job_liveness = FuturesUnordered::new();
@@ -2912,6 +2905,7 @@ pub(crate) async fn prepare_wallet_worker(
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &poi_runtime,
+                        &poi_submitter,
                         &forest,
                         &utxos,
                         &active_poi_list_keys,
@@ -3117,6 +3111,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
                                 &poi_runtime,
+                                &poi_submitter,
                                 &forest,
                                 &utxos,
                                 &active_poi_list_keys,
@@ -3226,6 +3221,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
                                 &poi_runtime,
+                                &poi_submitter,
                                 &forest,
                                 &utxos,
                                 &active_poi_list_keys,
@@ -3262,13 +3258,6 @@ pub(crate) async fn prepare_wallet_worker(
                             pending_output_poi_tentative_attempts
                                 .release_retryable(credential.reset_generation, &retryable);
                             if !accepted_candidates.is_empty() {
-                                spawn_tentative_poi_corpus_refresh(
-                                    &poi_jobs,
-                                    &public_data_plane,
-                                    &cancel,
-                                    cfg.chain.chain_id,
-                                    &tentative_poi_corpus_refresh_in_flight,
-                                );
                                 refresh_tentative_pending_output_poi_statuses(
                                     &worker_handle,
                                     &cancel,
@@ -3375,6 +3364,7 @@ pub(crate) async fn prepare_wallet_worker(
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &poi_runtime,
+                        &poi_submitter,
                         &forest,
                         &utxos,
                         &active_poi_list_keys,
@@ -3519,6 +3509,8 @@ pub(crate) async fn prepare_wallet_worker(
                                         cache_store.as_ref(),
                                         &cfg,
                                         reset_generation,
+                                        &active_poi_list_keys,
+                                        &poi_submitter,
                                         &contexts,
                                     )
                                     .await
@@ -3697,6 +3689,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 &cache_store,
                                 &cfg,
                                 &poi_runtime,
+                                &poi_submitter,
                                 &active_poi_list_keys,
                                 tentative_candidates,
                             );
@@ -3900,6 +3893,7 @@ pub(crate) async fn prepare_wallet_worker(
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &poi_runtime,
+                        &poi_submitter,
                         &forest,
                         &utxos,
                         &active_poi_list_keys,
@@ -4117,6 +4111,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     http_client.as_ref(),
                                     indexed_artifact_source.as_ref(),
                                     &poi_runtime,
+                                    &poi_submitter,
                                     &forest,
                                     &utxos,
                                     &active_poi_list_keys,
@@ -4569,6 +4564,7 @@ pub(crate) async fn prepare_wallet_worker(
                                             http_client.as_ref(),
                                             indexed_artifact_source.as_ref(),
                                             &poi_runtime,
+                                            &poi_submitter,
                                             &forest,
                                             &utxos,
                                             &active_poi_list_keys,
@@ -5054,21 +5050,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tentative_corpus_refresh_gate_releases_after_drop() {
-        let gate = Arc::new(AtomicBool::new(false));
-        assert!(
-            gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        );
-        assert!(
-            gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        );
-        drop(TentativePoiCorpusRefreshGuard(Arc::clone(&gate)));
-        assert!(!gate.load(Ordering::Acquire));
-    }
-
     #[tokio::test]
     async fn committed_corpus_revision_waiter_observes_latest_revision() {
         let (revision_tx, revision_rx) = watch::channel(PoiCorpusRevision::default());
@@ -5133,6 +5114,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -5286,6 +5268,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -5383,6 +5366,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -5442,6 +5426,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -5531,6 +5516,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -6416,6 +6402,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -6486,6 +6473,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -6600,6 +6588,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -6670,6 +6659,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -6781,6 +6771,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -6879,6 +6870,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -6991,6 +6983,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -7090,6 +7083,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7178,6 +7172,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7309,6 +7304,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7385,6 +7381,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7446,6 +7443,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7523,6 +7521,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7583,6 +7582,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7652,6 +7652,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -7713,6 +7714,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -7810,6 +7812,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -7903,6 +7906,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -8000,6 +8004,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -8096,6 +8101,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -8198,6 +8204,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -8252,6 +8259,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -8321,6 +8329,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -8399,6 +8408,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -8511,6 +8521,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -8580,6 +8591,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -8739,6 +8751,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -8997,6 +9010,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -9181,6 +9195,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -9331,6 +9346,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -9428,6 +9444,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -9628,6 +9645,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_event_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -9733,6 +9751,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -9813,6 +9832,7 @@ mod tests {
                     backfill_tx: backfill_request_tx,
                     backfill_sender: backfill_tx,
                     public_data_plane: test_public_data_plane(&db),
+                    poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
                 },
                 cfg,
                 1,
@@ -9924,6 +9944,7 @@ mod tests {
                     backfill_tx: backfill_request_tx,
                     backfill_sender: backfill_tx,
                     public_data_plane: test_public_data_plane(&db),
+                    poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
                 },
                 cfg.clone(),
                 1,
@@ -10015,6 +10036,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -10059,6 +10081,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -10128,6 +10151,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -10191,6 +10215,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -10256,6 +10281,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -10328,6 +10354,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -10386,6 +10413,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -10481,6 +10509,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -10637,6 +10666,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: public_data_plane.clone(),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -10834,6 +10864,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -10942,6 +10973,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -11149,6 +11181,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx,
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg.clone(),
             1,
@@ -11262,6 +11295,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -11330,6 +11364,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -11385,6 +11420,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,
@@ -11467,6 +11503,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -11562,6 +11599,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -11675,6 +11713,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -11760,6 +11799,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -11893,6 +11933,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             wallet_config(),
             1,
@@ -12987,6 +13028,7 @@ mod tests {
                 backfill_tx: backfill_request_tx,
                 backfill_sender: backfill_tx.clone(),
                 public_data_plane: test_public_data_plane(&db),
+                poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
             },
             cfg,
             1,

@@ -16,6 +16,7 @@ use super::{
     materialize_sender_transaction_candidates, output_poi_recovery_candidates,
     recover_missing_output_pois,
 };
+use crate::chain::ChainPoiSubmitterHandle;
 use poi::SensitiveUrl;
 use tokio::sync::{mpsc, watch};
 
@@ -89,7 +90,9 @@ impl WalletPoiRuntime {
     }
 
     /// Raw client for public POI operations and for constructing the private gateway.
-    /// Wallet-private effects must not call this client directly.
+    /// Wallet-private effects must not call this client directly. The one sanctioned
+    /// direct user for wallet-originated single-commitment sends is the chain PPOI
+    /// submitter (`chain::poi_submitter`), which sends the contexts wallets hand off.
     pub(crate) const fn public_client(&self) -> &PoiRpcClient {
         match self {
             Self::IndexedArtifacts { client, .. } | Self::PoiProxy { client } => client,
@@ -120,6 +123,8 @@ pub(crate) struct WalletWorkerServices {
     pub backfill_tx: mpsc::Sender<crate::types::BackfillRequest>,
     pub backfill_sender: mpsc::Sender<BackfillEvent>,
     pub public_data_plane: ChainPublicDataPlane,
+    /// The chain's PPOI submitter, which sends the wallet's single-commitment proofs.
+    pub poi_submitter: ChainPoiSubmitterHandle,
 }
 
 pub(super) fn now_epoch_secs() -> u64 {

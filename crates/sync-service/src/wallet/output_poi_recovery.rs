@@ -1110,7 +1110,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                     );
                 }
             }
-            PendingOutputPoiRemoteAttempt::Failed { error: err, .. } => {
+            PendingOutputPoiRemoteAttempt::Failed { error, .. } => {
                 if !matches!(
                     pending_output_poi_submission_plan_current(
                         authority,
@@ -1140,7 +1140,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                         predicate: plan.predicate(),
                         merge_submitted_list_keys: false,
                         action: OutputPoiRecoveryAction::SubmitFailed {
-                            error: err.to_string(),
+                            error,
                             retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                         },
                         now,

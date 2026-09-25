@@ -110,6 +110,7 @@ use output_poi_recovery::{
 };
 #[cfg(test)]
 use pending_output_poi::apply_owned_poi_private_delta_on_actor;
+pub(crate) use pending_output_poi::is_missing_railgun_txid_error;
 use pending_output_poi::{
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
     PendingOutputPoiTentativeAttemptKey, PendingOutputPoiTentativeCandidate,
@@ -136,7 +137,7 @@ use poi_maintenance::PoiMaintenanceController;
 use poi_refresh::{
     refresh_wallet_poi_statuses_remote_authorized, refresh_wallet_poi_statuses_selected,
 };
-use poi_sources::PendingOutputPoiSubmitter;
+pub(crate) use poi_sources::PendingOutputPoiSubmitter;
 pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
 use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
 use sender_candidate_recovery::{

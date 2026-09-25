@@ -1198,6 +1198,9 @@ pub(super) fn spawn_live_log_loop(
                             ) {
                                 Ok(apply) => {
                                     service.record_public_scan_apply(&apply).await;
+                                    if let WalletScanRowsPayload::Rows(rows) = &apply.rows.payload {
+                                        service.poi_submitter.observe(rows).await;
+                                    }
                                 }
                                 Err(err) => {
                                     warn!(
@@ -1554,7 +1557,9 @@ impl LiveForestInstall {
 /// Installs an indexed `candidate` as the live forest. It is dropped when the
 /// live forest already reached its target; otherwise it is persisted, swapped
 /// in under the write lock, and written as an anchor snapshot, then the
-/// forest block is published, and completion progress last.
+/// forest block is published, and completion progress. Last, when the PPOI
+/// submitter holds pending entries, the leaves the install added past the
+/// replaced forest are reported to it, after the lock is released.
 ///
 /// Runs inside the live loop, the only forest writer, so the forest block
 /// read first stays current until the swap.
@@ -1585,12 +1590,25 @@ async fn install_live_forest_candidate(
     let mut forest = service.forest.write().await;
     // The replaced forest drops with `candidate`, after the lock is released.
     std::mem::swap(&mut *forest, &mut candidate.forest);
+    // Diffed against the replaced forest, not the candidate's own base.
+    let added_leaves = if service.poi_submitter.pending_count() > 0 {
+        forest.leaves_beyond(&candidate.forest).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if let Err(err) = service.maybe_write_anchor_snapshot(snapshot_path, target, &forest) {
         warn!(?err, target, "failed to write anchor snapshot");
     }
     drop(forest);
     service.publish_forest_progress(target, cause);
     candidate.publish_completion(service.chain.deployment.chain_id, progress);
+    drop(candidate);
+    if !added_leaves.is_empty() {
+        service
+            .poi_submitter
+            .observe_forest_leaves(added_leaves)
+            .await;
+    }
     LiveForestInstall::Installed
 }
 
