@@ -3,7 +3,9 @@
 //! Settlement, vault relayer, and hook trampoline addresses are chain profile
 //! data supplied by callers.
 
-use alloy::primitives::{Address, B256, Bytes, FixedBytes, Signature, SignatureError, keccak256};
+use alloy::primitives::{
+    Address, B256, Bytes, FixedBytes, Signature, SignatureError, address, keccak256,
+};
 use alloy::sol;
 use alloy::sol_types::{Eip712Domain, SolStruct, eip712_domain};
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,12 @@ sol! {
         function invalidateOrder(bytes orderUid);
     }
 }
+
+/// `Order.buyToken` that pays the receiver in the chain's native asset
+/// (`GPv2Transfer.BUY_ETH_ADDRESS`). The settlement pays it with a
+/// 2,300-gas-stipend `transfer`, and the `Trade` event reports this address as
+/// the buy token.
+pub const BUY_NATIVE_TOKEN: Address = address!("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
 /// `Order.kind` of a sell order.
 pub const ORDER_KIND_SELL: &str = "sell";
@@ -197,7 +205,7 @@ impl AppData {
 mod tests {
     use super::*;
     use alloy::hex;
-    use alloy::primitives::{U256, address, b256};
+    use alloy::primitives::{U256, b256};
     use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
 
@@ -289,6 +297,39 @@ mod tests {
         let uid = order_uid(&test_order(), 1, settlement, signer.address());
         assert_eq!(uid.digest(), digest);
         assert_eq!(uid.owner(), signer.address());
+    }
+
+    #[test]
+    fn native_buy_order_commits_to_its_receiver() {
+        let signer = PrivateKeySigner::random();
+        let settlement = address!("0x9008D19f58AAbD9eD0D60971565AA8510560ab41");
+        let order = Order {
+            buyToken: BUY_NATIVE_TOKEN,
+            receiver: Address::repeat_byte(0x04),
+            ..test_order()
+        };
+        assert_ne!(order.receiver, signer.address());
+        let digest = order_digest(&order, 1, settlement);
+        let signature = eip712_order_signature(&signer.sign_hash_sync(&digest).unwrap());
+        assert_eq!(
+            recover_order_signer(&signature, &digest).unwrap(),
+            signer.address()
+        );
+        let uid = order_uid(&order, 1, settlement, signer.address());
+        assert_eq!(uid.digest(), digest);
+        assert_eq!(uid.owner(), signer.address());
+
+        // The UID is the settlement's proof of where the proceeds went.
+        let redirected = Order {
+            receiver: Address::repeat_byte(0x05),
+            ..order.clone()
+        };
+        assert_ne!(order_digest(&redirected, 1, settlement), digest);
+        let erc20_buy = Order {
+            buyToken: Address::repeat_byte(0x02),
+            ..order
+        };
+        assert_ne!(order_digest(&erc20_buy, 1, settlement), digest);
     }
 
     #[test]

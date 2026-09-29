@@ -51,7 +51,10 @@ pub use selection::{
     unshield_selection_info_with_broadcaster_fee_token,
     unshield_selection_info_with_separate_broadcaster_fee_seed,
 };
-pub use swap::{SwapAmountCheck, SwapAppDataTemplate, SwapPreHookSize, estimate_swap_app_data_len};
+pub use swap::{
+    SwapAmountCheck, SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize,
+    estimate_swap_app_data_len,
+};
 
 #[cfg(test)]
 use selection::select_utxos;

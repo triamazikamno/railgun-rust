@@ -1471,7 +1471,9 @@ async fn swap_app_data_estimate_matches_signed_hook_documents() {
         CommitmentPreimage, ShieldCiphertext, ShieldRequest, TokenData,
     };
 
-    use crate::tx::{SwapAmountCheck, SwapAppDataTemplate};
+    use crate::tx::{
+        SwapAmountCheck, SwapAppDataTemplate, SwapPostHookTemplate, estimate_swap_app_data_len,
+    };
 
     let wallet = test_wallet();
     let builder = test_transaction_builder();
@@ -1520,9 +1522,15 @@ async fn swap_app_data_estimate_matches_signed_hook_documents() {
     .unwrap();
     let template = SwapAppDataTemplate {
         app_code: "railgun".to_owned(),
-        post_hook_calls,
         pre_hook_gas_limit: 1_500_000,
-        post_hook_gas_limit: 400_000,
+        post_hook: Some(SwapPostHookTemplate {
+            calls: post_hook_calls,
+            gas_limit: 400_000,
+        }),
+    };
+    let pre_hook_only = SwapAppDataTemplate {
+        post_hook: None,
+        ..template.clone()
     };
 
     // Notes of 5 per tree, the sell amount, whether a retry invalidates an
@@ -1572,6 +1580,7 @@ async fn swap_app_data_estimate_matches_signed_hook_documents() {
             );
         }
         let request = swap_pre_hook_request(context, calls, sell_token, amount);
+        let pre_hook_calls = request.executor_calls.clone();
 
         let SwapAmountCheck::Fits(size) = builder
             .check_swap_pre_hook(&utxos, &request, &template, usize::MAX)
@@ -1596,16 +1605,17 @@ async fn swap_app_data_estimate_matches_signed_hook_documents() {
         let pre_hook = context
             .authorize_call(&plan.call, signer.sign_hash_sync(&digest).unwrap())
             .unwrap();
+        let pre_hooks = vec![AppDataHook {
+            call_data: pre_hook.data,
+            gas_limit: template.pre_hook_gas_limit,
+            target: context.executor,
+        }];
         let document = AppData::hooks(
             template.app_code.clone(),
-            vec![AppDataHook {
-                call_data: pre_hook.data,
-                gas_limit: template.pre_hook_gas_limit,
-                target: context.executor,
-            }],
+            pre_hooks.clone(),
             vec![AppDataHook {
                 call_data: post_hook.clone(),
-                gas_limit: template.post_hook_gas_limit,
+                gas_limit: 400_000,
                 target: context.executor,
             }],
         )
@@ -1617,6 +1627,22 @@ async fn swap_app_data_estimate_matches_signed_hook_documents() {
             document.len(),
             "{transaction_count} transactions"
         );
+
+        let pre_hook_only_document = AppData::hooks(template.app_code.clone(), pre_hooks, vec![])
+            .encode()
+            .unwrap()
+            .document;
+        assert_eq!(
+            estimate_swap_app_data_len(
+                &pre_hook_only,
+                context.executor,
+                &pre_hook_calls,
+                &size.preview.transactions,
+            )
+            .unwrap(),
+            pre_hook_only_document.len(),
+            "{transaction_count} transactions without a post-hook"
+        );
     }
 }
 
@@ -1625,7 +1651,8 @@ fn swap_max_amount_is_capped_by_app_data_budget_and_batch_limit() {
     use broadcaster_core::contracts::railgun::Call;
 
     use crate::tx::{
-        SwapAmountCheck, SwapAppDataTemplate, TransactionShape, estimate_swap_app_data_len,
+        SwapAmountCheck, SwapAppDataTemplate, SwapPostHookTemplate, TransactionShape,
+        estimate_swap_app_data_len,
     };
 
     let wallet = test_wallet();
@@ -1644,13 +1671,15 @@ fn swap_max_amount_is_capped_by_app_data_budget_and_batch_limit() {
     }];
     let template = SwapAppDataTemplate {
         app_code: "railgun".to_owned(),
-        post_hook_calls: vec![Call {
-            to: context.executor,
-            value: U256::ZERO,
-            data: Bytes::from(vec![0x02; 300]),
-        }],
         pre_hook_gas_limit: 1_000_000,
-        post_hook_gas_limit: 300_000,
+        post_hook: Some(SwapPostHookTemplate {
+            calls: vec![Call {
+                to: context.executor,
+                value: U256::ZERO,
+                data: Bytes::from(vec![0x02; 300]),
+            }],
+            gas_limit: 300_000,
+        }),
     };
     let request = |amount| swap_pre_hook_request(context, calls.clone(), sell_token, amount);
     let shape = |input_count| TransactionShape {

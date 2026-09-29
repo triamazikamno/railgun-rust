@@ -1,7 +1,8 @@
 //! Pre-proof sizing of a private swap's `CoW` hook app data.
 //!
 //! The pre-hook is a signed `RelayAdapt7702.execute` that unshields the sell
-//! token to the executor; the post-hook is a signed `RelayAdapt7702.multicall`.
+//! token to the executor; the optional post-hook is a signed
+//! `RelayAdapt7702.multicall`.
 //! Both are ABI encoded, so their lengths depend only on each transaction's
 //! nullifier, commitment, and ciphertext counts and on the calls' data lengths.
 
@@ -31,13 +32,22 @@ const EXECUTOR_SIGNATURE_LEN: usize = 65;
 #[derive(Debug, Clone)]
 pub struct SwapAppDataTemplate {
     pub app_code: String,
-    /// Post-hook `multicall` calls as they will be signed.
-    pub post_hook_calls: Vec<Call>,
     /// Upper bound on the pre-hook gas limit the order will carry. `gasLimit`
     /// is a decimal string, so a real limit with fewer digits encodes shorter.
     pub pre_hook_gas_limit: u64,
-    /// Upper bound on the post-hook gas limit, as for `pre_hook_gas_limit`.
-    pub post_hook_gas_limit: u64,
+    /// The order's post-hook, or `None` for an order that carries only the
+    /// pre-hook.
+    pub post_hook: Option<SwapPostHookTemplate>,
+}
+
+/// Post-hook part of a [`SwapAppDataTemplate`].
+#[derive(Debug, Clone)]
+pub struct SwapPostHookTemplate {
+    /// `multicall` calls as they will be signed.
+    pub calls: Vec<Call>,
+    /// Upper bound on the post-hook gas limit, as for
+    /// [`SwapAppDataTemplate::pre_hook_gas_limit`].
+    pub gas_limit: u64,
 }
 
 /// A swap sell amount with the selection its pre-hook plan will use and the
@@ -63,8 +73,8 @@ pub enum SwapAmountCheck {
 /// Length of the app data JSON document for a swap whose pre-hook spends
 /// `transactions` and makes `pre_hook_calls` from `executor`.
 ///
-/// Encodes both hooks with zero-filled transactions of the same shapes and
-/// 65-byte signatures. Commitment ciphertexts are sized with the empty
+/// Encodes the pre-hook, and the post-hook when the template has one, with
+/// zero-filled transactions of the same shapes and 65-byte signatures. Commitment ciphertexts are sized with the empty
 /// `annotationData` and `memo` the wallet emits. The result equals the real
 /// document length when the real gas limits have as many decimal digits as the
 /// template's upper bounds, and exceeds it otherwise.
@@ -86,13 +96,22 @@ pub fn estimate_swap_app_data_len(
         _signature: signature.clone(),
     }
     .abi_encode();
-    let post_hook = RelayAdapt7702::multicallCall {
-        _requireSuccess: true,
-        _calls: template.post_hook_calls.clone(),
-        _nonce: U256::ZERO,
-        _signature: signature,
-    }
-    .abi_encode();
+    let post_hooks = template
+        .post_hook
+        .iter()
+        .map(|post_hook| AppDataHook {
+            call_data: RelayAdapt7702::multicallCall {
+                _requireSuccess: true,
+                _calls: post_hook.calls.clone(),
+                _nonce: U256::ZERO,
+                _signature: signature.clone(),
+            }
+            .abi_encode()
+            .into(),
+            gas_limit: post_hook.gas_limit,
+            target: executor,
+        })
+        .collect();
     let app_data = AppData::hooks(
         template.app_code.clone(),
         vec![AppDataHook {
@@ -100,11 +119,7 @@ pub fn estimate_swap_app_data_len(
             gas_limit: template.pre_hook_gas_limit,
             target: executor,
         }],
-        vec![AppDataHook {
-            call_data: post_hook.into(),
-            gas_limit: template.post_hook_gas_limit,
-            target: executor,
-        }],
+        post_hooks,
     );
     Ok(app_data.encode()?.document.len())
 }
