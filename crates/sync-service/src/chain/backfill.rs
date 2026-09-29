@@ -841,7 +841,7 @@ impl ChainConfig {
         Ok(block.map(|block| block.header.timestamp))
     }
 
-    /// Maps each log block to its timestamp, preferring timestamps supplied
+    /// Maps each log block to its timestamp, preferring nonzero timestamps supplied
     /// with the logs and requesting headers only for blocks without one.
     pub(super) async fn fetch_log_block_timestamps(
         &self,
@@ -852,7 +852,10 @@ impl ChainConfig {
         let started = Instant::now();
         let mut timestamps = HashMap::new();
         for log in logs {
-            if let (Some(block_number), Some(timestamp)) = (log.block_number, log.block_timestamp) {
+            // A zero log timestamp is missing metadata, not the note's creation time.
+            if let (Some(block_number), Some(timestamp)) = (log.block_number, log.block_timestamp)
+                && timestamp != 0
+            {
                 timestamps.entry(block_number).or_insert(timestamp);
             }
         }

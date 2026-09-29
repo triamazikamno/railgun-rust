@@ -26,6 +26,48 @@ pub enum ShieldError {
     SigningFailed,
 }
 
+/// Railgun fee denominator, `BASIS_POINTS` in `RailgunLogic`.
+const FEE_BASIS_POINTS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ShieldFeeError {
+    #[error("minimum shielded amount must be nonzero")]
+    ZeroMinimum,
+    #[error("shield fee must be below 10000 basis points")]
+    FeeTooHigh,
+    #[error("required shield amount exceeds the uint120 note value")]
+    Overflow,
+}
+
+/// Smallest amount to shield so the note receives at least `min_net` after the
+/// shield fee.
+///
+/// Railgun's inclusive `getFee` leaves `amount - floor(amount * fee_bp / 10000)`
+/// in the note, which rises by at most 1 per unit of `amount`. The smallest
+/// sufficient amount is therefore
+/// `floor((min_net - 1) * 10000 / (10000 - fee_bp)) + 1`.
+///
+/// A zero `min_net` is rejected: the result is used as the executor's exact
+/// transfer guard, and its transfer helper treats 0 as the full balance.
+pub fn min_shield_amount(min_net: U256, fee_bp: U256) -> Result<U256, ShieldFeeError> {
+    if min_net.is_zero() {
+        return Err(ShieldFeeError::ZeroMinimum);
+    }
+    let basis = U256::from(FEE_BASIS_POINTS);
+    if fee_bp >= basis {
+        return Err(ShieldFeeError::FeeTooHigh);
+    }
+    let amount = (min_net - U256::ONE)
+        .checked_mul(basis)
+        .ok_or(ShieldFeeError::Overflow)?
+        / (basis - fee_bp)
+        + U256::ONE;
+    if amount.bit_len() > 120 {
+        return Err(ShieldFeeError::Overflow);
+    }
+    Ok(amount)
+}
+
 /// Build ABI-encoded calldata for `shield(ShieldRequest[])`.
 ///
 /// `shield_private_key` is the 32-byte key derived from `keccak256(evm_sign("RAILGUN_SHIELD"))`.
@@ -141,4 +183,71 @@ fn encrypt_shield_random(
         encryptedBundle: bundle,
         shieldKey: FixedBytes::from(shield_public_key),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Note value left by `RailgunLogic.getFee(amount, true, fee_bp)`.
+    fn net(amount: U256, fee_bp: u64) -> U256 {
+        amount - amount * U256::from(fee_bp) / U256::from(FEE_BASIS_POINTS)
+    }
+
+    fn assert_minimal(amount: U256, min_net: U256, fee_bp: u64) {
+        assert!(
+            net(amount, fee_bp) >= min_net,
+            "{amount} nets below {min_net} at {fee_bp} bp"
+        );
+        assert!(
+            net(amount - U256::ONE, fee_bp) < min_net,
+            "{amount} is not minimal for {min_net} at {fee_bp} bp"
+        );
+    }
+
+    #[test]
+    fn min_shield_amount_is_the_smallest_amount_meeting_the_net() {
+        assert_eq!(
+            min_shield_amount(U256::from(9_975), U256::from(25)),
+            Ok(U256::from(9_999))
+        );
+        assert_minimal(U256::from(9_999), U256::from(9_975), 25);
+        for fee_bp in [0, 1, 25, 50, 333, 5_000, 9_999] {
+            for min_net in 1..=3_000_u64 {
+                let min_net = U256::from(min_net);
+                let amount = min_shield_amount(min_net, U256::from(fee_bp)).unwrap();
+                assert_minimal(amount, min_net, fee_bp);
+            }
+        }
+    }
+
+    #[test]
+    fn min_shield_amount_near_the_note_value_limit() {
+        let max = (U256::ONE << 120) - U256::ONE;
+        assert_eq!(min_shield_amount(max, U256::ZERO), Ok(max));
+        assert_eq!(
+            min_shield_amount(max, U256::from(25)),
+            Err(ShieldFeeError::Overflow)
+        );
+        let min_net = net(max, 25);
+        let amount = min_shield_amount(min_net, U256::from(25)).unwrap();
+        assert!(amount <= max);
+        assert_minimal(amount, min_net, 25);
+    }
+
+    #[test]
+    fn min_shield_amount_rejects_unusable_inputs() {
+        assert_eq!(
+            min_shield_amount(U256::ZERO, U256::from(25)),
+            Err(ShieldFeeError::ZeroMinimum)
+        );
+        assert_eq!(
+            min_shield_amount(U256::ONE, U256::from(FEE_BASIS_POINTS)),
+            Err(ShieldFeeError::FeeTooHigh)
+        );
+        assert_eq!(
+            min_shield_amount(U256::MAX, U256::ZERO),
+            Err(ShieldFeeError::Overflow)
+        );
+    }
 }

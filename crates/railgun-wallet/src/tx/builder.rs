@@ -29,8 +29,8 @@ use super::{
     MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource,
     MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs, PublicInputs,
     SelectedInputIdentity, SendPlan, SendRequest, TransactPlan, TransactionBuilder,
-    TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, UnshieldMode, UnshieldPlan,
-    UnshieldRequest,
+    TransactionCall, TransactionPlanChunk, TransactionShape, UNRELAYED_ADAPT_PARAMS, UnshieldMode,
+    UnshieldPlan, UnshieldRequest,
 };
 
 use selection::{
@@ -40,6 +40,7 @@ use selection::{
 };
 
 mod selection;
+mod swap;
 
 pub use selection::{
     max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
@@ -50,6 +51,7 @@ pub use selection::{
     unshield_selection_info_with_broadcaster_fee_token,
     unshield_selection_info_with_separate_broadcaster_fee_seed,
 };
+pub use swap::{SwapAmountCheck, SwapAppDataTemplate, SwapPreHookSize, estimate_swap_app_data_len};
 
 #[cfg(test)]
 use selection::select_utxos;
@@ -482,7 +484,10 @@ impl TransactionBuilder {
         if has_relay_adapt_leg && relay_call_count == 0 {
             return Err(BuildError::MissingCompositeRelayActions);
         }
-        let uses_relay_adapt = has_relay_adapt_leg || relay_call_count > 0;
+        // Executor plans always settle through `execute`, even with no calls, so the
+        // executor signature also binds fee-only setup plans.
+        let uses_relay_adapt =
+            has_relay_adapt_leg || relay_call_count > 0 || request.executor.is_some();
         let execution = self.composite_execution(uses_relay_adapt, request.executor)?;
         let candidate_utxos = request.rebuild.as_ref().map_or_else(
             || Ok(utxos.to_vec()),
@@ -524,8 +529,8 @@ impl TransactionBuilder {
             (_, other) => other,
         })?;
 
-        let mut private_output_count = 0;
-        let mut public_output_count = 0;
+        // Build order: private sends, then public unshields.
+        let mut transactions = Vec::new();
         for (send_index, send) in request.private_sends.iter().enumerate() {
             let selection = &selections[request.public_unshields.len() + send_index];
             let allocations = spend_allocations(
@@ -535,20 +540,34 @@ impl TransactionBuilder {
                 None,
                 request.spend_up_to,
             )?;
-            private_output_count += allocations
-                .iter()
-                .map(|allocation| 1 + usize::from(!allocation.change.is_zero()))
-                .sum::<usize>();
+            transactions.extend(selection.chunks.iter().zip(allocations).map(
+                |(chunk, allocation)| TransactionShape {
+                    input_count: chunk.utxos.len(),
+                    output_count: 1 + usize::from(!allocation.change.is_zero()),
+                    has_unshield: false,
+                },
+            ));
         }
         for (unshield_index, leg) in request.public_unshields.iter().enumerate() {
             let selection = &selections[unshield_index];
             let allocations = spend_allocations(selection, leg.amount, U256::ZERO, None, false)?;
-            public_output_count += allocations.len();
-            private_output_count += allocations
-                .iter()
-                .filter(|allocation| !allocation.change.is_zero())
-                .count();
+            transactions.extend(selection.chunks.iter().zip(allocations).map(
+                |(chunk, allocation)| TransactionShape {
+                    input_count: chunk.utxos.len(),
+                    output_count: 1 + usize::from(!allocation.change.is_zero()),
+                    has_unshield: true,
+                },
+            ));
         }
+        let public_output_count = transactions
+            .iter()
+            .filter(|transaction| transaction.has_unshield)
+            .count();
+        let private_output_count = transactions
+            .iter()
+            .map(|transaction| transaction.output_count)
+            .sum::<usize>()
+            - public_output_count;
         let mut selected_inputs = selections
             .iter()
             .flat_map(|selection| selection.chunks.iter())
@@ -589,6 +608,7 @@ impl TransactionBuilder {
             preview: MixedPrivateActionPreview {
                 selected_inputs,
                 shape,
+                transactions,
             },
         })
     }
@@ -808,23 +828,31 @@ impl TransactionBuilder {
         };
         debug_assert_eq!(actual_selected_inputs, preview.selected_inputs);
         debug_assert_eq!(actual_shape, preview.shape);
+        debug_assert_eq!(
+            unproven_plans
+                .iter()
+                .map(|plan| TransactionShape {
+                    input_count: plan.inputs.len(),
+                    output_count: plan.outputs.len(),
+                    has_unshield: plan.has_unshield,
+                })
+                .collect::<Vec<_>>(),
+            preview.transactions
+        );
         let selected_inputs = preview.selected_inputs;
         let shape = preview.shape;
 
         let action_data = if uses_relay_adapt {
-            let action_data = if request.executor_calls.is_empty() {
-                request
-                    .relay_actions
-                    .as_ref()
-                    .ok_or(BuildError::MissingCompositeRelayActions)?
-                    .action_data(execution.account(), FixedBytes::<31>::from(rand_array()))?
-            } else {
-                ActionData {
+            let action_data = match (request.relay_actions.as_ref(), execution) {
+                (Some(relay_actions), _) => relay_actions
+                    .action_data(execution.account(), FixedBytes::<31>::from(rand_array()))?,
+                (None, CompositeExecution::Executor(_)) => ActionData {
                     random: FixedBytes::<31>::from(rand_array()),
                     requireSuccess: true,
                     minGasLimit: U256::ZERO,
                     calls: request.executor_calls.clone(),
-                }
+                },
+                (None, _) => return Err(BuildError::MissingCompositeRelayActions),
             };
             debug_assert!(action_data.requireSuccess);
             let transactions = unproven_plans

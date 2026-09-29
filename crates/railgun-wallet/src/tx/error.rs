@@ -1,4 +1,5 @@
 use alloy::primitives::{FixedBytes, U256};
+use broadcaster_core::contracts::cow::CowError;
 use poi::error::PoiRpcError;
 use thiserror::Error;
 
@@ -64,6 +65,12 @@ pub enum BuildError {
     MissingProof { tree: u32, position: u64 },
     #[error("min gas price exceeds uint72: {0}")]
     MinGasPriceTooLarge(u128),
+    #[error("swap pre-hook request must be one executor unshield leg to the executor")]
+    InvalidSwapRequest,
+    #[error("swap app data needs at least {len} bytes, above the {budget} byte budget")]
+    SwapAppDataTooLarge { len: usize, budget: usize },
+    #[error("app data encoding failed: {0}")]
+    AppData(#[from] CowError),
     #[error("encrypt note failed: {0}")]
     Encrypt(#[from] crate::notes::NoteError),
     #[error("prove failed: {0}")]

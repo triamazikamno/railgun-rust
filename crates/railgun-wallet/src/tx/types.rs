@@ -545,10 +545,23 @@ pub struct CompositePlanShape {
     pub uses_relay_adapt: bool,
 }
 
+/// Counts that fix one Railgun transaction's ABI encoding length before proving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionShape {
+    /// Nullifier count.
+    pub input_count: usize,
+    /// Commitment count, including an unshield output.
+    pub output_count: usize,
+    /// Whether the last output is an unshield, which carries no commitment ciphertext.
+    pub has_unshield: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixedPrivateActionPreview {
     pub selected_inputs: Vec<SelectedInputIdentity>,
     pub shape: CompositePlanShape,
+    /// Per-transaction shapes in build order.
+    pub transactions: Vec<TransactionShape>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

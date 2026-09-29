@@ -10100,21 +10100,27 @@ async fn log_block_timestamps_request_headers_only_for_blocks_without_log_timest
         JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 1600, |_, _, _| None));
     let chain = log_fetch_chain(&scope, server.url.clone(), 100);
     let rpc = chain.rpcs.random_provider().expect("rpc provider");
-    let log = |block_number, with_timestamp| {
-        serde_json::from_value::<Log>(if with_timestamp {
-            rpc_nullifiers_log_with_timestamp(contract, block_number)
-        } else {
-            rpc_nullifiers_log(contract, block_number)
-        })
-        .expect("RPC log")
+    let log = |block_number, timestamp| {
+        let mut log = serde_json::from_value::<Log>(rpc_nullifiers_log(contract, block_number))
+            .expect("RPC log");
+        log.block_timestamp = timestamp;
+        log
     };
     let partial = [
-        log(1003, true),
-        log(1050, false),
-        log(1070, true),
-        log(1070, false),
+        log(1003, Some(test_block_timestamp(1003))),
+        log(1050, None),
+        log(1060, Some(0)),
+        log(1060, None),
+        log(1070, Some(0)),
+        log(1070, Some(test_block_timestamp(1070))),
+        log(1070, None),
     ];
-    let without_timestamps = [log(1003, false), log(1050, false), log(1070, false)];
+    let without_timestamps = [
+        log(1003, None),
+        log(1050, None),
+        log(1060, None),
+        log(1070, None),
+    ];
 
     let from_logs = chain
         .fetch_log_block_timestamps(&rpc.provider, None, &partial)
@@ -10122,8 +10128,8 @@ async fn log_block_timestamps_request_headers_only_for_blocks_without_log_timest
         .expect("partial log timestamps");
     assert_eq!(
         header_blocks(&server.drain_request_bodies()),
-        vec![1050],
-        "headers are requested only for blocks whose logs all lack a timestamp"
+        vec![1050, 1060],
+        "missing or zero log timestamps need one header per block; a nonzero log timestamp suffices"
     );
     let from_headers = chain
         .fetch_log_block_timestamps(&rpc.provider, None, &without_timestamps)
@@ -10131,7 +10137,7 @@ async fn log_block_timestamps_request_headers_only_for_blocks_without_log_timest
         .expect("header timestamps");
     assert_eq!(
         header_blocks(&server.drain_request_bodies()),
-        vec![1003, 1050, 1070]
+        vec![1003, 1050, 1060, 1070]
     );
 
     assert_eq!(from_logs, from_headers);

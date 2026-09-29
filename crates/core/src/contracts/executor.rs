@@ -4,11 +4,16 @@
 //! Execution and multicall consume the same contract storage nonce. Ethereum
 //! account nonces and delegation authorizations are separate from this nonce.
 
-use alloy::primitives::{Address, B256, Signature, U256, keccak256};
+use alloy::primitives::{Address, B256, Bytes, Signature, U256, keccak256};
 use alloy::sol;
-use alloy::sol_types::{Eip712Domain, SolStruct, SolValue, eip712_domain};
+use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, SolValue, eip712_domain};
+use thiserror::Error;
 
-use super::railgun::{Call, RelayAdapt7702ActionData, Transaction};
+use super::cow::{GPv2Settlement, OrderUid};
+use super::railgun::{
+    Call, RelayAdapt7702, RelayAdapt7702ActionData, ShieldRequest, TokenTransfer, Transaction,
+    approveCall, shieldCall, transferCall,
+};
 
 /// Storage layout of the nonce-bearing profile at contract revision
 /// `1ea5e472867df1a14975a1ee5bf43dac21b89bde`: `nonce` is its first mutable field.
@@ -34,7 +39,15 @@ pub const EXECUTION_NONCE_STORAGE_SLOT: U256 = U256::ZERO;
 sol! {
     struct Execute { bytes32 payloadHash; }
     struct Multicall { bytes32 payloadHash; }
+
+    // Uniswap `SwapRouter02` reverts this call once `block.timestamp > deadline`.
+    interface DeadlineMulticall {
+        function multicall(uint256 deadline, bytes[] data) payable returns (bytes[] results);
+    }
 }
+
+/// Railgun `TokenType.ERC20`.
+const ERC20_TOKEN_TYPE: u8 = 0;
 
 const fn domain(chain_id: u64, executor: Address) -> Eip712Domain {
     eip712_domain! {
@@ -99,4 +112,383 @@ pub fn is_executor_signature(
         && signature
             .recover_address_from_prehash(signing_hash)
             .is_ok_and(|recovered| recovered == executor)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ExecutorActionError {
+    #[error("self-called transfer amount must be nonzero; the helper treats 0 as the full balance")]
+    ZeroTransferAmount,
+    #[error("full-balance shield request must have preimage value 0")]
+    NonZeroShieldValue,
+    #[error("full-balance shield request must be for an ERC-20 token")]
+    NonErc20Shield,
+    #[error("full-balance shield token does not match the guarded token")]
+    ShieldTokenMismatch,
+    #[error("signature does not authorize this multicall for the executor")]
+    InvalidSignature,
+}
+
+/// One call made by the executor inside a signed `execute` or `multicall`.
+///
+/// Targets other than the executor itself are chain profile data supplied by callers.
+#[derive(Clone)]
+pub enum ExecutorAction {
+    /// `token.approve(spender, amount)` for an exact amount.
+    Approve {
+        token: Address,
+        spender: Address,
+        amount: U256,
+    },
+    /// `target.multicall(deadline, [])` on a contract, such as Uniswap
+    /// `SwapRouter02`, that reverts once `block.timestamp > deadline`.
+    Deadline { target: Address, deadline: u64 },
+    /// `settlement.invalidateOrder(orderUid)` on `GPv2Settlement`.
+    InvalidateOrder {
+        settlement: Address,
+        order_uid: OrderUid,
+    },
+    /// The executor's own `transfer` helper for an exact ERC-20 amount. It uses
+    /// `SafeERC20`, so a `false` return or a short balance reverts. The helper
+    /// treats 0 as the full balance, so 0 is rejected.
+    Transfer {
+        token: Address,
+        to: Address,
+        amount: U256,
+    },
+    /// The executor's own `shield` helper for a request with preimage value 0,
+    /// which shields the executor's full ERC-20 balance of the request token.
+    ShieldFullBalance(ShieldRequest),
+}
+
+impl ExecutorAction {
+    /// Encode this action as a value-0 call made by `executor`.
+    pub fn call(&self, executor: Address) -> Result<Call, ExecutorActionError> {
+        let (to, data) = match self {
+            Self::Approve {
+                token,
+                spender,
+                amount,
+            } => (
+                *token,
+                approveCall {
+                    spender: *spender,
+                    amount: *amount,
+                }
+                .abi_encode(),
+            ),
+            Self::Deadline { target, deadline } => (
+                *target,
+                DeadlineMulticall::multicallCall {
+                    deadline: U256::from(*deadline),
+                    data: Vec::new(),
+                }
+                .abi_encode(),
+            ),
+            Self::InvalidateOrder {
+                settlement,
+                order_uid,
+            } => (
+                *settlement,
+                GPv2Settlement::invalidateOrderCall {
+                    orderUid: order_uid.0.into(),
+                }
+                .abi_encode(),
+            ),
+            Self::Transfer { token, to, amount } => {
+                if amount.is_zero() {
+                    return Err(ExecutorActionError::ZeroTransferAmount);
+                }
+                (
+                    executor,
+                    transferCall {
+                        _transfers: vec![TokenTransfer::erc20(*token, *to, *amount)],
+                    }
+                    .abi_encode(),
+                )
+            }
+            Self::ShieldFullBalance(request) => {
+                if request.preimage.token.tokenType != ERC20_TOKEN_TYPE {
+                    return Err(ExecutorActionError::NonErc20Shield);
+                }
+                if !request.preimage.value.is_zero() {
+                    return Err(ExecutorActionError::NonZeroShieldValue);
+                }
+                (
+                    executor,
+                    shieldCall {
+                        _shieldRequests: vec![request.clone()],
+                    }
+                    .abi_encode(),
+                )
+            }
+        };
+        Ok(Call {
+            to,
+            data: data.into(),
+            value: U256::ZERO,
+        })
+    }
+}
+
+/// Post-hook calls that shield `token` only if the executor holds at least `amount`.
+///
+/// The first call self-transfers exactly `amount` from the executor to itself. It
+/// moves nothing and exists only as a balance assertion: `SafeERC20` reverts on a
+/// short balance, and `requireSuccess = true` then reverts the whole post-hook.
+/// The second call shields the full balance under `shield`, which must be a
+/// value-0 ERC-20 request for `token`. Sign them with [`post_hook_signing_hash`]
+/// for a `multicall` with `requireSuccess = true`.
+///
+/// The guard is needed because the contract's full-balance shield returns without
+/// reverting when the balance is 0, so an unguarded post-hook could consume its
+/// nonce and shield nothing. `multicall` ignores return data, so a `balanceOf`
+/// call cannot serve as the check.
+///
+/// A self-transfer does not leave every token balance unchanged. Fee-on-transfer
+/// tokens lose the fee, rebasing tokens can lose a few wei to rounding, and some
+/// tokens reject self-transfers. Railgun's shield already rejects the first two,
+/// because it requires the received amount to equal the note value. For the
+/// rest, the post-hook reverts and the tokens stay with the executor.
+///
+/// Shielding exactly `amount` and then sweeping the remainder with a value-0
+/// shield would avoid the self-transfer. It would also create a second note
+/// whenever the balance exceeds `amount`, which is the usual outcome of a swap
+/// filled above its limit.
+pub fn guarded_shield_calls(
+    executor: Address,
+    token: Address,
+    amount: U256,
+    shield: ShieldRequest,
+) -> Result<Vec<Call>, ExecutorActionError> {
+    if shield.preimage.token.tokenAddress != token {
+        return Err(ExecutorActionError::ShieldTokenMismatch);
+    }
+    Ok(vec![
+        ExecutorAction::Transfer {
+            token,
+            to: executor,
+            amount,
+        }
+        .call(executor)?,
+        ExecutorAction::ShieldFullBalance(shield).call(executor)?,
+    ])
+}
+
+/// Signing hash of a post-hook `multicall` with `requireSuccess = true`.
+#[must_use]
+pub fn post_hook_signing_hash(
+    calls: &[Call],
+    nonce: U256,
+    chain_id: u64,
+    executor: Address,
+) -> B256 {
+    multicall_signing_hash(true, calls, nonce, chain_id, executor)
+}
+
+/// Encode `RelayAdapt7702.multicall` calldata for a post-hook, to be called on
+/// `executor`, after checking that `signature` authorizes it.
+pub fn signed_post_hook_calldata(
+    calls: Vec<Call>,
+    nonce: U256,
+    chain_id: u64,
+    executor: Address,
+    signature: &Signature,
+) -> Result<Bytes, ExecutorActionError> {
+    let signing_hash = post_hook_signing_hash(&calls, nonce, chain_id, executor);
+    if !is_executor_signature(signature, &signing_hash, executor) {
+        return Err(ExecutorActionError::InvalidSignature);
+    }
+    Ok(RelayAdapt7702::multicallCall {
+        _requireSuccess: true,
+        _calls: calls,
+        _nonce: nonce,
+        _signature: signature.as_bytes().into(),
+    }
+    .abi_encode()
+    .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::railgun::{CommitmentPreimage, ShieldCiphertext, TokenData};
+    use alloy::primitives::Uint;
+    use alloy::signers::SignerSync;
+    use alloy::signers::local::PrivateKeySigner;
+
+    const EXECUTOR: Address = Address::repeat_byte(0xe0);
+    const TOKEN: Address = Address::repeat_byte(0x70);
+
+    fn shield_request(token: TokenData, value: u64) -> ShieldRequest {
+        ShieldRequest {
+            preimage: CommitmentPreimage {
+                npk: B256::with_last_byte(1),
+                token,
+                value: Uint::from(value),
+            },
+            ciphertext: ShieldCiphertext {
+                encryptedBundle: [B256::ZERO; 3],
+                shieldKey: B256::ZERO,
+            },
+        }
+    }
+
+    #[test]
+    fn external_actions_encode_value_zero_calls_to_their_targets() {
+        let spender = Address::repeat_byte(0x5e);
+        let call = ExecutorAction::Approve {
+            token: TOKEN,
+            spender,
+            amount: U256::from(7),
+        }
+        .call(EXECUTOR)
+        .unwrap();
+        assert_eq!((call.to, call.value), (TOKEN, U256::ZERO));
+        let approve = approveCall::abi_decode(&call.data).unwrap();
+        assert_eq!((approve.spender, approve.amount), (spender, U256::from(7)));
+
+        let guard = Address::repeat_byte(0x68);
+        let call = ExecutorAction::Deadline {
+            target: guard,
+            deadline: 1_700_000_000,
+        }
+        .call(EXECUTOR)
+        .unwrap();
+        assert_eq!((call.to, call.value), (guard, U256::ZERO));
+        let deadline = DeadlineMulticall::multicallCall::abi_decode(&call.data).unwrap();
+        assert_eq!(deadline.deadline, U256::from(1_700_000_000_u64));
+        assert!(deadline.data.is_empty());
+
+        let settlement = Address::repeat_byte(0x90);
+        let order_uid = OrderUid::new(B256::repeat_byte(0xaa), EXECUTOR, 0x0102_0304);
+        let call = ExecutorAction::InvalidateOrder {
+            settlement,
+            order_uid,
+        }
+        .call(EXECUTOR)
+        .unwrap();
+        assert_eq!((call.to, call.value), (settlement, U256::ZERO));
+        let invalidate = GPv2Settlement::invalidateOrderCall::abi_decode(&call.data).unwrap();
+        assert_eq!(invalidate.orderUid.as_ref(), order_uid.0.as_slice());
+    }
+
+    #[test]
+    fn guarded_post_hook_self_transfers_exact_amount_then_shields_full_balance() {
+        let amount = U256::from(9_999);
+        let calls = guarded_shield_calls(
+            EXECUTOR,
+            TOKEN,
+            amount,
+            shield_request(TokenData::erc20(TOKEN), 0),
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.to == EXECUTOR && call.value.is_zero())
+        );
+
+        let transfer = transferCall::abi_decode(&calls[0].data).unwrap();
+        let [TokenTransfer { token, to, value }] = transfer._transfers.as_slice() else {
+            panic!("expected one transfer");
+        };
+        assert_eq!(
+            (token.tokenType, token.tokenAddress, token.tokenSubID),
+            (ERC20_TOKEN_TYPE, TOKEN, U256::ZERO)
+        );
+        assert_eq!((*to, *value), (EXECUTOR, amount));
+
+        let shield = shieldCall::abi_decode(&calls[1].data).unwrap();
+        let [request] = shield._shieldRequests.as_slice() else {
+            panic!("expected one shield request");
+        };
+        assert_eq!(request.preimage.token.tokenType, ERC20_TOKEN_TYPE);
+        assert_eq!(request.preimage.token.tokenAddress, TOKEN);
+        assert!(request.preimage.value.is_zero());
+    }
+
+    #[test]
+    fn self_helper_actions_reject_amounts_the_helpers_reinterpret() {
+        let erc20 = TokenData::erc20(TOKEN);
+        assert_eq!(
+            ExecutorAction::Transfer {
+                token: TOKEN,
+                to: EXECUTOR,
+                amount: U256::ZERO,
+            }
+            .call(EXECUTOR)
+            .unwrap_err(),
+            ExecutorActionError::ZeroTransferAmount
+        );
+        assert_eq!(
+            ExecutorAction::ShieldFullBalance(shield_request(erc20.clone(), 1))
+                .call(EXECUTOR)
+                .unwrap_err(),
+            ExecutorActionError::NonZeroShieldValue
+        );
+        let nft = TokenData {
+            tokenType: 1,
+            tokenAddress: TOKEN,
+            tokenSubID: U256::from(1),
+        };
+        assert_eq!(
+            ExecutorAction::ShieldFullBalance(shield_request(nft, 0))
+                .call(EXECUTOR)
+                .unwrap_err(),
+            ExecutorActionError::NonErc20Shield
+        );
+        assert_eq!(
+            guarded_shield_calls(EXECUTOR, TOKEN, U256::ZERO, shield_request(erc20, 0))
+                .unwrap_err(),
+            ExecutorActionError::ZeroTransferAmount
+        );
+        assert_eq!(
+            guarded_shield_calls(
+                EXECUTOR,
+                TOKEN,
+                U256::ONE,
+                shield_request(TokenData::erc20(Address::repeat_byte(0x71)), 0),
+            )
+            .unwrap_err(),
+            ExecutorActionError::ShieldTokenMismatch
+        );
+    }
+
+    #[test]
+    fn signed_post_hook_calldata_requires_the_executor_signature() {
+        let signer = PrivateKeySigner::random();
+        let executor = signer.address();
+        let calls = guarded_shield_calls(
+            executor,
+            TOKEN,
+            U256::ONE,
+            shield_request(TokenData::erc20(TOKEN), 0),
+        )
+        .unwrap();
+        let nonce = U256::from(4);
+        let signing_hash = post_hook_signing_hash(&calls, nonce, 1, executor);
+        let signature = signer.sign_hash_sync(&signing_hash).unwrap();
+
+        let other = PrivateKeySigner::random()
+            .sign_hash_sync(&signing_hash)
+            .unwrap();
+        assert_eq!(
+            signed_post_hook_calldata(calls.clone(), nonce, 1, executor, &other).unwrap_err(),
+            ExecutorActionError::InvalidSignature
+        );
+        assert_eq!(
+            signed_post_hook_calldata(calls.clone(), nonce + U256::ONE, 1, executor, &signature)
+                .unwrap_err(),
+            ExecutorActionError::InvalidSignature
+        );
+
+        let calldata =
+            signed_post_hook_calldata(calls.clone(), nonce, 1, executor, &signature).unwrap();
+        let decoded = RelayAdapt7702::multicallCall::abi_decode(&calldata).unwrap();
+        assert!(decoded._requireSuccess);
+        assert_eq!(decoded._nonce, nonce);
+        assert_eq!(decoded._calls.abi_encode(), calls.abi_encode());
+        assert_eq!(decoded._signature.as_ref(), signature.as_bytes().as_slice());
+    }
 }

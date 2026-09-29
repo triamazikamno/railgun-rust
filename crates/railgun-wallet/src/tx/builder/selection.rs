@@ -12,6 +12,24 @@ use super::super::{
 
 const MAX_ALTERNATE_BATCH_CANDIDATES: usize = 1024;
 const MAX_PARTIAL_SELECTION_CANDIDATES_PER_TREE: usize = 32;
+/// Candidate notes one tree search may examine before it stops descending and
+/// keeps what it has found. In `PartialSelectionSearch`, equal note values
+/// defeat pruning, so without a limit a tree of many equal notes enumerates
+/// every subset of up to 13 inputs. Each examined candidate extends the current
+/// subset to a distinct larger one, so a tree of at most `MAX_CIRCUIT_INPUTS`
+/// notes (8191 non-empty subsets) is still searched exhaustively.
+/// `SelectionSearch` collapses equal-value siblings, but on a large tree of
+/// distinct values the limit can still stop an exact-only search before it
+/// finds an exact match; that cut-off is accepted to keep the bound
+/// deterministic. The limit counts work rather than time, so preview and build
+/// reach the same selection.
+const MAX_SELECTION_SEARCH_VISITS: usize = 1 << MAX_CIRCUIT_INPUTS;
+/// Chunk sequences one multi-transaction candidate search may expand. Branches
+/// whose remainder never fits one transaction add no candidates, so the
+/// candidate cap alone does not stop them: eight trees of thirteen equal notes
+/// expand millions of sequences. The multi-leg selections in the builder tests
+/// expand at most 343. The limit counts work, so preview and build agree.
+const MAX_MULTI_TRANSACTION_SEARCH_NODES: usize = MAX_ALTERNATE_BATCH_CANDIDATES;
 
 #[derive(Debug, Clone)]
 pub(super) struct UtxoSelection {
@@ -422,7 +440,7 @@ fn max_batch_spendable_with_limit(
     .map_or(U256::ZERO, |selection| selection.total)
 }
 
-fn max_batch_selection(
+pub(super) fn max_batch_selection(
     utxos: &[Utxo],
     token_address: Address,
     first_base_output_count: usize,
@@ -767,6 +785,7 @@ fn multi_transaction_selection_candidates(
 
     let mut candidates = Vec::new();
     let mut chunks = Vec::new();
+    let mut nodes_left = MAX_MULTI_TRANSACTION_SEARCH_NODES;
     collect_multi_transaction_selection_candidates(
         utxos,
         token_address,
@@ -777,6 +796,7 @@ fn multi_transaction_selection_candidates(
         U256::ZERO,
         &mut chunks,
         &mut candidates,
+        &mut nodes_left,
     );
     candidates
 }
@@ -792,10 +812,15 @@ fn collect_multi_transaction_selection_candidates(
     selected_total: U256,
     chunks: &mut Vec<UtxoSelection>,
     candidates: &mut Vec<BatchUtxoSelection>,
+    nodes_left: &mut usize,
 ) {
-    if chunks.len() == max_transactions || candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES {
+    if chunks.len() == max_transactions
+        || candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES
+        || *nodes_left == 0
+    {
         return;
     }
+    *nodes_left -= 1;
 
     let base_output_count = if chunks.is_empty() {
         first_base_output_count
@@ -850,10 +875,11 @@ fn collect_multi_transaction_selection_candidates(
             next_selected_total,
             chunks,
             candidates,
+            nodes_left,
         );
         chunks.pop();
 
-        if candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES {
+        if candidates.len() >= MAX_ALTERNATE_BATCH_CANDIDATES || *nodes_left == 0 {
             return;
         }
     }
@@ -959,6 +985,25 @@ fn best_partial_selection_below_amount(
         .next()
 }
 
+/// Largest total strictly below `limit` that at most `max_inputs` notes of one
+/// tree can spend.
+pub(super) fn max_tree_total_below(
+    utxos: &[Utxo],
+    token_address: Address,
+    limit: U256,
+    max_inputs: usize,
+) -> Option<U256> {
+    token_utxos_by_tree(utxos, token_address)
+        .into_values()
+        .filter_map(|mut candidates| {
+            sort_search_candidates(&mut candidates);
+            let mut search = PartialSelectionSearch::new(&candidates, limit, max_inputs, 1);
+            search.run();
+            search.best.map(|selection| selection.total)
+        })
+        .max()
+}
+
 fn max_unshield_selection_with_output_count(
     utxos: &[Utxo],
     token_address: Address,
@@ -1002,7 +1047,10 @@ const fn max_inputs_for_base_outputs(base_output_count: usize) -> usize {
     }
 }
 
-fn token_utxos_by_tree(utxos: &[Utxo], token_address: Address) -> BTreeMap<u32, Vec<Utxo>> {
+pub(super) fn token_utxos_by_tree(
+    utxos: &[Utxo],
+    token_address: Address,
+) -> BTreeMap<u32, Vec<Utxo>> {
     let token_hash = U256::from_be_slice(token_address.as_slice());
     let mut by_tree: BTreeMap<u32, Vec<Utxo>> = BTreeMap::new();
     for utxo in utxos
@@ -1052,6 +1100,14 @@ fn max_possible_from(candidates: &[Utxo], start: usize, remaining: usize) -> U25
         .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
 }
 
+/// Smallest total of `remaining` notes from candidates sorted by descending
+/// value.
+fn min_possible_from(candidates: &[Utxo], remaining: usize) -> U256 {
+    candidates[candidates.len() - remaining..]
+        .iter()
+        .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
+}
+
 struct PartialSelectionSearch<'a> {
     candidates: &'a [Utxo],
     amount: U256,
@@ -1060,6 +1116,7 @@ struct PartialSelectionSearch<'a> {
     selected: Vec<usize>,
     best: Option<UtxoSelection>,
     selections: Vec<UtxoSelection>,
+    visits_left: usize,
 }
 
 impl<'a> PartialSelectionSearch<'a> {
@@ -1077,6 +1134,7 @@ impl<'a> PartialSelectionSearch<'a> {
             selected: Vec::with_capacity(max_input_count),
             best: None,
             selections: Vec::with_capacity(selection_limit),
+            visits_left: MAX_SELECTION_SEARCH_VISITS,
         }
     }
 
@@ -1105,6 +1163,10 @@ impl<'a> PartialSelectionSearch<'a> {
         }
 
         for index in start..self.candidates.len() {
+            if self.visits_left == 0 {
+                return;
+            }
+            self.visits_left -= 1;
             let next_total = total + self.candidates[index].note.value;
             if next_total >= self.amount {
                 continue;
@@ -1140,6 +1202,14 @@ fn push_unique_selection_candidate(
     candidate: UtxoSelection,
     limit: usize,
 ) {
+    // A full list only admits a candidate that sorts before its last entry.
+    if candidates.len() >= limit
+        && candidates
+            .last()
+            .is_some_and(|last| selection_max_order(&candidate, last) != Ordering::Less)
+    {
+        return;
+    }
     if limit == 0
         || candidates
             .iter()
@@ -1159,6 +1229,7 @@ struct SelectionSearch<'a> {
     base_output_count: usize,
     selected: Vec<usize>,
     best: Option<UtxoSelection>,
+    visits_left: usize,
 }
 
 impl<'a> SelectionSearch<'a> {
@@ -1175,6 +1246,7 @@ impl<'a> SelectionSearch<'a> {
             base_output_count,
             selected: Vec::with_capacity(target_count),
             best: None,
+            visits_left: MAX_SELECTION_SEARCH_VISITS,
         }
     }
 
@@ -1190,7 +1262,8 @@ impl<'a> SelectionSearch<'a> {
         if self.candidates.len().saturating_sub(start) < remaining {
             return;
         }
-        if self.exact_only() && total > self.amount {
+        if self.exact_only() && total + min_possible_from(self.candidates, remaining) > self.amount
+        {
             return;
         }
         if !self.exact_only() && self.best.as_ref().is_some_and(|best| total >= best.total) {
@@ -1199,9 +1272,31 @@ impl<'a> SelectionSearch<'a> {
         if total + max_possible_from(self.candidates, start, remaining) < self.amount {
             return;
         }
+        // Every leaf below adds at least the `remaining` smallest notes, and a
+        // leaf is recorded only below the best total, which never rises.
+        if !self.exact_only()
+            && self.best.as_ref().is_some_and(|best| {
+                total + min_possible_from(self.candidates, remaining) >= best.total
+            })
+        {
+            return;
+        }
 
         let end = self.candidates.len() - remaining;
         for index in start..=end {
+            // `sort_search_candidates` orders equal values by (tree, position),
+            // so keeping only the first sibling of each value preserves both
+            // tie-breaks: the first leaf found per total and the minimal
+            // `position_key` of an exact match. Skipped siblings cost no budget.
+            if index > start
+                && self.candidates[index].note.value == self.candidates[index - 1].note.value
+            {
+                continue;
+            }
+            if self.visits_left == 0 {
+                return;
+            }
+            self.visits_left -= 1;
             let next_total = total + self.candidates[index].note.value;
             if self.exact_only() && next_total > self.amount {
                 continue;
