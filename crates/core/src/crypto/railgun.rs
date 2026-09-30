@@ -283,7 +283,7 @@ fn xor_railgun(mut b: [u8; 8]) -> [u8; 8] {
 
 fn babyjub_unpack_point_circom(packed: [u8; 32]) -> Result<(Fq, Fq), RailgunError> {
     let mut y_bytes = packed;
-    let x_parity = (y_bytes[31] & 0x80) != 0;
+    let x_sign = (y_bytes[31] & 0x80) != 0;
     y_bytes[31] &= 0x7f;
 
     let y = Fq::from_le_bytes_mod_order(&y_bytes);
@@ -300,8 +300,9 @@ fn babyjub_unpack_point_circom(packed: [u8; 32]) -> Result<(Fq, Fq), RailgunErro
 
     let mut x = x2.sqrt().ok_or(RailgunError::InvalidPointSqrt)?;
 
-    let x_is_odd = (x.into_bigint().0[0] & 1) == 1;
-    if x_is_odd != x_parity {
+    // Circomlib encodes whether x is in the upper half of the field, not its parity.
+    let x_in_upper_half = x.into_bigint() > Fq::MODULUS_MINUS_ONE_DIV_TWO;
+    if x_in_upper_half != x_sign {
         x = -x;
     }
 
