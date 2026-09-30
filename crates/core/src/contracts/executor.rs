@@ -9,6 +9,7 @@ use alloy::sol;
 use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, SolValue, eip712_domain};
 use thiserror::Error;
 
+use super::across::SpokePool;
 use super::cow::{GPv2Settlement, OrderUid};
 use super::railgun::{
     Call, RelayAdapt7702, RelayAdapt7702ActionData, ShieldRequest, TokenTransfer, Transaction,
@@ -124,6 +125,10 @@ pub enum ExecutorActionError {
     NonErc20Shield,
     #[error("full-balance shield token does not match the guarded token")]
     ShieldTokenMismatch,
+    #[error("bridge deposit depositor must be the executor")]
+    DepositorNotExecutor,
+    #[error("bridge deposit message must be empty")]
+    NonEmptyDepositMessage,
     #[error("signature does not authorize this multicall for the executor")]
     InvalidSignature,
 }
@@ -138,6 +143,14 @@ pub enum ExecutorAction {
         token: Address,
         spender: Address,
         amount: U256,
+    },
+    /// `spoke_pool.depositV3(..)` on an Across V3 `SpokePool`, which pulls
+    /// `inputAmount` of `inputToken` from the executor. Across refunds an
+    /// expired deposit to its depositor, so the depositor must be the executor.
+    /// The message must be empty, so the fill is a plain transfer to the recipient.
+    AcrossDeposit {
+        spoke_pool: Address,
+        deposit: SpokePool::depositV3Call,
     },
     /// `target.multicall(deadline, [])` on a contract, such as Uniswap
     /// `SwapRouter02`, that reverts once `block.timestamp > deadline`.
@@ -176,6 +189,18 @@ impl ExecutorAction {
                 }
                 .abi_encode(),
             ),
+            Self::AcrossDeposit {
+                spoke_pool,
+                deposit,
+            } => {
+                if deposit.depositor != executor {
+                    return Err(ExecutorActionError::DepositorNotExecutor);
+                }
+                if !deposit.message.is_empty() {
+                    return Err(ExecutorActionError::NonEmptyDepositMessage);
+                }
+                (*spoke_pool, deposit.abi_encode())
+            }
             Self::Deadline { target, deadline } => (
                 *target,
                 DeadlineMulticall::multicallCall {
@@ -272,6 +297,57 @@ pub fn guarded_shield_calls(
         .call(executor)?,
         ExecutorAction::ShieldFullBalance(shield).call(executor)?,
     ])
+}
+
+/// Post-hook calls that bridge `deposit.inputAmount` of `deposit.inputToken`
+/// through the Across `SpokePool` at `spoke_pool`.
+///
+/// The calls are, in order: the self-transfer guard of [`guarded_shield_calls`]
+/// for exactly `inputAmount`, which reverts when the executor holds less; an
+/// approval of exactly `inputAmount` to `spoke_pool`; and the value-0
+/// `depositV3` call, which must name the executor as depositor and carry an
+/// empty message. When `surplus_shield` is given, a final value-0 full-balance
+/// shield of `inputToken` sweeps whatever the executor still holds after the
+/// deposit. Sign them with [`post_hook_signing_hash`] for a `multicall` with
+/// `requireSuccess = true`, so a failed deposit reverts the whole post-hook and
+/// leaves its nonce unused.
+pub fn bridge_deposit_calls(
+    executor: Address,
+    spoke_pool: Address,
+    deposit: SpokePool::depositV3Call,
+    surplus_shield: Option<ShieldRequest>,
+) -> Result<Vec<Call>, ExecutorActionError> {
+    let token = deposit.inputToken;
+    let amount = deposit.inputAmount;
+    if surplus_shield
+        .as_ref()
+        .is_some_and(|shield| shield.preimage.token.tokenAddress != token)
+    {
+        return Err(ExecutorActionError::ShieldTokenMismatch);
+    }
+    let mut calls = vec![
+        ExecutorAction::Transfer {
+            token,
+            to: executor,
+            amount,
+        }
+        .call(executor)?,
+        ExecutorAction::Approve {
+            token,
+            spender: spoke_pool,
+            amount,
+        }
+        .call(executor)?,
+        ExecutorAction::AcrossDeposit {
+            spoke_pool,
+            deposit,
+        }
+        .call(executor)?,
+    ];
+    if let Some(shield) = surplus_shield {
+        calls.push(ExecutorAction::ShieldFullBalance(shield).call(executor)?);
+    }
+    Ok(calls)
 }
 
 /// Signing hash of a post-hook `multicall` with `requireSuccess = true`.
@@ -451,6 +527,127 @@ mod tests {
                 shield_request(TokenData::erc20(Address::repeat_byte(0x71)), 0),
             )
             .unwrap_err(),
+            ExecutorActionError::ShieldTokenMismatch
+        );
+    }
+
+    fn across_deposit(depositor: Address) -> SpokePool::depositV3Call {
+        SpokePool::depositV3Call {
+            depositor,
+            recipient: Address::repeat_byte(0x7e),
+            inputToken: TOKEN,
+            outputToken: Address::repeat_byte(0x71),
+            inputAmount: U256::from(10_000),
+            outputAmount: U256::from(9_900),
+            destinationChainId: U256::from(42_161),
+            exclusiveRelayer: Address::ZERO,
+            quoteTimestamp: 1_700_000_000,
+            fillDeadline: 1_700_003_600,
+            exclusivityParameter: 0,
+            message: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn bridge_deposit_guards_approves_and_deposits_the_exact_amount() {
+        let spoke_pool = Address::repeat_byte(0x5b);
+        let deposit = across_deposit(EXECUTOR);
+        let calls = bridge_deposit_calls(EXECUTOR, spoke_pool, deposit.clone(), None).unwrap();
+        assert_eq!(
+            calls.iter().map(|call| call.to).collect::<Vec<_>>(),
+            [EXECUTOR, TOKEN, spoke_pool]
+        );
+        assert!(calls.iter().all(|call| call.value.is_zero()));
+
+        let transfer = transferCall::abi_decode(&calls[0].data).unwrap();
+        let [TokenTransfer { token, to, value }] = transfer._transfers.as_slice() else {
+            panic!("expected one transfer");
+        };
+        assert_eq!(
+            (token.tokenAddress, *to, *value),
+            (TOKEN, EXECUTOR, deposit.inputAmount)
+        );
+
+        let approve = approveCall::abi_decode(&calls[1].data).unwrap();
+        assert_eq!(
+            (approve.spender, approve.amount),
+            (spoke_pool, deposit.inputAmount)
+        );
+
+        let encoded = SpokePool::depositV3Call::abi_decode(&calls[2].data).unwrap();
+        assert_eq!(
+            (encoded.depositor, encoded.recipient),
+            (EXECUTOR, deposit.recipient)
+        );
+        assert_eq!(
+            (encoded.inputToken, encoded.outputToken),
+            (TOKEN, deposit.outputToken)
+        );
+        assert_eq!(
+            (encoded.inputAmount, encoded.outputAmount),
+            (deposit.inputAmount, deposit.outputAmount)
+        );
+        assert_eq!(encoded.destinationChainId, deposit.destinationChainId);
+        assert!(encoded.message.is_empty());
+
+        let with_shield = bridge_deposit_calls(
+            EXECUTOR,
+            spoke_pool,
+            deposit,
+            Some(shield_request(TokenData::erc20(TOKEN), 0)),
+        )
+        .unwrap();
+        assert_eq!(with_shield.len(), 4);
+        assert_eq!(with_shield[..3].to_vec().abi_encode(), calls.abi_encode());
+        assert_eq!(
+            (with_shield[3].to, with_shield[3].value),
+            (EXECUTOR, U256::ZERO)
+        );
+        let shield = shieldCall::abi_decode(&with_shield[3].data).unwrap();
+        let [request] = shield._shieldRequests.as_slice() else {
+            panic!("expected one shield request");
+        };
+        assert_eq!(request.preimage.token.tokenAddress, TOKEN);
+        assert!(request.preimage.value.is_zero());
+    }
+
+    #[test]
+    fn bridge_deposit_rejects_deposits_it_cannot_guard_or_refund() {
+        let reject = |deposit: SpokePool::depositV3Call, shield: Option<ShieldRequest>| {
+            bridge_deposit_calls(EXECUTOR, Address::repeat_byte(0x5b), deposit, shield).unwrap_err()
+        };
+        assert_eq!(
+            reject(across_deposit(Address::repeat_byte(0x99)), None),
+            ExecutorActionError::DepositorNotExecutor
+        );
+        assert_eq!(
+            reject(
+                SpokePool::depositV3Call {
+                    message: Bytes::from_static(&[0x01]),
+                    ..across_deposit(EXECUTOR)
+                },
+                None
+            ),
+            ExecutorActionError::NonEmptyDepositMessage
+        );
+        assert_eq!(
+            reject(
+                SpokePool::depositV3Call {
+                    inputAmount: U256::ZERO,
+                    ..across_deposit(EXECUTOR)
+                },
+                None
+            ),
+            ExecutorActionError::ZeroTransferAmount
+        );
+        assert_eq!(
+            reject(
+                across_deposit(EXECUTOR),
+                Some(shield_request(
+                    TokenData::erc20(Address::repeat_byte(0x71)),
+                    0
+                ))
+            ),
             ExecutorActionError::ShieldTokenMismatch
         );
     }
