@@ -469,7 +469,7 @@ impl SyncManager {
         Ok(chain.replace_wallet(cfg).await?)
     }
 
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn chain_handle(&self, chain: &ChainKey) -> Option<ChainHandle> {
         self.state
             .lock()
@@ -1544,6 +1544,7 @@ mod tests {
                 legacy_shield_block: 0,
                 relay_adapt_contract: Address::ZERO,
                 relay_adapt_7702_contract: Address::ZERO,
+                relay_adapt_history: &[],
             },
             sync: crate::RailgunSyncOptions {
                 archive_until_block: 0,

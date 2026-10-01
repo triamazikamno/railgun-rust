@@ -308,9 +308,9 @@ where
     } else {
         0
     };
-    for pair in hex_bytes[offset..].chunks_exact(2) {
-        let high = decode_hex_nibble(pair[0])?;
-        let low = decode_hex_nibble(pair[1])?;
+    for &[high, low] in hex_bytes[offset..].as_chunks::<2>().0 {
+        let high = decode_hex_nibble(high)?;
+        let low = decode_hex_nibble(low)?;
         bytes[index] = (high << 4) | low;
         index += 1;
     }

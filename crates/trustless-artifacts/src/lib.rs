@@ -638,7 +638,7 @@ impl GatewayUrls<'_> {
         self.len() == 0
     }
 
-    fn expose(&self, index: usize) -> &Url {
+    const fn expose(&self, index: usize) -> &Url {
         match self {
             Self::Public(gateways) => &gateways[index],
             Self::Poi(gateways) => gateways[index].expose_url(),

@@ -1539,6 +1539,7 @@ mod tests {
                 legacy_shield_block: 0,
                 relay_adapt_contract: Address::ZERO,
                 relay_adapt_7702_contract: Address::ZERO,
+                relay_adapt_history: &[],
             },
             sync: crate::RailgunSyncOptions {
                 archive_until_block: 0,
