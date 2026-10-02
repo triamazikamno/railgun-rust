@@ -9,7 +9,7 @@ use alloy::sol;
 use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, SolValue, eip712_domain};
 use thiserror::Error;
 
-use super::across::SpokePool;
+use super::across::{SpokePool, private_delivery_message};
 use super::cow::{GPv2Settlement, OrderUid};
 use super::railgun::{
     Call, RelayAdapt7702, RelayAdapt7702ActionData, ShieldRequest, TokenTransfer, Transaction,
@@ -129,8 +129,23 @@ pub enum ExecutorActionError {
     DepositorNotExecutor,
     #[error("bridge deposit message must be empty")]
     NonEmptyDepositMessage,
+    #[error("private bridge deposit recipient must be the handler")]
+    RecipientNotHandler,
     #[error("signature does not authorize this multicall for the executor")]
     InvalidSignature,
+}
+
+/// What the Across handler does with a private-delivery fill on the destination chain.
+#[derive(Clone)]
+pub struct AcrossPrivateDelivery {
+    /// The Across `MulticallHandler` on the destination chain.
+    pub handler: Address,
+    /// The executor on the destination chain that receives and shields the fill.
+    pub destination_executor: Address,
+    /// Signed `RelayAdapt7702.multicall` calldata for `destination_executor`.
+    pub shield_multicall: Bytes,
+    /// Where the handler sends the fill when a call fails. `None` reverts the fill.
+    pub fallback: Option<Address>,
 }
 
 /// One call made by the executor inside a signed `execute` or `multicall`.
@@ -148,9 +163,20 @@ pub enum ExecutorAction {
     /// `inputAmount` of `inputToken` from the executor. Across refunds an
     /// expired deposit to its depositor, so the depositor must be the executor.
     /// The message must be empty, so the fill is a plain transfer to the recipient.
+    /// Use [`Self::AcrossPrivateDeposit`] for a fill the handler shields.
     AcrossDeposit {
         spoke_pool: Address,
         deposit: SpokePool::depositV3Call,
+    },
+    /// `spoke_pool.depositV3(..)` whose fill goes to the Across `MulticallHandler`
+    /// with the [`private_delivery_message`] built from `delivery` for
+    /// `deposit.outputToken`. The depositor must be the executor, the recipient
+    /// must be `delivery.handler`, and `deposit.message` must be empty because
+    /// this action builds the message.
+    AcrossPrivateDeposit {
+        spoke_pool: Address,
+        deposit: SpokePool::depositV3Call,
+        delivery: AcrossPrivateDelivery,
     },
     /// `target.multicall(deadline, [])` on a contract, such as Uniswap
     /// `SwapRouter02`, that reverts once `block.timestamp > deadline`.
@@ -200,6 +226,35 @@ impl ExecutorAction {
                     return Err(ExecutorActionError::NonEmptyDepositMessage);
                 }
                 (*spoke_pool, deposit.abi_encode())
+            }
+            Self::AcrossPrivateDeposit {
+                spoke_pool,
+                deposit,
+                delivery,
+            } => {
+                if deposit.depositor != executor {
+                    return Err(ExecutorActionError::DepositorNotExecutor);
+                }
+                if !deposit.message.is_empty() {
+                    return Err(ExecutorActionError::NonEmptyDepositMessage);
+                }
+                if deposit.recipient != delivery.handler {
+                    return Err(ExecutorActionError::RecipientNotHandler);
+                }
+                (
+                    *spoke_pool,
+                    SpokePool::depositV3Call {
+                        message: private_delivery_message(
+                            delivery.handler,
+                            deposit.outputToken,
+                            delivery.destination_executor,
+                            delivery.shield_multicall.clone(),
+                            delivery.fallback,
+                        ),
+                        ..deposit.clone()
+                    }
+                    .abi_encode(),
+                )
             }
             Self::Deadline { target, deadline } => (
                 *target,
@@ -317,8 +372,57 @@ pub fn bridge_deposit_calls(
     deposit: SpokePool::depositV3Call,
     surplus_shield: Option<ShieldRequest>,
 ) -> Result<Vec<Call>, ExecutorActionError> {
-    let token = deposit.inputToken;
-    let amount = deposit.inputAmount;
+    deposit_calls(
+        executor,
+        spoke_pool,
+        deposit.inputToken,
+        deposit.inputAmount,
+        &ExecutorAction::AcrossDeposit {
+            spoke_pool,
+            deposit,
+        },
+        surplus_shield,
+    )
+}
+
+/// Post-hook calls that bridge like [`bridge_deposit_calls`] and have the
+/// Across handler on the destination chain shield the fill.
+///
+/// The calls and their order are the same. The `depositV3` call must name the
+/// executor as depositor and `delivery.handler` as recipient, and must carry an
+/// empty message, which is replaced by the [`private_delivery_message`] for
+/// `delivery` and `deposit.outputToken`.
+pub fn private_bridge_deposit_calls(
+    executor: Address,
+    spoke_pool: Address,
+    deposit: SpokePool::depositV3Call,
+    delivery: AcrossPrivateDelivery,
+    surplus_shield: Option<ShieldRequest>,
+) -> Result<Vec<Call>, ExecutorActionError> {
+    deposit_calls(
+        executor,
+        spoke_pool,
+        deposit.inputToken,
+        deposit.inputAmount,
+        &ExecutorAction::AcrossPrivateDeposit {
+            spoke_pool,
+            deposit,
+            delivery,
+        },
+        surplus_shield,
+    )
+}
+
+/// Guard, approval of `amount` of `token` to `spoke_pool`, the `deposit` action,
+/// and an optional full-balance shield of what is left.
+fn deposit_calls(
+    executor: Address,
+    spoke_pool: Address,
+    token: Address,
+    amount: U256,
+    deposit: &ExecutorAction,
+    surplus_shield: Option<ShieldRequest>,
+) -> Result<Vec<Call>, ExecutorActionError> {
     if surplus_shield
         .as_ref()
         .is_some_and(|shield| shield.preimage.token.tokenAddress != token)
@@ -338,11 +442,7 @@ pub fn bridge_deposit_calls(
             amount,
         }
         .call(executor)?,
-        ExecutorAction::AcrossDeposit {
-            spoke_pool,
-            deposit,
-        }
-        .call(executor)?,
+        deposit.call(executor)?,
     ];
     if let Some(shield) = surplus_shield {
         calls.push(ExecutorAction::ShieldFullBalance(shield).call(executor)?);
@@ -649,6 +749,108 @@ mod tests {
                 ))
             ),
             ExecutorActionError::ShieldTokenMismatch
+        );
+    }
+
+    const HANDLER: Address = Address::repeat_byte(0x7e);
+
+    fn private_delivery(fallback: Option<Address>) -> AcrossPrivateDelivery {
+        AcrossPrivateDelivery {
+            handler: HANDLER,
+            destination_executor: Address::repeat_byte(0xe1),
+            shield_multicall: Bytes::from_static(&[0xab; 37]),
+            fallback,
+        }
+    }
+
+    #[test]
+    fn private_bridge_deposit_sends_the_fill_to_the_handler_with_the_delivery_message() {
+        let spoke_pool = Address::repeat_byte(0x5b);
+        let deposit = across_deposit(EXECUTOR);
+        let delivery = private_delivery(Some(Address::repeat_byte(0xfb)));
+        let plain = bridge_deposit_calls(EXECUTOR, spoke_pool, deposit.clone(), None).unwrap();
+        let calls = private_bridge_deposit_calls(
+            EXECUTOR,
+            spoke_pool,
+            deposit.clone(),
+            delivery.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            calls.iter().map(|call| call.to).collect::<Vec<_>>(),
+            [EXECUTOR, TOKEN, spoke_pool]
+        );
+        assert!(calls.iter().all(|call| call.value.is_zero()));
+        assert_eq!(
+            calls[..2].to_vec().abi_encode(),
+            plain[..2].to_vec().abi_encode()
+        );
+
+        let encoded = SpokePool::depositV3Call::abi_decode(&calls[2].data).unwrap();
+        assert_eq!((encoded.depositor, encoded.recipient), (EXECUTOR, HANDLER));
+        assert_eq!(
+            encoded.message,
+            private_delivery_message(
+                HANDLER,
+                deposit.outputToken,
+                delivery.destination_executor,
+                delivery.shield_multicall.clone(),
+                delivery.fallback,
+            )
+        );
+        // Everything but the message is the caller's deposit.
+        assert_eq!(
+            SpokePool::depositV3Call {
+                message: Bytes::new(),
+                ..encoded
+            }
+            .abi_encode(),
+            deposit.abi_encode()
+        );
+
+        let with_shield = private_bridge_deposit_calls(
+            EXECUTOR,
+            spoke_pool,
+            deposit,
+            delivery,
+            Some(shield_request(TokenData::erc20(TOKEN), 0)),
+        )
+        .unwrap();
+        assert_eq!(with_shield.len(), 4);
+        assert_eq!(with_shield[..3].to_vec().abi_encode(), calls.abi_encode());
+        assert_eq!(with_shield[3].to, EXECUTOR);
+    }
+
+    #[test]
+    fn private_bridge_deposit_rejects_deposits_the_handler_would_not_deliver() {
+        let reject = |deposit: SpokePool::depositV3Call| {
+            private_bridge_deposit_calls(
+                EXECUTOR,
+                Address::repeat_byte(0x5b),
+                deposit,
+                private_delivery(None),
+                None,
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            reject(across_deposit(Address::repeat_byte(0x99))),
+            ExecutorActionError::DepositorNotExecutor
+        );
+        assert_eq!(
+            reject(SpokePool::depositV3Call {
+                message: Bytes::from_static(&[0x01]),
+                ..across_deposit(EXECUTOR)
+            }),
+            ExecutorActionError::NonEmptyDepositMessage
+        );
+        assert_eq!(
+            reject(SpokePool::depositV3Call {
+                recipient: Address::repeat_byte(0x7f),
+                ..across_deposit(EXECUTOR)
+            }),
+            ExecutorActionError::RecipientNotHandler
         );
     }
 

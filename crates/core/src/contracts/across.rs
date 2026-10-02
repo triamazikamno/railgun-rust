@@ -6,10 +6,14 @@
 //!
 //! Pinned against the `SpokePool` implementations deployed on Ethereum, BNB Chain,
 //! Polygon, and Arbitrum One, checked on 2026-09-29. Each of them has the
-//! `depositV3` selector and both event topics declared here.
+//! `depositV3` selector and both event topics declared here. The
+//! `MulticallHandler` ABI was checked on 2026-10-02 against the handlers at
+//! `0x924a9f036260DdD5808007E1AA95f08eD08aA569` (Ethereum, Polygon, Arbitrum One)
+//! and `0xAC537C12fE8f544D712d71ED4376a502EEa944d7` (BNB Chain).
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::sol;
+use alloy::sol_types::{SolCall, SolValue};
 
 sol! {
     struct V3RelayExecutionEventInfo {
@@ -69,6 +73,29 @@ sol! {
             V3RelayExecutionEventInfo relayExecutionInfo
         );
     }
+
+    // The handler decodes a fill's message as `abi.decode(message, (Instructions))`.
+    interface MulticallHandler {
+        struct Call {
+            address target;
+            bytes callData;
+            uint256 value;
+        }
+
+        struct Instructions {
+            Call[] calls;
+            address fallbackRecipient;
+        }
+
+        function handleV3AcrossMessage(
+            address token,
+            uint256 amount,
+            address relayer,
+            bytes message
+        );
+
+        function drainLeftoverTokens(address token, address destination);
+    }
 }
 
 /// An address as the left-padded `bytes32` that Across events carry.
@@ -87,12 +114,60 @@ pub fn bytes32_to_address(word: B256) -> Option<Address> {
         .then(|| Address::from_word(word))
 }
 
+/// The `depositV3` message that makes the `MulticallHandler` at `handler`
+/// deliver a fill of `token` privately through `executor`.
+///
+/// The message is `abi.encode(Instructions)` with two value-0 calls. The first
+/// is `handler.drainLeftoverTokens(token, executor)`, which only the handler
+/// itself may call and which sends the handler's whole `token` balance to
+/// `executor`. The second calls `executor` with `shield_multicall`, a signed
+/// `RelayAdapt7702.multicall` calldata that shields those tokens. The explicit
+/// drain comes first because the handler's own automatic drain runs after the
+/// calls, which is too late for the shield's balance guard.
+///
+/// With no `fallback` the handler reverts the fill when a call fails. With a
+/// `fallback` it reverts the calls instead and sends its `token` balance to
+/// that address.
+///
+/// The message length depends only on the length of `shield_multicall`.
+#[must_use]
+pub fn private_delivery_message(
+    handler: Address,
+    token: Address,
+    executor: Address,
+    shield_multicall: Bytes,
+    fallback: Option<Address>,
+) -> Bytes {
+    MulticallHandler::Instructions {
+        calls: vec![
+            MulticallHandler::Call {
+                target: handler,
+                callData: MulticallHandler::drainLeftoverTokensCall {
+                    token,
+                    destination: executor,
+                }
+                .abi_encode()
+                .into(),
+                value: U256::ZERO,
+            },
+            MulticallHandler::Call {
+                target: executor,
+                callData: shield_multicall,
+                value: U256::ZERO,
+            },
+        ],
+        fallbackRecipient: fallback.unwrap_or(Address::ZERO),
+    }
+    .abi_encode()
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::hex;
-    use alloy::primitives::{U256, address, b256};
-    use alloy::sol_types::{SolCall, SolEvent};
+    use alloy::primitives::{address, b256};
+    use alloy::sol_types::SolEvent;
 
     const USER: Address = address!("0x99C6a66C3dF9b84ad32907dDCBd90da4EcE12Cc3");
     const ARBITRUM_WETH: Address = address!("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1");
@@ -139,6 +214,51 @@ mod tests {
             SpokePool::FilledRelay::SIGNATURE_HASH,
             b256!("0x44b559f101f8fbcc8a0ea43fa91a05a729a5ea6e14a7c75aa750374690137208")
         );
+    }
+
+    #[test]
+    fn private_delivery_message_drains_to_the_executor_then_calls_it() {
+        assert_eq!(
+            MulticallHandler::handleV3AcrossMessageCall::SELECTOR,
+            hex!("3a5be8cb")
+        );
+        assert_eq!(
+            MulticallHandler::drainLeftoverTokensCall::SELECTOR,
+            hex!("ef8738d3")
+        );
+
+        let handler = address!("0x924a9f036260DdD5808007E1AA95f08eD08aA569");
+        let executor = Address::repeat_byte(0xe0);
+        let shield_multicall = Bytes::from_static(&[0xab; 37]);
+        let message = |shield_multicall: Bytes, fallback| {
+            private_delivery_message(handler, MAINNET_WETH, executor, shield_multicall, fallback)
+        };
+
+        let without_fallback = message(shield_multicall.clone(), None);
+        let instructions = MulticallHandler::Instructions::abi_decode(&without_fallback).unwrap();
+        assert_eq!(instructions.fallbackRecipient, Address::ZERO);
+        let [drain, shield] = instructions.calls.as_slice() else {
+            panic!("expected two calls");
+        };
+        assert_eq!((drain.target, drain.value), (handler, U256::ZERO));
+        let drained =
+            MulticallHandler::drainLeftoverTokensCall::abi_decode(&drain.callData).unwrap();
+        assert_eq!(
+            (drained.token, drained.destination),
+            (MAINNET_WETH, executor)
+        );
+        assert_eq!((shield.target, shield.value), (executor, U256::ZERO));
+        assert_eq!(shield.callData, shield_multicall);
+
+        let with_fallback = message(shield_multicall, Some(USER));
+        let instructions = MulticallHandler::Instructions::abi_decode(&with_fallback).unwrap();
+        assert_eq!(instructions.fallbackRecipient, USER);
+        assert_eq!(instructions.calls.len(), 2);
+
+        // Callers size app data with a placeholder of the same length.
+        let placeholder = message(Bytes::from_static(&[0; 37]), None);
+        assert_eq!(placeholder.len(), without_fallback.len());
+        assert_eq!(placeholder.len(), with_fallback.len());
     }
 
     #[test]
