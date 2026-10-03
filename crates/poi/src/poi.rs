@@ -514,7 +514,7 @@ struct PoiMerkletreeLeavesResponse {
 }
 
 mod fixed_bytes32_hex {
-    use super::{FixedBytes, hex};
+    use super::{FixedBytes, hex, u256_hex_full};
     use serde::{Deserialize, Deserializer, Serializer, de};
 
     pub(super) fn serialize<S>(value: &FixedBytes<32>, serializer: S) -> Result<S::Ok, S::Error>
@@ -529,7 +529,11 @@ mod fixed_bytes32_hex {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        decode(&value).map_err(de::Error::custom)
+        // Upstream event commitments are numeric hex and may omit leading zeros;
+        // Alloy FixedBytes parsing requires the full byte width.
+        u256_hex_full::parse_u256_hex(&value)
+            .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
+            .map_err(de::Error::custom)
     }
 
     pub(super) fn decode(value: &str) -> Result<FixedBytes<32>, String> {

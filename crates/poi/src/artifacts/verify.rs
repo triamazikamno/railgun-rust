@@ -20,9 +20,29 @@ pub fn verify_poi_event(event: &SignedPoiEvent, list_key: &[u8; 32]) -> Result<(
     {
         return Ok(());
     }
-    public_key
-        .verify(&legacy_unprefixed_poi_event_message(event), &signature)
-        .map_err(VerifyError::Signature)
+    let legacy_error =
+        match public_key.verify(&legacy_unprefixed_poi_event_message(event), &signature) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+    // Upstream signs the supplied hex spelling. Artifacts retain the fixed-width
+    // value, so try shorter spellings that remove only leading zero nibbles.
+    let commitment = hex::encode(event.blinded_commitment.as_slice());
+    for offset in 1..commitment.len() {
+        if commitment.as_bytes()[offset - 1] != b'0' {
+            break;
+        }
+        let abbreviated = &commitment[offset..];
+        for spelling in [format!("0x{abbreviated}"), abbreviated.to_string()] {
+            if public_key
+                .verify(&poi_event_message(event, &spelling), &signature)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(VerifyError::Signature(legacy_error))
 }
 
 pub fn verify_blocked_shield(
@@ -39,17 +59,15 @@ pub fn verify_blocked_shield(
 #[must_use]
 pub fn canonical_poi_event_message(event: &SignedPoiEvent) -> Vec<u8> {
     let blinded_commitment = hex::encode_prefixed(event.blinded_commitment.as_slice());
-    format!(
-        r#"{{"index":{},"blindedCommitment":"{}","type":"{}"}}"#,
-        event.index,
-        blinded_commitment,
-        event_type_str(event.event_type)
-    )
-    .into_bytes()
+    poi_event_message(event, &blinded_commitment)
 }
 
 fn legacy_unprefixed_poi_event_message(event: &SignedPoiEvent) -> Vec<u8> {
     let blinded_commitment = hex::encode(event.blinded_commitment.as_slice());
+    poi_event_message(event, &blinded_commitment)
+}
+
+fn poi_event_message(event: &SignedPoiEvent, blinded_commitment: &str) -> Vec<u8> {
     format!(
         r#"{{"index":{},"blindedCommitment":"{}","type":"{}"}}"#,
         event.index,
@@ -294,6 +312,35 @@ mod tests {
             signing_key.verifying_key().as_bytes(),
         )
         .expect("valid signature without reason");
+    }
+
+    #[test]
+    fn verifies_live_short_poi_event_after_canonical_round_trip() {
+        let event: SignedPoiEvent = serde_json::from_value(serde_json::json!({
+            "index": 4364,
+            "blindedCommitment": "0x2fb9e05a0c268b6b8fce0952f6775101bc800c90a81e35dd3b30849709f9f4",
+            "signature": "b8819e58e7fa122dae1e55de652db2b9d049ff28558a59e13632da8def24b3444b1291e7756fc55e07065a1de5ab4bd430c435f4f943c03fe4c3963d619dd208",
+            "type": "Transact",
+        }))
+        .expect("decode live Sepolia event with 31-byte commitment");
+        let expected_commitment =
+            "0x002fb9e05a0c268b6b8fce0952f6775101bc800c90a81e35dd3b30849709f9f4";
+        assert_eq!(event.blinded_commitment, fixed_hex(expected_commitment));
+        verify_poi_event(&event, &ACTIVE_LIST_KEY).expect("live abbreviated signature");
+
+        let serialized = serde_json::to_value(&event).expect("serialize canonical event");
+        assert_eq!(serialized["blindedCommitment"], expected_commitment);
+        let round_trip: SignedPoiEvent =
+            serde_json::from_value(serialized).expect("decode canonical event");
+        verify_poi_event(&round_trip, &ACTIVE_LIST_KEY)
+            .expect("abbreviated signature survives canonical serialization");
+
+        let mut tampered = round_trip.clone();
+        tampered.index += 1;
+        assert!(verify_poi_event(&tampered, &ACTIVE_LIST_KEY).is_err());
+        tampered = round_trip;
+        tampered.blinded_commitment[31] ^= 1;
+        assert!(verify_poi_event(&tampered, &ACTIVE_LIST_KEY).is_err());
     }
 
     #[test]
