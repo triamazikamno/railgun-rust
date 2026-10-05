@@ -1,3 +1,4 @@
+use super::saved_poi_compatibility::saved_pending_context_is_compatible;
 use alloy::sol_types::{SolCall, SolValue};
 use broadcaster_core::contracts::railgun::{
     CommitmentPreimage, Transaction, executeCall, relayCall, transactCall,
@@ -8,7 +9,7 @@ use crate::txid_cache::TxidPublicCacheTransaction;
 use crate::types::PoiCorpusRevision;
 
 use super::{
-    Arc, ChainPublicDataPlane, ChainScope, ChainType, DEFAULT_TXID_VERSION, DbStore,
+    Arc, BTreeMap, ChainPublicDataPlane, ChainScope, ChainType, DEFAULT_TXID_VERSION, DbStore,
     DenseMerkleTree, Duration, EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision, ExpectedPoiStatus,
     ExpectedWalletOutput, FixedBytes, HashMap, IndexedArtifactSourceConfig, InputWitness, Instant,
     LocalPoiMerkleProofSource, MerkleForest, Note, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
@@ -280,6 +281,9 @@ pub(super) fn matching_pending_output_poi_context_disposition(
     recoverable_list_keys: &[FixedBytes<32>],
     force_retry: bool,
 ) -> MatchingPendingOutputPoiContextDisposition {
+    if !saved_pending_context_is_compatible(context, &context.list_keys()) {
+        return MatchingPendingOutputPoiContextDisposition::Regenerate;
+    }
     if context.terminal_error.is_some() {
         return if force_retry {
             MatchingPendingOutputPoiContextDisposition::Regenerate
@@ -874,6 +878,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
     if recovered > 0 {
         match submit_observed_pending_output_pois_inner(
             request.authority,
+            request.public_data_plane,
             request.db,
             request.cache_store,
             request.cfg,
@@ -914,6 +919,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
 
 pub(super) async fn force_resubmit_matching_pending_output_pois_authorized(
     authority: &WalletPrivateMutationAuthority<'_>,
+    public_data_plane: &ChainPublicDataPlane,
     db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
@@ -930,6 +936,7 @@ pub(super) async fn force_resubmit_matching_pending_output_pois_authorized(
     }
     force_resubmit_matching_pending_output_pois_impl(
         authority,
+        public_data_plane,
         db,
         cache_store,
         cfg,
@@ -941,6 +948,7 @@ pub(super) async fn force_resubmit_matching_pending_output_pois_authorized(
 
 async fn force_resubmit_matching_pending_output_pois_impl(
     authority: &WalletPrivateMutationAuthority<'_>,
+    public_data_plane: &ChainPublicDataPlane,
     db: &DbStore,
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
@@ -1010,6 +1018,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
         );
         let Ok(attempt) = preflight_and_remote_submit_pending_output_poi(
             authority,
+            public_data_plane,
             cache_store,
             cfg,
             active_list_keys,
@@ -1070,6 +1079,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                 if !matches!(
                     pending_output_poi_submission_plan_current(
                         authority,
+                        public_data_plane,
                         cache_store,
                         cfg,
                         active_list_keys,
@@ -1114,6 +1124,7 @@ async fn force_resubmit_matching_pending_output_pois_impl(
                 if !matches!(
                     pending_output_poi_submission_plan_current(
                         authority,
+                        public_data_plane,
                         cache_store,
                         cfg,
                         active_list_keys,
@@ -2464,6 +2475,19 @@ pub(super) fn extend_pending_output_poi_context(
     mut new_pre_transaction_pois: PreTransactionPoiMap,
 ) -> PendingOutputPoiContextRecord {
     let mut extended = context.clone();
+    extended
+        .pre_transaction_pois_per_txid_leaf_per_list
+        .retain(|list_key, per_leaf| {
+            super::saved_poi_compatibility::saved_poi_map_is_compatible(
+                &BTreeMap::from([(*list_key, per_leaf.clone())]),
+                &[*list_key],
+            )
+        });
+    extended.submitted_poi_list_keys.retain(|list_key| {
+        extended
+            .pre_transaction_pois_per_txid_leaf_per_list
+            .contains_key(list_key)
+    });
     if extended.required_poi_list_keys.is_empty() {
         extended.required_poi_list_keys = extended.list_keys();
     }
@@ -2471,8 +2495,7 @@ pub(super) fn extend_pending_output_poi_context(
         if let Some(per_leaf) = new_pre_transaction_pois.remove(list_key) {
             extended
                 .pre_transaction_pois_per_txid_leaf_per_list
-                .entry(*list_key)
-                .or_insert(per_leaf);
+                .insert(*list_key, per_leaf);
         }
         if !extended.required_poi_list_keys.contains(list_key) {
             extended.required_poi_list_keys.push(*list_key);

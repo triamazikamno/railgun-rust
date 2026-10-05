@@ -1,3 +1,6 @@
+use super::saved_poi_compatibility::{
+    saved_pending_context_is_compatible, saved_poi_map_is_compatible,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -32,11 +35,49 @@ pub(crate) struct SenderCandidateRecoveryReport {
     /// Materializations skipped because the POI corpus advanced after proof preparation.
     pub(super) stale_revision_skips: u64,
     pub(super) expected_candidates: BTreeMap<FixedBytes<32>, Vec<u8>>,
+    pub(super) expected_pending_contexts: BTreeMap<FixedBytes<32>, Vec<u8>>,
+    /// Predecessors satisfied by an exact, durable replacement in this recovery run.
+    pub(super) satisfied_pending_contexts: BTreeSet<FixedBytes<32>>,
 }
 
 impl SenderCandidateRecoveryReport {
     pub(super) const fn completed(&self) -> usize {
         self.materialized.saturating_add(self.retired_locally_valid)
+    }
+
+    pub(super) fn matches_pending_contexts(
+        &self,
+        cache_store: &dyn WalletCacheStore,
+        cfg: &WalletConfig,
+    ) -> Result<bool, WalletCacheError> {
+        for (commitment, expected) in &self.expected_pending_contexts {
+            let current = cache_store.get_pending_output_poi_context(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                commitment,
+            )?;
+            if current
+                .as_ref()
+                .and_then(pending_output_poi_context_fingerprint)
+                .as_ref()
+                != Some(expected)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn merge_replay_report(&mut self, replay: Self) {
+        self.awaiting_public_txid_data = self
+            .awaiting_public_txid_data
+            .saturating_add(replay.awaiting_public_txid_data);
+        self.retrying = self.retrying.saturating_add(replay.retrying);
+        self.needs_attention = self.needs_attention.saturating_add(replay.needs_attention);
+        self.expected_pending_contexts
+            .extend(replay.expected_pending_contexts);
+        self.expected_pending_contexts
+            .retain(|commitment, _| !self.satisfied_pending_contexts.contains(commitment));
     }
 
     pub(super) fn matches_candidates(&self, candidates: &[SenderTransactionCandidate]) -> bool {
@@ -389,7 +430,8 @@ fn pending_context_covers_sender_output(
     active_list_keys: &[FixedBytes<32>],
     context: &PendingOutputPoiContextRecord,
 ) -> bool {
-    if context.terminal_error.is_some()
+    if !saved_pending_context_is_compatible(context, active_list_keys)
+        || context.terminal_error.is_some()
         || context.chain_id != chain_id
         || context.wallet_id != wallet_id
         || context.output_commitment != output.commitment
@@ -805,7 +847,13 @@ pub(super) async fn materialize_sender_transaction_candidates(
             owned_substitutes,
             proof_outputs,
             expected_corpus,
+            replacement_group,
+            external_valid_substitutes,
         } = prepared;
+        let satisfied_pending_contexts = replacement_group
+            .iter()
+            .map(|(context, _)| context.output_commitment)
+            .collect::<Vec<_>>();
         let apply_result = apply_poi_private_delta(
             output_request.authority,
             output_request.db,
@@ -820,6 +868,8 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 owned_substitutes,
                 proof_outputs,
                 expected_corpus,
+                replacement_group,
+                external_valid_substitutes,
             },
         )
         .await;
@@ -827,6 +877,9 @@ pub(super) async fn materialize_sender_transaction_candidates(
             Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
                 report.materialized = report.materialized.saturating_add(1);
                 report.expected_candidates.remove(&candidate_id);
+                report
+                    .satisfied_pending_contexts
+                    .extend(satisfied_pending_contexts);
             }
             Ok(PoiPrivateApplyOutcome::SkippedStaleCorpusRevision) => {
                 report.stale_revision_skips = report.stale_revision_skips.saturating_add(1);
@@ -858,6 +911,11 @@ struct PreparedSenderCandidateMaterialization {
     owned_substitutes: Vec<ExpectedWalletOutput>,
     proof_outputs: Vec<FixedBytes<32>>,
     expected_corpus: ExpectedPoiCorpusRevision,
+    replacement_group: Vec<(
+        PendingOutputPoiContextRecord,
+        Option<OutputPoiRecoveryRecord>,
+    )>,
+    external_valid_substitutes: Vec<Utxo>,
 }
 
 async fn prepare_sender_candidate_materialization(
@@ -884,6 +942,80 @@ async fn prepare_sender_candidate_materialization(
         OutputPoiProofSourceResolution::Unavailable => return Ok(None),
     };
     let wallet_nullifiers = WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys);
+    let old_contexts = request
+        .cache_store
+        .list_pending_output_poi_contexts(request.cfg.chain.chain_id, &request.cfg.cache_key)
+        .map_err(|_| {
+            RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::Recoverable,
+                "pending proof evidence is unavailable",
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            )
+        })?;
+    let source_contexts = old_contexts
+        .into_iter()
+        .filter(|context| {
+            context.observation.as_ref().is_some_and(|observation| {
+                observation.tx_hash == candidate.source.tx_hash
+                    && observation.block_number == candidate.source.block_number
+                    && observation.block_timestamp == candidate.source.block_timestamp
+            })
+        })
+        .collect::<Vec<_>>();
+    let replacing = source_contexts
+        .iter()
+        .any(|context| !saved_pending_context_is_compatible(context, &context.list_keys()));
+    let replacement_group = if replacing {
+        source_contexts
+            .into_iter()
+            .map(|context| {
+                request
+                    .cache_store
+                    .get_output_poi_recovery(
+                        request.cfg.chain.chain_id,
+                        &request.cfg.cache_key,
+                        &context.output_commitment,
+                    )
+                    .map(|recovery| (context, recovery))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                RecoveryFailure::retryable(
+                    OutputPoiRecoveryStatus::Recoverable,
+                    "pending recovery evidence is unavailable",
+                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                )
+            })?
+    } else {
+        Vec::new()
+    };
+    let Some(expected_corpus) = proof_source_resolution.expected_corpus_revision() else {
+        return Ok(None);
+    };
+    let candidate_blinded = qualified
+        .iter()
+        .flat_map(|transaction| {
+            transaction
+                .outputs
+                .iter()
+                .map(|output| output.poi.blinded_commitment)
+        })
+        .collect::<Vec<_>>();
+    let Some(valid_by_list) = super::saved_poi_compatibility::corpus_valid_outputs_by_list(
+        &expected_corpus.corpus,
+        request.cfg.chain.chain_id,
+        request.active_list_keys,
+        &candidate_blinded,
+    )
+    .await
+    else {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::Recoverable,
+            "output POI status is unavailable",
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        ));
+    };
+    let mut external_valid_substitutes = Vec::new();
     let now = now_epoch_secs();
     let mut pending_updates = Vec::new();
     let mut recovery_updates = Vec::new();
@@ -972,6 +1104,25 @@ async fn prepare_sender_candidate_materialization(
             elapsed_ms = proof_generation_started.elapsed().as_millis(),
             "sender candidate proof generation complete"
         );
+        if pre_transaction_pois
+            .values()
+            .flat_map(|per_leaf| per_leaf.values())
+            .any(|poi| {
+                !super::saved_poi_compatibility::saved_poi_is_compatible(
+                    poi,
+                    Some((
+                        qualified.public_row.transaction.nullifiers.len(),
+                        qualified.public_row.transaction.commitments.len(),
+                    )),
+                )
+            })
+        {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::ProofGenerationFailed,
+                "generated proof does not match the current verifier",
+                OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+            ));
+        }
         let mut transaction_proof_outputs = None;
         for list_key in request.active_list_keys {
             let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
@@ -1003,7 +1154,8 @@ async fn prepare_sender_candidate_materialization(
         {
             return Ok(None);
         }
-        if qualified.public_row.transaction.has_unshield
+        if !replacing
+            && qualified.public_row.transaction.has_unshield
             && !submit_sender_unshield_transaction_pois(
                 request,
                 candidate,
@@ -1039,13 +1191,24 @@ async fn prepare_sender_candidate_materialization(
                 owned_substitutes.push(ExpectedWalletOutput::new(current));
                 continue;
             }
+            let target_lists = super::saved_poi_compatibility::unresolved_output_lists(
+                request.active_list_keys,
+                output.poi.blinded_commitment,
+                &valid_by_list,
+            );
+            if target_lists.is_empty() {
+                external_valid_substitutes.push(output.clone());
+                continue;
+            }
+            let mut output_proofs = pre_transaction_pois.clone();
+            output_proofs.retain(|list_key, _| target_lists.contains(list_key));
             pending_updates.push(pending_output_poi_context_from_output_recovery(
                 request.cfg,
                 output,
                 &recovery_chunk,
                 txid_data.poi_data.txid_merkleroot_index,
-                pre_transaction_pois.clone(),
-                request.active_list_keys,
+                output_proofs,
+                &target_lists,
                 PendingOutputPoiRole::RecoveredOutgoing,
                 format!(
                     "recovered-sender-output-poi:{}:{}",
@@ -1081,6 +1244,8 @@ async fn prepare_sender_candidate_materialization(
         owned_substitutes,
         proof_outputs: proof_outputs.into_iter().collect(),
         expected_corpus,
+        replacement_group,
+        external_valid_substitutes,
     }))
 }
 
@@ -1127,6 +1292,9 @@ pub(super) async fn submit_sender_unshield_transaction_pois(
     txid_merkleroot_index: u64,
     pre_transaction_pois: &PreTransactionPoiMap,
 ) -> Result<bool, RecoveryFailure> {
+    if !saved_poi_map_is_compatible(pre_transaction_pois, request.active_list_keys) {
+        return Ok(false);
+    }
     for list_key in request.active_list_keys {
         let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
             return Ok(false);
@@ -1396,17 +1564,14 @@ mod tests {
     use crate::txid_cache::TxidPublicCacheTransaction;
     use alloy::primitives::Address;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
-    use broadcaster_core::transact::{PreTxPoi, SnarkJsProof};
+    use broadcaster_core::transact::PreTxPoi;
     use local_db::WalletCacheKey;
 
     fn sample_pre_tx_poi() -> PreTxPoi {
-        PreTxPoi {
-            snark_proof: SnarkJsProof::zero(),
-            txid_merkleroot: FixedBytes::ZERO,
-            poi_merkleroots: vec![FixedBytes::ZERO],
-            blinded_commitments_out: vec![FixedBytes::ZERO],
-            railgun_txid_if_has_unshield: alloy::primitives::Bytes::copy_from_slice(&[0_u8]),
-        }
+        let fixture: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../core/tests/fixtures/ppoi_3x3.json"))
+                .expect("proof fixture");
+        serde_json::from_value(fixture["pre_tx_poi"].clone()).expect("fixture proof")
     }
 
     fn fixture() -> (
@@ -1734,6 +1899,26 @@ mod tests {
             &[list_key],
             &context,
         ));
+        let current_material = context.pre_transaction_pois_per_txid_leaf_per_list.clone();
+        let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../core/tests/fixtures/ppoi_3x3_previous.json"
+        ))
+        .expect("old proof fixture");
+        let old_proof: PreTxPoi =
+            serde_json::from_value(fixture["pre_tx_poi"].clone()).expect("old fixture proof");
+        context.pre_transaction_pois_per_txid_leaf_per_list = BTreeMap::from([(
+            list_key,
+            BTreeMap::from([(FixedBytes::from([0x88; 32]), old_proof)]),
+        )]);
+        assert!(!pending_context_covers_sender_output(
+            candidate.chain_id,
+            candidate.wallet_id.as_str(),
+            &candidate,
+            output,
+            &[list_key],
+            &context
+        ));
+        context.pre_transaction_pois_per_txid_leaf_per_list = current_material;
         context.observation.as_mut().expect("observation").tx_hash = FixedBytes::from([0xaa; 32]);
         assert!(!pending_context_covers_sender_output(
             candidate.chain_id,

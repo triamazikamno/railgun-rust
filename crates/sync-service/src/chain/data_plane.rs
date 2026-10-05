@@ -9,7 +9,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{FixedBytes, U256};
@@ -1497,6 +1497,7 @@ impl ChainPublicDataPlaneState {
 
 #[derive(Clone)]
 pub(crate) struct ChainPublicDataPlane {
+    scan_service: Arc<StdMutex<Weak<ChainService>>>,
     db: Arc<DbStore>,
     epoch: Arc<AtomicU64>,
     state: Arc<Mutex<ChainPublicDataPlaneState>>,
@@ -1565,6 +1566,7 @@ impl ChainPublicDataPlane {
     #[must_use]
     pub(crate) fn new(db: Arc<DbStore>, epoch: Arc<AtomicU64>) -> Self {
         Self {
+            scan_service: Arc::new(StdMutex::new(Weak::new())),
             db,
             epoch,
             state: Arc::new(Mutex::new(ChainPublicDataPlaneState::default())),
@@ -1574,6 +1576,42 @@ impl ChainPublicDataPlane {
             runtime_lease: None,
             window_warm: Arc::new(StdMutex::new(PublicWindowWarmSlot::default())),
         }
+    }
+
+    pub(crate) fn bind_scan_service(&self, service: &Arc<ChainService>) {
+        *self
+            .scan_service
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(service);
+    }
+
+    pub(crate) async fn saved_poi_source_block_rows(
+        &self,
+        block_number: u64,
+    ) -> Result<PublicScanRowsAnswer, ChainError> {
+        let service = self
+            .scan_service
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade();
+        if let Some(service) = service {
+            return service
+                .public_scan_rows(PublicScanRange::new(block_number, block_number))
+                .await;
+        }
+        // Also supports standalone data planes with retained public rows.
+        Ok(
+            match self
+                .cached_wallet_scan_apply(block_number, block_number)
+                .await
+            {
+                Some(apply) => apply.into(),
+                None => PublicScanRowsAnswer::Missing {
+                    range: PublicScanRange::new(block_number, block_number),
+                    epoch: self.current_epoch(),
+                },
+            },
+        )
     }
 
     #[must_use]

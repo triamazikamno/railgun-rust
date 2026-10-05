@@ -74,6 +74,7 @@ mod poi_maintenance;
 mod poi_refresh;
 mod poi_sources;
 mod private_remote;
+mod saved_poi_compatibility;
 mod sender_candidate_recovery;
 mod worker;
 

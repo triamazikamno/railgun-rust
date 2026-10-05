@@ -384,6 +384,8 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoiMaintenanceError {
+    #[error("failed to reconstruct incompatible sender proof evidence")]
+    SenderCandidateReplay(#[source] WalletCacheError),
     #[error("failed to list sender transaction candidates")]
     SenderCandidateList(#[source] WalletCacheError),
 }
@@ -418,6 +420,37 @@ impl OutputPoiRecoveryRun<'_> {
             self.active_list_keys,
         )
         .await;
+        let forest = Arc::new(self.forest.read().await.clone());
+        let replay_report =
+            match super::saved_poi_compatibility::reconstruct_incompatible_sender_candidates(
+                &OutputPoiRecoveryRequest {
+                    authority: self.authority,
+                    db: self.db,
+                    cache_store: self.cache_store,
+                    cfg: self.cfg,
+                    public_data_plane: self.public_data_plane,
+                    http_client: self.http_client,
+                    indexed_artifact_source: self.indexed_artifact_source,
+                    forest: Arc::clone(&forest),
+                    poi_client: self.client,
+                    private_poi: self.private_poi,
+                    poi_runtime: self.poi_runtime,
+                    active_list_keys: self.active_list_keys,
+                    wallet_utxos: &snapshot,
+                    force_retry: self.force_retry,
+                },
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    return PoiMaintenanceRecoveryOutcome {
+                        recovered: 0,
+                        candidate_report: SenderCandidateRecoveryReport::default(),
+                        error: Some(PoiMaintenanceError::SenderCandidateReplay(error)),
+                    };
+                }
+            };
         let owned_recovery_candidates =
             !output_poi_recovery_candidates(&snapshot, self.active_list_keys).is_empty();
         let (sender_candidates, candidate_error) = match self
@@ -433,12 +466,11 @@ impl OutputPoiRecoveryRun<'_> {
         if !owned_recovery_candidates && sender_candidates.is_empty() {
             return PoiMaintenanceRecoveryOutcome {
                 recovered: 0,
-                candidate_report: SenderCandidateRecoveryReport::default(),
+                candidate_report: replay_report,
                 error: candidate_error,
             };
         }
-        let forest = Arc::new(self.forest.read().await.clone());
-        let candidate_report =
+        let mut candidate_report =
             materialize_sender_transaction_candidates(SenderCandidateRecoveryRequest {
                 output_recovery: OutputPoiRecoveryRequest {
                     authority: self.authority,
@@ -459,6 +491,7 @@ impl OutputPoiRecoveryRun<'_> {
                 candidates: sender_candidates,
             })
             .await;
+        candidate_report.merge_replay_report(replay_report);
         if !owned_recovery_candidates {
             return PoiMaintenanceRecoveryOutcome {
                 recovered: candidate_report.completed(),

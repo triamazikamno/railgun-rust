@@ -242,7 +242,10 @@ mod tests {
     use local_db::{DbConfig, DbStore};
     use wasmer::Store;
 
-    use super::{WASM_MODULE_CACHE_KIND, load_or_compile_wasm_module, module_cache_id};
+    use super::{
+        WASM_MODULE_CACHE_KIND, load_or_compile_wasm_module, module_cache_id,
+        wasm_module_cache_exists,
+    };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -282,6 +285,30 @@ mod tests {
             load_or_compile_wasm_module(Some(&db), &store, "test/variant", "default", wasm)
                 .expect("load cached module");
         assert!(second.cache_hit);
+
+        load_or_compile_wasm_module(Some(&db), &store, "01x01", "default", wasm)
+            .expect("compile ordinary module");
+        // A valid custom section changes the source bytes without requiring a larger fixture.
+        let changed_wasm = b"\0asm\x01\0\0\0\0\x02\x01x";
+        assert!(
+            !wasm_module_cache_exists(&db, "test/variant", "default", changed_wasm)
+                .expect("changed source misses")
+        );
+        let replacement =
+            load_or_compile_wasm_module(Some(&db), &store, "test/variant", "default", changed_wasm)
+                .expect("compile changed module");
+        assert!(!replacement.cache_hit);
+        let reused =
+            load_or_compile_wasm_module(Some(&db), &store, "test/variant", "default", changed_wasm)
+                .expect("reuse changed module");
+        assert!(reused.cache_hit);
+        assert!(
+            !wasm_module_cache_exists(&db, "test/variant", "default", wasm)
+                .expect("old source misses after replacement")
+        );
+        let ordinary = load_or_compile_wasm_module(Some(&db), &store, "01x01", "default", wasm)
+            .expect("reuse ordinary module");
+        assert!(ordinary.cache_hit);
 
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

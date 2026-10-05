@@ -402,7 +402,7 @@ impl PendingOutputPoiSubject {
 pub(crate) struct RecoveredOutgoingSubmissionSibling {
     pub(crate) subject: PendingOutputPoiSubject,
     pub(crate) expected_context_fingerprint: Vec<u8>,
-    pub(crate) expected_recovery: ExpectedRecordState,
+    pub(crate) plan: super::pending_output_poi::PendingOutputPoiSubmissionPlan,
 }
 
 /// Evidence that authorizes retirement of an exact pending-output POI context.
@@ -427,6 +427,15 @@ pub(crate) struct ExpectedPoiCorpusRevision {
 /// Owned semantic POI intent for actor re-entry (jobs never write mirrors or stale rows).
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
+    /// Restore the consumed scan candidate without applying the replay to wallet state.
+    SenderCandidateReconstruction {
+        candidate: SenderTransactionCandidate,
+        replay_fence: super::saved_poi_compatibility::SenderCandidateReplayFence,
+        expected_group: Vec<(
+            PendingOutputPoiContextRecord,
+            Option<OutputPoiRecoveryRecord>,
+        )>,
+    },
     /// Retire an exact sender candidate after the actor re-reads local artifact POI status.
     SenderCandidateLocallyValid {
         expected_candidate: SenderTransactionCandidate,
@@ -442,6 +451,13 @@ pub(crate) enum OwnedPoiPrivateDelta {
         recovery_updates: Vec<OutputPoiRecoveryRecord>,
         owned_substitutes: Vec<ExpectedWalletOutput>,
         proof_outputs: Vec<FixedBytes<32>>,
+        /// Exact unresolved predecessors when replacing proofs from an obsolete circuit.
+        replacement_group: Vec<(
+            PendingOutputPoiContextRecord,
+            Option<OutputPoiRecoveryRecord>,
+        )>,
+        /// Completed external outputs remain witness evidence without new pending records.
+        external_valid_substitutes: Vec<Utxo>,
         /// Corpus revision the candidate's proofs were built from.
         expected_corpus: ExpectedPoiCorpusRevision,
     },
@@ -475,9 +491,10 @@ pub(crate) enum OwnedPoiPrivateDelta {
     RecoveredOutgoingSubmission {
         siblings: Vec<RecoveredOutgoingSubmissionSibling>,
         owned_substitutes: Vec<ExpectedWalletOutput>,
+        external_valid_substitutes: Vec<FixedBytes<32>>,
+        expected_corpus: Option<ExpectedPoiCorpusRevision>,
         active_list_keys: Vec<FixedBytes<32>>,
         list_keys: Vec<FixedBytes<32>>,
-        predicate: PendingOutputPoiSubmissionPredicate,
         merge_submitted_list_keys: bool,
         action: OutputPoiRecoveryAction,
         now: u64,

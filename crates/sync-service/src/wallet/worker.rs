@@ -604,7 +604,7 @@ impl PoiMaintenanceJob {
                     credential,
                     key,
                     recovered: outcome.recovered,
-                    candidate_report: outcome.candidate_report,
+                    candidate_report: Box::new(outcome.candidate_report),
                     recovery_error: outcome.recovery_error,
                     forced_pending_attempts: outcome.forced_pending_attempts,
                     submitted: outcome.submitted,
@@ -721,6 +721,7 @@ impl PoiMaintenanceJob {
         let forced_pending_attempts = if self.force_output_poi_recovery {
             force_resubmit_matching_pending_output_pois_authorized(
                 &authority,
+                &self.public_data_plane,
                 self.db.as_ref(),
                 self.cache_store.as_ref(),
                 &self.cfg,
@@ -762,6 +763,7 @@ impl PoiMaintenanceJob {
         );
         let submitted = process_pending_output_poi_observations_authorized(
             &authority,
+            &self.public_data_plane,
             self.db.as_ref(),
             self.cache_store.as_ref(),
             &self.cfg,
@@ -3143,6 +3145,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 )
                                 .is_ok_and(|candidates| {
                                     candidate_report.matches_candidates(&candidates)
+                                        && candidate_report.matches_pending_contexts(cache_store.as_ref(), &cfg).unwrap_or(false)
                                 });
                             if workflow_status.awaiting_recovery > 0
                                 && candidate_report_is_current
@@ -4785,6 +4788,7 @@ mod tests {
     use super::*;
     use crate::types::WalletResetToken;
     use crate::wallet::actor::PoiRemoteJobKind;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn maintenance_watchdog_converts_timeout_and_panic_to_sanitized_abort_reasons() {
@@ -5494,6 +5498,7 @@ mod tests {
         let mut context =
             observed_external_pending_output_context(&cfg, &output, list_key, &source(110, 0xd0));
         context.terminal_error = None;
+        context.pre_transaction_pois_per_txid_leaf_per_list = current_pending_proof_map(list_key);
         let recovery =
             output_poi_recovery_for_pending_context(&context, OutputPoiRecoveryStatus::Submitted);
         db.put_pending_output_poi_context(&context)
@@ -5540,6 +5545,130 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
+    #[tokio::test]
+    async fn maintenance_completion_discards_waiting_details_when_replayed_pending_subject_changes()
+    {
+        for replace_subject in [false, true] {
+            let root_dir = temp_db_root("wallet-maintenance-subject-publication");
+            let db = Arc::new(
+                DbStore::open(DbConfig {
+                    root_dir: root_dir.clone(),
+                })
+                .expect("open db"),
+            );
+            let cache_store = Arc::new(FailingCacheStore::new(Arc::clone(&db)));
+            let mut cfg = wallet_config();
+            cfg.cache_store = Some(cache_store.clone());
+            let list_key = default_active_poi_list_keys()[0];
+            let output = test_wallet_utxo_with_random(110, 17, [0x31; 16]);
+            let mut context = observed_external_pending_output_context(
+                &cfg,
+                &output,
+                list_key,
+                &source(110, 0xd0),
+            );
+            context.terminal_error = None;
+            context.submitted_poi_list_keys.clear();
+            let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+                "../../../core/tests/fixtures/ppoi_3x3_previous.json"
+            ))
+            .expect("actual previous-key proof");
+            let proof: broadcaster_core::transact::PreTxPoi =
+                serde_json::from_value(fixture["pre_tx_poi"].clone()).expect("decode old proof");
+            context.pre_transaction_pois_per_txid_leaf_per_list = BTreeMap::from([(
+                list_key,
+                BTreeMap::from([(FixedBytes::from([0x41; 32]), proof)]),
+            )]);
+            let recovery = output_poi_recovery_for_pending_context(
+                &context,
+                OutputPoiRecoveryStatus::Recoverable,
+            );
+            db.put_pending_output_poi_context(&context)
+                .expect("seed pending subject");
+            db.put_output_poi_recovery(&recovery)
+                .expect("seed replay recovery");
+            if replace_subject {
+                let mut replacement = context.clone();
+                replacement.source_operation_id = Some("replacement-after-replay-snapshot".into());
+                *cache_store
+                    .replay_pending_replacement
+                    .lock()
+                    .expect("arm replay race") = Some(replacement);
+            }
+            let (_live_tx, live_rx) = broadcast::channel(8);
+            let (backfill_tx, backfill_rx) = mpsc::channel(8);
+            let (backfill_request_tx, _backfill_request_rx) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let handle = spawn_wallet_worker(
+                WalletWorkerServices {
+                    db: Arc::clone(&db),
+                    http_client: None,
+                    indexed_artifact_source: None,
+                    poi_runtime: test_artifact_poi_runtime(),
+                    forest: Arc::new(RwLock::new(MerkleForest::new())),
+                    backfill_tx: backfill_request_tx,
+                    backfill_sender: backfill_tx.clone(),
+                    public_data_plane: test_public_data_plane_with_poi_service(&db),
+                    poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
+                },
+                cfg,
+                1,
+                live_rx,
+                backfill_rx,
+                cancel.clone(),
+                Vec::new(),
+                100,
+            )
+            .await
+            .expect("spawn worker");
+            assert_eq!(
+                handle
+                    .observation()
+                    .ppoi_workflow_status()
+                    .awaiting_recovery,
+                1
+            );
+            assert_eq!(
+                send_target_token(&backfill_tx, 100, handle.mint_sync_token(0)).await,
+                WalletBackfillFinishResult::Ready { committed_to: 100 }
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while cache_store.recovery_reads.load(Ordering::SeqCst) < 2
+                    || *handle.poi_refreshing_rx.borrow()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                // Drain a subsequent actor request so the completion branch has published.
+                handle
+                    .clear_all_local_pending_spent()
+                    .await
+                    .expect("actor completion barrier");
+            })
+            .await
+            .expect("maintenance completion");
+            let status = *handle.observation().ppoi_workflow_status();
+            assert_eq!(status.awaiting_recovery, 1);
+            assert_eq!(
+                status.awaiting_public_txid_data,
+                u64::from(!replace_subject),
+                "only the current replay subject may publish its wait detail"
+            );
+            assert_eq!(status.retrying_recovery, 0);
+            assert!(
+                cache_store
+                    .replay_pending_replacement
+                    .lock()
+                    .expect("replay race consumed")
+                    .is_none()
+            );
+            cancel.cancel();
+            drop(handle);
+            drop(cache_store);
+            drop(db);
+            fs::remove_dir_all(root_dir).expect("remove temp db dir");
+        }
+    }
+
     #[derive(Debug, Clone, Copy, Default)]
     struct FailingCacheStoreState {
         store_calls: usize,
@@ -5556,6 +5685,8 @@ mod tests {
         db: Arc<DbStore>,
         state: Mutex<FailingCacheStoreState>,
         actor_state: Mutex<Option<WalletSyncActorStateRecord>>,
+        recovery_reads: AtomicU64,
+        replay_pending_replacement: Mutex<Option<PendingOutputPoiContextRecord>>,
     }
 
     impl FailingCacheStore {
@@ -5564,6 +5695,8 @@ mod tests {
                 db,
                 state: Mutex::default(),
                 actor_state: Mutex::default(),
+                recovery_reads: AtomicU64::new(0),
+                replay_pending_replacement: Mutex::default(),
             }
         }
 
@@ -5718,6 +5851,17 @@ mod tests {
             wallet_id: &WalletCacheKey,
             output_commitment: &FixedBytes<32>,
         ) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError> {
+            // Replay selects the source from its first recovery read, then captures the
+            // predecessor on its second. Replace the durable subject after that snapshot.
+            if self.recovery_reads.fetch_add(1, Ordering::SeqCst) == 1
+                && let Some(replacement) = self
+                    .replay_pending_replacement
+                    .lock()
+                    .expect("replay replacement")
+                    .take()
+            {
+                self.db.put_pending_output_poi_context(&replacement)?;
+            }
             <DbStore as WalletCacheStore>::get_output_poi_recovery(
                 self.db.as_ref(),
                 chain_id,
@@ -9400,12 +9544,14 @@ mod tests {
         let cfg = wallet_config();
         let list_key = default_active_poi_list_keys()[0];
         let external_output = test_wallet_utxo_with_random(110, 17, [0x17; 16]);
-        let stale_context = observed_external_pending_output_context(
+        let mut stale_context = observed_external_pending_output_context(
             &cfg,
             &external_output,
             list_key,
             &source(110, 0xd2),
         );
+        stale_context.pre_transaction_pois_per_txid_leaf_per_list =
+            current_pending_proof_map(list_key);
         let stale_observation = stale_context
             .observation
             .clone()
@@ -9497,6 +9643,7 @@ mod tests {
         assert_eq!(
             pending_output_poi_submission_plan_current(
                 &authority,
+                &test_public_data_plane(&db),
                 db.as_ref(),
                 &cfg,
                 &[list_key],
@@ -9588,6 +9735,7 @@ mod tests {
         assert_eq!(
             pending_output_poi_submission_plan_current(
                 &authority,
+                &test_public_data_plane(&db),
                 db.as_ref(),
                 &cfg,
                 &[list_key],
@@ -12891,6 +13039,16 @@ mod tests {
             submitted_poi_list_keys: Vec::new(),
             terminal_error: None,
         }
+    }
+
+    fn current_pending_proof_map(list_key: FixedBytes<32>) -> crate::wallet::PreTransactionPoiMap {
+        let fixture: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../core/tests/fixtures/ppoi_3x3.json"))
+                .expect("current proof fixture");
+        let proof = serde_json::from_value(fixture["pre_tx_poi"].clone()).expect("current proof");
+        let leaf = serde_json::from_value(fixture["public_context"]["txid_leaf_hash"].clone())
+            .expect("current proof leaf");
+        BTreeMap::from([(list_key, BTreeMap::from([(leaf, proof)]))])
     }
 
     fn observed_external_pending_output_context(

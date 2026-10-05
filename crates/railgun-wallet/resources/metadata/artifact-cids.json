@@ -911,22 +911,22 @@
   },
   "POI_13x13": {
     "wasm": {
-      "cid": "QmQFajQFuNjNbRPV4Nuden9ve3ZmTgE2c7yVJ1i4f9474j",
-      "br_bytes": 966721
+      "cid": "QmUtQFFYcmooihjn5wfYdVNPbtkEv4SKqegwcdcd1L3K5X",
+      "br_bytes": 994825
     },
     "zkey": {
-      "cid": "QmXE63puZpTVHjsrm4WxqxaGdhRNkbbpzF1713fRTdAUap",
-      "br_bytes": 27880141
+      "cid": "QmTY2yzKjMhjdcgC52Q3aiHE5wNRUsWgdDtzFtqSFfuzXm",
+      "br_bytes": 28026761
     }
   },
   "POI_3x3": {
     "wasm": {
-      "cid": "QmfWcMX3b4GBseab9LpmPz8ozKoRJLqyS26sqhFELXSMqn",
-      "br_bytes": 911894
+      "cid": "QmaNNJxu5DqzmB3W6BSR49bsPM1MNhwWH9o4Dqd8cSpeyL",
+      "br_bytes": 921691
     },
     "zkey": {
-      "cid": "QmUcU98hmiWCysxoUbi2ogsm11Xgg9RcyNaRcYMzHiZ9zH",
-      "br_bytes": 7784805
+      "cid": "QmYG6a72rcLiddX1DyHmDvRaDpkPAf3VdHNNPxVBqndhEy",
+      "br_bytes": 7951125
     }
   }
 }

@@ -262,6 +262,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ark_bn254::{Bn254, Fr, G1Affine};
+    use ark_circom::index::NPIndex;
+    use ark_groth16::{ProvingKey, VerifyingKey};
     use local_db::{DbConfig, DbStore};
 
     use super::{ZKEY_CACHE_FORMAT_VERSION, ZkeyCacheDbExt};
@@ -274,6 +277,73 @@ mod tests {
         let pid = std::process::id();
         let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
         dir.join(format!("{pid}-{counter}"))
+    }
+
+    #[test]
+    fn changed_zkey_source_replaces_only_its_derived_cache() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let proving_key = ProvingKey::<Bn254> {
+            vk: VerifyingKey::default(),
+            beta_g1: G1Affine::default(),
+            delta_g1: G1Affine::default(),
+            a_query: Vec::new(),
+            b_g1_query: Vec::new(),
+            b_g2_query: Vec::new(),
+            h_query: Vec::new(),
+            l_query: Vec::new(),
+        };
+        let matrices = NPIndex::<Fr> {
+            num_instance_variables: 1,
+            num_witness_variables: 0,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 0,
+            c_num_non_zero: 0,
+            a: vec![vec![(Fr::from(1), 0)]],
+            b: vec![Vec::new()],
+            c: vec![Vec::new()],
+        };
+        let old_hash = [1_u8; 32];
+        let new_hash = [2_u8; 32];
+        for variant in ["POI_3x3", "01x01"] {
+            db.write_zkey_cache(variant, old_hash, &proving_key, &matrices)
+                .expect("write original cache");
+        }
+        assert!(super::zkey_cache_exists(&db, "POI_3x3", old_hash).expect("old source matches"));
+        assert!(!super::zkey_cache_exists(&db, "POI_3x3", new_hash).expect("new source differs"));
+        assert!(
+            db.load_zkey_cache("POI_3x3", new_hash)
+                .expect("reject obsolete source")
+                .is_none()
+        );
+
+        let mut replacement_matrices = matrices.clone();
+        replacement_matrices.a[0][0].0 = Fr::from(2);
+        db.write_zkey_cache("POI_3x3", new_hash, &proving_key, &replacement_matrices)
+            .expect("replace cache from new source");
+        assert!(super::zkey_cache_exists(&db, "POI_3x3", new_hash).expect("new source matches"));
+        assert!(!super::zkey_cache_exists(&db, "POI_3x3", old_hash).expect("old source differs"));
+        assert!(
+            db.load_zkey_cache("POI_3x3", old_hash)
+                .expect("reject replaced source")
+                .is_none()
+        );
+        assert_eq!(
+            db.load_zkey_cache("POI_3x3", new_hash)
+                .expect("reuse replacement"),
+            Some((proving_key.clone(), replacement_matrices))
+        );
+        assert_eq!(
+            db.load_zkey_cache("01x01", old_hash)
+                .expect("reuse ordinary cache"),
+            Some((proving_key, matrices))
+        );
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     #[test]

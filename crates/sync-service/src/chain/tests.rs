@@ -7239,6 +7239,52 @@ async fn public_scan_coverage_distinguishes_row_bearing_cached_coverage() {
 }
 
 #[tokio::test]
+async fn saved_poi_source_block_rows_uses_bound_service_for_exact_block() {
+    let root_dir = temp_db_root("saved-poi-source-block-bound-service");
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let squid = GraphqlServer::spawn_controlled(
+        vec![
+            squid_wallet_probe(200),
+            squid_wallet_page_with_nullifier(120),
+        ],
+        None,
+    );
+    let rpcs = Arc::new(QueryRpcPool::new(Vec::new(), Duration::from_secs(1)));
+    let mut chain = test_chain_config(&test_scope(), rpcs, None);
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane.clone());
+    public_data_plane.bind_scan_service(&service);
+
+    let answer = public_data_plane
+        .saved_poi_source_block_rows(120)
+        .await
+        .expect("fetch saved PPOI source block");
+    let PublicScanRowsAnswer::Rows(rows) = answer else {
+        panic!("the bound service must fetch uncached source block rows");
+    };
+    assert_eq!(rows.range, PublicScanRange::new(120, 120));
+    assert_eq!(rows.source, PublicScanSource::Squid);
+    assert_eq!(rows.rows.nullifiers.len(), 1);
+
+    let requests = squid.requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    let page_request = json_rpc_request_body(&requests[1]);
+    assert_eq!(page_request["variables"]["fromBlock"], "120");
+    assert_eq!(page_request["variables"]["toBlock"], "120");
+
+    drop(service);
+    drop(public_data_plane);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
 async fn public_scan_rows_rejects_source_result_after_epoch_invalidation() {
     let root_dir = temp_db_root("public-scan-rows-stale-source-result");
     let db = Arc::new(
@@ -12348,13 +12394,39 @@ async fn live_batch_sends_prepared_output_ppoi_proofs() {
 /// finalizes left the outputs' PPOI proofs unsent.
 #[tokio::test(start_paused = true)]
 async fn created_output_ppoi_context_is_sent_after_sender_wallet_retires() {
+    #[derive(serde::Deserialize)]
+    struct ProofFixture {
+        pre_tx_poi: broadcaster_core::transact::PreTxPoi,
+        public_context: ProofPublicContext,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProofPublicContext {
+        commitments_out: Vec<U256>,
+        output_npks: Vec<U256>,
+        input_tree: u64,
+        railgun_txid: U256,
+        txid_leaf_hash: U256,
+    }
+
+    let proof_fixture: ProofFixture = serde_json::from_slice(include_bytes!(
+        "../../../core/tests/fixtures/ppoi_3x3_two_outputs.json"
+    ))
+    .expect("current two-output PPOI fixture");
+    let public_context = proof_fixture.public_context;
     let scope = test_scope();
-    let output = FixedBytes::from([0xc2; 32]);
+    let output = FixedBytes::from(public_context.commitments_out[1].to_be_bytes::<32>());
+    let output_npk = FixedBytes::from(public_context.output_npks[1].to_be_bytes::<32>());
+    let txid_leaf_hash = FixedBytes::from(public_context.txid_leaf_hash.to_be_bytes::<32>());
     let list = poi::poi::default_active_poi_list_keys()[0];
     let log = rpc_transact_outputs_log(
         scope.railgun_contract,
         50,
-        vec![FixedBytes::from([0xc1; 32]), output],
+        public_context
+            .commitments_out
+            .iter()
+            .map(|commitment| FixedBytes::from(commitment.to_be_bytes::<32>()))
+            .collect(),
     );
     let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(vec![log], 100, |_, _, _| None));
     let transport = Arc::new(RecordingPoiTransport::default());
@@ -12397,12 +12469,12 @@ async fn created_output_ppoi_context_is_sent_after_sender_wallet_retires() {
             .create_pending_output_poi_contexts(vec![crate::types::PendingOutputPoiContextIntent {
                 txid_version: DEFAULT_TXID_VERSION.to_string(),
                 output_commitment: output,
-                output_npk: FixedBytes::from([0x22; 32]),
-                utxo_tree_in: 0,
-                railgun_txid: U256::from(7),
+                output_npk,
+                utxo_tree_in: public_context.input_tree,
+                railgun_txid: public_context.railgun_txid,
                 pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(
                     list,
-                    BTreeMap::new(),
+                    BTreeMap::from([(txid_leaf_hash, proof_fixture.pre_tx_poi)]),
                 )]),
                 required_poi_list_keys: vec![list],
                 output_role: local_db::PendingOutputPoiRole::Recipient,

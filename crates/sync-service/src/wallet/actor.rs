@@ -1497,7 +1497,7 @@ pub(crate) enum WalletRemoteDone {
         credential: WalletActorCredential,
         key: PoiRemoteJobKey,
         recovered: usize,
-        candidate_report: super::SenderCandidateRecoveryReport,
+        candidate_report: Box<super::SenderCandidateRecoveryReport>,
         recovery_error: Option<super::PoiMaintenanceError>,
         forced_pending_attempts: usize,
         submitted: usize,

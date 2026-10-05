@@ -352,9 +352,9 @@ mod tests {
     use super::*;
 
     const POI_3X3_VKEY_SHA256: &str =
-        "92120a7dfda25cc56c79ce7047f2ff8596f4d96e95dcdc2ff4d599a5cdcf5c56";
+        "e6ac836dcabb1d70f3924f172d8edd52e09269f87a0d5b977650c63a8070bd31";
     const POI_13X13_VKEY_SHA256: &str =
-        "e89e11bc12d5aedcce861e1a1079b9f05c8e41cdf66a0019ed4c89e5d939a96b";
+        "b939fbc34c9ba9cc294a8b5c1e72ddc4088e559d351dc4fab7b71234d34bbb17";
 
     fn sha256_hex(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))

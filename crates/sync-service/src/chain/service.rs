@@ -971,6 +971,8 @@ impl ChainService {
             public_data_plane,
         });
 
+        service.public_data_plane.bind_scan_service(&service);
+
         Ok(PreparedChainService {
             service,
             rpcs,
