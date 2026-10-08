@@ -162,6 +162,43 @@ pub fn private_delivery_message(
     .into()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PrivateDepositError {
+    #[error("private deposit recipient must be the handler")]
+    RecipientNotHandler,
+    #[error("private deposit message must be empty")]
+    NonEmptyMessage,
+}
+
+/// `depositV3` calldata for a deposit an account sends itself, whose fill the
+/// Across handler at `handler` shields through `executor`.
+///
+/// `deposit.recipient` must be `handler` and `deposit.message` must be empty;
+/// it is replaced by `private_delivery_message(handler, deposit.outputToken,
+/// executor, shield_multicall, fallback)`.
+pub fn private_deposit_calldata(
+    mut deposit: SpokePool::depositV3Call,
+    handler: Address,
+    executor: Address,
+    shield_multicall: Bytes,
+    fallback: Option<Address>,
+) -> Result<Bytes, PrivateDepositError> {
+    if deposit.recipient != handler {
+        return Err(PrivateDepositError::RecipientNotHandler);
+    }
+    if !deposit.message.is_empty() {
+        return Err(PrivateDepositError::NonEmptyMessage);
+    }
+    deposit.message = private_delivery_message(
+        handler,
+        deposit.outputToken,
+        executor,
+        shield_multicall,
+        fallback,
+    );
+    Ok(deposit.abi_encode().into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +296,67 @@ mod tests {
         let placeholder = message(Bytes::from_static(&[0; 37]), None);
         assert_eq!(placeholder.len(), without_fallback.len());
         assert_eq!(placeholder.len(), with_fallback.len());
+    }
+
+    #[test]
+    fn private_deposit_calldata_sets_the_delivery_message() {
+        let handler = address!("0x924a9f036260DdD5808007E1AA95f08eD08aA569");
+        let executor = Address::repeat_byte(0xe0);
+        let shield_multicall = Bytes::from_static(&[0xab; 37]);
+        let deposit = SpokePool::depositV3Call {
+            depositor: USER,
+            recipient: handler,
+            inputToken: ARBITRUM_WETH,
+            outputToken: MAINNET_WETH,
+            inputAmount: U256::from(INPUT_AMOUNT),
+            outputAmount: U256::from(OUTPUT_AMOUNT),
+            destinationChainId: U256::ONE,
+            exclusiveRelayer: Address::ZERO,
+            quoteTimestamp: 1_700_000_000,
+            fillDeadline: 1_700_003_600,
+            exclusivityParameter: 0,
+            message: Bytes::new(),
+        };
+        let calldata = |deposit: &SpokePool::depositV3Call| {
+            private_deposit_calldata(
+                deposit.clone(),
+                handler,
+                executor,
+                shield_multicall.clone(),
+                Some(USER),
+            )
+        };
+
+        let sent = SpokePool::depositV3Call::abi_decode(&calldata(&deposit).unwrap()).unwrap();
+        assert_eq!((sent.depositor, sent.recipient), (USER, handler));
+        assert_eq!(sent.outputAmount, deposit.outputAmount);
+        assert_eq!(
+            sent.message,
+            private_delivery_message(
+                handler,
+                MAINNET_WETH,
+                executor,
+                shield_multicall.clone(),
+                Some(USER)
+            )
+        );
+
+        let to_user = SpokePool::depositV3Call {
+            recipient: USER,
+            ..deposit.clone()
+        };
+        assert_eq!(
+            calldata(&to_user),
+            Err(PrivateDepositError::RecipientNotHandler)
+        );
+        let with_message = SpokePool::depositV3Call {
+            message: Bytes::from_static(&[0x01]),
+            ..deposit
+        };
+        assert_eq!(
+            calldata(&with_message),
+            Err(PrivateDepositError::NonEmptyMessage)
+        );
     }
 
     #[test]

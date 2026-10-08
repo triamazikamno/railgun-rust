@@ -136,7 +136,7 @@ pub enum ExecutorActionError {
 }
 
 /// What the Across handler does with a private-delivery fill on the destination chain.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcrossPrivateDelivery {
     /// The Across `MulticallHandler` on the destination chain.
     pub handler: Address,

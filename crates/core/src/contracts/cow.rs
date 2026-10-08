@@ -7,7 +7,7 @@ use alloy::primitives::{
     Address, B256, Bytes, FixedBytes, Signature, SignatureError, address, keccak256,
 };
 use alloy::sol;
-use alloy::sol_types::{Eip712Domain, SolStruct, eip712_domain};
+use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, eip712_domain};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -133,6 +133,17 @@ pub fn recover_order_signer(signature: &[u8; 65], digest: &B256) -> Result<Addre
         return Err(CowError::InvalidSignatureV(v));
     }
     Ok(Signature::from_raw_array(signature)?.recover_address_from_prehash(digest)?)
+}
+
+/// `GPv2Settlement.invalidateOrder(orderUid)` calldata. Only the order's owner
+/// may send it.
+#[must_use]
+pub fn invalidate_order_calldata(order_uid: &OrderUid) -> Bytes {
+    GPv2Settlement::invalidateOrderCall {
+        orderUid: order_uid.0.into(),
+    }
+    .abi_encode()
+    .into()
 }
 
 /// App-data document carrying only order hooks.
@@ -297,6 +308,15 @@ mod tests {
         let uid = order_uid(&test_order(), 1, settlement, signer.address());
         assert_eq!(uid.digest(), digest);
         assert_eq!(uid.owner(), signer.address());
+    }
+
+    #[test]
+    fn invalidate_order_calldata_carries_the_uid() {
+        let uid = OrderUid::new(B256::repeat_byte(0xd1), TEST_OWNER, 1_700_000_000);
+        let calldata = invalidate_order_calldata(&uid);
+        assert_eq!(calldata[..4], keccak256("invalidateOrder(bytes)")[..4]);
+        let call = GPv2Settlement::invalidateOrderCall::abi_decode(&calldata).unwrap();
+        assert_eq!(call.orderUid.as_ref(), uid.0.as_slice());
     }
 
     #[test]
