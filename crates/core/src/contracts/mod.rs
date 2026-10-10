@@ -1,6 +1,7 @@
 pub mod across;
 pub mod cow;
 pub mod cow_shed;
+pub mod erc20_permit;
 pub mod executor;
 pub mod railgun;
 pub mod shield;
