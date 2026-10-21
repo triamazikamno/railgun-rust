@@ -29,7 +29,7 @@ impl NoteCiphertext {
         receiver: &AddressData,
         sender_viewing_private_key: &[u8; 32],
     ) -> Result<Self, NoteError> {
-        let sender_random = MEMO_SENDER_RANDOM_NULL;
+        let sender_random: [u8; 15] = rand::random();
         let (blinded_sender, blinded_receiver) = note_blinding_keys(
             &sender.viewing_public_key,
             &receiver.viewing_public_key,
