@@ -706,6 +706,16 @@ impl RailgunSyncOptions {
                 anchor_interval: 1000,
                 anchor_retention: 5,
             }),
+            8453 => Some(Self {
+                block_range,
+                poll_interval,
+                indexed_artifact_source: None,
+                archive_until_block: 0,
+                indexed_wallet_block_range: 1_000_000,
+                quick_sync_endpoint: None,
+                anchor_interval: 1000,
+                anchor_retention: 5,
+            }),
             _ => None,
         }
     }
@@ -2952,6 +2962,12 @@ mod tests {
                 .unwrap()
                 .indexed_wallet_block_range,
             5_000_000
+        );
+        assert_eq!(
+            RailgunSyncOptions::for_chain(8453, 100, std::time::Duration::from_secs(1))
+                .unwrap()
+                .indexed_wallet_block_range,
+            1_000_000
         );
     }
 

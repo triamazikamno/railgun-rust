@@ -48,6 +48,10 @@ const RELAY_ADAPT_7702_DELEGATES: &[ExecutorDelegate] = &[
     nonce_bearing_v1(address!("0xa2BFd382c54bb33DF6A13f21acd8770dc1e67D4D")),
 ];
 
+const BASE_RELAY_ADAPT_7702_DELEGATES: &[ExecutorDelegate] = &[nonce_bearing_v1(address!(
+    "0xAcBC3De27E7d9750a7F26b2eCCE9c89C24Cc8691"
+))];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RailgunDeployment {
     pub chain_id: u64,
@@ -112,6 +116,17 @@ impl RailgunDeployment {
                 v2_start_block: 0,
                 legacy_shield_block: 68_196_853,
             }),
+            8453 => Some(Self {
+                chain_id,
+                contract: address!("0x0047d1f97674614189e80566575fb615788acf25"),
+                relay_adapt_contract: None,
+                relay_adapt_7702_contract: address!("0xAcBC3De27E7d9750a7F26b2eCCE9c89C24Cc8691"),
+                relay_adapt_7702_delegates: BASE_RELAY_ADAPT_7702_DELEGATES,
+                relay_adapt_history: &[],
+                deployment_block: 50_224_711,
+                v2_start_block: 0,
+                legacy_shield_block: 0,
+            }),
             _ => None,
         }
     }
@@ -123,7 +138,7 @@ mod tests {
 
     #[test]
     fn current_relay_adapt_is_latest_history_entry() {
-        for chain_id in [1, 56, 137, 42161] {
+        for chain_id in [1, 56, 137, 42161, 8453] {
             let deployment = RailgunDeployment::for_chain(chain_id).unwrap();
             assert_eq!(
                 deployment.relay_adapt_contract,
@@ -134,7 +149,7 @@ mod tests {
 
     #[test]
     fn primary_relay_adapt_7702_is_latest_delegate() {
-        for chain_id in [1, 56, 137, 42161] {
+        for chain_id in [1, 56, 137, 42161, 8453] {
             let deployment = RailgunDeployment::for_chain(chain_id).unwrap();
             assert_eq!(
                 Some(deployment.relay_adapt_7702_contract),
