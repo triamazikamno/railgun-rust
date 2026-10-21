@@ -24,7 +24,8 @@ use broadcaster_core::transact::{
 use merkletree::tree::DenseMerkleTree;
 use tracing::debug;
 
-const PUBLIC_TXID_RECORD_SECTION_ID: u16 = 1;
+// Section 1 held the earlier record layout with a spent-input Merkle root and is not read.
+pub(super) const PUBLIC_TXID_RECORD_SECTION_ID: u16 = 3;
 const PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID: u16 = 2;
 
 pub(crate) struct TxidPublicArtifactSource {
@@ -743,7 +744,6 @@ impl<'a> PublicTxidCursor<'a> {
         let transaction_hash = self.read_fixed_bytes("transaction_hash")?;
         let _first_log_index = self.read_u64("first_log_index")?;
         let _last_log_index = self.read_u64("last_log_index")?;
-        let merkle_root = self.read_fixed_bytes("merkle_root")?;
         let nullifiers = self.read_u256_vec("nullifiers")?;
         let commitments = self.read_u256_vec("commitments")?;
         let bound_params_hash = U256::from_be_bytes(self.read_fixed_bytes("bound_params_hash")?);
@@ -771,7 +771,6 @@ impl<'a> PublicTxidCursor<'a> {
                 transaction_hash: FixedBytes::from(transaction_hash),
                 block_number,
                 block_timestamp,
-                merkle_root: U256::from_be_bytes(merkle_root),
                 nullifiers,
                 commitments,
                 bound_params_hash,

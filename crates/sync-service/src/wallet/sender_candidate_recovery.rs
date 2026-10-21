@@ -1634,7 +1634,6 @@ mod tests {
                 transaction_hash: source.tx_hash,
                 block_number: source.block_number,
                 block_timestamp: source.block_timestamp,
-                merkle_root: U256::from(1),
                 nullifiers: vec![input.utxo.nullifier(keys.nullifying_key)],
                 commitments: vec![U256::from_be_bytes(output_commitment.0)],
                 bound_params_hash: U256::from(2),

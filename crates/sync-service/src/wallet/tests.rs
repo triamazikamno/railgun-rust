@@ -15,14 +15,14 @@ use super::output_poi_recovery::test_support::{
 };
 use super::output_poi_recovery::{
     MatchingPendingOutputPoiContextDisposition, OutputPoiProofSourceResolution,
-    PublicTxidRecoveryBuildRequest, RecoveryChunk, RecoveryFailure, WalletNullifierIndex,
-    build_output_poi_recovery_chunk, build_output_poi_recovery_chunk_from_public_cache,
+    PublicTxidRecoveryBuildRequest, RecoveryChunk, RecoveryFailure, RecoverySpendPublicKey,
+    WalletNullifierIndex, build_output_poi_recovery_chunk,
+    build_output_poi_recovery_chunk_from_public_cache,
     build_output_poi_recovery_chunk_from_public_rows, decode_railgun_transactions,
     extend_pending_output_poi_context, matching_pending_output_poi_context_disposition,
     newly_recoverable_output_poi_list_keys, output_poi_recovery_proof_retry_after,
     output_poi_recovery_retry_allowed_for_lists, output_start_global_position,
     preflight_local_output_poi_input_proofs, recoverable_output_poi_list_keys,
-    recovery_input_merkle_tree_for_root,
 };
 use super::pending_output_poi::{
     pending_output_poi_observation_state_updates, pending_output_poi_submit_identity,
@@ -105,7 +105,7 @@ use broadcaster_core::transact::{
     MERKLE_ZERO_VALUE, PreTxPoi, compute_railgun_txid_parts, railgun_txid_leaf_hash,
     railgun_txid_leaf_hash_with_output_start,
 };
-use broadcaster_core::tree::TREE_LEAF_COUNT;
+use broadcaster_core::tree::{TREE_DEPTH, TREE_LEAF_COUNT};
 use local_db::{
     DbConfig, DbStore, OpaqueWalletPrivateRow, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
     OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey,
@@ -116,12 +116,15 @@ use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleTreeUpdate};
 use poi::SensitiveUrl;
 use poi::cache::{PoiCache, PoiCacheIdentity};
 use poi::error::{PoiError, PoiRpcError};
-use poi::poi::{BlindedCommitmentData, PoiEventType, PoiRpcClient, SingleCommitmentProofContext};
+use poi::poi::{
+    BlindedCommitmentData, PoiEventType, PoiMerkleProof, PoiRpcClient, SingleCommitmentProofContext,
+};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::prover::{ProverError, ProverService};
 use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
 use railgun_wallet::tx::{
-    PoiMerkleProofSource, PreTransactionPoiError, PreTransactionPoiMap, PrivateInputs, PublicInputs,
+    InputWitness, PoiMerkleProofSource, PostTransactionPoiData, PreTransactionPoiError,
+    PreTransactionPoiMap, PrivateInputs, PublicInputs, TransactionPlanChunk,
 };
 use railgun_wallet::wallet_cache::{WalletCacheError, wallet_utxo_stable_identity};
 use railgun_wallet::{
@@ -2996,56 +2999,140 @@ fn live_metadata_flush_mark_persisted_resets_thresholds() {
     ));
 }
 
-#[test]
-fn recovery_input_tree_search_finds_root_beyond_former_bounded_window() {
-    let first_input = test_wallet_utxo(0);
+#[tokio::test]
+async fn output_poi_recovery_public_row_with_older_input_root_keeps_original_poi_inputs() {
+    let spending_public_key = [uint!(4_U256), uint!(5_U256)];
+    let scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
+    let mut input = test_wallet_utxo(0);
+    let output = test_wallet_utxo(8);
+    input.spent = Some(output.utxo.source.clone());
+    // The transaction proved against the one-leaf root. Leaves 1-7 arrived before its outputs at
+    // position 8, and leaves from 8 on stand in for later growth.
     let mut forest = MerkleForest::new();
-    for position in 0..256 {
+    for position in 0..16 {
         forest
             .insert_leaf(MerkleTreeUpdate {
-                tree_number: first_input.utxo.tree,
+                tree_number: input.utxo.tree,
                 tree_position: position,
-                hash: if position == first_input.utxo.position {
-                    first_input.utxo.note.commitment()
+                hash: if position == input.utxo.position {
+                    input.utxo.note.commitment()
                 } else {
                     U256::from(position + 12)
                 },
             })
-            .expect("insert deterministic leaf");
+            .expect("insert input tree leaf");
     }
-    let expected_root = forest
-        .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 64)
-        .expect("historical proof")
-        .root;
-    let current_proof = forest
-        .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 256)
-        .expect("current proof");
-    assert_ne!(current_proof.root, expected_root);
-
-    let input_merkle = recovery_input_merkle_tree_for_root(
-        &forest,
-        first_input.utxo.tree,
-        &first_input,
-        256,
-        expected_root,
-    )
-    .expect("find historical root");
-    let recovered_proof = input_merkle.tree.prove(first_input.utxo.position);
-
-    assert_eq!(recovered_proof.root, expected_root);
-    assert_eq!(recovered_proof.leaf, first_input.utxo.note.commitment());
-
-    let Err(failure) = recovery_input_merkle_tree_for_root(
-        &forest,
-        first_input.utxo.tree,
-        &first_input,
-        256,
-        U256::MAX,
-    ) else {
-        panic!("unavailable historical root should fail");
+    let original_proof = forest
+        .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
+        .expect("original input proof");
+    let forest = Arc::new(forest);
+    let bound_params_hash = U256::from(0x33_u64);
+    let nullifiers = vec![input.utxo.nullifier(scan_keys.nullifying_key)];
+    let original_inputs = vec![InputWitness {
+        utxo: input.utxo.clone(),
+        merkle_proof: original_proof,
+    }];
+    let original_outputs = vec![output.utxo.note.clone()];
+    let original_chunk = TransactionPlanChunk {
+        tree_number: input.utxo.tree,
+        merkle_root: original_proof.root,
+        inputs: original_inputs.clone(),
+        outputs: original_outputs.clone(),
+        has_unshield: false,
+        public_inputs: PublicInputs::from_parts(
+            original_proof.root,
+            bound_params_hash,
+            nullifiers.clone(),
+            &original_outputs,
+        ),
+        private_inputs: PrivateInputs::from_inputs(
+            input.utxo.token_address(),
+            &original_inputs,
+            &original_outputs,
+            &scan_keys,
+            &RecoverySpendPublicKey {
+                spending_public_key,
+            },
+        ),
+        signature: [U256::ZERO; 3],
     };
-    assert_eq!(failure.status, OutputPoiRecoveryStatus::MissingMerkleProof);
-    assert_eq!(failure.category, "input_merkle_proof_unavailable");
+    let row = PublicTxidTransaction {
+        txid_index: 12,
+        transaction: TxidPublicCacheTransaction {
+            id: "12".to_string(),
+            transaction_hash: output.utxo.source.tx_hash,
+            block_number: output.utxo.source.block_number,
+            block_timestamp: output.utxo.source.block_timestamp,
+            nullifiers,
+            commitments: vec![output.utxo.note.commitment()],
+            bound_params_hash,
+            has_unshield: false,
+            unshield_preimage: None,
+            utxo_tree_in: u64::from(input.utxo.tree),
+            utxo_tree_out: u64::from(output.utxo.tree),
+            utxo_batch_start_position_out: output.utxo.position,
+        },
+    };
+    let wallet_utxos = vec![input, output.clone()];
+    let wallet_nullifiers = WalletNullifierIndex::new(&wallet_utxos, &scan_keys);
+
+    let recovered = build_output_poi_recovery_chunk_from_public_rows(
+        &output,
+        &wallet_nullifiers,
+        &[row],
+        None,
+        &[],
+        &forest,
+        &[],
+        spending_public_key,
+        &scan_keys,
+    )
+    .await
+    .expect("recover chunk without the transaction root");
+
+    assert_ne!(recovered.chunk.merkle_root, original_chunk.merkle_root);
+    let output_start_global = U256::from(recovered.output_start_global);
+    let txid_data = PostTransactionPoiData {
+        txid_leaf_hash: FixedBytes::from(
+            railgun_txid_leaf_hash_with_output_start(
+                original_chunk.railgun_txid(),
+                u64::from(original_chunk.tree_number),
+                output_start_global,
+            )
+            .to_be_bytes::<32>(),
+        ),
+        txid_merkleroot: FixedBytes::from([0x77; 32]),
+        txid_merkleroot_index: 12,
+        txid_merkle_proof_indices: U256::from(12_u64),
+        txid_merkle_proof_path_elements: vec![U256::from(9_u64); TREE_DEPTH],
+        utxo_batch_global_start_position_out: output_start_global,
+    };
+    let original_chunk_inputs = original_chunk
+        .post_transaction_poi_inputs(&txid_data)
+        .expect("original POI chunk inputs");
+    let poi_proofs = original_chunk_inputs
+        .blinded_commitments_in
+        .iter()
+        .map(|blinded| PoiMerkleProof {
+            leaf: U256::from_be_bytes(blinded.0),
+            elements: vec![U256::from(5_u64); TREE_DEPTH],
+            indices: U256::ZERO,
+            root: U256::from(6_u64),
+        })
+        .collect::<Vec<_>>();
+    let poi_proof_inputs = |chunk: &TransactionPlanChunk| {
+        let proof_inputs = chunk
+            .post_transaction_poi_inputs(&txid_data)
+            .expect("POI chunk inputs")
+            .proof_inputs(&poi_proofs)
+            .expect("POI proof inputs");
+        // PoiProofInputs has no PartialEq; its Debug output lists every circuit input.
+        format!("{proof_inputs:?}")
+    };
+    assert_eq!(
+        poi_proof_inputs(&recovered.chunk),
+        poi_proof_inputs(&original_chunk)
+    );
 }
 
 #[tokio::test]
@@ -3164,7 +3251,6 @@ async fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_
             transaction_hash: output.utxo.source.tx_hash,
             block_number: output.utxo.source.block_number,
             block_timestamp: output.utxo.source.block_timestamp,
-            merkle_root,
             nullifiers: decoded
                 .nullifiers
                 .iter()
@@ -3253,10 +3339,6 @@ async fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_
             hash: input.utxo.note.commitment(),
         })
         .expect("insert input leaf");
-    let merkle_root = forest
-        .prove_with_leaf_count(input.utxo.tree, input.utxo.position, 1)
-        .expect("input proof")
-        .root;
     let forest = Arc::new(forest);
     let row = PublicTxidTransaction {
         txid_index: 12,
@@ -3265,7 +3347,6 @@ async fn output_poi_recovery_chunk_uses_public_row_and_sender_candidate_without_
             transaction_hash: source.tx_hash,
             block_number: source.block_number,
             block_timestamp: source.block_timestamp,
-            merkle_root,
             nullifiers: vec![input.utxo.nullifier(scan_keys.nullifying_key)],
             commitments: vec![
                 fee_note.commitment(),

@@ -1,3 +1,4 @@
+use super::artifact::PUBLIC_TXID_RECORD_SECTION_ID;
 use super::index::{load_index_shard, test_support::index_entries_for_hash, write_index_shard};
 use super::paths::safe_file_component;
 use super::proof::{
@@ -842,10 +843,6 @@ async fn txid_public_cache_syncs_broad_page_and_builds_proof() {
     )
     .expect("lookup recovered output row");
     assert_eq!(cached.txid_index, 0);
-    assert_eq!(
-        cached.transaction.merkle_root,
-        U256::from_be_bytes([0x22; 32])
-    );
     assert_eq!(
         cache
             .cached_latest_validated()
@@ -4711,7 +4708,7 @@ async fn txid_public_artifact_chunk_rejects_missing_root_without_progress() {
 }
 
 #[tokio::test]
-async fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
+async fn txid_public_artifact_chunk_rejects_root_mismatch_and_previous_section_without_progress() {
     let root_dir = temp_db_root();
     let db = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -4724,7 +4721,11 @@ async fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
         txid_version: "V2_PoseidonMerkle",
     };
     let row = indexed_transaction(0x11, 0x02, 0x01, 0x03);
-    let chunk = public_txid_artifact_chunk(0, &[row], Some(FixedBytes::from([0xff; 32])));
+    let chunk = public_txid_artifact_chunk(
+        0,
+        std::slice::from_ref(&row),
+        Some(FixedBytes::from([0xff; 32])),
+    );
     let cache = TxidPublicCache::new(&db, key);
     let permit = cache.begin_write().await;
     let mut manifest = permit
@@ -4740,6 +4741,35 @@ async fn txid_public_artifact_chunk_rejects_root_mismatch_without_progress() {
         error,
         super::TxidPublicCacheError::MetadataMismatch(message)
             if message.contains("Merkle root mismatch")
+    ));
+    assert_eq!(manifest.validated_cached_txid_index, None);
+    assert!(manifest.pages.is_empty());
+
+    let rows = std::slice::from_ref(&row);
+    let previous_section_chunk = verified_public_txid_artifact_chunk(
+        0,
+        rows,
+        Some(txid_root_for_transactions(rows)),
+        public_txid_artifact_envelope_in_section(
+            0,
+            0,
+            1,
+            1,
+            &public_txid_artifact_payload(0, rows),
+        ),
+    );
+
+    let error = manifest
+        .apply_artifact_chunks(&permit, &[previous_section_chunk])
+        .expect_err("chunk with only the previous record section should fail");
+
+    assert!(matches!(
+        error,
+        super::TxidPublicCacheError::Artifact(
+            crate::indexed_artifacts::IndexedArtifactManifestError::ChunkSectionMissing {
+                section_id: PUBLIC_TXID_RECORD_SECTION_ID
+            }
+        )
     ));
     assert_eq!(manifest.validated_cached_txid_index, None);
     assert!(manifest.pages.is_empty());
@@ -4774,7 +4804,6 @@ fn txid_public_artifact_rejects_extreme_vector_count_without_allocation() {
     payload.extend_from_slice(&[0x21; 32]);
     write_u64(&mut payload, 1);
     write_u64(&mut payload, 1);
-    payload.extend_from_slice(&[0x55; 32]);
     write_u32(&mut payload, u32::MAX);
     let chunk = public_txid_artifact_chunk_from_payload(0, 0, 1, &payload, None);
 
@@ -5065,6 +5094,22 @@ fn public_txid_artifact_envelope_with_end(
     row_count: u64,
     payload: &[u8],
 ) -> Vec<u8> {
+    public_txid_artifact_envelope_in_section(
+        start_index,
+        end_index,
+        row_count,
+        PUBLIC_TXID_RECORD_SECTION_ID,
+        payload,
+    )
+}
+
+fn public_txid_artifact_envelope_in_section(
+    start_index: u64,
+    end_index: u64,
+    row_count: u64,
+    section_id: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(INDEXED_ARTIFACT_CHUNK_MAGIC);
     write_u16(&mut bytes, INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION);
@@ -5078,7 +5123,7 @@ fn public_txid_artifact_envelope_with_end(
     write_u64(&mut bytes, row_count);
     write_u64(&mut bytes, payload.len() as u64);
     write_u16(&mut bytes, 1);
-    write_u16(&mut bytes, 1);
+    write_u16(&mut bytes, section_id);
     write_u64(&mut bytes, 0);
     write_u64(&mut bytes, payload.len() as u64);
     bytes.extend_from_slice(payload);
@@ -5104,7 +5149,7 @@ fn public_txid_artifact_envelope_with_sidecar(
     write_u64(&mut bytes, row_count);
     write_u64(&mut bytes, (records.len() + sidecar.len()) as u64);
     write_u16(&mut bytes, 2);
-    write_u16(&mut bytes, 1);
+    write_u16(&mut bytes, PUBLIC_TXID_RECORD_SECTION_ID);
     write_u64(&mut bytes, 0);
     write_u64(&mut bytes, records.len() as u64);
     write_u16(&mut bytes, 2);
@@ -5129,7 +5174,6 @@ fn public_txid_artifact_payload(
         bytes.extend_from_slice(transaction.transaction_hash.as_slice());
         write_u64(&mut bytes, 1);
         write_u64(&mut bytes, 1);
-        bytes.extend_from_slice(transaction.merkle_root.as_slice());
         write_u256_vec(&mut bytes, &transaction.nullifiers);
         write_u256_vec(&mut bytes, &transaction.commitments);
         bytes.extend_from_slice(&transaction.bound_params_hash.to_be_bytes::<32>());

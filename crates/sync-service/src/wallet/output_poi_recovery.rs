@@ -1894,12 +1894,11 @@ fn cached_transaction_matches_public_row(
     transaction: &Transaction,
     public: &TxidPublicCacheTransaction,
 ) -> bool {
-    transaction.merkleRoot == FixedBytes::from(public.merkle_root.to_be_bytes::<32>())
-        && transaction
-            .nullifiers
-            .iter()
-            .map(|nullifier| U256::from_be_bytes(nullifier.0))
-            .eq(public.nullifiers.iter().copied())
+    transaction
+        .nullifiers
+        .iter()
+        .map(|nullifier| U256::from_be_bytes(nullifier.0))
+        .eq(public.nullifiers.iter().copied())
         && transaction
             .commitments
             .iter()
@@ -2001,22 +2000,22 @@ pub(super) async fn build_recovery_chunk_for_public_transaction(
             "transaction has no wallet-owned inputs",
         )
     })?;
-    let input_merkle = recovery_input_merkle_tree_for_root_blocking(
+    let input_merkle = recovery_input_merkle_tree_blocking(
         Arc::clone(forest),
         input_tree,
         (*first_input).clone(),
         max_leaf_count,
-        transaction.merkle_root,
     )
     .await?;
+    let merkle_root = input_merkle.root();
     let mut input_witnesses = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let proof = input_merkle.tree.prove(input.utxo.position);
-        if proof.root != transaction.merkle_root || proof.leaf != input.utxo.note.commitment() {
+        let proof = input_merkle.prove(input.utxo.position);
+        if proof.leaf != input.utxo.note.commitment() {
             return Err(RecoveryFailure::retryable_category(
                 OutputPoiRecoveryStatus::MissingMerkleProof,
                 "input_merkle_proof_unavailable",
-                "reconstructed Merkle proof does not match transaction root",
+                "reconstructed Merkle proof does not match wallet input commitment",
                 OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
             ));
         }
@@ -2029,7 +2028,7 @@ pub(super) async fn build_recovery_chunk_for_public_transaction(
         output_notes.push(unshield_note);
     }
     let public_inputs = PublicInputs::from_parts(
-        transaction.merkle_root,
+        merkle_root,
         transaction.bound_params_hash,
         transaction.nullifiers.clone(),
         &output_notes,
@@ -2054,7 +2053,7 @@ pub(super) async fn build_recovery_chunk_for_public_transaction(
     Ok(RecoveryChunk {
         chunk: TransactionPlanChunk {
             tree_number: input_tree,
-            merkle_root: transaction.merkle_root,
+            merkle_root,
             inputs: input_witnesses,
             outputs: output_notes,
             has_unshield: transaction.has_unshield,
@@ -2178,27 +2177,21 @@ fn build_recovery_chunk_for_transaction(
             OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
         ));
     }
-    let merkle_root = U256::from_be_bytes(transaction.merkleRoot.0);
     let first_input = inputs.first().ok_or_else(|| {
         RecoveryFailure::permanent(
             OutputPoiRecoveryStatus::MissingWalletInputs,
             "transaction has no wallet-owned inputs",
         )
     })?;
-    let input_merkle = recovery_input_merkle_tree_for_root(
-        forest,
-        input_tree,
-        first_input,
-        max_leaf_count,
-        merkle_root,
-    )?;
+    let input_merkle = recovery_input_merkle_tree(forest, input_tree, first_input, max_leaf_count)?;
+    let merkle_root = input_merkle.root();
     let mut input_witnesses = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let proof = input_merkle.tree.prove(input.utxo.position);
-        if proof.root != merkle_root || proof.leaf != input.utxo.note.commitment() {
+        let proof = input_merkle.prove(input.utxo.position);
+        if proof.leaf != input.utxo.note.commitment() {
             return Err(RecoveryFailure::retryable(
                 OutputPoiRecoveryStatus::MissingMerkleProof,
-                "reconstructed Merkle proof does not match transaction root",
+                "reconstructed Merkle proof does not match wallet input commitment",
                 OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
             ));
         }
@@ -2290,24 +2283,18 @@ pub(super) fn unshield_note_from_transaction(
     Ok(Some(note))
 }
 
-pub(super) struct RecoveryInputMerkleTree {
-    pub(super) tree: DenseMerkleTree,
-}
-
-pub(super) fn recovery_input_merkle_tree_for_root(
+fn recovery_input_merkle_tree(
     forest: &MerkleForest,
     input_tree: u32,
     first_input: &WalletUtxo,
     max_leaf_count: u64,
-    merkle_root: U256,
-) -> Result<RecoveryInputMerkleTree, RecoveryFailure> {
-    let min_leaf_count = first_input.utxo.position.saturating_add(1);
+) -> Result<DenseMerkleTree, RecoveryFailure> {
     let max_leaf_count = max_leaf_count.min(TREE_LEAF_COUNT);
-    if max_leaf_count < min_leaf_count {
+    if max_leaf_count < first_input.utxo.position.saturating_add(1) {
         return Err(RecoveryFailure::retryable_category(
             OutputPoiRecoveryStatus::MissingMerkleProof,
             "input_merkle_proof_unavailable",
-            "transaction root predates the first wallet input leaf",
+            "transaction outputs precede the first wallet input leaf",
             OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
         ));
     }
@@ -2322,48 +2309,28 @@ pub(super) fn recovery_input_merkle_tree_for_root(
             OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
         ));
     }
-    let mut tree = DenseMerkleTree::from_forest_prefix(forest, input_tree, max_leaf_count);
-    for leaf_count in (min_leaf_count..=max_leaf_count).rev() {
-        if tree.root() == merkle_root {
-            let proof = tree.prove(first_input.utxo.position);
-            if proof.leaf == first_input.utxo.note.commitment() && proof.root == merkle_root {
-                return Ok(RecoveryInputMerkleTree { tree });
-            }
-        }
-        if leaf_count > min_leaf_count {
-            tree.remove_leaf(leaf_count - 1);
-        }
-    }
-    Err(RecoveryFailure::retryable_category(
-        OutputPoiRecoveryStatus::MissingMerkleProof,
-        "input_merkle_proof_unavailable",
-        "reconstructed Merkle proof does not match transaction root in local Merkle history",
-        OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+    Ok(DenseMerkleTree::from_forest_prefix(
+        forest,
+        input_tree,
+        max_leaf_count,
     ))
 }
 
-async fn recovery_input_merkle_tree_for_root_blocking(
+async fn recovery_input_merkle_tree_blocking(
     forest: Arc<MerkleForest>,
     input_tree: u32,
     first_input: WalletUtxo,
     max_leaf_count: u64,
-    merkle_root: U256,
-) -> Result<RecoveryInputMerkleTree, RecoveryFailure> {
+) -> Result<DenseMerkleTree, RecoveryFailure> {
     tokio::task::spawn_blocking(move || {
-        recovery_input_merkle_tree_for_root(
-            &forest,
-            input_tree,
-            &first_input,
-            max_leaf_count,
-            merkle_root,
-        )
+        recovery_input_merkle_tree(&forest, input_tree, &first_input, max_leaf_count)
     })
     .await
     .map_err(|error| {
         RecoveryFailure::retryable_category(
             OutputPoiRecoveryStatus::MissingMerkleProof,
             "input_merkle_proof_unavailable",
-            format!("historical Merkle proof search failed: {error}"),
+            format!("input Merkle tree build failed: {error}"),
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         )
     })?
