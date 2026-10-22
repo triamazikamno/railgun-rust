@@ -26,6 +26,7 @@ use super::{
 use super::logs::INDEXED_SQUID_STEP_DEADLINE;
 use super::poi_submitter::ChainPoiSubmitterDriver;
 use super::workers::{read_head_bounded, untried_provider};
+use crate::poi_submission::{PoiSubmissionRouting, PoiSubmissionScheduler};
 use crate::runtime_admission::DbRuntimeLease;
 use std::collections::{BTreeSet, VecDeque};
 
@@ -945,6 +946,7 @@ impl ChainService {
         poi_policy: GlobalPoiPolicy,
         runtime_lease: DbRuntimeLease,
         rpc_http_client: Option<reqwest::Client>,
+        poi_submission_scheduler: Arc<PoiSubmissionScheduler>,
     ) -> Result<PreparedChainService, ChainError> {
         if chain.sync.archive_until_block > 0
             && chain.archive_rpc_url.is_none()
@@ -1012,11 +1014,19 @@ impl ChainService {
             public_data_plane =
                 public_data_plane.with_poi_cache_service(Arc::new(poi_cache_service));
         }
+        let poi_submission_routing = chain.poi_submission_routes.clone().map(|provider| {
+            PoiSubmissionRouting::new(
+                poi_submission_scheduler,
+                provider,
+                poi_policy.rpc_url().clone(),
+            )
+        });
         let (poi_submitter, poi_submitter_driver) = ChainPoiSubmitterDriver::for_chain(
             chain.deployment.chain_id,
             &poi_policy,
             &chain.http_client,
             &public_data_plane,
+            poi_submission_routing,
         );
         let service = Arc::new(Self {
             chain,

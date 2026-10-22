@@ -752,6 +752,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         finality_depth: 0,
         http_client: reqwest::Client::new(),
         progress_tx: None,
+        poi_submission_routes: None,
     };
     let (head_tx, _head_rx) = watch::channel(0);
     let (safe_head_tx, _safe_head_rx) = watch::channel(0);
@@ -5610,6 +5611,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         finality_depth: 0,
         http_client: reqwest::Client::new(),
         progress_tx: None,
+        poi_submission_routes: None,
     };
     let (head_tx, _head_rx) = watch::channel(0);
     let (safe_head_tx, _safe_head_rx) = watch::channel(200);
@@ -5801,6 +5803,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         finality_depth: 0,
         http_client: reqwest::Client::new(),
         progress_tx: None,
+        poi_submission_routes: None,
     };
     let (head_tx, _head_rx) = watch::channel(0);
     let (safe_head_tx, _safe_head_rx) = watch::channel(150);
@@ -8434,6 +8437,7 @@ fn test_chain_config(
         finality_depth: 0,
         http_client: reqwest::Client::new(),
         progress_tx: None,
+        poi_submission_routes: None,
     }
 }
 
@@ -11801,6 +11805,7 @@ async fn headless_chain_start_skips_forest_catch_up_and_live_loop_rewinds_first(
         test_proxy_poi_policy(),
         lease,
         None,
+        crate::poi_submission::test_support::seeded_scheduler(0),
     ));
     // Busy-yielding keeps the paused clock still until every provider holds
     // a head read. Each provider then stays blocked, so chain start could

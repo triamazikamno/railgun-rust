@@ -1453,6 +1453,7 @@ mod tests {
             finality_depth: 1,
             http_client: reqwest::Client::new(),
             progress_tx: None,
+            poi_submission_routes: None,
         }
     }
 

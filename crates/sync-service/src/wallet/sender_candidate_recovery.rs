@@ -723,6 +723,13 @@ pub(super) async fn materialize_sender_transaction_candidates(
             WalletNullifierIndex::new(output_request.wallet_utxos, &output_request.cfg.scan_keys)
         })
     };
+    // Weighted by unshield count, so that with the per-candidate shuffle the
+    // first unshield tried is uniform over every candidate's unshields.
+    let candidates = output_request
+        .private_poi
+        .submission_order(candidates, |candidate| {
+            sender_candidate_unshield_txids(candidate).len()
+        });
     for candidate in candidates {
         let candidate_id = candidate.semantic_id();
         let output_count = u64::try_from(candidate.outputs.len())
@@ -1587,7 +1594,11 @@ pub(super) async fn process_sender_candidate_unshields(
 
     let mut submitted = 0_u64;
     let mut waiting = 0_u64;
-    for txid in target.difference(&valid).copied() {
+    let unresolved = request.private_poi.submission_order(
+        target.difference(&valid).copied().collect::<Vec<_>>(),
+        |_| 1,
+    );
+    for txid in unresolved {
         if let Some(outcome) = attempts.waiting(txid, Instant::now(), request.force_retry) {
             waiting = waiting.saturating_add(1);
             match outcome {
@@ -1604,25 +1615,51 @@ pub(super) async fn process_sender_candidate_unshields(
             }
             continue;
         }
-        let (txid_merkleroot_index, pre_transaction_pois) =
-            if let Some(cached) = cached_proofs.remove(&txid) {
-                cached
-            } else {
-                let (Some(spending_public_key), Some(prover)) = (
-                    request.cfg.spending_public_key,
-                    request.cfg.poi_recovery_prover.as_ref(),
-                ) else {
-                    report.retrying = report.retrying.saturating_add(1);
-                    continue;
-                };
-                let Some(transaction) = qualified.iter().find(|transaction| {
-                    transaction.public_row.transaction.has_unshield
-                        && sender_unshield_railgun_txid(transaction) == txid
-                }) else {
-                    report.awaiting_public_txid_data =
-                        report.awaiting_public_txid_data.saturating_add(1);
-                    continue;
-                };
+        // A cached proof, or what proving this TXID needs.
+        let proof = if let Some(cached) = cached_proofs.remove(&txid) {
+            Ok(cached)
+        } else {
+            let (Some(spending_public_key), Some(prover)) = (
+                request.cfg.spending_public_key,
+                request.cfg.poi_recovery_prover.as_ref(),
+            ) else {
+                report.retrying = report.retrying.saturating_add(1);
+                continue;
+            };
+            let Some(transaction) = qualified.iter().find(|transaction| {
+                transaction.public_row.transaction.has_unshield
+                    && sender_unshield_railgun_txid(transaction) == txid
+            }) else {
+                report.awaiting_public_txid_data =
+                    report.awaiting_public_txid_data.saturating_add(1);
+                continue;
+            };
+            Err((spending_public_key, prover, transaction))
+        };
+        // Reserve before proving, so that a deferral wastes no proof.
+        let route = match request
+            .private_poi
+            .reserve_transact_route(
+                request.cfg.chain.chain_id,
+                U256::from_be_bytes(txid.0),
+                None,
+            )
+            .await
+        {
+            Ok(route) => route,
+            Err(deferred) => {
+                attempts.record(
+                    txid,
+                    SenderUnshieldAttemptOutcome::Retrying,
+                    deferred.retry_after(),
+                );
+                report.retrying = report.retrying.saturating_add(1);
+                continue;
+            }
+        };
+        let (txid_merkleroot_index, pre_transaction_pois) = match proof {
+            Ok(cached) => cached,
+            Err((spending_public_key, prover, transaction)) => {
                 match prove_sender_transaction(
                     request,
                     &candidate,
@@ -1644,9 +1681,11 @@ pub(super) async fn process_sender_candidate_unshields(
                         continue;
                     }
                 }
-            };
+            }
+        };
         match submit_sender_unshield_transaction_pois(
             request,
+            &route,
             &candidate,
             public_data_fence,
             txid_merkleroot_index,
@@ -2132,6 +2171,7 @@ where
 
 pub(super) async fn submit_sender_unshield_transaction_pois(
     request: &OutputPoiRecoveryRequest<'_>,
+    route: &TransactProofRoute,
     candidate: &SenderTransactionCandidate,
     public_data_fence: &SenderCandidatePublicDataFence,
     txid_merkleroot_index: u64,
@@ -2148,6 +2188,7 @@ pub(super) async fn submit_sender_unshield_transaction_pois(
             match request
                 .private_poi
                 .submit_transact_proof(
+                    route,
                     || async {
                         Ok::<bool, std::convert::Infallible>(
                             public_data_fence.is_current(candidate.source.tx_hash)

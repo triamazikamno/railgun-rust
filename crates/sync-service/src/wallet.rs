@@ -106,8 +106,9 @@ pub(crate) use handle::{
 use local_poi_cache::log_local_poi_cache_unavailable;
 use output_poi_recovery::{
     OutputPoiRecoveryRequest, force_resubmit_matching_pending_output_pois_authorized,
-    mark_valid_output_poi_recoveries, mark_valid_output_poi_recoveries_authorized,
-    new_output_poi_recovery_record, output_poi_recovery_candidates, recover_missing_output_pois,
+    force_resubmit_pending_output_poi_context, mark_valid_output_poi_recoveries,
+    mark_valid_output_poi_recoveries_authorized, new_output_poi_recovery_record,
+    output_poi_recovery_candidates, recover_missing_output_pois,
 };
 #[cfg(test)]
 use pending_output_poi::apply_owned_poi_private_delta_on_actor;
@@ -140,7 +141,10 @@ use poi_refresh::{
 };
 pub(crate) use poi_sources::PendingOutputPoiSubmitter;
 pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
-use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
+use private_remote::{
+    DeferredForceKind, DeferredForcedSubmissions, TransactProofRoute, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale,
+};
 use sender_candidate_recovery::{
     SenderCandidatePublicDataFence, SenderCandidateRecoveryReport, SenderCandidateRecoveryRequest,
     SenderUnshieldAttempts, materialize_sender_transaction_candidates,

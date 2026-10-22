@@ -9145,6 +9145,7 @@ dependencies = [
  "poi",
  "railgun-indexed-artifacts",
  "railgun-wallet",
+ "rand 0.10.2",
  "reqwest",
  "rmp-serde",
  "rust-ipns",

@@ -31,6 +31,7 @@ use url::Url;
 
 use crate::SenderTransactionCandidate;
 use crate::indexed_artifacts::{ChainScope, ChainType, IndexedArtifactManifestReuse};
+use crate::poi_submission::PoiSubmissionRouteProvider;
 use crate::wallet::WalletActorTokenAuthority;
 
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
@@ -611,6 +612,10 @@ pub struct ChainConfig {
     /// Caller-configured transport for quick-sync and other internal HTTP requests.
     pub http_client: reqwest::Client,
     pub progress_tx: Option<SyncProgressSender>,
+    /// Opens one isolated route per Railgun transaction for PPOI submissions,
+    /// which the manager's submission scheduler then spaces. `None` sends them
+    /// through `http_client` without spacing.
+    pub poi_submission_routes: Option<Arc<dyn PoiSubmissionRouteProvider>>,
 }
 
 impl ChainConfig {

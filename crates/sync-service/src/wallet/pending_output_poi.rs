@@ -11,7 +11,7 @@ use poi::error::PoiRpcError;
 
 use super::{
     BTreeMap, BlindedCommitmentData, CancellationToken, ChainPublicDataPlane,
-    CommitmentObservation, DbStore, EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision,
+    CommitmentObservation, DbStore, DeferredForceKind, EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision,
     ExpectedPoiListState, ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, FixedBytes,
     Instant, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction,
     OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, OwnedPoiPrivateDelta,
@@ -19,12 +19,13 @@ use super::{
     PendingOutputPoiObservation, PendingOutputPoiRole, PendingOutputPoiSubject,
     PendingOutputPoiSubmissionPredicate, PendingOutputPoiValidationEvidence, PoiError,
     PoiPrivateApplyOutcome, PoiStatus, PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey,
-    RecoveredOutgoingSubmissionSibling, SingleCommitmentProofContext, UtxoPoiMetadata,
-    WalletCacheError, WalletCacheKey, WalletCacheStore, WalletCheckpointMutation, WalletConfig,
-    WalletHandle, WalletPoiRuntime, WalletPpoiSubmissionStatus, WalletPpoiWorkflowStatus,
-    WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
-    WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo,
-    WalletUtxoMutation, debug, default_active_poi_list_keys, info, new_output_poi_recovery_record,
+    RecoveredOutgoingSubmissionSibling, SingleCommitmentProofContext, TransactProofRoute,
+    UtxoPoiMetadata, WalletCacheError, WalletCacheKey, WalletCacheStore, WalletCheckpointMutation,
+    WalletConfig, WalletHandle, WalletPoiRuntime, WalletPpoiSubmissionStatus,
+    WalletPpoiWorkflowStatus, WalletPrivateCommit, WalletPrivateMutationAuthority,
+    WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletPrivateRemoteError,
+    WalletPrivateRemoteStale, WalletUtxo, WalletUtxoMutation, debug, default_active_poi_list_keys,
+    force_resubmit_pending_output_poi_context, info, new_output_poi_recovery_record,
     now_epoch_secs, warn,
 };
 
@@ -769,6 +770,9 @@ pub(super) enum PendingOutputPoiPreflight {
 pub(super) enum PendingOutputPoiRemoteAttempt {
     NotCurrent,
     AuthorityStale,
+    /// The submission scheduler did not admit the transaction; nothing was
+    /// sent, and the caller skips its TXID this pass without a durable write.
+    Deferred,
     /// Preflight failed structural build (missing pre-tx POIs); caller may mark terminal.
     MissingPreTransactionPois,
     Succeeded {
@@ -878,6 +882,17 @@ impl PendingOutputPoiSubmissionPlan {
             PendingOutputPoiSubmissionKind::ForceMatching => {
                 PendingOutputPoiSubmitIntent::ForceMatching
             }
+        }
+    }
+
+    /// How a deferral of this plan stays forced for later passes, if at all.
+    const fn deferred_force_kind(&self) -> Option<DeferredForceKind> {
+        if matches!(self.kind, PendingOutputPoiSubmissionKind::ForceMatching) {
+            Some(DeferredForceKind::ForceMatching)
+        } else if self.force_submission_retry {
+            Some(DeferredForceKind::RetrySubmitted)
+        } else {
+            None
         }
     }
 }
@@ -1451,6 +1466,7 @@ async fn submit_recovered_outgoing_submission_group(
     active_list_keys: &[FixedBytes<32>],
     group: &RecoveredOutgoingSubmissionGroup,
     private_poi: &WalletPrivatePoiClients,
+    route: &mut Option<TransactProofRoute>,
 ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
     let Some(leader) = group.members.first() else {
         return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
@@ -1458,9 +1474,26 @@ async fn submit_recovered_outgoing_submission_group(
     let Some(txid_merkleroot_index) = leader.record.txid_merkleroot_index else {
         return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
     };
+    let forced = group
+        .members
+        .iter()
+        .filter_map(|member| member.plan.deferred_force_kind())
+        .max();
+    let Some(route) = transact_proof_route(
+        private_poi,
+        route,
+        cfg.chain.chain_id,
+        &leader.record,
+        forced,
+    )
+    .await
+    else {
+        return Ok(PendingOutputPoiRemoteAttempt::Deferred);
+    };
     for (list_key, poi) in &group.proofs {
         let result = private_poi
             .submit_transact_proof(
+                route,
                 || async {
                     Ok(matches!(
                         recovered_outgoing_submission_group_current(
@@ -1552,7 +1585,54 @@ async fn submit_observed_pending_output_pois_impl(
         force_submission_retry,
         "pending output POI retry-submitted scan started"
     );
-    for record in &records {
+    let forced_txids = private_poi.deferred_forced_txids();
+    let mut deferred_txids = BTreeSet::new();
+    let mut route: Option<TransactProofRoute> = None;
+    let order = private_poi.submission_order_by_key(records.iter().collect::<Vec<_>>(), |record| {
+        record.railgun_txid
+    });
+    for record in order {
+        if deferred_txids.contains(&record.railgun_txid) {
+            continue;
+        }
+        if route
+            .as_ref()
+            .is_some_and(|current| current.railgun_txid() != record.railgun_txid)
+        {
+            route = None;
+        }
+        // A forced submission deferred by an earlier pass is still forced the same way.
+        if forced_txids.get(&record.railgun_txid) == Some(&DeferredForceKind::ForceMatching) {
+            match force_resubmit_pending_output_poi_context(
+                authority,
+                public_data_plane,
+                db,
+                cache_store,
+                cfg,
+                active_list_keys,
+                record,
+                private_poi,
+                &mut route,
+                now,
+            )
+            .await
+            {
+                Some(PendingOutputPoiRemoteAttempt::Succeeded { .. }) => submitted_contexts += 1,
+                Some(PendingOutputPoiRemoteAttempt::Deferred) => {
+                    deferred_txids.insert(record.railgun_txid);
+                }
+                Some(PendingOutputPoiRemoteAttempt::AuthorityStale) => break,
+                Some(
+                    PendingOutputPoiRemoteAttempt::NotCurrent
+                    | PendingOutputPoiRemoteAttempt::MissingPreTransactionPois
+                    | PendingOutputPoiRemoteAttempt::Failed { .. },
+                )
+                | None => {}
+            }
+            continue;
+        }
+        let force_submission_retry =
+            force_submission_retry || forced_txids.contains_key(&record.railgun_txid);
         let Some(observation) = record.observation.clone() else {
             continue;
         };
@@ -1583,6 +1663,7 @@ async fn submit_observed_pending_output_pois_impl(
                 active_list_keys,
                 &group,
                 private_poi,
+                &mut route,
             )
             .await?;
             debug!(
@@ -1601,6 +1682,10 @@ async fn submit_observed_pending_output_pois_impl(
                     PendingOutputPoiRemoteAttempt::AuthorityStale => break,
                     PendingOutputPoiRemoteAttempt::NotCurrent
                     | PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => continue,
+                    PendingOutputPoiRemoteAttempt::Deferred => {
+                        deferred_txids.insert(record.railgun_txid);
+                        continue;
+                    }
                     PendingOutputPoiRemoteAttempt::Succeeded {
                         submitted_list_keys,
                     } => (
@@ -1739,10 +1824,14 @@ async fn submit_observed_pending_output_pois_impl(
             &subject,
             &plan,
             private_poi,
+            &mut route,
         )
         .await?
         {
             PendingOutputPoiRemoteAttempt::NotCurrent => {}
+            PendingOutputPoiRemoteAttempt::Deferred => {
+                deferred_txids.insert(record.railgun_txid);
+            }
             PendingOutputPoiRemoteAttempt::AuthorityStale => break,
             PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
                 if apply_poi_private_delta(
@@ -1872,6 +1961,32 @@ async fn submit_observed_pending_output_pois_impl(
     Ok(submitted_contexts)
 }
 
+/// The pass's route for `record`'s transaction, reserved on its first
+/// transact proof and reused by its later records. `None` when deferred.
+async fn transact_proof_route<'a>(
+    private_poi: &WalletPrivatePoiClients,
+    route: &'a mut Option<TransactProofRoute>,
+    chain_id: u64,
+    record: &PendingOutputPoiContextRecord,
+    forced: Option<DeferredForceKind>,
+) -> Option<&'a TransactProofRoute> {
+    if route
+        .as_ref()
+        .is_none_or(|current| current.railgun_txid() != record.railgun_txid)
+    {
+        // Drop another transaction's route before reserving this one.
+        *route = None;
+        *route = Some(
+            private_poi
+                .reserve_transact_route(chain_id, record.railgun_txid, forced)
+                .await
+                .ok()?,
+        );
+        private_poi.end_forced_deferral(record.railgun_txid);
+    }
+    route.as_ref()
+}
+
 async fn submit_pending_output_poi_context_via_gateway(
     authority: &WalletPrivateMutationAuthority<'_>,
     public_data_plane: &ChainPublicDataPlane,
@@ -1886,8 +2001,20 @@ async fn submit_pending_output_poi_context_via_gateway(
     context: SingleCommitmentProofContext,
     observation: &PendingOutputPoiObservation,
     submitted_list_keys: &[FixedBytes<32>],
+    route: &mut Option<TransactProofRoute>,
 ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
     if let Some(txid_merkleroot_index) = record.txid_merkleroot_index {
+        let Some(route) = transact_proof_route(
+            private_poi,
+            route,
+            chain_id,
+            record,
+            plan.deferred_force_kind(),
+        )
+        .await
+        else {
+            return Ok(PendingOutputPoiRemoteAttempt::Deferred);
+        };
         for list_key in submitted_list_keys {
             let Some(per_leaf) = context
                 .pre_transaction_pois_per_txid_leaf_per_list
@@ -1898,6 +2025,7 @@ async fn submit_pending_output_poi_context_via_gateway(
             for poi in per_leaf.values() {
                 let result = private_poi
                     .submit_transact_proof(
+                        route,
                         || async {
                             Ok(matches!(
                                 pending_output_poi_submission_plan_current(
@@ -4446,6 +4574,7 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
     subject: &PendingOutputPoiSubject,
     plan: &PendingOutputPoiSubmissionPlan,
     private_poi: &WalletPrivatePoiClients,
+    route: &mut Option<TransactProofRoute>,
 ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
     if record.observation.as_ref() != Some(observation)
         || !saved_pending_context_matches_public_transaction(
@@ -4518,6 +4647,7 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
         context,
         observation,
         &submitted_list_keys,
+        route,
     )
     .await
 }

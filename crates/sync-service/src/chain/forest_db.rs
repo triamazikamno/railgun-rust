@@ -1273,6 +1273,7 @@ mod tests {
             finality_depth: 0,
             http_client: reqwest::Client::new(),
             progress_tx: None,
+            poi_submission_routes: None,
         }
     }
 

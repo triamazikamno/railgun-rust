@@ -1,12 +1,15 @@
 use super::{
-    Arc, BTreeMap, BlindedCommitmentData, FixedBytes, PendingOutputPoiSubmitter, PoiError,
-    PoiRpcClient, PoiStatus, PoiStatusReader, SingleCommitmentProofContext,
-    WalletPrivateRemoteAuthority,
+    Arc, BTreeMap, BlindedCommitmentData, Duration, FixedBytes, PendingOutputPoiSubmitter,
+    PoiError, PoiRpcClient, PoiStatus, PoiStatusReader, SingleCommitmentProofContext, U256,
+    WalletPrivateRemoteAuthority, debug,
 };
 use crate::chain::{
     PendingOutputPoiHandoff, PendingOutputPoiHandoffFailure, PendingOutputPoiSubmitIntent,
 };
+use crate::poi_submission::{PoiSubmissionAdmission, PoiSubmissionPermit, PoiSubmissionRouting};
 use std::convert::Infallible;
+use std::fmt;
+use std::sync::{Mutex as StdMutex, PoisonError};
 
 /// Why a wallet-private remote effect was rejected before transport dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,16 +122,81 @@ impl WalletPrivateRemoteGate {
     }
 }
 
+/// How a deferred submission was forced. A force-matching request outranks a
+/// forced retry when both are deferred for one transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DeferredForceKind {
+    /// A forced retry of submitted lists, still behind the recovery gate.
+    RetrySubmitted,
+    /// A force-resubmit of every matching list, with no recovery gate.
+    ForceMatching,
+}
+
+/// Railgun TXIDs whose forced submission was deferred, with how each was
+/// forced, kept for a reset generation so that later passes still force them
+/// until one is admitted.
+#[derive(Clone, Default)]
+pub(crate) struct DeferredForcedSubmissions(Arc<StdMutex<BTreeMap<U256, DeferredForceKind>>>);
+
+impl fmt::Debug for DeferredForcedSubmissions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeferredForcedSubmissions")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeferredForcedSubmissions {
+    fn txids(&self) -> std::sync::MutexGuard<'_, BTreeMap<U256, DeferredForceKind>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One Railgun transaction's transact-proof route for a pass. Only
+/// [`WalletPrivatePoiClients::reserve_transact_route`] builds one, so a
+/// routed wallet never sends a transact proof over the shared client.
+pub(crate) struct TransactProofRoute {
+    railgun_txid: U256,
+    /// `None` without a route provider: the shared POI client, as before.
+    permit: Option<PoiSubmissionPermit>,
+}
+
+impl TransactProofRoute {
+    pub(crate) const fn railgun_txid(&self) -> U256 {
+        self.railgun_txid
+    }
+}
+
+/// A transaction the scheduler did not admit this pass.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TransactProofsDeferred {
+    /// When spacing ends; `None` when the route limit is full or the route
+    /// failed to open.
+    until: Option<tokio::time::Instant>,
+}
+
+impl TransactProofsDeferred {
+    /// Wait before trying again; zero means the next pass.
+    pub(crate) fn retry_after(self) -> Duration {
+        self.until.map_or(Duration::ZERO, |until| {
+            until.saturating_duration_since(tokio::time::Instant::now())
+        })
+    }
+}
+
 /// Remote POI clients available to a wallet job only through generation/subject gates.
 /// Raw transports are intentionally private so production call sites cannot bypass dispatch.
-/// Transact proofs go to the POI node directly; single-commitment proofs are handed off
-/// to the chain PPOI submitter.
+/// Transact proofs go to the POI node directly, over a per-transaction route when the
+/// chain has a route provider; single-commitment proofs are handed off to the chain
+/// PPOI submitter.
 #[derive(Clone)]
 pub(crate) struct WalletPrivatePoiClients {
     effects: WalletPrivateRemoteEffects,
     status: Arc<dyn PoiStatusReader>,
     submit: Arc<dyn PendingOutputPoiSubmitter>,
     handoff: Arc<dyn PendingOutputPoiHandoff>,
+    routing: Option<PoiSubmissionRouting>,
+    forced_deferrals: DeferredForcedSubmissions,
 }
 
 impl WalletPrivatePoiClients {
@@ -142,7 +210,144 @@ impl WalletPrivatePoiClients {
             status: Arc::new(client.clone()),
             submit: Arc::new(client),
             handoff,
+            routing: None,
+            forced_deferrals: DeferredForcedSubmissions::default(),
         }
+    }
+
+    /// Sends transact proofs over per-transaction routes when `routing` is
+    /// set, recording forced ones it defers in `forced_deferrals`.
+    #[must_use]
+    pub(crate) fn with_submission_routing(
+        mut self,
+        routing: Option<PoiSubmissionRouting>,
+        forced_deferrals: DeferredForcedSubmissions,
+    ) -> Self {
+        self.routing = routing;
+        self.forced_deferrals = forced_deferrals;
+        self
+    }
+
+    /// TXIDs whose forced submission is still deferred, with how each was
+    /// forced. Snapshot at the start of a pass, since admission of a pending
+    /// output's transaction removes a TXID.
+    pub(crate) fn deferred_forced_txids(&self) -> BTreeMap<U256, DeferredForceKind> {
+        self.forced_deferrals.txids().clone()
+    }
+
+    /// Ends the forced deferral of a pending output's transaction once it is
+    /// admitted, however the current pass planned it.
+    pub(crate) fn end_forced_deferral(&self, railgun_txid: U256) {
+        self.forced_deferrals.txids().remove(&railgun_txid);
+    }
+
+    /// Admits one transaction's transact proofs. Without a route provider this
+    /// always succeeds and sends over the shared client. With one, a deferral,
+    /// failed route open or invalidated authority sends nothing; a `forced`
+    /// deferral of a still valid job stays forced, the same way, for later
+    /// passes until the transaction is admitted. Admission never ends a
+    /// forced deferral; see [`Self::end_forced_deferral`].
+    pub(crate) async fn reserve_transact_route(
+        &self,
+        chain_id: u64,
+        railgun_txid: U256,
+        forced: Option<DeferredForceKind>,
+    ) -> Result<TransactProofRoute, TransactProofsDeferred> {
+        let Some(routing) = &self.routing else {
+            return Ok(TransactProofRoute {
+                railgun_txid,
+                permit: None,
+            });
+        };
+        // Admission and the open run under the gate, so an invalid job is not
+        // admitted and invalidation interrupts a pending open.
+        let admission = self
+            .effects
+            .gate
+            .dispatch::<_, _, Infallible>(async {
+                match routing.scheduler.try_reserve(chain_id, railgun_txid) {
+                    PoiSubmissionAdmission::Admitted(reservation) => {
+                        reservation.open(routing).await.map_err(|error| {
+                            debug!(
+                                chain_id,
+                                %error,
+                                "PPOI route unavailable; transact proofs deferred"
+                            );
+                            None
+                        })
+                    }
+                    PoiSubmissionAdmission::Deferred { until } => Err(until),
+                }
+            })
+            .await;
+        let until = match admission {
+            Ok(permit) => {
+                return Ok(TransactProofRoute {
+                    railgun_txid,
+                    permit: Some(permit),
+                });
+            }
+            Err(WalletPrivateRemoteError::Remote(until)) => until,
+            Err(WalletPrivateRemoteError::Stale(_)) => {
+                return Err(TransactProofsDeferred { until: None });
+            }
+            Err(WalletPrivateRemoteError::Check(never)) => match never {},
+        };
+        if let Some(kind) = forced {
+            let mut txids = self.forced_deferrals.txids();
+            let recorded = txids.entry(railgun_txid).or_insert(kind);
+            *recorded = (*recorded).max(kind);
+        }
+        Err(TransactProofsDeferred { until })
+    }
+
+    /// Unchanged without a route provider. With one, a random order that
+    /// picks each next item with probability proportional to its `weight`,
+    /// counted as at least 1.
+    pub(crate) fn submission_order<T>(
+        &self,
+        mut items: Vec<T>,
+        weight: impl Fn(&T) -> usize,
+    ) -> Vec<T> {
+        let Some(routing) = &self.routing else {
+            return items;
+        };
+        let mut weights = items
+            .iter()
+            .map(|item| weight(item).max(1))
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(items.len());
+        while !weights.is_empty() {
+            let mut pick = routing.scheduler.choose_index(weights.iter().sum());
+            let mut index = 0;
+            while pick >= weights[index] {
+                pick -= weights[index];
+                index += 1;
+            }
+            weights.swap_remove(index);
+            ordered.push(items.swap_remove(index));
+        }
+        ordered
+    }
+
+    /// Unchanged without a route provider. With one, a uniform random order
+    /// of the distinct keys, keeping each key's items together and in order.
+    pub(crate) fn submission_order_by_key<T, K: Ord>(
+        &self,
+        items: Vec<T>,
+        key: impl Fn(&T) -> K,
+    ) -> Vec<T> {
+        if self.routing.is_none() {
+            return items;
+        }
+        let mut groups = BTreeMap::<K, Vec<T>>::new();
+        for item in items {
+            groups.entry(key(&item)).or_default().push(item);
+        }
+        self.submission_order(groups.into_values().collect(), |_| 1)
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     pub(crate) async fn pois_per_list<Check, CheckFuture, CheckError>(
@@ -207,9 +412,11 @@ impl WalletPrivatePoiClients {
             .await
     }
 
+    /// Sends one transact proof of `route`'s transaction over that route.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_transact_proof<Check, CheckFuture, CheckError>(
         &self,
+        route: &TransactProofRoute,
         check_subject: Check,
         txid_version: &str,
         chain_type: u8,
@@ -222,9 +429,13 @@ impl WalletPrivatePoiClients {
         Check: FnOnce() -> CheckFuture,
         CheckFuture: std::future::Future<Output = Result<bool, CheckError>>,
     {
+        let submitter: &dyn PendingOutputPoiSubmitter = match &route.permit {
+            Some(permit) => permit.submitter(),
+            None => self.submit.as_ref(),
+        };
         self.effects
             .run(check_subject, || {
-                self.submit.submit_transact_proof(
+                submitter.submit_transact_proof(
                     txid_version,
                     chain_type,
                     chain_id,
@@ -252,6 +463,8 @@ impl WalletPrivatePoiClients {
             status,
             submit,
             handoff,
+            routing: None,
+            forced_deferrals: DeferredForcedSubmissions::default(),
         }
     }
 
@@ -283,6 +496,8 @@ impl WalletPrivatePoiClients {
             status: unavailable.clone(),
             submit: unavailable,
             handoff,
+            routing: None,
+            forced_deferrals: DeferredForcedSubmissions::default(),
         }
     }
 }

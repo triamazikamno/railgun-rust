@@ -2,8 +2,12 @@
 //!
 //! A wallet hands off send-ready contexts before broadcast. The driver learns
 //! each output's position from finalized live rows or wallet handoffs and
-//! sends through the proxied POI client, independent of the active wallet.
-//! State is memory-only and ends at chain cancel or at each entry's TTL.
+//! sends independent of the active wallet. With a route provider it sends
+//! each Railgun transaction's proofs over that transaction's isolated route,
+//! as the shared submission scheduler admits it, and the transaction stays
+//! admitted while any of its proofs waits or runs; otherwise it sends through
+//! the wallets' shared POI client. State is memory-only and ends at chain
+//! cancel or at each entry's TTL.
 
 use std::collections::{HashMap, VecDeque, hash_map};
 use std::fmt;
@@ -11,27 +15,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use alloy::primitives::FixedBytes;
+use alloy::primitives::{FixedBytes, U256};
 use async_trait::async_trait;
 use broadcaster_core::tree::normalize_tree_position;
 use merkletree::tree::MerkleTreeUpdate;
 use poi::error::PoiError;
 use poi::poi::SingleCommitmentProofContext;
 use railgun_wallet::scan::WalletScanInputRows;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::{ChainPublicDataPlane, EVM_CHAIN_TYPE};
+use crate::poi_submission::{
+    PoiSubmissionAdmission, PoiSubmissionReservation, PoiSubmissionRouting,
+};
 use crate::types::GlobalPoiPolicy;
 use crate::wallet::{PendingOutputPoiSubmitter, WalletPoiRuntime, is_missing_railgun_txid_error};
 
 /// Bound of the command channel. Commands are answered after in-memory work
 /// only, so the queue drains quickly.
 const COMMAND_CHANNEL_CAPACITY: usize = 256;
-/// Sends running at once; further sends wait in FIFO order.
+/// Sends running at once; further sends wait in FIFO order, or for their
+/// transaction's admission when routed.
 const MAX_IN_FLIGHT_SENDS: usize = 4;
 /// Lifetime of an entry after its latest prepare or handoff.
 const ENTRY_TTL: Duration = Duration::from_mins(30);
@@ -105,6 +113,8 @@ pub(crate) trait PendingOutputPoiHandoff: Send + Sync {
 pub(crate) struct ChainPoiSubmitterHandle {
     commands: mpsc::Sender<Command>,
     pending: Arc<AtomicUsize>,
+    /// The driver's routing, which wallets share for their transact proofs.
+    routing: Option<PoiSubmissionRouting>,
 }
 
 impl ChainPoiSubmitterHandle {
@@ -120,6 +130,11 @@ impl ChainPoiSubmitterHandle {
             .await
             .map_err(|_| ChainPoiSubmitterClosed)?;
         done.await.map_err(|_| ChainPoiSubmitterClosed)
+    }
+
+    /// The chain's per-transaction PPOI routing, if it has a route provider.
+    pub(crate) const fn submission_routing(&self) -> Option<&PoiSubmissionRouting> {
+        self.routing.as_ref()
     }
 
     /// Number of entries the driver holds, as last stored by the driver.
@@ -183,6 +198,7 @@ impl ChainPoiSubmitterHandle {
         Self {
             commands,
             pending: Arc::default(),
+            routing: None,
         }
     }
 
@@ -244,14 +260,16 @@ pub(super) struct ChainPoiSubmitterDriver {
 }
 
 impl ChainPoiSubmitterDriver {
-    /// Builds the chain's submitter over the proxied POI client wallets use.
-    /// The corpus refresh after a successful send runs only with indexed POI
-    /// artifacts, where a local corpus exists.
+    /// Builds the chain's submitter over the proxied POI client wallets use,
+    /// or over per-transaction routes when `routing` is set. The corpus
+    /// refresh after a successful send runs only with indexed POI artifacts,
+    /// where a local corpus exists.
     pub(super) fn for_chain(
         chain_id: u64,
         poi_policy: &GlobalPoiPolicy,
         http_client: &reqwest::Client,
         public_data_plane: &ChainPublicDataPlane,
+        routing: Option<PoiSubmissionRouting>,
     ) -> (ChainPoiSubmitterHandle, Self) {
         let runtime = WalletPoiRuntime::from_policy(poi_policy, Some(http_client));
         let refresh_plane = runtime
@@ -261,6 +279,7 @@ impl ChainPoiSubmitterDriver {
             chain_id,
             Arc::new(runtime.public_client().clone()),
             refresh_plane,
+            routing,
         )
     }
 
@@ -268,18 +287,23 @@ impl ChainPoiSubmitterDriver {
         chain_id: u64,
         transport: Arc<dyn PendingOutputPoiSubmitter>,
         public_data_plane: Option<ChainPublicDataPlane>,
+        routing: Option<PoiSubmissionRouting>,
     ) -> (ChainPoiSubmitterHandle, Self) {
         let (commands_tx, commands) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let handle = ChainPoiSubmitterHandle {
             commands: commands_tx,
             pending: Arc::clone(&pending),
+            routing: routing.clone(),
         };
         let driver = Self {
             commands,
             state: DriverState {
                 chain_id,
                 transport,
+                route_changes: routing.as_ref().map(|routing| routing.scheduler.changed()),
+                routing,
+                admission_retry_at: None,
                 public_data_plane,
                 pending,
                 entries: HashMap::new(),
@@ -301,7 +325,7 @@ impl ChainPoiSubmitterDriver {
         chain_id: u64,
         transport: Arc<dyn PendingOutputPoiSubmitter>,
     ) -> (ChainPoiSubmitterHandle, Self) {
-        Self::new(chain_id, transport, None)
+        Self::new(chain_id, transport, None, None)
     }
 
     /// Number of commands waiting for the driver.
@@ -329,6 +353,9 @@ impl ChainPoiSubmitterDriver {
                     }
                     Some(joined) = state.sends.join_next_with_id() => state.finish_send(joined),
                     Some(_) = state.refresh.join_next() => state.finish_refresh(),
+                    () = route_released(state.route_changes.as_mut()) => {
+                        state.start_queued_sends();
+                    }
                     () = sleep_until_deadline(deadline) => state.handle_deadline(),
                 }
             }
@@ -343,6 +370,16 @@ async fn sleep_until_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
+    }
+}
+
+/// Completes when the scheduler frees a route slot; never without routing.
+async fn route_released(changes: Option<&mut watch::Receiver<()>>) {
+    let Some(changes) = changes else {
+        return std::future::pending().await;
+    };
+    if changes.changed().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -487,10 +524,15 @@ struct Attempt {
     context: Arc<SingleCommitmentProofContext>,
     lists: ListSet,
     running: Option<AbortHandle>,
+    /// While queued and routed, the transaction's live reservation, which
+    /// keeps it admitted until this attempt starts, is cancelled or expires.
+    /// The started send owns it instead.
+    reservation: Option<PoiSubmissionReservation>,
 }
 
 impl Attempt {
-    /// Aborts a running send. A queued one is skipped when dequeued.
+    /// Aborts a running send. A queued one drops its reservation and is
+    /// skipped when dequeued.
     fn cancel(self) {
         if let Some(running) = self.running {
             running.abort();
@@ -503,15 +545,60 @@ struct Backoff {
     retry_at: Option<Instant>,
 }
 
+/// Railgun TXID of queued attempt `id` of `commitment`, or `None` once that
+/// attempt was cancelled, superseded or started.
+fn queued_txid(
+    entries: &HashMap<FixedBytes<32>, Entry>,
+    commitment: FixedBytes<32>,
+    id: u64,
+) -> Option<U256> {
+    let attempt = entries
+        .get(&commitment)?
+        .placement
+        .as_ref()?
+        .attempt
+        .as_ref()?;
+    (attempt.id == id && attempt.running.is_none()).then_some(attempt.context.railgun_txid)
+}
+
+/// Queued attempt `id` of `commitment`, unless it was cancelled, superseded
+/// or started.
+fn queued_attempt_mut(
+    entries: &mut HashMap<FixedBytes<32>, Entry>,
+    commitment: FixedBytes<32>,
+    id: u64,
+) -> Option<&mut Attempt> {
+    entries
+        .get_mut(&commitment)?
+        .placement
+        .as_mut()?
+        .attempt
+        .as_mut()
+        .filter(|attempt| attempt.id == id && attempt.running.is_none())
+}
+
+/// How a spawned send ended.
+enum SendOutcome {
+    Completed(Result<(), PoiError>),
+    /// The transaction's route did not open; nothing was sent.
+    RouteUnavailable,
+}
+
 struct DriverState {
     chain_id: u64,
+    /// Shared client for every send when `routing` is `None`.
     transport: Arc<dyn PendingOutputPoiSubmitter>,
+    routing: Option<PoiSubmissionRouting>,
+    /// Marked when the scheduler frees a route slot; set with `routing`.
+    route_changes: Option<watch::Receiver<()>>,
+    /// When admission spacing ends after the scheduler deferred a send.
+    admission_retry_at: Option<Instant>,
     public_data_plane: Option<ChainPublicDataPlane>,
     pending: Arc<AtomicUsize>,
     entries: HashMap<FixedBytes<32>, Entry>,
     /// Queued attempts, by commitment and attempt id.
     queue: VecDeque<(FixedBytes<32>, u64)>,
-    sends: JoinSet<Result<(), PoiError>>,
+    sends: JoinSet<SendOutcome>,
     /// Commitment and attempt id of each spawned send.
     running: HashMap<tokio::task::Id, (FixedBytes<32>, u64)>,
     refresh: JoinSet<()>,
@@ -536,6 +623,7 @@ impl DriverState {
                 [Some(entry.expires_at), retry_at]
             })
             .flatten()
+            .chain(self.admission_retry_at)
             .min()
     }
 
@@ -581,8 +669,13 @@ impl DriverState {
                     entry.place_finalized(observed.output);
                     if !entry.current_tuple_settled() {
                         sends += 1;
-                        self.request_send(observed.commitment);
+                        self.queue_send(observed.commitment);
                     }
+                }
+                // Started once the whole batch is queued, so that its first
+                // transaction gets no head start in admission.
+                if sends > 0 {
+                    self.start_queued_sends();
                 }
                 self.store_pending();
                 if matched > 0 {
@@ -684,9 +777,15 @@ impl DriverState {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Queues a send of the entry's current tuple and starts what may start.
+    fn request_send(&mut self, commitment: FixedBytes<32>) {
+        self.queue_send(commitment);
+        self.start_queued_sends();
+    }
+
     /// Queues a send of the entry's current tuple, replacing an attempt for
     /// other lists at the same position.
-    fn request_send(&mut self, commitment: FixedBytes<32>) {
+    fn queue_send(&mut self, commitment: FixedBytes<32>) {
         let Some(entry) = self.entries.get_mut(&commitment) else {
             return;
         };
@@ -706,39 +805,138 @@ impl DriverState {
             context: Arc::clone(&entry.context),
             lists: entry.lists.clone(),
             running: None,
+            reservation: None,
         });
         if let Some(backoff) = placement.backoff.as_mut() {
             backoff.retry_at = None;
         }
         self.queue.push_back((commitment, id));
-        self.start_queued_sends();
     }
 
     fn start_queued_sends(&mut self) {
+        if let Some(routing) = self.routing.clone() {
+            self.start_routed_sends(&routing);
+            return;
+        }
         while self.running.len() < MAX_IN_FLIGHT_SENDS {
             let Some((commitment, id)) = self.queue.pop_front() else {
                 return;
             };
-            let Some(placement) = self
-                .entries
-                .get_mut(&commitment)
-                .and_then(|entry| entry.placement.as_mut())
-            else {
+            self.spawn_send(commitment, id, None);
+        }
+    }
+
+    /// Starts queued attempts that hold their transaction's reservation, then
+    /// admits one uniformly random queued transaction at a time until the
+    /// scheduler defers. Deferred attempts stay queued with their state
+    /// untouched.
+    fn start_routed_sends(&mut self, routing: &PoiSubmissionRouting) {
+        self.admission_retry_at = None;
+        let entries = &self.entries;
+        self.queue
+            .retain(|&(commitment, id)| queued_txid(entries, commitment, id).is_some());
+        self.hold_live_reservations(routing);
+        while self.running.len() < MAX_IN_FLIGHT_SENDS {
+            let entries = &mut self.entries;
+            let held = self
+                .queue
+                .iter()
+                .enumerate()
+                .find_map(|(index, &(commitment, id))| {
+                    let attempt = queued_attempt_mut(entries, commitment, id)?;
+                    Some((index, attempt.reservation.take()?))
+                });
+            if let Some((index, reservation)) = held {
+                let Some((commitment, id)) = self.queue.remove(index) else {
+                    return;
+                };
+                self.spawn_send(commitment, id, Some((routing.clone(), reservation)));
                 continue;
+            }
+            let mut txids = Vec::<U256>::new();
+            for &(commitment, id) in &self.queue {
+                if let Some(txid) = queued_txid(&self.entries, commitment, id)
+                    && !txids.contains(&txid)
+                {
+                    txids.push(txid);
+                }
+            }
+            if txids.is_empty() {
+                return;
+            }
+            let txid = txids[routing.scheduler.choose_index(txids.len())];
+            match routing.scheduler.try_reserve(self.chain_id, txid) {
+                PoiSubmissionAdmission::Admitted(admitted) => {
+                    // Every queued attempt of the transaction takes the
+                    // admission before any of them starts.
+                    self.hold_live_reservations(routing);
+                    drop(admitted);
+                }
+                PoiSubmissionAdmission::Deferred { until } => {
+                    self.admission_retry_at = until;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Gives each queued attempt its transaction's live reservation, or
+    /// none, so that a transaction with waiting attempts stays admitted after
+    /// its running sends end, and a reservation whose open failed is dropped
+    /// rather than reused.
+    fn hold_live_reservations(&mut self, routing: &PoiSubmissionRouting) {
+        for &(commitment, id) in &self.queue {
+            if let Some(attempt) = queued_attempt_mut(&mut self.entries, commitment, id) {
+                attempt.reservation = routing
+                    .scheduler
+                    .join(self.chain_id, attempt.context.railgun_txid);
+            }
+        }
+    }
+
+    /// Spawns queued attempt `id` of `commitment`, over the reservation's
+    /// route when one is given; the send then owns the reservation. Skips a
+    /// cancelled or superseded attempt.
+    fn spawn_send(
+        &mut self,
+        commitment: FixedBytes<32>,
+        id: u64,
+        route: Option<(PoiSubmissionRouting, PoiSubmissionReservation)>,
+    ) {
+        let Some(placement) = self
+            .entries
+            .get_mut(&commitment)
+            .and_then(|entry| entry.placement.as_mut())
+        else {
+            return;
+        };
+        let output = placement.output;
+        let Some(attempt) = placement
+            .attempt
+            .as_mut()
+            .filter(|attempt| attempt.id == id && attempt.running.is_none())
+        else {
+            return;
+        };
+        let transport = Arc::clone(&self.transport);
+        let context = Arc::clone(&attempt.context);
+        let chain_id = self.chain_id;
+        let abort = self.sends.spawn(async move {
+            // The permit, and with it the transaction's route, lives until
+            // this send ends.
+            let permit = match route {
+                Some((routing, reservation)) => match reservation.open(&routing).await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => return SendOutcome::RouteUnavailable,
+                },
+                None => None,
             };
-            let output = placement.output;
-            let Some(attempt) = placement
-                .attempt
-                .as_mut()
-                .filter(|attempt| attempt.id == id && attempt.running.is_none())
-            else {
-                continue;
+            let submitter: &dyn PendingOutputPoiSubmitter = match &permit {
+                Some(permit) => permit.submitter(),
+                None => transport.as_ref(),
             };
-            let transport = Arc::clone(&self.transport);
-            let context = Arc::clone(&attempt.context);
-            let chain_id = self.chain_id;
-            let abort = self.sends.spawn(async move {
-                transport
+            SendOutcome::Completed(
+                submitter
                     .submit_single_commitment_proofs(
                         &context.txid_version,
                         EVM_CHAIN_TYPE,
@@ -747,16 +945,16 @@ impl DriverState {
                         output.tree,
                         output.position,
                     )
-                    .await
-            });
-            self.running.insert(abort.id(), (commitment, id));
-            attempt.running = Some(abort);
-        }
+                    .await,
+            )
+        });
+        self.running.insert(abort.id(), (commitment, id));
+        attempt.running = Some(abort);
     }
 
-    fn finish_send(&mut self, joined: Result<(tokio::task::Id, Result<(), PoiError>), JoinError>) {
-        let (task_id, result) = match joined {
-            Ok((task_id, result)) => (task_id, Some(result)),
+    fn finish_send(&mut self, joined: Result<(tokio::task::Id, SendOutcome), JoinError>) {
+        let (task_id, outcome) = match joined {
+            Ok((task_id, outcome)) => (task_id, Some(outcome)),
             Err(err) => {
                 if err.is_panic() {
                     warn!(chain_id = self.chain_id, "chain PPOI send task panicked");
@@ -765,9 +963,35 @@ impl DriverState {
             }
         };
         if let Some((commitment, id)) = self.running.remove(&task_id) {
-            self.apply_send_result(commitment, id, result);
+            match outcome {
+                Some(SendOutcome::RouteUnavailable) => self.requeue_send(commitment, id),
+                Some(SendOutcome::Completed(result)) => {
+                    self.apply_send_result(commitment, id, Some(result));
+                }
+                None => self.apply_send_result(commitment, id, None),
+            }
         }
         self.start_queued_sends();
+    }
+
+    /// Queues a started attempt again after its route failed to open,
+    /// recording no failure or backoff.
+    fn requeue_send(&mut self, commitment: FixedBytes<32>, id: u64) {
+        let Some(attempt) = self
+            .entries
+            .get_mut(&commitment)
+            .and_then(|entry| entry.placement.as_mut())
+            .and_then(|placement| placement.attempt.as_mut())
+            .filter(|attempt| attempt.id == id)
+        else {
+            return;
+        };
+        attempt.running = None;
+        self.queue.push_back((commitment, id));
+        debug!(
+            chain_id = self.chain_id,
+            "chain PPOI route unavailable; send deferred"
+        );
     }
 
     /// Applies a completed attempt if it is still the entry's attempt. A
@@ -860,8 +1084,10 @@ impl DriverState {
             })
             .collect::<Vec<_>>();
         for commitment in due {
-            self.request_send(commitment);
+            self.queue_send(commitment);
         }
+        // Also retries admission once its spacing ends.
+        self.start_queued_sends();
         self.store_pending();
     }
 
@@ -930,6 +1156,7 @@ pub(crate) mod test_support {
     #[derive(Default)]
     pub(crate) struct RecordingPoiTransport {
         sends: Mutex<Vec<RecordedSend>>,
+        transact_sends: Mutex<Vec<(u64, FixedBytes<32>)>>,
         script: Mutex<VecDeque<ScriptedSend>>,
     }
 
@@ -940,6 +1167,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn sends(&self) -> Vec<RecordedSend> {
             self.sends.lock().expect("sends lock").clone()
+        }
+
+        /// Transact proofs sent, as TXID merkleroot index and list key.
+        pub(crate) fn transact_sends(&self) -> Vec<(u64, FixedBytes<32>)> {
+            self.transact_sends.lock().expect("sends lock").clone()
         }
     }
 
@@ -983,11 +1215,15 @@ pub(crate) mod test_support {
             _txid_version: &str,
             _chain_type: u8,
             _chain_id: u64,
-            _list_key: &FixedBytes<32>,
-            _txid_merkleroot_index: u64,
+            list_key: &FixedBytes<32>,
+            txid_merkleroot_index: u64,
             _poi: &broadcaster_core::transact::PreTxPoi,
         ) -> Result<(), PoiError> {
-            panic!("the chain submitter sends no transact proofs");
+            self.transact_sends
+                .lock()
+                .expect("sends lock")
+                .push((txid_merkleroot_index, *list_key));
+            Ok(())
         }
     }
 }
@@ -1006,9 +1242,12 @@ mod tests {
 
     use super::test_support::{RecordedSend, RecordingPoiTransport, ScriptedSend};
     use super::{
-        ChainPoiSubmitterHandle, EVM_CHAIN_TYPE, ObservedOutput, OutputPosition,
-        PendingOutputPoiHandoff, PendingOutputPoiHandoffFailure, PendingOutputPoiSubmitIntent,
+        ChainPoiSubmitterDriver, ChainPoiSubmitterHandle, EVM_CHAIN_TYPE, INITIAL_RETRY_BACKOFF,
+        ObservedOutput, OutputPosition, PendingOutputPoiHandoff, PendingOutputPoiHandoffFailure,
+        PendingOutputPoiSubmitIntent,
     };
+    use crate::poi_submission::test_support::{RecordingRoutes, seeded_scheduler};
+    use crate::poi_submission::{MAX_ADMISSION_GAP, MIN_ADMISSION_GAP, PoiSubmissionAdmission};
     use crate::wallet::PendingOutputPoiSubmitter;
 
     const CHAIN_ID: u64 = 1;
@@ -1018,40 +1257,64 @@ mod tests {
     struct Harness {
         handle: ChainPoiSubmitterHandle,
         transport: Arc<RecordingPoiTransport>,
+        routes: Arc<RecordingRoutes>,
         cancel: CancellationToken,
         driver: JoinHandle<()>,
     }
 
     impl Harness {
         fn spawn() -> Self {
+            Self::spawn_with(None)
+        }
+
+        /// Sends over per-TXID routes admitted by a scheduler seeded with `seed`.
+        fn spawn_routed(seed: u64) -> Self {
+            Self::spawn_with(Some(seed))
+        }
+
+        fn spawn_with(seed: Option<u64>) -> Self {
             let transport = Arc::new(RecordingPoiTransport::default());
+            let routes = RecordingRoutes::new();
             let cancel = CancellationToken::new();
-            let (handle, driver) = ChainPoiSubmitterHandle::spawn_for_test(
+            let (handle, driver) = ChainPoiSubmitterDriver::new(
                 CHAIN_ID,
                 Arc::clone(&transport) as Arc<dyn PendingOutputPoiSubmitter>,
-                cancel.clone(),
+                None,
+                seed.map(|seed| routes.routing(seeded_scheduler(seed))),
             );
             Self {
                 handle,
                 transport,
+                routes,
+                driver: driver.spawn(cancel.clone()),
                 cancel,
-                driver,
             }
         }
 
         async fn prepare(&self) {
-            self.handle
-                .prepare(vec![context()])
-                .await
-                .expect("driver running");
+            self.prepare_contexts(vec![context()]).await;
+        }
+
+        async fn prepare_contexts(&self, contexts: Vec<SingleCommitmentProofContext>) {
+            self.handle.prepare(contexts).await.expect("driver running");
         }
 
         async fn observe(&self, position: u64) {
+            self.observe_at(&[(COMMITMENT, position)]).await;
+        }
+
+        /// Reports one finalized batch of `(commitment, position)` outputs.
+        async fn observe_at(&self, outputs: &[(FixedBytes<32>, u64)]) {
             self.handle
-                .observe_outputs(vec![ObservedOutput {
-                    commitment: COMMITMENT,
-                    output: OutputPosition { tree: 0, position },
-                }])
+                .observe_outputs(
+                    outputs
+                        .iter()
+                        .map(|&(commitment, position)| ObservedOutput {
+                            commitment,
+                            output: OutputPosition { tree: 0, position },
+                        })
+                        .collect(),
+                )
                 .await;
             self.settle().await;
         }
@@ -1061,6 +1324,15 @@ mod tests {
             intent: PendingOutputPoiSubmitIntent,
             position: u64,
         ) -> Result<(), PendingOutputPoiHandoffFailure> {
+            self.hand_off_context(intent, context(), position).await
+        }
+
+        async fn hand_off_context(
+            &self,
+            intent: PendingOutputPoiSubmitIntent,
+            context: SingleCommitmentProofContext,
+            position: u64,
+        ) -> Result<(), PendingOutputPoiHandoffFailure> {
             let result = self
                 .handle
                 .hand_off_single_commitment_proofs(
@@ -1068,7 +1340,7 @@ mod tests {
                     DEFAULT_TXID_VERSION,
                     EVM_CHAIN_TYPE,
                     CHAIN_ID,
-                    context(),
+                    context,
                     0,
                     position,
                 )
@@ -1097,18 +1369,35 @@ mod tests {
                 .collect()
         }
 
+        /// Commitments sent over each opened route, in opening order.
+        fn routed_commitments(&self) -> Vec<Vec<FixedBytes<32>>> {
+            self.routes
+                .routes()
+                .iter()
+                .map(|route| route.sends().iter().map(|send| send.commitment).collect())
+                .collect()
+        }
+
         async fn stop(self) {
             self.cancel.cancel();
             self.driver.await.expect("driver exits");
+            assert!(
+                self.transport.transact_sends().is_empty(),
+                "the chain submitter never sends transact proofs"
+            );
         }
     }
 
     fn context() -> SingleCommitmentProofContext {
+        context_for(COMMITMENT, 7)
+    }
+
+    fn context_for(commitment: FixedBytes<32>, txid: u64) -> SingleCommitmentProofContext {
         SingleCommitmentProofContext {
             txid_version: DEFAULT_TXID_VERSION.to_string(),
-            railgun_txid: U256::from(7),
+            railgun_txid: U256::from(txid),
             utxo_tree_in: 0,
-            commitment: COMMITMENT,
+            commitment,
             npk: FixedBytes::new([0x22; 32]),
             pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(LIST, BTreeMap::new())]),
         }
@@ -1284,6 +1573,299 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         harness.settle().await;
         assert_eq!(harness.handle.pending_count(), 0);
+        harness.stop().await;
+    }
+
+    fn commitment(byte: u8) -> FixedBytes<32> {
+        FixedBytes::new([byte; 32])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routed_batch_admits_a_random_txid_first_and_each_next_after_a_gap() {
+        // The driver's first draw picks among the batch's three TXIDs.
+        let (seed, picked) = (0..64)
+            .map(|seed| (seed, seeded_scheduler(seed).choose_index(3)))
+            .find(|&(_, picked)| picked != 0)
+            .expect("a seed that does not pick the queue head");
+        let harness = Harness::spawn_routed(seed);
+        let outputs = [(commitment(1), 1), (commitment(2), 2), (commitment(3), 3)];
+        harness
+            .prepare_contexts(
+                outputs
+                    .map(|(commitment, txid)| context_for(commitment, txid))
+                    .into(),
+            )
+            .await;
+
+        harness.observe_at(&outputs).await;
+        let first = vec![vec![outputs[picked].0]];
+        assert_eq!(harness.routed_commitments(), first);
+
+        tokio::time::advance(MIN_ADMISSION_GAP.saturating_sub(Duration::from_secs(1))).await;
+        harness.settle().await;
+        assert_eq!(harness.routed_commitments(), first, "spacing holds");
+
+        for routes in 2..=3 {
+            tokio::time::advance(MAX_ADMISSION_GAP).await;
+            harness.settle().await;
+            assert_eq!(
+                harness.routed_commitments().len(),
+                routes,
+                "one more TXID after each gap"
+            );
+        }
+        let mut admitted = harness.routed_commitments();
+        admitted.sort();
+        assert_eq!(
+            admitted,
+            outputs.map(|(commitment, _)| vec![commitment]),
+            "every TXID is admitted over its own route"
+        );
+        harness.stop().await;
+    }
+
+    /// Each route's commitments sorted, routes in commitment order.
+    fn sorted_routes(harness: &Harness) -> Vec<Vec<FixedBytes<32>>> {
+        let mut routed = harness.routed_commitments();
+        for route in &mut routed {
+            route.sort();
+        }
+        routed.sort();
+        routed
+    }
+
+    /// Releases stalled route opens and lets every send they unblock end
+    /// before the driver handles any of those ends.
+    async fn release_opens(harness: &Harness) {
+        harness.routes.set_open_gate(true);
+        tokio::task::yield_now().await;
+        harness.settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outputs_of_one_txid_share_one_admission_and_route() {
+        let harness = Harness::spawn_routed(0);
+        // One more output than send slots.
+        let outputs = (1..=5)
+            .map(|byte| (commitment(byte), u64::from(byte)))
+            .collect::<Vec<_>>();
+        harness
+            .prepare_contexts(
+                outputs
+                    .iter()
+                    .map(|&(commitment, _)| context_for(commitment, 7))
+                    .collect(),
+            )
+            .await;
+        harness.routes.set_open_gate(false);
+
+        harness.observe_at(&outputs).await;
+        assert_eq!(
+            harness.routes.opens(),
+            1,
+            "later sends join the stalled open"
+        );
+        release_opens(&harness).await;
+
+        assert_eq!(
+            sorted_routes(&harness),
+            vec![
+                outputs
+                    .iter()
+                    .map(|&(commitment, _)| commitment)
+                    .collect::<Vec<_>>()
+            ],
+            "the waiting output keeps the admission after the others end"
+        );
+        assert_eq!(harness.routes.opens(), 1);
+        harness.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_queued_behind_other_txids_keeps_its_route() {
+        let harness = Harness::spawn_routed(0);
+        let (first, later) = (commitment(1), commitment(2));
+        let others = [commitment(3), commitment(4), commitment(5)];
+        harness
+            .prepare_contexts(
+                [context_for(first, 1), context_for(later, 1)]
+                    .into_iter()
+                    .chain(others.map(|commitment| context_for(commitment, 2)))
+                    .collect(),
+            )
+            .await;
+        harness.routes.set_open_gate(false);
+        harness.observe_at(&[(first, 1)]).await;
+        tokio::time::advance(MAX_ADMISSION_GAP).await;
+        harness
+            .observe_at(&others.map(|commitment| (commitment, 3)))
+            .await;
+
+        // Every send slot is taken, so the later output waits.
+        harness.observe_at(&[(later, 2)]).await;
+        assert_eq!(harness.routes.opens(), 2);
+        release_opens(&harness).await;
+
+        assert_eq!(
+            sorted_routes(&harness),
+            vec![vec![first, later], others.to_vec()],
+            "the later output needs no new admission"
+        );
+        assert_eq!(harness.routes.opens(), 2);
+        harness.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_output_holds_its_admission_until_it_expires() {
+        let harness = Harness::spawn_routed(0);
+        let scheduler = Arc::clone(
+            &harness
+                .handle
+                .submission_routing()
+                .expect("routed")
+                .scheduler,
+        );
+        let queued = commitment(1);
+        let busy = (2..=5).map(commitment).collect::<Vec<_>>();
+        harness.prepare_contexts(vec![context_for(queued, 1)]).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
+        harness
+            .prepare_contexts(
+                busy.iter()
+                    .map(|&commitment| context_for(commitment, 2))
+                    .collect(),
+            )
+            .await;
+        harness.routes.set_open_gate(false);
+        harness
+            .observe_at(
+                &busy
+                    .iter()
+                    .map(|&commitment| (commitment, 2))
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+        tokio::time::advance(MAX_ADMISSION_GAP).await;
+        let PoiSubmissionAdmission::Admitted(admitted) =
+            scheduler.try_reserve(CHAIN_ID, U256::from(1))
+        else {
+            panic!("TXID 1 is admitted");
+        };
+
+        // Every send slot is taken, so the output waits.
+        harness.observe_at(&[(queued, 1)]).await;
+        drop(admitted);
+        assert!(
+            scheduler.join(CHAIN_ID, U256::from(1)).is_some(),
+            "the waiting output holds the admission"
+        );
+
+        // The queued output's entry expires a minute before the others.
+        tokio::time::advance(Duration::from_mins(27)).await;
+        harness.settle().await;
+        assert_eq!(harness.handle.pending_count(), busy.len());
+        assert!(scheduler.join(CHAIN_ID, U256::from(1)).is_none());
+        assert!(
+            matches!(
+                scheduler.try_reserve(CHAIN_ID, U256::from(3)),
+                PoiSubmissionAdmission::Admitted(_)
+            ),
+            "the expired output frees its route slot"
+        );
+        harness.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_txid_keeps_its_attempt_and_reports_no_failure() {
+        let harness = Harness::spawn_routed(0);
+        let (first, second) = (commitment(1), commitment(2));
+        harness
+            .prepare_contexts(vec![context_for(first, 1), context_for(second, 2)])
+            .await;
+        harness
+            .hand_off_context(
+                PendingOutputPoiSubmitIntent::Missing,
+                context_for(first, 1),
+                1,
+            )
+            .await
+            .expect("admitted");
+        harness
+            .hand_off_context(
+                PendingOutputPoiSubmitIntent::Missing,
+                context_for(second, 2),
+                2,
+            )
+            .await
+            .expect("a deferral is not a failure");
+
+        // A failure would schedule a resend after this backoff, inside the gap.
+        tokio::time::advance(INITIAL_RETRY_BACKOFF).await;
+        harness.settle().await;
+        harness
+            .hand_off_context(
+                PendingOutputPoiSubmitIntent::Missing,
+                context_for(second, 2),
+                2,
+            )
+            .await
+            .expect("still no failure while deferred");
+        assert_eq!(harness.routed_commitments(), vec![vec![first]]);
+
+        tokio::time::advance(MAX_ADMISSION_GAP).await;
+        harness.settle().await;
+        assert_eq!(
+            harness.routed_commitments(),
+            vec![vec![first], vec![second]],
+            "the queued attempt sends once"
+        );
+        harness.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_route_open_defers_and_never_sends() {
+        let harness = Harness::spawn_routed(0);
+        harness.routes.fail_opens(true);
+        // One more output than send slots, so one waits through the failure.
+        let outputs = (1..=4)
+            .map(|byte| (commitment(byte), u64::from(byte)))
+            .chain([(COMMITMENT, 5)])
+            .collect::<Vec<_>>();
+        harness
+            .prepare_contexts(
+                outputs
+                    .iter()
+                    .map(|&(commitment, _)| context_for(commitment, 7))
+                    .collect(),
+            )
+            .await;
+
+        harness.observe_at(&outputs).await;
+        harness
+            .hand_off(PendingOutputPoiSubmitIntent::Missing, 5)
+            .await
+            .expect("a failed route open is not a send failure");
+        assert_eq!(harness.routes.opens(), 1, "no output bypasses admission");
+        assert!(harness.routed_commitments().is_empty());
+        assert!(
+            harness.transport.sends().is_empty(),
+            "no shared-client fallback"
+        );
+
+        harness.routes.fail_opens(false);
+        tokio::time::advance(MAX_ADMISSION_GAP).await;
+        harness.settle().await;
+        let mut sent = outputs
+            .iter()
+            .map(|&(commitment, _)| commitment)
+            .collect::<Vec<_>>();
+        sent.sort();
+        assert_eq!(
+            sorted_routes(&harness),
+            vec![sent],
+            "every output goes over one freshly admitted route"
+        );
+        assert_eq!(harness.routes.opens(), 2);
         harness.stop().await;
     }
 }

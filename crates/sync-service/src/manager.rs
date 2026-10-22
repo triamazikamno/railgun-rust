@@ -13,6 +13,7 @@ use crate::chain::{
     ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, PreparedChainService,
     PublicDataPlaneError,
 };
+use crate::poi_submission::{PoiSubmissionScheduler, PoiSubmissionSchedulerConfig};
 use crate::public_cache::{
     PersistedPublicSyncCacheResetError, PersistedPublicSyncCacheResetReport,
     reset_persisted_public_sync_caches,
@@ -94,6 +95,8 @@ pub struct SyncManager {
     db: Arc<DbStore>,
     poi_policy: GlobalPoiPolicy,
     gateway_pool: StdMutex<Option<GatewayPool>>,
+    /// Shared by every chain so admission spacing spans all of them.
+    poi_submission_scheduler: Arc<PoiSubmissionScheduler>,
     state: Arc<StdMutex<SyncManagerState>>,
 }
 
@@ -219,6 +222,10 @@ impl SyncManager {
             db,
             poi_policy,
             gateway_pool: StdMutex::new(None),
+            poi_submission_scheduler: PoiSubmissionScheduler::new(
+                PoiSubmissionSchedulerConfig::default(),
+                rand::make_rng(),
+            ),
             state: Arc::new(StdMutex::new(SyncManagerState {
                 lifecycle: SyncManagerLifecycle::Running,
                 lease: Some(lease),
@@ -346,6 +353,7 @@ impl SyncManager {
                         ),
                         lease,
                         rpc_http_client.clone(),
+                        Arc::clone(&self.poi_submission_scheduler),
                     );
                     tokio::pin!(prepare);
                     let prepared = tokio::select! {
@@ -1566,6 +1574,7 @@ mod tests {
             finality_depth: 0,
             http_client: reqwest::Client::new(),
             progress_tx: None,
+            poi_submission_routes: None,
         }
     }
 

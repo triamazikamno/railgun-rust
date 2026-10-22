@@ -1,7 +1,7 @@
 //! Actor-owned POI maintenance scheduling: one in-flight job plus durable rerun intent.
 
-use super::SenderUnshieldAttempts;
 use super::actor::{PoiRemoteJobKey, PoiRemoteJobKind, WalletActorCredential};
+use super::{DeferredForcedSubmissions, SenderUnshieldAttempts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum PoiMaintenancePhase {
@@ -29,6 +29,8 @@ pub(super) struct PoiMaintenanceController {
     rerun_pending: bool,
     /// Actor-lifetime unshield attempt pacing shared with maintenance jobs.
     unshield_attempts: SenderUnshieldAttempts,
+    /// Forced transact-proof submissions deferred by spacing, shared with jobs.
+    forced_deferrals: DeferredForcedSubmissions,
 }
 
 impl PoiMaintenanceController {
@@ -40,6 +42,11 @@ impl PoiMaintenanceController {
     #[must_use]
     pub(super) fn unshield_attempts(&self) -> SenderUnshieldAttempts {
         self.unshield_attempts.clone()
+    }
+
+    #[must_use]
+    pub(super) fn forced_deferrals(&self) -> DeferredForcedSubmissions {
+        self.forced_deferrals.clone()
     }
 
     #[must_use]
@@ -120,10 +127,12 @@ impl PoiMaintenanceController {
     /// Drop durable force across `AcceptReset` / generation advance.
     ///
     /// Does not clear `Running`: the in-flight job still owns the phase until
-    /// `on_job_done` so a second concurrent job cannot start.
-    pub(super) const fn clear_force_on_reset(&mut self) {
+    /// `on_job_done` so a second concurrent job cannot start. That job keeps
+    /// the old forced deferrals, so it cannot record any in the new generation.
+    pub(super) fn clear_force_on_reset(&mut self) {
         self.force_pending = false;
         self.rerun_pending = false;
+        self.forced_deferrals = DeferredForcedSubmissions::default();
     }
 }
 

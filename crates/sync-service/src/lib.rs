@@ -4,6 +4,7 @@ mod manager;
 pub(crate) mod poi_artifacts;
 mod poi_cache;
 mod poi_limits;
+mod poi_submission;
 pub mod poi_v4;
 mod public_cache;
 mod runtime_admission;
@@ -34,6 +35,7 @@ pub use indexed_artifacts::IndexedArtifactManifestReuse;
 pub use manager::{
     ChainPublicSyncCacheResetResult, PublicSyncCachesResetReport, SyncManager, SyncManagerError,
 };
+pub use poi_submission::{PoiSubmissionRoute, PoiSubmissionRouteError, PoiSubmissionRouteProvider};
 pub use public_cache::{
     OfflinePoiCorpusReset, PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
     PersistedPublicSyncCacheResetReport, reset_offline_poi_corpus,

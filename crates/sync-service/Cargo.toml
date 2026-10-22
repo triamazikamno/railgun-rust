@@ -22,6 +22,7 @@ merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
 railgun-indexed-artifacts = { path = "../indexed-artifacts" }
 railgun-wallet = { path = "../railgun-wallet" }
+rand = { workspace = true }
 reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 rust-ipns = { workspace = true }

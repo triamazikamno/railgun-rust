@@ -2,9 +2,9 @@ use super::handle::LOCAL_PENDING_SPENT_TTL;
 use super::pending_output_poi::pending_output_poi_handoff_context;
 use super::{
     Arc, AtomicU64, BackfillEvent, CancellationToken, ChainError, ChainPublicDataPlane, DbStore,
-    Duration, FixedBytes, FuturesUnordered, HashSet, IndexedArtifactSourceConfig, Instant,
-    Instrument, LocalPoiStatusReader, MerkleForest, Mutex, OutputPoiRecoveryRun,
-    PendingOutputPoiContextIntent, PendingOutputPoiTentativeAttemptKey,
+    DeferredForcedSubmissions, Duration, FixedBytes, FuturesUnordered, HashSet,
+    IndexedArtifactSourceConfig, Instant, Instrument, LocalPoiStatusReader, MerkleForest, Mutex,
+    OutputPoiRecoveryRun, PendingOutputPoiContextIntent, PendingOutputPoiTentativeAttemptKey,
     PendingOutputPoiTentativeCandidate, PendingOutputPoiTentativeLocalStatus, PendingWalletReset,
     PoiMaintenanceController, PoiMaintenanceError, PoiProxyFallback, PoiRemoteJobKey, PoiRpcClient,
     PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey, RwLock,
@@ -488,6 +488,7 @@ fn request_poi_maintenance(
         active_poi_list_keys: active_poi_list_keys.to_vec(),
         force_output_poi_recovery: spec.force_output_poi_recovery,
         unshield_attempts: controller.unshield_attempts(),
+        forced_deferrals: controller.forced_deferrals(),
     }
     .spawn(poi_jobs);
     debug!(
@@ -630,6 +631,9 @@ struct PoiMaintenanceJob {
     force_output_poi_recovery: bool,
     /// Actor-lifetime unshield attempt pacing, shared with the controller.
     unshield_attempts: SenderUnshieldAttempts,
+    /// Forced submissions deferred by spacing in this job's reset generation,
+    /// shared with the controller until it resets.
+    forced_deferrals: DeferredForcedSubmissions,
 }
 
 struct PoiMaintenanceOutcome {
@@ -694,6 +698,10 @@ impl PoiMaintenanceJob {
             authority.remote_authority(),
             self.poi_client.clone(),
             Arc::new(self.poi_submitter.clone()),
+        )
+        .with_submission_routing(
+            self.poi_submitter.submission_routing().cloned(),
+            self.forced_deferrals,
         );
         // Reconstruct runtime view for authorized helpers.
         let poi_runtime = if self.poi_is_indexed {
