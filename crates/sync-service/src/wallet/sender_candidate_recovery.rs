@@ -790,10 +790,18 @@ pub(super) async fn materialize_sender_transaction_candidates(
             }
         };
         let wallet_nullifiers = wallet_nullifiers();
+        let corpus_blocked = corpus_shield_blocked_unshield_inputs(
+            output_request,
+            &proof_source_resolution,
+            &qualified,
+            wallet_nullifiers,
+        )
+        .await;
         let eligible = eligible_sender_unshield_txids(
             &qualified,
             wallet_nullifiers,
             output_request.active_list_keys,
+            &corpus_blocked,
         );
         let valid =
             sender_unshield_valid_txids(output_request, &proof_source_resolution, &eligible).await;
@@ -1202,11 +1210,13 @@ fn sender_unshield_railgun_txid(transaction: &QualifiedSenderTransaction) -> Fix
 ///
 /// A shield-blocked wallet input makes no proof possible; this is not a refund-authorization
 /// decision. Qualification already resolved each row input to the unique wallet UTXO spent by
-/// the row's transaction, so the nullifier index finds exactly those inputs.
+/// the row's transaction, so the nullifier index finds exactly those inputs. An input is blocked
+/// when its stored statuses say so or its blinded commitment is in `corpus_blocked`.
 fn eligible_sender_unshield_txids(
     qualified: &[QualifiedSenderTransaction],
     wallet_nullifiers: &WalletNullifierIndex<'_>,
     active_list_keys: &[FixedBytes<32>],
+    corpus_blocked: &BTreeSet<FixedBytes<32>>,
 ) -> BTreeSet<FixedBytes<32>> {
     qualified
         .iter()
@@ -1225,10 +1235,68 @@ fn eligible_sender_unshield_txids(
                         })
                         .is_some_and(|wallet_utxo| {
                             poi_shield_blocked_on_any_list(&wallet_utxo.utxo.poi, active_list_keys)
+                                || corpus_blocked.contains(&wallet_utxo.utxo.poi.blinded_commitment)
                         })
                 })
         })
         .map(sender_unshield_railgun_txid)
+        .collect()
+}
+
+/// Blinded commitments of qualified unshield inputs the local corpus marks Shield-blocked on an
+/// active list. Stored statuses of spent inputs are never refreshed, so they can miss the block.
+/// Empty when the corpus is not local or the read fails.
+async fn corpus_shield_blocked_unshield_inputs(
+    request: &OutputPoiRecoveryRequest<'_>,
+    proof_source_resolution: &OutputPoiProofSourceResolution,
+    qualified: &[QualifiedSenderTransaction],
+    wallet_nullifiers: &WalletNullifierIndex<'_>,
+) -> BTreeSet<FixedBytes<32>> {
+    let OutputPoiProofSourceResolution::Local { corpus, .. } = proof_source_resolution else {
+        return BTreeSet::new();
+    };
+    let datas = qualified
+        .iter()
+        .map(|transaction| &transaction.public_row.transaction)
+        .filter(|row| row.has_unshield)
+        .flat_map(|row| {
+            row.nullifiers.iter().filter_map(move |nullifier| {
+                let input_tree = u32::try_from(row.utxo_tree_in).ok()?;
+                wallet_nullifiers.input_for(input_tree, *nullifier, row.transaction_hash)
+            })
+        })
+        .map(|wallet_utxo| {
+            BlindedCommitmentData::new(
+                wallet_utxo.utxo.poi.blinded_commitment,
+                blinded_commitment_type(wallet_utxo.utxo.poi.commitment_kind),
+            )
+        })
+        .collect::<Vec<_>>();
+    if datas.is_empty() {
+        return BTreeSet::new();
+    }
+    let _revision_fence = corpus.revision_read_fence().await;
+    let Ok(statuses) = corpus
+        .status_reader()
+        .pois_per_list(
+            DEFAULT_TXID_VERSION,
+            EVM_CHAIN_TYPE,
+            request.cfg.chain.chain_id,
+            request.active_list_keys,
+            &datas,
+        )
+        .await
+    else {
+        return BTreeSet::new();
+    };
+    statuses
+        .into_iter()
+        .filter(|(_, per_list)| {
+            per_list
+                .values()
+                .any(|status| *status == PoiStatus::ShieldBlocked)
+        })
+        .map(|(blinded_commitment, _)| blinded_commitment)
         .collect()
 }
 
@@ -2592,6 +2660,7 @@ mod tests {
                 &qualified,
                 &WalletNullifierIndex::new(&wallet_utxos, &keys),
                 &[list_key],
+                &BTreeSet::new(),
             ),
             both
         );
@@ -2606,6 +2675,7 @@ mod tests {
                 &qualified,
                 &WalletNullifierIndex::new(&blocked, &keys),
                 &[list_key],
+                &BTreeSet::new(),
             ),
             BTreeSet::from([sender_unshield_railgun_txid(&qualified[0])]),
             "a Shield-blocked input removes only its own row's unshield"

@@ -3972,7 +3972,8 @@ enum UnshieldFixtureShape {
     /// Compatible pending contexts cover the fee and change.
     OutputsCovered,
     /// A full unshield with no private outputs, optionally spending a Shield-blocked input. The
-    /// spend is not scanned yet: the input is unspent and no candidate is stored.
+    /// block is known only to the local corpus: the stored statuses of the spent input are not
+    /// refreshed. The spend is not scanned yet: the input is unspent and no candidate is stored.
     UnshieldOnly { input_blocked: bool },
     /// A self-broadcast partial unshield: owned change and the unshield, with no broadcaster
     /// fee. The change PPOI is not Valid locally.
@@ -4031,19 +4032,7 @@ async fn partial_unshield_fixture(
         ViewingKeyData::from_spending_public_key([9; 32], [U256::from(13), U256::from(14)]);
     let spend_source = source(0xc1);
     let token = Address::from([0xc2; 20]);
-    let mut input = test_wallet_utxo(7);
-    if matches!(
-        shape,
-        UnshieldFixtureShape::UnshieldOnly {
-            input_blocked: true
-        }
-    ) {
-        input
-            .utxo
-            .poi
-            .statuses
-            .insert(list_key, PoiStatus::ShieldBlocked);
-    }
+    let input = test_wallet_utxo(7);
     let input_nullifier = input.utxo.nullifier(cfg.scan_keys.nullifying_key);
     let fee_note = Note::new_change(
         broadcaster.master_public_key,
@@ -4269,6 +4258,21 @@ async fn partial_unshield_fixture(
                 .collect::<Vec<_>>(),
         )
         .expect("seed local PPOI statuses");
+    if matches!(
+        shape,
+        UnshieldFixtureShape::UnshieldOnly {
+            input_blocked: true
+        }
+    ) {
+        cache
+            .apply_blocked_shields(&[poi::poi::BlockedShield {
+                commitment_hash: hex::encode_prefixed(input.utxo.poi.commitment),
+                blinded_commitment: hex::encode_prefixed(input.utxo.poi.blinded_commitment),
+                block_reason: None,
+                signature: hex::encode_prefixed([0_u8; 64]),
+            }])
+            .expect("seed blocked input shield");
+    }
     cache.accept_current_roots();
     seed_data_plane_poi_cache(&public_data_plane, cfg.chain.chain_id, list_key, cache).await;
 
