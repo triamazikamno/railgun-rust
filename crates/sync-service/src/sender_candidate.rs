@@ -33,6 +33,16 @@ pub struct SenderTransactionCandidate {
     pub source: UtxoSource,
     pub wallet_spends: Vec<SenderTransactionCandidateSpend>,
     pub outputs: Vec<SenderTransactionCandidateOutput>,
+    pub unshield: Option<SenderTransactionCandidateUnshield>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderTransactionCandidateUnshield {
+    /// Railgun TXIDs of unresolved eligible inner unshields, strictly ascending, nonempty.
+    pub railgun_txids: Vec<FixedBytes<32>>,
+    /// Private outputs were handed to pending-output maintenance (or none exist); only
+    /// unshield work remains and output materialization is skipped.
+    pub outputs_handed_off: bool,
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
@@ -47,8 +57,8 @@ pub enum SenderTransactionCandidateError {
     InvalidOutputs,
     #[error("sender transaction candidate note does not match its output commitment")]
     NoteCommitmentMismatch,
-    #[error("sender transaction candidate must contain at least one valid sender note")]
-    MissingSenderNote,
+    #[error("sender transaction candidate unshield TXIDs must be nonempty, unique, and sorted")]
+    InvalidUnshield,
     #[error("invalid sender transaction candidate encoding")]
     InvalidEncoding,
 }
@@ -68,9 +78,19 @@ impl SenderTransactionCandidate {
             source,
             wallet_spends,
             outputs,
+            unshield: None,
         };
         record.validate()?;
         Ok(record)
+    }
+
+    pub fn with_unshield(
+        mut self,
+        unshield: Option<SenderTransactionCandidateUnshield>,
+    ) -> Result<Self, SenderTransactionCandidateError> {
+        self.unshield = unshield;
+        self.validate()?;
+        Ok(self)
     }
 
     #[must_use]
@@ -100,7 +120,6 @@ impl SenderTransactionCandidate {
 
         let mut positions = BTreeSet::new();
         let mut commitments = BTreeSet::new();
-        let mut has_sender_note = false;
         for (index, output) in self.outputs.iter().enumerate() {
             if index > 0 && output_key(&self.outputs[index - 1]) >= output_key(output) {
                 return Err(SenderTransactionCandidateError::InvalidOutputs);
@@ -115,11 +134,16 @@ impl SenderTransactionCandidate {
                 if note_commitment != output.commitment {
                     return Err(SenderTransactionCandidateError::NoteCommitmentMismatch);
                 }
-                has_sender_note = true;
             }
         }
-        if !has_sender_note {
-            return Err(SenderTransactionCandidateError::MissingSenderNote);
+        if let Some(unshield) = &self.unshield
+            && (unshield.railgun_txids.is_empty()
+                || !unshield
+                    .railgun_txids
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]))
+        {
+            return Err(SenderTransactionCandidateError::InvalidUnshield);
         }
         Ok(())
     }
@@ -171,6 +195,13 @@ struct CandidateWire {
     source: SourceWire,
     wallet_spends: Vec<SpendWire>,
     outputs: Vec<OutputWire>,
+    unshield: Option<UnshieldWire>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UnshieldWire {
+    railgun_txids: Vec<[u8; 32]>,
+    outputs_handed_off: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -238,6 +269,10 @@ impl From<&SenderTransactionCandidate> for CandidateWire {
                     }),
                 })
                 .collect(),
+            unshield: record.unshield.as_ref().map(|unshield| UnshieldWire {
+                railgun_txids: unshield.railgun_txids.iter().map(|txid| txid.0).collect(),
+                outputs_handed_off: unshield.outputs_handed_off,
+            }),
         }
     }
 }
@@ -279,6 +314,16 @@ impl TryFrom<CandidateWire> for SenderTransactionCandidate {
                     }),
                 })
                 .collect(),
+            unshield: wire
+                .unshield
+                .map(|unshield| SenderTransactionCandidateUnshield {
+                    railgun_txids: unshield
+                        .railgun_txids
+                        .into_iter()
+                        .map(FixedBytes::from)
+                        .collect(),
+                    outputs_handed_off: unshield.outputs_handed_off,
+                }),
         })
     }
 }
@@ -349,6 +394,48 @@ mod tests {
                 .expect("sender note")
                 .commitment()
         );
+
+        let unshield = SenderTransactionCandidateUnshield {
+            railgun_txids: vec![FixedBytes::from([0x01; 32]), FixedBytes::from([0x02; 32])],
+            outputs_handed_off: true,
+        };
+        let with_unshield = record
+            .clone()
+            .with_unshield(Some(unshield.clone()))
+            .expect("candidate with unshield");
+        let encoded_unshield = with_unshield.encode().expect("encode unshield candidate");
+        let decoded_unshield =
+            SenderTransactionCandidate::decode(&encoded_unshield).expect("decode unshield");
+        assert_eq!(decoded_unshield.unshield, Some(unshield));
+        assert_eq!(
+            decoded_unshield
+                .encode()
+                .expect("re-encode unshield candidate"),
+            encoded_unshield
+        );
+        assert_ne!(encoded_unshield, encoded);
+
+        let mut spend_only = record.clone();
+        spend_only.outputs.clear();
+        spend_only
+            .validate()
+            .expect("candidate without sender note");
+        for railgun_txids in [
+            Vec::new(),
+            vec![FixedBytes::from([0x02; 32]), FixedBytes::from([0x01; 32])],
+            vec![FixedBytes::from([0x01; 32]), FixedBytes::from([0x01; 32])],
+        ] {
+            assert_eq!(
+                record
+                    .clone()
+                    .with_unshield(Some(SenderTransactionCandidateUnshield {
+                        railgun_txids,
+                        outputs_handed_off: false,
+                    }))
+                    .err(),
+                Some(SenderTransactionCandidateError::InvalidUnshield)
+            );
+        }
 
         let mut malformed = record.clone();
         malformed.outputs[0].commitment = FixedBytes::ZERO;

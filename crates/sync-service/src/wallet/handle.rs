@@ -90,8 +90,9 @@ use super::{
     Arc, AtomicU64, BTreeMap, BackfillEvent, CancellationToken, Duration, FixedBytes, Mutex,
     Ordering, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OwnedMutexGuard,
     PendingOutputPoiContextIntent, PendingOutputPoiContextRecord, PoiStatus, PublicPoiCorpusHandle,
-    RwLock, SenderCandidatePublicDataFence, SenderTransactionCandidate, SyncProgressUpdate, Utxo,
-    UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
+    RwLock, SenderCandidatePublicDataFence, SenderTransactionCandidate,
+    SenderTransactionCandidateUnshield, SyncProgressUpdate, Utxo, UtxoCommitmentKind,
+    UtxoPoiMetadata, UtxoSource, WalletActorApplyToken, WalletActorCommitToken,
     WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
     WalletBackfillRejectReason, WalletBackfillStartResult, WalletCacheError, WalletCacheKey,
     WalletCurrentSnapshot, WalletInactiveReason, WalletIndexedCatchUpStatus, WalletObservation,
@@ -436,10 +437,13 @@ pub(crate) enum OwnedPoiPrivateDelta {
             Option<OutputPoiRecoveryRecord>,
         )>,
     },
-    /// Retire an exact sender candidate after the actor re-reads local artifact POI status.
+    /// Retire an exact sender candidate after the actor re-reads local artifact POI status, or
+    /// keep only its remaining unshield work when `unshield` is set.
     SenderCandidateLocallyValid {
         expected_candidate: SenderTransactionCandidate,
         corpus: PublicPoiCorpusHandle,
+        public_data_fence: SenderCandidatePublicDataFence,
+        unshield: Option<SenderTransactionCandidateUnshield>,
     },
     /// Install standard external pending/recovery siblings, reuse exact wallet-owned substitutes,
     /// and consume their scan candidate in one actor-owned durable commit.
@@ -460,6 +464,21 @@ pub(crate) enum OwnedPoiPrivateDelta {
         external_valid_substitutes: Vec<Utxo>,
         /// Corpus revision the candidate's proofs were built from.
         expected_corpus: ExpectedPoiCorpusRevision,
+        /// Remaining unshield work; when set the candidate is kept instead of consumed.
+        unshield: Option<SenderTransactionCandidateUnshield>,
+    },
+    /// Record, narrow, or retire a sender candidate's unshield work without completing any
+    /// validation.
+    SenderCandidateUnshieldUpdate {
+        expected_candidate: SenderTransactionCandidate,
+        public_data_fence: SenderCandidatePublicDataFence,
+        replacement: Option<SenderTransactionCandidate>,
+    },
+    /// Complete unshield TXIDs after the actor re-reads them Valid on every active list.
+    SenderCandidateUnshieldValidated {
+        expected_candidate: SenderTransactionCandidate,
+        validated_txids: Vec<FixedBytes<32>>,
+        corpus: PublicPoiCorpusHandle,
     },
     /// Fold a recovery action into the exact predecessor, optionally replacing a pending
     /// context whose predecessor is also exact.

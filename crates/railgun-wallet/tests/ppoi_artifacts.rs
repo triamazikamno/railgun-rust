@@ -190,6 +190,7 @@ async fn prove_current_ppoi_shapes() {
         (1, false, "ppoi_3x3.json"),
         (2, false, "ppoi_3x3_two_outputs.json"),
         (3, true, "ppoi_13x13_unshield.json"),
+        (0, true, "ppoi_3x3_unshield_only.json"),
     ] {
         let chunk = synthetic_chunk(private_output_count, has_unshield);
         let base = chunk

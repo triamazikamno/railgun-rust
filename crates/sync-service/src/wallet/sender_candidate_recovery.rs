@@ -1,19 +1,22 @@
 use super::saved_poi_compatibility::{
-    saved_pending_context_is_compatible, saved_poi_map_is_compatible,
+    corpus_valid_blinded_commitments, saved_pending_context_is_compatible,
+    saved_poi_map_is_compatible,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
+use std::sync::PoisonError;
 
+use crate::SenderTransactionCandidateError;
 use crate::chain::{ChainPublicDataPlaneCommitGuard, PublicTxidDataAuthority};
 use crate::types::PublicDataPlaneEpoch;
-use railgun_wallet::tx::PoiMerkleProofSource;
 
 use super::output_poi_recovery::{
     OutputPoiProofSourceResolution, PublicCacheTxidRecoveryRequest, PublicCacheTxidRefreshRequest,
-    RecoveryFailure, WalletNullifierIndex, build_recovery_chunk_for_public_transaction,
-    new_output_poi_recovery_record_for_output, output_poi_recovery_proof_retry_after,
-    pending_output_poi_context_from_output_recovery, preflight_local_recovery_chunk_input_proofs,
+    RecoveredOutputTxidData, RecoveryChunk, RecoveryFailure, WalletNullifierIndex,
+    build_recovery_chunk_for_public_transaction, new_output_poi_recovery_record_for_output,
+    output_poi_recovery_proof_retry_after, pending_output_poi_context_from_output_recovery,
+    poi_shield_blocked_on_any_list, preflight_local_recovery_chunk_input_proofs,
     recovered_output_txid_data_from_public_cache, refresh_public_txid_cache,
 };
 #[allow(clippy::wildcard_imports)]
@@ -21,6 +24,88 @@ use super::*;
 pub(super) struct SenderCandidateRecoveryRequest<'a> {
     pub(super) output_recovery: OutputPoiRecoveryRequest<'a>,
     pub(super) candidates: Vec<SenderTransactionCandidate>,
+    pub(super) unshield_attempts: &'a SenderUnshieldAttempts,
+}
+
+/// In-memory unshield submission pacing keyed by Railgun TXID, kept for the actor lifetime.
+#[derive(Clone, Default)]
+pub(crate) struct SenderUnshieldAttempts(
+    Arc<std::sync::Mutex<BTreeMap<FixedBytes<32>, SenderUnshieldAttempt>>>,
+);
+
+impl fmt::Debug for SenderUnshieldAttempts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SenderUnshieldAttempts")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SenderUnshieldAttempt {
+    next_attempt_at: Instant,
+    outcome: SenderUnshieldAttemptOutcome,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SenderUnshieldAttemptOutcome {
+    Submitted,
+    Retrying,
+    NeedsAttention,
+}
+
+impl SenderUnshieldAttempts {
+    fn waiting(
+        &self,
+        txid: FixedBytes<32>,
+        now: Instant,
+        force: bool,
+    ) -> Option<SenderUnshieldAttemptOutcome> {
+        if force {
+            return None;
+        }
+        let attempts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        attempts
+            .get(&txid)
+            .filter(|attempt| now < attempt.next_attempt_at)
+            .map(|attempt| attempt.outcome)
+    }
+
+    fn record(
+        &self,
+        txid: FixedBytes<32>,
+        outcome: SenderUnshieldAttemptOutcome,
+        retry_after: Duration,
+    ) {
+        let attempt = SenderUnshieldAttempt {
+            next_attempt_at: Instant::now() + retry_after,
+            outcome,
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(txid, attempt);
+    }
+
+    fn retain(&self, live: &BTreeSet<FixedBytes<32>>) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|txid, _| live.contains(txid));
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_all(&self) {
+        let now = Instant::now();
+        for attempt in self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values_mut()
+        {
+            attempt.next_attempt_at = now;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,6 +119,9 @@ pub(crate) struct SenderCandidateRecoveryReport {
     pub(super) covered_by_pending_contexts: u64,
     /// Materializations skipped because the POI corpus advanced after proof preparation.
     pub(super) stale_revision_skips: u64,
+    /// Unshields this actor submitted that are not yet Valid, counted once each per pass.
+    pub(super) unshield_awaiting_validation: u64,
+    pub(super) unshields_validated: usize,
     pub(super) expected_candidates: BTreeMap<FixedBytes<32>, Vec<u8>>,
     pub(super) expected_pending_contexts: BTreeMap<FixedBytes<32>, Vec<u8>>,
     /// Predecessors satisfied by an exact, durable replacement in this recovery run.
@@ -42,7 +130,9 @@ pub(crate) struct SenderCandidateRecoveryReport {
 
 impl SenderCandidateRecoveryReport {
     pub(super) const fn completed(&self) -> usize {
-        self.materialized.saturating_add(self.retired_locally_valid)
+        self.materialized
+            .saturating_add(self.retired_locally_valid)
+            .saturating_add(self.unshields_validated)
     }
 
     pub(super) fn matches_pending_contexts(
@@ -149,7 +239,7 @@ impl SenderCandidatePublicDataFence {
 }
 
 #[derive(Clone)]
-struct QualifiedSenderTransaction {
+pub(super) struct QualifiedSenderTransaction {
     txid_index: u64,
     public_row: PublicTxidTransaction,
     output_start_global: u128,
@@ -172,12 +262,20 @@ pub(crate) struct SenderCandidateLocalClassification {
 ///
 /// This is deliberately shared by the preflight and actor paths.  The actor repeats it from
 /// its fresh wallet snapshot before allowing the candidate-only durable deletion.
+///
+/// Every output must be either exactly one wallet UTXO owned by the scan key or an external
+/// output. An all-owned candidate classifies with no external outputs, which settles only its
+/// private outputs, not its unshields. A candidate without outputs is `None`: it takes the
+/// no-private-output unshield route instead.
 pub(crate) fn classify_sender_candidate_for_local_retirement(
     candidate: &SenderTransactionCandidate,
     wallet_utxos: &[WalletUtxo],
     scan_keys: &railgun_wallet::scan::WalletScanKeys,
 ) -> Option<SenderCandidateLocalClassification> {
     candidate.validate().ok()?;
+    if candidate.outputs.is_empty() {
+        return None;
+    }
 
     let expected_spends = candidate
         .wallet_spends
@@ -281,9 +379,6 @@ pub(crate) fn classify_sender_candidate_for_local_retirement(
         external_outputs.push(BlindedCommitmentData::transact(
             recomputed.poi.blinded_commitment,
         ));
-    }
-    if external_outputs.is_empty() {
-        return None;
     }
     Some(SenderCandidateLocalClassification { external_outputs })
 }
@@ -583,6 +678,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
     let SenderCandidateRecoveryRequest {
         output_recovery,
         candidates,
+        unshield_attempts,
     } = request;
     let output_request = &output_recovery;
     let mut report = SenderCandidateRecoveryReport {
@@ -597,7 +693,12 @@ pub(super) async fn materialize_sender_transaction_candidates(
             .collect(),
         ..SenderCandidateRecoveryReport::default()
     };
+    let mut live_unshields = candidates
+        .iter()
+        .flat_map(sender_candidate_unshield_txids)
+        .collect::<BTreeSet<_>>();
     if candidates.is_empty() {
+        unshield_attempts.retain(&live_unshields);
         return report;
     }
     debug!(
@@ -615,39 +716,176 @@ pub(super) async fn materialize_sender_transaction_candidates(
         DEFAULT_TXID_VERSION,
     );
     let mut public_txid_cache_refreshed = None;
+    // Built on first qualification: candidates still awaiting public data need no nullifiers.
+    let wallet_nullifier_index = std::sync::OnceLock::new();
+    let wallet_nullifiers = || {
+        wallet_nullifier_index.get_or_init(|| {
+            WalletNullifierIndex::new(output_request.wallet_utxos, &output_request.cfg.scan_keys)
+        })
+    };
     for candidate in candidates {
         let candidate_id = candidate.semantic_id();
         let output_count = u64::try_from(candidate.outputs.len())
             .unwrap_or(u64::MAX)
             .max(1);
-        if let Some(coverage) = sender_candidate_coverage(output_request, &candidate).await {
-            report.covered_by_pending_contexts = report
-                .covered_by_pending_contexts
-                .saturating_add(coverage.pending_contexts);
-            debug!(
-                chain_id = output_request.cfg.chain.chain_id,
-                covered_by_local_valid = coverage.local_valid,
-                covered_by_pending_contexts = coverage.pending_contexts,
-                "sender candidate recovery skipped covered candidate"
-            );
+        let stored_unshields = sender_candidate_unshield_txids(&candidate);
+        // Outputs already belong to pending-output maintenance; only unshield work remains.
+        let handed_off = candidate
+            .unshield
+            .as_ref()
+            .is_some_and(|unshield| unshield.outputs_handed_off);
+        let pending_count = if handed_off {
+            u64::try_from(stored_unshields.len()).unwrap_or(u64::MAX)
+        } else {
+            output_count
+        };
+        let coverage = if handed_off {
+            None
+        } else {
+            sender_candidate_coverage(output_request, &candidate).await
+        };
+        if output_request.active_list_keys.is_empty() {
+            if let Some(coverage) = coverage {
+                record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
+            } else {
+                report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(pending_count);
+            }
             continue;
         }
+        let proof_source_resolution = output_request
+            .resolve_proof_source(output_request.active_list_keys)
+            .await;
+        if matches!(
+            &proof_source_resolution,
+            OutputPoiProofSourceResolution::Unavailable
+        ) {
+            if let Some(coverage) = coverage {
+                record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
+            } else {
+                log_local_poi_cache_unavailable(output_request.cfg, "sender_candidate_recovery");
+                report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(pending_count);
+            }
+            continue;
+        }
+        let QualifiedSenderCandidate {
+            qualified,
+            public_data_fence,
+            data_epoch,
+        } = match qualify_sender_candidate_from_public_rows(
+            output_request,
+            &candidate,
+            &cache_key,
+            &mut public_txid_cache_refreshed,
+        )
+        .await
+        {
+            Ok(qualified) => qualified,
+            Err(pending) => {
+                if let Some(coverage) = coverage {
+                    record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
+                } else {
+                    pending.record(&mut report, pending_count);
+                }
+                continue;
+            }
+        };
+        let wallet_nullifiers = wallet_nullifiers();
+        let eligible = eligible_sender_unshield_txids(
+            &qualified,
+            wallet_nullifiers,
+            output_request.active_list_keys,
+        );
+        let valid =
+            sender_unshield_valid_txids(output_request, &proof_source_resolution, &eligible).await;
+        if handed_off {
+            process_sender_candidate_unshields(
+                output_request,
+                &mut report,
+                unshield_attempts,
+                &mut live_unshields,
+                SenderUnshieldInputs {
+                    candidate,
+                    eligible,
+                    valid,
+                    qualified: &qualified,
+                    wallet_nullifiers,
+                    public_data_fence: &public_data_fence,
+                    proof_source_resolution: &proof_source_resolution,
+                    cached_proofs: BTreeMap::new(),
+                },
+            )
+            .await;
+            continue;
+        }
+        let work = unresolved_sender_unshield_txids(&eligible, &stored_unshields, valid.as_ref());
+        let unshield_inputs = |candidate, valid, cached_proofs| SenderUnshieldInputs {
+            candidate,
+            eligible: eligible.clone(),
+            valid,
+            qualified: &qualified,
+            wallet_nullifiers,
+            public_data_fence: &public_data_fence,
+            proof_source_resolution: &proof_source_resolution,
+            cached_proofs,
+        };
+
+        if let Some(coverage) = coverage {
+            record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
+            if !eligible.is_empty() || !stored_unshields.is_empty() {
+                process_sender_candidate_unshields(
+                    output_request,
+                    &mut report,
+                    unshield_attempts,
+                    &mut live_unshields,
+                    unshield_inputs(candidate, valid, BTreeMap::new()),
+                )
+                .await;
+            }
+            continue;
+        }
+
         if let Some(corpus) = locally_valid_sender_candidate(output_request, &candidate).await {
+            // Retiring needs proof that no eligible unshield is unresolved.
+            if !eligible.is_empty() && valid.is_none() {
+                report.retrying = report.retrying.saturating_add(1);
+                continue;
+            }
+            let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work) else {
+                report.needs_attention = report.needs_attention.saturating_add(output_count);
+                continue;
+            };
             let apply_result = apply_poi_private_delta(
                 output_request.authority,
                 output_request.db,
                 output_request.cache_store,
                 output_request.cfg,
                 OwnedPoiPrivateDelta::SenderCandidateLocallyValid {
-                    expected_candidate: candidate.clone(),
+                    expected_candidate: candidate,
                     corpus,
+                    public_data_fence: public_data_fence.clone(),
+                    unshield: replacement
+                        .as_ref()
+                        .and_then(|replacement| replacement.unshield.clone()),
                 },
             )
             .await;
             match apply_result {
                 Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
-                    report.retired_locally_valid = report.retired_locally_valid.saturating_add(1);
-                    report.expected_candidates.remove(&candidate_id);
+                    if let Some(replacement) = replacement {
+                        track_sender_candidate(&mut report, &replacement);
+                        process_sender_candidate_unshields(
+                            output_request,
+                            &mut report,
+                            unshield_attempts,
+                            &mut live_unshields,
+                            unshield_inputs(replacement, valid, BTreeMap::new()),
+                        )
+                        .await;
+                    } else {
+                        report.retired_locally_valid =
+                            report.retired_locally_valid.saturating_add(1);
+                        report.expected_candidates.remove(&candidate_id);
+                    }
                 }
                 Ok(
                     PoiPrivateApplyOutcome::Skipped
@@ -659,140 +897,61 @@ pub(super) async fn materialize_sender_transaction_candidates(
             }
             continue;
         }
-        if output_request.active_list_keys.is_empty() {
-            report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(output_count);
-            continue;
-        }
-        let proof_source_resolution = output_request
-            .resolve_proof_source(output_request.active_list_keys)
-            .await;
-        if matches!(
-            &proof_source_resolution,
-            OutputPoiProofSourceResolution::Unavailable
-        ) {
-            log_local_poi_cache_unavailable(output_request.cfg, "sender_candidate_recovery");
-            report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(output_count);
-            continue;
-        }
-        let mut data_epoch = output_request.public_data_plane.current_epoch();
-        let mut rows = output_request
-            .public_data_plane
-            .txid_transactions_for_outer_hash_with_authority(&cache_key, candidate.source.tx_hash);
-        if matches!(&rows, Ok((rows, _)) if rows.is_empty())
-            || matches!(&rows, Err(TxidPublicCacheError::CacheNotReady { .. }))
+
+        if qualified
+            .iter()
+            .all(|transaction| transaction.outputs.is_empty())
         {
-            let refreshed = refresh_sender_candidate_public_txid_cache(
-                output_request,
-                &cache_key,
-                &mut public_txid_cache_refreshed,
-            )
-            .await;
-            if refreshed {
-                data_epoch = output_request.public_data_plane.current_epoch();
-                rows = output_request
-                    .public_data_plane
-                    .txid_transactions_for_outer_hash_with_authority(
-                        &cache_key,
-                        candidate.source.tx_hash,
-                    );
-            } else {
-                report.retrying = report.retrying.saturating_add(output_count);
+            let eligible_count = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
+            if !eligible.is_empty() && valid.is_none() {
+                report.retrying = report.retrying.saturating_add(eligible_count);
                 continue;
             }
-        }
-        let (mut rows, fetched_authority) = match rows {
-            Ok((rows, _authority)) if rows.is_empty() => {
-                report.awaiting_public_txid_data = report
-                    .awaiting_public_txid_data
-                    .saturating_add(output_count);
-                continue;
-            }
-            Ok((rows, authority)) => (rows, authority),
-            Err(TxidPublicCacheError::CacheNotReady { .. }) => {
-                report.awaiting_public_txid_data = report
-                    .awaiting_public_txid_data
-                    .saturating_add(output_count);
-                continue;
-            }
-            Err(_) => {
-                report.retrying = report.retrying.saturating_add(output_count);
-                continue;
-            }
-        };
-        let mut authority = fetched_authority;
-        let mut qualification = qualify_sender_candidate(
-            &candidate,
-            output_request.wallet_utxos,
-            &output_request.cfg.scan_keys,
-            rows.clone(),
-        );
-        if matches!(qualification, Ok(None)) && public_txid_cache_refreshed.is_none() {
-            if !refresh_sender_candidate_public_txid_cache(
-                output_request,
-                &cache_key,
-                &mut public_txid_cache_refreshed,
-            )
-            .await
-            {
-                report.retrying = report.retrying.saturating_add(output_count);
-                continue;
-            }
-            data_epoch = output_request.public_data_plane.current_epoch();
-            (rows, authority) = match output_request
-                .public_data_plane
-                .txid_transactions_for_outer_hash_with_authority(
-                    &cache_key,
-                    candidate.source.tx_hash,
-                ) {
-                Ok((rows, authority)) if !rows.is_empty() => (rows, authority),
-                Ok(_) | Err(TxidPublicCacheError::CacheNotReady { .. }) => {
-                    report.awaiting_public_txid_data = report
-                        .awaiting_public_txid_data
-                        .saturating_add(output_count);
-                    continue;
-                }
-                Err(_) => {
-                    report.retrying = report.retrying.saturating_add(output_count);
-                    continue;
-                }
-            };
-            qualification = qualify_sender_candidate(
-                &candidate,
-                output_request.wallet_utxos,
-                &output_request.cfg.scan_keys,
-                rows.clone(),
-            );
-        }
-        let qualified = match qualification {
-            Ok(Some(qualified)) => qualified,
-            Ok(None) => {
-                debug!(
-                    chain_id = output_request.cfg.chain.chain_id,
-                    category = "public_rows_do_not_cover_candidate",
-                    "sender candidate recovery qualification incomplete"
-                );
-                report.awaiting_public_txid_data = report
-                    .awaiting_public_txid_data
-                    .saturating_add(output_count);
-                continue;
-            }
-            Err(()) => {
-                warn!(
-                    chain_id = output_request.cfg.chain.chain_id,
-                    category = "candidate_shape_or_wallet_association_mismatch",
-                    "sender candidate recovery qualification failed"
-                );
+            // No replacement retires the candidate: a blocked refund or an already-valid unshield.
+            let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work) else {
                 report.needs_attention = report.needs_attention.saturating_add(output_count);
                 continue;
+            };
+            let apply_result = apply_poi_private_delta(
+                output_request.authority,
+                output_request.db,
+                output_request.cache_store,
+                output_request.cfg,
+                OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate {
+                    expected_candidate: candidate,
+                    public_data_fence: public_data_fence.clone(),
+                    replacement: replacement.clone(),
+                },
+            )
+            .await;
+            match apply_result {
+                Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                    if let Some(replacement) = replacement {
+                        track_sender_candidate(&mut report, &replacement);
+                        process_sender_candidate_unshields(
+                            output_request,
+                            &mut report,
+                            unshield_attempts,
+                            &mut live_unshields,
+                            unshield_inputs(replacement, valid, BTreeMap::new()),
+                        )
+                        .await;
+                    } else {
+                        report.expected_candidates.remove(&candidate_id);
+                    }
+                }
+                Ok(
+                    PoiPrivateApplyOutcome::Skipped
+                    | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+                ) => {}
+                Err(_) => {
+                    report.needs_attention =
+                        report.needs_attention.saturating_add(eligible_count.max(1));
+                }
             }
-        };
-        let public_data_fence = SenderCandidatePublicDataFence::new(
-            output_request.public_data_plane,
-            cache_key.clone(),
-            data_epoch,
-            rows,
-            authority,
-        );
+            continue;
+        }
+
         let Some(spending_public_key) = output_request.cfg.spending_public_key else {
             report.retrying = report.retrying.saturating_add(output_count);
             continue;
@@ -801,14 +960,18 @@ pub(super) async fn materialize_sender_transaction_candidates(
             report.retrying = report.retrying.saturating_add(output_count);
             continue;
         };
+        let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work) else {
+            report.needs_attention = report.needs_attention.saturating_add(output_count);
+            continue;
+        };
         let prepared = match prepare_sender_candidate_materialization(
             output_request,
             &candidate,
-            qualified,
+            &qualified,
             spending_public_key,
             prover,
-            &public_data_fence,
-            proof_source_resolution,
+            &proof_source_resolution,
+            &work,
         )
         .await
         {
@@ -849,6 +1012,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
             expected_corpus,
             replacement_group,
             external_valid_substitutes,
+            unshield_proofs,
         } = prepared;
         let satisfied_pending_contexts = replacement_group
             .iter()
@@ -861,7 +1025,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
             output_request.cfg,
             OwnedPoiPrivateDelta::SenderCandidateMaterialization {
                 expected_candidate: candidate,
-                public_data_fence,
+                public_data_fence: public_data_fence.clone(),
                 active_list_keys: output_request.active_list_keys.to_vec(),
                 pending_updates,
                 recovery_updates,
@@ -870,16 +1034,31 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 expected_corpus,
                 replacement_group,
                 external_valid_substitutes,
+                unshield: replacement
+                    .as_ref()
+                    .and_then(|replacement| replacement.unshield.clone()),
             },
         )
         .await;
         match apply_result {
             Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
                 report.materialized = report.materialized.saturating_add(1);
-                report.expected_candidates.remove(&candidate_id);
                 report
                     .satisfied_pending_contexts
                     .extend(satisfied_pending_contexts);
+                if let Some(replacement) = replacement {
+                    track_sender_candidate(&mut report, &replacement);
+                    process_sender_candidate_unshields(
+                        output_request,
+                        &mut report,
+                        unshield_attempts,
+                        &mut live_unshields,
+                        unshield_inputs(replacement, valid, unshield_proofs),
+                    )
+                    .await;
+                } else {
+                    report.expected_candidates.remove(&candidate_id);
+                }
             }
             Ok(PoiPrivateApplyOutcome::SkippedStaleCorpusRevision) => {
                 report.stale_revision_skips = report.stale_revision_skips.saturating_add(1);
@@ -889,6 +1068,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
             Err(_) => report.needs_attention = report.needs_attention.saturating_add(output_count),
         }
     }
+    unshield_attempts.retain(&live_unshields);
     debug!(
         chain_id = output_request.cfg.chain.chain_id,
         materialized = report.materialized,
@@ -899,10 +1079,561 @@ pub(super) async fn materialize_sender_transaction_candidates(
         needs_attention = report.needs_attention,
         covered_by_pending_contexts = report.covered_by_pending_contexts,
         stale_revision_skips = report.stale_revision_skips,
+        unshield_awaiting_validation = report.unshield_awaiting_validation,
+        unshields_validated = report.unshields_validated,
         expected_candidates = report.expected_candidates.len(),
         "sender candidate recovery scan complete"
     );
     report
+}
+
+fn record_covered_sender_candidate(
+    report: &mut SenderCandidateRecoveryReport,
+    cfg: &WalletConfig,
+    coverage: SenderCandidateCoverage,
+) {
+    report.covered_by_pending_contexts = report
+        .covered_by_pending_contexts
+        .saturating_add(coverage.pending_contexts);
+    debug!(
+        chain_id = cfg.chain.chain_id,
+        covered_by_local_valid = coverage.local_valid,
+        covered_by_pending_contexts = coverage.pending_contexts,
+        "sender candidate recovery skipped covered candidate"
+    );
+}
+
+/// Keep the report's expected candidate encoding in step with a durable candidate update.
+fn track_sender_candidate(
+    report: &mut SenderCandidateRecoveryReport,
+    candidate: &SenderTransactionCandidate,
+) {
+    if let Ok(encoded) = candidate.encode() {
+        report
+            .expected_candidates
+            .insert(candidate.semantic_id(), encoded);
+    } else {
+        report.expected_candidates.remove(&candidate.semantic_id());
+    }
+}
+
+fn sender_candidate_unshield_txids(
+    candidate: &SenderTransactionCandidate,
+) -> BTreeSet<FixedBytes<32>> {
+    candidate
+        .unshield
+        .iter()
+        .flat_map(|unshield| unshield.railgun_txids.iter().copied())
+        .collect()
+}
+
+/// The candidate with only its unshield work left after its outputs are handed off, or `None`
+/// when no unshield work remains.
+fn sender_candidate_with_unshield_work(
+    candidate: &SenderTransactionCandidate,
+    work: &BTreeSet<FixedBytes<32>>,
+) -> Result<Option<SenderTransactionCandidate>, SenderTransactionCandidateError> {
+    sender_candidate_with_remaining_unshield(candidate, work.iter().copied().collect(), true)
+}
+
+/// The candidate left after completing `validated` unshield TXIDs, or `None` when it retires.
+pub(super) fn sender_candidate_after_unshield_validation(
+    candidate: &SenderTransactionCandidate,
+    unshield: &SenderTransactionCandidateUnshield,
+    validated: &BTreeSet<FixedBytes<32>>,
+) -> Result<Option<SenderTransactionCandidate>, SenderTransactionCandidateError> {
+    let remaining = unshield
+        .railgun_txids
+        .iter()
+        .copied()
+        .filter(|txid| !validated.contains(txid))
+        .collect();
+    sender_candidate_with_remaining_unshield(candidate, remaining, unshield.outputs_handed_off)
+}
+
+/// The candidate keeping only `remaining` unshield TXIDs, or `None` when it retires because no
+/// TXID remains and its outputs are handed off.
+fn sender_candidate_with_remaining_unshield(
+    candidate: &SenderTransactionCandidate,
+    remaining: Vec<FixedBytes<32>>,
+    outputs_handed_off: bool,
+) -> Result<Option<SenderTransactionCandidate>, SenderTransactionCandidateError> {
+    if remaining.is_empty() && outputs_handed_off {
+        return Ok(None);
+    }
+    candidate
+        .clone()
+        .with_unshield(
+            (!remaining.is_empty()).then_some(SenderTransactionCandidateUnshield {
+                railgun_txids: remaining,
+                outputs_handed_off,
+            }),
+        )
+        .map(Some)
+}
+
+/// Eligible unshield TXIDs still to resolve: those already recorded plus those not Valid.
+/// Unknown statuses (`valid` is `None`) keep every eligible TXID.
+fn unresolved_sender_unshield_txids(
+    eligible: &BTreeSet<FixedBytes<32>>,
+    stored: &BTreeSet<FixedBytes<32>>,
+    valid: Option<&BTreeSet<FixedBytes<32>>>,
+) -> BTreeSet<FixedBytes<32>> {
+    eligible
+        .iter()
+        .copied()
+        .filter(|txid| stored.contains(txid) || valid.is_none_or(|valid| !valid.contains(txid)))
+        .collect()
+}
+
+fn sender_unshield_railgun_txid(transaction: &QualifiedSenderTransaction) -> FixedBytes<32> {
+    let transaction = &transaction.public_row.transaction;
+    FixedBytes::from(
+        broadcaster_core::transact::compute_railgun_txid_parts(
+            &transaction.nullifiers,
+            &transaction.commitments,
+            transaction.bound_params_hash,
+        )
+        .to_be_bytes::<32>(),
+    )
+}
+
+/// Railgun TXIDs of qualified inner unshields whose POI proof can be built.
+///
+/// A shield-blocked wallet input makes no proof possible; this is not a refund-authorization
+/// decision. Qualification already resolved each row input to the unique wallet UTXO spent by
+/// the row's transaction, so the nullifier index finds exactly those inputs.
+fn eligible_sender_unshield_txids(
+    qualified: &[QualifiedSenderTransaction],
+    wallet_nullifiers: &WalletNullifierIndex<'_>,
+    active_list_keys: &[FixedBytes<32>],
+) -> BTreeSet<FixedBytes<32>> {
+    qualified
+        .iter()
+        .filter(|transaction| {
+            let row = &transaction.public_row.transaction;
+            row.has_unshield
+                && !row.nullifiers.iter().any(|nullifier| {
+                    u32::try_from(row.utxo_tree_in)
+                        .ok()
+                        .and_then(|input_tree| {
+                            wallet_nullifiers.input_for(
+                                input_tree,
+                                *nullifier,
+                                row.transaction_hash,
+                            )
+                        })
+                        .is_some_and(|wallet_utxo| {
+                            poi_shield_blocked_on_any_list(&wallet_utxo.utxo.poi, active_list_keys)
+                        })
+                })
+        })
+        .map(sender_unshield_railgun_txid)
+        .collect()
+}
+
+/// Unshield TXIDs Valid on every active list in the local corpus; `None` when the read failed.
+pub(super) async fn sender_unshield_valid_txids(
+    request: &OutputPoiRecoveryRequest<'_>,
+    proof_source_resolution: &OutputPoiProofSourceResolution,
+    txids: &BTreeSet<FixedBytes<32>>,
+) -> Option<BTreeSet<FixedBytes<32>>> {
+    if txids.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let OutputPoiProofSourceResolution::Local { corpus, .. } = proof_source_resolution else {
+        return None;
+    };
+    let datas = txids
+        .iter()
+        .map(|txid| BlindedCommitmentData::unshield(*txid))
+        .collect::<Vec<_>>();
+    let _revision_fence = corpus.revision_read_fence().await;
+    corpus_valid_blinded_commitments(
+        corpus,
+        request.cfg.chain.chain_id,
+        request.active_list_keys,
+        &datas,
+    )
+    .await
+    .ok()
+}
+
+struct QualifiedSenderCandidate {
+    qualified: Vec<QualifiedSenderTransaction>,
+    public_data_fence: SenderCandidatePublicDataFence,
+    data_epoch: PublicDataPlaneEpoch,
+}
+
+/// Why public rows do not yet qualify a candidate; each maps to one report category.
+#[derive(Debug, Clone, Copy)]
+enum SenderCandidateQualificationPending {
+    AwaitingPublicTxidData,
+    Retrying,
+    NeedsAttention,
+}
+
+impl SenderCandidateQualificationPending {
+    const fn record(self, report: &mut SenderCandidateRecoveryReport, count: u64) {
+        let counter = match self {
+            Self::AwaitingPublicTxidData => &mut report.awaiting_public_txid_data,
+            Self::Retrying => &mut report.retrying,
+            Self::NeedsAttention => &mut report.needs_attention,
+        };
+        *counter = counter.saturating_add(count);
+    }
+}
+
+async fn qualify_sender_candidate_from_public_rows(
+    request: &OutputPoiRecoveryRequest<'_>,
+    candidate: &SenderTransactionCandidate,
+    cache_key: &PublicTxidCacheKey,
+    refreshed: &mut Option<bool>,
+) -> Result<QualifiedSenderCandidate, SenderCandidateQualificationPending> {
+    let mut data_epoch = request.public_data_plane.current_epoch();
+    let mut rows = request
+        .public_data_plane
+        .txid_transactions_for_outer_hash_with_authority(cache_key, candidate.source.tx_hash);
+    if matches!(&rows, Ok((rows, _)) if rows.is_empty())
+        || matches!(&rows, Err(TxidPublicCacheError::CacheNotReady { .. }))
+    {
+        if !refresh_sender_candidate_public_txid_cache(request, cache_key, refreshed).await {
+            return Err(SenderCandidateQualificationPending::Retrying);
+        }
+        data_epoch = request.public_data_plane.current_epoch();
+        rows = request
+            .public_data_plane
+            .txid_transactions_for_outer_hash_with_authority(cache_key, candidate.source.tx_hash);
+    }
+    let (mut rows, mut authority) = match rows {
+        Ok((rows, _authority)) if rows.is_empty() => {
+            return Err(SenderCandidateQualificationPending::AwaitingPublicTxidData);
+        }
+        Ok((rows, authority)) => (rows, authority),
+        Err(TxidPublicCacheError::CacheNotReady { .. }) => {
+            return Err(SenderCandidateQualificationPending::AwaitingPublicTxidData);
+        }
+        Err(_) => return Err(SenderCandidateQualificationPending::Retrying),
+    };
+    let mut qualification = qualify_sender_candidate(
+        candidate,
+        request.wallet_utxos,
+        &request.cfg.scan_keys,
+        rows.clone(),
+    );
+    if matches!(qualification, Ok(None)) && refreshed.is_none() {
+        if !refresh_sender_candidate_public_txid_cache(request, cache_key, refreshed).await {
+            return Err(SenderCandidateQualificationPending::Retrying);
+        }
+        data_epoch = request.public_data_plane.current_epoch();
+        (rows, authority) = match request
+            .public_data_plane
+            .txid_transactions_for_outer_hash_with_authority(cache_key, candidate.source.tx_hash)
+        {
+            Ok((rows, authority)) if !rows.is_empty() => (rows, authority),
+            Ok(_) | Err(TxidPublicCacheError::CacheNotReady { .. }) => {
+                return Err(SenderCandidateQualificationPending::AwaitingPublicTxidData);
+            }
+            Err(_) => return Err(SenderCandidateQualificationPending::Retrying),
+        };
+        qualification = qualify_sender_candidate(
+            candidate,
+            request.wallet_utxos,
+            &request.cfg.scan_keys,
+            rows.clone(),
+        );
+    }
+    let qualified = match qualification {
+        Ok(Some(qualified)) => qualified,
+        Ok(None) => {
+            debug!(
+                chain_id = request.cfg.chain.chain_id,
+                category = "public_rows_do_not_cover_candidate",
+                "sender candidate recovery qualification incomplete"
+            );
+            return Err(SenderCandidateQualificationPending::AwaitingPublicTxidData);
+        }
+        Err(()) => {
+            warn!(
+                chain_id = request.cfg.chain.chain_id,
+                category = "candidate_shape_or_wallet_association_mismatch",
+                "sender candidate recovery qualification failed"
+            );
+            return Err(SenderCandidateQualificationPending::NeedsAttention);
+        }
+    };
+    Ok(QualifiedSenderCandidate {
+        qualified,
+        public_data_fence: SenderCandidatePublicDataFence::new(
+            request.public_data_plane,
+            cache_key.clone(),
+            data_epoch,
+            rows,
+            authority,
+        ),
+        data_epoch,
+    })
+}
+
+pub(super) struct SenderUnshieldInputs<'a> {
+    pub(super) candidate: SenderTransactionCandidate,
+    /// Eligible unshield TXIDs of the qualified rows.
+    pub(super) eligible: BTreeSet<FixedBytes<32>>,
+    /// Eligible TXIDs already Valid locally; `None` when the status read failed.
+    pub(super) valid: Option<BTreeSet<FixedBytes<32>>>,
+    pub(super) qualified: &'a [QualifiedSenderTransaction],
+    /// Spent wallet UTXOs of this pass, indexed by input tree and nullifier.
+    pub(super) wallet_nullifiers: &'a WalletNullifierIndex<'a>,
+    pub(super) public_data_fence: &'a SenderCandidatePublicDataFence,
+    pub(super) proof_source_resolution: &'a OutputPoiProofSourceResolution,
+    /// Proofs built during materialization, keyed by TXID, with their TXID merkleroot index.
+    pub(super) cached_proofs: BTreeMap<FixedBytes<32>, (u64, PreTransactionPoiMap)>,
+}
+
+/// Reconcile, complete, and submit a candidate's unshield work.
+///
+/// A submission acknowledgement never completes anything; only a later local Valid read does.
+pub(super) async fn process_sender_candidate_unshields(
+    request: &OutputPoiRecoveryRequest<'_>,
+    report: &mut SenderCandidateRecoveryReport,
+    attempts: &SenderUnshieldAttempts,
+    live: &mut BTreeSet<FixedBytes<32>>,
+    inputs: SenderUnshieldInputs<'_>,
+) {
+    let SenderUnshieldInputs {
+        mut candidate,
+        eligible,
+        valid,
+        qualified,
+        wallet_nullifiers,
+        public_data_fence,
+        proof_source_resolution,
+        mut cached_proofs,
+    } = inputs;
+    let candidate_id = candidate.semantic_id();
+    let stored = sender_candidate_unshield_txids(&candidate);
+    let eligible_count = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
+    let Some(valid) = valid else {
+        let unknown = eligible.union(&stored).count();
+        report.retrying = report
+            .retrying
+            .saturating_add(u64::try_from(unknown).unwrap_or(u64::MAX));
+        return;
+    };
+    let target = unresolved_sender_unshield_txids(&eligible, &stored, Some(&valid));
+    live.extend(target.iter().copied());
+    if target != stored {
+        let outputs_handed_off = candidate
+            .unshield
+            .as_ref()
+            .is_some_and(|unshield| unshield.outputs_handed_off);
+        let Ok(replacement) = sender_candidate_with_remaining_unshield(
+            &candidate,
+            target.iter().copied().collect(),
+            outputs_handed_off,
+        ) else {
+            report.needs_attention = report.needs_attention.saturating_add(eligible_count);
+            return;
+        };
+        match apply_poi_private_delta(
+            request.authority,
+            request.db,
+            request.cache_store,
+            request.cfg,
+            OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate {
+                expected_candidate: candidate,
+                public_data_fence: public_data_fence.clone(),
+                replacement: replacement.clone(),
+            },
+        )
+        .await
+        {
+            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {}
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => return,
+            Err(_) => {
+                report.needs_attention = report.needs_attention.saturating_add(eligible_count);
+                return;
+            }
+        }
+        let Some(replacement) = replacement else {
+            report.expected_candidates.remove(&candidate_id);
+            return;
+        };
+        track_sender_candidate(report, &replacement);
+        candidate = replacement;
+    }
+
+    let completed = target
+        .intersection(&valid)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if !completed.is_empty() {
+        // `valid` is nonempty only after a read from this local corpus.
+        let OutputPoiProofSourceResolution::Local { corpus, .. } = proof_source_resolution else {
+            return;
+        };
+        let Some(unshield) = candidate.unshield.as_ref() else {
+            return;
+        };
+        let Ok(next) = sender_candidate_after_unshield_validation(&candidate, unshield, &completed)
+        else {
+            report.needs_attention = report.needs_attention.saturating_add(eligible_count);
+            return;
+        };
+        match apply_poi_private_delta(
+            request.authority,
+            request.db,
+            request.cache_store,
+            request.cfg,
+            OwnedPoiPrivateDelta::SenderCandidateUnshieldValidated {
+                expected_candidate: candidate,
+                validated_txids: completed.iter().copied().collect(),
+                corpus: corpus.clone(),
+            },
+        )
+        .await
+        {
+            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                report.unshields_validated =
+                    report.unshields_validated.saturating_add(completed.len());
+            }
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => return,
+            Err(_) => {
+                report.needs_attention = report.needs_attention.saturating_add(eligible_count);
+                return;
+            }
+        }
+        let Some(next) = next else {
+            report.expected_candidates.remove(&candidate_id);
+            return;
+        };
+        track_sender_candidate(report, &next);
+        candidate = next;
+    }
+
+    let mut submitted = 0_u64;
+    let mut waiting = 0_u64;
+    for txid in target.difference(&valid).copied() {
+        if let Some(outcome) = attempts.waiting(txid, Instant::now(), request.force_retry) {
+            waiting = waiting.saturating_add(1);
+            match outcome {
+                SenderUnshieldAttemptOutcome::Submitted => {
+                    report.unshield_awaiting_validation =
+                        report.unshield_awaiting_validation.saturating_add(1);
+                }
+                SenderUnshieldAttemptOutcome::Retrying => {
+                    report.retrying = report.retrying.saturating_add(1);
+                }
+                SenderUnshieldAttemptOutcome::NeedsAttention => {
+                    report.needs_attention = report.needs_attention.saturating_add(1);
+                }
+            }
+            continue;
+        }
+        let (txid_merkleroot_index, pre_transaction_pois) =
+            if let Some(cached) = cached_proofs.remove(&txid) {
+                cached
+            } else {
+                let (Some(spending_public_key), Some(prover)) = (
+                    request.cfg.spending_public_key,
+                    request.cfg.poi_recovery_prover.as_ref(),
+                ) else {
+                    report.retrying = report.retrying.saturating_add(1);
+                    continue;
+                };
+                let Some(transaction) = qualified.iter().find(|transaction| {
+                    transaction.public_row.transaction.has_unshield
+                        && sender_unshield_railgun_txid(transaction) == txid
+                }) else {
+                    report.awaiting_public_txid_data =
+                        report.awaiting_public_txid_data.saturating_add(1);
+                    continue;
+                };
+                match prove_sender_transaction(
+                    request,
+                    &candidate,
+                    transaction,
+                    wallet_nullifiers,
+                    spending_public_key,
+                    prover,
+                    proof_source_resolution,
+                )
+                .await
+                {
+                    Ok(Some(proved)) => (
+                        proved.txid_data.poi_data.txid_merkleroot_index,
+                        proved.pre_transaction_pois,
+                    ),
+                    Ok(None) => continue,
+                    Err(failure) => {
+                        record_sender_unshield_failure(report, attempts, txid, &failure);
+                        continue;
+                    }
+                }
+            };
+        match submit_sender_unshield_transaction_pois(
+            request,
+            &candidate,
+            public_data_fence,
+            txid_merkleroot_index,
+            &pre_transaction_pois,
+        )
+        .await
+        {
+            Ok(true) => {
+                attempts.record(
+                    txid,
+                    SenderUnshieldAttemptOutcome::Submitted,
+                    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+                );
+                report.unshield_awaiting_validation =
+                    report.unshield_awaiting_validation.saturating_add(1);
+                submitted = submitted.saturating_add(1);
+            }
+            Ok(false) => report.retrying = report.retrying.saturating_add(1),
+            Err(failure) => record_sender_unshield_failure(report, attempts, txid, &failure),
+        }
+    }
+    debug!(
+        chain_id = request.cfg.chain.chain_id,
+        eligible = eligible.len(),
+        unresolved = target.len(),
+        validated = completed.len(),
+        submitted,
+        waiting,
+        "sender candidate unshield work processed"
+    );
+}
+
+fn record_sender_unshield_failure(
+    report: &mut SenderCandidateRecoveryReport,
+    attempts: &SenderUnshieldAttempts,
+    txid: FixedBytes<32>,
+    failure: &RecoveryFailure,
+) {
+    warn!(
+        status = ?failure.status,
+        retryable = failure.retry_after.is_some(),
+        failure_category = failure.category,
+        "sender candidate unshield proof submission failed"
+    );
+    if let Some(retry_after) = failure.retry_after {
+        attempts.record(txid, SenderUnshieldAttemptOutcome::Retrying, retry_after);
+        report.retrying = report.retrying.saturating_add(1);
+    } else {
+        attempts.record(
+            txid,
+            SenderUnshieldAttemptOutcome::NeedsAttention,
+            OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+        );
+        report.needs_attention = report.needs_attention.saturating_add(1);
+    }
 }
 
 struct PreparedSenderCandidateMaterialization {
@@ -916,16 +1647,140 @@ struct PreparedSenderCandidateMaterialization {
         Option<OutputPoiRecoveryRecord>,
     )>,
     external_valid_substitutes: Vec<Utxo>,
+    /// Proofs of rows in the requested unshield work, reused for their unshield submission.
+    unshield_proofs: BTreeMap<FixedBytes<32>, (u64, PreTransactionPoiMap)>,
+}
+
+struct ProvedSenderTransaction {
+    recovery_chunk: RecoveryChunk,
+    txid_data: RecoveredOutputTxidData,
+    pre_transaction_pois: PreTransactionPoiMap,
+}
+
+/// Prove one qualified sender transaction from the local proof source.
+///
+/// `Ok(None)` means the candidate or proof source went stale and nothing was proved.
+async fn prove_sender_transaction(
+    request: &OutputPoiRecoveryRequest<'_>,
+    candidate: &SenderTransactionCandidate,
+    qualified: &QualifiedSenderTransaction,
+    wallet_nullifiers: &WalletNullifierIndex<'_>,
+    spending_public_key: [U256; 2],
+    prover: &railgun_wallet::prover::ProverService,
+    proof_source_resolution: &OutputPoiProofSourceResolution,
+) -> Result<Option<ProvedSenderTransaction>, RecoveryFailure> {
+    if !sender_candidate_still_current(
+        request.authority,
+        request.cache_store,
+        request.cfg,
+        candidate,
+    )
+    .await
+    {
+        return Ok(None);
+    }
+    let recovery_chunk = build_recovery_chunk_for_public_transaction(
+        qualified.output_start_global,
+        qualified.output_notes.clone(),
+        candidate.source.tx_hash,
+        wallet_nullifiers,
+        &qualified.public_row.transaction,
+        &request.forest,
+        request.active_list_keys,
+        spending_public_key,
+        &request.cfg.scan_keys,
+        Some(qualified.txid_index),
+    )
+    .await?;
+    if !sender_candidate_still_current(
+        request.authority,
+        request.cache_store,
+        request.cfg,
+        candidate,
+    )
+    .await
+    {
+        return Ok(None);
+    }
+    let OutputPoiProofSourceResolution::Local { source, .. } = proof_source_resolution else {
+        return Ok(None);
+    };
+    preflight_local_recovery_chunk_input_proofs(
+        Some(source),
+        request.cfg,
+        &recovery_chunk,
+        request.active_list_keys,
+    )
+    .await?;
+    let txid_data = recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
+        public_data_plane: request.public_data_plane,
+        cfg: request.cfg,
+        poi_client: request.poi_client,
+        http_client: request.http_client,
+        indexed_artifact_source: request.indexed_artifact_source,
+        recovery_chunk: &recovery_chunk,
+        started: Instant::now(),
+    })
+    .await?;
+    debug!(
+        chain_id = request.cfg.chain.chain_id,
+        "sender candidate proof generation started"
+    );
+    let proof_generation_started = Instant::now();
+    let pre_transaction_pois = generate_sender_candidate_post_transaction_pois(
+        PostTransactionPoiGenerationRequest {
+            chunk: &recovery_chunk.chunk,
+            txid_data: &txid_data.poi_data,
+            chain_type: EVM_CHAIN_TYPE,
+            chain_id: request.cfg.chain.chain_id,
+            txid_version: Some(DEFAULT_TXID_VERSION),
+            required_poi_list_keys: request.active_list_keys,
+            proof_source: source,
+            prover,
+            verify_proof: OUTPUT_POI_RECOVERY_VERIFY_PROOF,
+        },
+        SENDER_CANDIDATE_PROOF_GENERATION_TIMEOUT,
+    )
+    .await?;
+    debug!(
+        chain_id = request.cfg.chain.chain_id,
+        elapsed_ms = proof_generation_started.elapsed().as_millis(),
+        "sender candidate proof generation complete"
+    );
+    if pre_transaction_pois
+        .values()
+        .flat_map(|per_leaf| per_leaf.values())
+        .any(|poi| {
+            !super::saved_poi_compatibility::saved_poi_is_compatible(
+                poi,
+                Some((
+                    qualified.public_row.transaction.nullifiers.len(),
+                    qualified.public_row.transaction.commitments.len(),
+                )),
+            )
+        })
+    {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::ProofGenerationFailed,
+            "generated proof does not match the current verifier",
+            OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+        ));
+    }
+    Ok(Some(ProvedSenderTransaction {
+        recovery_chunk,
+        txid_data,
+        pre_transaction_pois,
+    }))
 }
 
 async fn prepare_sender_candidate_materialization(
     request: &OutputPoiRecoveryRequest<'_>,
     candidate: &SenderTransactionCandidate,
-    qualified: Vec<QualifiedSenderTransaction>,
+    qualified: &[QualifiedSenderTransaction],
     spending_public_key: [U256; 2],
     prover: &railgun_wallet::prover::ProverService,
-    public_data_fence: &SenderCandidatePublicDataFence,
-    proof_source_resolution: OutputPoiProofSourceResolution,
+    proof_source_resolution: &OutputPoiProofSourceResolution,
+    unshield_work: &BTreeSet<FixedBytes<32>>,
 ) -> Result<Option<PreparedSenderCandidateMaterialization>, RecoveryFailure> {
     if !sender_candidate_still_current(
         request.authority,
@@ -937,10 +1792,12 @@ async fn prepare_sender_candidate_materialization(
     {
         return Ok(None);
     }
-    let proof_source: &dyn PoiMerkleProofSource = match &proof_source_resolution {
-        OutputPoiProofSourceResolution::Local { source, .. } => source,
-        OutputPoiProofSourceResolution::Unavailable => return Ok(None),
-    };
+    if matches!(
+        proof_source_resolution,
+        OutputPoiProofSourceResolution::Unavailable
+    ) {
+        return Ok(None);
+    }
     let wallet_nullifiers = WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys);
     let old_contexts = request
         .cache_store
@@ -1021,108 +1878,28 @@ async fn prepare_sender_candidate_materialization(
     let mut recovery_updates = Vec::new();
     let mut owned_substitutes = Vec::new();
     let mut proof_outputs = BTreeSet::new();
+    let mut unshield_proofs = BTreeMap::new();
     for qualified in qualified {
         if qualified.outputs.is_empty() {
-            return Ok(None);
+            continue;
         }
-        if !sender_candidate_still_current(
-            request.authority,
-            request.cache_store,
-            request.cfg,
+        let Some(ProvedSenderTransaction {
+            recovery_chunk,
+            txid_data,
+            pre_transaction_pois,
+        }) = prove_sender_transaction(
+            request,
             candidate,
-        )
-        .await
-        {
-            return Ok(None);
-        }
-        let recovery_chunk = build_recovery_chunk_for_public_transaction(
-            qualified.output_start_global,
-            qualified.output_notes,
-            candidate.source.tx_hash,
+            qualified,
             &wallet_nullifiers,
-            &qualified.public_row.transaction,
-            &request.forest,
-            request.active_list_keys,
             spending_public_key,
-            &request.cfg.scan_keys,
-            Some(qualified.txid_index),
+            prover,
+            proof_source_resolution,
         )
-        .await?;
-        if !sender_candidate_still_current(
-            request.authority,
-            request.cache_store,
-            request.cfg,
-            candidate,
-        )
-        .await
-        {
-            return Ok(None);
-        }
-        let OutputPoiProofSourceResolution::Local { source, .. } = &proof_source_resolution else {
+        .await?
+        else {
             return Ok(None);
         };
-        preflight_local_recovery_chunk_input_proofs(
-            Some(source),
-            request.cfg,
-            &recovery_chunk,
-            request.active_list_keys,
-        )
-        .await?;
-        let txid_data =
-            recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
-                public_data_plane: request.public_data_plane,
-                cfg: request.cfg,
-                poi_client: request.poi_client,
-                http_client: request.http_client,
-                indexed_artifact_source: request.indexed_artifact_source,
-                recovery_chunk: &recovery_chunk,
-                started: Instant::now(),
-            })
-            .await?;
-        debug!(
-            chain_id = request.cfg.chain.chain_id,
-            "sender candidate proof generation started"
-        );
-        let proof_generation_started = Instant::now();
-        let pre_transaction_pois = generate_sender_candidate_post_transaction_pois(
-            PostTransactionPoiGenerationRequest {
-                chunk: &recovery_chunk.chunk,
-                txid_data: &txid_data.poi_data,
-                chain_type: EVM_CHAIN_TYPE,
-                chain_id: request.cfg.chain.chain_id,
-                txid_version: Some(DEFAULT_TXID_VERSION),
-                required_poi_list_keys: request.active_list_keys,
-                proof_source,
-                prover,
-                verify_proof: OUTPUT_POI_RECOVERY_VERIFY_PROOF,
-            },
-            SENDER_CANDIDATE_PROOF_GENERATION_TIMEOUT,
-        )
-        .await?;
-        debug!(
-            chain_id = request.cfg.chain.chain_id,
-            elapsed_ms = proof_generation_started.elapsed().as_millis(),
-            "sender candidate proof generation complete"
-        );
-        if pre_transaction_pois
-            .values()
-            .flat_map(|per_leaf| per_leaf.values())
-            .any(|poi| {
-                !super::saved_poi_compatibility::saved_poi_is_compatible(
-                    poi,
-                    Some((
-                        qualified.public_row.transaction.nullifiers.len(),
-                        qualified.public_row.transaction.commitments.len(),
-                    )),
-                )
-            })
-        {
-            return Err(RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::ProofGenerationFailed,
-                "generated proof does not match the current verifier",
-                OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
-            ));
-        }
         let mut transaction_proof_outputs = None;
         for list_key in request.active_list_keys {
             let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
@@ -1154,18 +1931,17 @@ async fn prepare_sender_candidate_materialization(
         {
             return Ok(None);
         }
-        if !replacing
-            && qualified.public_row.transaction.has_unshield
-            && !submit_sender_unshield_transaction_pois(
-                request,
-                candidate,
-                public_data_fence,
-                txid_data.poi_data.txid_merkleroot_index,
-                &pre_transaction_pois,
-            )
-            .await?
-        {
-            return Ok(None);
+        if qualified.public_row.transaction.has_unshield {
+            let txid = sender_unshield_railgun_txid(qualified);
+            if unshield_work.contains(&txid) {
+                unshield_proofs.insert(
+                    txid,
+                    (
+                        txid_data.poi_data.txid_merkleroot_index,
+                        pre_transaction_pois.clone(),
+                    ),
+                );
+            }
         }
         for output in &qualified.outputs {
             let expected = ExpectedWalletOutput::new(&WalletUtxo::new(output.clone()));
@@ -1246,6 +2022,7 @@ async fn prepare_sender_candidate_materialization(
         expected_corpus,
         replacement_group,
         external_valid_substitutes,
+        unshield_proofs,
     }))
 }
 
@@ -1387,7 +2164,8 @@ fn qualify_sender_candidate(
             .len()
             .checked_sub(usize::from(transaction.has_unshield))
             .ok_or(())?;
-        if private_output_count == 0 {
+        // A row with no private outputs qualifies only for its unshield.
+        if private_output_count == 0 && !transaction.has_unshield {
             return Err(());
         }
         let output_start_global = transaction.output_start_global();
@@ -1752,7 +2530,7 @@ mod tests {
             &candidate,
             &[first_input.clone(), second_input.clone()],
             &keys,
-            vec![first_row, foreign_row, second_row],
+            vec![first_row.clone(), foreign_row, second_row.clone()],
         )
         .expect("complete rows are valid")
         .expect("all candidate evidence is covered");
@@ -1789,6 +2567,49 @@ mod tests {
             .collect()
         );
         assert!(!qualified.iter().any(|chunk| chunk.txid_index == 9));
+
+        // Two inner unshields in one outer transaction are each keyed by their own TXID.
+        let unshield_rows = [first_row, second_row].map(|mut row| {
+            row.transaction.has_unshield = true;
+            row.transaction
+                .commitments
+                .push(U256::from(0x7a_u64 + row.txid_index));
+            row
+        });
+        let wallet_utxos = [first_input, second_input];
+        let qualified =
+            qualify_sender_candidate(&candidate, &wallet_utxos, &keys, unshield_rows.to_vec())
+                .expect("unshield rows are valid")
+                .expect("unshield rows cover the candidate");
+        let list_key = FixedBytes::from([0x7b; 32]);
+        let both = qualified
+            .iter()
+            .map(sender_unshield_railgun_txid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            eligible_sender_unshield_txids(
+                &qualified,
+                &WalletNullifierIndex::new(&wallet_utxos, &keys),
+                &[list_key],
+            ),
+            both
+        );
+        let mut blocked = wallet_utxos;
+        blocked[1]
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::ShieldBlocked);
+        assert_eq!(
+            eligible_sender_unshield_txids(
+                &qualified,
+                &WalletNullifierIndex::new(&blocked, &keys),
+                &[list_key],
+            ),
+            BTreeSet::from([sender_unshield_railgun_txid(&qualified[0])]),
+            "a Shield-blocked input removes only its own row's unshield"
+        );
     }
 
     #[test]
@@ -1800,9 +2621,55 @@ mod tests {
                 .is_none()
         );
 
-        let mut wrong_output = row;
+        let mut wrong_output = row.clone();
         wrong_output.transaction.commitments[0] = U256::from(123);
-        assert!(qualify_sender_candidate(&candidate, &[input], &keys, vec![wrong_output]).is_err());
+        assert!(
+            qualify_sender_candidate(
+                &candidate,
+                std::slice::from_ref(&input),
+                &keys,
+                vec![wrong_output]
+            )
+            .is_err()
+        );
+
+        // A full unshield qualifies a spend-only candidate with no private outputs.
+        let mut spend_only = candidate.clone();
+        spend_only.outputs.clear();
+        let mut unshield_only = row.clone();
+        unshield_only.transaction.commitments = vec![U256::from(0x7a)];
+        unshield_only.transaction.has_unshield = true;
+        let qualified = qualify_sender_candidate(
+            &spend_only,
+            std::slice::from_ref(&input),
+            &keys,
+            vec![unshield_only.clone()],
+        )
+        .expect("unshield-only row is well formed")
+        .expect("unshield-only row covers the spend-only candidate");
+        assert_eq!(qualified.len(), 1);
+        assert!(qualified[0].outputs.is_empty());
+
+        let mut no_outputs = unshield_only;
+        no_outputs.transaction.commitments.clear();
+        no_outputs.transaction.has_unshield = false;
+        assert!(
+            qualify_sender_candidate(
+                &spend_only,
+                std::slice::from_ref(&input),
+                &keys,
+                vec![no_outputs]
+            )
+            .is_err(),
+            "a row with neither private outputs nor an unshield is malformed"
+        );
+
+        let mut unknown_note = candidate;
+        unknown_note.outputs[0].note = None;
+        assert!(
+            qualify_sender_candidate(&unknown_note, &[input], &keys, vec![row]).is_err(),
+            "a private commitment without its sender note is malformed evidence"
+        );
     }
 
     #[test]
@@ -1841,11 +2708,34 @@ mod tests {
 
         let classification = classify_sender_candidate_for_local_retirement(
             &mixed,
-            &[input.clone(), owned_utxo],
+            &[input.clone(), owned_utxo.clone()],
             &keys,
         )
         .expect("exact mixed candidate classification");
         assert_eq!(classification.external_outputs.len(), 1);
+
+        let mut owned_only = mixed.clone();
+        owned_only
+            .outputs
+            .retain(|output| output.commitment == owned_output.commitment);
+        let classification = classify_sender_candidate_for_local_retirement(
+            &owned_only,
+            &[input.clone(), owned_utxo.clone()],
+            &keys,
+        )
+        .expect("an all-owned candidate classifies for local retirement");
+        assert!(classification.external_outputs.is_empty());
+        let mut spend_only = mixed.clone();
+        spend_only.outputs.clear();
+        assert!(
+            classify_sender_candidate_for_local_retirement(
+                &spend_only,
+                &[input.clone(), owned_utxo],
+                &keys,
+            )
+            .is_none(),
+            "a candidate without outputs keeps the no-private-output route"
+        );
 
         let mut extra_spend = input;
         extra_spend.utxo.position += 1;

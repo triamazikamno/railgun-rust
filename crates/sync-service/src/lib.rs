@@ -42,7 +42,8 @@ pub use public_cache::{
 pub use sender_candidate::{
     SENDER_TRANSACTION_CANDIDATE_FORMAT_VERSION, SenderTransactionCandidate,
     SenderTransactionCandidateError, SenderTransactionCandidateOutput,
-    SenderTransactionCandidateSpend, sender_transaction_candidate_rewind_ids,
+    SenderTransactionCandidateSpend, SenderTransactionCandidateUnshield,
+    sender_transaction_candidate_rewind_ids,
 };
 pub use trustless_artifacts::{VerifiedCidError, fetch_verified_cid, fetch_verified_cid_with_pool};
 pub use types::{

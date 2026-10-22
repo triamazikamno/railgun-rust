@@ -86,6 +86,18 @@ pub(super) async fn corpus_valid_outputs(
         .copied()
         .map(super::BlindedCommitmentData::transact)
         .collect::<Vec<_>>();
+    corpus_valid_blinded_commitments(corpus, chain_id, list_keys, &data)
+        .await
+        .ok()
+}
+
+/// Blinded commitments of `data` Valid on every list in `list_keys` in the local corpus.
+pub(super) async fn corpus_valid_blinded_commitments(
+    corpus: &super::PublicPoiCorpusHandle,
+    chain_id: u64,
+    list_keys: &[FixedBytes<32>],
+    data: &[super::BlindedCommitmentData],
+) -> Result<BTreeSet<FixedBytes<32>>, super::PoiError> {
     let statuses = corpus
         .status_reader()
         .pois_per_list(
@@ -93,23 +105,20 @@ pub(super) async fn corpus_valid_outputs(
             super::EVM_CHAIN_TYPE,
             chain_id,
             list_keys,
-            &data,
+            data,
         )
-        .await
-        .ok()?;
-    Some(
-        outputs
-            .iter()
-            .copied()
-            .filter(|output| {
-                statuses.get(output).is_some_and(|per_list| {
-                    list_keys
-                        .iter()
-                        .all(|list_key| per_list.get(list_key) == Some(&super::PoiStatus::Valid))
-                })
+        .await?;
+    Ok(data
+        .iter()
+        .map(|data| data.blinded_commitment)
+        .filter(|blinded| {
+            statuses.get(blinded).is_some_and(|per_list| {
+                list_keys
+                    .iter()
+                    .all(|list_key| per_list.get(list_key) == Some(&super::PoiStatus::Valid))
             })
-            .collect(),
-    )
+        })
+        .collect())
 }
 
 pub(super) async fn corpus_valid_outputs_by_list(

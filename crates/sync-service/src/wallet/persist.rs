@@ -7,9 +7,9 @@ use super::{
     GlobalPoiPolicy, IndexedArtifactSourceConfig, Instant, MerkleForest, OutputPoiRecoveryRecord,
     OutputPoiRecoveryRequest, PendingOutputPoiContextRecord, PoiProxyFallback, PoiRpcClient,
     PublicPoiCorpusKey, RwLock, SenderCandidateRecoveryReport, SenderCandidateRecoveryRequest,
-    SenderTransactionCandidate, SystemTime, UNIX_EPOCH, UtxoCommitmentKind, WalletActorCommitToken,
-    WalletCacheError, WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletHandle,
-    WalletObservation, WalletPoiRefreshSelection, WalletPrivateCommit,
+    SenderTransactionCandidate, SenderUnshieldAttempts, SystemTime, UNIX_EPOCH, UtxoCommitmentKind,
+    WalletActorCommitToken, WalletCacheError, WalletCacheStore, WalletCheckpointMutation,
+    WalletConfig, WalletHandle, WalletObservation, WalletPoiRefreshSelection, WalletPrivateCommit,
     WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletPrivatePoiClients,
     WalletReadiness, WalletReadinessWaitError, WalletUtxo, WalletUtxoMutation, debug,
     log_local_poi_cache_unavailable, mark_valid_output_poi_recoveries,
@@ -380,6 +380,7 @@ pub(super) struct OutputPoiRecoveryRun<'a> {
     pub(super) private_poi: &'a WalletPrivatePoiClients,
     pub(super) active_list_keys: &'a [FixedBytes<32>],
     pub(super) force_retry: bool,
+    pub(super) unshield_attempts: &'a SenderUnshieldAttempts,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -489,6 +490,7 @@ impl OutputPoiRecoveryRun<'_> {
                     force_retry: self.force_retry,
                 },
                 candidates: sender_candidates,
+                unshield_attempts: self.unshield_attempts,
             })
             .await;
         candidate_report.merge_replay_report(replay_report);

@@ -37,8 +37,9 @@ use super::{
 mod public_cache;
 
 pub(super) use public_cache::{
-    PublicCacheTxidRecoveryRequest, PublicCacheTxidRefreshRequest, public_txid_rows_for_outer_hash,
-    recovered_output_txid_data_from_public_cache, refresh_public_txid_cache,
+    PublicCacheTxidRecoveryRequest, PublicCacheTxidRefreshRequest, RecoveredOutputTxidData,
+    public_txid_rows_for_outer_hash, recovered_output_txid_data_from_public_cache,
+    refresh_public_txid_cache,
 };
 
 #[derive(Clone, Copy)]
@@ -252,6 +253,15 @@ fn output_poi_statuses_are_recoverable_for_lists(
             .get(list_key)
             .is_none_or(|status| status.is_recoverable())
     })
+}
+
+pub(super) fn poi_shield_blocked_on_any_list(
+    poi: &UtxoPoiMetadata,
+    active_list_keys: &[FixedBytes<32>],
+) -> bool {
+    active_list_keys
+        .iter()
+        .any(|list_key| poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked))
 }
 
 pub(super) fn recoverable_output_poi_list_keys(
@@ -1562,9 +1572,7 @@ pub(super) async fn preflight_local_recovery_chunk_input_proofs(
         return Ok(());
     };
     if recovery_chunk.chunk.inputs.iter().any(|wallet_input| {
-        active_list_keys.iter().any(|list_key| {
-            wallet_input.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
-        })
+        poi_shield_blocked_on_any_list(&wallet_input.utxo.poi, active_list_keys)
     }) {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::InputPoiNotValid,
@@ -1642,9 +1650,7 @@ pub(super) fn output_poi_recovery_input_blinded_commitments(
         let inputs =
             wallet_inputs_for_transaction(candidate, wallet_nullifiers, transaction).ok()?;
         if inputs.iter().any(|wallet_utxo| {
-            active_list_keys.iter().any(|list_key| {
-                wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
-            })
+            poi_shield_blocked_on_any_list(&wallet_utxo.utxo.poi, active_list_keys)
         }) {
             return None;
         }
@@ -1982,11 +1988,10 @@ pub(super) async fn build_recovery_chunk_for_public_transaction(
         input_tree,
         &transaction.nullifiers,
     )?;
-    if inputs.iter().any(|wallet_utxo| {
-        active_list_keys.iter().any(|list_key| {
-            wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
-        })
-    }) {
+    if inputs
+        .iter()
+        .any(|wallet_utxo| poi_shield_blocked_on_any_list(&wallet_utxo.utxo.poi, active_list_keys))
+    {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::InputPoiNotValid,
             "one or more transaction inputs are shield-blocked",
@@ -2166,11 +2171,10 @@ fn build_recovery_chunk_for_transaction(
     };
     let inputs =
         wallet_inputs_for_source_transaction(source_tx_hash, wallet_nullifiers, transaction)?;
-    if inputs.iter().any(|wallet_utxo| {
-        active_list_keys.iter().any(|list_key| {
-            wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
-        })
-    }) {
+    if inputs
+        .iter()
+        .any(|wallet_utxo| poi_shield_blocked_on_any_list(&wallet_utxo.utxo.poi, active_list_keys))
+    {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::InputPoiNotValid,
             "one or more transaction inputs are shield-blocked",

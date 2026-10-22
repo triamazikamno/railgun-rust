@@ -33,6 +33,9 @@ input to one private output with the 3x3 circuit, one input to two private
 outputs for recovery-group tests, then one input to three private outputs
 plus an unshield with the 13x13 circuit. The latter protects
 the circuit-selection boundary where the unshield counts as a fourth output.
+A fourth shape, one input to an unshield only with no private outputs, uses the
+3x3 circuit and writes `ppoi_3x3_unshield_only.json`, which is a provisioned
+check only and is not retained here.
 Each proof passes zkey verification and the independently embedded core key;
 a changed transaction root fails verification.
 

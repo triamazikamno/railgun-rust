@@ -60,7 +60,7 @@ use crate::types::{
 };
 use crate::{
     SenderTransactionCandidate, SenderTransactionCandidateSpend,
-    sender_transaction_candidate_rewind_ids,
+    SenderTransactionCandidateUnshield, sender_transaction_candidate_rewind_ids,
 };
 
 mod actor;
@@ -143,7 +143,7 @@ pub(crate) use poi_sources::{LocalPoiStatusReader, PoiStatusReader};
 use private_remote::{WalletPrivatePoiClients, WalletPrivateRemoteError, WalletPrivateRemoteStale};
 use sender_candidate_recovery::{
     SenderCandidatePublicDataFence, SenderCandidateRecoveryReport, SenderCandidateRecoveryRequest,
-    materialize_sender_transaction_candidates,
+    SenderUnshieldAttempts, materialize_sender_transaction_candidates,
 };
 
 pub use crate::types::{WalletPendingOverlay, WalletPendingSpent};

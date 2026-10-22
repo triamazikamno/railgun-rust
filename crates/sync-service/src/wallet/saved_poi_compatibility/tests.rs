@@ -749,6 +749,7 @@ async fn source_block_reconstructs_consumed_exact_spend_candidate_and_preserves_
             },
             replacement_group: vec![(group.pending[0].clone(), Some(group.recoveries[0].clone()))],
             external_valid_substitutes: Vec::new(),
+            unshield: None,
         },
     )
     .await
@@ -914,6 +915,7 @@ async fn unresolved_group_replacement_is_atomic_and_rejects_stale_evidence() {
                 expected_corpus: corpus,
                 replacement_group: expected,
                 external_valid_substitutes: Vec::new(),
+                unshield: None,
             },
         )
         .await;
@@ -1137,6 +1139,7 @@ async fn external_siblings_keep_only_unresolved_output_and_list_targets() {
             } else {
                 vec![current.outputs[1].clone()]
             },
+            unshield: None,
         };
         let mut handle = test_wallet_handle(vec![current.input.clone()]);
         handle.cache_key = current.cfg.cache_key.clone();
@@ -1491,6 +1494,7 @@ async fn exact_spend_recovery_regenerates_previous_external_proof_and_submits_cu
         private_poi: &private_poi,
         active_list_keys: &lists,
         force_retry: false,
+        unshield_attempts: &SenderUnshieldAttempts::default(),
     })
     .recover_missing()
     .await;

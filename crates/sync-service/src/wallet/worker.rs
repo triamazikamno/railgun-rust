@@ -8,8 +8,8 @@ use super::{
     PendingOutputPoiTentativeCandidate, PendingOutputPoiTentativeLocalStatus, PendingWalletReset,
     PoiMaintenanceController, PoiMaintenanceError, PoiProxyFallback, PoiRemoteJobKey, PoiRpcClient,
     PoiStatusReader, PublicPoiCorpusHandle, PublicPoiCorpusKey, RwLock,
-    SenderCandidateRecoveryReport, SharedLogBatch, SyncProgressStage, SyncProgressUpdate,
-    WALLET_POI_REFRESH_INTERVAL, WalletActorCommitToken, WalletActorCredential,
+    SenderCandidateRecoveryReport, SenderUnshieldAttempts, SharedLogBatch, SyncProgressStage,
+    SyncProgressUpdate, WALLET_POI_REFRESH_INTERVAL, WalletActorCommitToken, WalletActorCredential,
     WalletActorLifecycleCell, WalletActorState, WalletBackfillApplyResult,
     WalletBackfillFinishResult, WalletBackfillGrant, WalletBackfillOwnerDisposition,
     WalletBackfillOwnerSignal, WalletBackfillRejectReason, WalletBackfillResetResult,
@@ -487,6 +487,7 @@ fn request_poi_maintenance(
         utxos: Arc::clone(utxos),
         active_poi_list_keys: active_poi_list_keys.to_vec(),
         force_output_poi_recovery: spec.force_output_poi_recovery,
+        unshield_attempts: controller.unshield_attempts(),
     }
     .spawn(poi_jobs);
     debug!(
@@ -497,6 +498,56 @@ fn request_poi_maintenance(
     );
     sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
     true
+}
+
+/// Refine a current candidate report against the unrefined base derived from durable records.
+///
+/// Returns `None` when the base cannot be derived; callers then treat the report as not current.
+fn current_ppoi_workflow_status_for_candidate_report(
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    published: crate::WalletPpoiWorkflowStatus,
+    report: &SenderCandidateRecoveryReport,
+) -> Option<crate::WalletPpoiWorkflowStatus> {
+    let base = wallet_ppoi_workflow_status_after_mutations(
+        cache_store,
+        cfg,
+        active_list_keys,
+        published.validation_revision,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .ok()?
+    .status;
+    Some(ppoi_workflow_status_with_candidate_report(base, report))
+}
+
+/// Refine a PPOI workflow status with a current sender candidate recovery report.
+///
+/// `status` must be an unrefined base derived from durable records: the refinement moves
+/// units between buckets, so applying it to an already refined status compounds the move.
+fn ppoi_workflow_status_with_candidate_report(
+    mut status: crate::WalletPpoiWorkflowStatus,
+    report: &SenderCandidateRecoveryReport,
+) -> crate::WalletPpoiWorkflowStatus {
+    // Submitted unshields wait on validation, not recovery.
+    let moved = report
+        .unshield_awaiting_validation
+        .min(status.awaiting_recovery);
+    status.awaiting_recovery -= moved;
+    status.awaiting_validation = status.awaiting_validation.saturating_add(moved);
+    status.awaiting_public_txid_data = report
+        .awaiting_public_txid_data
+        .min(status.awaiting_recovery);
+    status.awaiting_poi_data = report.awaiting_poi_data.min(status.awaiting_recovery);
+    status.retrying_recovery = report.retrying.min(status.awaiting_recovery);
+    status.recovery_needs_attention = report.needs_attention.min(status.awaiting_recovery);
+    status
 }
 
 /// Re-enter after remote job completion: clear phase, maybe start forced follow-up.
@@ -577,6 +628,8 @@ struct PoiMaintenanceJob {
     utxos: Arc<RwLock<Vec<WalletUtxo>>>,
     active_poi_list_keys: Vec<FixedBytes<32>>,
     force_output_poi_recovery: bool,
+    /// Actor-lifetime unshield attempt pacing, shared with the controller.
+    unshield_attempts: SenderUnshieldAttempts,
 }
 
 struct PoiMaintenanceOutcome {
@@ -749,6 +802,7 @@ impl PoiMaintenanceJob {
             private_poi: &private_poi,
             active_list_keys: &self.active_poi_list_keys,
             force_retry: self.force_output_poi_recovery,
+            unshield_attempts: &self.unshield_attempts,
         })
         .recover_missing()
         .await;
@@ -3137,7 +3191,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     .notify_changed_if(true, "poi_maintenance_remote_done")
                                     .await;
                             }
-                            let mut workflow_status = maintenance_observation.ppoi_workflow_status();
+                            let published = maintenance_observation.ppoi_workflow_status();
                             let candidate_report_is_current = cache_store
                                 .list_sender_transaction_candidates(
                                     cfg.chain.chain_id,
@@ -3147,27 +3201,27 @@ pub(crate) async fn prepare_wallet_worker(
                                     candidate_report.matches_candidates(&candidates)
                                         && candidate_report.matches_pending_contexts(cache_store.as_ref(), &cfg).unwrap_or(false)
                                 });
-                            if workflow_status.awaiting_recovery > 0
-                                && candidate_report_is_current
-                            {
-                                workflow_status.awaiting_public_txid_data = candidate_report
-                                    .awaiting_public_txid_data
-                                    .min(workflow_status.awaiting_recovery);
-                                workflow_status.awaiting_poi_data = candidate_report
-                                    .awaiting_poi_data
-                                    .min(workflow_status.awaiting_recovery);
-                                workflow_status.retrying_recovery = candidate_report
-                                    .retrying
-                                    .min(workflow_status.awaiting_recovery);
-                                workflow_status.recovery_needs_attention = candidate_report
-                                    .needs_attention
-                                    .min(workflow_status.awaiting_recovery);
-                            } else if workflow_status.awaiting_recovery == 0 {
-                                workflow_status.awaiting_public_txid_data = 0;
-                                workflow_status.awaiting_poi_data = 0;
-                                workflow_status.retrying_recovery = 0;
-                                workflow_status.recovery_needs_attention = 0;
-                            }
+                            let refined = if candidate_report_is_current {
+                                current_ppoi_workflow_status_for_candidate_report(
+                                    cache_store.as_ref(),
+                                    &cfg,
+                                    &active_poi_list_keys,
+                                    published,
+                                    &candidate_report,
+                                )
+                            } else {
+                                None
+                            };
+                            let workflow_status = refined.unwrap_or_else(|| {
+                                let mut status = published;
+                                if status.awaiting_recovery == 0 {
+                                    status.awaiting_public_txid_data = 0;
+                                    status.awaiting_poi_data = 0;
+                                    status.retrying_recovery = 0;
+                                    status.recovery_needs_attention = 0;
+                                }
+                                status
+                            });
                             maintenance_observation.publish_ppoi_workflow_status(workflow_status);
                             if let Some(error) = recovery_error.as_ref() {
                                 warn!(
@@ -3189,6 +3243,10 @@ pub(crate) async fn prepare_wallet_worker(
                                     candidate_report.covered_by_pending_contexts,
                                 candidate_stale_revision_skips =
                                     candidate_report.stale_revision_skips,
+                                candidate_unshield_awaiting_validation =
+                                    candidate_report.unshield_awaiting_validation,
+                                candidate_unshields_validated =
+                                    candidate_report.unshields_validated,
                                 candidate_report_is_current,
                                 forced_pending_attempts,
                                 submitted,
@@ -5543,6 +5601,98 @@ mod tests {
         cancel.cancel();
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn current_candidate_report_moves_submitted_unshields_and_attention_out_of_recovery() {
+        let root_dir = temp_db_root("wallet-candidate-report-refinement");
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let cfg = wallet_config();
+        // A spend-only wallet: both outstanding units are handed-off unshields.
+        for (position, byte) in [(7, 0xd4), (8, 0xd5)] {
+            let spent = test_wallet_utxo(105, position);
+            let candidate = crate::SenderTransactionCandidate::new(
+                cfg.chain.chain_id,
+                cfg.cache_key.clone(),
+                source(110, byte),
+                vec![crate::SenderTransactionCandidateSpend {
+                    tree: spent.utxo.tree,
+                    position: spent.utxo.position,
+                    commitment: spent.utxo.poi.commitment,
+                }],
+                Vec::new(),
+            )
+            .expect("sender candidate")
+            .with_unshield(Some(crate::SenderTransactionCandidateUnshield {
+                railgun_txids: vec![FixedBytes::from([byte; 32])],
+                outputs_handed_off: true,
+            }))
+            .expect("sender candidate with unshield work");
+            db.put_opaque_wallet_private_row(
+                &candidate.namespace(),
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &OpaqueWalletPrivateRow {
+                    row_id: candidate.row_identity(),
+                    payload: candidate.encode().expect("encode sender candidate"),
+                },
+            )
+            .expect("seed sender candidate");
+        }
+        let report = SenderCandidateRecoveryReport {
+            unshield_awaiting_validation: 1,
+            needs_attention: 1,
+            ..SenderCandidateRecoveryReport::default()
+        };
+        let active_list_keys = default_active_poi_list_keys();
+        let refined = current_ppoi_workflow_status_for_candidate_report(
+            &db,
+            &cfg,
+            &active_list_keys,
+            WalletPpoiWorkflowStatus::default(),
+            &report,
+        )
+        .expect("derive refined status");
+        assert_eq!(
+            refined,
+            WalletPpoiWorkflowStatus {
+                awaiting_recovery: 1,
+                awaiting_validation: 1,
+                recovery_needs_attention: 1,
+                ..WalletPpoiWorkflowStatus::default()
+            }
+        );
+        assert_eq!(refined.outstanding_count(), 2);
+        // A later pass without durable mutations refines the same base, not the published status.
+        assert_eq!(
+            current_ppoi_workflow_status_for_candidate_report(
+                &db,
+                &cfg,
+                &active_list_keys,
+                refined,
+                &report,
+            ),
+            Some(refined)
+        );
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+
+        let clamped = ppoi_workflow_status_with_candidate_report(
+            WalletPpoiWorkflowStatus {
+                awaiting_recovery: 1,
+                ..WalletPpoiWorkflowStatus::default()
+            },
+            &SenderCandidateRecoveryReport {
+                unshield_awaiting_validation: 3,
+                ..SenderCandidateRecoveryReport::default()
+            },
+        );
+        assert_eq!(
+            (clamped.awaiting_recovery, clamped.awaiting_validation),
+            (0, 1)
+        );
     }
 
     #[tokio::test]
@@ -8848,7 +8998,13 @@ mod tests {
                 note: Some(candidate_note),
             }],
         )
-        .expect("sender candidate");
+        .expect("sender candidate")
+        // Unshield work the rewind removes without completing any validation.
+        .with_unshield(Some(crate::SenderTransactionCandidateUnshield {
+            railgun_txids: vec![FixedBytes::from([0xd4; 32])],
+            outputs_handed_off: false,
+        }))
+        .expect("sender candidate with unshield work");
         db.put_opaque_wallet_private_row(
             &sender_candidate.namespace(),
             WalletPrivateRecordKind::SenderTransactionCandidate,
@@ -8909,6 +9065,10 @@ mod tests {
         .expect("spawn wallet worker");
         let workflow_initial = *handle.observation().ppoi_workflow_status();
         assert_eq!(workflow_initial.needs_attention, 2);
+        assert_eq!(
+            workflow_initial.awaiting_recovery, 2,
+            "the candidate's external output and its unshield TXID"
+        );
         assert_eq!(workflow_initial.validation_revision, 0);
 
         assert_eq!(

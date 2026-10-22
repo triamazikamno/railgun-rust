@@ -256,10 +256,10 @@ pub(super) fn sender_scan_candidate_inputs(
         }
     }
 
-    outputs_by_tx
+    spends_by_tx
         .into_iter()
-        .filter_map(|(tx_hash, mut outputs)| {
-            let (source, wallet_spends) = spends_by_tx.remove(&tx_hash)?;
+        .map(|(tx_hash, (source, wallet_spends))| {
+            let mut outputs = outputs_by_tx.remove(&tx_hash).unwrap_or_default();
             outputs.sort_by_key(|output| (output.tree, output.position, output.commitment));
             let outputs = outputs
                 .into_iter()
@@ -270,14 +270,11 @@ pub(super) fn sender_scan_candidate_inputs(
                     note: decrypt_sender_note(&output.ciphertext, output.commitment, scan_keys),
                 })
                 .collect::<Vec<_>>();
-            if !outputs.iter().any(|output| output.note.is_some()) {
-                return None;
-            }
-            Some(SenderScanCandidateInput {
+            SenderScanCandidateInput {
                 source,
                 wallet_spends,
                 outputs,
-            })
+            }
         })
         .collect()
 }
@@ -403,7 +400,7 @@ mod sender_scan_tests {
         ];
 
         let mut candidates = sender_scan_candidate_inputs(
-            &[wallet_utxo],
+            std::slice::from_ref(&wallet_utxo),
             keys.nullifying_key,
             &nullifier_sources,
             outputs,
@@ -434,6 +431,34 @@ mod sender_scan_tests {
             .expect("convert candidate record");
         assert_eq!(record.semantic_id(), matching_source.tx_hash);
         assert_eq!(record.outputs.len(), 2);
+
+        // A full unshield has no sender scan output; its exact wallet spend is still a candidate.
+        let mut spend_only = sender_scan_candidate_inputs(
+            &[wallet_utxo],
+            keys.nullifying_key,
+            &nullifier_sources,
+            Vec::new(),
+            &keys,
+        );
+        assert_eq!(spend_only.len(), 1);
+        let record = spend_only
+            .remove(0)
+            .into_record(
+                1,
+                local_db::WalletCacheKey::from_opaque_bytes(b"sender-scan-wallet")
+                    .expect("wallet key"),
+            )
+            .expect("spend-only candidate record");
+        assert_eq!(record.semantic_id(), matching_source.tx_hash);
+        assert_eq!(
+            record
+                .wallet_spends
+                .iter()
+                .map(|spend| (spend.tree, spend.position))
+                .collect::<Vec<_>>(),
+            vec![(2, 7)]
+        );
+        assert!(record.outputs.is_empty());
     }
 
     #[test]

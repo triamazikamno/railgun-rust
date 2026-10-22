@@ -1,5 +1,6 @@
 //! Actor-owned POI maintenance scheduling: one in-flight job plus durable rerun intent.
 
+use super::SenderUnshieldAttempts;
 use super::actor::{PoiRemoteJobKey, PoiRemoteJobKind, WalletActorCredential};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,12 +27,19 @@ pub(super) struct PoiMaintenanceController {
     phase: PoiMaintenancePhase,
     force_pending: bool,
     rerun_pending: bool,
+    /// Actor-lifetime unshield attempt pacing shared with maintenance jobs.
+    unshield_attempts: SenderUnshieldAttempts,
 }
 
 impl PoiMaintenanceController {
     #[must_use]
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub(super) fn unshield_attempts(&self) -> SenderUnshieldAttempts {
+        self.unshield_attempts.clone()
     }
 
     #[must_use]
