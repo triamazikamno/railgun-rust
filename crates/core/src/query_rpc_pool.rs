@@ -98,13 +98,26 @@ impl QueryRpcPool {
     /// Creates a pool that routes all RPC traffic through the given
     /// pre-configured [`reqwest::Client`] (e.g. one with a SOCKS proxy).
     #[must_use]
-    #[allow(clippy::needless_pass_by_value)] // Client is Arc-based; clone is cheap
     pub fn with_http_client(urls: Vec<Url>, cooldown: Duration, client: reqwest::Client) -> Self {
-        let providers: Vec<ProviderEntry> = urls
+        let mut pool = Self::with_http_clients(
+            urls.into_iter().map(|url| (url, client.clone())).collect(),
+            cooldown,
+        );
+        pool.http_client = Some(client);
+        pool
+    }
+
+    /// Creates a pool in which each endpoint sends its RPC traffic through
+    /// its own [`reqwest::Client`]. [`Self::http_client`] returns the first
+    /// endpoint's client.
+    #[must_use]
+    pub fn with_http_clients(endpoints: Vec<(Url, reqwest::Client)>, cooldown: Duration) -> Self {
+        let http_client = endpoints.first().map(|(_, client)| client.clone());
+        let providers: Vec<ProviderEntry> = endpoints
             .into_iter()
-            .map(|url| ProviderEntry {
+            .map(|(url, client)| ProviderEntry {
                 provider: ProviderBuilder::new()
-                    .connect_reqwest(client.clone(), url.clone())
+                    .connect_reqwest(client, url.clone())
                     .erased(),
                 url,
             })
@@ -114,7 +127,7 @@ impl QueryRpcPool {
             providers,
             cooldown,
             cooldowns: Mutex::new(HashMap::new()),
-            http_client: Some(client),
+            http_client,
             log_spans: Mutex::new(HashMap::new()),
         }
     }
@@ -374,5 +387,105 @@ mod tests {
         assert!(!pool.archive_admitted());
         pool.set_archive_admission(RpcAdmission::Admitted);
         assert!(pool.archive_admitted());
+    }
+
+    /// Answers every JSON-RPC request with `0x1` and reports the request's
+    /// `x-client` header and path.
+    fn spawn_recording_rpc() -> (Url, std::sync::mpsc::Receiver<(String, String)>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
+        let url = Url::parse(&format!("http://{}", listener.local_addr().expect("addr")))
+            .expect("rpc url");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("accept");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).expect("request line");
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let (mut client, mut length) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header line");
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap_or((line, ""));
+                    match name.to_ascii_lowercase().as_str() {
+                        "x-client" => value.trim().clone_into(&mut client),
+                        "content-length" => length = value.trim().parse().expect("length"),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("body");
+                let id =
+                    serde_json::from_slice::<serde_json::Value>(&body).expect("json")["id"].clone();
+                let reply =
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": "0x1"}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .expect("reply");
+                tx.send((client, path)).expect("record request");
+            }
+        });
+        (url, rx)
+    }
+
+    fn tagged_client(tag: &str) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-client", tag.parse().expect("header value"));
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("client")
+    }
+
+    #[tokio::test]
+    async fn per_url_clients_send_through_their_own_client_and_share_pool_behavior() {
+        let (base, requests) = spawn_recording_rpc();
+        let tor = base.join("tor").expect("tor url");
+        let direct = base.join("direct").expect("direct url");
+        let pool = QueryRpcPool::with_http_clients(
+            vec![
+                (tor.clone(), tagged_client("tor")),
+                (direct.clone(), tagged_client("direct")),
+            ],
+            Duration::from_secs(60),
+        )
+        .with_pending_admission();
+
+        assert!(pool.available_providers().is_empty(), "admission applies");
+        pool.set_provider_admission(0, RpcAdmission::Admitted);
+        pool.set_provider_admission(1, RpcAdmission::Admitted);
+        for handle in pool.available_providers() {
+            assert_eq!(handle.provider.get_chain_id().await.expect("chain id"), 1);
+            let (client, path) = requests.recv().expect("recorded request");
+            let expected = if handle.url == tor { "tor" } else { "direct" };
+            assert_eq!(
+                (client.as_str(), path),
+                (expected, handle.url.path().to_owned())
+            );
+        }
+
+        let tor_handle = pool.handle(0);
+        pool.mark_bad_provider(&tor_handle);
+        let available = pool.available_providers();
+        assert_eq!(available.len(), 1, "cooldown applies");
+        assert_eq!(available[0].url, direct);
+
+        pool.narrow_log_span(LogSpanEndpoint::Provider(1), 25);
+        assert_eq!(pool.log_span(LogSpanEndpoint::Provider(1), 500), 25);
+        assert_eq!(pool.log_span(LogSpanEndpoint::Provider(0), 500), 500);
     }
 }

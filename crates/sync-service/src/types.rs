@@ -607,6 +607,9 @@ pub struct ChainConfig {
     pub sync: RailgunSyncOptions,
     pub rpcs: Arc<QueryRpcPool>,
     pub archive_rpc_url: Option<Url>,
+    /// Transport for the archive endpoint. `None` uses the client the chain
+    /// was added with, or `http_client`.
+    pub archive_rpc_http_client: Option<reqwest::Client>,
     pub block_time: Duration,
     pub finality_depth: u64,
     /// Caller-configured transport for quick-sync and other internal HTTP requests.

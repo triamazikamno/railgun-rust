@@ -1564,6 +1564,7 @@ mod tests {
                 Duration::from_secs(1),
             )),
             archive_rpc_url: None,
+            archive_rpc_http_client: None,
             block_time: Duration::from_secs(12),
             finality_depth: 0,
             http_client: reqwest::Client::new(),

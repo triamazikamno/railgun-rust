@@ -8,9 +8,9 @@ use super::{
     DynProvider, FixedBytes, ForestMetaCheck, ForestReorgDecision, HashMap, HashSet, Instant, Log,
     LogRangeFetch, LogSpanEndpoint, MerkleForest, MerkleForestDbExt, MerkleForestSnapshot,
     Ordering, Path, PersistError, Provider, ProviderHandle, SNAPSHOT_VERSION, SharedLogBatch,
-    WalletBackfillDriver, WalletResetReplayPlan, anchor_file_name, debug,
-    fetch_logs_for_range_with_provider, info, parse_anchor_block, wallet_reorg_backfill_from_block,
-    wallet_sync_target, warn,
+    WalletBackfillDriver, WalletResetReplayPlan, anchor_file_name, build_provider_with_http_client,
+    debug, fetch_logs_for_range_with_provider, info, parse_anchor_block,
+    wallet_reorg_backfill_from_block, wallet_sync_target, warn,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -716,6 +716,26 @@ impl ChainConfig {
         }
     }
 
+    /// Builds the configured archive provider over `archive_rpc_http_client`,
+    /// else `fallback_client`, else `http_client`.
+    pub(super) async fn build_archive_provider(
+        &self,
+        fallback_client: Option<&reqwest::Client>,
+    ) -> Result<Option<DynProvider>, ChainError> {
+        let Some(url) = self.archive_rpc_url.as_ref() else {
+            return Ok(None);
+        };
+        let client = self
+            .archive_rpc_http_client
+            .as_ref()
+            .or(fallback_client)
+            .unwrap_or(&self.http_client);
+        build_provider_with_http_client(url, Some(client))
+            .await
+            .map(Some)
+            .map_err(ChainError::ProviderBuild)
+    }
+
     /// Returns the archive provider that serves reads at or below
     /// `archive_until_block`, or `None` when no archive endpoint is configured
     /// and the regular provider serves them. A configured archive endpoint the
@@ -1375,9 +1395,19 @@ mod tests {
         chain.deployment.legacy_shield_block = 250;
 
         let rpc = chain.rpcs.random_provider().expect("rpc provider");
-        let archive = broadcaster_core::provider::build_provider(&archive_mock.url)
+        chain.archive_rpc_url = Some(archive_mock.url.clone());
+        chain.archive_rpc_http_client = Some(reqwest::Client::new());
+        // The add-chain client cannot reach anything, so served archive reads
+        // prove the archive client carries them.
+        let unreachable = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("proxy"))
+            .build()
+            .expect("unreachable client");
+        let archive = chain
+            .build_archive_provider(Some(&unreachable))
             .await
-            .expect("archive provider");
+            .expect("archive provider")
+            .expect("configured archive provider");
         let cancel = CancellationToken::new();
 
         let logs = chain
@@ -1449,6 +1479,7 @@ mod tests {
             },
             rpcs: Arc::new(QueryRpcPool::new(vec![rpc_url], Duration::from_secs(1))),
             archive_rpc_url: None,
+            archive_rpc_http_client: None,
             block_time: Duration::from_secs(12),
             finality_depth: 1,
             http_client: reqwest::Client::new(),

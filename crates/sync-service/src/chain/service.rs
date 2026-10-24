@@ -13,14 +13,13 @@ use super::{
     WalletPoiRuntime, WalletReadiness, WalletReadinessError, WalletRegistration,
     WalletResetReplayPlan, WalletScanApply, WalletStartupSyncCandidate, WalletStartupSyncError,
     WalletStartupSyncStrategy, WalletWorkerServices, artifact_failure_can_fallback_to_squid,
-    await_wallet_cancellation, broadcast, build_provider_with_http_client, debug, info, mpsc,
-    oneshot, send_wallet_startup_events, should_hedge_wallet_startup, sort_logs,
-    spawn_backfill_loop, spawn_head_poller, spawn_live_log_loop, spawn_pending_tip_loop,
-    spawn_txid_public_cache_loop, spawn_wallet_lag_fallback_loop, squid_tail_target_after_artifact,
-    wait_or_cancel, wallet_backfill_from_block, wallet_cache_store,
-    wallet_finish_result_removes_cursor, wallet_finish_retry_request,
-    wallet_remote_target_before_cached_suffix, wallet_startup_warm_from_block, wallet_sync_target,
-    warn, watch,
+    await_wallet_cancellation, broadcast, debug, info, mpsc, oneshot, send_wallet_startup_events,
+    should_hedge_wallet_startup, sort_logs, spawn_backfill_loop, spawn_head_poller,
+    spawn_live_log_loop, spawn_pending_tip_loop, spawn_txid_public_cache_loop,
+    spawn_wallet_lag_fallback_loop, squid_tail_target_after_artifact, wait_or_cancel,
+    wallet_backfill_from_block, wallet_cache_store, wallet_finish_result_removes_cursor,
+    wallet_finish_retry_request, wallet_remote_target_before_cached_suffix,
+    wallet_startup_warm_from_block, wallet_sync_target, warn, watch,
 };
 
 use super::logs::INDEXED_SQUID_STEP_DEADLINE;
@@ -958,17 +957,9 @@ impl ChainService {
                 "archive RPC URL not configured; using regular RPC providers for archive-range fallback"
             );
         }
-        let archive_provider = match chain.archive_rpc_url.as_ref() {
-            Some(url) => Some(
-                build_provider_with_http_client(
-                    url,
-                    Some(rpc_http_client.as_ref().unwrap_or(&chain.http_client)),
-                )
-                .await
-                .map_err(ChainError::ProviderBuild)?,
-            ),
-            None => None,
-        };
+        let archive_provider = chain
+            .build_archive_provider(rpc_http_client.as_ref())
+            .await?;
 
         let rpcs = chain.rpcs.clone();
         let fallback_rpc = rpcs
