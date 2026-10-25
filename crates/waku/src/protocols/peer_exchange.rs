@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use libp2p::request_response;
 
 pub(crate) const PEER_EXCHANGE_CODEC: &str = "/vac/waku/peer-exchange/2.0.0-alpha1";
+// nwaku a0087c1 waku_peer_exchange/common.nim DefaultMaxRpcSize (10 * 153_600 + 65_536).
+pub(crate) const PEER_EXCHANGE_RESPONSE_MAX_BYTES: usize = 1_601_536;
 
 #[derive(Clone, Default)]
 pub(crate) struct PeerExchangeCodec;
@@ -31,7 +33,12 @@ impl request_response::Codec for PeerExchangeCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(io).await
+        // Outbound-only protocol, so this path is never taken.
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(
+            io,
+            PEER_EXCHANGE_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn read_response<T>(
@@ -42,7 +49,11 @@ impl request_response::Codec for PeerExchangeCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(io).await
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(
+            io,
+            PEER_EXCHANGE_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn write_request<T>(
@@ -75,7 +86,7 @@ pub(crate) fn behaviour() -> request_response::Behaviour<PeerExchangeCodec> {
     request_response::Behaviour::new(
         [(
             PeerExchangeProtocol,
-            request_response::ProtocolSupport::Full,
+            request_response::ProtocolSupport::Outbound,
         )],
         request_response::Config::default(),
     )

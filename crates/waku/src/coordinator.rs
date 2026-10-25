@@ -16,7 +16,6 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
@@ -108,10 +107,6 @@ impl StoreQueryOptions {
         }
     }
 }
-
-static LIGHTPUSH_UNIMPLEMENTED: OnceLock<proto::light_push::LightPushResponseV3> = OnceLock::new();
-static PEER_EXCHANGE_EMPTY_RESPONSE: OnceLock<proto::peer_exchange::PeerExchangeRpc> =
-    OnceLock::new();
 
 #[derive(Debug, Default)]
 struct PeerState {
@@ -959,40 +954,6 @@ impl NodeInner {
                     .try_send(TransportCmd::SendMetadataResponse { channel, response })
                 {
                     error!(%error, "failed to send metadata response command");
-                }
-            }
-            TransportEvent::LightPushRequest { peer_id, channel } => {
-                debug!(%peer_id, "received inbound lightpush request");
-                let response = LIGHTPUSH_UNIMPLEMENTED
-                    .get_or_init(|| proto::light_push::LightPushResponseV3 {
-                        request_id: String::new(),
-                        status_code: 503,
-                        status_desc: Some("not implemented".to_string()),
-                        relay_peer_count: None,
-                    })
-                    .clone();
-                if let Err(error) = self
-                    .transport_tx
-                    .try_send(TransportCmd::SendLightPushResponse { channel, response })
-                {
-                    error!(%error, "failed to send lightpush response command");
-                }
-            }
-            TransportEvent::PeerExchangeRequest { peer_id, channel } => {
-                debug!(%peer_id, "received peer exchange request");
-                let response = PEER_EXCHANGE_EMPTY_RESPONSE
-                    .get_or_init(|| proto::peer_exchange::PeerExchangeRpc {
-                        query: None,
-                        response: Some(proto::peer_exchange::PeerExchangeResponse {
-                            peer_infos: Vec::new(),
-                        }),
-                    })
-                    .clone();
-                if let Err(error) = self
-                    .transport_tx
-                    .try_send(TransportCmd::SendPeerExchangeResponse { channel, response })
-                {
-                    error!(%error, "failed to send peer exchange response command");
                 }
             }
             TransportEvent::LightPushResponse {

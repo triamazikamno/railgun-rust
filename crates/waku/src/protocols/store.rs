@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use libp2p::request_response;
 
 pub(crate) const STORE_QUERY_CODEC: &str = "/vac/waku/store-query/3.0.0";
+// nwaku a0087c1 waku_store/rpc_codec.nim MaxPageSize * (153_600 + 65_536), MaxPageSize = 100.
+pub(crate) const STORE_QUERY_RESPONSE_MAX_BYTES: usize = 21_913_600;
 
 #[derive(Clone, Default)]
 pub(crate) struct StoreQueryCodec;
@@ -31,7 +33,12 @@ impl request_response::Codec for StoreQueryCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(io).await
+        // Outbound-only protocol, so this path is never taken.
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(
+            io,
+            STORE_QUERY_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn read_response<T>(
@@ -42,7 +49,11 @@ impl request_response::Codec for StoreQueryCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(io).await
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(
+            io,
+            STORE_QUERY_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn write_request<T>(

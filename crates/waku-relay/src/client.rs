@@ -18,7 +18,7 @@ use waku::{
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
 pub const DEFAULT_SHARD_ID: u32 = 1;
 const FEE_HISTORY_LOOKBACK: Duration = Duration::from_mins(2);
-const FEE_HISTORY_PAGE_LIMIT: u64 = 500;
+const FEE_HISTORY_PAGE_LIMIT: u64 = 100;
 const DEFAULT_NWAKU_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKUP_PEER_DELAY: Duration = Duration::from_mins(1);
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {

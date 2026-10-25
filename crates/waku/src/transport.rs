@@ -60,14 +60,6 @@ pub(crate) enum TransportCmd {
         channel: ResponseChannel<proto::metadata::WakuMetadataResponse>,
         response: proto::metadata::WakuMetadataResponse,
     },
-    SendLightPushResponse {
-        channel: ResponseChannel<proto::light_push::LightPushResponseV3>,
-        response: proto::light_push::LightPushResponseV3,
-    },
-    SendPeerExchangeResponse {
-        channel: ResponseChannel<proto::peer_exchange::PeerExchangeRpc>,
-        response: proto::peer_exchange::PeerExchangeRpc,
-    },
     // Filter commands
     SendFilterSubscribe {
         req_id: ReqId,
@@ -102,14 +94,6 @@ pub(crate) enum TransportEvent {
     MetadataRequest {
         peer_id: PeerId,
         channel: ResponseChannel<proto::metadata::WakuMetadataResponse>,
-    },
-    LightPushRequest {
-        peer_id: PeerId,
-        channel: ResponseChannel<proto::light_push::LightPushResponseV3>,
-    },
-    PeerExchangeRequest {
-        peer_id: PeerId,
-        channel: ResponseChannel<proto::peer_exchange::PeerExchangeRpc>,
     },
     LightPushResponse {
         req_id: ReqId,
@@ -150,6 +134,22 @@ pub(crate) struct Behaviour {
     filter_push: libp2p_stream::Behaviour,
 }
 
+fn new_behaviour(local_key: &identity::Keypair) -> Behaviour {
+    Behaviour {
+        identify: identify::Behaviour::new(
+            identify::Config::new("waku-rust/0.1.0".to_string(), local_key.public())
+                .with_push_listen_addr_updates(true),
+        ),
+        ping: ping::Behaviour::new(ping::Config::new()),
+        metadata: protocols::metadata::behaviour(),
+        lightpush: protocols::lightpush::behaviour(),
+        peer_exchange: protocols::peer_exchange::behaviour(),
+        filter_subscribe: protocols::filter::filter_subscribe_behaviour(),
+        store_query: protocols::store::behaviour(),
+        filter_push: libp2p_stream::Behaviour::new(),
+    }
+}
+
 /// Transport layer that owns the libp2p Swarm.
 /// Receives commands from coordinator, emits raw events back.
 pub(crate) struct Transport {
@@ -171,23 +171,9 @@ impl Transport {
 
         let transport = build_transport(&local_key, network)?;
 
-        let behaviour = Behaviour {
-            identify: identify::Behaviour::new(
-                identify::Config::new("waku-rust/0.1.0".to_string(), local_key.public())
-                    .with_push_listen_addr_updates(true),
-            ),
-            ping: ping::Behaviour::new(ping::Config::new()),
-            metadata: protocols::metadata::behaviour(),
-            lightpush: protocols::lightpush::behaviour(),
-            peer_exchange: protocols::peer_exchange::behaviour(),
-            filter_subscribe: protocols::filter::filter_subscribe_behaviour(),
-            store_query: protocols::store::behaviour(),
-            filter_push: libp2p_stream::Behaviour::new(),
-        };
-
         let swarm = Swarm::new(
             transport,
-            behaviour,
+            new_behaviour(&local_key),
             local_peer_id,
             libp2p::swarm::Config::with_tokio_executor()
                 .with_idle_connection_timeout(Duration::from_secs(config.idle_timeout_secs)),
@@ -325,26 +311,6 @@ impl Transport {
                     debug!(?error, "failed to send metadata response");
                 }
             }
-            TransportCmd::SendLightPushResponse { channel, response } => {
-                if let Err(error) = self
-                    .swarm
-                    .behaviour_mut()
-                    .lightpush
-                    .send_response(channel, response)
-                {
-                    debug!(?error, "failed to send lightpush response");
-                }
-            }
-            TransportCmd::SendPeerExchangeResponse { channel, response } => {
-                if let Err(error) = self
-                    .swarm
-                    .behaviour_mut()
-                    .peer_exchange
-                    .send_response(channel, response)
-                {
-                    debug!(?error, "failed to send peer exchange response");
-                }
-            }
             TransportCmd::SendFilterSubscribe {
                 req_id,
                 peer_id,
@@ -403,26 +369,22 @@ impl Transport {
                 channel,
             }),
             SwarmEvent::Behaviour(BehaviourEvent::Lightpush(
-                request_response::Event::Message { peer, message, .. },
-            )) => match message {
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    let (req_id, peer_id) = self.pending_lightpush.remove(&request_id)?;
-                    Some(TransportEvent::LightPushResponse {
-                        req_id,
-                        peer_id,
-                        result: Ok(response),
-                    })
-                }
-                request_response::Message::Request { channel, .. } => {
-                    Some(TransportEvent::LightPushRequest {
-                        peer_id: peer,
-                        channel,
-                    })
-                }
-            },
+                request_response::Event::Message {
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                },
+            )) => {
+                let (req_id, peer_id) = self.pending_lightpush.remove(&request_id)?;
+                Some(TransportEvent::LightPushResponse {
+                    req_id,
+                    peer_id,
+                    result: Ok(response),
+                })
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Lightpush(
                 request_response::Event::OutboundFailure {
                     request_id, error, ..
@@ -436,25 +398,21 @@ impl Transport {
                 })
             }
             SwarmEvent::Behaviour(BehaviourEvent::PeerExchange(
-                request_response::Event::Message { peer, message, .. },
-            )) => match message {
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    let req_id = self.pending_px.remove(&request_id)?;
-                    Some(TransportEvent::PeerExchangeResponse {
-                        req_id,
-                        result: Ok(response),
-                    })
-                }
-                request_response::Message::Request { channel, .. } => {
-                    Some(TransportEvent::PeerExchangeRequest {
-                        peer_id: peer,
-                        channel,
-                    })
-                }
-            },
+                request_response::Event::Message {
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                },
+            )) => {
+                let req_id = self.pending_px.remove(&request_id)?;
+                Some(TransportEvent::PeerExchangeResponse {
+                    req_id,
+                    result: Ok(response),
+                })
+            }
             SwarmEvent::Behaviour(BehaviourEvent::PeerExchange(
                 request_response::Event::OutboundFailure {
                     request_id, error, ..
@@ -536,7 +494,7 @@ async fn handle_filter_push_stream(
     while let Ok(push) = ProstLengthDelimitedCodec::<
         proto::filter::MessagePush,
         proto::filter::FilterSubscribeResponse,
-    >::read_request(&mut stream)
+    >::read_request(&mut stream, protocols::filter::FILTER_PUSH_MAX_BYTES)
     .await
     {
         if event_tx
@@ -752,5 +710,92 @@ mod tests {
     #[test]
     fn arti_dial_target_rejects_non_tcp_addrs() {
         assert!(dial_target("/ip4/203.0.113.10/udp/30304/quic-v1").is_err());
+    }
+
+    fn memory_swarm<B: NetworkBehaviour>(key: &identity::Keypair, behaviour: B) -> Swarm<B> {
+        let transport = libp2p::core::transport::MemoryTransport::default()
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise::Config::new(key).expect("noise config"))
+            .multiplex(yamux::Config::default())
+            .boxed();
+        Swarm::new(
+            transport,
+            behaviour,
+            PeerId::from(key.public()),
+            libp2p::swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(60)),
+        )
+    }
+
+    #[tokio::test]
+    async fn wallet_behaviour_accepts_only_metadata_and_filter_push_inbound() {
+        let listener_key = identity::Keypair::generate_ed25519();
+        let listener_peer = PeerId::from(listener_key.public());
+        let mut listener = memory_swarm(&listener_key, new_behaviour(&listener_key));
+        // Production registers filter push in `Transport::run`; keep the acceptor alive likewise.
+        let _filter_push_streams = listener
+            .behaviour()
+            .filter_push
+            .new_control()
+            .accept(StreamProtocol::new(protocols::filter::FILTER_PUSH_CODEC))
+            .expect("register filter push");
+        let addr = Multiaddr::empty().with(Protocol::Memory(rand::random()));
+        listener.listen_on(addr.clone()).expect("listen");
+        tokio::spawn(async move {
+            loop {
+                listener.select_next_some().await;
+            }
+        });
+
+        let dialer_key = identity::Keypair::generate_ed25519();
+        let mut dialer = memory_swarm(&dialer_key, libp2p_stream::Behaviour::new());
+        let mut control = dialer.behaviour().new_control();
+
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            dialer
+                .dial(addr.with(Protocol::P2p(listener_peer)))
+                .expect("dial");
+            loop {
+                if let SwarmEvent::ConnectionEstablished { peer_id, .. } =
+                    dialer.select_next_some().await
+                    && peer_id == listener_peer
+                {
+                    break;
+                }
+            }
+            tokio::spawn(async move {
+                loop {
+                    dialer.select_next_some().await;
+                }
+            });
+
+            for protocol in [
+                protocols::lightpush::LIGHTPUSH_V3_CODEC,
+                protocols::peer_exchange::PEER_EXCHANGE_CODEC,
+                protocols::filter::FILTER_SUBSCRIBE_CODEC,
+            ] {
+                let result = control
+                    .open_stream(listener_peer, StreamProtocol::new(protocol))
+                    .await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(_))
+                    ),
+                    "{protocol} must not be accepted inbound"
+                );
+            }
+            for protocol in [
+                protocols::metadata::METADATA_CODEC,
+                protocols::filter::FILTER_PUSH_CODEC,
+            ] {
+                control
+                    .open_stream(listener_peer, StreamProtocol::new(protocol))
+                    .await
+                    .unwrap_or_else(|error| panic!("{protocol} must be accepted inbound: {error}"));
+            }
+        })
+        .await
+        .expect("test timed out");
     }
 }

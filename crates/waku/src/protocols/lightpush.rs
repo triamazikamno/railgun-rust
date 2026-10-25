@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use libp2p::request_response;
 
 pub(crate) const LIGHTPUSH_V3_CODEC: &str = "/vac/waku/lightpush/3.0.0";
+// nwaku a0087c1 waku_lightpush/rpc_codec.nim DefaultMaxPushResponseSize.
+pub(crate) const LIGHTPUSH_RESPONSE_MAX_BYTES: usize = 65_536;
 
 #[derive(Clone, Default)]
 pub(crate) struct LightPushCodec;
@@ -31,7 +33,12 @@ impl request_response::Codec for LightPushCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(io).await
+        // Outbound-only protocol, so this path is never taken.
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(
+            io,
+            LIGHTPUSH_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn read_response<T>(
@@ -42,7 +49,11 @@ impl request_response::Codec for LightPushCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(io).await
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(
+            io,
+            LIGHTPUSH_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn write_request<T>(
@@ -73,7 +84,10 @@ impl request_response::Codec for LightPushCodec {
 #[must_use]
 pub(crate) fn behaviour() -> request_response::Behaviour<LightPushCodec> {
     request_response::Behaviour::new(
-        [(LightPushProtocol, request_response::ProtocolSupport::Full)],
+        [(
+            LightPushProtocol,
+            request_response::ProtocolSupport::Outbound,
+        )],
         request_response::Config::default(),
     )
 }

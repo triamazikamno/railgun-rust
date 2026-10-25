@@ -5,6 +5,10 @@ use libp2p::request_response;
 
 pub(crate) const FILTER_SUBSCRIBE_CODEC: &str = "/vac/waku/filter-subscribe/2.0.0-beta1";
 pub(crate) const FILTER_PUSH_CODEC: &str = "/vac/waku/filter-push/2.0.0-beta1";
+// nwaku a0087c1 waku_filter_v2/rpc_codec.nim DefaultMaxPushSize (10 * 153_600 + 65_536).
+pub(crate) const FILTER_PUSH_MAX_BYTES: usize = 1_601_536;
+// nwaku a0087c1 waku_filter_v2/rpc_codec.nim DefaultMaxSubscribeResponseSize.
+pub(crate) const FILTER_SUBSCRIBE_RESPONSE_MAX_BYTES: usize = 65_536;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Filter Subscribe Protocol (client → server, request/response)
@@ -36,7 +40,12 @@ impl request_response::Codec for FilterSubscribeCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(io).await
+        // Outbound-only protocol, so this path is never taken.
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(
+            io,
+            FILTER_SUBSCRIBE_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn read_response<T>(
@@ -47,7 +56,11 @@ impl request_response::Codec for FilterSubscribeCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(io).await
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(
+            io,
+            FILTER_SUBSCRIBE_RESPONSE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn write_request<T>(
@@ -80,7 +93,7 @@ pub(crate) fn filter_subscribe_behaviour() -> request_response::Behaviour<Filter
     request_response::Behaviour::new(
         [(
             FilterSubscribeProtocol,
-            request_response::ProtocolSupport::Full,
+            request_response::ProtocolSupport::Outbound,
         )],
         request_response::Config::default(),
     )

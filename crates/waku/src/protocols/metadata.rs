@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use libp2p::request_response;
 
 pub(crate) const METADATA_CODEC: &str = "/vac/waku/metadata/1.0.0";
+// nwaku a0087c1 waku_metadata/protocol.nim RpcResponseMaxBytes, used for both reads.
+pub(crate) const METADATA_RPC_MAX_BYTES: usize = 1_024;
 
 #[derive(Clone, Default)]
 pub(crate) struct MetadataCodec;
@@ -31,7 +33,11 @@ impl request_response::Codec for MetadataCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(io).await
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_request(
+            io,
+            METADATA_RPC_MAX_BYTES,
+        )
+        .await
     }
 
     async fn read_response<T>(
@@ -42,7 +48,11 @@ impl request_response::Codec for MetadataCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(io).await
+        ProstLengthDelimitedCodec::<Self::Request, Self::Response>::read_response(
+            io,
+            METADATA_RPC_MAX_BYTES,
+        )
+        .await
     }
 
     async fn write_request<T>(
