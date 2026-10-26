@@ -5,14 +5,16 @@ use base64::engine::general_purpose;
 use lru::LruCache;
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use waku::proto::{HashKey, WakuMessage};
 use waku::{
-    DEFAULT_CLEARNET_DOH_ENDPOINT, DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions,
-    WakuConfig, WakuNetworkConfig, WakuNode, WakuTorClientProvider, parse_multiaddr, parse_peer_id,
+    DEFAULT_CLEARNET_DOH_ENDPOINT, DiscoveredPeer, PeerId, PeerSnapshot, PeerStats,
+    StoreQueryOptions, WakuConfig, WakuError, WakuNetworkConfig, WakuNode, WakuTorClientProvider,
+    parse_multiaddr, parse_peer_id,
 };
 
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
@@ -209,6 +211,257 @@ async fn observe_backup_peers(node: Arc<WakuNode>, peers: Vec<DiscoveredPeer>) {
                 node.add_additional_peers(peers);
             }
             return;
+        }
+    }
+}
+
+type HistoryFuture =
+    Pin<Box<dyn Future<Output = (PeerId, Result<Vec<WakuMessage>, WakuError>)> + Send>>;
+
+/// Store history inputs for [`forward_messages`].
+struct StoreHistory {
+    lookback: Duration,
+    peer_rx: Option<broadcast::Receiver<PeerId>>,
+    list_peers: Box<dyn Fn() -> Vec<PeerId> + Send>,
+    query: Box<dyn FnMut(PeerId) -> HistoryFuture + Send>,
+}
+
+/// Queues `peer_id` unless it is already queued, in flight or queried.
+///
+/// A notification for the in-flight peer is recorded in its flag so a failed query can be retried.
+fn queue_store_peer(
+    pending: &mut VecDeque<PeerId>,
+    in_flight: &mut Option<(PeerId, bool)>,
+    queried: &HashSet<PeerId>,
+    peer_id: PeerId,
+) -> bool {
+    if let Some((in_flight_peer, notified)) = in_flight
+        && *in_flight_peer == peer_id
+    {
+        *notified = true;
+        return false;
+    }
+    if pending.contains(&peer_id) || queried.contains(&peer_id) {
+        return false;
+    }
+    pending.push_back(peer_id);
+    true
+}
+
+/// Forwards one Store peer's history; returns `false` once the sink is closed.
+fn forward_store_messages(
+    cache: &mut LruCache<u64, ()>,
+    sink_tx: &mpsc::Sender<WakuMessage>,
+    content_topics: &[String],
+    peer_id: PeerId,
+    messages: Vec<WakuMessage>,
+    lookback: Duration,
+) -> bool {
+    let returned = messages.len();
+    let mut matching_topics = 0usize;
+    let mut delivered = 0usize;
+    let mut deduped = 0usize;
+    let mut dropped = 0usize;
+    for msg in messages {
+        if !content_topics.contains(&msg.content_topic) {
+            continue;
+        }
+        matching_topics += 1;
+        tracing::debug!(
+            %peer_id,
+            msg.content_topic,
+            hash = msg.hash_key(),
+            "received historical message from store peer"
+        );
+        match handle_relay_message(cache, sink_tx, msg) {
+            RelayMessageOutcome::Delivered => delivered += 1,
+            RelayMessageOutcome::Duplicate => deduped += 1,
+            RelayMessageOutcome::Dropped => dropped += 1,
+            RelayMessageOutcome::SinkClosed => return false,
+        }
+    }
+    tracing::debug!(
+        %peer_id,
+        returned,
+        matching_topics,
+        delivered,
+        deduped,
+        dropped,
+        lookback_secs = lookback.as_secs(),
+        "queried historical fee messages from store peer"
+    );
+    true
+}
+
+/// Polls nwaku once; returns `false` once the sink is closed.
+async fn poll_nwaku_messages(
+    http: &reqwest::Client,
+    url: &str,
+    nwaku_request_timeout: Duration,
+    content_topics: &[String],
+    cache: &mut LruCache<u64, ()>,
+    sink_tx: &mpsc::Sender<WakuMessage>,
+) -> bool {
+    let response = tokio::select! {
+        () = wait_for_relay_sink_closed(sink_tx) => return false,
+        response = nwaku_request(http.get(url), nwaku_request_timeout).send() => response.and_then(reqwest::Response::error_for_status),
+    };
+    match response {
+        Ok(resp) => {
+            let messages = tokio::select! {
+                () = wait_for_relay_sink_closed(sink_tx) => return false,
+                messages = resp.json::<Vec<Message>>() => messages,
+            };
+            match messages {
+                Ok(messages) => {
+                    for msg in messages {
+                        if !content_topics.contains(&msg.content_topic) {
+                            continue;
+                        }
+                        match general_purpose::STANDARD.decode(msg.payload.as_bytes()) {
+                            Ok(payload) => {
+                                let msg = WakuMessage {
+                                    content_topic: msg.content_topic,
+                                    payload,
+                                    ..Default::default()
+                                };
+                                tracing::trace!(
+                                    msg.content_topic,
+                                    hash = msg.hash_key(),
+                                    "received message from nwaku"
+                                );
+                                if matches!(
+                                    handle_relay_message(cache, sink_tx, msg),
+                                    RelayMessageOutcome::SinkClosed
+                                ) {
+                                    return false;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to decode message payload");
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error.without_url(), "failed to decode messages from nwaku");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error.without_url(), "failed to poll messages from nwaku");
+        }
+    }
+    true
+}
+
+/// Forwards fleet, nwaku and Store history messages into `sink_tx` through one dedup cache.
+///
+/// Store peers are queried one at a time, and live messages keep flowing while a query runs.
+async fn forward_messages(
+    mut fleet_rx: mpsc::Receiver<WakuMessage>,
+    sink_tx: mpsc::Sender<WakuMessage>,
+    content_topics: Vec<String>,
+    nwaku_messages_url: Option<String>,
+    http: reqwest::Client,
+    nwaku_request_timeout: Duration,
+    mut store: Option<StoreHistory>,
+) {
+    let mut cache = LruCache::new(CACHE_SIZE);
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut pending_store_peers: VecDeque<PeerId> = store
+        .as_ref()
+        .map(|store| (store.list_peers)().into())
+        .unwrap_or_default();
+    let mut successfully_queried_store_peers = HashSet::new();
+    let mut history: Option<HistoryFuture> = None;
+    let mut in_flight = None;
+    loop {
+        if relay_sink_is_closed(&sink_tx) {
+            tracing::debug!("relay sink is closed, breaking...");
+            return;
+        }
+
+        if history.is_none()
+            && let Some(store) = store.as_mut()
+        {
+            while let Some(peer_id) = pending_store_peers.pop_front() {
+                if !successfully_queried_store_peers.contains(&peer_id) {
+                    history = Some((store.query)(peer_id));
+                    in_flight = Some((peer_id, false));
+                    break;
+                }
+            }
+        }
+
+        tokio::select! {
+            () = wait_for_relay_sink_closed(&sink_tx) => return,
+            _ = tick.tick(), if nwaku_messages_url.is_some() => {
+                let Some(url) = &nwaku_messages_url else { continue };
+                if !poll_nwaku_messages(&http, url, nwaku_request_timeout, &content_topics, &mut cache, &sink_tx).await {
+                    return;
+                }
+            }
+            msg = fleet_rx.recv() => {
+                if let Some(msg) = msg {
+                    tracing::trace!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
+                    if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
+                        return;
+                    }
+                } else {
+                    tracing::warn!("fleet subscription channel closed");
+                    break;
+                }
+            }
+            (peer_id, result) = async {
+                match history.as_mut() {
+                    Some(query) => query.await,
+                    None => std::future::pending().await,
+                }
+            }, if history.is_some() => {
+                history = None;
+                let notified = in_flight.take().is_some_and(|(_, notified)| notified);
+                match result {
+                    Ok(messages) => {
+                        successfully_queried_store_peers.insert(peer_id);
+                        let lookback = store.as_ref().map_or(Duration::ZERO, |store| store.lookback);
+                        if !forward_store_messages(&mut cache, &sink_tx, &content_topics, peer_id, messages, lookback) {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%peer_id, %error, "failed to query historical fee messages from store peer");
+                        if notified && queue_store_peer(&mut pending_store_peers, &mut None, &successfully_queried_store_peers, peer_id) {
+                            tracing::debug!(%peer_id, "re-queueing store peer notified during its failed query");
+                        }
+                    }
+                }
+            }
+            notification = async {
+                match store.as_mut().and_then(|store| store.peer_rx.as_mut()) {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if store.as_ref().is_some_and(|store| store.peer_rx.is_some()) => {
+                let Some(store) = store.as_mut() else { continue };
+                match notification {
+                    Ok(peer_id) => {
+                        if queue_store_peer(&mut pending_store_peers, &mut in_flight, &successfully_queried_store_peers, peer_id) {
+                            tracing::debug!(%peer_id, "queueing store peer for fee history query");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "missed store peer notifications");
+                        for peer_id in (store.list_peers)() {
+                            queue_store_peer(&mut pending_store_peers, &mut in_flight, &successfully_queried_store_peers, peer_id);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("store peer notification channel closed");
+                        store.peer_rx = None;
+                    }
+                }
+            }
         }
     }
 }
@@ -429,188 +682,48 @@ impl Client {
         }
 
         if self.nwaku_url.is_some() || history_lookback.is_some() {
-            {
-                let mut fleet_rx = rx;
-                let (sink_tx, sink_rx) = mpsc::channel(1024);
-                rx = sink_rx;
-                let mut cache = LruCache::new(CACHE_SIZE);
-
+            let (sink_tx, sink_rx) = mpsc::channel(1024);
+            let nwaku_messages_url = self.nwaku_url.as_ref().map(|nwaku_url| {
+                let encoded_pubsub_path = urlencoding::encode(&self.pubsub_path);
+                format!("{nwaku_url}/relay/v1/messages/{encoded_pubsub_path}")
+            });
+            let store = history_lookback.map(|lookback| {
+                let peer_rx = waku_fleet.subscribe_store_peers();
+                let list_fleet = Arc::clone(waku_fleet);
+                let query_fleet = Arc::clone(waku_fleet);
                 let pubsub_path = self.pubsub_path.clone();
-                let nwaku_url = self.nwaku_url.clone();
-                let waku_fleet = Arc::clone(waku_fleet);
-                let http = self.http_client.clone();
-                let nwaku_request_timeout = self.nwaku_request_timeout;
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(Duration::from_secs(2));
-                    let encoded_pubsub_path = urlencoding::encode(&pubsub_path);
-                    let nwaku_messages_url = nwaku_url.as_ref().map(|nwaku_url| {
-                        format!("{nwaku_url}/relay/v1/messages/{encoded_pubsub_path}")
-                    });
-                    let mut store_peer_rx =
-                        history_lookback.map(|_| waku_fleet.subscribe_store_peers());
-                    let mut pending_store_peers: VecDeque<_> = if history_lookback.is_some() {
-                        waku_fleet.store_peers().into()
-                    } else {
-                        VecDeque::new()
-                    };
-                    let mut successfully_queried_store_peers = HashSet::new();
-                    loop {
-                        if relay_sink_is_closed(&sink_tx) {
-                            tracing::debug!("relay sink is closed, breaking...");
-                            return;
-                        }
-
-                        if let Some(lookback) = history_lookback
-                            && let Some(peer_id) = pending_store_peers.pop_front()
-                        {
-                            if successfully_queried_store_peers.contains(&peer_id) {
-                                continue;
-                            }
-
-                            let end = now_nanos();
-                            let start = end.saturating_sub(duration_nanos(lookback));
-                            let query = StoreQueryOptions {
-                                pubsub_topic: pubsub_path.clone(),
-                                content_topics: content_topics.clone(),
-                                time_start: Some(start),
-                                time_end: Some(end),
-                                pagination_limit: Some(FEE_HISTORY_PAGE_LIMIT),
-                            };
-
-                            let query_result = tokio::select! {
-                                () = wait_for_relay_sink_closed(&sink_tx) => return,
-                                result = waku_fleet.store_query_peer(peer_id, query) => result,
-                            };
-
-                            match query_result {
-                                Ok(messages) => {
-                                    successfully_queried_store_peers.insert(peer_id);
-                                    let returned = messages.len();
-                                    let mut matching_topics = 0usize;
-                                    let mut delivered = 0usize;
-                                    let mut deduped = 0usize;
-                                    let mut dropped = 0usize;
-                                    for msg in messages {
-                                        if !content_topics.contains(&msg.content_topic) {
-                                            continue;
-                                        }
-                                        matching_topics += 1;
-                                        tracing::debug!(
-                                            %peer_id,
-                                            msg.content_topic,
-                                            hash = msg.hash_key(),
-                                            "received historical message from store peer"
-                                        );
-                                        match handle_relay_message(&mut cache, &sink_tx, msg) {
-                                            RelayMessageOutcome::Delivered => delivered += 1,
-                                            RelayMessageOutcome::Duplicate => deduped += 1,
-                                            RelayMessageOutcome::Dropped => dropped += 1,
-                                            RelayMessageOutcome::SinkClosed => return,
-                                        }
-                                    }
-                                    tracing::debug!(
-                                        %peer_id,
-                                        returned,
-                                        matching_topics,
-                                        delivered,
-                                        deduped,
-                                        dropped,
-                                        lookback_secs = lookback.as_secs(),
-                                        "queried historical fee messages from store peer"
-                                    );
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%peer_id, %error, "failed to query historical fee messages from store peer");
-                                }
-                            }
-                            continue;
-                        }
-
-                        tokio::select! {
-                            () = wait_for_relay_sink_closed(&sink_tx) => return,
-                            _ = tick.tick(), if nwaku_messages_url.is_some() => {
-                                let Some(url) = &nwaku_messages_url else { continue };
-                                let response = tokio::select! {
-                                    () = wait_for_relay_sink_closed(&sink_tx) => return,
-                                    response = nwaku_request(http.get(url), nwaku_request_timeout).send() => response.and_then(reqwest::Response::error_for_status),
-                                };
-                                match response {
-                                    Ok(resp) => {
-                                        let messages = tokio::select! {
-                                            () = wait_for_relay_sink_closed(&sink_tx) => return,
-                                            messages = resp.json::<Vec<Message>>() => messages,
-                                        };
-                                        match messages {
-                                            Ok(messages) => {
-                                                for msg in messages {
-                                                    if !content_topics.contains(&msg.content_topic) {
-                                                        continue;
-                                                    }
-                                                    match general_purpose::STANDARD.decode(msg.payload.as_bytes()) {
-                                                        Ok(payload) => {
-                                                            let msg = WakuMessage {
-                                                                content_topic: msg.content_topic,
-                                                                payload,
-                                                                ..Default::default()
-                                                            };
-                                                            tracing::trace!(msg.content_topic, hash=msg.hash_key(), "received message from nwaku");
-                                                            if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
-                                                                return;
-                                                            }
-                                                        }
-                                                        Err(error) => {
-                                                            tracing::warn!(%error, "failed to decode message payload");
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                tracing::warn!(error = %error.without_url(), "failed to decode messages from nwaku");
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(error = %error.without_url(), "failed to poll messages from nwaku");
-                                    }
-                                }
-                            }
-                            msg = fleet_rx.recv() => {
-                                if let Some(msg) = msg {
-                                    tracing::trace!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
-                                    if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
-                                        return;
-                                    }
-                                } else {
-                                    tracing::warn!("fleet subscription channel closed");
-                                    break;
-                                }
-                            }
-                            store_peer = async {
-                                match store_peer_rx.as_mut() {
-                                    Some(rx) => Some(rx.recv().await),
-                                    None => None,
-                                }
-                            }, if store_peer_rx.is_some() => {
-                                match store_peer {
-                                    Some(Ok(peer_id)) => {
-                                        tracing::debug!(%peer_id, "queueing store peer for fee history query");
-                                        pending_store_peers.push_back(peer_id);
-                                    }
-                                    Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                                        tracing::warn!(skipped, "missed store peer notifications");
-                                        pending_store_peers.extend(waku_fleet.store_peers());
-                                    }
-                                    Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                                        tracing::warn!("store peer notification channel closed");
-                                        store_peer_rx = None;
-                                    }
-                                    None => {}
-                                }
-                            }
-                        }
-                    }
-                });
-            }
+                let content_topics = content_topics.clone();
+                StoreHistory {
+                    lookback,
+                    peer_rx: Some(peer_rx),
+                    list_peers: Box::new(move || list_fleet.store_peers()),
+                    query: Box::new(move |peer_id: PeerId| -> HistoryFuture {
+                        let end = now_nanos();
+                        let start = end.saturating_sub(duration_nanos(lookback));
+                        let query = StoreQueryOptions {
+                            pubsub_topic: pubsub_path.clone(),
+                            content_topics: content_topics.clone(),
+                            time_start: Some(start),
+                            time_end: Some(end),
+                            pagination_limit: Some(FEE_HISTORY_PAGE_LIMIT),
+                        };
+                        let fleet = Arc::clone(&query_fleet);
+                        Box::pin(
+                            async move { (peer_id, fleet.store_query_peer(peer_id, query).await) },
+                        )
+                    }),
+                }
+            });
+            tokio::spawn(forward_messages(
+                rx,
+                sink_tx,
+                content_topics,
+                nwaku_messages_url,
+                self.http_client.clone(),
+                self.nwaku_request_timeout,
+                store,
+            ));
+            rx = sink_rx;
         }
 
         Ok(rx)
@@ -798,8 +911,9 @@ fn add_tor_doh_fallback(config: &mut WakuConfig, fallback_endpoints_configured: 
 mod tests {
     use super::{
         CACHE_SIZE, Client, ClientConfig, ClientError, DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID,
-        RelayMessageOutcome, add_tor_doh_fallback, handle_relay_message, is_fee_content_topic,
-        relay_shard_pubsub_path, relay_sink_is_closed, wait_for_relay_sink_closed,
+        HistoryFuture, RelayMessageOutcome, StoreHistory, add_tor_doh_fallback, forward_messages,
+        handle_relay_message, is_fee_content_topic, relay_shard_pubsub_path, relay_sink_is_closed,
+        wait_for_relay_sink_closed,
     };
     use lru::LruCache;
     use std::net::TcpListener;
@@ -807,9 +921,161 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
-    use tokio::sync::mpsc;
+    use tokio::sync::{broadcast, mpsc, oneshot};
+    use tokio::time::timeout;
     use waku::proto::WakuMessage;
-    use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
+    use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT, PeerId, WakuError};
+
+    const FEE_TOPIC: &str = "/railgun/v2/0-1-fees/json";
+
+    fn fee_message(payload: u8) -> WakuMessage {
+        WakuMessage {
+            content_topic: FEE_TOPIC.to_string(),
+            payload: vec![payload],
+            ..Default::default()
+        }
+    }
+
+    fn spawn_forwarding(
+        fleet_rx: mpsc::Receiver<WakuMessage>,
+        sink_tx: mpsc::Sender<WakuMessage>,
+        store: StoreHistory,
+    ) {
+        tokio::spawn(forward_messages(
+            fleet_rx,
+            sink_tx,
+            vec![FEE_TOPIC.to_string()],
+            None,
+            reqwest::Client::new(),
+            Duration::from_secs(1),
+            Some(store),
+        ));
+    }
+
+    #[tokio::test]
+    async fn live_messages_forward_while_store_history_is_pending() {
+        let peer = PeerId::random();
+        let (fleet_tx, fleet_rx) = mpsc::channel(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel(8);
+        let (peer_tx, peer_rx) = broadcast::channel(8);
+        let (history_tx, history_rx) = oneshot::channel();
+        let mut history_rx = Some(history_rx);
+        spawn_forwarding(
+            fleet_rx,
+            sink_tx,
+            StoreHistory {
+                lookback: Duration::from_mins(2),
+                peer_rx: Some(peer_rx),
+                list_peers: Box::new(move || vec![peer]),
+                query: Box::new(move |peer_id: PeerId| -> HistoryFuture {
+                    let rx = history_rx.take().expect("one history query");
+                    Box::pin(async move { (peer_id, rx.await.expect("history result")) })
+                }),
+            },
+        );
+        let (m1, m2) = (fee_message(1), fee_message(2));
+
+        fleet_tx.send(m1.clone()).await.expect("loop reads fleet");
+        let live = timeout(Duration::from_secs(1), sink_rx.recv()).await;
+        assert_eq!(
+            live.expect("live message while history pending"),
+            Some(m1.clone())
+        );
+
+        // A second query panics the loop and closes the sink, failing the final assertion,
+        // so this notification during a successful query must not re-query the peer.
+        peer_tx.send(peer).expect("loop subscribed");
+        timeout(Duration::from_secs(1), async {
+            while !peer_tx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loop consumes store peer notification");
+
+        history_tx
+            .send(Ok(vec![m1, m2.clone()]))
+            .expect("history pending");
+        let history = timeout(Duration::from_secs(1), sink_rx.recv()).await;
+        assert_eq!(history.expect("new history message"), Some(m2));
+        assert!(
+            timeout(Duration::from_millis(100), sink_rx.recv())
+                .await
+                .is_err(),
+            "history copy of the live message must be deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_store_peer_does_not_delay_another() {
+        type Call = (PeerId, oneshot::Sender<Result<Vec<WakuMessage>, WakuError>>);
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let (_fleet_tx, fleet_rx) = mpsc::channel(1);
+        let (sink_tx, _sink_rx) = mpsc::channel(8);
+        let (peer_tx, peer_rx) = broadcast::channel(64);
+        let (calls_tx, mut calls_rx) = mpsc::unbounded_channel::<Call>();
+        spawn_forwarding(
+            fleet_rx,
+            sink_tx,
+            StoreHistory {
+                lookback: Duration::from_mins(2),
+                peer_rx: Some(peer_rx),
+                list_peers: Box::new(move || vec![a]),
+                query: Box::new(move |peer_id: PeerId| -> HistoryFuture {
+                    let (result_tx, result_rx) = oneshot::channel();
+                    calls_tx
+                        .send((peer_id, result_tx))
+                        .expect("test reads history calls");
+                    Box::pin(async move {
+                        (
+                            peer_id,
+                            result_rx.await.unwrap_or(Err(WakuError::Cancelled)),
+                        )
+                    })
+                }),
+            },
+        );
+        let next_call = async |calls_rx: &mut mpsc::UnboundedReceiver<Call>| {
+            timeout(Duration::from_secs(1), calls_rx.recv())
+                .await
+                .expect("history query started")
+                .expect("query closure alive")
+        };
+
+        let (first, fail_a) = next_call(&mut calls_rx).await;
+        assert_eq!(first, a);
+        for _ in 0..32 {
+            peer_tx.send(a).expect("loop subscribed");
+        }
+        peer_tx.send(b).expect("loop subscribed");
+        timeout(Duration::from_secs(1), async {
+            while !peer_tx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loop consumes store peer notifications");
+
+        fail_a
+            .send(Err(WakuError::StoreRequestFailed))
+            .expect("A pending");
+        let (second, done_b) = next_call(&mut calls_rx).await;
+        assert_eq!(second, b, "B is queried right after A fails");
+        done_b.send(Ok(Vec::new())).expect("B pending");
+
+        let mut a_requeries = 0;
+        while let Ok(Some((peer_id, result_tx))) =
+            timeout(Duration::from_millis(100), calls_rx.recv()).await
+        {
+            assert_eq!(peer_id, a);
+            a_requeries += 1;
+            let _ = result_tx.send(Err(WakuError::StoreRequestFailed));
+        }
+        assert_eq!(
+            a_requeries, 1,
+            "A notified during its failed query is retried exactly once"
+        );
+    }
 
     #[test]
     fn relay_shard_pubsub_path_uses_static_sharding_format() {

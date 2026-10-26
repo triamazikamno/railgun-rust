@@ -333,7 +333,7 @@ impl Default for FilterState {
 
 #[derive(Debug)]
 struct StorePending {
-    waiter: oneshot::Sender<Result<proto::store::StoreQueryResponse, WakuError>>,
+    waiter: oneshot::Sender<Result<protocols::store::StoreQueryPage, WakuError>>,
     deadline: Instant,
 }
 
@@ -1407,7 +1407,7 @@ impl NodeInner {
     async fn handle_store_query_response(
         &self,
         req_id: ReqId,
-        result: Result<proto::store::StoreQueryResponse, OutboundFailure>,
+        result: Result<protocols::store::StoreQueryPage, OutboundFailure>,
     ) {
         let mut store = self.ops.store.lock().await;
         let Some(pending) = store.pending.remove(&req_id) else {

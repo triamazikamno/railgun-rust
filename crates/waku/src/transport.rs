@@ -112,7 +112,7 @@ pub(crate) enum TransportEvent {
     },
     StoreQueryResponse {
         req_id: ReqId,
-        result: Result<proto::store::StoreQueryResponse, request_response::OutboundFailure>,
+        result: Result<protocols::store::StoreQueryPage, request_response::OutboundFailure>,
     },
 }
 

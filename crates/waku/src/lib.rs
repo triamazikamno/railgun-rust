@@ -22,4 +22,5 @@ pub use discovery::{
     TEST_ENR_TREE,
 };
 pub use error::{TransportInitError, WakuError};
+pub use libp2p::PeerId;
 pub use types::{parse_multiaddr, parse_peer_id};

@@ -12,7 +12,7 @@ use crate::config::{WakuConfig, WakuTransportProfile};
 use crate::discovery;
 use crate::error::WakuError;
 use crate::proto;
-use crate::proto::HashKey;
+use crate::protocols::store::StoreQueryPage;
 use crate::transport::{ReqId, Transport, TransportCmd};
 use crate::types::OpId;
 
@@ -252,99 +252,23 @@ impl WakuNode {
         self.inner.store_peer_tx.subscribe()
     }
 
-    pub async fn store_query(
-        &self,
-        options: StoreQueryOptions,
-    ) -> Result<Vec<proto::WakuMessage>, WakuError> {
-        options.validate()?;
-
-        let peers = self.store_peers();
-        if peers.is_empty() {
-            return Err(WakuError::NoPeersAvailable);
-        }
-
-        let mut last_error = None;
-        let mut saw_success = false;
-        let mut seen_messages = HashSet::new();
-        let mut messages = Vec::new();
-        for peer_id in peers {
-            match self.store_query_peer_pages(peer_id, &options).await {
-                Ok(peer_messages) => {
-                    saw_success = true;
-                    for message in peer_messages {
-                        if seen_messages.insert(message.hash_key()) {
-                            messages.push(message);
-                        }
-                    }
-                }
-                Err(error) => {
-                    debug!(%peer_id, ?error, "store query failed on peer");
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        if saw_success {
-            Ok(messages)
-        } else {
-            Err(last_error.unwrap_or(WakuError::NoPeersAvailable))
-        }
-    }
-
     pub async fn store_query_peer(
         &self,
         peer_id: PeerId,
         options: StoreQueryOptions,
     ) -> Result<Vec<proto::WakuMessage>, WakuError> {
         options.validate()?;
-        self.store_query_peer_pages(peer_id, &options).await
-    }
-
-    async fn store_query_peer_pages(
-        &self,
-        peer_id: PeerId,
-        options: &StoreQueryOptions,
-    ) -> Result<Vec<proto::WakuMessage>, WakuError> {
-        let mut cursor = None;
-        let mut seen_cursors = HashSet::new();
-        let mut messages = Vec::new();
-
-        loop {
-            let request = options.to_request(cursor.clone());
-            let response = self.store_query_peer_page(peer_id, request).await?;
-
-            if !store_status_ok(&response) {
-                return Err(WakuError::StoreQueryFailed {
-                    status_code: response.status_code,
-                    status_desc: response.status_desc,
-                });
-            }
-
-            messages.extend(
-                response
-                    .messages
-                    .into_iter()
-                    .filter_map(|entry| entry.message),
-            );
-
-            let Some(next_cursor) = response.pagination_cursor else {
-                break;
-            };
-
-            if next_cursor.is_empty() || !seen_cursors.insert(next_cursor.clone()) {
-                break;
-            }
-            cursor = Some(next_cursor);
-        }
-
-        Ok(messages)
+        store_query_peer_pages(peer_id, &options, move |request| {
+            self.store_query_peer_page(peer_id, request)
+        })
+        .await
     }
 
     async fn store_query_peer_page(
         &self,
         peer_id: PeerId,
         request: proto::store::StoreQueryRequest,
-    ) -> Result<proto::store::StoreQueryResponse, WakuError> {
+    ) -> Result<StoreQueryPage, WakuError> {
         let req_id = self.inner.ops.next_req_id();
         let (waiter, rx) = oneshot::channel();
 
@@ -591,5 +515,183 @@ impl WakuNode {
             )
         })
         .await
+    }
+}
+
+// Bound one peer's history query so a Store peer cannot keep it paging or growing.
+const MAX_STORE_QUERY_PAGES: usize = 8;
+const MAX_STORE_QUERY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Page through one peer's Store history until its cursor ends or a limit is reached.
+///
+/// Response frame lengths, not decoded sizes, count toward `MAX_STORE_QUERY_BYTES`, since
+/// decoded messages can retain more capacity than they encode to.
+async fn store_query_peer_pages<F, Fut>(
+    peer_id: PeerId,
+    options: &StoreQueryOptions,
+    mut fetch_page: F,
+) -> Result<Vec<proto::WakuMessage>, WakuError>
+where
+    F: FnMut(proto::store::StoreQueryRequest) -> Fut,
+    Fut: Future<Output = Result<StoreQueryPage, WakuError>>,
+{
+    let mut cursor = None;
+    let mut messages = Vec::new();
+    let mut pages = 0usize;
+    let mut bytes = 0usize;
+
+    loop {
+        let StoreQueryPage {
+            response,
+            frame_len,
+        } = fetch_page(options.to_request(cursor.take())).await?;
+        pages += 1;
+        bytes += frame_len;
+
+        if !store_status_ok(&response) {
+            return Err(WakuError::StoreQueryFailed {
+                status_code: response.status_code,
+                status_desc: response.status_desc,
+            });
+        }
+
+        messages.extend(
+            response
+                .messages
+                .into_iter()
+                .filter_map(|entry| entry.message),
+        );
+
+        let Some(next_cursor) = response.pagination_cursor.filter(|c| !c.is_empty()) else {
+            debug!(%peer_id, pages, bytes, messages = messages.len(), "store query complete");
+            break;
+        };
+        if pages >= MAX_STORE_QUERY_PAGES || bytes >= MAX_STORE_QUERY_BYTES {
+            let limit = if pages >= MAX_STORE_QUERY_PAGES {
+                "pages"
+            } else {
+                "bytes"
+            };
+            warn!(%peer_id, limit, pages, bytes, "store query stopped at history limit");
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::store::decode_store_query_page;
+    use prost::Message;
+
+    fn options() -> StoreQueryOptions {
+        StoreQueryOptions {
+            pubsub_topic: "/waku/2/rs/1/0".to_string(),
+            content_topics: vec!["/railgun/v2/0-1-fees/json".to_string()],
+            time_start: None,
+            time_end: None,
+            pagination_limit: Some(100),
+        }
+    }
+
+    /// A page with one message per payload byte.
+    fn page(cursor: Option<Vec<u8>>, payloads: &[u8]) -> StoreQueryPage {
+        let response = proto::store::StoreQueryResponse {
+            messages: payloads
+                .iter()
+                .map(|&payload| proto::store::WakuMessageKeyValue {
+                    message: Some(proto::WakuMessage {
+                        payload: vec![payload],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            pagination_cursor: cursor,
+            ..Default::default()
+        };
+        StoreQueryPage {
+            frame_len: response.encoded_len(),
+            response,
+        }
+    }
+
+    /// Run the paging loop over `page_for(call_number)`, returning each request's cursor and
+    /// the payload byte of every message returned.
+    async fn query(
+        mut page_for: impl FnMut(u8) -> StoreQueryPage,
+    ) -> (Vec<Option<Vec<u8>>>, Vec<u8>) {
+        let mut cursors = Vec::new();
+        let messages = store_query_peer_pages(PeerId::random(), &options(), |request| {
+            cursors.push(request.pagination_cursor);
+            let page = page_for(cursors.len() as u8);
+            async move { Ok::<_, WakuError>(page) }
+        })
+        .await
+        .expect("store query");
+        let payloads = messages
+            .iter()
+            .map(|message| message.payload.first().copied().unwrap_or_default())
+            .collect();
+        (cursors, payloads)
+    }
+
+    #[tokio::test]
+    async fn fresh_cursors_stop_at_page_limit() {
+        let (cursors, payloads) = query(|n| page(Some(vec![n]), &[n])).await;
+        assert_eq!(cursors.len(), MAX_STORE_QUERY_PAGES);
+        assert_eq!(payloads, (1..=8).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn repeated_cursor_stops_at_page_limit() {
+        let (cursors, _) = query(|_| page(Some(vec![7]), &[])).await;
+        assert_eq!(cursors.len(), MAX_STORE_QUERY_PAGES);
+    }
+
+    #[tokio::test]
+    async fn large_cursors_stop_at_byte_limit() {
+        // Each frame is just over 5 MiB, so the fourth crosses 16 MiB.
+        let (cursors, _) = query(|n| page(Some(vec![n; 5 * 1024 * 1024]), &[])).await;
+        assert_eq!(cursors.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn byte_limit_counts_frame_length_not_decoded_size() {
+        // A ~9 MiB payload followed by an empty duplicate decodes to an empty payload.
+        let page_for = |n: u8| {
+            let mut message = proto::WakuMessage {
+                payload: vec![n; 9 * 1024 * 1024],
+                content_topic: "t".to_string(),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            prost::encoding::bytes::encode(1, &Vec::<u8>::new(), &mut message);
+            let mut entry = Vec::new();
+            prost::encoding::bytes::encode(2, &message, &mut entry);
+            let mut frame = proto::store::StoreQueryResponse {
+                pagination_cursor: Some(vec![n]),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            prost::encoding::bytes::encode(20, &entry, &mut frame);
+
+            let page = decode_store_query_page(&frame).expect("decode page");
+            assert!(page.response.encoded_len() * 1000 < page.frame_len);
+            page
+        };
+
+        let (cursors, _) = query(page_for).await;
+        assert_eq!(cursors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ended_cursor_returns_all_pages() {
+        let (cursors, payloads) = query(|n| page((n < 3).then(|| vec![n]), &[n])).await;
+        assert_eq!(cursors, vec![None, Some(vec![1]), Some(vec![2])]);
+        assert_eq!(payloads, vec![1, 2, 3]);
     }
 }

@@ -26,7 +26,7 @@ where
     Req: Message + Default,
     Resp: Message + Default,
 {
-    async fn read_length_prefixed<T>(io: &mut T, cap: usize) -> io::Result<Vec<u8>>
+    pub(crate) async fn read_length_prefixed<T>(io: &mut T, cap: usize) -> io::Result<Vec<u8>>
     where
         T: AsyncRead + Unpin,
     {
