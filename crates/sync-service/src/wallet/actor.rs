@@ -1744,7 +1744,10 @@ mod tests {
             from_block: 5,
             reset_generation: 1,
         });
-        assert!(receiver.borrow().ppoi_submission_statuses().is_empty());
+        assert_eq!(
+            receiver.borrow().ppoi_submission_statuses(),
+            [] as [WalletPpoiSubmissionStatus; 0]
+        );
         publisher.publish(
             WalletViewState::Current(crate::types::WalletCurrentSnapshot::new(
                 9,
@@ -1756,7 +1759,10 @@ mod tests {
             WalletReadiness::Syncing,
         );
         assert_eq!(receiver.borrow().ppoi_workflow_status(), &status);
-        assert!(receiver.borrow().ppoi_submission_statuses().is_empty());
+        assert_eq!(
+            receiver.borrow().ppoi_submission_statuses(),
+            [] as [WalletPpoiSubmissionStatus; 0]
+        );
 
         publisher.publish_terminal(WalletInactiveReason::Shutdown, 1);
         assert_eq!(
@@ -1766,7 +1772,10 @@ mod tests {
                 ..WalletPpoiWorkflowStatus::default()
             }
         );
-        assert!(receiver.borrow().ppoi_submission_statuses().is_empty());
+        assert_eq!(
+            receiver.borrow().ppoi_submission_statuses(),
+            [] as [WalletPpoiSubmissionStatus; 0]
+        );
     }
 
     #[test]

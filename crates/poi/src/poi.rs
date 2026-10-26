@@ -2010,8 +2010,8 @@ mod tests {
                 serde_json::from_str(fixture).expect("deserialize POI event fixture");
             assert_eq!(event.signed_poi_event.event_type, event_type);
             assert_ne!(event.signed_poi_event.blinded_commitment, FixedBytes::ZERO);
-            assert!(!event.signed_poi_event.signature.is_empty());
-            assert!(!event.validated_merkleroot.is_empty());
+            assert_ne!(event.signed_poi_event.signature, "");
+            assert_ne!(event.validated_merkleroot, "");
         }
     }
 
@@ -2025,9 +2025,9 @@ mod tests {
             record.block_reason.as_deref(),
             Some("fixture blocked shield")
         );
-        assert!(!record.commitment_hash.is_empty());
-        assert!(!record.blinded_commitment.is_empty());
-        assert!(!record.signature.is_empty());
+        assert_ne!(record.commitment_hash, "");
+        assert_ne!(record.blinded_commitment, "");
+        assert_ne!(record.signature, "");
     }
 
     #[test]

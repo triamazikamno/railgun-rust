@@ -1332,7 +1332,7 @@ mod tests {
             120,
             vec![bad_checkpoint],
         );
-        assert!(checkpoint_pages.is_empty());
+        assert_eq!(checkpoint_pages, [] as [MerkleCheckpointArtifactPage; 0]);
         let commitment_chunk = commitment_chunk(
             scope(),
             vec![(0, 101, [0x11; 32]), (1, 102, [0x22; 32])],

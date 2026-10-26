@@ -3463,7 +3463,7 @@ async fn failed_short_startup_hedge_uses_artifact_chunk_spanning_cursor_and_reus
         3,
         "replacement wallet should reuse the cached delivery range without HTTP"
     );
-    assert!(rpc.drain_request_bodies().is_empty());
+    assert_eq!(rpc.drain_request_bodies(), [] as [serde_json::Value; 0]);
     assert!(squid.requests.try_recv().is_err());
 
     service.unregister_all_wallets().await;
@@ -13622,10 +13622,9 @@ async fn reorg_during_far_behind_attempt_aborts_it() {
     }
     assert_eq!(*fixture.forest_rx.borrow(), 0);
     assert_eq!(fixture.meta(), Some((0, [0; 32])));
-    assert!(
-        events
-            .with_message("far-behind live forest catch-up finished")
-            .is_empty()
+    assert_eq!(
+        events.with_message("far-behind live forest catch-up finished"),
+        [] as [BTreeMap<String, String>; 0]
     );
     assert_eq!(
         events.with_message("live forest progress"),
@@ -13688,10 +13687,9 @@ async fn far_behind_attempt_blocks_the_stall_trigger_and_ends_with_shutdown() {
         get_logs.load(Ordering::Acquire) == 3
     })
     .await;
-    assert!(
-        events
-            .with_message("live merkle forest stall fallback to Squid finished")
-            .is_empty()
+    assert_eq!(
+        events.with_message("live merkle forest stall fallback to Squid finished"),
+        [] as [BTreeMap<String, String>; 0]
     );
     assert_eq!(
         Arc::strong_count(&fixture.service),

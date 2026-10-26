@@ -28,6 +28,8 @@ impl LogRequestBudget {
     }
 
     /// Reserves one request, or fails once `limit` requests were reserved.
+    // `try_update`, the replacement, needs Rust 1.95; the workspace MSRV is 1.91.
+    #[allow(deprecated)]
     fn reserve(&self) -> Result<(), ChainError> {
         self.issued
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |issued| {

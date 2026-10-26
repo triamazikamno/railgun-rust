@@ -2085,7 +2085,7 @@ mod tests {
                 .lock()
                 .expect("maintenance admission state after shutdown");
             assert_eq!(admission.retained_payload_bytes, 0);
-            assert!(admission.keys.is_empty());
+            assert_eq!(admission.keys, [] as [IndexedArtifactMaintenanceKey; 0]);
         }
         assert_eq!(
             scheduler.try_schedule(IndexedArtifactMaintenanceKey::Test(4), 1, async {},),
@@ -2587,7 +2587,7 @@ mod tests {
         let verified =
             verify_catalog_bytes(&descriptor, &bytes).expect("empty v1 catalog verifies");
 
-        assert!(verified.chunks.is_empty());
+        assert_eq!(verified.chunks, [] as [IndexedArtifactDescriptor; 0]);
     }
 
     #[test]
@@ -2894,7 +2894,10 @@ mod tests {
             .await
             .expect("missing generation is valid for v1");
 
-        assert!(verified.catalog.chunks.is_empty());
+        assert_eq!(
+            verified.catalog.chunks,
+            [] as [IndexedArtifactDescriptor; 0]
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             server.request_paths().len() + skipped.request_paths().len(),
@@ -3345,7 +3348,10 @@ mod tests {
             ))
             .expect("stage later chunk");
 
-        assert!(stager.drain_contiguous().expect("drain").is_empty());
+        assert_eq!(
+            stager.drain_contiguous().expect("drain"),
+            [] as [VerifiedIndexedArtifactChunk; 0]
+        );
         assert_eq!(stager.next_range_start(), 0);
         assert_eq!(stager.staged_len(), 1);
 

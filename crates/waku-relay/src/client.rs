@@ -1213,7 +1213,7 @@ mod tests {
 
         add_tor_doh_fallback(&mut waku, true);
 
-        assert!(waku.discovery.doh_fallback_endpoints.is_empty());
+        assert_eq!(waku.discovery.doh_fallback_endpoints, [] as [String; 0]);
     }
 
     #[tokio::test]

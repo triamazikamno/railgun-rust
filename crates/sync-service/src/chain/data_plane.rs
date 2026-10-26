@@ -4191,7 +4191,10 @@ mod tests {
 
         {
             let state = data_plane.state.lock().await;
-            assert!(state.coverage.records().is_empty());
+            assert_eq!(
+                state.coverage.records(),
+                [] as [PublicScanCoverageRecord; 0]
+            );
             assert!(state.recent_scan_rows.is_empty());
         }
 
@@ -4208,7 +4211,10 @@ mod tests {
             }
         );
         let state = data_plane.state.lock().await;
-        assert!(state.coverage.records().is_empty());
+        assert_eq!(
+            state.coverage.records(),
+            [] as [PublicScanCoverageRecord; 0]
+        );
         assert!(state.recent_scan_rows.is_empty());
         drop(state);
         assert!(

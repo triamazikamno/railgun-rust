@@ -596,7 +596,7 @@ mod tests {
         assert_eq!((call.to, call.value), (guard, U256::ZERO));
         let deadline = DeadlineMulticall::multicallCall::abi_decode(&call.data).unwrap();
         assert_eq!(deadline.deadline, U256::from(1_700_000_000_u64));
-        assert!(deadline.data.is_empty());
+        assert_eq!(deadline.data, [] as [Bytes; 0]);
 
         let settlement = Address::repeat_byte(0x90);
         let order_uid = OrderUid::new(B256::repeat_byte(0xaa), EXECUTOR, 0x0102_0304);

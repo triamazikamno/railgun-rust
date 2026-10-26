@@ -2647,7 +2647,7 @@ async fn txid_public_format_v1_ignores_partitioned_catalog_context() {
         .expect("successor descriptor should not require its catalog body");
 
     assert_eq!(plan.required.len(), 1);
-    assert!(plan.stable_current.is_empty());
+    assert_eq!(plan.stable_current, [] as [VerifiedIndexedArtifactChunk; 0]);
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

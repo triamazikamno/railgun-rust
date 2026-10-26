@@ -2835,7 +2835,10 @@ mod tests {
             &keys,
         )
         .expect("an all-owned candidate classifies for local retirement");
-        assert!(classification.external_outputs.is_empty());
+        assert_eq!(
+            classification.external_outputs,
+            [] as [BlindedCommitmentData; 0]
+        );
         let mut spend_only = mixed.clone();
         spend_only.outputs.clear();
         assert!(

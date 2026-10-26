@@ -1702,7 +1702,7 @@ mod tests {
         let tail = descriptor(10, 19, Some(root(9)), EventArtifactKind::CurrentTail);
         let entry = entry(20, 10, Some(tail), Vec::new());
         let plan = no_replay_plan(&entry, 20, entry.current_root, true).expect("no-replay plan");
-        assert!(plan.route.descriptors.is_empty());
+        assert_eq!(plan.route.descriptors, [] as [EventArtifactDescriptor; 0]);
         assert_eq!(plan.cost.network_request_count, 0);
         assert_eq!(plan.cost.replay_event_count, 0);
         assert!(no_replay_plan(&entry, 20, Some(root(0xff)), true).is_none());

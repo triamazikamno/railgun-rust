@@ -1590,7 +1590,7 @@ mod tests {
             .cache
             .to_bytes()
             .expect("serialize returned artifact cache");
-        assert!(returned.record.cache_payload.is_empty());
+        assert_eq!(returned.record.cache_payload, [] as [u8; 0]);
         let bundle = match db
             .inspect_poi_corpus_journal(0, 1, "V2_PoseidonMerkle", &publisher)
             .expect("inspect committed artifact journal")
@@ -1617,7 +1617,10 @@ mod tests {
         assert_eq!(head.delta_count, 0);
         assert_eq!(head.delta_payload_bytes, 0);
         assert!(head.blocked_revision.is_none());
-        assert!(bundle.deltas.is_empty());
+        assert_eq!(
+            bundle.deltas,
+            [] as [local_db::PoiCorpusJournalDeltaRecord; 0]
+        );
         let decoded = PoiCache::from_bytes(&bundle.base.cache_payload, returned.cache.identity())
             .expect("decode returned artifact payload");
         assert_eq!(

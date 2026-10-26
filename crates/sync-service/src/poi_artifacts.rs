@@ -3181,7 +3181,7 @@ mod tests {
             .cache
             .to_bytes()
             .expect("serialize returned public RPC cache");
-        assert!(returned.record.cache_payload.is_empty());
+        assert_eq!(returned.record.cache_payload, [] as [u8; 0]);
         let bundle = match db
             .inspect_poi_corpus_journal(
                 identity.chain_type,
@@ -3255,7 +3255,10 @@ mod tests {
             other => panic!("unexpected initial journal: {other:?}"),
         };
         let initial_base_payload = initial_bundle.base.cache_payload;
-        assert!(initial_bundle.deltas.is_empty());
+        assert_eq!(
+            initial_bundle.deltas,
+            [] as [PoiCorpusJournalDeltaRecord; 0]
+        );
 
         let expected_base = load_persisted_cache(&db, &identity)
             .expect("load journal base")
@@ -3374,7 +3377,7 @@ mod tests {
             StoredRecord::Valid(bundle) => bundle,
             other => panic!("unexpected blocked-only journal: {other:?}"),
         };
-        assert!(bundle.deltas.is_empty());
+        assert_eq!(bundle.deltas, [] as [PoiCorpusJournalDeltaRecord; 0]);
         assert!(bundle.blocked.is_some());
         drop(db);
         let db = DbStore::open(DbConfig {
@@ -3686,7 +3689,7 @@ mod tests {
         assert_eq!(compacted.journal_head.as_ref(), Some(&head));
         assert_eq!(head.base_revision, head.revision);
         assert_eq!(head.delta_count, 0);
-        assert!(bundle.deltas.is_empty());
+        assert_eq!(bundle.deltas, [] as [PoiCorpusJournalDeltaRecord; 0]);
         assert_eq!(
             PoiCache::from_bytes(&bundle.base.cache_payload, &identity)
                 .expect("decode compacted base")

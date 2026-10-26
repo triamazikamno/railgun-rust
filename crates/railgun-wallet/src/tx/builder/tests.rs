@@ -2412,7 +2412,7 @@ async fn composite_and_mixed_reject_mismatched_adapter_before_signing() {
         }
     }
     assert!(signer.signed_msg.get().is_none());
-    assert!(prover.bound_params_hashes().is_empty());
+    assert_eq!(prover.bound_params_hashes(), [] as [U256; 0]);
 }
 
 #[tokio::test]

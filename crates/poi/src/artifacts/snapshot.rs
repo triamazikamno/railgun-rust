@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(snapshot.events[0].event_type, PoiEventType::Shield);
         assert_eq!(snapshot.events[1].event_index, events[1].event_index);
         assert_eq!(snapshot.events[1].event_type, PoiEventType::Transact);
-        assert!(snapshot.blocked_shields.is_empty());
+        assert_eq!(snapshot.blocked_shields, [] as [SnapshotBlockedShield; 0]);
     }
 
     #[test]

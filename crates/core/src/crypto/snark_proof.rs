@@ -145,7 +145,7 @@ fn fq2_from_pair_c0c1(pair: &[U256]) -> Result<Fq2, SnarkProofError> {
 }
 fn g2_from_snarkjs_pi_b(pi_b: &[[U256; 2]; 2]) -> Result<G2Affine, SnarkProofError> {
     let candidates: [([U256; 2], [U256; 2]); 4] = [
-        (pi_b[0], pi_b[1]),
+        (*pi_b).into(),
         (pi_b[1], pi_b[0]),
         ([pi_b[0][1], pi_b[0][0]], [pi_b[1][1], pi_b[1][0]]),
         ([pi_b[1][1], pi_b[1][0]], [pi_b[0][1], pi_b[0][0]]),

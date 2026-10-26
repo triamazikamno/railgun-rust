@@ -4610,7 +4610,10 @@ async fn self_broadcast_partial_unshield_retires_without_prover() {
     Box::pin(run_partial_unshield_maintenance(&fixture, &attempts)).await;
     assert!(fixture.stored_candidate().is_none());
     assert_eq!(fixture.published_workflow().outstanding_count(), 0);
-    assert!(fixture.submitter.calls().is_empty());
+    assert_eq!(
+        fixture.submitter.calls(),
+        [] as [(FixedBytes<32>, u64, u64); 0]
+    );
 
     let PartialUnshieldFixture { root_dir, db, .. } = fixture;
     drop(db);
@@ -5010,7 +5013,10 @@ async fn shield_blocked_refund_retires_spend_only_candidate_without_submission()
         fixture.stored_candidate().is_none(),
         "no PPOI can be built for a blocked input, so the refund leaves no work"
     );
-    assert!(fixture.submitter.calls().is_empty());
+    assert_eq!(
+        fixture.submitter.calls(),
+        [] as [(FixedBytes<32>, u64, u64); 0]
+    );
     assert_eq!(report.unshields_validated, 0);
     let workflow = fixture.published_workflow();
     assert_eq!(workflow.outstanding_count(), 0);
@@ -5085,7 +5091,10 @@ async fn rescanned_unshield_only_spend_recreates_candidate_and_completes_unshiel
         fixture.published_workflow().validation_revision,
         revision + 1
     );
-    assert!(fixture.submitter.calls().is_empty());
+    assert_eq!(
+        fixture.submitter.calls(),
+        [] as [(FixedBytes<32>, u64, u64); 0]
+    );
 
     let PartialUnshieldFixture { root_dir, db, .. } = fixture;
     drop(db);
@@ -5279,7 +5288,10 @@ async fn local_poi_status_refresh_reads_cache_without_remote_pois_per_list() {
 
     assert!(outcome.changed);
     assert!(outcome.complete);
-    assert!(unused_remote.calls().is_empty());
+    assert_eq!(
+        unused_remote.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
     assert_eq!(
         wallet_utxos[0].utxo.poi.statuses.get(&list_key),
         Some(&PoiStatus::Valid)
@@ -5354,7 +5366,7 @@ async fn observed_local_valid_context_suppresses_submission_after_restart() {
         .await,
         0
     );
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     assert!(
         store
             .get_pending_output_poi_context(
@@ -5452,7 +5464,7 @@ async fn external_local_valid_context_completes_without_submission() {
         .await,
         0
     );
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     assert!(
         store
             .get_pending_output_poi_context(
@@ -6301,8 +6313,11 @@ async fn locally_valid_sender_candidate_retires_without_public_or_remote_effects
         .expect("load covered candidate")
         .is_some()
     );
-    assert!(remote_status.calls().is_empty());
-    assert!(remote_submit.calls().is_empty());
+    assert_eq!(
+        remote_status.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
+    assert_eq!(remote_submit.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     db.delete_pending_output_poi_context(
         cfg.chain.chain_id,
         cfg.cache_key.as_str(),
@@ -6392,8 +6407,11 @@ async fn locally_valid_sender_candidate_retires_without_public_or_remote_effects
     let workflow_status = observation.ppoi_workflow_status();
     assert_eq!(workflow_status.awaiting_recovery, 0);
     assert_eq!(workflow_status.outstanding_count(), 0);
-    assert!(remote_status.calls().is_empty());
-    assert!(remote_submit.calls().is_empty());
+    assert_eq!(
+        remote_status.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
+    assert_eq!(remote_submit.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
 
     db.put_opaque_wallet_private_row(
         &candidate.namespace(),
@@ -6472,8 +6490,11 @@ async fn locally_valid_sender_candidate_retires_without_public_or_remote_effects
         );
         assert_eq!(current.spent, expected.spent);
     }
-    assert!(remote_status.calls().is_empty());
-    assert!(remote_submit.calls().is_empty());
+    assert_eq!(
+        remote_status.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
+    assert_eq!(remote_submit.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
 
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -7866,7 +7887,10 @@ async fn pending_tip_tentative_submission_is_non_durable_and_safe_head_remains_e
         &private_poi,
     )
     .await;
-    assert!(failed.succeeded.is_empty());
+    assert_eq!(
+        failed.succeeded,
+        [] as [super::pending_output_poi::PendingOutputPoiTentativeAttemptKey; 0]
+    );
     assert_eq!(failed.retryable, vec![candidate_key.clone()]);
     assert_eq!(failed.accepted, 0);
     assert_eq!(failed.missing_txid, 1);
@@ -7878,7 +7902,10 @@ async fn pending_tip_tentative_submission_is_non_durable_and_safe_head_remains_e
         .expect("load context after tentative submission")
         .expect("context after tentative submission");
     assert!(after_tentative.observation.is_none());
-    assert!(after_tentative.submitted_poi_list_keys.is_empty());
+    assert_eq!(
+        after_tentative.submitted_poi_list_keys,
+        [] as [FixedBytes<32>; 0]
+    );
     assert!(after_tentative.terminal_error.is_none());
     assert!(
         store
@@ -7897,7 +7924,10 @@ async fn pending_tip_tentative_submission_is_non_durable_and_safe_head_remains_e
         &private_poi,
     )
     .await;
-    assert!(remote_failed.succeeded.is_empty());
+    assert_eq!(
+        remote_failed.succeeded,
+        [] as [super::pending_output_poi::PendingOutputPoiTentativeAttemptKey; 0]
+    );
     assert_eq!(remote_failed.retryable, vec![candidate_key.clone()]);
     assert_eq!(remote_failed.accepted, 0);
     assert_eq!(remote_failed.missing_txid, 0);
@@ -7915,7 +7945,10 @@ async fn pending_tip_tentative_submission_is_non_durable_and_safe_head_remains_e
     )
     .await;
     assert_eq!(succeeded.succeeded, vec![candidate_key.clone()]);
-    assert!(succeeded.retryable.is_empty());
+    assert_eq!(
+        succeeded.retryable,
+        [] as [super::pending_output_poi::PendingOutputPoiTentativeAttemptKey; 0]
+    );
     assert_eq!(succeeded.accepted, 1);
     assert_eq!(succeeded.missing_txid, 0);
     assert_eq!(succeeded.remote_failure, 0);
@@ -7926,7 +7959,10 @@ async fn pending_tip_tentative_submission_is_non_durable_and_safe_head_remains_e
         .expect("load context after tentative success")
         .expect("context after tentative success");
     assert!(after_success.observation.is_none());
-    assert!(after_success.submitted_poi_list_keys.is_empty());
+    assert_eq!(
+        after_success.submitted_poi_list_keys,
+        [] as [FixedBytes<32>; 0]
+    );
     assert!(after_success.terminal_error.is_none());
     assert!(
         store
@@ -8233,13 +8269,13 @@ async fn proxy_refresh_reconciles_owned_valid_context_after_submission_persisten
         0
     );
     assert_eq!(submitter.calls().len(), 1);
-    assert!(
+    assert_eq!(
         store
             .get_pending_output_poi_context(chain_id, &cfg.cache_key, &output_commitment)
             .expect("load pending context")
             .expect("pending context preserved")
-            .submitted_poi_list_keys
-            .is_empty()
+            .submitted_poi_list_keys,
+        [] as [FixedBytes<32>; 0]
     );
     assert!(
         store
@@ -8541,7 +8577,10 @@ async fn verified_valid_rejects_mismatched_recovery_source() {
             .get(&list_key),
         Some(&PoiStatus::ProofSubmitted)
     );
-    assert!(client.calls().is_empty());
+    assert_eq!(
+        client.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -8913,7 +8952,7 @@ async fn recovered_outgoing_group_final_apply_rechecks_every_predecessor() {
             )
             .expect("load unchanged group context")
             .expect("group context present");
-        assert!(current.submitted_poi_list_keys.is_empty());
+        assert_eq!(current.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
         assert_eq!(
             store
                 .get_output_poi_recovery(
@@ -8970,7 +9009,7 @@ async fn recovered_outgoing_group_read_error_prevents_rpc() {
         .await,
         0
     );
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
 
     drop(cache_store);
     drop(store);
@@ -9017,7 +9056,7 @@ async fn recovered_outgoing_group_persistence_failure_has_no_partial_apply() {
     );
     assert_eq!(submitter.calls().len(), 1);
     for record in &group {
-        assert!(
+        assert_eq!(
             store
                 .get_pending_output_poi_context(
                     cfg.chain.chain_id,
@@ -9026,8 +9065,8 @@ async fn recovered_outgoing_group_persistence_failure_has_no_partial_apply() {
                 )
                 .expect("load unchanged context")
                 .expect("context present")
-                .submitted_poi_list_keys
-                .is_empty()
+                .submitted_poi_list_keys,
+            [] as [FixedBytes<32>; 0]
         );
         assert_eq!(
             store
@@ -9095,7 +9134,7 @@ async fn recovered_outgoing_ambiguous_remote_failure_stays_coherently_retryable(
             )
             .expect("load retryable context")
             .expect("context present");
-        assert!(context.submitted_poi_list_keys.is_empty());
+        assert_eq!(context.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
         let recovery = store
             .get_output_poi_recovery(
                 cfg.chain.chain_id,
@@ -9389,7 +9428,7 @@ async fn external_submission_rejects_scan_replacement_before_remote_transport() 
         attempt,
         super::PendingOutputPoiRemoteAttempt::NotCurrent
     ));
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     assert_eq!(
         store
             .get_pending_output_poi_context(
@@ -9478,7 +9517,7 @@ async fn authorized_external_pending_output_force_retry_resubmits_without_sender
         .await,
         0
     );
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     assert_eq!(
         pending_output_poi_context_fingerprint(
             &store
@@ -9713,7 +9752,10 @@ async fn external_proxy_verification_rejects_scan_replacement_before_remote_tran
     assert_eq!(outcome.completed, 0);
     assert_eq!(outcome.pending, 0);
     assert_eq!(outcome.errors, 0);
-    assert!(transport.calls().is_empty());
+    assert_eq!(
+        transport.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
     assert_eq!(
         store
             .get_pending_output_poi_context(
@@ -9798,7 +9840,10 @@ async fn submitted_external_proxy_verification_rejects_mismatched_recovery_befor
     assert_eq!(outcome.completed, 0);
     assert_eq!(outcome.pending, 0);
     assert_eq!(outcome.errors, 0);
-    assert!(transport.calls().is_empty());
+    assert_eq!(
+        transport.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
     assert!(
         store
             .get_pending_output_poi_context(
@@ -9865,7 +9910,10 @@ async fn unsubmitted_external_pending_output_cannot_use_owned_valid_reconciliati
     assert_eq!(outcome.completed, 0);
     assert_eq!(outcome.pending, 0);
     assert_eq!(outcome.errors, 0);
-    assert!(transport.calls().is_empty());
+    assert_eq!(
+        transport.calls(),
+        [] as [(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>); 0]
+    );
     assert!(
         store
             .get_pending_output_poi_context(
@@ -9941,7 +9989,7 @@ async fn authorized_external_pending_output_persistence_failure_does_not_commit(
         )
         .expect("load pending context")
         .expect("pending context preserved");
-    assert!(persisted.submitted_poi_list_keys.is_empty());
+    assert_eq!(persisted.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
     assert!(
         store
             .get_output_poi_recovery(
@@ -10215,7 +10263,7 @@ async fn authorized_pending_output_poi_retry_resubmits_submitted_lists() {
         .await,
         0
     );
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     assert_eq!(
         pending_output_poi_context_fingerprint(
             &store
@@ -10474,7 +10522,7 @@ async fn authorized_pending_output_poi_skips_output_that_no_longer_needs_poi() {
     .await;
 
     assert_eq!(submitted, 0);
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -10538,7 +10586,7 @@ async fn pending_output_poi_maintenance_is_scoped_to_wallet_id() {
         .get_pending_output_poi_context(chain_id, wallet_b_id.as_str(), &wallet_b_commitment)
         .expect("load wallet B pending context")
         .expect("wallet B pending context present");
-    assert!(wallet_b.submitted_poi_list_keys.is_empty());
+    assert_eq!(wallet_b.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
 
     wallet_b.submitted_poi_list_keys = vec![list_key];
     store
@@ -10783,7 +10831,7 @@ async fn pending_output_poi_submission_failure_remains_retryable() {
         .expect("load pending context")
         .expect("pending context present");
     assert!(failed.observation.is_some());
-    assert!(failed.submitted_poi_list_keys.is_empty());
+    assert_eq!(failed.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
     assert!(failed.terminal_error.is_none());
 
     process_pending_output_poi_observations(
@@ -10867,7 +10915,7 @@ async fn authorized_pending_output_submission_cancels_without_mutating_context()
     release_tx.send(()).expect("release submitter");
 
     assert_eq!(task.await.expect("submission task"), 0);
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     let loaded = store
         .get_pending_output_poi_context(
             chain_id,
@@ -10876,7 +10924,7 @@ async fn authorized_pending_output_submission_cancels_without_mutating_context()
         )
         .expect("load pending context")
         .expect("pending context present");
-    assert!(loaded.submitted_poi_list_keys.is_empty());
+    assert_eq!(loaded.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
     assert!(
         store
             .get_output_poi_recovery(
@@ -11081,7 +11129,7 @@ async fn recovered_output_poi_context_resubmits_when_forced_before_retry_time() 
         Some(&submitter),
     )
     .await;
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
 
     process_pending_output_poi_observations_inner(
         &store,
@@ -11700,7 +11748,7 @@ async fn routed_deferred_forced_intent_keeps_its_kind() {
     assert_eq!(ordinary_pass(false).await, 1);
     let routed = routes.routes();
     assert_eq!(routed.len(), 2, "only the force-resubmit is sent");
-    assert!(routed[0].transact_sends().is_empty());
+    assert_eq!(routed[0].transact_sends(), [] as [(u64, FixedBytes<32>); 0]);
     let mut sends = routed[1].transact_sends();
     sends.sort_unstable();
     assert_eq!(
@@ -12406,7 +12454,10 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
             .pre_transaction_pois_per_txid_leaf_per_list
             .contains_key(&list_a)
     );
-    assert!(rebuilt_extension.submitted_poi_list_keys.is_empty());
+    assert_eq!(
+        rebuilt_extension.submitted_poi_list_keys,
+        [] as [FixedBytes<32>; 0]
+    );
     let extended = extend_pending_output_poi_context(
         &pending,
         &new_list_keys,
@@ -12748,7 +12799,10 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
     regenerated.output_role = PendingOutputPoiRole::Change;
     regenerated.created_at = 999;
     regenerated.source_operation_id = Some("forced-regeneration".to_string());
-    assert!(regenerated.submitted_poi_list_keys.is_empty());
+    assert_eq!(
+        regenerated.submitted_poi_list_keys,
+        [] as [FixedBytes<32>; 0]
+    );
     assert!(regenerated.terminal_error.is_none());
 
     let mut handle = test_wallet_handle(vec![wallet_utxo.clone()]);
@@ -12799,7 +12853,7 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
         pending_output_poi_context_fingerprint(&regenerated)
     );
     assert!(current.terminal_error.is_none());
-    assert!(current.submitted_poi_list_keys.is_empty());
+    assert_eq!(current.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
     assert!(
         super::saved_poi_compatibility::saved_pending_context_is_compatible(&current, &[list_key])
     );
@@ -13269,7 +13323,7 @@ async fn submission_workflow_projection_failure_aborts_before_commit_and_retry_c
         )
         .expect("load retained pending context")
         .expect("pending context retained");
-    assert!(retained.submitted_poi_list_keys.is_empty());
+    assert_eq!(retained.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
     assert_eq!(
         handle.observation().ppoi_workflow_status(),
         &workflow_before
@@ -13817,7 +13871,7 @@ async fn force_resubmit_ignores_nonmatching_pending_output_context() {
     .await;
 
     assert_eq!(submitted, 0);
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -14397,12 +14451,12 @@ async fn local_pending_spent_expires_after_successful_overlay_refresh() {
         .set_chain_pending_overlay(WalletPendingOverlay::default())
         .await;
 
-    assert!(
+    assert_eq!(
         handle
             .pending_overlay()
             .expect("current view")
-            .local_pending_spent
-            .is_empty()
+            .local_pending_spent,
+        [] as [WalletPendingSpent; 0]
     );
 }
 
@@ -14498,12 +14552,12 @@ async fn local_pending_spent_prunes_when_confirmed_spent_covers_key() {
         .set_chain_pending_overlay(WalletPendingOverlay::default())
         .await;
 
-    assert!(
+    assert_eq!(
         handle
             .pending_overlay()
             .expect("current view")
-            .local_pending_spent
-            .is_empty()
+            .local_pending_spent,
+        [] as [WalletPendingSpent; 0]
     );
 }
 
@@ -14519,12 +14573,12 @@ async fn clear_local_pending_spent_removes_manual_locks() {
     }
 
     assert!(handle.clear_local_pending_spent_for_test().await);
-    assert!(
+    assert_eq!(
         handle
             .pending_overlay()
             .expect("current view")
-            .local_pending_spent
-            .is_empty()
+            .local_pending_spent,
+        [] as [WalletPendingSpent; 0]
     );
     assert!(!handle.clear_local_pending_spent_for_test().await);
 }
@@ -14573,13 +14627,9 @@ async fn terminal_wallet_views_override_retained_reset_pending_state() {
         Err(WalletPrivateRequestError::Inactive)
     );
     assert_eq!(*handle.rev_rx.borrow(), revision);
-    assert!(
-        handle
-            .pending_overlay
-            .read()
-            .await
-            .local_pending_spent
-            .is_empty()
+    assert_eq!(
+        handle.pending_overlay.read().await.local_pending_spent,
+        [] as [WalletPendingSpent; 0]
     );
 
     let stopping = test_wallet_handle(vec![wallet_utxo]);

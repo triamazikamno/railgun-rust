@@ -1376,7 +1376,7 @@ mod tests {
             .await
             .expect("regular RPC should be used for archive range");
 
-        assert!(logs.is_empty());
+        assert_eq!(logs, [] as [Log; 0]);
         assert_eq!(mock.requests.load(Ordering::SeqCst), 1);
     }
 
@@ -1439,7 +1439,7 @@ mod tests {
             .fetch_logs_for_range(&rpc, Some(&archive), 100, 120, &cancel)
             .await
             .expect("admitted archive serves archive-range logs");
-        assert!(logs.is_empty());
+        assert_eq!(logs, [] as [Log; 0]);
         let hash = chain
             .fetch_block_hash(&rpc.provider, Some(&archive), 120)
             .await

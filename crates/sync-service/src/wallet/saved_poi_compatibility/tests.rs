@@ -641,7 +641,7 @@ async fn source_block_reconstructs_consumed_exact_spend_candidate_and_preserves_
         migration_wallet_payloads(&handle.utxos.read().await) == baseline,
         "reconstruction must preserve the complete actor snapshot"
     );
-    assert!(submitter.calls().is_empty());
+    assert_eq!(submitter.calls(), [] as [(FixedBytes<32>, u64, u64); 0]);
     drop(private_poi);
     drop(plane);
     drop(store);

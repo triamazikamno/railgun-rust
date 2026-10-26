@@ -408,7 +408,7 @@ mod tests {
 
         let entry: ManifestEntry = serde_json::from_str(json).expect("entry decodes");
 
-        assert!(entry.retained_deltas.is_empty());
+        assert_eq!(entry.retained_deltas, [] as [RetainedDeltaDescriptor; 0]);
     }
 
     #[test]

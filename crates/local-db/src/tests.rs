@@ -1078,7 +1078,7 @@ fn poi_corpus_journal_blocked_only_revision_does_not_add_delta() {
         StoredRecord::Valid(bundle) => bundle,
         other => panic!("unexpected stored journal: {other:?}"),
     };
-    assert!(bundle.deltas.is_empty());
+    assert_eq!(bundle.deltas, [] as [PoiCorpusJournalDeltaRecord; 0]);
     assert_eq!(bundle.blocked, first.blocked);
 
     drop(store);
@@ -1268,7 +1268,7 @@ fn poi_corpus_journal_rebase_retires_deltas_and_reset_clears_all_state() {
         other => panic!("unexpected rebased journal: {other:?}"),
     };
     assert_eq!(bundle.base.cache_payload, replacement.cache_payload);
-    assert!(bundle.deltas.is_empty());
+    assert_eq!(bundle.deltas, [] as [PoiCorpusJournalDeltaRecord; 0]);
     assert!(bundle.blocked.is_none());
 
     let (removed, generation) = store
@@ -2079,7 +2079,7 @@ fn pending_output_poi_context_roundtrip_and_listing() {
     assert_eq!(loaded.output_role, PendingOutputPoiRole::Recipient);
     assert_eq!(loaded.required_poi_list_keys, record.required_poi_list_keys);
     assert!(loaded.observation.is_none());
-    assert!(loaded.submitted_poi_list_keys.is_empty());
+    assert_eq!(loaded.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
     assert!(loaded.terminal_error.is_none());
 
     let records = store
@@ -2878,11 +2878,11 @@ fn wallet_private_namespace_deletion_is_complete_isolated_and_idempotent() {
             sender_transaction_candidate_rows: 1,
         }
     );
-    assert!(
+    assert_eq!(
         store
             .list_wallet_utxos(&target.wallet_id)
-            .expect("list deleted target UTXOs")
-            .is_empty()
+            .expect("list deleted target UTXOs"),
+        [] as [super::WalletUtxoRecord; 0]
     );
     assert!(
         store
@@ -3435,11 +3435,11 @@ fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
         }
     );
     for namespace in &namespaces {
-        assert!(
+        assert_eq!(
             store
                 .list_wallet_utxos(&namespace.wallet_id)
-                .expect("list deleted wallet UTXOs")
-                .is_empty()
+                .expect("list deleted wallet UTXOs"),
+            [] as [super::WalletUtxoRecord; 0]
         );
     }
     for key in &delete_keys {
@@ -3647,14 +3647,14 @@ fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
             .expect("load rolled-back metadata")
             .is_none()
     );
-    assert!(
+    assert_eq!(
         store
             .list_opaque_wallet_private_rows(
                 &namespace,
                 WalletPrivateRecordKind::PendingOutputPoiContext,
             )
-            .expect("list rolled-back pending rows")
-            .is_empty()
+            .expect("list rolled-back pending rows"),
+        [] as [OpaqueWalletPrivateRow; 0]
     );
     assert_eq!(
         store
@@ -3782,12 +3782,12 @@ fn typed_db_store_pending_and_recovery_records_use_plaintext_v2_encoding() {
             .source_tx_hash,
         recovery.source_tx_hash
     );
-    assert!(
+    assert_eq!(
         store
             .list_wallet_private_v1_rows(&namespace)
             .expect("list v1 rows")
-            .pending_output_contexts
-            .is_empty()
+            .pending_output_contexts,
+        [] as [super::WalletPrivateV1Row; 0]
     );
     let opaque_pending = store
         .list_opaque_wallet_private_rows(
@@ -3928,8 +3928,14 @@ fn typed_wallet_private_crud_consumes_shipped_v1_rows() {
     let v1_rows = store
         .list_wallet_private_v1_rows(&namespace)
         .expect("list remaining v1 rows");
-    assert!(v1_rows.pending_output_contexts.is_empty());
-    assert!(v1_rows.output_poi_recoveries.is_empty());
+    assert_eq!(
+        v1_rows.pending_output_contexts,
+        [] as [super::WalletPrivateV1Row; 0]
+    );
+    assert_eq!(
+        v1_rows.output_poi_recoveries,
+        [] as [super::WalletPrivateV1Row; 0]
+    );
     assert!(
         store
             .wallet_private_compaction_requested()
@@ -3944,12 +3950,12 @@ fn typed_wallet_private_crud_consumes_shipped_v1_rows() {
     store
         .put_pending_output_poi_context(&pending)
         .expect("put consumes matching v1 pending");
-    assert!(
+    assert_eq!(
         store
             .list_wallet_private_v1_rows(&namespace)
             .expect("list v1 rows after typed pending put")
-            .pending_output_contexts
-            .is_empty()
+            .pending_output_contexts,
+        [] as [super::WalletPrivateV1Row; 0]
     );
     put_raw_pending_output_record(
         &store,
@@ -3989,12 +3995,12 @@ fn typed_wallet_private_crud_consumes_shipped_v1_rows() {
     store
         .put_output_poi_recovery(&recovery)
         .expect("put consumes matching v1 recovery");
-    assert!(
+    assert_eq!(
         store
             .list_wallet_private_v1_rows(&namespace)
             .expect("list v1 rows after typed put")
-            .output_poi_recoveries
-            .is_empty()
+            .output_poi_recoveries,
+        [] as [super::WalletPrivateV1Row; 0]
     );
     put_raw_output_poi_recovery_record(
         &store,
@@ -4525,14 +4531,14 @@ fn wallet_private_v1_migration_is_atomic_and_namespace_scoped() {
             .expect("list rolled-back sources"),
         sources
     );
-    assert!(
+    assert_eq!(
         store
             .list_opaque_wallet_private_rows(
                 &namespace,
                 WalletPrivateRecordKind::PendingOutputPoiContext,
             )
-            .expect("list rolled-back destinations")
-            .is_empty()
+            .expect("list rolled-back destinations"),
+        [] as [OpaqueWalletPrivateRow; 0]
     );
 
     assert_eq!(
@@ -4553,12 +4559,12 @@ fn wallet_private_v1_migration_is_atomic_and_namespace_scoped() {
             .expect("list migrated pending rows"),
         pending_destinations
     );
-    assert!(
+    assert_eq!(
         store
             .list_wallet_private_v1_rows(&namespace)
             .expect("list consumed v1 rows")
-            .pending_output_contexts
-            .is_empty()
+            .pending_output_contexts,
+        [] as [super::WalletPrivateV1Row; 0]
     );
     assert_eq!(
         store
@@ -4710,18 +4716,18 @@ fn wallet_private_canonicalization_is_versioned_atomic_and_idempotent() {
             .expect("list canonical recovery rows"),
         recovery_destinations
     );
-    assert!(
+    assert_eq!(
         store
             .list_wallet_private_v1_rows(&legacy)
             .expect("list consumed legacy v1")
-            .pending_output_contexts
-            .is_empty()
+            .pending_output_contexts,
+        [] as [super::WalletPrivateV1Row; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .list_opaque_wallet_private_rows(&legacy, WalletPrivateRecordKind::OutputPoiRecovery,)
-            .expect("list consumed legacy v2")
-            .is_empty()
+            .expect("list consumed legacy v2"),
+        [] as [OpaqueWalletPrivateRow; 0]
     );
     assert_eq!(
         store
@@ -4916,11 +4922,11 @@ fn desktop_wallet_vault_records_are_isolated_by_prefix() {
             )],
         )
         .expect("replace cache prefix");
-    assert!(
+    assert_eq!(
         store
             .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
-            .expect("list reset cache records")
-            .is_empty()
+            .expect("list reset cache records"),
+        [] as [DesktopWalletVaultRecord; 0]
     );
     assert_eq!(
         store
@@ -4942,11 +4948,11 @@ fn desktop_wallet_vault_records_are_isolated_by_prefix() {
     store
         .replace_desktop_wallet_vault_prefix_with_records("", &[])
         .expect("clear all vault records with empty prefix");
-    assert!(
+    assert_eq!(
         store
             .list_desktop_wallet_vault_records("")
-            .expect("list cleared vault records")
-            .is_empty()
+            .expect("list cleared vault records"),
+        [] as [DesktopWalletVaultRecord; 0]
     );
 
     drop(store);
@@ -5096,11 +5102,11 @@ fn schema_seven_legacy_composite_wallet_rows_migrate_explicitly() {
             .expect("read pre-migration wallet meta")
             .is_none()
     );
-    assert!(
+    assert_eq!(
         store
             .list_wallet_utxos(&wallet_id)
-            .expect("read pre-migration wallet UTXOs")
-            .is_empty()
+            .expect("read pre-migration wallet UTXOs"),
+        [] as [super::WalletUtxoRecord; 0]
     );
     let pending_rows = store
         .list_pending_output_poi_contexts(chain_id, wallet_id.as_str())
@@ -5729,11 +5735,11 @@ fn schema_seven_migration_failure_rolls_back_rows_and_version() {
             .expect("legacy row present"),
         b"encrypted"
     );
-    assert!(
+    assert_eq!(
         store
             .list_wallet_utxos(&wallet_id)
-            .expect("list rolled-back target rows")
-            .is_empty()
+            .expect("list rolled-back target rows"),
+        [] as [super::WalletUtxoRecord; 0]
     );
     assert!(raw_pending_output_record_exists(
         &store,

@@ -7030,13 +7030,9 @@ mod tests {
         let snapshot = handle.utxos.read().await;
         assert_eq!(snapshot.len(), 1);
         assert!(snapshot[0].spent.is_some());
-        assert!(
-            handle
-                .pending_overlay
-                .read()
-                .await
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            handle.pending_overlay.read().await.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
 
         cancel.cancel();
@@ -8782,7 +8778,7 @@ mod tests {
             WalletBackfillResetResult::accepted_committed(1, 99)
         );
         let overlay = handle.pending_overlay().expect("current after rewind");
-        assert!(overlay.pending_spent.is_empty());
+        assert_eq!(overlay.pending_spent, [] as [WalletPendingSpent; 0]);
         assert!(overlay.new_utxos.is_empty());
         assert_eq!(overlay.local_pending_spent, vec![recent_local]);
         assert!(overlay.local_pending_spent[0].matches_local_utxo(&wallet_utxo));
@@ -9233,7 +9229,10 @@ mod tests {
             .expect("load external context after rewind retry")
             .expect("external proof context is retained");
         assert!(rewound_context.observation.is_none());
-        assert!(rewound_context.submitted_poi_list_keys.is_empty());
+        assert_eq!(
+            rewound_context.submitted_poi_list_keys,
+            [] as [FixedBytes<32>; 0]
+        );
         assert!(rewound_context.terminal_error.is_none());
         assert!(
             db.get_output_poi_recovery(
@@ -9551,10 +9550,9 @@ mod tests {
             reset_pending_observation.view(),
             WalletViewState::ResetPending { .. }
         ));
-        assert!(
-            reset_pending_observation
-                .ppoi_submission_statuses()
-                .is_empty()
+        assert_eq!(
+            reset_pending_observation.ppoi_submission_statuses(),
+            [] as [WalletPpoiSubmissionStatus; 0]
         );
 
         let pending = PendingWalletReset::new(1, 100, 1, WalletResetReplayPlan::new(0, 150, false));
@@ -9788,7 +9786,7 @@ mod tests {
             .expect("load rewound external context")
             .expect("retain immutable external proof context");
         assert!(rewound.observation.is_none());
-        assert!(rewound.submitted_poi_list_keys.is_empty());
+        assert_eq!(rewound.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
         assert!(rewound.terminal_error.is_none());
         assert_eq!(rewound.railgun_txid, stale_context.railgun_txid);
         assert_eq!(
@@ -9871,7 +9869,7 @@ mod tests {
         assert_eq!(observed.output_tree, 3);
         assert_eq!(observed.output_position, 21);
         assert_eq!(observed.tx_hash, canonical_source.tx_hash);
-        assert!(canonical.submitted_poi_list_keys.is_empty());
+        assert_eq!(canonical.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
         assert!(canonical.terminal_error.is_none());
         assert_eq!(canonical.missing_list_keys(), vec![list_key]);
         assert_eq!(
@@ -12429,13 +12427,13 @@ mod tests {
                 .any(|spent| spent.matches_local_utxo(&missing))
         );
         assert_eq!(handle.clear_all_local_pending_spent().await, Ok(true));
-        assert!(
+        assert_eq!(
             handle
                 .current_snapshot()
                 .expect("cleared wallet view")
                 .pending_overlay
-                .local_pending_spent
-                .is_empty()
+                .local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
         {
             let mut overlay = handle.pending_overlay.write().await;
@@ -12460,13 +12458,9 @@ mod tests {
             Ok(WalletPendingSpentMarkOutcome::Marked),
             "a confirmed spend retires the local intent for the exact input"
         );
-        assert!(
-            handle
-                .pending_overlay
-                .read()
-                .await
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            handle.pending_overlay.read().await.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
 
         handle.retire_actor();
@@ -12512,13 +12506,9 @@ mod tests {
 
         assert_eq!(handle.clear_all_local_pending_spent().await, Ok(true));
         handle.utxos.write().await.push(latent);
-        assert!(
-            handle
-                .pending_overlay
-                .read()
-                .await
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            handle.pending_overlay.read().await.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
 
         cancel.cancel();
@@ -12552,13 +12542,9 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert!(
-            handle
-                .pending_overlay
-                .read()
-                .await
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            handle.pending_overlay.read().await.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
 
         cancel.cancel();
@@ -12600,11 +12586,9 @@ mod tests {
         );
         assert_eq!(clear_result.await.expect("clear result"), Ok(true));
         let final_snapshot = handle.current_snapshot().expect("final wallet view");
-        assert!(
-            final_snapshot
-                .pending_overlay
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            final_snapshot.pending_overlay.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
         assert_eq!(final_snapshot.revision, revision.wrapping_add(2));
 
@@ -12653,7 +12637,7 @@ mod tests {
         assert!(persisted.txid_merkleroot_index.is_none());
         assert!(persisted.source_operation_id.is_none());
         assert!(persisted.observation.is_none());
-        assert!(persisted.submitted_poi_list_keys.is_empty());
+        assert_eq!(persisted.submitted_poi_list_keys, [] as [FixedBytes<32>; 0]);
         assert!(persisted.terminal_error.is_none());
         let retained_checkpoint = db
             .get_wallet_meta(&cfg.cache_key)
@@ -12728,7 +12712,10 @@ mod tests {
             .expect("deduplicated pending context");
         assert_eq!(deduplicated.output_npk, first.output_npk);
         assert!(deduplicated.observation.is_none());
-        assert!(deduplicated.submitted_poi_list_keys.is_empty());
+        assert_eq!(
+            deduplicated.submitted_poi_list_keys,
+            [] as [FixedBytes<32>; 0]
+        );
         assert!(deduplicated.terminal_error.is_none());
 
         cache_store.fail_next_meta();
@@ -12809,13 +12796,9 @@ mod tests {
         );
         let revision_after_clear = *handle.rev_rx.borrow();
         assert!(revision_after_clear > revision);
-        assert!(
-            handle
-                .pending_overlay
-                .read()
-                .await
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            handle.pending_overlay.read().await.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
         assert!(
             db.get_pending_output_poi_context(
@@ -12841,13 +12824,9 @@ mod tests {
         )
         .await;
         assert_eq!(*handle.rev_rx.borrow(), revision_after_clear);
-        assert!(
-            handle
-                .pending_overlay
-                .read()
-                .await
-                .local_pending_spent
-                .is_empty()
+        assert_eq!(
+            handle.pending_overlay.read().await.local_pending_spent,
+            [] as [WalletPendingSpent; 0]
         );
         assert!(
             db.get_pending_output_poi_context(

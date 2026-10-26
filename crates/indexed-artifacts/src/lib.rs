@@ -3212,7 +3212,10 @@ mod tests {
         )
         .expect("empty replacement catalog covers superseded tail");
 
-        assert!(plan.required_current_chunks.is_empty());
+        assert_eq!(
+            plan.required_current_chunks,
+            [] as [IndexedArtifactPlannedChunk; 0]
+        );
         assert_eq!(coverage_ranges(&plan), vec![(100, 110)]);
     }
 
@@ -3244,7 +3247,10 @@ mod tests {
         )
         .expect("partial newer coverage keeps older non-overlapping coverage");
 
-        assert!(plan.required_current_chunks.is_empty());
+        assert_eq!(
+            plan.required_current_chunks,
+            [] as [IndexedArtifactPlannedChunk; 0]
+        );
         assert_eq!(
             coverage_ranges(&plan),
             vec![(100, 149), (150, 160), (161, 200)]
@@ -3381,8 +3387,14 @@ mod tests {
         let plan_without_later = plan_from_descriptors(std::slice::from_ref(&old_tail), &request)
             .expect("plan without later chunk");
 
-        assert!(plan_without_later.required_current_chunks.is_empty());
-        assert!(plan_without_later.optional_prior_tail_retention.is_empty());
+        assert_eq!(
+            plan_without_later.required_current_chunks,
+            [] as [IndexedArtifactPlannedChunk; 0]
+        );
+        assert_eq!(
+            plan_without_later.optional_prior_tail_retention,
+            [] as [IndexedArtifactPlannedChunk; 0]
+        );
 
         let current_tail = StreamFixture::descriptor(
             IndexedDatasetKind::PublicTxid,
@@ -4088,8 +4100,14 @@ mod tests {
         )
         .expect("irrelevant partitions are ignored");
 
-        assert!(plan.required_current_chunks.is_empty());
-        assert!(plan.required_current_coverage.is_empty());
+        assert_eq!(
+            plan.required_current_chunks,
+            [] as [IndexedArtifactPlannedChunk; 0]
+        );
+        assert_eq!(
+            plan.required_current_coverage,
+            [] as [IndexedArtifactStreamCoverage; 0]
+        );
     }
 
     #[test]

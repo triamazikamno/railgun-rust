@@ -1519,7 +1519,7 @@ mod tests {
             .expect_err("last attempt failed");
 
         assert!(failure.missing_txid);
-        assert!(!failure.summary.is_empty());
+        assert_ne!(failure.summary, "");
         assert_eq!(
             harness.positions(),
             vec![5, 5],
@@ -1846,7 +1846,7 @@ mod tests {
             .await
             .expect("a failed route open is not a send failure");
         assert_eq!(harness.routes.opens(), 1, "no output bypasses admission");
-        assert!(harness.routed_commitments().is_empty());
+        assert_eq!(harness.routed_commitments(), [] as [Vec<FixedBytes<32>>; 0]);
         assert!(
             harness.transport.sends().is_empty(),
             "no shared-client fallback"

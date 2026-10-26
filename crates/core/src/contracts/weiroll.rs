@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(slot(inputs(0)[0]), address_word(deposit.proxy));
         assert_eq!(inputs(0)[1..], [0xff_u8; 5]);
         let balance = output(0);
-        assert!(slot(balance).is_empty());
+        assert_eq!(slot(balance), [] as [u8; 0]);
 
         // output = math.scale(balance, destination_min, buy_amount)
         assert_eq!(selector(1), hex!("ca939f26"));
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(inputs(1)[3..], [0xff_u8; 3]);
         let scaled = output(1);
         assert_ne!(scaled, balance);
-        assert!(slot(scaled).is_empty());
+        assert_eq!(slot(scaled), [] as [u8; 0]);
 
         // input_token.approve(spoke_pool, balance)
         assert_eq!(selector(2), hex!("095ea7b3"));
