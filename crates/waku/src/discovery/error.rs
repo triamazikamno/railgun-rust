@@ -20,7 +20,7 @@ pub enum DnsResolveError {
     #[error("DoH DNS query encode failed: {0}")]
     DohEncode(#[source] hickory_resolver::proto::ProtoError),
     #[error("DoH response body read failed: {0}")]
-    DohBody(#[source] reqwest::Error),
+    DohBody(#[source] crate::http_body::BodyLimitError),
     #[error("DoH DNS message parse failed: {0}")]
     DohParse(#[source] hickory_resolver::proto::ProtoError),
     #[error("DoH returned DNS response code {0:?}")]

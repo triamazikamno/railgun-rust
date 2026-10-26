@@ -14,7 +14,7 @@ use waku::proto::{HashKey, WakuMessage};
 use waku::{
     DEFAULT_CLEARNET_DOH_ENDPOINT, DiscoveredPeer, PeerId, PeerSnapshot, PeerStats,
     StoreQueryOptions, WakuConfig, WakuError, WakuNetworkConfig, WakuNode, WakuTorClientProvider,
-    parse_multiaddr, parse_peer_id,
+    parse_multiaddr, parse_peer_id, read_limited_body,
 };
 
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
@@ -22,6 +22,7 @@ pub const DEFAULT_SHARD_ID: u32 = 1;
 const FEE_HISTORY_LOOKBACK: Duration = Duration::from_mins(2);
 const FEE_HISTORY_PAGE_LIMIT: u64 = 100;
 const DEFAULT_NWAKU_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const NWAKU_MAX_POLL_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_PEER_DELAY: Duration = Duration::from_mins(1);
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
     Some(n) => n,
@@ -308,11 +309,18 @@ async fn poll_nwaku_messages(
     };
     match response {
         Ok(resp) => {
-            let messages = tokio::select! {
+            let body = tokio::select! {
                 () = wait_for_relay_sink_closed(sink_tx) => return false,
-                messages = resp.json::<Vec<Message>>() => messages,
+                body = read_limited_body(resp, NWAKU_MAX_POLL_BYTES) => body,
             };
-            match messages {
+            let body = match body {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read messages from nwaku");
+                    return true;
+                }
+            };
+            match serde_json::from_slice::<Vec<Message>>(&body) {
                 Ok(messages) => {
                     for msg in messages {
                         if !content_topics.contains(&msg.content_topic) {
@@ -344,7 +352,7 @@ async fn poll_nwaku_messages(
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error.without_url(), "failed to decode messages from nwaku");
+                    tracing::warn!(%error, "failed to decode messages from nwaku");
                 }
             }
         }
@@ -911,11 +919,13 @@ fn add_tor_doh_fallback(config: &mut WakuConfig, fallback_endpoints_configured: 
 mod tests {
     use super::{
         CACHE_SIZE, Client, ClientConfig, ClientError, DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID,
-        HistoryFuture, RelayMessageOutcome, StoreHistory, add_tor_doh_fallback, forward_messages,
-        handle_relay_message, is_fee_content_topic, relay_shard_pubsub_path, relay_sink_is_closed,
+        HistoryFuture, NWAKU_MAX_POLL_BYTES, RelayMessageOutcome, StoreHistory,
+        add_tor_doh_fallback, forward_messages, handle_relay_message, is_fee_content_topic,
+        poll_nwaku_messages, relay_shard_pubsub_path, relay_sink_is_closed,
         wait_for_relay_sink_closed,
     };
     use lru::LruCache;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::mpsc as std_mpsc;
@@ -1340,5 +1350,67 @@ mod tests {
             error.url().is_none(),
             "endpoint credentials must not escape in errors"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_nwaku_poll_is_rejected_and_next_poll_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind nwaku endpoint");
+        let url = format!(
+            "http://{}/relay/v1/auto/messages",
+            listener.local_addr().expect("read listener address")
+        );
+        let server = thread::spawn(move || {
+            let mut buf = [0_u8; 1024];
+            let (mut stream, _) = listener.accept().expect("accept oversized poll");
+            let _ = stream.read(&mut buf);
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n[{{\"contentTopic\":\"{FEE_TOPIC}\",\"payload\":\"AQ==\"}}]"
+            )
+            .into_bytes();
+            // Trailing whitespace keeps the body valid JSON if it were read in full.
+            response.resize(response.len() + NWAKU_MAX_POLL_BYTES + 1, b' ');
+            let _ = stream.write_all(&response);
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().expect("accept next poll");
+            let _ = stream.read(&mut buf);
+            let body = format!("[{{\"contentTopic\":\"{FEE_TOPIC}\",\"payload\":\"Ag==\"}}]");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let http = reqwest::Client::new();
+        let topics = [FEE_TOPIC.to_string()];
+        let mut cache = LruCache::new(CACHE_SIZE);
+        let (sink_tx, mut sink_rx) = mpsc::channel(8);
+
+        assert!(
+            poll_nwaku_messages(
+                &http,
+                &url,
+                Duration::from_secs(10),
+                &topics,
+                &mut cache,
+                &sink_tx
+            )
+            .await
+        );
+        assert!(sink_rx.try_recv().is_err());
+
+        assert!(
+            poll_nwaku_messages(
+                &http,
+                &url,
+                Duration::from_secs(10),
+                &topics,
+                &mut cache,
+                &sink_tx
+            )
+            .await
+        );
+        assert_eq!(sink_rx.try_recv(), Ok(fee_message(2)));
+        server.join().expect("nwaku endpoint thread exits");
     }
 }

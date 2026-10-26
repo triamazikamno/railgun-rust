@@ -1,18 +1,25 @@
 use super::error::DnsResolveError;
+use crate::http_body::read_limited_body;
 use hickory_resolver::proto::op::{Message, Query, ResponseCode};
 use hickory_resolver::proto::rr::rdata::TXT;
 use hickory_resolver::proto::rr::{Name, RData, RecordType};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 const DNS_MESSAGE_CONTENT_TYPE: &str = "application/dns-message";
+const DOH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+// RFC 8484 caps DNS messages at 65535 bytes.
+const DOH_MAX_RESPONSE_BYTES: usize = 65_535;
 
 #[derive(Clone)]
 pub(super) struct TxtResolver {
     doh_endpoints: Vec<String>,
     http: Client,
+    // Per request, not client-wide: in Tor/proxy modes `http` is the wallet's shared client.
+    doh_request_timeout: Duration,
     system: Option<hickory_resolver::TokioResolver>,
     cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
@@ -44,6 +51,7 @@ impl TxtResolver {
         Ok(Self {
             doh_endpoints,
             http,
+            doh_request_timeout: DOH_REQUEST_TIMEOUT,
             system,
             cache: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -113,6 +121,7 @@ impl TxtResolver {
             .header(reqwest::header::CONTENT_TYPE, DNS_MESSAGE_CONTENT_TYPE)
             .header(reqwest::header::ACCEPT, DNS_MESSAGE_CONTENT_TYPE)
             .body(request)
+            .timeout(self.doh_request_timeout)
             .send()
             .await
             .map_err(DnsResolveError::DohRequest)?;
@@ -122,7 +131,9 @@ impl TxtResolver {
             return Err(DnsResolveError::DohStatus(status));
         }
 
-        let body = resp.bytes().await.map_err(DnsResolveError::DohBody)?;
+        let body = read_limited_body(resp, DOH_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(DnsResolveError::DohBody)?;
         let parsed = Message::from_vec(&body).map_err(DnsResolveError::DohParse)?;
         if parsed.response_code() != ResponseCode::NoError {
             return Err(DnsResolveError::DohResponseCode(parsed.response_code()));
@@ -262,6 +273,46 @@ mod tests {
             .resolve_txt("example.invalid")
             .await
             .expect("fallback DoH TXT lookup");
+
+        assert_eq!(records, vec!["fallback"]);
+    }
+
+    #[tokio::test]
+    async fn stalled_doh_body_times_out_and_falls_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled DoH server");
+        let stalled_endpoint = format!(
+            "http://{}/dns-query",
+            listener.local_addr().expect("stalled DoH addr")
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {DNS_MESSAGE_CONTENT_TYPE}\r\ncontent-length: 512\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = release_rx.recv();
+            }
+        });
+        let fallback_endpoint = spawn_doh_response(
+            "200 OK",
+            txt_response_body("example.invalid", vec!["fallback".to_string()]),
+        );
+        let mut resolver =
+            TxtResolver::new_with_endpoints(vec![stalled_endpoint, fallback_endpoint], None, false)
+                .expect("resolver");
+        resolver.doh_request_timeout = Duration::from_millis(200);
+
+        let records = tokio::time::timeout(
+            Duration::from_secs(5),
+            resolver.resolve_txt("example.invalid"),
+        )
+        .await
+        .expect("stalled DoH body must not block fallback")
+        .expect("fallback DoH TXT lookup");
+        drop(release_tx);
 
         assert_eq!(records, vec!["fallback"]);
     }
