@@ -108,8 +108,35 @@ impl StoreQueryOptions {
     }
 }
 
+const MAX_LEARNED_PEERS: usize = 256;
+const MAX_ADDRS_PER_PEER: usize = 16;
+
+/// Where a peer book entry came from, weakest first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PeerSource {
+    #[default]
+    Learned,
+    Dns {
+        last_round: u64,
+    },
+    Configured,
+}
+
+impl PeerSource {
+    const fn upgraded(self, incoming: Self) -> Self {
+        match (self, incoming) {
+            (_, Self::Configured) | (Self::Learned, Self::Dns { .. }) => incoming,
+            (Self::Dns { last_round: old }, Self::Dns { last_round: new }) => Self::Dns {
+                last_round: if new > old { new } else { old },
+            },
+            (current, _) => current,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct PeerState {
+    source: PeerSource,
     addrs: Vec<Multiaddr>,
     connected: bool,
     supports_lightpush_v3: bool,
@@ -190,27 +217,146 @@ fn record_dial_failure(state: &mut PeerState, now: Instant) {
     state.next_dial_at = Some(now + backoff);
 }
 
+fn apply_addr_policy(tor: bool, addrs: &mut Vec<Multiaddr>) {
+    if tor {
+        retain_tor_safe_addrs(addrs);
+    } else {
+        addrs.sort();
+    }
+}
+
+/// Keeps the most recently announced addresses, then sorts them by the address policy.
+fn merge_addrs(addrs: &mut Vec<Multiaddr>, announced: Vec<Multiaddr>, tor: bool) {
+    let mut merged = Vec::with_capacity(MAX_ADDRS_PER_PEER);
+    for addr in announced.into_iter().chain(std::mem::take(addrs)) {
+        if merged.len() == MAX_ADDRS_PER_PEER {
+            break;
+        }
+        if !merged.contains(&addr) {
+            merged.push(addr);
+        }
+    }
+    apply_addr_policy(tor, &mut merged);
+    *addrs = merged;
+}
+
+fn is_idle(book: &PeerBook, peer_id: &PeerId) -> bool {
+    !book.connected.contains(peer_id) && !book.dialing.contains(peer_id)
+}
+
+/// Evicts idle learned peers without addresses, then those with the most dial failures, until
+/// fewer than `MAX_LEARNED_PEERS` remain or nothing is eligible. Returns the learned count.
+fn evict_idle_learned_peers(book: &mut PeerBook) -> usize {
+    let mut learned = book
+        .peers
+        .values()
+        .filter(|state| state.source == PeerSource::Learned)
+        .count();
+    while learned >= MAX_LEARNED_PEERS {
+        let victim = book
+            .peers
+            .iter()
+            .filter(|(peer_id, state)| {
+                state.source == PeerSource::Learned && is_idle(book, peer_id)
+            })
+            .max_by_key(|(_, state)| (state.addrs.is_empty(), state.dial_failures))
+            .filter(|(_, state)| state.addrs.is_empty() || state.dial_failures > 0)
+            .map(|(peer_id, _)| *peer_id);
+        let Some(victim) = victim else { break };
+        book.peers.remove(&victim);
+        learned -= 1;
+    }
+    learned
+}
+
+/// Adds or updates a peer. A new learned peer needs a free learned slot. Returns whether the
+/// peer is in the book afterwards.
+fn insert_peer(
+    book: &mut PeerBook,
+    peer_id: PeerId,
+    addrs: Vec<Multiaddr>,
+    source: PeerSource,
+    tor: bool,
+) -> bool {
+    if let Some(state) = book.peers.get_mut(&peer_id) {
+        state.source = state.source.upgraded(source);
+        merge_addrs(&mut state.addrs, addrs, tor);
+        return true;
+    }
+    if source == PeerSource::Learned && evict_idle_learned_peers(book) >= MAX_LEARNED_PEERS {
+        debug!(%peer_id, "learned peer limit reached, dropping peer");
+        return false;
+    }
+    let mut state = PeerState {
+        source,
+        ..PeerState::default()
+    };
+    merge_addrs(&mut state.addrs, addrs, tor);
+    book.peers.insert(peer_id, state);
+    true
+}
+
+/// Removes the least recently discovered idle DNS peers until at most `bound` remain.
+fn retain_dns_peers(book: &mut PeerBook, bound: usize) {
+    let dns = book
+        .peers
+        .values()
+        .filter(|state| matches!(state.source, PeerSource::Dns { .. }))
+        .count();
+    if dns <= bound {
+        return;
+    }
+    let mut idle = book
+        .peers
+        .iter()
+        .filter_map(|(peer_id, state)| match state.source {
+            PeerSource::Dns { last_round } if is_idle(book, peer_id) => {
+                Some((last_round, *peer_id))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    idle.sort_unstable_by_key(|(last_round, _)| *last_round);
+    for (_, peer_id) in idle.into_iter().take(dns - bound) {
+        book.peers.remove(&peer_id);
+    }
+}
+
 fn remap_wrong_peer_id(
     book: &mut PeerBook,
     expected_peer_id: PeerId,
     obtained_peer_id: PeerId,
     address: &Multiaddr,
     now: Instant,
+    tor: bool,
 ) {
     let dialed_addr = without_trailing_peer_id(address);
-    if let Some(state) = book.peers.get_mut(&expected_peer_id) {
+    let expected_exhausted = book.peers.get_mut(&expected_peer_id).is_some_and(|state| {
         state
             .addrs
             .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
         record_dial_failure(state, now);
+        state.source == PeerSource::Learned && state.addrs.is_empty()
+    });
+    if expected_exhausted && is_idle(book, &expected_peer_id) {
+        book.peers.remove(&expected_peer_id);
     }
 
     let remapped_addr = with_peer_id(address, obtained_peer_id);
-    let obtained_state = book.peers.entry(obtained_peer_id).or_default();
-    obtained_state
-        .addrs
-        .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
-    obtained_state.addrs.push(remapped_addr);
+    if let Some(state) = book.peers.get_mut(&obtained_peer_id) {
+        state
+            .addrs
+            .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
+        merge_addrs(&mut state.addrs, vec![remapped_addr], tor);
+    } else {
+        insert_peer(
+            book,
+            obtained_peer_id,
+            vec![remapped_addr],
+            PeerSource::Learned,
+            tor,
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -424,6 +570,7 @@ struct NodeInner {
     metadata_response: proto::metadata::WakuMetadataResponse,
     peer_exchange_cooldown: Duration,
     op_counter: AtomicU64,
+    dns_round: AtomicU64,
     store_peer_tx: broadcast::Sender<PeerId>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -443,11 +590,7 @@ impl NodeInner {
     }
 
     fn apply_addr_policy(&self, addrs: &mut Vec<Multiaddr>) {
-        if self.uses_tor_profile() {
-            retain_tor_safe_addrs(addrs);
-        } else {
-            addrs.sort();
-        }
+        apply_addr_policy(self.uses_tor_profile(), addrs);
     }
 
     fn maybe_dial(&self) {
@@ -491,7 +634,8 @@ impl NodeInner {
 
     async fn discover(&self) -> Result<usize, discovery::DiscoveryError> {
         let peers = self.discovery_config.discover_all().await?;
-        Ok(self.apply_discovered_peers(peers))
+        let round = self.dns_round.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(self.apply_discovered_peers(peers, PeerSource::Dns { last_round: round }))
     }
 
     async fn peer_exchange_rounds(&self, rounds: usize) -> Result<(), WakuError> {
@@ -518,26 +662,36 @@ impl NodeInner {
         rx.await.map_err(|_| WakuError::Cancelled)
     }
 
-    fn apply_discovered_peers(&self, peers: Vec<discovery::DiscoveredPeer>) -> usize {
+    fn apply_discovered_peers(
+        &self,
+        peers: Vec<discovery::DiscoveredPeer>,
+        source: PeerSource,
+    ) -> usize {
         let discovered = peers.len();
-        let mut usable = 0;
-        let known;
-
-        {
-            let mut book = self.peer_book.write();
-            for mut peer in peers {
+        let tor = self.uses_tor_profile();
+        let peers = peers
+            .into_iter()
+            .filter_map(|mut peer| {
                 self.apply_addr_policy(&mut peer.addrs);
-                if peer.addrs.is_empty() {
-                    continue;
-                }
-                usable += 1;
-                let entry = book.peers.entry(peer.peer_id).or_default();
-                entry.addrs.extend(peer.addrs);
-                self.apply_addr_policy(&mut entry.addrs);
-                entry.addrs.dedup();
+                (!peer.addrs.is_empty()).then_some(peer)
+            })
+            .collect::<Vec<_>>();
+        let usable = peers.len();
+
+        let known = {
+            let mut book = self.peer_book.write();
+            for peer in peers {
+                insert_peer(&mut book, peer.peer_id, peer.addrs, source, tor);
             }
-            known = book.peers.len();
-        }
+            if matches!(source, PeerSource::Dns { .. }) {
+                let bound = self
+                    .discovery_config
+                    .max_enrs_per_tree
+                    .saturating_mul(self.discovery_config.enr_trees.len());
+                retain_dns_peers(&mut book, bound);
+            }
+            book.peers.len()
+        };
 
         debug!(discovered, usable, known, "applied discovered peers");
         self.maybe_dial();
@@ -896,7 +1050,14 @@ impl NodeInner {
                         %address,
                         "remapping stale peer address to authenticated peer id"
                     );
-                    remap_wrong_peer_id(&mut book, peer_id, obtained, &address, now);
+                    remap_wrong_peer_id(
+                        &mut book,
+                        peer_id,
+                        obtained,
+                        &address,
+                        now,
+                        self.uses_tor_profile(),
+                    );
                 } else if let Some(state) = book.peers.get_mut(&peer_id) {
                     record_dial_failure(state, now);
                 }
@@ -930,9 +1091,7 @@ impl NodeInner {
                     entry.supports_peer_exchange = supports_px;
                     entry.supports_filter = supports_filter;
                     entry.supports_store = supports_store;
-                    entry.addrs.extend(addrs);
-                    self.apply_addr_policy(&mut entry.addrs);
-                    entry.addrs.dedup();
+                    merge_addrs(&mut entry.addrs, addrs, self.uses_tor_profile());
                     became_store_capable
                 };
 
@@ -1155,9 +1314,19 @@ impl NodeInner {
             if let Ok(response) = result
                 && let Some(resp) = response.response
             {
-                batch
-                    .results
-                    .extend(resp.peer_infos.into_iter().filter_map(|p| p.enr));
+                let records = resp.peer_infos.len();
+                if u64::try_from(records)
+                    .is_ok_and(|records| records <= self.config.peer_exchange_peers_per_query)
+                {
+                    batch
+                        .results
+                        .extend(resp.peer_infos.into_iter().filter_map(|p| p.enr));
+                } else {
+                    debug!(
+                        records,
+                        "discarding peer exchange response with too many records"
+                    );
+                }
             }
 
             if batch.finished < batch.expected {
@@ -1174,23 +1343,11 @@ impl NodeInner {
     }
 
     async fn finish_peer_exchange_batch(&self, batch_id: usize, enrs: Vec<Vec<u8>>) {
-        {
-            let mut book = self.peer_book.write();
-            for enr_rlp in enrs {
-                if let Ok(mut peer) = discovery::enr::decode_enr_rlp(&enr_rlp) {
-                    self.apply_addr_policy(&mut peer.addrs);
-                    if peer.addrs.is_empty() {
-                        continue;
-                    }
-                    let entry = book.peers.entry(peer.peer_id).or_default();
-                    entry.addrs.extend(peer.addrs);
-                    self.apply_addr_policy(&mut entry.addrs);
-                    entry.addrs.dedup();
-                }
-            }
-        }
-
-        self.maybe_dial();
+        let peers = enrs
+            .into_iter()
+            .filter_map(|enr| discovery::enr::decode_enr_rlp(&enr).ok())
+            .collect();
+        self.apply_discovered_peers(peers, PeerSource::Learned);
 
         let op_id = {
             let mut px = self.ops.peer_exchange.lock().await;
@@ -1587,7 +1744,9 @@ mod tests {
         let dialed_addr = addr("/ip4/45.76.230.253/tcp/30304");
         let mut book = PeerBook::default();
 
-        book.peers.entry(advertised_peer).or_default().addrs = vec![stale_addr.clone()];
+        let advertised = book.peers.entry(advertised_peer).or_default();
+        advertised.addrs = vec![stale_addr.clone()];
+        advertised.source = PeerSource::Dns { last_round: 1 };
 
         remap_wrong_peer_id(
             &mut book,
@@ -1595,6 +1754,7 @@ mod tests {
             authenticated_peer,
             &stale_addr,
             Instant::now(),
+            false,
         );
 
         let advertised_state = book.peers.get(&advertised_peer).expect("advertised peer");
@@ -1626,5 +1786,456 @@ mod tests {
 
         assert!(node.is_shutdown());
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    fn test_node(discovery_config: DiscoveryConfig) -> NodeInner {
+        let (transport_tx, _) = mpsc::channel(64);
+        let (dial_tx, _) = mpsc::channel(64);
+        let (store_peer_tx, _) = broadcast::channel(STORE_PEER_EVENT_CAPACITY);
+        let (shutdown_tx, _) = watch::channel(false);
+        NodeInner {
+            config: NodeConfig::default(),
+            discovery_config,
+            network_profile: WakuTransportProfile::Direct,
+            peer_book: Arc::new(RwLock::new(PeerBook::default())),
+            session_refresh_disconnects: RwLock::new(HashSet::new()),
+            discovery_wake: Notify::new(),
+            ops: OpTracker::new(),
+            transport_tx,
+            dial_tx,
+            metadata_response: proto::metadata::WakuMetadataResponse::default(),
+            peer_exchange_cooldown: Duration::from_mins(1),
+            op_counter: AtomicU64::new(1),
+            dns_round: AtomicU64::new(0),
+            store_peer_tx,
+            shutdown_tx,
+        }
+    }
+
+    fn test_enr_rlp(seed: u32) -> Vec<u8> {
+        use enr::k256::ecdsa::SigningKey;
+        let mut secret = [0_u8; 32];
+        secret[28..].copy_from_slice(&(seed + 1).to_be_bytes());
+        let key = SigningKey::from_slice(&secret).expect("test ENR key");
+        let enr = enr::Enr::<SigningKey>::builder()
+            .ip4(std::net::Ipv4Addr::from(0x0a00_0000 + seed))
+            .tcp4(60000)
+            .add_value("waku2", &[1_u8].as_slice())
+            .build(&key)
+            .expect("test ENR");
+        alloy_rlp::encode(&enr)
+    }
+
+    fn peer_addr(n: usize) -> Multiaddr {
+        addr(&format!("/ip4/10.0.{}.{}/tcp/60000", n / 256, n % 256))
+    }
+
+    fn learned_count(book: &PeerBook) -> usize {
+        book.peers
+            .values()
+            .filter(|state| state.source == PeerSource::Learned)
+            .count()
+    }
+
+    fn offer_learned(book: &mut PeerBook) -> (PeerId, bool) {
+        let peer_id = PeerId::random();
+        let inserted = insert_peer(
+            book,
+            peer_id,
+            vec![peer_addr(1_000)],
+            PeerSource::Learned,
+            false,
+        );
+        (peer_id, inserted)
+    }
+
+    /// Fills the book with healthy learned peers; peer `n` has `peer_addr(n)`.
+    fn fill_learned(book: &mut PeerBook) -> Vec<PeerId> {
+        (0..MAX_LEARNED_PEERS)
+            .map(|n| {
+                let peer_id = PeerId::random();
+                assert!(insert_peer(
+                    book,
+                    peer_id,
+                    vec![peer_addr(n)],
+                    PeerSource::Learned,
+                    false
+                ));
+                peer_id
+            })
+            .collect()
+    }
+
+    fn state_mut(book: &mut PeerBook, peer_id: PeerId) -> &mut PeerState {
+        book.peers.get_mut(&peer_id).expect("peer state")
+    }
+
+    #[tokio::test]
+    async fn peer_exchange_response_above_requested_count_is_discarded() {
+        let node = test_node(DiscoveryConfig::default());
+        for (records, added) in [(61, 0), (60, 60)] {
+            let req_id = node.ops.next_req_id();
+            {
+                let mut px = node.ops.peer_exchange.lock().await;
+                px.pending.insert(req_id, 0);
+                px.ops.insert(
+                    0,
+                    ResponseBatch {
+                        expected: 1,
+                        finished: 0,
+                        results: Vec::new(),
+                        deadline: Instant::now() + Duration::from_secs(10),
+                    },
+                );
+            }
+            let peer_infos = (0..records)
+                .map(|seed| proto::peer_exchange::PeerInfo {
+                    enr: Some(test_enr_rlp(seed)),
+                })
+                .collect();
+            let rpc = proto::peer_exchange::PeerExchangeRpc {
+                query: None,
+                response: Some(proto::peer_exchange::PeerExchangeResponse { peer_infos }),
+            };
+            node.handle_peer_exchange_response(req_id, Ok(rpc)).await;
+            assert_eq!(
+                node.peer_book.read().peers.len(),
+                added,
+                "{records} records"
+            );
+        }
+    }
+
+    #[test]
+    fn learned_flood_keeps_configured_and_dns_peers() {
+        let mut book = PeerBook::default();
+        let configured = PeerId::random();
+        let dns = PeerId::random();
+        insert_peer(
+            &mut book,
+            configured,
+            vec![peer_addr(0)],
+            PeerSource::Configured,
+            false,
+        );
+        insert_peer(
+            &mut book,
+            dns,
+            vec![peer_addr(1)],
+            PeerSource::Dns { last_round: 1 },
+            false,
+        );
+        for peer_id in [configured, dns] {
+            state_mut(&mut book, peer_id).dial_failures = 9;
+        }
+
+        for n in 0..1_000 {
+            let peer_id = PeerId::random();
+            if insert_peer(
+                &mut book,
+                peer_id,
+                vec![peer_addr(n + 2)],
+                PeerSource::Learned,
+                false,
+            ) {
+                state_mut(&mut book, peer_id).dial_failures = 1;
+            }
+        }
+
+        assert_eq!(learned_count(&book), MAX_LEARNED_PEERS);
+        assert_eq!(book.peers[&configured].source, PeerSource::Configured);
+        assert_eq!(book.peers[&configured].addrs, vec![peer_addr(0)]);
+        assert_eq!(book.peers[&dns].source, PeerSource::Dns { last_round: 1 });
+        assert_eq!(book.peers[&dns].addrs, vec![peer_addr(1)]);
+    }
+
+    #[test]
+    fn full_learned_book_evicts_idle_empty_then_most_failed_else_drops_newcomer() {
+        let mut book = PeerBook::default();
+        let peers = fill_learned(&mut book);
+        let (empty, failing, worse) = (peers[0], peers[1], peers[2]);
+        state_mut(&mut book, empty).addrs.clear();
+        state_mut(&mut book, failing).dial_failures = 1;
+        state_mut(&mut book, worse).dial_failures = 3;
+
+        assert!(offer_learned(&mut book).1);
+        assert!(!book.peers.contains_key(&empty));
+        assert!(book.peers.contains_key(&worse));
+        assert!(offer_learned(&mut book).1);
+        assert!(!book.peers.contains_key(&worse));
+        assert!(offer_learned(&mut book).1);
+        assert!(!book.peers.contains_key(&failing));
+
+        let (dropped, inserted) = offer_learned(&mut book);
+        assert!(!inserted);
+        assert!(!book.peers.contains_key(&dropped));
+        assert_eq!(learned_count(&book), MAX_LEARNED_PEERS);
+    }
+
+    #[test]
+    fn connected_or_dialing_learned_peers_are_not_evicted() {
+        for dialing in [false, true] {
+            let mut book = PeerBook::default();
+            let peers = fill_learned(&mut book);
+            let (busy, failing) = (peers[0], peers[1]);
+            state_mut(&mut book, busy).dial_failures = 9;
+            state_mut(&mut book, failing).dial_failures = 1;
+            if dialing {
+                book.dialing.insert(busy);
+            } else {
+                book.connected.insert(busy);
+            }
+
+            assert!(offer_learned(&mut book).1);
+            assert!(!book.peers.contains_key(&failing));
+            assert!(!offer_learned(&mut book).1);
+            assert!(book.peers.contains_key(&busy));
+        }
+    }
+
+    #[test]
+    fn connection_path_overshoot_is_reclaimed_at_next_learned_insertion() {
+        let mut book = PeerBook::default();
+        let failing = fill_learned(&mut book)[0];
+        state_mut(&mut book, failing).dial_failures = 1;
+        let extra = (0..3).map(|_| PeerId::random()).collect::<Vec<_>>();
+        for peer_id in &extra {
+            book.connected.insert(*peer_id);
+            book.peers.entry(*peer_id).or_default().connected = true;
+        }
+        assert_eq!(learned_count(&book), MAX_LEARNED_PEERS + extra.len());
+
+        for peer_id in &extra {
+            book.connected.remove(peer_id);
+            let state = state_mut(&mut book, *peer_id);
+            state.connected = false;
+            state.dial_failures = 1;
+        }
+        assert!(offer_learned(&mut book).1);
+        assert_eq!(learned_count(&book), MAX_LEARNED_PEERS);
+        assert!(
+            extra
+                .iter()
+                .all(|peer_id| !book.peers.contains_key(peer_id))
+        );
+    }
+
+    #[test]
+    fn wrong_identity_endpoint_keeps_learned_peers_at_cap() {
+        let mut book = PeerBook::default();
+        let peers = fill_learned(&mut book);
+        let endpoint = peer_addr(0);
+        let mut expected = peers[0];
+        for _ in 0..100 {
+            let obtained = PeerId::random();
+            remap_wrong_peer_id(
+                &mut book,
+                expected,
+                obtained,
+                &with_peer_id(&endpoint, expected),
+                Instant::now(),
+                false,
+            );
+            assert!(!book.peers.contains_key(&expected));
+            assert_eq!(
+                book.peers[&obtained].addrs,
+                vec![with_peer_id(&endpoint, obtained)]
+            );
+            assert_eq!(learned_count(&book), MAX_LEARNED_PEERS);
+            expected = obtained;
+        }
+    }
+
+    #[test]
+    fn dns_retention_keeps_most_recently_seen_within_quota() {
+        let node = test_node(DiscoveryConfig {
+            max_enrs_per_tree: 4,
+            ..DiscoveryConfig::default()
+        });
+        assert_eq!(node.discovery_config.enr_trees.len(), 1);
+        let mut next_addr = 0;
+        let mut batch = |reseen: &[PeerId], fresh: usize| {
+            let mut peers = reseen.to_vec();
+            peers.extend((0..fresh).map(|_| PeerId::random()));
+            let discovered = peers
+                .iter()
+                .map(|peer_id| {
+                    next_addr += 1;
+                    discovery::DiscoveredPeer {
+                        peer_id: *peer_id,
+                        addrs: vec![peer_addr(next_addr)],
+                    }
+                })
+                .collect::<Vec<_>>();
+            (peers, discovered)
+        };
+
+        let (first, discovered) = batch(&[], 2);
+        node.apply_discovered_peers(discovered, PeerSource::Dns { last_round: 1 });
+        let (_, discovered) = batch(&[], 2);
+        node.apply_discovered_peers(discovered, PeerSource::Dns { last_round: 2 });
+        // Re-seeing a round-1 peer keeps it over the round-2 peers.
+        let (latest, discovered) = batch(&first[..1], 3);
+        node.apply_discovered_peers(discovered, PeerSource::Dns { last_round: 3 });
+        let retained = node
+            .peer_book
+            .read()
+            .peers
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(retained, latest.into_iter().collect());
+
+        let (newest, discovered) = batch(&[], 4);
+        node.apply_discovered_peers(discovered, PeerSource::Dns { last_round: 4 });
+        let book = node.peer_book.read();
+        assert_eq!(book.peers.len(), 4);
+        assert!(
+            newest
+                .iter()
+                .all(|peer_id| book.peers.contains_key(peer_id))
+        );
+    }
+
+    #[test]
+    fn stronger_sources_upgrade_and_weaker_never_downgrade() {
+        let mut book = PeerBook::default();
+        let peer_id = PeerId::random();
+        let mut offer = |source| {
+            insert_peer(&mut book, peer_id, vec![peer_addr(0)], source, false);
+            book.peers[&peer_id].source
+        };
+        let dns = PeerSource::Dns { last_round: 2 };
+
+        assert_eq!(offer(PeerSource::Learned), PeerSource::Learned);
+        assert_eq!(offer(dns), dns);
+        assert_eq!(offer(PeerSource::Learned), dns);
+        assert_eq!(offer(PeerSource::Configured), PeerSource::Configured);
+        assert_eq!(offer(PeerSource::Learned), PeerSource::Configured);
+        assert_eq!(offer(dns), PeerSource::Configured);
+    }
+
+    #[test]
+    fn address_merge_dedups_and_keeps_newest_sixteen() {
+        let (first, second) = (peer_addr(1), peer_addr(2));
+        let mut addrs = Vec::new();
+        for _ in 0..10 {
+            merge_addrs(&mut addrs, vec![first.clone()], false);
+            merge_addrs(&mut addrs, vec![second.clone()], false);
+        }
+        assert_eq!(addrs, vec![first, second]);
+
+        let mut addrs = (0..MAX_ADDRS_PER_PEER).map(peer_addr).collect::<Vec<_>>();
+        let newest = addr("/ip4/10.255.0.1/tcp/60000");
+        merge_addrs(&mut addrs, vec![newest.clone()], false);
+        assert_eq!(addrs.len(), MAX_ADDRS_PER_PEER);
+        assert_eq!(addrs.last(), Some(&newest));
+    }
+
+    #[tokio::test]
+    #[ignore = "runs peer exchange against the live Waku fleet"]
+    async fn live_peer_exchange_responses_fit_request_and_frame() {
+        let transport = crate::transport::Transport::new(
+            &NodeConfig::default(),
+            &crate::config::WakuNetworkConfig::direct(),
+        )
+        .expect("transport");
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (filter_push_tx, _filter_push_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(transport.run(cmd_rx, event_tx, filter_push_tx, shutdown_rx));
+
+        let peers = DiscoveryConfig::default()
+            .discover_all()
+            .await
+            .expect("live discovery");
+        let dialed = peers.len().min(8);
+        for peer in peers.into_iter().take(dialed) {
+            cmd_tx
+                .send(TransportCmd::Dial {
+                    peer_id: peer.peer_id,
+                    addrs: peer.addrs,
+                })
+                .await
+                .expect("dial command");
+        }
+
+        let mut asked = HashSet::new();
+        let mut failed_dials = HashSet::new();
+        let mut pending = 0_usize;
+        let mut next_req_id = 0;
+        let mut responses = Vec::new();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, event_rx.recv()).await {
+            match event {
+                TransportEvent::IdentifyReceived {
+                    peer_id,
+                    protocols: supported,
+                    ..
+                } if supported
+                    .iter()
+                    .any(|p| p == protocols::peer_exchange::PEER_EXCHANGE_CODEC)
+                    && asked.insert(peer_id) =>
+                {
+                    next_req_id += 1;
+                    let request = proto::peer_exchange::PeerExchangeRpc {
+                        query: Some(proto::peer_exchange::PeerExchangeQuery {
+                            num_peers: Some(60),
+                        }),
+                        response: None,
+                    };
+                    cmd_tx
+                        .send(TransportCmd::SendPeerExchange {
+                            req_id: next_req_id,
+                            peer_id,
+                            request,
+                        })
+                        .await
+                        .expect("peer exchange command");
+                    pending += 1;
+                }
+                TransportEvent::MetadataRequest { channel, .. } => {
+                    // The Railgun fleet (waku-relay's defaults) drops peers outside cluster 5.
+                    let response = proto::metadata::WakuMetadataResponse {
+                        cluster_id: Some(5),
+                        shards: vec![1],
+                    };
+                    cmd_tx
+                        .send(TransportCmd::SendMetadataResponse { channel, response })
+                        .await
+                        .expect("metadata response command");
+                }
+                TransportEvent::DialError { peer_id, .. } => {
+                    failed_dials.insert(peer_id);
+                }
+                TransportEvent::PeerExchangeResponse { result, .. } => {
+                    pending -= 1;
+                    match result {
+                        Ok(rpc) => {
+                            let records = rpc.response.as_ref().map_or(0, |r| r.peer_infos.len());
+                            let bytes = prost::Message::encoded_len(&rpc);
+                            eprintln!("peer exchange response: {records} records, {bytes} bytes");
+                            responses.push((records, bytes));
+                        }
+                        Err(error) => eprintln!("peer exchange failed: {error}"),
+                    }
+                }
+                _ => {}
+            }
+            if pending == 0 && asked.len() + failed_dials.len() >= dialed {
+                break;
+            }
+        }
+        let _ = shutdown_tx.send(true);
+
+        assert!(
+            !responses.is_empty(),
+            "no successful peer exchange response"
+        );
+        for (records, bytes) in responses {
+            assert!(records <= 60);
+            assert!(bytes <= protocols::peer_exchange::PEER_EXCHANGE_RESPONSE_MAX_BYTES);
+        }
     }
 }

@@ -18,7 +18,7 @@ use crate::types::OpId;
 
 use super::{
     FilterBatch, FilterOp, FilterState, LightPushResult, NodeInner, OpTracker, PeerBook,
-    PeerSnapshot, PeerStats, ResponseBatch, STORE_PEER_EVENT_CAPACITY, StorePending,
+    PeerSnapshot, PeerSource, PeerStats, ResponseBatch, STORE_PEER_EVENT_CAPACITY, StorePending,
     StoreQueryOptions, SubId, Subscription, WakuNode, build_filter_request,
     remove_lightpush_operation, store_status_ok,
 };
@@ -68,6 +68,7 @@ impl WakuNode {
             metadata_response,
             peer_exchange_cooldown: config.peer_exchange_cooldown,
             op_counter: AtomicU64::new(1),
+            dns_round: AtomicU64::new(0),
             store_peer_tx,
             shutdown_tx,
         });
@@ -115,7 +116,8 @@ impl WakuNode {
     }
 
     pub fn add_additional_peers(&self, peers: Vec<discovery::DiscoveredPeer>) {
-        self.inner.apply_discovered_peers(peers);
+        self.inner
+            .apply_discovered_peers(peers, PeerSource::Configured);
     }
 
     /// Refresh peer dialing after the underlying network session changes.

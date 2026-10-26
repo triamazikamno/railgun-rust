@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use libp2p::request_response;
 
 pub(crate) const PEER_EXCHANGE_CODEC: &str = "/vac/waku/peer-exchange/2.0.0-alpha1";
-// nwaku a0087c1 waku_peer_exchange/common.nim DefaultMaxRpcSize (10 * 153_600 + 65_536).
-pub(crate) const PEER_EXCHANGE_RESPONSE_MAX_BYTES: usize = 1_601_536;
+// 60 requested records at EIP-778's 300-byte ENR limit (enforced by `enr`) fit well within 64 KiB.
+pub(crate) const PEER_EXCHANGE_RESPONSE_MAX_BYTES: usize = 65_536;
 
 #[derive(Clone, Default)]
 pub(crate) struct PeerExchangeCodec;
