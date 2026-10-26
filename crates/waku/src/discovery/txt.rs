@@ -82,11 +82,7 @@ impl TxtResolver {
                     source,
                 })?;
 
-        Ok(response
-            .iter()
-            .flat_map(hickory_resolver::proto::rr::rdata::TXT::txt_data)
-            .map(|part| String::from_utf8_lossy(part).into_owned())
-            .collect())
+        Ok(response.iter().map(txt_to_string).collect())
     }
 
     async fn resolve_txt_doh(&self, domain: &str) -> Result<Vec<String>, DnsResolveError> {
@@ -164,6 +160,8 @@ fn txt_to_string(txt: &TXT) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
+    use hickory_resolver::name_server::TokioConnectionProvider;
     use hickory_resolver::proto::op::MessageType;
     use hickory_resolver::proto::rr::Record;
     use std::io::{Read, Write};
@@ -266,5 +264,47 @@ mod tests {
             .expect("fallback DoH TXT lookup");
 
         assert_eq!(records, vec!["fallback"]);
+    }
+
+    #[tokio::test]
+    async fn system_txt_record_strings_are_joined() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind mock DNS server");
+        let dns_addr = socket.local_addr().expect("mock DNS addr");
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 512];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf) {
+                let query = Message::from_vec(&buf[..len]).expect("parse mock DNS query");
+                let mut response = Message::from_vec(&txt_response_body(
+                    "example.com",
+                    vec!["part1".to_string(), "part2".to_string()],
+                ))
+                .expect("parse mock DNS response");
+                response.set_id(query.id());
+                let bytes = response.to_vec().expect("encode mock DNS response");
+                let _ = socket.send_to(&bytes, peer);
+            }
+        });
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            NameServerConfigGroup::from_ips_clear(&[dns_addr.ip()], dns_addr.port(), true),
+        );
+        let endpoint = spawn_doh_response("503 Service Unavailable", Vec::new());
+        let mut resolver =
+            TxtResolver::new_with_endpoints(vec![endpoint], None, false).expect("resolver");
+        resolver.system = Some(
+            hickory_resolver::TokioResolver::builder_with_config(
+                config,
+                TokioConnectionProvider::default(),
+            )
+            .build(),
+        );
+
+        let records = resolver
+            .resolve_txt("example.com")
+            .await
+            .expect("system TXT lookup");
+
+        assert_eq!(records, vec!["part1part2"]);
     }
 }

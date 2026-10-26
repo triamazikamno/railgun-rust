@@ -71,6 +71,10 @@ pub enum EnrTreeError {
     InvalidSignature(#[source] k256::ecdsa::Error),
     #[error("signature verification failed")]
     SignatureVerificationFailed,
+    #[error("invalid hash label: must be unpadded base32 of 12 to 32 bytes")]
+    InvalidHash,
+    #[error("hash mismatch: no TXT record matches its label")]
+    HashMismatch,
     #[error("DNS resolution failed: {0}")]
     Dns(#[from] DnsResolveError),
 }

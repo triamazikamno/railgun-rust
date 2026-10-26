@@ -104,19 +104,41 @@ impl DiscoveryConfig {
             self.http_client.clone(),
             self.allow_system_dns,
         )?;
+        self.discover_with(&resolver).await
+    }
+
+    async fn discover_with<R: enr_tree::TxtLookup>(
+        &self,
+        resolver: &R,
+    ) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
         let mut peers = HashMap::<PeerId, Vec<Multiaddr>>::new();
+        let mut any_succeeded = false;
+        let mut last_error = None;
 
         for tree in &self.enr_trees {
-            for peer in enr_tree::discover_from_tree(
-                &resolver,
+            match enr_tree::discover_from_tree(
+                resolver,
                 tree,
                 self.max_txt_queries_per_tree,
                 self.max_enrs_per_tree,
             )
-            .await?
+            .await
             {
-                peers.entry(peer.peer_id).or_default().extend(peer.addrs);
+                Ok(found) => {
+                    any_succeeded = true;
+                    for peer in found {
+                        peers.entry(peer.peer_id).or_default().extend(peer.addrs);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(tree = %tree, %error, "dns discovery tree failed");
+                    last_error = Some(error);
+                }
             }
+        }
+
+        if !any_succeeded && let Some(error) = last_error {
+            return Err(DiscoveryError::EnrTree(error));
         }
 
         Ok(peers
@@ -127,5 +149,43 @@ impl DiscoveryConfig {
                 DiscoveredPeer { peer_id, addrs }
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enr_tree::fixture::genuine_tree;
+
+    #[tokio::test]
+    async fn failed_tree_does_not_drop_other_trees() {
+        let (mut tampered, branch, leaves) = genuine_tree("tampered.example", 16);
+        let name = tampered.name(&branch);
+        tampered
+            .records
+            .insert(name, vec![format!("enrtree-branch:{}", leaves[0])]);
+        let (genuine, _, _) = genuine_tree("genuine.example", 16);
+
+        let mut records = tampered.records;
+        records.extend(genuine.records);
+        let mut config = DiscoveryConfig {
+            enr_trees: vec![tampered.url, genuine.url],
+            ..DiscoveryConfig::default()
+        };
+        let peers = config
+            .discover_with(&records)
+            .await
+            .expect("genuine tree peers");
+        assert_eq!(peers.len(), 2);
+
+        config.enr_trees.truncate(1);
+        let error = config
+            .discover_with(&records)
+            .await
+            .expect_err("only tree failed");
+        assert!(matches!(
+            error,
+            DiscoveryError::EnrTree(EnrTreeError::HashMismatch)
+        ));
     }
 }
