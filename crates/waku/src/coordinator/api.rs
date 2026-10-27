@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use libp2p::PeerId;
 use parking_lot::RwLock;
-use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, warn};
 
@@ -13,6 +14,7 @@ use crate::discovery;
 use crate::error::WakuError;
 use crate::proto;
 use crate::protocols::store::StoreQueryPage;
+use crate::tasks::task_tracker;
 use crate::transport::{ReqId, Transport, TransportCmd};
 use crate::types::OpId;
 
@@ -26,14 +28,16 @@ use super::{
 impl WakuNode {
     /// Spawn the node and transport tasks.
     pub fn spawn(config: WakuConfig) -> Result<Self, WakuError> {
-        let transport = Transport::new(&config.node, &config.network)?;
+        let (tasks, task_waiter) = task_tracker();
+        let transport = Transport::new(&config.node, &config.network, tasks.clone())?;
+        let local_peer_id = transport.local_peer_id();
         let (transport_tx, transport_cmd_rx) = mpsc::channel(64);
         let (transport_event_tx, transport_event_rx) = mpsc::channel(64);
         let (filter_push_tx, filter_push_rx) = mpsc::channel(64);
         let (dial_tx, dial_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        tokio::spawn(transport.run(
+        tasks.spawn(transport.run(
             transport_cmd_rx,
             transport_event_tx,
             filter_push_tx,
@@ -69,13 +73,17 @@ impl WakuNode {
             peer_exchange_cooldown: config.peer_exchange_cooldown,
             op_counter: AtomicU64::new(1),
             dns_round: AtomicU64::new(0),
+            dns_records: RwLock::new(Vec::new()),
+            peer_capabilities_changed: Notify::new(),
+            local_peer_id,
+            tasks: Mutex::new(task_waiter),
             store_peer_tx,
             shutdown_tx,
         });
 
         {
             let inner = inner.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 inner
                     .run_event_loop(transport_event_rx, filter_push_rx)
                     .await;
@@ -84,21 +92,21 @@ impl WakuNode {
 
         {
             let inner = inner.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 inner.run_dialer(dial_rx).await;
             });
         }
 
         {
             let inner = inner.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 inner.run_discovery_loop().await;
             });
         }
 
         {
             let inner = inner.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 inner.run_peer_exchange_loop().await;
             });
         }
@@ -106,8 +114,54 @@ impl WakuNode {
         Ok(Self { inner })
     }
 
+    /// Signal shutdown without waiting; see [`Self::shutdown_and_wait`].
     pub fn shutdown(&self) {
         self.inner.shutdown();
+    }
+
+    /// Signal shutdown and wait up to `bound` for the node to terminate.
+    ///
+    /// `Ok` guarantees that every task the node spawned has ended: the transport loop, event
+    /// loop, dialer, DNS discovery loop, peer-exchange loop and filter-push stream handlers, plus
+    /// every libp2p connection and pending-dial task spawned through the swarm executor. The
+    /// swarm and its transport, including the Tor client provider, have been dropped, so no
+    /// dial, DNS discovery or peer exchange can start again.
+    ///
+    /// Limit: in the Direct profile, QUIC endpoint driver tasks are spawned inside quinn, are
+    /// not tracked, and end when their sockets close. The Tor profile has no QUIC.
+    ///
+    /// Returns [`WakuError::ShutdownIncomplete`] if `bound` elapses first; the node stays shut
+    /// down and a later call may wait again. Concurrent calls serialize, and calls after
+    /// termination was observed return `Ok` immediately.
+    pub async fn shutdown_and_wait(&self, bound: Duration) -> Result<(), WakuError> {
+        self.shutdown();
+        timeout(bound, async { self.inner.tasks.lock().await.wait().await })
+            .await
+            .map_err(|_| WakuError::ShutdownIncomplete)
+    }
+
+    /// Wait up to `bound` until a connected peer supports `LightPush` v3 and a connected peer,
+    /// possibly another one, supports Filter.
+    ///
+    /// Returns [`WakuError::NoPeersAvailable`] when `bound` elapses and
+    /// [`WakuError::Cancelled`] once the node is shut down.
+    pub async fn wait_ready(&self, bound: Duration) -> Result<(), WakuError> {
+        self.inner.wait_ready(bound).await
+    }
+
+    /// This node's libp2p peer ID, generated fresh for each spawned node.
+    #[must_use]
+    pub fn local_peer_id(&self) -> PeerId {
+        self.inner.local_peer_id
+    }
+
+    /// Records from the latest successful DNS discovery round, after the address policy.
+    ///
+    /// Only ENR-tree record addresses appear here; peer-exchange peers and Identify-reported
+    /// addresses never do. A failed round keeps the previous records.
+    #[must_use]
+    pub fn dns_peer_records(&self) -> Vec<discovery::DiscoveredPeer> {
+        self.inner.dns_records.read().clone()
     }
 
     #[must_use]

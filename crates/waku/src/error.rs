@@ -34,6 +34,8 @@ pub enum WakuError {
     },
     #[error("store request failed")]
     StoreRequestFailed,
+    #[error("node shutdown did not complete in time")]
+    ShutdownIncomplete,
 }
 
 /// Errors that can occur during transport initialization.

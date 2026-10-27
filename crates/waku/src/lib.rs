@@ -6,6 +6,7 @@ mod error;
 mod http_body;
 pub mod proto;
 mod protocols;
+mod tasks;
 mod transport;
 mod types;
 

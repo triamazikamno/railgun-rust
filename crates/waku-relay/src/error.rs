@@ -20,4 +20,8 @@ pub enum ClientError {
     ParsePeerId,
     #[error("failed to parse multiaddr")]
     ParseMultiaddr,
+    #[error("waku node not ready: {0}")]
+    NotReady(#[source] WakuError),
+    #[error("waku node shutdown failed: {0}")]
+    Shutdown(#[source] WakuError),
 }

@@ -3,6 +3,7 @@ use crate::error::TransportInitError;
 use crate::proto;
 use crate::protocols;
 use crate::protocols::codec::ProstLengthDelimitedCodec;
+use crate::tasks::TaskTracker;
 use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt};
 use libp2p::core::multiaddr::Protocol;
@@ -158,25 +159,32 @@ pub(crate) struct Transport {
     pending_px: HashMap<OutboundRequestId, ReqId>,
     pending_filter: HashMap<OutboundRequestId, (ReqId, PeerId)>,
     pending_store: HashMap<OutboundRequestId, ReqId>,
+    tasks: TaskTracker,
 }
 
 impl Transport {
-    /// Create a new transport.
+    /// Create a new transport whose swarm spawns connection and dial tasks through `tasks`.
     pub(crate) fn new(
         config: &NodeConfig,
         network: &WakuNetworkConfig,
+        tasks: TaskTracker,
     ) -> Result<Self, TransportInitError> {
         let local_key = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(local_key.public());
 
         let transport = build_transport(&local_key, network)?;
 
+        let executor_tasks = tasks.clone();
         let swarm = Swarm::new(
             transport,
             new_behaviour(&local_key),
             local_peer_id,
-            libp2p::swarm::Config::with_tokio_executor()
-                .with_idle_connection_timeout(Duration::from_secs(config.idle_timeout_secs)),
+            libp2p::swarm::Config::with_executor(
+                move |future: Pin<Box<dyn Future<Output = ()> + Send>>| {
+                    executor_tasks.spawn(future);
+                },
+            )
+            .with_idle_connection_timeout(Duration::from_secs(config.idle_timeout_secs)),
         );
 
         Ok(Self {
@@ -185,7 +193,12 @@ impl Transport {
             pending_px: HashMap::new(),
             pending_filter: HashMap::new(),
             pending_store: HashMap::new(),
+            tasks,
         })
+    }
+
+    pub(crate) fn local_peer_id(&self) -> PeerId {
+        *self.swarm.local_peer_id()
     }
 
     /// Run the transport loop.
@@ -218,7 +231,12 @@ impl Transport {
                         error!("filter push stream acceptor closed, stopping transport loop");
                         break;
                     };
-                    tokio::spawn(handle_filter_push_stream(peer_id, stream, filter_push_tx.clone()));
+                    self.tasks.spawn(handle_filter_push_stream(
+                        peer_id,
+                        stream,
+                        filter_push_tx.clone(),
+                        shutdown.clone(),
+                    ));
                 }
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
@@ -486,28 +504,43 @@ impl Transport {
     }
 }
 
-async fn handle_filter_push_stream(
+/// Forward pushes from one inbound filter-push stream until it ends or shutdown is requested.
+///
+/// Shutdown drops the stream: an idle remote would otherwise keep the substream, and with
+/// mplex or QUIC its connection, alive after the swarm is gone.
+async fn handle_filter_push_stream<S>(
     peer_id: PeerId,
-    mut stream: libp2p::Stream,
+    mut stream: S,
     event_tx: mpsc::Sender<FilterPushEvent>,
-) {
-    while let Ok(push) = ProstLengthDelimitedCodec::<
-        proto::filter::MessagePush,
-        proto::filter::FilterSubscribeResponse,
-    >::read_request(&mut stream, protocols::filter::FILTER_PUSH_MAX_BYTES)
-    .await
-    {
-        if event_tx
-            .send(FilterPushEvent {
-                peer_id,
-                push: Box::new(push),
-            })
+    mut shutdown: watch::Receiver<bool>,
+) where
+    S: futures::AsyncRead + Unpin + Send + 'static,
+{
+    let forward = async {
+        while let Ok(push) =
+            ProstLengthDelimitedCodec::<
+                proto::filter::MessagePush,
+                proto::filter::FilterSubscribeResponse,
+            >::read_request(&mut stream, protocols::filter::FILTER_PUSH_MAX_BYTES)
             .await
-            .is_err()
         {
-            error!(%peer_id, "transport event channel closed, stopping filter push stream");
-            break;
+            if event_tx
+                .send(FilterPushEvent {
+                    peer_id,
+                    push: Box::new(push),
+                })
+                .await
+                .is_err()
+            {
+                error!(%peer_id, "transport event channel closed, stopping filter push stream");
+                break;
+            }
         }
+    };
+    tokio::select! {
+        () = forward => {}
+        // Also completes when the sender is dropped.
+        _ = shutdown.wait_for(|stop| *stop) => {}
     }
 }
 
@@ -797,5 +830,49 @@ mod tests {
         })
         .await
         .expect("test timed out");
+    }
+
+    /// A remote that never sends; the `Arc` shows when the stream is dropped.
+    struct IdleStream(
+        #[expect(dead_code, reason = "held only to observe the drop")] std::sync::Arc<()>,
+    );
+
+    impl futures::AsyncRead for IdleStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_push_handler_drops_idle_stream_on_shutdown() {
+        let alive = std::sync::Arc::new(());
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handler = tokio::spawn(handle_filter_push_stream(
+            PeerId::random(),
+            IdleStream(std::sync::Arc::clone(&alive)),
+            event_tx,
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handler.is_finished(),
+            "an idle stream keeps the handler waiting"
+        );
+        shutdown_tx.send(true).expect("handler watches shutdown");
+        tokio::time::timeout(Duration::from_secs(1), handler)
+            .await
+            .expect("handler stops on shutdown")
+            .expect("handler does not panic");
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "shutdown drops the stream"
+        );
     }
 }

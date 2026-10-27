@@ -6,6 +6,7 @@ use crate::error::WakuError;
 use crate::proto;
 use crate::proto::HashKey;
 use crate::protocols;
+use crate::tasks::TaskWaiter;
 use crate::transport::{FilterPushEvent, ReqId, TransportCmd, TransportEvent};
 use crate::types::OpId;
 use libp2p::request_response::OutboundFailure;
@@ -207,6 +208,17 @@ impl PeerBook {
                 dial_failures: state.dial_failures,
             })
             .collect()
+    }
+
+    /// Whether connected peers cover both `LightPush` v3 and Filter, possibly on different peers.
+    fn ready(&self) -> bool {
+        let any_connected = |supports: fn(&PeerState) -> bool| {
+            self.connected
+                .iter()
+                .any(|peer_id| self.peers.get(peer_id).is_some_and(supports))
+        };
+        any_connected(|state| state.supports_lightpush_v3)
+            && any_connected(|state| state.supports_filter)
     }
 }
 
@@ -571,14 +583,43 @@ struct NodeInner {
     peer_exchange_cooldown: Duration,
     op_counter: AtomicU64,
     dns_round: AtomicU64,
+    /// Latest successful DNS round's records after the address policy, kept apart from the
+    /// peer book so peer-exchange peers and Identify addresses never enter it.
+    dns_records: RwLock<Vec<discovery::DiscoveredPeer>>,
+    /// Notified when a peer connects, disconnects or reports its protocols, and at shutdown.
+    peer_capabilities_changed: Notify,
+    local_peer_id: PeerId,
+    /// Completes once every task the node spawned has ended; see `WakuNode::shutdown_and_wait`.
+    tasks: Mutex<TaskWaiter>,
     store_peer_tx: broadcast::Sender<PeerId>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl NodeInner {
     fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        // `send` would not record the value once every receiver has gone.
+        self.shutdown_tx.send_replace(true);
         self.discovery_wake.notify_waiters();
+        self.peer_capabilities_changed.notify_waiters();
+    }
+
+    async fn wait_ready(&self, bound: Duration) -> Result<(), WakuError> {
+        let deadline = Instant::now() + bound;
+        loop {
+            let changed = self.peer_capabilities_changed.notified();
+            tokio::pin!(changed);
+            // Register before checking so a change between the check and the await still wakes us.
+            changed.as_mut().enable();
+            if self.is_shutdown() {
+                return Err(WakuError::Cancelled);
+            }
+            if self.peer_book.read().ready() {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return Err(WakuError::NoPeersAvailable);
+            }
+        }
     }
 
     fn is_shutdown(&self) -> bool {
@@ -634,8 +675,22 @@ impl NodeInner {
 
     async fn discover(&self) -> Result<usize, discovery::DiscoveryError> {
         let peers = self.discovery_config.discover_all().await?;
+        Ok(self.record_dns_round(peers))
+    }
+
+    /// Replace the DNS record snapshot with a successful round, then add it to the peer book.
+    fn record_dns_round(&self, peers: Vec<discovery::DiscoveredPeer>) -> usize {
         let round = self.dns_round.fetch_add(1, Ordering::Relaxed) + 1;
-        Ok(self.apply_discovered_peers(peers, PeerSource::Dns { last_round: round }))
+        let records = peers
+            .iter()
+            .cloned()
+            .filter_map(|mut peer| {
+                self.apply_addr_policy(&mut peer.addrs);
+                (!peer.addrs.is_empty()).then_some(peer)
+            })
+            .collect();
+        *self.dns_records.write() = records;
+        self.apply_discovered_peers(peers, PeerSource::Dns { last_round: round })
     }
 
     async fn peer_exchange_rounds(&self, rounds: usize) -> Result<(), WakuError> {
@@ -1012,6 +1067,7 @@ impl NodeInner {
                     }
                     state.supports_store
                 };
+                self.peer_capabilities_changed.notify_waiters();
                 if supports_store {
                     debug!(%peer_id, "connected peer supports store");
                     let _ = self.store_peer_tx.send(peer_id);
@@ -1036,6 +1092,7 @@ impl NodeInner {
                         }
                     }
                 }
+                self.peer_capabilities_changed.notify_waiters();
                 self.maybe_dial();
             }
             TransportEvent::DialError { peer_id, error } => {
@@ -1094,6 +1151,7 @@ impl NodeInner {
                     merge_addrs(&mut entry.addrs, addrs, self.uses_tor_profile());
                     became_store_capable
                 };
+                self.peer_capabilities_changed.notify_waiters();
 
                 if became_store_capable {
                     debug!(%peer_id, "peer supports store");
@@ -1807,6 +1865,10 @@ mod tests {
             peer_exchange_cooldown: Duration::from_mins(1),
             op_counter: AtomicU64::new(1),
             dns_round: AtomicU64::new(0),
+            dns_records: RwLock::new(Vec::new()),
+            peer_capabilities_changed: Notify::new(),
+            local_peer_id: PeerId::random(),
+            tasks: Mutex::new(crate::tasks::task_tracker().1),
             store_peer_tx,
             shutdown_tx,
         }
@@ -2133,11 +2195,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_records_exclude_peer_exchange_peers_and_identify_addrs() {
+        let node = test_node(DiscoveryConfig::default());
+        let (tree_peer, learned_peer) = (PeerId::random(), PeerId::random());
+        let peer = |peer_id, n| discovery::DiscoveredPeer {
+            peer_id,
+            addrs: vec![peer_addr(n)],
+        };
+
+        node.record_dns_round(vec![peer(tree_peer, 1)]);
+        node.apply_discovered_peers(vec![peer(learned_peer, 2)], PeerSource::Learned);
+        node.handle_transport_event(TransportEvent::ConnectionEstablished { peer_id: tree_peer })
+            .await;
+        node.handle_transport_event(TransportEvent::IdentifyReceived {
+            peer_id: tree_peer,
+            protocols: Vec::new(),
+            addrs: vec![peer_addr(3)],
+        })
+        .await;
+
+        {
+            let book = node.peer_book.read();
+            assert!(book.peers.contains_key(&learned_peer));
+            assert!(book.peers[&tree_peer].addrs.contains(&peer_addr(3)));
+        }
+        let records = node.dns_records.read();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].peer_id, tree_peer);
+        assert_eq!(records[0].addrs, vec![peer_addr(1)]);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_needs_lightpush_and_filter_peers() {
+        let node = test_node(DiscoveryConfig::default());
+        let (lightpush_peer, filter_peer) = (PeerId::random(), PeerId::random());
+        let identify = |peer_id, codec: &str| TransportEvent::IdentifyReceived {
+            peer_id,
+            protocols: vec![codec.to_string()],
+            addrs: Vec::new(),
+        };
+        for peer_id in [lightpush_peer, filter_peer] {
+            node.handle_transport_event(TransportEvent::ConnectionEstablished { peer_id })
+                .await;
+        }
+        node.handle_transport_event(identify(
+            lightpush_peer,
+            protocols::lightpush::LIGHTPUSH_V3_CODEC,
+        ))
+        .await;
+
+        assert!(matches!(
+            node.wait_ready(Duration::from_millis(200)).await,
+            Err(WakuError::NoPeersAvailable)
+        ));
+
+        // `join!` polls the wait first, so it is already waiting when Identify arrives.
+        let (ready, ()) = tokio::join!(
+            node.wait_ready(Duration::from_secs(5)),
+            node.handle_transport_event(identify(
+                filter_peer,
+                protocols::filter::FILTER_SUBSCRIBE_CODEC,
+            )),
+        );
+        assert!(ready.is_ok(), "{ready:?}");
+
+        node.shutdown();
+        assert!(matches!(
+            node.wait_ready(Duration::from_secs(5)).await,
+            Err(WakuError::Cancelled)
+        ));
+    }
+
+    fn quiet_config() -> WakuConfig {
+        let mut config = WakuConfig::default();
+        config.discovery.enr_trees.clear();
+        config
+    }
+
+    #[tokio::test]
+    async fn nodes_have_distinct_peer_ids_and_own_tor_providers() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tor_node = |dials: Arc<AtomicUsize>| {
+            let provider: crate::config::WakuTorClientProvider = Arc::new(move || {
+                dials.fetch_add(1, Ordering::SeqCst);
+                None::<crate::config::WakuTorClient>
+            });
+            let mut config = quiet_config();
+            config.network = crate::config::WakuNetworkConfig::tor_with_client_provider(
+                provider,
+                reqwest::Client::new(),
+            );
+            WakuNode::spawn(config).expect("spawn Tor Waku node")
+        };
+        let (a_dials, b_dials) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let a = tor_node(Arc::clone(&a_dials));
+        let b = tor_node(Arc::clone(&b_dials));
+
+        a.add_additional_peers(vec![discovery::DiscoveredPeer {
+            peer_id: PeerId::random(),
+            addrs: vec![addr("/ip4/127.0.0.1/tcp/9")],
+        }]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while a_dials.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("node A dials through its own Tor provider");
+
+        assert_eq!(b_dials.load(Ordering::SeqCst), 0);
+        assert_ne!(a.local_peer_id(), b.local_peer_id());
+        for node in [a, b] {
+            node.shutdown_and_wait(Duration::from_secs(5))
+                .await
+                .expect("node shuts down");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_wait_ends_pending_dial() {
+        use std::io::{ErrorKind, Read};
+        use std::net::{TcpListener, TcpStream};
+
+        async fn accept(
+            listener: &TcpListener,
+            bound: Duration,
+        ) -> Result<TcpStream, tokio::time::error::Elapsed> {
+            tokio::time::timeout(bound, async {
+                loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                }
+            })
+            .await
+        }
+
+        // The listener accepts and stays silent, so the dial waits in its handshake.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let node = WakuNode::spawn(quiet_config()).expect("spawn Waku node");
+        node.add_additional_peers(vec![discovery::DiscoveredPeer {
+            peer_id: PeerId::random(),
+            addrs: vec![addr(&format!("/ip4/127.0.0.1/tcp/{port}"))],
+        }]);
+        let mut socket = accept(&listener, Duration::from_secs(5))
+            .await
+            .expect("node dials the listener");
+
+        node.shutdown_and_wait(Duration::from_secs(5))
+            .await
+            .expect("shutdown completes");
+
+        // The dialer's handshake bytes may precede EOF; a timeout means the dial is still open.
+        socket.set_nonblocking(false).expect("blocking socket");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        let mut buf = [0_u8; 256];
+        loop {
+            match socket.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    assert!(
+                        !matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+                        "pending dial outlived shutdown"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            accept(&listener, Duration::from_millis(500)).await.is_err(),
+            "no dial starts after shutdown"
+        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            node.shutdown_and_wait(Duration::from_secs(5)),
+        )
+        .await
+        .expect("repeated shutdown returns immediately")
+        .expect("repeated shutdown succeeds");
+    }
+
+    #[tokio::test]
     #[ignore = "runs peer exchange against the live Waku fleet"]
     async fn live_peer_exchange_responses_fit_request_and_frame() {
         let transport = crate::transport::Transport::new(
             &NodeConfig::default(),
             &crate::config::WakuNetworkConfig::direct(),
+            crate::tasks::task_tracker().0,
         )
         .expect("transport");
         let (cmd_tx, cmd_rx) = mpsc::channel(64);

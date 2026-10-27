@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use waku::proto::{HashKey, WakuMessage};
 use waku::{
@@ -480,14 +480,17 @@ pub struct Client {
     nwaku_url: Option<String>,
     pubsub_path: String,
     waku_fleet: Option<Arc<WakuNode>>,
-    backup_peer_task: Option<JoinHandle<()>>,
+    /// Parsed configured direct peers, kept for [`Client::seed_peers`].
+    direct_peers: Vec<DiscoveredPeer>,
+    /// The backup-peer observer, if any, and every message-forwarding task.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
     network_mode: RelayNetworkMode,
     disabled_reason: Option<Arc<str>>,
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Some(task) = self.backup_peer_task.as_ref() {
+        for task in self.tasks.get_mut() {
             task.abort();
         }
         if let Some(waku_fleet) = self.waku_fleet.as_ref() {
@@ -515,7 +518,8 @@ impl Client {
         let http_client = http_client.unwrap_or_default();
         let disabled_reason = (mode == RelayNetworkMode::Proxy)
             .then(|| Arc::<str>::from("proxy mode does not support Waku libp2p transports"));
-        let mut backup_peer_task = None;
+        let mut tasks = Vec::new();
+        let mut direct_peers = Vec::new();
         let waku = if let Some(reason) = disabled_reason.as_ref() {
             tracing::warn!(%reason, "Waku disabled by network policy");
             None
@@ -529,12 +533,12 @@ impl Client {
                 config.network =
                     WakuNetworkConfig::tor_with_client_provider(tor_client, http_client.clone());
             }
-            let direct_peers = parse_peers(&cfg.direct_peers)?;
+            direct_peers = parse_peers(&cfg.direct_peers)?;
             let backup_peers = parse_peers(&cfg.backup_peers)?;
             let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
-            waku.add_additional_peers(direct_peers);
+            waku.add_additional_peers(direct_peers.clone());
             if !backup_peers.is_empty() {
-                backup_peer_task = Some(tokio::spawn(observe_backup_peers(
+                tasks.push(tokio::spawn(observe_backup_peers(
                     Arc::clone(&waku),
                     backup_peers,
                 )));
@@ -547,7 +551,8 @@ impl Client {
             nwaku_url: cfg.nwaku_url.clone(),
             pubsub_path: relay_shard_pubsub_path(cluster_id, shard_id),
             waku_fleet: waku,
-            backup_peer_task,
+            direct_peers,
+            tasks: Mutex::new(tasks),
             network_mode: mode,
             disabled_reason,
         })
@@ -633,6 +638,94 @@ impl Client {
             .map_or_else(Vec::new, |waku| waku.peer_snapshots())
     }
 
+    /// This client's Waku peer ID, or `None` when Waku is disabled.
+    #[must_use]
+    pub fn local_peer_id(&self) -> Option<PeerId> {
+        self.waku_fleet.as_ref().map(|waku| waku.local_peer_id())
+    }
+
+    /// Peers another Waku node can bootstrap from: the latest verified ENR-tree DNS records
+    /// and the configured direct peers, deduplicated by peer ID with configured peers first.
+    ///
+    /// Contains only ENR-tree record addresses and configured addresses, never peers learned
+    /// through peer exchange or addresses reported by Identify. Backup peers are excluded.
+    /// Empty when Waku is disabled.
+    #[must_use]
+    pub fn seed_peers(&self) -> Vec<AdditionalPeer> {
+        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        self.direct_peers
+            .iter()
+            .cloned()
+            .chain(waku_fleet.dns_peer_records())
+            .filter(|peer| seen.insert(peer.peer_id))
+            .map(|peer| AdditionalPeer {
+                peer_id: peer.peer_id.to_string(),
+                addrs: peer.addrs.iter().map(ToString::to_string).collect(),
+            })
+            .collect()
+    }
+
+    /// The embedded node, unless Waku is disabled or the node was shut down.
+    fn active_fleet(&self) -> Result<&Arc<WakuNode>, ClientError> {
+        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
+            let reason = self
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("Waku is unavailable for the selected network mode");
+            return Err(ClientError::Disabled(reason.to_string()));
+        };
+        if waku_fleet.is_shutdown() {
+            return Err(ClientError::Disabled("Waku node was shut down".to_string()));
+        }
+        Ok(waku_fleet)
+    }
+
+    /// Wait up to `bound` until connected Waku peers support both `LightPush` and Filter.
+    pub async fn wait_ready(&self, bound: Duration) -> Result<(), ClientError> {
+        let waku_fleet = self.active_fleet()?;
+        waku_fleet
+            .wait_ready(bound)
+            .await
+            .map_err(ClientError::NotReady)
+    }
+
+    /// Stop background work and wait up to `bound` for the embedded Waku node to terminate.
+    ///
+    /// Signals the node to stop, so no new subscription registers a forwarding task, then
+    /// aborts and awaits the backup-peer observer and every message-forwarding task (which
+    /// stops nwaku polling), then waits on [`WakuNode::shutdown_and_wait`]. Subscription
+    /// receivers stop receiving messages. Returns `Ok` when Waku is disabled, and is safe to
+    /// call more than once.
+    ///
+    /// `bound` limits only the embedded-node wait, not acquiring the task list or joining the
+    /// tasks. Concurrent calls serialize. A cancelled call leaves the tasks it has not yet
+    /// seen end in the list, so a later call still waits for them.
+    pub async fn shutdown(&self, bound: Duration) -> Result<(), ClientError> {
+        if let Some(waku_fleet) = self.waku_fleet.as_ref() {
+            waku_fleet.shutdown();
+        }
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.iter().for_each(JoinHandle::abort);
+            // Pop only after the await completes, so a cancelled call keeps the handle.
+            while let Some(task) = tasks.last_mut() {
+                // A cancelled or panicked task has ended too.
+                let _ = task.await;
+                tasks.pop();
+            }
+        }
+        if let Some(waku_fleet) = self.waku_fleet.as_ref() {
+            waku_fleet
+                .shutdown_and_wait(bound)
+                .await
+                .map_err(ClientError::Shutdown)?;
+        }
+        Ok(())
+    }
+
     pub async fn subscribe(
         &self,
         content_topics: Vec<String>,
@@ -665,13 +758,7 @@ impl Client {
         content_topics: Vec<String>,
         history_lookback: Option<Duration>,
     ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
-        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
-            let reason = self
-                .disabled_reason
-                .as_deref()
-                .unwrap_or("Waku is unavailable for the selected network mode");
-            return Err(ClientError::Disabled(reason.to_string()));
-        };
+        let waku_fleet = self.active_fleet()?;
         let mut rx = waku_fleet
             .filter_subscribe(self.pubsub_path.clone(), content_topics.clone())
             .await
@@ -722,7 +809,13 @@ impl Client {
                     }),
                 }
             });
-            tokio::spawn(forward_messages(
+            let mut tasks = self.tasks.lock().await;
+            // `shutdown` signals before taking this lock, so a task registered here is joined.
+            if waku_fleet.is_shutdown() {
+                return Err(ClientError::Disabled("Waku node was shut down".to_string()));
+            }
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(tokio::spawn(forward_messages(
                 rx,
                 sink_tx,
                 content_topics,
@@ -730,7 +823,8 @@ impl Client {
                 self.http_client.clone(),
                 self.nwaku_request_timeout,
                 store,
-            ));
+            )));
+            drop(tasks);
             rx = sink_rx;
         }
 
@@ -806,13 +900,7 @@ impl Client {
             content_topic,
             "publishing Waku message to fleet"
         );
-        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
-            let reason = self
-                .disabled_reason
-                .as_deref()
-                .unwrap_or("Waku is unavailable for the selected network mode");
-            return Err(ClientError::Disabled(reason.to_string()));
-        };
+        let waku_fleet = self.active_fleet()?;
         match waku_fleet
             .lightpush_all(
                 self.pubsub_path.clone(),
@@ -1246,8 +1334,10 @@ mod tests {
             );
             assert_eq!(peers[0].peer_id.to_string(), direct.peer_id);
             let observer = client
-                .backup_peer_task
-                .as_ref()
+                .tasks
+                .try_lock()
+                .expect("no shutdown in progress")
+                .first()
                 .map(tokio::task::JoinHandle::abort_handle);
             assert_eq!(observer.is_none(), cfg.backup_peers.is_empty());
 
@@ -1265,6 +1355,166 @@ mod tests {
             }
             assert_eq!(node.peer_snapshots().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn client_shutdown_stops_nwaku_polling() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]";
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind nwaku endpoint");
+        let address = listener.local_addr().expect("read listener address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        // Every subscription request after the first is handed to the test unanswered.
+        let (held_tx, held_rx) = std_mpsc::channel();
+        let server = thread::spawn({
+            let (requests, stop) = (Arc::clone(&requests), Arc::clone(&stop));
+            move || {
+                let mut subscriptions = 0;
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0_u8; 4096];
+                    let len = stream.read(&mut buf).unwrap_or(0);
+                    if buf[..len].starts_with(b"POST /relay/v1/subscriptions") {
+                        subscriptions += 1;
+                        if subscriptions > 1 {
+                            let _ = held_tx.send(stream);
+                            continue;
+                        }
+                    }
+                    let _ = stream.write_all(RESPONSE);
+                }
+            }
+        });
+        let cfg = ClientConfig {
+            nwaku_url: Some(format!("http://{address}")),
+            dns_enr_trees: Some(Vec::new()),
+            max_peers: Some(0),
+            ..Default::default()
+        };
+        let client = Arc::new(Client::new(&cfg).expect("client starts"));
+        let _messages = client
+            .subscribe(vec!["/railgun/v2/0-1-transact/json".to_string()])
+            .await
+            .expect("subscribe");
+
+        // The subscription request plus the first poll.
+        timeout(Duration::from_secs(5), async {
+            while requests.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client polls nwaku");
+
+        // A subscription whose nwaku request is in flight when shutdown runs.
+        let late = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .subscribe(vec!["/railgun/v2/0-1-fees/json".to_string()])
+                    .await
+            }
+        });
+        let mut held = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = held_rx.try_recv() {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late subscription reaches nwaku");
+
+        client
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("client shuts down");
+        let _ = held.write_all(RESPONSE);
+        drop(held);
+        let late = timeout(Duration::from_secs(5), late)
+            .await
+            .expect("late subscription finishes")
+            .expect("late subscription does not panic");
+        assert!(
+            late.is_err(),
+            "a subscription finishing after shutdown starts no forwarding"
+        );
+        let after_shutdown = requests.load(Ordering::SeqCst);
+        // Longer than the 2 s poll interval, with the receiver still alive.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), after_shutdown);
+        assert!(
+            client
+                .subscribe(vec!["/railgun/v2/0-1-transact/json".to_string()])
+                .await
+                .is_err(),
+            "a shut-down client starts no new subscription"
+        );
+        client
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("repeated shutdown succeeds");
+
+        stop.store(true, Ordering::SeqCst);
+        drop(std::net::TcpStream::connect(address));
+        server.join().expect("nwaku endpoint thread exits");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_tasks_despite_cancelled_and_overlapping_calls() {
+        let client = Client {
+            http_client: reqwest::Client::new(),
+            nwaku_request_timeout: Duration::from_secs(1),
+            nwaku_url: None,
+            pubsub_path: relay_shard_pubsub_path(DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID),
+            waku_fleet: None,
+            direct_peers: Vec::new(),
+            tasks: tokio::sync::Mutex::new(Vec::new()),
+            network_mode: super::RelayNetworkMode::Direct,
+            disabled_reason: None,
+        };
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+        // Blocks its worker without an await point, so abort cannot end it until released.
+        client.tasks.lock().await.push(tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        started_rx.await.expect("worker started");
+        let wait = Duration::from_millis(200);
+
+        // Boxed so that dropping it cancels the call.
+        let mut first = Box::pin(client.shutdown(Duration::from_secs(1)));
+        assert!(
+            timeout(wait, &mut first).await.is_err(),
+            "worker still runs"
+        );
+        assert!(
+            timeout(wait, client.shutdown(Duration::from_secs(1)))
+                .await
+                .is_err(),
+            "an overlapping call must not return before the worker ends"
+        );
+        // Cancel the first call while the worker still runs.
+        drop(first);
+        let mut last = Box::pin(client.shutdown(Duration::from_secs(1)));
+        assert!(
+            timeout(wait, &mut last).await.is_err(),
+            "a call after cancelled ones must still wait for the worker"
+        );
+
+        release_tx.send(()).expect("worker waits for release");
+        timeout(Duration::from_secs(2), last)
+            .await
+            .expect("shutdown completes once the worker ends")
+            .expect("shutdown succeeds");
     }
 
     #[test]
@@ -1325,7 +1575,8 @@ mod tests {
             nwaku_url: Some(format!("http://{address}/private-endpoint-token")),
             pubsub_path: relay_shard_pubsub_path(DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID),
             waku_fleet: None,
-            backup_peer_task: None,
+            direct_peers: Vec::new(),
+            tasks: tokio::sync::Mutex::new(Vec::new()),
             network_mode: super::RelayNetworkMode::Direct,
             disabled_reason: None,
         };
