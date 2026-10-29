@@ -30,6 +30,13 @@ const ARBITRUM_RELAY_ADAPT_HISTORY: &[Address] = &[
     address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
 ];
 
+const SEPOLIA_RELAY_ADAPT_HISTORY: &[Address] =
+    &[address!("0x7e3d929EbD5bDC84d02Bd3205c777578f33A214D")];
+
+const SEPOLIA_RELAY_ADAPT_7702_DELEGATES: &[ExecutorDelegate] = &[nonce_bearing_v1(address!(
+    "0x05aE73C5925d843864AE6f261f3175dE2ebCd963"
+))];
+
 const fn nonce_bearing_v1(address: Address) -> ExecutorDelegate {
     ExecutorDelegate {
         address,
@@ -124,6 +131,17 @@ impl RailgunDeployment {
                 relay_adapt_7702_delegates: BASE_RELAY_ADAPT_7702_DELEGATES,
                 relay_adapt_history: &[],
                 deployment_block: 50_224_711,
+                v2_start_block: 0,
+                legacy_shield_block: 0,
+            }),
+            11_155_111 => Some(Self {
+                chain_id,
+                contract: address!("0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea"),
+                relay_adapt_contract: Some(address!("0x7e3d929EbD5bDC84d02Bd3205c777578f33A214D")),
+                relay_adapt_7702_contract: address!("0x05aE73C5925d843864AE6f261f3175dE2ebCd963"),
+                relay_adapt_7702_delegates: SEPOLIA_RELAY_ADAPT_7702_DELEGATES,
+                relay_adapt_history: SEPOLIA_RELAY_ADAPT_HISTORY,
+                deployment_block: 5_784_774,
                 v2_start_block: 0,
                 legacy_shield_block: 0,
             }),

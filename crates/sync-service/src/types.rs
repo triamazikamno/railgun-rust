@@ -724,6 +724,21 @@ impl RailgunSyncOptions {
                 anchor_interval: 1000,
                 anchor_retention: 5,
             }),
+            11_155_111 => Some(Self {
+                block_range,
+                poll_interval,
+                indexed_artifact_source: None,
+                archive_until_block: 0,
+                indexed_wallet_block_range: 300_000,
+                quick_sync_endpoint: Some(
+                    Url::parse(
+                        "https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql",
+                    )
+                    .ok()?,
+                ),
+                anchor_interval: 1000,
+                anchor_retention: 5,
+            }),
             _ => None,
         }
     }
