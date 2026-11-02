@@ -39,8 +39,8 @@ pub struct Body {
     pub railgun_address: railgun::Address,
     pub available_wallets: u32,
     pub version: String,
-    #[serde(with = "serde_helpers::checksum_address")]
-    pub relay_adapt: Address,
+    #[serde(with = "relay_adapt")]
+    pub relay_adapt: Option<Address>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_adapt_7702: Option<Address>,
     #[serde(rename = "requiredPOIListKeys")]
@@ -48,6 +48,35 @@ pub struct Body {
     pub reliability: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+}
+
+/// Broadcasters announce "no relay adapt" as `""` or the zero address, and
+/// Alloy's `Address` deserializer rejects `""`. `None` is written as the zero
+/// address so builds that still require an address accept our announcements.
+mod relay_adapt {
+    use super::serde_helpers::checksum_address;
+    use alloy::primitives::Address;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::ref_option)] // serde `with` passes `&Option<T>`
+    pub(super) fn serialize<S>(address: &Option<Address>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        checksum_address::serialize(&address.unwrap_or_default(), serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            return Ok(None);
+        }
+        let address: Address = s.parse().map_err(serde::de::Error::custom)?;
+        Ok((!address.is_zero()).then_some(address))
+    }
 }
 
 impl Body {
@@ -108,16 +137,19 @@ mod tests {
             .expect("test Railgun address"),
             available_wallets: 1,
             version: "8.2.3".to_string(),
-            relay_adapt: Address::ZERO,
+            relay_adapt: None,
             relay_adapt_7702: Some(delegate),
             required_poi_list_keys: Vec::new(),
             reliability: 1.0,
             identifier: None,
         };
         let mut payload = body.into_signed_payload(seed).expect("signed payload");
+        let wire = std::str::from_utf8(&payload.data).expect("utf-8 payload");
+        assert!(wire.contains(r#""relayAdapt":"0x0000000000000000000000000000000000000000""#));
 
         let (body, verified) = payload.decode_and_verify().expect("decoded payload");
         assert!(verified);
+        assert_eq!(body.relay_adapt, None);
         assert_eq!(body.relay_adapt_7702, Some(delegate));
 
         payload.signature[0] ^= 1;
@@ -125,5 +157,29 @@ mod tests {
             .decode_and_verify()
             .expect("decoded tampered payload");
         assert!(!verified);
+    }
+
+    #[test]
+    fn relay_adapt_decodes_empty_and_zero_as_none() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(with = "super::relay_adapt")]
+            relay_adapt: Option<Address>,
+        }
+        let decode = |value: &str| {
+            serde_json::from_str::<Wrapper>(&format!(r#"{{"relay_adapt":"{value}"}}"#))
+                .map(|wrapper| wrapper.relay_adapt)
+        };
+
+        assert_eq!(decode("").expect("empty"), None);
+        assert_eq!(
+            decode("0x0000000000000000000000000000000000000000").expect("zero"),
+            None
+        );
+        assert_eq!(
+            decode("0x2222222222222222222222222222222222222222").expect("address"),
+            Some(Address::repeat_byte(0x22))
+        );
+        assert!(decode("0x12").is_err());
     }
 }
