@@ -57,13 +57,13 @@ use super::workers::{
     wallet_lag_fallback_state_for_test,
 };
 use super::{
-    ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestReorgDecision,
-    GeneratedCommitmentBatch, IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession,
-    IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind, LogRangeLimit, MerkleForestDbExt,
-    Nullified, Nullifiers, PublicCoverageAnswer, PublicDataPlaneDiagnosticKind,
-    PublicDataPlaneError, PublicPoiCorpusKey, PublicScanRange, PublicScanRowsAnswer,
-    PublicScanSource, RailgunLegacyShieldEvents, Shield, Transact, TransportError,
-    WalletIndexedCatchUpStatusGuard, WalletStartupSyncError, WalletWorkerServices,
+    ChainError, ChainPublicDataPlane, ChainService, CommitmentBatch, ForestMetaCheck,
+    ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletArtifactPageOutcome,
+    IndexedWalletArtifactSession, IndexedWalletCatchUpSourceOrder, IndexedWalletPageKind,
+    LogRangeLimit, MerkleForestDbExt, Nullified, Nullifiers, PublicCoverageAnswer,
+    PublicDataPlaneDiagnosticKind, PublicDataPlaneError, PublicPoiCorpusKey, PublicScanRange,
+    PublicScanRowsAnswer, PublicScanSource, RailgunLegacyShieldEvents, Shield, Transact,
+    TransportError, WalletIndexedCatchUpStatusGuard, WalletStartupSyncError, WalletWorkerServices,
     artifact_failure_can_fallback_to_squid, send_wallet_startup_events,
     should_hedge_wallet_startup, sort_logs, spawn_backfill_loop, spawn_live_log_loop,
     squid_tail_target_after_artifact, wallet_backfill_from_block,
@@ -4211,6 +4211,48 @@ fn forest_reorg_decision_requires_confirmed_mismatch() {
         ForestReorgDecision::from_confirmed_hash(100, 100, [1u8; 32], Some([2u8; 32])),
         ForestReorgDecision::Mismatch
     );
+}
+
+#[tokio::test]
+async fn forest_meta_check_reads_matching_hash_once_and_rewinds_only_on_agreeing_pair() {
+    let scope = test_scope();
+    let stored_hash = [0x11; 32];
+    for (hash_bytes, expected, reads) in [
+        (vec![0x11], ForestMetaCheck::Match, 1),
+        (
+            vec![0xaa, 0xaa],
+            ForestMetaCheck::Mismatch {
+                current_hash: [0xaa; 32],
+            },
+            2,
+        ),
+        (vec![0xaa, 0xbb, 0xbb], ForestMetaCheck::Unconfirmed, 2),
+    ] {
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(hash_bytes.clone()));
+        let rpc = JsonRpcServer::spawn_handler(move |request: &serde_json::Value| {
+            let block_number = hex_quantity(&request["params"][0]);
+            let block = queue
+                .lock()
+                .expect("hash queue")
+                .pop_front()
+                .map(|hash_byte| {
+                    rpc_block(block_number, test_block_timestamp(block_number), hash_byte)
+                });
+            serde_json::json!({ "result": block })
+        });
+        let chain = log_fetch_chain(&scope, rpc.url.clone(), 100);
+        let provider = chain.rpcs.random_provider().expect("rpc provider");
+
+        let check = chain
+            .check_forest_meta(&provider.provider, None, 120, stored_hash, 120)
+            .await
+            .expect("check forest meta");
+
+        let bodies = rpc.drain_request_bodies();
+        assert_eq!(check, expected, "responses {hash_bytes:x?}");
+        assert_eq!(bodies.len(), reads, "responses {hash_bytes:x?}");
+        assert_eq!(header_blocks(&bodies), vec![120; reads]);
+    }
 }
 
 #[test]

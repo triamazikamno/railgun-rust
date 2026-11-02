@@ -193,7 +193,7 @@ pub(super) fn spawn_pending_tip_loop(
     service: Arc<ChainService>,
     rpcs: Arc<QueryRpcPool>,
     archive_provider: Option<DynProvider>,
-    mut head_rx: watch::Receiver<u64>,
+    head_rx: watch::Receiver<u64>,
     mut safe_head_rx: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
@@ -201,7 +201,7 @@ pub(super) fn spawn_pending_tip_loop(
     tokio::spawn(
         async move {
             loop {
-                let safe_head = *safe_head_rx.borrow();
+                let safe_head = *safe_head_rx.borrow_and_update();
                 let head = *head_rx.borrow();
                 refresh_pending_tip_overlays(
                     &service,
@@ -215,7 +215,7 @@ pub(super) fn spawn_pending_tip_loop(
 
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    _ = head_rx.changed() => {},
+                    // The poller sends the head before the safe head on every poll, so the safe head alone wakes this loop.
                     _ = safe_head_rx.changed() => {},
                     () = tokio::time::sleep(service.chain.sync.poll_interval) => {},
                 }

@@ -751,8 +751,10 @@ impl ChainConfig {
     }
 
     /// Checks the forest metadata `(meta_last_block, stored_hash)` against the
-    /// confirmed hash of `last_processed`. Reads the hash only when the forest
-    /// is past deployment and the metadata records a hash for `last_processed`.
+    /// hash of `last_processed`. Reads the hash only when the forest is past
+    /// deployment and the metadata records a hash for `last_processed`. One
+    /// read returning the stored hash is a match; a different hash must be
+    /// confirmed by the next read before it counts as a mismatch.
     /// Shared by the reorg check and the startup catch-up gate.
     pub(super) async fn check_forest_meta(
         &self,
@@ -768,9 +770,17 @@ impl ChainConfig {
         if meta_last_block != last_processed {
             return Ok(ForestMetaCheck::StaleMeta);
         }
-        let current_hash = self
-            .fetch_confirmed_block_hash(provider, archive_provider, last_processed)
-            .await?;
+        let current_hash = match self
+            .fetch_block_hash(provider, archive_provider, last_processed)
+            .await?
+        {
+            Some(first_hash) if first_hash == stored_hash => return Ok(ForestMetaCheck::Match),
+            Some(first_hash) => {
+                self.confirm_block_hash(provider, archive_provider, last_processed, first_hash)
+                    .await?
+            }
+            None => None,
+        };
         let decision = ForestReorgDecision::from_confirmed_hash(
             last_processed,
             meta_last_block,
@@ -798,7 +808,19 @@ impl ChainConfig {
         else {
             return Ok(None);
         };
+        self.confirm_block_hash(provider, archive_provider, block_number, first_hash)
+            .await
+    }
 
+    /// Makes a second read of `block_number` and returns `first_hash` only
+    /// when it agrees.
+    async fn confirm_block_hash(
+        &self,
+        provider: &DynProvider,
+        archive_provider: Option<&DynProvider>,
+        block_number: u64,
+        first_hash: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, ChainError> {
         let Some(second_hash) = self
             .fetch_block_hash(provider, archive_provider, block_number)
             .await?
