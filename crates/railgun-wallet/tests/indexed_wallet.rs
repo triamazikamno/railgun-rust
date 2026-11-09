@@ -184,6 +184,44 @@ fn indexed_shield_commitment_decrypts_wallet_utxo() {
 }
 
 #[test]
+fn indexed_shield_commitment_rejects_foreign_npk_encrypted_to_wallet() {
+    let victim = scan_keys(7);
+    let attacker = scan_keys(11);
+    // The attacker keeps the npk but encrypts the random to the victim's viewing key.
+    let calldata = build_shield_calldata(
+        attacker.master_public_key,
+        &victim.viewing_public_key,
+        Address::ZERO,
+        uint!(55_U256),
+        &[3u8; 32],
+    )
+    .expect("shield calldata");
+    let request = shieldCall::abi_decode(&calldata)
+        .expect("decode shield call")
+        ._shieldRequests
+        .into_iter()
+        .next()
+        .expect("shield request");
+    let expected_commitment = request.preimage.hash();
+    let input = IndexedShieldCommitmentInput {
+        tree_number: 4,
+        tree_position: 15,
+        preimage: request.preimage,
+        shield_ciphertext: request.ciphertext,
+        source: source(3),
+    };
+
+    let delta = parse_delta(&[], &[input], &[], &[], &[], &victim);
+
+    assert!(delta.utxos.is_empty());
+    assert_eq!(delta.commitment_observations.len(), 1);
+    assert_eq!(
+        delta.commitment_observations[0].commitment,
+        expected_commitment
+    );
+}
+
+#[test]
 fn indexed_nullifier_converts_to_spent_marker() {
     let keys = scan_keys(7);
     let input = IndexedNullifierInput {

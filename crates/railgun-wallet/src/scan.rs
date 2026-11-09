@@ -728,8 +728,13 @@ fn scan_shield_commitment(
     let shared_key =
         shared_symmetric_key(&keys.viewing_private_key, &ciphertext.shieldKey.0).ok()?;
     let random = decrypt_shield_random(&ciphertext.encryptedBundle, &shared_key).ok()?;
+    // Decryption only proves the bundle was encrypted to us; the npk must also be ours.
+    let note = preimage.note_with_random(random);
+    if note.npk != Note::npk_for(keys.master_public_key, random) {
+        return None;
+    }
     Some(Utxo::new(
-        preimage.note_with_random(random),
+        note,
         tree,
         position,
         source,
