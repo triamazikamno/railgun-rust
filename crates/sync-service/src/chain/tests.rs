@@ -797,6 +797,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         poi_submitter_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+        txid_public_cache_task: std::sync::Mutex::new(None),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
         public_data_plane,
@@ -5685,6 +5686,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         poi_submitter_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+        txid_public_cache_task: std::sync::Mutex::new(None),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
         public_data_plane: public_data_plane.clone(),
@@ -5878,6 +5880,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         poi_submitter_task: std::sync::Mutex::new(None),
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+        txid_public_cache_task: std::sync::Mutex::new(None),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
         public_data_plane: public_data_plane.clone(),
@@ -8740,6 +8743,7 @@ fn test_chain_service_with_poi_submitter(
             poi_submitter_task: std::sync::Mutex::new(None),
             anchor_last: std::sync::atomic::AtomicU64::new(0),
             txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
+            txid_public_cache_task: std::sync::Mutex::new(None),
             wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
             wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
             public_data_plane,
@@ -13767,6 +13771,47 @@ async fn far_behind_attempt_blocks_the_stall_trigger_and_ends_with_shutdown() {
 
     drop(commitments);
     drop(service);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn chain_shutdown_awaits_stalled_txid_public_cache_sync() {
+    let scope = test_scope();
+    let (squid, squid_block) = GraphqlServer::spawn_with_blocked_response(vec!["{}"], 0);
+    let (root_dir, db) = open_forest_db("txid-public-cache-shutdown");
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![Url::parse("http://127.0.0.1:1").expect("rpc url")],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, None);
+    chain.sync.quick_sync_endpoint = Some(squid.url.clone());
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)));
+    let service = test_chain_service(Arc::clone(&db), chain, public_data_plane);
+
+    service.spawn_txid_public_cache_loop_once();
+    wait_for_std_signal(
+        squid_block.request_started,
+        "TXID public cache page request started",
+    )
+    .await;
+
+    // The held page would stall the sync for minutes of header timeouts and retries.
+    tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+        .await
+        .expect("shutdown must not wait for the stalled TXID public cache sync");
+    assert_eq!(
+        Arc::strong_count(&service),
+        1,
+        "the TXID public cache loop released its service handle"
+    );
+
+    squid_block
+        .release
+        .send(())
+        .expect("release stalled TXID page");
+    drop(squid);
+    drop(service);
+    drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 

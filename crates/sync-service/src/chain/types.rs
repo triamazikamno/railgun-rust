@@ -484,6 +484,7 @@ pub struct ChainService {
     pub(super) poi_submitter_task: StdMutex<Option<JoinHandle<()>>>,
     pub(super) anchor_last: AtomicU64,
     pub(super) txid_public_cache_started: AtomicBool,
+    pub(super) txid_public_cache_task: StdMutex<Option<JoinHandle<()>>>,
     pub(super) wallet_actor_next: AtomicU64,
     pub(super) wallet_reset_intent_next: AtomicU64,
     pub(super) public_data_plane: ChainPublicDataPlane,

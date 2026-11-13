@@ -1038,6 +1038,7 @@ impl ChainService {
             poi_submitter_task: std::sync::Mutex::new(None),
             anchor_last: AtomicU64::new(last_anchor),
             txid_public_cache_started: AtomicBool::new(false),
+            txid_public_cache_task: std::sync::Mutex::new(None),
             wallet_actor_next: AtomicU64::new(1),
             wallet_reset_intent_next: AtomicU64::new(1),
             public_data_plane,
@@ -1132,11 +1133,20 @@ impl ChainService {
         }
     }
 
-    fn spawn_txid_public_cache_loop_once(self: &Arc<Self>) {
+    pub(super) fn spawn_txid_public_cache_loop_once(self: &Arc<Self>) {
         if self.txid_public_cache_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        spawn_txid_public_cache_loop(Arc::clone(self), self.cancel.clone());
+        let mut task = self
+            .txid_public_cache_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Shutdown cancels before it takes the handle under this lock, so no
+        // loop starts after shutdown has awaited it.
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        *task = spawn_txid_public_cache_loop(Arc::clone(self), self.cancel.clone());
     }
 
     fn spawn_txid_public_cache_loop_when_ready(
@@ -3482,6 +3492,22 @@ impl ChainService {
             warn!(
                 chain_id = self.chain.deployment.chain_id,
                 "chain PPOI submitter failed during shutdown"
+            );
+        }
+        // The loop drops an in-flight sync on cancel, and its service clone
+        // keeps the data plane, and with it the runtime lease, alive.
+        let txid_public_cache_task = self
+            .txid_public_cache_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = txid_public_cache_task
+            && let Err(err) = task.await
+            && !err.is_cancelled()
+        {
+            warn!(
+                chain_id = self.chain.deployment.chain_id,
+                "TXID public cache loop failed during shutdown"
             );
         }
         self.public_data_plane.shutdown().await;

@@ -766,17 +766,20 @@ pub(super) const fn pending_tip_provider_covers_target(
     provider_head >= target_block
 }
 
-pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: CancellationToken) {
+pub(super) fn spawn_txid_public_cache_loop(
+    service: Arc<ChainService>,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
     let endpoint = service.chain.sync.quick_sync_endpoint.clone();
     let indexed_artifact_source = service.chain.sync.indexed_artifact_source.clone();
     if endpoint.is_none() && indexed_artifact_source.is_none() {
-        return;
+        return None;
     }
     let chain_id = service.chain.deployment.chain_id;
     let railgun_contract = service.chain.deployment.contract;
     let http_client = Some(service.chain.http_client.clone());
     let db = service.db.clone();
-    tokio::spawn(
+    Some(tokio::spawn(
         async move {
             loop {
                 let key = TxidPublicCacheKey {
@@ -787,16 +790,20 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
                 };
                 let cache = TxidPublicCache::new(&db, key);
                 let maintenance = service.public_data_plane.indexed_artifact_maintenance();
-                if let Err(err) = cache
-                    .sync_to_indexed_tip_maintained(
+                // Cache writes are synchronous between awaits, so dropping the
+                // sync on cancel stops between complete writes.
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    result = cache.sync_to_indexed_tip_maintained(
                         endpoint.as_ref(),
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         &maintenance,
                         Arc::clone(&db),
-                    )
-                    .await
-                {
+                    ) => result,
+                };
+                if let Err(err) = result {
                     warn!(err = %err.without_url(), chain_id, "TXID public cache background sync failed");
                 }
                 tokio::select! {
@@ -806,7 +813,7 @@ pub(super) fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: C
             }
         }
         .instrument(tracing::info_span!("txid_public_cache", chain_id)),
-    );
+    ))
 }
 
 pub(super) fn spawn_live_log_loop(
