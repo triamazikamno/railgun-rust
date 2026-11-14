@@ -1,15 +1,21 @@
 use alloy::hex;
 use alloy::primitives::Address;
-use redb::{ReadableTable, WriteTransaction};
+use redb::{ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::BTreeSet;
 
 use super::{
-    APP_SETTINGS_TABLE, DESKTOP_WALLET_VAULT_TABLE, DbError,
-    LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX, OUTPUT_POI_RECOVERY_TABLE, OutputPoiRecoveryRecord,
-    PENDING_OUTPUT_POI_CONTEXT_TABLE, POI_ARTIFACT_CACHE_GENERATION_KEY, POI_ARTIFACT_CACHE_TABLE,
-    PendingOutputPoiContextRecord, PoiArtifactCacheRecord, WALLET_META_TABLE, WALLET_UTXO_TABLE,
-    WalletCacheKey, decode, encode, prefix_range_end, wallet_utxo_key,
+    ByteTableDefinition, DbError, LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX,
+    OUTPUT_POI_RECOVERY_TABLE, OutputPoiRecoveryRecord, PENDING_OUTPUT_POI_CONTEXT_TABLE,
+    POI_ARTIFACT_CACHE_GENERATION_KEY, POI_ARTIFACT_CACHE_TABLE, POI_SIDECAR_KEY_PREFIX,
+    POI_SIDECAR_STATE_TABLE, PendingOutputPoiContextRecord, PoiArtifactCacheRecord,
+    WALLET_META_TABLE, WALLET_UTXO_TABLE, WalletCacheKey, decode, encode, list_table_prefix,
+    prefix_range_end, wallet_utxo_key,
 };
+
+// Application-owned tables that only these historical migrations may touch.
+const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
+const DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
+    TableDefinition::new("desktop_wallet_vault_v1");
 
 struct SchemaSevenWalletUtxoRow {
     source_key: String,
@@ -92,6 +98,34 @@ pub(super) fn migrate_schema_9_to_10(txn: &WriteTransaction) -> Result<(), DbErr
     let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
     for (key, payload) in records {
         table.insert(key.as_str(), payload.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Moves `sync-service`'s POI state out of the application settings table, byte for byte.
+pub(super) fn migrate_schema_11_to_12(txn: &WriteTransaction) -> Result<(), DbError> {
+    let mut source = txn.open_table(APP_SETTINGS_TABLE)?;
+    let mut rows = Vec::new();
+    if let Some(value) = source.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
+        rows.push((
+            POI_ARTIFACT_CACHE_GENERATION_KEY.to_owned(),
+            value.value().to_vec(),
+        ));
+    }
+    rows.extend(list_table_prefix(&source, POI_SIDECAR_KEY_PREFIX)?);
+
+    let mut destination = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
+    for (key, _) in &rows {
+        if destination.get(key.as_str())?.is_some() {
+            return Err(DbError::SchemaMigrationDestinationConflict {
+                table: "poi_sidecar_state_v1",
+                key: key.clone(),
+            });
+        }
+    }
+    for (key, value) in &rows {
+        destination.insert(key.as_str(), value.as_slice())?;
+        source.remove(key.as_str())?;
     }
     Ok(())
 }

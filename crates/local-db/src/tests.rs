@@ -1,22 +1,20 @@
 use super::{
-    APP_SETTINGS_TABLE, BLOB_INDEX_TABLE, CURRENT_SCHEMA_VERSION, CanonicalBlobMetaIdentity,
-    DESKTOP_WALLET_VAULT_TABLE, DbConfig, DbError, DbStore, DesktopWalletVaultRecord,
-    ExpectedPoiCorpusJournalState, MERKLE_FOREST_INDEX_TABLE, META_KEY, META_TABLE, Meta,
-    OUTPUT_POI_RECOVERY_TABLE, OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow,
-    OpaqueWalletPrivateRowMutation, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    PENDING_FEE_NOTE_ASSURANCE_TABLE, PENDING_OUTPUT_POI_CONTEXT_TABLE,
+    AppTable, AppTableWriter, BLOB_INDEX_TABLE, ByteTableDefinition, CURRENT_SCHEMA_VERSION,
+    CanonicalBlobMetaIdentity, DbConfig, DbError, DbStore, ExpectedPoiCorpusJournalState,
+    MERKLE_FOREST_INDEX_TABLE, META_KEY, META_TABLE, Meta, OUTPUT_POI_RECOVERY_TABLE,
+    OUTPUT_POI_RECOVERY_V2_TABLE, OpaqueWalletPrivateRow, OpaqueWalletPrivateRowMutation,
+    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, PENDING_OUTPUT_POI_CONTEXT_TABLE,
     PENDING_OUTPUT_POI_CONTEXT_V2_TABLE, POI_ARTIFACT_CACHE_GENERATION_KEY,
     POI_ARTIFACT_CACHE_TABLE, POI_CORPUS_JOURNAL_FORMAT_VERSION,
-    POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES, POI_CORPUS_JOURNAL_TABLE, PendingFeeNoteAssuranceRecord,
+    POI_CORPUS_JOURNAL_MAX_PAYLOAD_BYTES, POI_CORPUS_JOURNAL_TABLE, POI_SIDECAR_STATE_TABLE,
     PendingOutputPoiContextRecord, PendingOutputPoiRole, PoiArtifactCacheRecord,
     PoiArtifactDescriptorRecord, PoiCacheRecordSource, PoiCorpusBlockedSnapshotRecord,
     PoiCorpusJournalCommitCondition, PoiCorpusJournalCommitOutcome, PoiCorpusJournalDeltaRecord,
     PoiCorpusJournalHeadRecord, PoiCorpusJournalInspection, PoiCorpusRpcHealthRecord,
     PoiCorpusValidationRecord, PoiPublisherManifestObservation,
     PoiPublisherManifestWatermarkRecord, SENDER_TRANSACTION_CANDIDATE_V1_TABLE, StoredRecord,
-    TERMINAL_FEE_NOTE_ASSURANCE_TABLE, WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE,
-    WALLET_UTXO_TABLE, WalletCacheKey, WalletDeletionBatch, WalletDeletionReport, WalletMeta,
-    WalletMetaMutation, WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
+    WALLET_META_TABLE, WALLET_SYNC_ACTOR_STATE_TABLE, WALLET_UTXO_TABLE, WalletCacheKey,
+    WalletMeta, WalletMetaMutation, WalletPendingResetRecord, WalletPrivateCanonicalizationBatch,
     WalletPrivateCanonicalizationKindBatch, WalletPrivateCanonicalizationReport,
     WalletPrivateNamespaceDeletionReport, WalletPrivateNamespaceId, WalletPrivateRecordKind,
     WalletPrivateStateBatch, WalletPrivateV1MigrationBatch, WalletPrivateV1MigrationReport,
@@ -24,15 +22,60 @@ use super::{
 };
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, keccak256};
 use alloy::uint;
-use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
+use broadcaster_core::transact::{PreTxPoi, SnarkJsProof};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Application tables that existing databases still carry; `local-db` no longer owns them.
+const APP_SETTINGS: AppTable = AppTable::new("app_settings_v1");
+const DESKTOP_WALLET_VAULT: AppTable = AppTable::new("desktop_wallet_vault_v1");
+const RAW_APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
+const RAW_DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
+    TableDefinition::new("desktop_wallet_vault_v1");
+const RAW_PENDING_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
+    TableDefinition::new("fee_note_assurance_pending");
+const RAW_TERMINAL_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
+    TableDefinition::new("fee_note_assurance_terminal");
+/// The tables of a schema-10 database. Schema 11 adds `sender_transaction_candidate_v1`.
+const SCHEMA_TEN_TABLES: [ByteTableDefinition; 17] = [
+    META_TABLE,
+    BLOB_INDEX_TABLE,
+    MERKLE_FOREST_INDEX_TABLE,
+    ZKEY_INDEX_TABLE,
+    WALLET_UTXO_TABLE,
+    WALLET_META_TABLE,
+    WALLET_SYNC_ACTOR_STATE_TABLE,
+    RAW_PENDING_FEE_NOTE_ASSURANCE_TABLE,
+    RAW_TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
+    PENDING_OUTPUT_POI_CONTEXT_TABLE,
+    OUTPUT_POI_RECOVERY_TABLE,
+    PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
+    OUTPUT_POI_RECOVERY_V2_TABLE,
+    POI_ARTIFACT_CACHE_TABLE,
+    POI_CORPUS_JOURNAL_TABLE,
+    RAW_APP_SETTINGS_TABLE,
+    RAW_DESKTOP_WALLET_VAULT_TABLE,
+];
+
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn put_app_row(store: &DbStore, table: AppTable, key: &str, value: &[u8]) {
+    store
+        .write_app_tables(|tables| tables.insert(table, key, value))
+        .expect("write app table row");
+}
+
+fn get_app_row(store: &DbStore, table: AppTable, key: &str) -> Option<Vec<u8>> {
+    store
+        .read_app_tables(|tables| tables.get(table, key))
+        .expect("read app table row")
+}
 
 fn wallet_cache_key(byte: u8) -> WalletCacheKey {
     WalletCacheKey::from_opaque_id([byte; 16])
@@ -572,23 +615,6 @@ fn assert_no_atomic_temps(kind_dir: &std::path::Path) {
                 .to_string_lossy()
                 .starts_with(".railgun-blob-"))
     );
-}
-
-fn sample_record(chain_id: u64, public_tx_hash: FixedBytes<32>) -> PendingFeeNoteAssuranceRecord {
-    PendingFeeNoteAssuranceRecord {
-        chain_id,
-        public_tx_hash,
-        context: FeeNoteAssuranceContext {
-            chain_type: 0,
-            txid_version: "V3_PoseidonMerkle".to_string(),
-            railgun_txid: uint!(5_U256),
-            utxo_tree_in: 9,
-            fee_commitment: FixedBytes::from([1u8; 32]),
-            fee_note_npk: FixedBytes::from([2u8; 32]),
-            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
-            required_poi_list_keys: vec![FixedBytes::from([4u8; 32])],
-        },
-    }
 }
 
 fn sample_pre_tx_poi(byte: u8) -> PreTxPoi {
@@ -1928,129 +1954,6 @@ fn blocked_snapshot_only_justifies_revision_holes_through_its_revision() {
 }
 
 #[test]
-fn pending_fee_note_assurance_roundtrip_and_listing() {
-    let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-
-    let record = sample_record(1, FixedBytes::from([0x11; 32]));
-    store
-        .put_pending_fee_note_assurance(&record)
-        .expect("store assurance record");
-
-    let loaded = store
-        .get_pending_fee_note_assurance(record.chain_id, &record.public_tx_hash)
-        .expect("load assurance record")
-        .expect("record present");
-    assert_eq!(loaded.context.txid_version, record.context.txid_version);
-    assert_eq!(loaded.context.railgun_txid, record.context.railgun_txid);
-    assert_eq!(
-        loaded.context.required_poi_list_keys,
-        record.context.required_poi_list_keys
-    );
-
-    let records = store
-        .list_pending_fee_note_assurance(record.chain_id)
-        .expect("list pending assurance records");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].public_tx_hash, record.public_tx_hash);
-
-    assert!(
-        store
-            .list_terminal_fee_note_assurance(record.chain_id)
-            .expect("list terminal assurance records")
-            .is_empty()
-    );
-
-    drop(store);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[test]
-fn delete_pending_fee_note_assurance_removes_record() {
-    let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-
-    let record = sample_record(56, FixedBytes::from([0x22; 32]));
-    let key = record.key();
-    assert!(key.starts_with("56|"));
-
-    store
-        .put_pending_fee_note_assurance(&record)
-        .expect("store assurance record");
-    store
-        .delete_pending_fee_note_assurance(record.chain_id, &record.public_tx_hash)
-        .expect("delete assurance record");
-
-    assert!(
-        store
-            .get_pending_fee_note_assurance(record.chain_id, &record.public_tx_hash)
-            .expect("load deleted record")
-            .is_none()
-    );
-
-    drop(store);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[test]
-fn marking_fee_note_assurance_terminal_moves_record() {
-    let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-
-    let record = sample_record(99, FixedBytes::from([0x33; 32]));
-    store
-        .put_pending_fee_note_assurance(&record)
-        .expect("store assurance record");
-    store
-        .mark_fee_note_assurance_terminal(
-            &record,
-            super::FeeNoteAssuranceTerminalOutcome::CommitmentMismatch,
-        )
-        .expect("mark assurance record terminal");
-
-    assert!(
-        store
-            .get_pending_fee_note_assurance(record.chain_id, &record.public_tx_hash)
-            .expect("load pending assurance record")
-            .is_none()
-    );
-    assert!(
-        store
-            .list_pending_fee_note_assurance(record.chain_id)
-            .expect("list pending assurance records")
-            .is_empty()
-    );
-
-    let terminal = store
-        .get_terminal_fee_note_assurance(record.chain_id, &record.public_tx_hash)
-        .expect("load terminal assurance record")
-        .expect("terminal record present");
-    assert_eq!(
-        terminal.outcome,
-        super::FeeNoteAssuranceTerminalOutcome::CommitmentMismatch
-    );
-    assert_eq!(terminal.context.railgun_txid, record.context.railgun_txid);
-
-    let terminal_records = store
-        .list_terminal_fee_note_assurance(record.chain_id)
-        .expect("list terminal assurance records");
-    assert_eq!(terminal_records.len(), 1);
-    assert_eq!(terminal_records[0].public_tx_hash, record.public_tx_hash);
-
-    drop(store);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[test]
 fn pending_output_poi_context_roundtrip_and_listing() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
@@ -2171,75 +2074,6 @@ fn output_poi_recovery_roundtrip_and_wallet_listing() {
 }
 
 #[test]
-fn app_settings_records_are_transactional_plaintext_records() {
-    let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-
-    assert!(
-        store
-            .get_app_settings_record("wallet-settings")
-            .expect("load missing settings")
-            .is_none()
-    );
-
-    store
-        .put_app_settings_record("wallet-settings", b"settings-v1")
-        .expect("store settings");
-    store
-        .put_app_settings_record("other-settings", b"other")
-        .expect("store other settings");
-    let max_prefix_key = format!("{}-settings", char::MAX);
-    store
-        .put_app_settings_record(&max_prefix_key, b"max-prefix")
-        .expect("store max-prefix settings");
-
-    assert_eq!(
-        store
-            .get_app_settings_record("wallet-settings")
-            .expect("load settings")
-            .expect("settings present"),
-        b"settings-v1"
-    );
-
-    let records = store
-        .list_app_settings_records("wallet")
-        .expect("list settings records");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].key, "wallet-settings");
-    assert_eq!(records[0].payload, b"settings-v1");
-    assert_eq!(
-        store
-            .list_app_settings_records("")
-            .expect("list all settings records")
-            .len(),
-        3
-    );
-    assert_eq!(
-        store
-            .list_app_settings_records(&char::MAX.to_string())
-            .expect("list max-prefix settings")
-            .len(),
-        1
-    );
-
-    store
-        .delete_app_settings_record("wallet-settings")
-        .expect("delete settings");
-    assert!(
-        store
-            .get_app_settings_record("wallet-settings")
-            .expect("load deleted settings")
-            .is_none()
-    );
-
-    drop(store);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[test]
 fn poi_publisher_manifest_watermarks_round_trip_and_are_isolated() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
@@ -2272,9 +2106,7 @@ fn poi_publisher_manifest_watermarks_round_trip_and_are_isolated() {
     store
         .advance_poi_publisher_manifest_watermark(second.publisher_pubkey, second.accepted_sequence)
         .expect("store second publisher watermark");
-    store
-        .put_app_settings_record("wallet-settings", b"settings-v1")
-        .expect("store unrelated app setting");
+    put_app_row(&store, APP_SETTINGS, "wallet-settings", b"settings-v1");
 
     let loaded_first = store
         .get_poi_publisher_manifest_watermark(&first.publisher_pubkey)
@@ -2304,16 +2136,17 @@ fn poi_publisher_manifest_watermarks_round_trip_and_are_isolated() {
             .is_none()
     );
     assert_eq!(
-        store
-            .get_app_settings_record("wallet-settings")
-            .expect("load unrelated app setting")
+        get_app_row(&store, APP_SETTINGS, "wallet-settings")
             .expect("unrelated app setting present"),
         b"settings-v1"
     );
 
     let mismatched_key = PoiPublisherManifestWatermarkRecord::key_for(&second.publisher_pubkey);
     store
-        .put_app_settings_record(&mismatched_key, &encode(&first).expect("encode watermark"))
+        .put_raw_poi_sidecar_state_for_test(
+            &mismatched_key,
+            &encode(&first).expect("encode watermark"),
+        )
         .expect("store mismatched publisher watermark");
     assert!(matches!(
         store.get_poi_publisher_manifest_watermark(&second.publisher_pubkey),
@@ -2511,7 +2344,7 @@ fn poi_corpus_rpc_health_records_round_trip_and_are_isolated() {
         &second.list_key,
     );
     store
-        .put_app_settings_record(
+        .put_raw_poi_sidecar_state_for_test(
             &mismatched_key,
             &encode(&first).expect("encode corpus RPC health"),
         )
@@ -3122,13 +2955,10 @@ fn wallet_private_state_and_vault_records_commit_atomically() {
         pending_reset: None,
         updated_at: 20,
     };
-    let vault_records = [DesktopWalletVaultRecord {
-        key: "wallet-chain-metadata|21".to_string(),
-        payload: b"encrypted-metadata".to_vec(),
-    }];
+    let (vault_key, vault_payload) = ("wallet-chain-metadata|21", b"encrypted-metadata");
 
     store
-        .batch_commit_wallet_private_state_with_vault_records(
+        .batch_commit_wallet_private_state_with(
             &WalletPrivateStateBatch {
                 namespace: &namespace,
                 utxos: WalletUtxoRowMutation::Replace(&utxos),
@@ -3138,7 +2968,7 @@ fn wallet_private_state_and_vault_records_commit_atomically() {
                 output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
                 sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
             },
-            &vault_records,
+            |tables| tables.insert(DESKTOP_WALLET_VAULT, vault_key, vault_payload),
         )
         .expect("commit private state and vault record");
 
@@ -3167,10 +2997,8 @@ fn wallet_private_state_and_vault_records_commit_atomically() {
         Some(actor_state)
     );
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record(&vault_records[0].key)
-            .expect("load committed vault record"),
-        Some(vault_records[0].payload.clone())
+        get_app_row(&store, DESKTOP_WALLET_VAULT, vault_key),
+        Some(vault_payload.to_vec())
     );
 
     drop(store);
@@ -3206,9 +3034,12 @@ fn wallet_private_state_and_vault_records_roll_back_before_commit_failure() {
     store
         .put_wallet_sync_actor_state(&original_actor_state)
         .expect("seed old actor state");
-    store
-        .put_desktop_wallet_vault_record("wallet-chain-metadata|22", b"old-encrypted-metadata")
-        .expect("seed old vault record");
+    put_app_row(
+        &store,
+        DESKTOP_WALLET_VAULT,
+        "wallet-chain-metadata|22",
+        b"old-encrypted-metadata",
+    );
 
     let replacement_utxos = [("new-utxo".to_string(), b"new-payload".to_vec())];
     let replacement_meta = WalletMeta {
@@ -3223,11 +3054,8 @@ fn wallet_private_state_and_vault_records_roll_back_before_commit_failure() {
         pending_reset: None,
         updated_at: 2,
     };
-    let vault_records = [DesktopWalletVaultRecord {
-        key: "wallet-chain-metadata|22".to_string(),
-        payload: b"new-encrypted-metadata".to_vec(),
-    }];
-    let result = store.batch_commit_wallet_private_state_with_vault_records_transaction(
+    let vault_key = "wallet-chain-metadata|22";
+    let result: Result<(), DbError> = store.batch_commit_wallet_private_state_with(
         &WalletPrivateStateBatch {
             namespace: &namespace,
             utxos: WalletUtxoRowMutation::Replace(&replacement_utxos),
@@ -3237,8 +3065,8 @@ fn wallet_private_state_and_vault_records_roll_back_before_commit_failure() {
             output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
             sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
         },
-        &vault_records,
-        || {
+        |tables| {
+            tables.insert(DESKTOP_WALLET_VAULT, vault_key, b"new-encrypted-metadata")?;
             Err(DbError::Io(std::io::Error::other(
                 "injected pre-commit failure",
             )))
@@ -3272,14 +3100,158 @@ fn wallet_private_state_and_vault_records_roll_back_before_commit_failure() {
         Some(original_actor_state)
     );
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record(&vault_records[0].key)
-            .expect("load rolled-back vault record"),
+        get_app_row(&store, DESKTOP_WALLET_VAULT, vault_key),
         Some(b"old-encrypted-metadata".to_vec())
     );
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn app_tables_read_empty_before_first_write_and_round_trip() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let table = AppTable::new("test_app_table");
+    let read_back = |store: &DbStore| {
+        store.read_app_tables(|tables| {
+            Ok::<_, DbError>((tables.get(table, "a|1")?, tables.list_prefix(table, "a|")?))
+        })
+    };
+
+    assert_eq!(
+        read_back(&store).expect("read unwritten app table"),
+        (None, Vec::new())
+    );
+
+    store
+        .write_app_tables(|tables| {
+            tables.insert(table, "a|2", b"second")?;
+            tables.insert(table, "b|1", b"outside")?;
+            tables.insert(table, "a|1", b"first")?;
+            Ok::<_, DbError>(())
+        })
+        .expect("write app table");
+    assert_eq!(
+        read_back(&store).expect("read app table"),
+        (
+            Some(b"first".to_vec()),
+            vec![
+                ("a|1".to_string(), b"first".to_vec()),
+                ("a|2".to_string(), b"second".to_vec()),
+            ]
+        )
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn reserved_app_table_name_fails_and_persists_nothing() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let wallet_id = wallet_cache_key(0x31);
+    store
+        .put_wallet_utxo(&wallet_id, "utxo", b"stored")
+        .expect("seed wallet UTXO");
+    let app_table = AppTable::new("test_app_table");
+    let reserved = AppTable::new("wallet_utxo");
+
+    let result: Result<(), DbError> = store.write_app_tables(|tables| {
+        tables.insert(app_table, "key", b"value")?;
+        let rejected = tables.insert(reserved, "utxo", b"overwritten");
+        assert!(matches!(
+            rejected,
+            Err(DbError::ReservedTableName {
+                table: "wallet_utxo"
+            })
+        ));
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(DbError::ReservedTableName {
+            table: "wallet_utxo"
+        })
+    ));
+    assert!(matches!(
+        store.read_app_tables(|tables| tables.get(reserved, "utxo")),
+        Err(DbError::ReservedTableName {
+            table: "wallet_utxo"
+        })
+    ));
+    assert_eq!(
+        store
+            .read_app_tables(|tables| tables.get(app_table, "key"))
+            .expect("read app table"),
+        None
+    );
+    let utxos = store
+        .list_wallet_utxos(&wallet_id)
+        .expect("list wallet UTXOs");
+    assert_eq!(utxos.len(), 1);
+    assert_eq!(utxos[0].payload.as_slice(), b"stored");
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn application_owned_table_names_are_not_reserved() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+
+    for name in [
+        "desktop_wallet_vault_v1",
+        "app_settings_v1",
+        "fee_note_assurance_pending",
+        "fee_note_assurance_terminal",
+    ] {
+        let table = AppTable::new(name);
+        put_app_row(&store, table, "key", name.as_bytes());
+        assert_eq!(
+            get_app_row(&store, table, "key").as_deref(),
+            Some(name.as_bytes())
+        );
+    }
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+/// Removes `delete_keys` plus one absent key, inserts `put_records`, and reports what each
+/// remove found, or fails after writing when `fail` is set.
+fn replace_vault_rows(
+    tables: &mut AppTableWriter<'_>,
+    delete_keys: &[String],
+    put_records: &[(String, Vec<u8>)],
+    fail: bool,
+) -> Result<Vec<bool>, DbError> {
+    let removed = delete_keys
+        .iter()
+        .map(String::as_str)
+        .chain(["wallet-meta|absent"])
+        .map(|key| tables.remove(DESKTOP_WALLET_VAULT, key))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (key, payload) in put_records {
+        tables.insert(DESKTOP_WALLET_VAULT, key, payload)?;
+    }
+    if fail {
+        return Err(DbError::Io(std::io::Error::other(
+            "injected wallet deletion failure",
+        )));
+    }
+    Ok(removed)
 }
 
 #[test]
@@ -3339,29 +3311,25 @@ fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
         ("hardware-reservation|a".to_string(), b"reserved-a".to_vec()),
         ("hardware-reservation|b".to_string(), b"reserved-b".to_vec()),
     ];
-    store
-        .put_desktop_wallet_vault_records(&[
-            (delete_keys[0].clone(), b"metadata".to_vec()),
-            (delete_keys[1].clone(), b"view".to_vec()),
-            (put_records[0].0.clone(), b"old-reservation".to_vec()),
-            ("wallet-meta|other".to_string(), b"other".to_vec()),
-        ])
-        .expect("seed vault records");
-    let batch = WalletDeletionBatch {
-        private_namespaces: &namespaces,
-        desktop_wallet_vault_delete_keys: &delete_keys,
-        desktop_wallet_vault_put_records: &put_records,
+    put_app_row(&store, DESKTOP_WALLET_VAULT, &delete_keys[0], b"metadata");
+    put_app_row(&store, DESKTOP_WALLET_VAULT, &delete_keys[1], b"view");
+    put_app_row(
+        &store,
+        DESKTOP_WALLET_VAULT,
+        &put_records[0].0,
+        b"old-reservation",
+    );
+    put_app_row(&store, DESKTOP_WALLET_VAULT, "wallet-meta|other", b"other");
+    let delete_wallet = |fail: bool| {
+        store.delete_wallet_namespaces_with(&namespaces, |tables| {
+            replace_vault_rows(tables, &delete_keys, &put_records, fail)
+        })
     };
 
-    let hook_called = std::cell::Cell::new(false);
-    let result = store.delete_wallet_transaction(&batch, || {
-        hook_called.set(true);
-        Err(DbError::Io(std::io::Error::other(
-            "injected wallet deletion failure",
-        )))
-    });
-    assert!(result.is_err());
-    assert!(hook_called.get());
+    assert!(matches!(
+        delete_wallet(true),
+        Err(DbError::Io(error)) if error.to_string() == "injected wallet deletion failure"
+    ));
     for namespace in &namespaces {
         assert_eq!(
             store
@@ -3398,31 +3366,19 @@ fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
         );
     }
     for key in &delete_keys {
-        assert!(
-            store
-                .get_desktop_wallet_vault_record(key)
-                .expect("load rolled-back deleted vault record")
-                .is_some()
-        );
+        assert!(get_app_row(&store, DESKTOP_WALLET_VAULT, key).is_some());
     }
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record(&put_records[0].0)
-            .expect("load rolled-back updated vault record")
+        get_app_row(&store, DESKTOP_WALLET_VAULT, &put_records[0].0)
             .expect("original updated vault record present"),
         b"old-reservation"
     );
-    assert!(
-        store
-            .get_desktop_wallet_vault_record(&put_records[1].0)
-            .expect("load rolled-back inserted vault record")
-            .is_none()
-    );
+    assert!(get_app_row(&store, DESKTOP_WALLET_VAULT, &put_records[1].0).is_none());
 
     assert_eq!(
-        store.delete_wallet(&batch).expect("commit wallet deletion"),
-        WalletDeletionReport {
-            private_namespace_rows: WalletPrivateNamespaceDeletionReport {
+        delete_wallet(false).expect("commit wallet deletion"),
+        (
+            WalletPrivateNamespaceDeletionReport {
                 wallet_utxo_rows: 2,
                 wallet_meta_rows: 2,
                 wallet_sync_actor_state_rows: 2,
@@ -3430,9 +3386,8 @@ fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
                 output_poi_recovery_rows: 2,
                 sender_transaction_candidate_rows: 0,
             },
-            desktop_wallet_vault_rows_deleted: 2,
-            desktop_wallet_vault_rows_put: 2,
-        }
+            vec![true, true, false],
+        )
     );
     for namespace in &namespaces {
         assert_eq!(
@@ -3443,27 +3398,16 @@ fn wallet_deletion_batch_is_atomic_across_namespaces_and_vault_records() {
         );
     }
     for key in &delete_keys {
-        assert!(
-            store
-                .get_desktop_wallet_vault_record(key)
-                .expect("load deleted vault record")
-                .is_none()
-        );
+        assert!(get_app_row(&store, DESKTOP_WALLET_VAULT, key).is_none());
     }
     for (key, payload) in &put_records {
         assert_eq!(
-            store
-                .get_desktop_wallet_vault_record(key)
-                .expect("load put vault record")
-                .expect("put vault record present")
-                .as_slice(),
-            payload.as_slice()
+            get_app_row(&store, DESKTOP_WALLET_VAULT, key).as_ref(),
+            Some(payload)
         );
     }
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record("wallet-meta|other")
-            .expect("load unrelated vault record")
+        get_app_row(&store, DESKTOP_WALLET_VAULT, "wallet-meta|other")
             .expect("unrelated vault record present"),
         b"other"
     );
@@ -3636,10 +3580,9 @@ fn opaque_wallet_private_rows_commit_atomically_with_plaintext_state() {
         },
     };
 
-    let result =
-        store.batch_commit_wallet_private_state_with_vault_records_transaction(&batch, &[], || {
-            Err(DbError::Io(std::io::Error::other("injected failure")))
-        });
+    let result: Result<(), DbError> = store.batch_commit_wallet_private_state_with(&batch, |_| {
+        Err(DbError::Io(std::io::Error::other("injected failure")))
+    });
     assert!(result.is_err());
     assert!(
         store
@@ -4756,12 +4699,13 @@ fn clear_poi_artifact_cache_removes_only_poi_artifact_records() {
     store
         .put_poi_artifact_cache(&record_b)
         .expect("store second POI artifact cache");
-    store
-        .put_app_settings_record("wallet-settings", b"settings-v1")
-        .expect("store settings");
-    store
-        .put_desktop_wallet_vault_record("vault|meta", b"encrypted metadata")
-        .expect("store vault metadata");
+    put_app_row(&store, APP_SETTINGS, "wallet-settings", b"settings-v1");
+    put_app_row(
+        &store,
+        DESKTOP_WALLET_VAULT,
+        "vault|meta",
+        b"encrypted metadata",
+    );
 
     let (removed, generation) = store
         .clear_poi_artifact_cache_with_generation()
@@ -4798,234 +4742,13 @@ fn clear_poi_artifact_cache_removes_only_poi_artifact_records() {
             .is_none()
     );
     assert_eq!(
-        store
-            .get_app_settings_record("wallet-settings")
-            .expect("load settings after POI cache clear")
-            .expect("settings still present"),
+        get_app_row(&store, APP_SETTINGS, "wallet-settings").expect("settings still present"),
         b"settings-v1"
     );
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record("vault|meta")
-            .expect("load vault metadata after POI cache clear")
+        get_app_row(&store, DESKTOP_WALLET_VAULT, "vault|meta")
             .expect("vault metadata still present"),
         b"encrypted metadata"
-    );
-
-    drop(store);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[test]
-fn desktop_wallet_vault_records_are_isolated_by_prefix() {
-    let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-
-    store
-        .put_desktop_wallet_vault_record("vault|meta", b"encrypted metadata")
-        .expect("store metadata");
-    store
-        .put_desktop_wallet_vault_record("wallet-cache|opaque-a|row-1", b"encrypted row 1")
-        .expect("store row 1");
-    store
-        .put_desktop_wallet_vault_record("wallet-cache|opaque-b|row-2", b"encrypted row 2")
-        .expect("store row 2");
-    let max_prefix_key = format!("{}-vault", char::MAX);
-    store
-        .put_desktop_wallet_vault_record(&max_prefix_key, b"max-prefix")
-        .expect("store max-prefix vault record");
-
-    let meta = store
-        .get_desktop_wallet_vault_record("vault|meta")
-        .expect("load metadata")
-        .expect("metadata present");
-    assert_eq!(meta, b"encrypted metadata");
-
-    assert!(
-        !store
-            .put_desktop_wallet_vault_record_if_absent("vault|meta", b"replacement")
-            .expect("skip existing metadata")
-    );
-    assert_eq!(
-        store
-            .get_desktop_wallet_vault_record("vault|meta")
-            .expect("load unchanged metadata")
-            .expect("metadata present"),
-        b"encrypted metadata"
-    );
-    assert!(
-        store
-            .put_desktop_wallet_vault_record_if_absent("vault|new", b"new metadata")
-            .expect("insert missing metadata")
-    );
-    assert_eq!(
-        store
-            .get_desktop_wallet_vault_record("vault|new")
-            .expect("load inserted metadata")
-            .expect("metadata present"),
-        b"new metadata"
-    );
-    assert_eq!(
-        store
-            .list_desktop_wallet_vault_records("")
-            .expect("list all vault records")
-            .len(),
-        5
-    );
-    assert_eq!(
-        store
-            .list_desktop_wallet_vault_records(&char::MAX.to_string())
-            .expect("list max-prefix vault records")
-            .len(),
-        1
-    );
-
-    let cache_a = store
-        .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
-        .expect("list cache records");
-    assert_eq!(cache_a.len(), 1);
-    assert_eq!(cache_a[0].key, "wallet-cache|opaque-a|row-1");
-    assert_eq!(cache_a[0].payload, b"encrypted row 1");
-
-    store
-        .put_desktop_wallet_vault_records(&[
-            (
-                "wallet-cache|opaque-a|row-3".to_string(),
-                b"encrypted row 3".to_vec(),
-            ),
-            (
-                "wallet-chain-meta|opaque-a".to_string(),
-                b"metadata".to_vec(),
-            ),
-        ])
-        .expect("batch put cache records");
-    let cache_a = store
-        .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
-        .expect("list updated cache records");
-    assert_eq!(cache_a.len(), 2);
-    assert!(
-        store
-            .get_desktop_wallet_vault_record("wallet-chain-meta|opaque-a")
-            .expect("load metadata")
-            .is_some()
-    );
-
-    store
-        .replace_desktop_wallet_vault_prefix_with_records(
-            "wallet-cache|opaque-a|",
-            &[(
-                "wallet-chain-meta|opaque-a".to_string(),
-                b"reset-meta".to_vec(),
-            )],
-        )
-        .expect("replace cache prefix");
-    assert_eq!(
-        store
-            .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
-            .expect("list reset cache records"),
-        [] as [DesktopWalletVaultRecord; 0]
-    );
-    assert_eq!(
-        store
-            .get_desktop_wallet_vault_record("wallet-chain-meta|opaque-a")
-            .expect("load reset metadata")
-            .expect("metadata present"),
-        b"reset-meta"
-    );
-
-    store
-        .delete_desktop_wallet_vault_record("wallet-cache|opaque-a|row-1")
-        .expect("delete cache record");
-    assert!(
-        store
-            .get_desktop_wallet_vault_record("wallet-cache|opaque-a|row-1")
-            .expect("load deleted cache record")
-            .is_none()
-    );
-    store
-        .replace_desktop_wallet_vault_prefix_with_records("", &[])
-        .expect("clear all vault records with empty prefix");
-    assert_eq!(
-        store
-            .list_desktop_wallet_vault_records("")
-            .expect("list cleared vault records"),
-        [] as [DesktopWalletVaultRecord; 0]
-    );
-
-    drop(store);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
-}
-
-#[test]
-fn desktop_wallet_vault_batch_update_rolls_back_as_one_transaction() {
-    let root_dir = temp_db_root();
-    let store = DbStore::open(DbConfig {
-        root_dir: root_dir.clone(),
-    })
-    .expect("open db");
-    let delete_keys = vec![
-        "wallet-meta|target".to_string(),
-        "wallet-view|target".to_string(),
-    ];
-    let reservation = vec![(
-        "hardware-reservation|target".to_string(),
-        b"reserved".to_vec(),
-    )];
-    store
-        .put_desktop_wallet_vault_records(&[
-            (delete_keys[0].clone(), b"metadata".to_vec()),
-            (delete_keys[1].clone(), b"view".to_vec()),
-            ("wallet-meta|other".to_string(), b"other".to_vec()),
-        ])
-        .expect("seed vault records");
-
-    let result =
-        store.update_desktop_wallet_vault_records_transaction(&delete_keys, &reservation, || {
-            Err(DbError::Io(std::io::Error::other("injected batch failure")))
-        });
-    assert!(result.is_err());
-    for key in &delete_keys {
-        assert!(
-            store
-                .get_desktop_wallet_vault_record(key)
-                .expect("load rolled-back record")
-                .is_some()
-        );
-    }
-    assert!(
-        store
-            .get_desktop_wallet_vault_record(&reservation[0].0)
-            .expect("load rolled-back reservation")
-            .is_none()
-    );
-
-    store
-        .update_desktop_wallet_vault_records(&delete_keys, &reservation)
-        .expect("commit vault batch update");
-    for key in &delete_keys {
-        assert!(
-            store
-                .get_desktop_wallet_vault_record(key)
-                .expect("load deleted record")
-                .is_none()
-        );
-    }
-    assert_eq!(
-        store
-            .get_desktop_wallet_vault_record(&reservation[0].0)
-            .expect("load committed reservation")
-            .expect("reservation present"),
-        b"reserved"
-    );
-    assert_eq!(
-        store
-            .get_desktop_wallet_vault_record("wallet-meta|other")
-            .expect("load preserved other wallet")
-            .expect("other wallet present"),
-        b"other"
     );
 
     drop(store);
@@ -5087,7 +4810,7 @@ fn schema_seven_legacy_composite_wallet_rows_migrate_explicitly() {
         root_dir: root_dir.clone(),
     })
     .expect("open schema-7 composite-wallet db");
-    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 12);
     assert_eq!(
         store
             .read_meta()
@@ -5186,13 +4909,18 @@ fn schema_eleven_legacy_composite_wallet_rows_migrate_explicitly() {
             created_at: 456,
         })
         .expect("write schema-11 meta");
+    drop(store);
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open schema-11 composite-wallet db");
     store
         .migrate_legacy_composite_wallet_keys()
         .expect("migrate schema-11 composite-wallet rows");
     store
         .migrate_legacy_composite_wallet_keys()
         .expect("rescan canonical wallet rows");
-    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 12);
     assert_eq!(
         store
             .read_meta()
@@ -5331,15 +5059,14 @@ fn schema_seven_migration_moves_alpha_wallet_cache_rows_atomically() {
             root_dir: root_dir.clone(),
         })
         .expect("open db");
-        store
-            .put_desktop_wallet_vault_records(&[
-                (legacy_key.clone(), payload.to_vec()),
-                (unrelated_key.to_string(), b"encrypted metadata".to_vec()),
-            ])
-            .expect("store alpha wallet records");
-        store
-            .put_app_settings_record("wallet-settings", b"settings")
-            .expect("store settings");
+        put_app_row(&store, DESKTOP_WALLET_VAULT, &legacy_key, payload);
+        put_app_row(
+            &store,
+            DESKTOP_WALLET_VAULT,
+            unrelated_key,
+            b"encrypted metadata",
+        );
+        put_app_row(&store, APP_SETTINGS, "wallet-settings", b"settings");
         put_raw_pending_output_record(&store, &legacy_pending_key, &pending_payload);
         store
             .write_meta(&Meta {
@@ -5369,12 +5096,7 @@ fn schema_seven_migration_moves_alpha_wallet_cache_rows_atomically() {
             payload: payload.to_vec(),
         }]
     );
-    assert!(
-        reopened
-            .get_desktop_wallet_vault_record(&legacy_key)
-            .expect("load removed legacy row")
-            .is_none()
-    );
+    assert!(get_app_row(&reopened, DESKTOP_WALLET_VAULT, &legacy_key).is_none());
     assert_eq!(
         decode::<PendingOutputPoiContextRecord>(
             &reopened
@@ -5395,17 +5117,11 @@ fn schema_seven_migration_moves_alpha_wallet_cache_rows_atomically() {
         &legacy_pending_key
     ));
     assert_eq!(
-        reopened
-            .get_desktop_wallet_vault_record(unrelated_key)
-            .expect("load preserved metadata")
-            .expect("metadata present"),
+        get_app_row(&reopened, DESKTOP_WALLET_VAULT, unrelated_key).expect("metadata present"),
         b"encrypted metadata"
     );
     assert_eq!(
-        reopened
-            .get_app_settings_record("wallet-settings")
-            .expect("load preserved settings")
-            .expect("settings present"),
+        get_app_row(&reopened, APP_SETTINGS, "wallet-settings").expect("settings present"),
         b"settings"
     );
     assert!(
@@ -5502,12 +5218,12 @@ fn schema_nine_released_poi_corpus_fixture_preserves_record_and_binds_generation
         })
         .expect("open fixture db");
         put_raw_poi_artifact_record(&store, &key, &payload);
-        store
-            .put_app_settings_record(
-                POI_ARTIFACT_CACHE_GENERATION_KEY,
-                &encode(&4_u64).expect("encode generation"),
-            )
-            .expect("seed generation");
+        put_app_row(
+            &store,
+            APP_SETTINGS,
+            POI_ARTIFACT_CACHE_GENERATION_KEY,
+            &encode(&4_u64).expect("encode generation"),
+        );
         store
             .write_meta(&Meta {
                 schema_version: 9,
@@ -5527,6 +5243,12 @@ fn schema_nine_released_poi_corpus_fixture_preserves_record_and_binds_generation
         .expect("migrated corpus present");
     assert_eq!(migrated.cache_generation, 4);
     assert_eq!(migrated.cache_payload, fixture.cache_payload);
+    assert_eq!(
+        reopened
+            .poi_artifact_cache_generation()
+            .expect("read moved generation"),
+        4
+    );
     assert_eq!(
         reopened
             .read_meta()
@@ -5648,9 +5370,7 @@ fn schema_eight_to_current_preserves_existing_rows() {
         root_dir: root_dir.clone(),
     })
     .expect("open store");
-    store
-        .put_app_settings_record("schema-nine-sentinel", b"preserved")
-        .expect("write sentinel");
+    put_app_row(&store, APP_SETTINGS, "schema-nine-sentinel", b"preserved");
     store
         .write_meta(&Meta {
             schema_version: 8,
@@ -5673,10 +5393,7 @@ fn schema_eight_to_current_preserves_existing_rows() {
         CURRENT_SCHEMA_VERSION
     );
     assert_eq!(
-        reopened
-            .get_app_settings_record("schema-nine-sentinel")
-            .expect("read sentinel")
-            .expect("sentinel present"),
+        get_app_row(&reopened, APP_SETTINGS, "schema-nine-sentinel").expect("sentinel present"),
         b"preserved"
     );
 
@@ -5697,9 +5414,7 @@ fn schema_seven_migration_failure_rolls_back_rows_and_version() {
         root_dir: root_dir.clone(),
     })
     .expect("open db");
-    store
-        .put_desktop_wallet_vault_records(&[(legacy_key.clone(), b"encrypted".to_vec())])
-        .expect("store alpha wallet row");
+    put_app_row(&store, DESKTOP_WALLET_VAULT, &legacy_key, b"encrypted");
     put_raw_pending_output_record(
         &store,
         &legacy_pending_key,
@@ -5729,10 +5444,7 @@ fn schema_seven_migration_failure_rolls_back_rows_and_version() {
         7
     );
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record(&legacy_key)
-            .expect("load rolled-back legacy row")
-            .expect("legacy row present"),
+        get_app_row(&store, DESKTOP_WALLET_VAULT, &legacy_key).expect("legacy row present"),
         b"encrypted"
     );
     assert_eq!(
@@ -5871,9 +5583,7 @@ fn schema_seven_migration_rejects_malformed_cache_rows_without_mutation() {
         root_dir: root_dir.clone(),
     })
     .expect("open db");
-    store
-        .put_desktop_wallet_vault_records(&[(malformed_key.clone(), b"encrypted".to_vec())])
-        .expect("store malformed alpha wallet row");
+    put_app_row(&store, DESKTOP_WALLET_VAULT, &malformed_key, b"encrypted");
     let schema_seven = Meta {
         schema_version: 7,
         app_version: "0.1.0-alpha.6".to_string(),
@@ -5896,10 +5606,7 @@ fn schema_seven_migration_rejects_malformed_cache_rows_without_mutation() {
         7
     );
     assert_eq!(
-        store
-            .get_desktop_wallet_vault_record(&malformed_key)
-            .expect("load preserved malformed row")
-            .expect("malformed row present"),
+        get_app_row(&store, DESKTOP_WALLET_VAULT, &malformed_key).expect("malformed row present"),
         b"encrypted"
     );
 
@@ -5939,9 +5646,9 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
         .expect("create alpha UTXO table");
     txn.open_table(WALLET_META_TABLE)
         .expect("create alpha wallet meta table");
-    txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)
+    txn.open_table(RAW_PENDING_FEE_NOTE_ASSURANCE_TABLE)
         .expect("create alpha pending assurance table");
-    txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)
+    txn.open_table(RAW_TERMINAL_FEE_NOTE_ASSURANCE_TABLE)
         .expect("create alpha terminal assurance table");
     txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)
         .expect("create alpha pending output table");
@@ -5949,11 +5656,11 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
         .expect("create alpha output recovery table");
     txn.open_table(POI_ARTIFACT_CACHE_TABLE)
         .expect("create alpha POI cache table");
-    txn.open_table(APP_SETTINGS_TABLE)
+    txn.open_table(RAW_APP_SETTINGS_TABLE)
         .expect("create alpha settings table");
     {
         let mut table = txn
-            .open_table(DESKTOP_WALLET_VAULT_TABLE)
+            .open_table(RAW_DESKTOP_WALLET_VAULT_TABLE)
             .expect("create alpha vault table");
         table
             .insert(valid_key.as_str(), valid_payload.as_slice())
@@ -6009,7 +5716,7 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
     }
     {
         let table = read_txn
-            .open_table(DESKTOP_WALLET_VAULT_TABLE)
+            .open_table(RAW_DESKTOP_WALLET_VAULT_TABLE)
             .expect("open retained vault");
         assert_eq!(
             table
@@ -6040,7 +5747,7 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
     let txn = db.begin_write().expect("begin fixture repair");
     {
         let mut table = txn
-            .open_table(DESKTOP_WALLET_VAULT_TABLE)
+            .open_table(RAW_DESKTOP_WALLET_VAULT_TABLE)
             .expect("open fixture vault");
         table
             .remove(malformed_key.as_str())
@@ -6064,6 +5771,7 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
     expected_tables.insert(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE.name().to_string());
     expected_tables.insert(OUTPUT_POI_RECOVERY_V2_TABLE.name().to_string());
     expected_tables.insert(POI_CORPUS_JOURNAL_TABLE.name().to_string());
+    expected_tables.insert(POI_SIDECAR_STATE_TABLE.name().to_string());
     expected_tables.insert(SENDER_TRANSACTION_CANDIDATE_V1_TABLE.name().to_string());
     assert_eq!(migrated_tables, expected_tables);
     drop(read_txn);
@@ -6084,12 +5792,7 @@ fn opening_schema_seven_malformed_cache_fixture_preserves_table_set_and_rows() {
             payload: valid_payload.to_vec(),
         }]
     );
-    assert!(
-        store
-            .get_desktop_wallet_vault_record(&valid_key)
-            .expect("load migrated source row")
-            .is_none()
-    );
+    assert!(get_app_row(&store, DESKTOP_WALLET_VAULT, &valid_key).is_none());
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -6156,68 +5859,38 @@ fn reopen_older_schema_db_backs_up_and_recreates() {
 }
 
 #[test]
-fn schema_ten_to_eleven_adds_only_sender_candidate_table() {
+fn schema_ten_to_current_adds_only_new_tables() {
     let root_dir = temp_db_root();
-    let railgun_dir = root_dir.join("railgun");
-    fs::create_dir_all(&railgun_dir).expect("create railgun dir");
-    let database_path = railgun_dir.join("db.redb");
-    let db = Database::create(&database_path).expect("create schema-10 database");
-    let txn = db.begin_write().expect("begin schema-10 fixture write");
-    for table in [
-        META_TABLE,
-        BLOB_INDEX_TABLE,
-        MERKLE_FOREST_INDEX_TABLE,
-        ZKEY_INDEX_TABLE,
-        WALLET_UTXO_TABLE,
-        WALLET_META_TABLE,
-        WALLET_SYNC_ACTOR_STATE_TABLE,
-        PENDING_FEE_NOTE_ASSURANCE_TABLE,
-        TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
-        PENDING_OUTPUT_POI_CONTEXT_TABLE,
-        OUTPUT_POI_RECOVERY_TABLE,
-        PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
-        OUTPUT_POI_RECOVERY_V2_TABLE,
-        POI_ARTIFACT_CACHE_TABLE,
-        POI_CORPUS_JOURNAL_TABLE,
-        APP_SETTINGS_TABLE,
-        DESKTOP_WALLET_VAULT_TABLE,
-    ] {
-        txn.open_table(table).expect("create schema-10 table");
-    }
-    let schema_ten_meta = encode(&Meta {
-        schema_version: 10,
-        app_version: "schema-10".to_string(),
-        created_at: 123,
-    })
-    .expect("encode schema-10 meta");
-    txn.open_table(META_TABLE)
-        .expect("open meta table")
-        .insert(META_KEY, schema_ten_meta.as_slice())
-        .expect("insert schema-10 meta");
-    txn.commit().expect("commit schema-10 fixture");
-    let read_txn = db.begin_read().expect("read schema-10 tables");
-    let before = read_txn
-        .list_tables()
-        .expect("list schema-10 tables")
+    let db = create_raw_fixture(&root_dir, 10, &SCHEMA_TEN_TABLES);
+    let txn = db.begin_write().expect("begin schema-10 row write");
+    txn.open_table(RAW_DESKTOP_WALLET_VAULT_TABLE)
+        .expect("open vault table")
+        .insert("vault-row", b"vault-payload".as_slice())
+        .expect("insert vault row");
+    txn.commit().expect("commit schema-10 row");
+    drop(db);
+    let before = SCHEMA_TEN_TABLES
+        .iter()
         .map(|table| table.name().to_string())
         .collect::<BTreeSet<_>>();
-    drop(read_txn);
-    drop(db);
 
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
     })
-    .expect("migrate schema 10 to 11");
-    let read_txn = store.db.begin_read().expect("read schema-11 tables");
+    .expect("migrate schema 10 to current");
+    let read_txn = store.db.begin_read().expect("read current tables");
     let after = read_txn
         .list_tables()
-        .expect("list schema-11 tables")
+        .expect("list current tables")
         .map(|table| table.name().to_string())
         .collect::<BTreeSet<_>>();
     drop(read_txn);
     assert_eq!(
         after.difference(&before).cloned().collect::<Vec<_>>(),
-        vec![SENDER_TRANSACTION_CANDIDATE_V1_TABLE.name().to_string()]
+        vec![
+            POI_SIDECAR_STATE_TABLE.name().to_string(),
+            SENDER_TRANSACTION_CANDIDATE_V1_TABLE.name().to_string(),
+        ]
     );
     assert_eq!(
         store
@@ -6225,8 +5898,296 @@ fn schema_ten_to_eleven_adds_only_sender_candidate_table() {
             .expect("read meta")
             .expect("meta present")
             .schema_version,
+        CURRENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        get_app_row(&store, DESKTOP_WALLET_VAULT, "vault-row").expect("vault row present"),
+        b"vault-payload"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+fn schema_eleven_sidecar_watermark() -> PoiPublisherManifestWatermarkRecord {
+    PoiPublisherManifestWatermarkRecord {
+        publisher_pubkey: FixedBytes::from([0x61; 32]),
+        accepted_sequence: 12,
+        accepted_manifest_hash: Some(FixedBytes::from([0x62; 32])),
+        updated_at: 1_700_000_000,
+    }
+}
+
+fn schema_eleven_sidecar_rows() -> BTreeMap<String, Vec<u8>> {
+    let watermark = schema_eleven_sidecar_watermark();
+    let health = PoiCorpusRpcHealthRecord {
+        chain_type: 0,
+        chain_id: 1,
+        txid_version: "V2_PoseidonMerkle".to_string(),
+        list_key: FixedBytes::from([0x63; 32]),
+        cache_generation: 4,
+        last_successful_rpc_sync_at_ms: Some(1_700_000_000_123),
+        updated_at: 1_700_000_001,
+    };
+    BTreeMap::from([
+        (
+            POI_ARTIFACT_CACHE_GENERATION_KEY.to_string(),
+            encode(&4_u64).expect("encode generation"),
+        ),
+        (
+            watermark.key(),
+            encode(&watermark).expect("encode watermark"),
+        ),
+        (
+            health.key(),
+            encode(&health).expect("encode corpus RPC health"),
+        ),
+    ])
+}
+
+/// Writes a schema-11 database whose POI sidecar state still lives in `app_settings_v1`.
+fn create_schema_eleven_sidecar_fixture(conflicting_generation: Option<&[u8]>) -> PathBuf {
+    let root_dir = temp_db_root();
+    let tables = [
+        SCHEMA_TEN_TABLES.as_slice(),
+        &[SENDER_TRANSACTION_CANDIDATE_V1_TABLE],
+    ]
+    .concat();
+    let db = create_raw_fixture(&root_dir, 11, &tables);
+    let txn = db.begin_write().expect("begin schema-11 row write");
+    {
+        let mut table = txn
+            .open_table(RAW_APP_SETTINGS_TABLE)
+            .expect("open settings table");
+        for (key, value) in schema_eleven_sidecar_rows() {
+            table
+                .insert(key.as_str(), value.as_slice())
+                .expect("insert sidecar row");
+        }
+        for key in ["wallet-settings", "ui-state", "gateway-state"] {
+            table
+                .insert(key, key.as_bytes())
+                .expect("insert settings row");
+        }
+    }
+    {
+        let mut table = txn
+            .open_table(RAW_DESKTOP_WALLET_VAULT_TABLE)
+            .expect("open vault table");
+        table
+            .insert("vault-a", b"vault-a-payload".as_slice())
+            .expect("insert first vault row");
+        table
+            .insert("vault-b", b"vault-b-payload".as_slice())
+            .expect("insert second vault row");
+    }
+    if let Some(payload) = conflicting_generation {
+        txn.open_table(POI_SIDECAR_STATE_TABLE)
+            .expect("create sidecar table")
+            .insert(POI_ARTIFACT_CACHE_GENERATION_KEY, payload)
+            .expect("insert conflicting generation");
+    }
+    txn.commit().expect("commit schema-11 fixture");
+    root_dir
+}
+
+/// Creates `<root>/railgun/db.redb` with `tables` and a `Meta` row at `schema_version`.
+fn create_raw_fixture(
+    root_dir: &std::path::Path,
+    schema_version: u32,
+    tables: &[ByteTableDefinition],
+) -> Database {
+    let railgun_dir = root_dir.join("railgun");
+    fs::create_dir_all(&railgun_dir).expect("create railgun dir");
+    let db = Database::create(railgun_dir.join("db.redb")).expect("create fixture database");
+    let txn = db.begin_write().expect("begin fixture write");
+    for table in tables {
+        txn.open_table(*table).expect("create fixture table");
+    }
+    let meta = encode(&Meta {
+        schema_version,
+        app_version: format!("schema-{schema_version}"),
+        created_at: 123,
+    })
+    .expect("encode fixture meta");
+    txn.open_table(META_TABLE)
+        .expect("open meta table")
+        .insert(META_KEY, meta.as_slice())
+        .expect("insert fixture meta");
+    txn.commit().expect("commit fixture tables");
+    db
+}
+
+fn raw_table_rows(
+    db: &Database,
+    definition: super::ByteTableDefinition,
+) -> BTreeMap<String, Vec<u8>> {
+    let txn = db.begin_read().expect("begin raw table read");
+    let table = txn.open_table(definition).expect("open raw table");
+    table
+        .iter()
+        .expect("iterate raw table")
+        .map(|entry| {
+            let (key, value) = entry.expect("read raw row");
+            (key.value().to_string(), value.value().to_vec())
+        })
+        .collect()
+}
+
+fn has_database_backup(root_dir: &std::path::Path) -> bool {
+    fs::read_dir(root_dir.join("railgun"))
+        .expect("read railgun dir")
+        .any(|entry| {
+            entry
+                .expect("read dir entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("db.redb.bak.")
+        })
+}
+
+#[test]
+fn schema_eleven_moves_poi_sidecar_state_out_of_app_settings() {
+    let root_dir = create_schema_eleven_sidecar_fixture(None);
+    let db = Database::open(root_dir.join("railgun").join("db.redb")).expect("open fixture");
+    let settings_before = raw_table_rows(&db, RAW_APP_SETTINGS_TABLE);
+    let vault_before = raw_table_rows(&db, RAW_DESKTOP_WALLET_VAULT_TABLE);
+    drop(db);
+    let sidecar = schema_eleven_sidecar_rows();
+    let (moved, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = settings_before
+        .into_iter()
+        .partition(|(key, _)| sidecar.contains_key(key));
+    assert_eq!(moved, sidecar);
+
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("migrate schema-11 fixture");
+    assert_eq!(raw_table_rows(&store.db, POI_SIDECAR_STATE_TABLE), moved);
+    assert_eq!(raw_table_rows(&store.db, RAW_APP_SETTINGS_TABLE), kept);
+    assert_eq!(
+        raw_table_rows(&store.db, RAW_DESKTOP_WALLET_VAULT_TABLE),
+        vault_before
+    );
+    assert_eq!(
+        store
+            .read_meta()
+            .expect("read migrated meta")
+            .expect("meta present")
+            .schema_version,
+        CURRENT_SCHEMA_VERSION
+    );
+    assert!(!has_database_backup(&root_dir));
+    assert_eq!(
+        store
+            .poi_artifact_cache_generation()
+            .expect("read moved generation"),
+        4
+    );
+    let watermark = schema_eleven_sidecar_watermark();
+    assert_eq!(
+        store
+            .get_poi_publisher_manifest_watermark(&watermark.publisher_pubkey)
+            .expect("read moved watermark"),
+        Some(watermark)
+    );
+    drop(store);
+
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen migrated db");
+    assert_eq!(raw_table_rows(&reopened.db, POI_SIDECAR_STATE_TABLE), moved);
+    assert_eq!(raw_table_rows(&reopened.db, RAW_APP_SETTINGS_TABLE), kept);
+    assert_eq!(
+        raw_table_rows(&reopened.db, RAW_DESKTOP_WALLET_VAULT_TABLE),
+        vault_before
+    );
+    assert_eq!(
+        reopened
+            .read_meta()
+            .expect("read reopened meta")
+            .expect("meta present")
+            .schema_version,
+        CURRENT_SCHEMA_VERSION
+    );
+
+    drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn schema_eleven_sidecar_destination_conflict_leaves_database_unchanged() {
+    let conflicting = encode(&9_u64).expect("encode conflicting generation");
+    let root_dir = create_schema_eleven_sidecar_fixture(Some(&conflicting));
+    let database_path = root_dir.join("railgun").join("db.redb");
+    let db = Database::open(&database_path).expect("open fixture");
+    let meta_before = raw_table_rows(&db, META_TABLE);
+    let settings_before = raw_table_rows(&db, RAW_APP_SETTINGS_TABLE);
+    drop(db);
+
+    assert!(matches!(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        }),
+        Err(DbError::SchemaMigrationDestinationConflict {
+            table: "poi_sidecar_state_v1",
+            key,
+        }) if key == POI_ARTIFACT_CACHE_GENERATION_KEY
+    ));
+
+    let db = Database::open(&database_path).expect("open rejected database");
+    assert_eq!(raw_table_rows(&db, META_TABLE), meta_before);
+    assert_eq!(raw_table_rows(&db, RAW_APP_SETTINGS_TABLE), settings_before);
+    assert_eq!(
+        raw_table_rows(&db, POI_SIDECAR_STATE_TABLE),
+        BTreeMap::from([(POI_ARTIFACT_CACHE_GENERATION_KEY.to_string(), conflicting)])
+    );
+    assert!(!has_database_backup(&root_dir));
+
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn schema_eleven_sidecar_migration_failure_rolls_back() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    for (key, value) in schema_eleven_sidecar_rows() {
+        put_app_row(&store, APP_SETTINGS, &key, &value);
+    }
+    let schema_eleven = Meta {
+        schema_version: 11,
+        app_version: "0.3.0-rc.1".to_string(),
+        created_at: 124,
+    };
+    store
+        .write_meta(&schema_eleven)
+        .expect("write schema-11 meta");
+    let settings_before = raw_table_rows(&store.db, RAW_APP_SETTINGS_TABLE);
+
+    let result = store.run_migrations_transaction(&schema_eleven, 12, || {
+        Err(DbError::Io(std::io::Error::other(
+            "injected migration failure",
+        )))
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        store
+            .read_meta()
+            .expect("read rolled-back meta")
+            .expect("meta present")
+            .schema_version,
         11
     );
+    assert_eq!(
+        raw_table_rows(&store.db, RAW_APP_SETTINGS_TABLE),
+        settings_before
+    );
+    assert!(raw_table_rows(&store.db, POI_SIDECAR_STATE_TABLE).is_empty());
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

@@ -308,7 +308,7 @@ mod tests {
 
     use alloy::primitives::{Address, FixedBytes};
     use local_db::{
-        BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
+        AppTable, BlobMeta, DbConfig, PoiArtifactCacheRecord, PoiArtifactDescriptorRecord,
         PoiCacheRecordSource, PoiCorpusValidationRecord, WalletCacheKey, WalletMeta,
     };
 
@@ -319,6 +319,8 @@ mod tests {
     use url::Url;
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+    const APP_SETTINGS: AppTable = AppTable::new("app_settings_v1");
+    const DESKTOP_WALLET_VAULT: AppTable = AppTable::new("desktop_wallet_vault_v1");
 
     #[tokio::test]
     async fn offline_reset_clears_public_caches_and_preserves_unrelated_data() {
@@ -372,8 +374,6 @@ mod tests {
         let publisher = FixedBytes::from([0x55; 32]);
         db.advance_poi_publisher_manifest_watermark(publisher, 17)
             .expect("seed publisher watermark");
-        db.put_app_settings_record("wallet-settings", b"settings")
-            .expect("seed settings");
         let wallet_key = WalletCacheKey::new("wallet", 1, Address::from([0x66; 20]));
         db.put_wallet_meta(
             &wallet_key,
@@ -386,8 +386,11 @@ mod tests {
         .expect("seed wallet-private metadata");
         db.put_wallet_utxo(&wallet_key, "balance-row", b"encrypted-balance")
             .expect("seed wallet-private balance row");
-        db.put_desktop_wallet_vault_record("wallet-key", b"encrypted-key")
-            .expect("seed wallet key record");
+        db.write_app_tables(|tables| {
+            tables.insert(APP_SETTINGS, "wallet-settings", b"settings")?;
+            tables.insert(DESKTOP_WALLET_VAULT, "wallet-key", b"encrypted-key")
+        })
+        .expect("seed settings and wallet key record");
 
         let report = reset_persisted_public_sync_caches(&db)
             .await
@@ -452,7 +455,7 @@ mod tests {
             17
         );
         assert_eq!(
-            db.get_app_settings_record("wallet-settings")
+            db.read_app_tables(|tables| tables.get(APP_SETTINGS, "wallet-settings"))
                 .expect("read settings")
                 .expect("settings preserved"),
             b"settings"
@@ -471,7 +474,7 @@ mod tests {
             1
         );
         assert_eq!(
-            db.get_desktop_wallet_vault_record("wallet-key")
+            db.read_app_tables(|tables| tables.get(DESKTOP_WALLET_VAULT, "wallet-key"))
                 .expect("read wallet key record")
                 .expect("wallet key record preserved"),
             b"encrypted-key"
@@ -503,8 +506,10 @@ mod tests {
         let wallet_key = WalletCacheKey::new("wallet", 1, Address::from([0x83; 20]));
         db.put_wallet_utxo(&wallet_key, "private-row", b"encrypted")
             .expect("seed wallet-private row");
-        db.put_desktop_wallet_vault_record("wallet-key", b"encrypted-key")
-            .expect("seed vault row");
+        db.write_app_tables(|tables| {
+            tables.insert(DESKTOP_WALLET_VAULT, "wallet-key", b"encrypted-key")
+        })
+        .expect("seed vault row");
 
         let reset = reset_offline_poi_corpus(&db)
             .await
@@ -532,7 +537,7 @@ mod tests {
             1
         );
         assert_eq!(
-            db.get_desktop_wallet_vault_record("wallet-key")
+            db.read_app_tables(|tables| tables.get(DESKTOP_WALLET_VAULT, "wallet-key"))
                 .expect("read vault")
                 .expect("vault retained"),
             b"encrypted-key"

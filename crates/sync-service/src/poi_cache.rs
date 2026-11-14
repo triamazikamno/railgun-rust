@@ -3438,8 +3438,11 @@ mod tests {
             persisted_public_rpc_journal_with_delta_count(db.as_ref(), &identity, generation, 0);
         let installed_cache = persisted.cache.clone();
         let installed_head = persisted.journal_head.expect("installed journal head");
-        db.put_app_settings_record("poi_artifact_cache_generation", b"invalid-generation")
-            .expect("corrupt generation setting");
+        db.put_raw_poi_sidecar_state_for_test(
+            "poi_artifact_cache_generation",
+            b"invalid-generation",
+        )
+        .expect("corrupt generation setting");
         let rpc = spawn_stalled_http_server();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
 
