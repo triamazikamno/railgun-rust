@@ -39,6 +39,7 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+local-db = { path = "../local-db", features = ["test-utils"] }
 multihash-codetable = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 trustless-artifacts = { path = "../trustless-artifacts", features = ["test-utils"] }

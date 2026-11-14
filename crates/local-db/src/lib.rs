@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt::{self, Display};
@@ -13,10 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use alloy::primitives::{Address, FixedBytes, U256, keccak256};
-use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, railgun_txid_leaf_hash};
+use broadcaster_core::transact::{PreTxPoi, railgun_txid_leaf_hash};
 use redb::{
-    Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table,
-    TableDefinition, TableHandle, WriteTransaction,
+    Database, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, Table, TableDefinition, TableHandle, WriteTransaction,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -35,10 +36,6 @@ const WALLET_UTXO_TABLE: ByteTableDefinition = TableDefinition::new("wallet_utxo
 const WALLET_META_TABLE: ByteTableDefinition = TableDefinition::new("wallet_meta");
 const WALLET_SYNC_ACTOR_STATE_TABLE: ByteTableDefinition =
     TableDefinition::new("wallet_sync_actor_state_v1");
-const PENDING_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
-    TableDefinition::new("fee_note_assurance_pending");
-const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: ByteTableDefinition =
-    TableDefinition::new("fee_note_assurance_terminal");
 const PENDING_OUTPUT_POI_CONTEXT_TABLE: ByteTableDefinition =
     TableDefinition::new("pending_output_poi_context");
 const OUTPUT_POI_RECOVERY_TABLE: ByteTableDefinition = TableDefinition::new("output_poi_recovery");
@@ -50,13 +47,12 @@ const SENDER_TRANSACTION_CANDIDATE_V1_TABLE: ByteTableDefinition =
     TableDefinition::new("sender_transaction_candidate_v1");
 const POI_ARTIFACT_CACHE_TABLE: ByteTableDefinition = TableDefinition::new("poi_artifact_cache");
 const POI_CORPUS_JOURNAL_TABLE: ByteTableDefinition = TableDefinition::new("poi_corpus_journal_v1");
-const APP_SETTINGS_TABLE: ByteTableDefinition = TableDefinition::new("app_settings_v1");
+const POI_SIDECAR_STATE_TABLE: ByteTableDefinition = TableDefinition::new("poi_sidecar_state_v1");
 const POI_ARTIFACT_CACHE_GENERATION_KEY: &str = "poi_artifact_cache_generation";
+const POI_SIDECAR_KEY_PREFIX: &str = "railgun:ppoi-sidecar:v1:";
 const POI_PUBLISHER_MANIFEST_WATERMARK_KEY_PREFIX: &str =
     "railgun:ppoi-sidecar:v1:publisher-manifest-watermark:";
 const POI_CORPUS_RPC_HEALTH_KEY_PREFIX: &str = "railgun:ppoi-sidecar:v1:corpus-rpc-health:";
-const DESKTOP_WALLET_VAULT_TABLE: ByteTableDefinition =
-    TableDefinition::new("desktop_wallet_vault_v1");
 const LEGACY_DESKTOP_WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
 const WALLET_CACHE_KEY_DOMAIN: &[u8] = b"railgun-wallet-cache-key-v1";
 const WALLET_PRIVATE_CANONICALIZATION_VERSION_KEY_PREFIX: &str =
@@ -72,8 +68,6 @@ pub enum LocalDbTable {
     WalletUtxo,
     WalletMeta,
     WalletSyncActorState,
-    PendingFeeNoteAssurance,
-    TerminalFeeNoteAssurance,
     PendingOutputPoiContextV1,
     OutputPoiRecoveryV1,
     PendingOutputPoiContextV2,
@@ -81,8 +75,7 @@ pub enum LocalDbTable {
     SenderTransactionCandidateV1,
     PoiArtifactCache,
     PoiCorpusJournal,
-    AppSettings,
-    DesktopWalletVault,
+    PoiSidecarState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,15 +87,11 @@ pub enum LocalDbTableDecodeKind {
     WalletUtxo,
     WalletMeta,
     WalletSyncActorState,
-    PendingFeeNoteAssurance,
-    TerminalFeeNoteAssurance,
     PendingOutputPoiContextV1,
     OutputPoiRecoveryV1,
     OpaqueBytes,
     PoiArtifactCache,
     PoiCorpusJournal,
-    AppSettings,
-    DesktopWalletVault,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,16 +138,6 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::WalletSyncActorState,
     },
     LocalDbTableInfo {
-        table: LocalDbTable::PendingFeeNoteAssurance,
-        name: "fee_note_assurance_pending",
-        decode_kind: LocalDbTableDecodeKind::PendingFeeNoteAssurance,
-    },
-    LocalDbTableInfo {
-        table: LocalDbTable::TerminalFeeNoteAssurance,
-        name: "fee_note_assurance_terminal",
-        decode_kind: LocalDbTableDecodeKind::TerminalFeeNoteAssurance,
-    },
-    LocalDbTableInfo {
         table: LocalDbTable::PendingOutputPoiContextV1,
         name: "pending_output_poi_context",
         decode_kind: LocalDbTableDecodeKind::PendingOutputPoiContextV1,
@@ -194,14 +173,9 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::PoiCorpusJournal,
     },
     LocalDbTableInfo {
-        table: LocalDbTable::AppSettings,
-        name: "app_settings_v1",
-        decode_kind: LocalDbTableDecodeKind::AppSettings,
-    },
-    LocalDbTableInfo {
-        table: LocalDbTable::DesktopWalletVault,
-        name: "desktop_wallet_vault_v1",
-        decode_kind: LocalDbTableDecodeKind::DesktopWalletVault,
+        table: LocalDbTable::PoiSidecarState,
+        name: "poi_sidecar_state_v1",
+        decode_kind: LocalDbTableDecodeKind::OpaqueBytes,
     },
 ];
 
@@ -216,8 +190,6 @@ impl LocalDbTable {
             Self::WalletUtxo => WALLET_UTXO_TABLE,
             Self::WalletMeta => WALLET_META_TABLE,
             Self::WalletSyncActorState => WALLET_SYNC_ACTOR_STATE_TABLE,
-            Self::PendingFeeNoteAssurance => PENDING_FEE_NOTE_ASSURANCE_TABLE,
-            Self::TerminalFeeNoteAssurance => TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
             Self::PendingOutputPoiContextV1 => PENDING_OUTPUT_POI_CONTEXT_TABLE,
             Self::OutputPoiRecoveryV1 => OUTPUT_POI_RECOVERY_TABLE,
             Self::PendingOutputPoiContextV2 => PENDING_OUTPUT_POI_CONTEXT_V2_TABLE,
@@ -225,8 +197,7 @@ impl LocalDbTable {
             Self::SenderTransactionCandidateV1 => SENDER_TRANSACTION_CANDIDATE_V1_TABLE,
             Self::PoiArtifactCache => POI_ARTIFACT_CACHE_TABLE,
             Self::PoiCorpusJournal => POI_CORPUS_JOURNAL_TABLE,
-            Self::AppSettings => APP_SETTINGS_TABLE,
-            Self::DesktopWalletVault => DESKTOP_WALLET_VAULT_TABLE,
+            Self::PoiSidecarState => POI_SIDECAR_STATE_TABLE,
         }
     }
 }
@@ -246,7 +217,7 @@ const WALLET_PRIVATE_COMPACTION_REQUESTED_KEY: &str = "wallet_private_compaction
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WalletCacheKey(String);
@@ -450,6 +421,8 @@ pub enum DbError {
     InvalidBlobRelativePath { kind: String },
     #[error("unsafe blob entry for kind {kind}")]
     UnsafeBlobEntry { kind: String },
+    #[error("application table name is reserved by local-db: {table}")]
+    ReservedTableName { table: &'static str },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,20 +681,6 @@ impl WalletPrivateNamespaceDeletionReport {
             .sender_transaction_candidate_rows
             .saturating_add(other.sender_transaction_candidate_rows);
     }
-}
-
-/// Typed inputs for permanently deleting a wallet's private and vault state.
-pub struct WalletDeletionBatch<'a> {
-    pub private_namespaces: &'a [WalletPrivateNamespaceId],
-    pub desktop_wallet_vault_delete_keys: &'a [String],
-    pub desktop_wallet_vault_put_records: &'a [(String, Vec<u8>)],
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WalletDeletionReport {
-    pub private_namespace_rows: WalletPrivateNamespaceDeletionReport,
-    pub desktop_wallet_vault_rows_deleted: u64,
-    pub desktop_wallet_vault_rows_put: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1388,51 +1347,6 @@ impl PoiCorpusRpcHealthRecord {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FeeNoteAssuranceTerminalOutcome {
-    RevertedReceipt,
-    CommitmentMismatch,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingFeeNoteAssuranceRecord {
-    pub chain_id: u64,
-    pub public_tx_hash: FixedBytes<32>,
-    pub context: FeeNoteAssuranceContext,
-}
-
-impl PendingFeeNoteAssuranceRecord {
-    #[must_use]
-    pub fn key(&self) -> String {
-        Self::key_for(self.chain_id, &self.public_tx_hash)
-    }
-
-    #[must_use]
-    pub fn key_for(chain_id: u64, public_tx_hash: &FixedBytes<32>) -> String {
-        format!("{chain_id}|{}", hex::encode(public_tx_hash))
-    }
-
-    #[must_use]
-    pub fn prefix_for_chain(chain_id: u64) -> String {
-        format!("{chain_id}|")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalFeeNoteAssuranceRecord {
-    pub chain_id: u64,
-    pub public_tx_hash: FixedBytes<32>,
-    pub context: FeeNoteAssuranceContext,
-    pub outcome: FeeNoteAssuranceTerminalOutcome,
-}
-
-impl TerminalFeeNoteAssuranceRecord {
-    #[must_use]
-    pub fn key(&self) -> String {
-        PendingFeeNoteAssuranceRecord::key_for(self.chain_id, &self.public_tx_hash)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PendingOutputPoiRole {
     BroadcasterFee,
     Recipient,
@@ -1744,16 +1658,124 @@ pub struct WalletPrivateStateBatch<'a> {
     pub sender_transaction_candidates: OpaqueWalletPrivateRowMutation<'a>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DesktopWalletVaultRecord {
-    pub key: String,
-    pub payload: Vec<u8>,
+/// A byte table owned by an application rather than by `local-db`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AppTable(&'static str);
+
+impl AppTable {
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0
+    }
+
+    fn definition(self) -> Result<ByteTableDefinition, DbError> {
+        if LOCAL_DB_TABLES.iter().any(|info| info.name == self.0) {
+            return Err(DbError::ReservedTableName { table: self.0 });
+        }
+        Ok(TableDefinition::new(self.0))
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AppSettingsRecord {
-    pub key: String,
-    pub payload: Vec<u8>,
+/// Reads application tables inside one `local-db` read transaction.
+pub struct AppTableReader<'txn> {
+    txn: &'txn ReadTransaction,
+}
+
+impl AppTableReader<'_> {
+    pub fn get(&self, table: AppTable, key: &str) -> Result<Option<Vec<u8>>, DbError> {
+        match self.open(table)? {
+            Some(table) => Ok(table.get(key)?.map(|value| value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Lists the rows whose key starts with `prefix`, in key order.
+    pub fn list_prefix(
+        &self,
+        table: AppTable,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, DbError> {
+        match self.open(table)? {
+            Some(table) => list_table_prefix(&table, prefix),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn open(
+        &self,
+        table: AppTable,
+    ) -> Result<Option<ReadOnlyTable<&'static str, &'static [u8]>>, DbError> {
+        match self.txn.open_table(table.definition()?) {
+            Ok(table) => Ok(Some(table)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Reads and writes application tables inside one `local-db` write transaction.
+pub struct AppTableWriter<'txn> {
+    txn: &'txn WriteTransaction,
+    rejected: Cell<Option<AppTable>>,
+}
+
+impl<'txn> AppTableWriter<'txn> {
+    pub fn get(&self, table: AppTable, key: &str) -> Result<Option<Vec<u8>>, DbError> {
+        let table = self.open(table)?;
+        Ok(table.get(key)?.map(|value| value.value().to_vec()))
+    }
+
+    /// Lists the rows whose key starts with `prefix`, in key order.
+    pub fn list_prefix(
+        &self,
+        table: AppTable,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, DbError> {
+        list_table_prefix(&self.open(table)?, prefix)
+    }
+
+    pub fn insert(&mut self, table: AppTable, key: &str, value: &[u8]) -> Result<(), DbError> {
+        self.open(table)?.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Removes `key` and returns whether the row existed.
+    pub fn remove(&mut self, table: AppTable, key: &str) -> Result<bool, DbError> {
+        let mut table = self.open(table)?;
+        Ok(table.remove(key)?.is_some())
+    }
+
+    fn open(&self, table: AppTable) -> Result<Table<'txn, &'static str, &'static [u8]>, DbError> {
+        let definition = table.definition().inspect_err(|_| {
+            self.rejected.set(self.rejected.get().or(Some(table)));
+        })?;
+        Ok(self.txn.open_table(definition)?)
+    }
+
+    /// Runs `write`, then fails if it touched a reserved name even when it swallowed that
+    /// error, so the caller never commits such a transaction.
+    fn run<T, E: From<DbError>>(
+        txn: &'txn WriteTransaction,
+        write: impl FnOnce(&mut AppTableWriter<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut writer = Self {
+            txn,
+            rejected: Cell::new(None),
+        };
+        let value = write(&mut writer)?;
+        match writer.rejected.get() {
+            Some(table) => Err(DbError::ReservedTableName {
+                table: table.name(),
+            }
+            .into()),
+            None => Ok(value),
+        }
+    }
 }
 
 impl DbStore {
@@ -2233,43 +2255,47 @@ impl DbStore {
         Ok(())
     }
 
+    /// Runs `read` against application tables in one read transaction.
+    pub fn read_app_tables<T, E: From<DbError>>(
+        &self,
+        read: impl FnOnce(&AppTableReader<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let txn = self.db.begin_read().map_err(DbError::from)?;
+        read(&AppTableReader { txn: &txn })
+    }
+
+    /// Runs `write` against application tables in one write transaction and commits only
+    /// when it returns `Ok`.
+    pub fn write_app_tables<T, E: From<DbError>>(
+        &self,
+        write: impl FnOnce(&mut AppTableWriter<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let txn = self.db.begin_write().map_err(DbError::from)?;
+        let value = AppTableWriter::run(&txn, write)?;
+        txn.commit().map_err(DbError::from)?;
+        Ok(value)
+    }
+
     pub fn batch_commit_wallet_private_state(
         &self,
         batch: &WalletPrivateStateBatch<'_>,
     ) -> Result<(), DbError> {
-        self.batch_commit_wallet_private_state_with_vault_records(batch, &[])
+        self.batch_commit_wallet_private_state_with(batch, |_| Ok(()))
     }
 
-    pub fn batch_commit_wallet_private_state_with_vault_records(
+    /// Writes `batch` and runs `write` in the same write transaction, committing only when
+    /// both succeed.
+    pub fn batch_commit_wallet_private_state_with<T, E: From<DbError>>(
         &self,
         batch: &WalletPrivateStateBatch<'_>,
-        vault_records: &[DesktopWalletVaultRecord],
-    ) -> Result<(), DbError> {
-        self.batch_commit_wallet_private_state_with_vault_records_transaction(
-            batch,
-            vault_records,
-            || Ok(()),
-        )
-    }
-
-    fn batch_commit_wallet_private_state_with_vault_records_transaction(
-        &self,
-        batch: &WalletPrivateStateBatch<'_>,
-        vault_records: &[DesktopWalletVaultRecord],
-        before_commit: impl FnOnce() -> Result<(), DbError>,
-    ) -> Result<(), DbError> {
+        write: impl FnOnce(&mut AppTableWriter<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
         Self::validate_wallet_private_state_batch(batch)?;
-        let txn = self.db.begin_write()?;
+        let txn = self.db.begin_write().map_err(DbError::from)?;
         Self::write_wallet_private_state_batch(&txn, batch)?;
-        if !vault_records.is_empty() {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            for record in vault_records {
-                table.insert(record.key.as_str(), record.payload.as_slice())?;
-            }
-        }
-        before_commit()?;
-        txn.commit()?;
-        Ok(())
+        let value = AppTableWriter::run(&txn, write)?;
+        txn.commit().map_err(DbError::from)?;
+        Ok(value)
     }
 
     fn validate_wallet_private_state_batch(
@@ -2461,45 +2487,23 @@ impl DbStore {
         })
     }
 
-    /// Applies all namespace and desktop-vault mutations in one write transaction.
-    pub fn delete_wallet(
+    /// Deletes every namespace and runs `write` in the same write transaction, committing
+    /// only when both succeed.
+    pub fn delete_wallet_namespaces_with<T, E: From<DbError>>(
         &self,
-        batch: &WalletDeletionBatch<'_>,
-    ) -> Result<WalletDeletionReport, DbError> {
-        self.delete_wallet_transaction(batch, || Ok(()))
-    }
-
-    fn delete_wallet_transaction(
-        &self,
-        batch: &WalletDeletionBatch<'_>,
-        before_commit: impl FnOnce() -> Result<(), DbError>,
-    ) -> Result<WalletDeletionReport, DbError> {
-        let txn = self.db.begin_write()?;
-        let mut report = WalletDeletionReport::default();
-        for identity in batch.private_namespaces {
-            let namespace_report =
-                Self::delete_wallet_private_namespace_in_transaction(&txn, identity)?;
-            report
-                .private_namespace_rows
-                .add_assign_saturating(namespace_report);
+        namespaces: &[WalletPrivateNamespaceId],
+        write: impl FnOnce(&mut AppTableWriter<'_>) -> Result<T, E>,
+    ) -> Result<(WalletPrivateNamespaceDeletionReport, T), E> {
+        let txn = self.db.begin_write().map_err(DbError::from)?;
+        let mut report = WalletPrivateNamespaceDeletionReport::default();
+        for identity in namespaces {
+            report.add_assign_saturating(Self::delete_wallet_private_namespace_in_transaction(
+                &txn, identity,
+            )?);
         }
-        {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            for key in batch.desktop_wallet_vault_delete_keys {
-                if table.remove(key.as_str())?.is_some() {
-                    report.desktop_wallet_vault_rows_deleted =
-                        report.desktop_wallet_vault_rows_deleted.saturating_add(1);
-                }
-            }
-            for (key, payload) in batch.desktop_wallet_vault_put_records {
-                table.insert(key.as_str(), payload.as_slice())?;
-                report.desktop_wallet_vault_rows_put =
-                    report.desktop_wallet_vault_rows_put.saturating_add(1);
-            }
-        }
-        before_commit()?;
-        txn.commit()?;
-        Ok(report)
+        let value = AppTableWriter::run(&txn, write)?;
+        txn.commit().map_err(DbError::from)?;
+        Ok((report, value))
     }
 
     pub fn list_wallet_utxos(
@@ -3253,7 +3257,7 @@ impl DbStore {
 
     pub fn poi_artifact_cache_generation(&self) -> Result<u64, DbError> {
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
         match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
             Some(value) => decode(value.value()),
             None => Ok(0),
@@ -3268,7 +3272,7 @@ impl DbStore {
     pub fn clear_poi_artifact_cache_with_generation(&self) -> Result<(u64, u64), DbError> {
         let txn = self.db.begin_write()?;
         let generation = {
-            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            let mut table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
             let current = match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
                 Some(value) => decode(value.value())?,
                 None => 0_u64,
@@ -3314,7 +3318,7 @@ impl DbStore {
     ) -> Result<StoredRecord<PoiPublisherManifestWatermarkRecord>, DbError> {
         let key = PoiPublisherManifestWatermarkRecord::key_for(publisher_pubkey);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
         let Some(value) = table.get(key.as_str())? else {
             return Ok(StoredRecord::Missing);
         };
@@ -3335,7 +3339,7 @@ impl DbStore {
         let key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
         let txn = self.db.begin_write()?;
         let record = {
-            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            let mut table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
             if let Some(value) = table.get(key.as_str())? {
                 let record: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
                 if record.publisher_pubkey != publisher_pubkey {
@@ -3371,7 +3375,7 @@ impl DbStore {
         let key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
         let txn = self.db.begin_write()?;
         let observation = {
-            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            let mut table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
             let existing = match table.get(key.as_str())? {
                 Some(value) => {
                     let record: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
@@ -3445,7 +3449,7 @@ impl DbStore {
     ) -> Result<StoredRecord<PoiCorpusRpcHealthRecord>, DbError> {
         let key = PoiCorpusRpcHealthRecord::key_for(chain_type, chain_id, txid_version, list_key);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
         let Some(value) = table.get(key.as_str())? else {
             return Ok(StoredRecord::Missing);
         };
@@ -3473,107 +3477,24 @@ impl DbStore {
         let data = encode(&record)?;
         let txn = self.db.begin_write()?;
         {
-            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            let mut table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
             table.insert(key.as_str(), data.as_slice())?;
         }
         txn.commit()?;
         Ok(())
     }
 
-    pub fn get_pending_fee_note_assurance(
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_raw_poi_sidecar_state_for_test(
         &self,
-        chain_id: u64,
-        public_tx_hash: &FixedBytes<32>,
-    ) -> Result<Option<PendingFeeNoteAssuranceRecord>, DbError> {
-        let key = PendingFeeNoteAssuranceRecord::key_for(chain_id, public_tx_hash);
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
-        match table.get(key.as_str())? {
-            Some(value) => Ok(Some(decode(value.value())?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn put_pending_fee_note_assurance(
-        &self,
-        record: &PendingFeeNoteAssuranceRecord,
+        key: &str,
+        value: &[u8],
     ) -> Result<(), DbError> {
-        let key = record.key();
-        let data = encode(record)?;
         let txn = self.db.begin_write()?;
         {
-            let mut table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
-            table.insert(key.as_str(), data.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_pending_fee_note_assurance(
-        &self,
-        chain_id: u64,
-        public_tx_hash: &FixedBytes<32>,
-    ) -> Result<(), DbError> {
-        let key = PendingFeeNoteAssuranceRecord::key_for(chain_id, public_tx_hash);
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
-            table.remove(key.as_str())?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn list_pending_fee_note_assurance(
-        &self,
-        chain_id: u64,
-    ) -> Result<Vec<PendingFeeNoteAssuranceRecord>, DbError> {
-        let prefix = PendingFeeNoteAssuranceRecord::prefix_for_chain(chain_id);
-        self.list_decoded_by_prefix(PENDING_FEE_NOTE_ASSURANCE_TABLE, &prefix)
-    }
-
-    pub fn get_terminal_fee_note_assurance(
-        &self,
-        chain_id: u64,
-        public_tx_hash: &FixedBytes<32>,
-    ) -> Result<Option<TerminalFeeNoteAssuranceRecord>, DbError> {
-        let key = PendingFeeNoteAssuranceRecord::key_for(chain_id, public_tx_hash);
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
-        match table.get(key.as_str())? {
-            Some(value) => Ok(Some(decode(value.value())?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn list_terminal_fee_note_assurance(
-        &self,
-        chain_id: u64,
-    ) -> Result<Vec<TerminalFeeNoteAssuranceRecord>, DbError> {
-        let prefix = PendingFeeNoteAssuranceRecord::prefix_for_chain(chain_id);
-        self.list_decoded_by_prefix(TERMINAL_FEE_NOTE_ASSURANCE_TABLE, &prefix)
-    }
-
-    pub fn mark_fee_note_assurance_terminal(
-        &self,
-        record: &PendingFeeNoteAssuranceRecord,
-        outcome: FeeNoteAssuranceTerminalOutcome,
-    ) -> Result<(), DbError> {
-        let key = record.key();
-        let terminal = TerminalFeeNoteAssuranceRecord {
-            chain_id: record.chain_id,
-            public_tx_hash: record.public_tx_hash,
-            context: record.context.clone(),
-            outcome,
-        };
-        let data = encode(&terminal)?;
-        let txn = self.db.begin_write()?;
-        {
-            let mut pending_table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
-            pending_table.remove(key.as_str())?;
-
-            let mut terminal_table = txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
-            terminal_table.insert(key.as_str(), data.as_slice())?;
+            let mut table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
+            table.insert(key, value)?;
         }
         txn.commit()?;
         Ok(())
@@ -4460,192 +4381,6 @@ impl DbStore {
         Ok(records)
     }
 
-    pub fn get_app_settings_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
-        match table.get(key)? {
-            Some(value) => Ok(Some(value.value().to_vec())),
-            None => Ok(None),
-        }
-    }
-
-    pub fn put_app_settings_record(&self, key: &str, payload: &[u8]) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
-            table.insert(key, payload)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_app_settings_record(&self, key: &str) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
-            table.remove(key)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn list_app_settings_records(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<AppSettingsRecord>, DbError> {
-        let range_end = prefix_range_end(prefix);
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
-        let mut out = Vec::new();
-        let entries = match range_end.as_deref() {
-            Some(range_end) => table.range(prefix..range_end)?,
-            None => table.range(prefix..)?,
-        };
-        for entry in entries {
-            let (key, value) = entry?;
-            out.push(AppSettingsRecord {
-                key: key.value().to_string(),
-                payload: value.value().to_vec(),
-            });
-        }
-        Ok(out)
-    }
-
-    pub fn get_desktop_wallet_vault_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-        match table.get(key)? {
-            Some(value) => Ok(Some(value.value().to_vec())),
-            None => Ok(None),
-        }
-    }
-
-    pub fn put_desktop_wallet_vault_record(
-        &self,
-        key: &str,
-        payload: &[u8],
-    ) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            table.insert(key, payload)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn put_desktop_wallet_vault_record_if_absent(
-        &self,
-        key: &str,
-        payload: &[u8],
-    ) -> Result<bool, DbError> {
-        let txn = self.db.begin_write()?;
-        let inserted = {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            if table.get(key)?.is_some() {
-                false
-            } else {
-                table.insert(key, payload)?;
-                true
-            }
-        };
-        txn.commit()?;
-        Ok(inserted)
-    }
-
-    pub fn put_desktop_wallet_vault_records(
-        &self,
-        records: &[(String, Vec<u8>)],
-    ) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            for (key, payload) in records {
-                table.insert(key.as_str(), payload.as_slice())?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn update_desktop_wallet_vault_records(
-        &self,
-        delete_keys: &[String],
-        put_records: &[(String, Vec<u8>)],
-    ) -> Result<(), DbError> {
-        self.update_desktop_wallet_vault_records_transaction(delete_keys, put_records, || Ok(()))
-    }
-
-    fn update_desktop_wallet_vault_records_transaction(
-        &self,
-        delete_keys: &[String],
-        put_records: &[(String, Vec<u8>)],
-        before_commit: impl FnOnce() -> Result<(), DbError>,
-    ) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            for key in delete_keys {
-                table.remove(key.as_str())?;
-            }
-            for (key, payload) in put_records {
-                table.insert(key.as_str(), payload.as_slice())?;
-            }
-        }
-        before_commit()?;
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_desktop_wallet_vault_record(&self, key: &str) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            table.remove(key)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn replace_desktop_wallet_vault_prefix_with_records(
-        &self,
-        prefix: &str,
-        records: &[(String, Vec<u8>)],
-    ) -> Result<(), DbError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            remove_table_prefix(&mut table, prefix)?;
-            for (key, payload) in records {
-                table.insert(key.as_str(), payload.as_slice())?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub fn list_desktop_wallet_vault_records(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<DesktopWalletVaultRecord>, DbError> {
-        let range_end = prefix_range_end(prefix);
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-        let mut out = Vec::new();
-        let entries = match range_end.as_deref() {
-            Some(range_end) => table.range(prefix..range_end)?,
-            None => table.range(prefix..)?,
-        };
-        for entry in entries {
-            let (key, value) = entry?;
-            out.push(DesktopWalletVaultRecord {
-                key: key.value().to_string(),
-                payload: value.value().to_vec(),
-            });
-        }
-        Ok(out)
-    }
-
     fn initialize_schema(&self) -> Result<(), DbError> {
         let txn = self.db.begin_write()?;
         Self::initialize_schema_tables(&txn)?;
@@ -4661,8 +4396,6 @@ impl DbStore {
         txn.open_table(WALLET_UTXO_TABLE)?;
         txn.open_table(WALLET_META_TABLE)?;
         txn.open_table(WALLET_SYNC_ACTOR_STATE_TABLE)?;
-        txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
-        txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_V2_TABLE)?;
@@ -4670,8 +4403,7 @@ impl DbStore {
         txn.open_table(SENDER_TRANSACTION_CANDIDATE_V1_TABLE)?;
         txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
         txn.open_table(POI_CORPUS_JOURNAL_TABLE)?;
-        txn.open_table(APP_SETTINGS_TABLE)?;
-        txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+        txn.open_table(POI_SIDECAR_STATE_TABLE)?;
         Ok(())
     }
 
@@ -4713,8 +4445,8 @@ impl DbStore {
         before_commit: impl FnOnce() -> Result<(), DbError>,
     ) -> Result<(), DbError> {
         let migrate_schema_seven = match (meta.schema_version, to) {
-            (7, 8..=11) => true,
-            (8, 9..=11) | (9, 10..=11) | (10, 11) => false,
+            (7, 8..=12) => true,
+            (8, 9..=12) | (9, 10..=12) | (10, 11..=12) | (11, 12) => false,
             _ => {
                 return Err(DbError::UnsupportedSchemaVersion {
                     version: meta.schema_version,
@@ -4739,6 +4471,9 @@ impl DbStore {
         }
         if meta.schema_version <= 9 && to >= 10 {
             migrations::migrate_schema_9_to_10(&txn)?;
+        }
+        if meta.schema_version <= 11 && to >= 12 {
+            migrations::migrate_schema_11_to_12(&txn)?;
         }
         Self::initialize_schema_tables(&txn)?;
         {
@@ -4968,7 +4703,7 @@ fn poi_commit_context_conflict(
     expected_manifest_hash: Option<FixedBytes<32>>,
 ) -> Result<Option<PoiCommitContextConflict>, DbError> {
     let generation = {
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
         match table.get(POI_ARTIFACT_CACHE_GENERATION_KEY)? {
             Some(value) => decode(value.value())?,
             None => 0_u64,
@@ -4982,7 +4717,7 @@ fn poi_commit_context_conflict(
     };
     let watermark_key = PoiPublisherManifestWatermarkRecord::key_for(&publisher_pubkey);
     let actual = {
-        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let table = txn.open_table(POI_SIDECAR_STATE_TABLE)?;
         match table.get(watermark_key.as_str())? {
             Some(value) => {
                 let watermark: PoiPublisherManifestWatermarkRecord = decode(value.value())?;
@@ -5283,6 +5018,26 @@ where
         None => table.range(prefix..)?,
     };
     Ok(range.next().transpose()?.is_some())
+}
+
+fn list_table_prefix<TableType>(
+    table: &TableType,
+    prefix: &str,
+) -> Result<Vec<(String, Vec<u8>)>, DbError>
+where
+    TableType: ReadableTable<&'static str, &'static [u8]>,
+{
+    let range_end = prefix_range_end(prefix);
+    let entries = match range_end.as_deref() {
+        Some(end) => table.range(prefix..end)?,
+        None => table.range(prefix..)?,
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let (key, value) = entry?;
+        out.push((key.value().to_string(), value.value().to_vec()));
+    }
+    Ok(out)
 }
 
 fn decode_poi_corpus_journal_delta_bounded(
