@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::SenderTransactionCandidate;
 use crate::SenderTransactionCandidateUnshield;
+use crate::types::WalletBackfillRejectReason;
 
 use super::{
     BTreeMap, BlindedCommitmentData, DbStore, ExpectedPoiStatus, FixedBytes,
@@ -104,13 +105,28 @@ fn commit_sender_candidate_replacement(
         Ok::<(), WalletCacheError>(())
     });
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
+    durable_apply_outcome(result)
+}
+
+/// Outcome of a durable commit that leaves UTXOs unchanged; a rejected apply is an error.
+fn durable_apply_outcome(
+    result: Result<Result<(), WalletCacheError>, WalletBackfillRejectReason>,
+) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+    result.map_or(Err(WalletCacheError::Crypto), |committed| {
+        committed.map(|()| PoiPrivateApplyOutcome::Applied {
             utxo_changed: false,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(WalletCacheError::Crypto),
-    }
+        })
+    })
+}
+
+/// Outcome of an active apply that may change UTXOs; a rejected apply is skipped.
+fn active_apply_outcome(
+    result: Result<Result<(), WalletCacheError>, WalletBackfillRejectReason>,
+    utxo_changed: bool,
+) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+    result.map_or(Ok(PoiPrivateApplyOutcome::Skipped), |committed| {
+        committed.map(|()| PoiPrivateApplyOutcome::Applied { utxo_changed })
+    })
 }
 
 /// Wallet state one exclusive apply holds while it folds a delta.
@@ -680,13 +696,7 @@ async fn apply_sender_candidate_materialization(
         Ok::<(), WalletCacheError>(())
     });
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: false,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(WalletCacheError::Crypto),
-    }
+    durable_apply_outcome(result)
 }
 
 async fn apply_sender_candidate_unshield_update(
@@ -965,13 +975,7 @@ async fn apply_output_recovery(
         Ok::<(), WalletCacheError>(())
     });
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: false,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(WalletCacheError::Crypto),
-    }
+    durable_apply_outcome(result)
 }
 
 fn apply_pending_submission(
@@ -1115,13 +1119,7 @@ fn apply_pending_submission(
         Ok::<(), WalletCacheError>(())
     });
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: false,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(WalletCacheError::Crypto),
-    }
+    durable_apply_outcome(result)
 }
 
 async fn apply_recovered_outgoing_submission(
@@ -1365,13 +1363,7 @@ async fn apply_recovered_outgoing_submission(
         Ok::<(), WalletCacheError>(())
     });
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: false,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(WalletCacheError::Crypto),
-    }
+    durable_apply_outcome(result)
 }
 
 fn apply_pending_context_terminal(
@@ -1475,13 +1467,7 @@ fn apply_pending_context_terminal(
         Ok::<(), WalletCacheError>(())
     });
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: false,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(WalletCacheError::Crypto),
-    }
+    durable_apply_outcome(result)
 }
 
 async fn apply_locally_valid_pending_lists(
@@ -1692,13 +1678,7 @@ async fn apply_locally_valid_pending_lists(
     });
     drop(utxos_locked);
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: changed,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Ok(PoiPrivateApplyOutcome::Skipped),
-    }
+    active_apply_outcome(result, changed)
 }
 
 async fn apply_verified_valid(
@@ -1816,13 +1796,7 @@ async fn apply_verified_valid(
             Ok::<(), WalletCacheError>(())
         });
         drop(permit);
-        return match result {
-            Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-                utxo_changed: false,
-            }),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(WalletCacheError::Crypto),
-        };
+        return durable_apply_outcome(result);
     }
 
     let PendingOutputPoiSubject::Owned(expected_output) = subject else {
@@ -1937,13 +1911,7 @@ async fn apply_verified_valid(
     });
     drop(utxos_locked);
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied {
-            utxo_changed: changed,
-        }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Ok(PoiPrivateApplyOutcome::Skipped),
-    }
+    active_apply_outcome(result, changed)
 }
 
 async fn apply_poi_status_refresh(
@@ -2003,9 +1971,5 @@ async fn apply_poi_status_refresh(
     });
     drop(utxos_locked);
     drop(permit);
-    match result {
-        Ok(Ok(())) => Ok(PoiPrivateApplyOutcome::Applied { utxo_changed: true }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Ok(PoiPrivateApplyOutcome::Skipped),
-    }
+    active_apply_outcome(result, true)
 }
