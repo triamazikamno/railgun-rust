@@ -1,3 +1,7 @@
+use super::verification::{
+    AuthorizedPoiStatusSource, PendingOutputPoiVerificationOutcome,
+    verify_submitted_pending_output_pois_inner,
+};
 use super::*;
 use crate::wallet::{PendingOutputPoiSubmitter, PoiRpcClient};
 
