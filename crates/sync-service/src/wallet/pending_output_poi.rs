@@ -1833,7 +1833,7 @@ impl PendingOutputPoiSubmissionPass<'_> {
         else {
             return Ok(ControlFlow::Continue(()));
         };
-        match preflight_and_remote_submit_pending_output_poi(
+        let remote_attempt = preflight_and_remote_submit_pending_output_poi(
             self.authority,
             self.public_data_plane,
             self.cache_store,
@@ -1846,11 +1846,12 @@ impl PendingOutputPoiSubmissionPass<'_> {
             self.private_poi,
             &mut state.route,
         )
-        .await?
-        {
-            PendingOutputPoiRemoteAttempt::NotCurrent => {}
+        .await?;
+        let (list_keys, merge_submitted_list_keys, action, submitted) = match remote_attempt {
+            PendingOutputPoiRemoteAttempt::NotCurrent => return Ok(ControlFlow::Continue(())),
             PendingOutputPoiRemoteAttempt::Deferred => {
                 state.deferred_txids.insert(record.railgun_txid);
+                return Ok(ControlFlow::Continue(()));
             }
             PendingOutputPoiRemoteAttempt::AuthorityStale => return Ok(ControlFlow::Break(())),
             PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
@@ -1876,90 +1877,76 @@ impl PendingOutputPoiSubmissionPass<'_> {
                         "failed to atomically persist pending output POI terminal state"
                     );
                 }
+                return Ok(ControlFlow::Continue(()));
             }
             PendingOutputPoiRemoteAttempt::Succeeded {
                 submitted_list_keys,
-            } => {
-                if !self
-                    .pending_output_poi_submission_side_effect_current(record, &subject, &plan)
-                    .await?
-                {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                match apply_poi_private_delta(
-                    self.authority,
-                    self.db,
-                    self.cache_store,
-                    self.cfg,
-                    OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
-                        subject: subject.clone(),
-                        expected_context_fingerprint,
-                        expected_recovery: plan.expected_recovery.clone(),
-                        active_list_keys: self.active_list_keys.to_vec(),
-                        list_keys: submitted_list_keys,
-                        predicate: plan.predicate(),
-                        merge_submitted_list_keys: true,
-                        action: OutputPoiRecoveryAction::Submitted {
-                            retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-                        },
-                        now: self.now,
-                    }),
-                )
-                .await
-                {
-                    Ok(PoiPrivateApplyOutcome::Applied { .. }) => state.submitted_contexts += 1,
-                    Ok(
-                        PoiPrivateApplyOutcome::Skipped
-                        | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
-                    ) => {}
-                    Err(_) => {
-                        warn!(
-                            chain_id,
-                            "failed to atomically persist pending output POI submitted state"
-                        );
-                    }
+            } => (
+                submitted_list_keys,
+                true,
+                OutputPoiRecoveryAction::Submitted {
+                    retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+                },
+                true,
+            ),
+            PendingOutputPoiRemoteAttempt::Failed { error } => (
+                plan.list_keys.clone(),
+                false,
+                OutputPoiRecoveryAction::SubmitFailed {
+                    error,
+                    retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                },
+                false,
+            ),
+        };
+        if !self
+            .pending_output_poi_submission_side_effect_current(record, &subject, &plan)
+            .await?
+        {
+            return Ok(ControlFlow::Continue(()));
+        }
+        match apply_poi_private_delta(
+            self.authority,
+            self.db,
+            self.cache_store,
+            self.cfg,
+            OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
+                subject: subject.clone(),
+                expected_context_fingerprint,
+                expected_recovery: plan.expected_recovery.clone(),
+                active_list_keys: self.active_list_keys.to_vec(),
+                list_keys,
+                predicate: plan.predicate(),
+                merge_submitted_list_keys,
+                action,
+                now: self.now,
+            }),
+        )
+        .await
+        {
+            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                if submitted {
+                    state.submitted_contexts += 1;
                 }
             }
-            PendingOutputPoiRemoteAttempt::Failed { error } => {
-                if !self
-                    .pending_output_poi_submission_side_effect_current(record, &subject, &plan)
-                    .await?
-                {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                if apply_poi_private_delta(
-                    self.authority,
-                    self.db,
-                    self.cache_store,
-                    self.cfg,
-                    OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
-                        subject: subject.clone(),
-                        expected_context_fingerprint,
-                        expected_recovery: plan.expected_recovery.clone(),
-                        active_list_keys: self.active_list_keys.to_vec(),
-                        list_keys: plan.list_keys.clone(),
-                        predicate: plan.predicate(),
-                        merge_submitted_list_keys: false,
-                        action: OutputPoiRecoveryAction::SubmitFailed {
-                            error,
-                            retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                        },
-                        now: self.now,
-                    }),
-                )
-                .await
-                .is_err()
-                {
-                    warn!(
-                        chain_id,
-                        "failed to atomically persist pending output POI submit-failure state"
-                    );
-                }
-                warn!(
-                    chain_id,
-                    "pending output POI submission failed; keeping context retryable"
-                );
-            }
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => {}
+            Err(_) if submitted => warn!(
+                chain_id,
+                "failed to atomically persist pending output POI submitted state"
+            ),
+            Err(_) => warn!(
+                chain_id,
+                "failed to atomically persist pending output POI submit-failure state"
+            ),
+        }
+        if !submitted {
+            warn!(
+                chain_id,
+                "pending output POI submission failed; keeping context retryable"
+            );
         }
         Ok(ControlFlow::Continue(()))
     }
