@@ -360,14 +360,16 @@ pub(super) async fn reconstruct_incompatible_sender_candidates(
             request.db,
             request.cache_store,
             request.cfg,
-            super::OwnedPoiPrivateDelta::SenderCandidateReconstruction {
-                candidate,
-                replay_fence: SenderCandidateReplayFence {
-                    public_data_plane: request.public_data_plane.clone(),
-                    epoch: rows.epoch,
+            super::OwnedPoiPrivateDelta::SenderCandidateReconstruction(
+                super::SenderCandidateReconstructionDelta {
+                    candidate,
+                    replay_fence: SenderCandidateReplayFence {
+                        public_data_plane: request.public_data_plane.clone(),
+                        epoch: rows.epoch,
+                    },
+                    expected_group,
                 },
-                expected_group,
-            },
+            ),
         )
         .await?;
         match outcome {

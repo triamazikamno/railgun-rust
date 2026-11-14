@@ -874,14 +874,16 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 output_request.db,
                 output_request.cache_store,
                 output_request.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateLocallyValid {
-                    expected_candidate: candidate,
-                    corpus,
-                    public_data_fence: public_data_fence.clone(),
-                    unshield: replacement
-                        .as_ref()
-                        .and_then(|replacement| replacement.unshield.clone()),
-                },
+                OwnedPoiPrivateDelta::SenderCandidateLocallyValid(
+                    SenderCandidateLocallyValidDelta {
+                        expected_candidate: candidate,
+                        corpus,
+                        public_data_fence: public_data_fence.clone(),
+                        unshield: replacement
+                            .as_ref()
+                            .and_then(|replacement| replacement.unshield.clone()),
+                    },
+                ),
             )
             .await;
             match apply_result {
@@ -932,11 +934,13 @@ pub(super) async fn materialize_sender_transaction_candidates(
                 output_request.db,
                 output_request.cache_store,
                 output_request.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate {
-                    expected_candidate: candidate,
-                    public_data_fence: public_data_fence.clone(),
-                    replacement: replacement.clone(),
-                },
+                OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate(
+                    SenderCandidateUnshieldUpdateDelta {
+                        expected_candidate: candidate,
+                        public_data_fence: public_data_fence.clone(),
+                        replacement: replacement.clone(),
+                    },
+                ),
             )
             .await;
             match apply_result {
@@ -1038,21 +1042,23 @@ pub(super) async fn materialize_sender_transaction_candidates(
             output_request.db,
             output_request.cache_store,
             output_request.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                expected_candidate: candidate,
-                public_data_fence: public_data_fence.clone(),
-                active_list_keys: output_request.active_list_keys.to_vec(),
-                pending_updates,
-                recovery_updates,
-                owned_substitutes,
-                proof_outputs,
-                expected_corpus,
-                replacement_group,
-                external_valid_substitutes,
-                unshield: replacement
-                    .as_ref()
-                    .and_then(|replacement| replacement.unshield.clone()),
-            },
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                SenderCandidateMaterializationDelta {
+                    expected_candidate: candidate,
+                    public_data_fence: public_data_fence.clone(),
+                    active_list_keys: output_request.active_list_keys.to_vec(),
+                    pending_updates,
+                    recovery_updates,
+                    owned_substitutes,
+                    proof_outputs,
+                    expected_corpus,
+                    replacement_group,
+                    external_valid_substitutes,
+                    unshield: replacement
+                        .as_ref()
+                        .and_then(|replacement| replacement.unshield.clone()),
+                },
+            ),
         )
         .await;
         match apply_result {
@@ -1515,11 +1521,13 @@ pub(super) async fn process_sender_candidate_unshields(
             request.db,
             request.cache_store,
             request.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate {
-                expected_candidate: candidate,
-                public_data_fence: public_data_fence.clone(),
-                replacement: replacement.clone(),
-            },
+            OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate(
+                SenderCandidateUnshieldUpdateDelta {
+                    expected_candidate: candidate,
+                    public_data_fence: public_data_fence.clone(),
+                    replacement: replacement.clone(),
+                },
+            ),
         )
         .await
         {
@@ -1563,11 +1571,13 @@ pub(super) async fn process_sender_candidate_unshields(
             request.db,
             request.cache_store,
             request.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateUnshieldValidated {
-                expected_candidate: candidate,
-                validated_txids: completed.iter().copied().collect(),
-                corpus: corpus.clone(),
-            },
+            OwnedPoiPrivateDelta::SenderCandidateUnshieldValidated(
+                SenderCandidateUnshieldValidatedDelta {
+                    expected_candidate: candidate,
+                    validated_txids: completed.iter().copied().collect(),
+                    corpus: corpus.clone(),
+                },
+            ),
         )
         .await
         {

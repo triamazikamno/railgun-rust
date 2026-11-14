@@ -429,135 +429,171 @@ pub(crate) struct ExpectedPoiCorpusRevision {
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedPoiPrivateDelta {
     /// Restore the consumed scan candidate without applying the replay to wallet state.
-    SenderCandidateReconstruction {
-        candidate: SenderTransactionCandidate,
-        replay_fence: super::saved_poi_compatibility::SenderCandidateReplayFence,
-        expected_group: Vec<(
-            PendingOutputPoiContextRecord,
-            Option<OutputPoiRecoveryRecord>,
-        )>,
-    },
+    SenderCandidateReconstruction(SenderCandidateReconstructionDelta),
     /// Retire an exact sender candidate after the actor re-reads local artifact POI status, or
     /// keep only its remaining unshield work when `unshield` is set.
-    SenderCandidateLocallyValid {
-        expected_candidate: SenderTransactionCandidate,
-        corpus: PublicPoiCorpusHandle,
-        public_data_fence: SenderCandidatePublicDataFence,
-        unshield: Option<SenderTransactionCandidateUnshield>,
-    },
+    SenderCandidateLocallyValid(SenderCandidateLocallyValidDelta),
     /// Install standard external pending/recovery siblings, reuse exact wallet-owned substitutes,
     /// and consume their scan candidate in one actor-owned durable commit.
-    SenderCandidateMaterialization {
-        expected_candidate: SenderTransactionCandidate,
-        public_data_fence: SenderCandidatePublicDataFence,
-        active_list_keys: Vec<FixedBytes<32>>,
-        pending_updates: Vec<PendingOutputPoiContextRecord>,
-        recovery_updates: Vec<OutputPoiRecoveryRecord>,
-        owned_substitutes: Vec<ExpectedWalletOutput>,
-        proof_outputs: Vec<FixedBytes<32>>,
-        /// Exact unresolved predecessors when replacing proofs from an obsolete circuit.
-        replacement_group: Vec<(
-            PendingOutputPoiContextRecord,
-            Option<OutputPoiRecoveryRecord>,
-        )>,
-        /// Completed external outputs remain witness evidence without new pending records.
-        external_valid_substitutes: Vec<Utxo>,
-        /// Corpus revision the candidate's proofs were built from.
-        expected_corpus: ExpectedPoiCorpusRevision,
-        /// Remaining unshield work; when set the candidate is kept instead of consumed.
-        unshield: Option<SenderTransactionCandidateUnshield>,
-    },
+    SenderCandidateMaterialization(SenderCandidateMaterializationDelta),
     /// Record, narrow, or retire a sender candidate's unshield work without completing any
     /// validation.
-    SenderCandidateUnshieldUpdate {
-        expected_candidate: SenderTransactionCandidate,
-        public_data_fence: SenderCandidatePublicDataFence,
-        replacement: Option<SenderTransactionCandidate>,
-    },
+    SenderCandidateUnshieldUpdate(SenderCandidateUnshieldUpdateDelta),
     /// Complete unshield TXIDs after the actor re-reads them Valid on every active list.
-    SenderCandidateUnshieldValidated {
-        expected_candidate: SenderTransactionCandidate,
-        validated_txids: Vec<FixedBytes<32>>,
-        corpus: PublicPoiCorpusHandle,
-    },
+    SenderCandidateUnshieldValidated(SenderCandidateUnshieldValidatedDelta),
     /// Fold a recovery action into the exact predecessor, optionally replacing a pending
     /// context whose predecessor is also exact.
-    OutputRecovery {
-        expected_output: ExpectedWalletOutput,
-        active_list_keys: Vec<FixedBytes<32>>,
-        target_list_keys: Vec<FixedBytes<32>>,
-        required_poi_status: ExpectedPoiStatus,
-        pending_update: Box<Option<(ExpectedRecordState, PendingOutputPoiContextRecord)>>,
-        expected_recovery: ExpectedRecordState,
-        action: OutputPoiRecoveryAction,
-        now: u64,
-        /// Set only when the commit consumes a proof built from the local corpus.
-        expected_corpus: Option<ExpectedPoiCorpusRevision>,
-        /// Source scan epoch used to reconstruct missing sender notes.
-        replay_fence: Option<super::saved_poi_compatibility::SenderCandidateReplayFence>,
-    },
+    OutputRecovery(OutputRecoveryDelta),
     /// Apply a completed submission to the current context/recovery records.
-    PendingSubmission {
-        subject: PendingOutputPoiSubject,
-        expected_context_fingerprint: Vec<u8>,
-        expected_recovery: ExpectedRecordState,
-        active_list_keys: Vec<FixedBytes<32>>,
-        list_keys: Vec<FixedBytes<32>>,
-        predicate: PendingOutputPoiSubmissionPredicate,
-        merge_submitted_list_keys: bool,
-        action: OutputPoiRecoveryAction,
-        now: u64,
-    },
+    PendingSubmission(PendingSubmissionDelta),
     /// Apply one recovered sender transaction/list result to every exact output sibling.
-    RecoveredOutgoingSubmission {
-        siblings: Vec<RecoveredOutgoingSubmissionSibling>,
-        owned_substitutes: Vec<ExpectedWalletOutput>,
-        external_valid_substitutes: Vec<FixedBytes<32>>,
-        expected_corpus: Option<ExpectedPoiCorpusRevision>,
-        active_list_keys: Vec<FixedBytes<32>>,
-        list_keys: Vec<FixedBytes<32>>,
-        merge_submitted_list_keys: bool,
-        action: OutputPoiRecoveryAction,
-        now: u64,
-    },
+    RecoveredOutgoingSubmission(RecoveredOutgoingSubmissionDelta),
     /// Mark a still-current context terminal after a structural submission failure.
-    PendingContextTerminal {
-        subject: PendingOutputPoiSubject,
-        expected_context_fingerprint: Vec<u8>,
-        expected_recovery: ExpectedRecordState,
-        active_list_keys: Vec<FixedBytes<32>>,
-        target_list_keys: Vec<FixedBytes<32>>,
-        error: String,
-    },
+    PendingContextTerminal(PendingContextTerminalDelta),
     /// Mark list keys Valid only for the stable output and target-list state that were verified.
-    VerifiedValid {
-        subject: PendingOutputPoiSubject,
-        evidence: PendingOutputPoiValidationEvidence,
-        expected_context_fingerprint: Vec<u8>,
-        expected_recovery: ExpectedRecordState,
-        expected_poi_list_state: Option<ExpectedPoiListState>,
-        active_list_keys: Vec<FixedBytes<32>>,
-        valid_list_keys: Vec<FixedBytes<32>>,
-        now: u64,
-    },
+    VerifiedValid(VerifiedValidDelta),
     /// Reconcile only the list keys proven Valid by the local POI corpus. The context remains
     /// pending when other active lists still need submission.
-    LocallyValidPendingLists {
-        subject: PendingOutputPoiSubject,
-        expected_context_fingerprint: Vec<u8>,
-        expected_recovery: ExpectedRecordState,
-        active_list_keys: Vec<FixedBytes<32>>,
-        valid_list_keys: Vec<FixedBytes<32>>,
-        now: u64,
-    },
+    LocallyValidPendingLists(LocallyValidPendingListsDelta),
     /// Apply remotely-read statuses only to currently matching unspent UTXOs.
-    PoiStatusRefresh {
-        active_list_keys: Vec<FixedBytes<32>>,
-        expected_poi_by_blinded_commitment: BTreeMap<FixedBytes<32>, UtxoPoiMetadata>,
-        statuses_by_blinded_commitment:
-            BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>,
-        refreshed_at: u64,
-    },
+    PoiStatusRefresh(PoiStatusRefreshDelta),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SenderCandidateReconstructionDelta {
+    pub(crate) candidate: SenderTransactionCandidate,
+    pub(crate) replay_fence: super::saved_poi_compatibility::SenderCandidateReplayFence,
+    pub(crate) expected_group: Vec<(
+        PendingOutputPoiContextRecord,
+        Option<OutputPoiRecoveryRecord>,
+    )>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SenderCandidateLocallyValidDelta {
+    pub(crate) expected_candidate: SenderTransactionCandidate,
+    pub(crate) corpus: PublicPoiCorpusHandle,
+    pub(crate) public_data_fence: SenderCandidatePublicDataFence,
+    pub(crate) unshield: Option<SenderTransactionCandidateUnshield>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SenderCandidateMaterializationDelta {
+    pub(crate) expected_candidate: SenderTransactionCandidate,
+    pub(crate) public_data_fence: SenderCandidatePublicDataFence,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) pending_updates: Vec<PendingOutputPoiContextRecord>,
+    pub(crate) recovery_updates: Vec<OutputPoiRecoveryRecord>,
+    pub(crate) owned_substitutes: Vec<ExpectedWalletOutput>,
+    pub(crate) proof_outputs: Vec<FixedBytes<32>>,
+    /// Exact unresolved predecessors when replacing proofs from an obsolete circuit.
+    pub(crate) replacement_group: Vec<(
+        PendingOutputPoiContextRecord,
+        Option<OutputPoiRecoveryRecord>,
+    )>,
+    /// Completed external outputs remain witness evidence without new pending records.
+    pub(crate) external_valid_substitutes: Vec<Utxo>,
+    /// Corpus revision the candidate's proofs were built from.
+    pub(crate) expected_corpus: ExpectedPoiCorpusRevision,
+    /// Remaining unshield work; when set the candidate is kept instead of consumed.
+    pub(crate) unshield: Option<SenderTransactionCandidateUnshield>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SenderCandidateUnshieldUpdateDelta {
+    pub(crate) expected_candidate: SenderTransactionCandidate,
+    pub(crate) public_data_fence: SenderCandidatePublicDataFence,
+    pub(crate) replacement: Option<SenderTransactionCandidate>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SenderCandidateUnshieldValidatedDelta {
+    pub(crate) expected_candidate: SenderTransactionCandidate,
+    pub(crate) validated_txids: Vec<FixedBytes<32>>,
+    pub(crate) corpus: PublicPoiCorpusHandle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OutputRecoveryDelta {
+    pub(crate) expected_output: ExpectedWalletOutput,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) target_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) required_poi_status: ExpectedPoiStatus,
+    pub(crate) pending_update: Box<Option<(ExpectedRecordState, PendingOutputPoiContextRecord)>>,
+    pub(crate) expected_recovery: ExpectedRecordState,
+    pub(crate) action: OutputPoiRecoveryAction,
+    pub(crate) now: u64,
+    /// Set only when the commit consumes a proof built from the local corpus.
+    pub(crate) expected_corpus: Option<ExpectedPoiCorpusRevision>,
+    /// Source scan epoch used to reconstruct missing sender notes.
+    pub(crate) replay_fence: Option<super::saved_poi_compatibility::SenderCandidateReplayFence>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSubmissionDelta {
+    pub(crate) subject: PendingOutputPoiSubject,
+    pub(crate) expected_context_fingerprint: Vec<u8>,
+    pub(crate) expected_recovery: ExpectedRecordState,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) list_keys: Vec<FixedBytes<32>>,
+    pub(crate) predicate: PendingOutputPoiSubmissionPredicate,
+    pub(crate) merge_submitted_list_keys: bool,
+    pub(crate) action: OutputPoiRecoveryAction,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveredOutgoingSubmissionDelta {
+    pub(crate) siblings: Vec<RecoveredOutgoingSubmissionSibling>,
+    pub(crate) owned_substitutes: Vec<ExpectedWalletOutput>,
+    pub(crate) external_valid_substitutes: Vec<FixedBytes<32>>,
+    pub(crate) expected_corpus: Option<ExpectedPoiCorpusRevision>,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) list_keys: Vec<FixedBytes<32>>,
+    pub(crate) merge_submitted_list_keys: bool,
+    pub(crate) action: OutputPoiRecoveryAction,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingContextTerminalDelta {
+    pub(crate) subject: PendingOutputPoiSubject,
+    pub(crate) expected_context_fingerprint: Vec<u8>,
+    pub(crate) expected_recovery: ExpectedRecordState,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) target_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) error: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedValidDelta {
+    pub(crate) subject: PendingOutputPoiSubject,
+    pub(crate) evidence: PendingOutputPoiValidationEvidence,
+    pub(crate) expected_context_fingerprint: Vec<u8>,
+    pub(crate) expected_recovery: ExpectedRecordState,
+    pub(crate) expected_poi_list_state: Option<ExpectedPoiListState>,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) valid_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LocallyValidPendingListsDelta {
+    pub(crate) subject: PendingOutputPoiSubject,
+    pub(crate) expected_context_fingerprint: Vec<u8>,
+    pub(crate) expected_recovery: ExpectedRecordState,
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) valid_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) now: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PoiStatusRefreshDelta {
+    pub(crate) active_list_keys: Vec<FixedBytes<32>>,
+    pub(crate) expected_poi_by_blinded_commitment: BTreeMap<FixedBytes<32>, UtxoPoiMetadata>,
+    pub(crate) statuses_by_blinded_commitment:
+        BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>,
+    pub(crate) refreshed_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

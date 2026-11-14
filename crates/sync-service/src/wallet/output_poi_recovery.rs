@@ -16,11 +16,12 @@ use super::{
     LocalPoiMerkleProofSource, MerkleForest, Note, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER, OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
     OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
-    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
-    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiContextRecord,
-    PendingOutputPoiObservation, PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt,
-    PendingOutputPoiRole, PendingOutputPoiSubmissionPlan, PoiPrivateApplyOutcome, PoiRpcClient,
-    PoiStatus, PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
+    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, OutputRecoveryDelta,
+    OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingContextTerminalDelta,
+    PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiPreflight,
+    PendingOutputPoiRemoteAttempt, PendingOutputPoiRole, PendingOutputPoiSubmissionPlan,
+    PendingSubmissionDelta, PoiPrivateApplyOutcome, PoiRpcClient, PoiStatus,
+    PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
     PreTransactionPoiMap, PrivateInputs, ProverError, PublicInputs, PublicPoiCorpusHandle,
     PublicPoiCorpusKey, PublicTxidCacheKey, PublicTxidLatestValidated, PublicTxidProofRequest,
     PublicTxidProofTarget, PublicTxidSyncRequest, PublicTxidTransaction, RailgunSpendSigner,
@@ -791,7 +792,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                     request.db,
                     request.cache_store,
                     request.cfg,
-                    OwnedPoiPrivateDelta::OutputRecovery {
+                    OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
                         expected_output: ExpectedWalletOutput::new(candidate),
                         active_list_keys: request.active_list_keys.to_vec(),
                         target_list_keys: recoverable_list_keys.clone(),
@@ -811,7 +812,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                         now,
                         expected_corpus: proof_source_resolution.expected_corpus_revision(),
                         replay_fence: recovery_chunk.replay_fence.clone(),
-                    },
+                    }),
                 )
                 .await
                 {
@@ -1109,14 +1110,14 @@ pub(super) async fn force_resubmit_pending_output_poi_context(
                 db,
                 cache_store,
                 cfg,
-                OwnedPoiPrivateDelta::PendingContextTerminal {
+                OwnedPoiPrivateDelta::PendingContextTerminal(PendingContextTerminalDelta {
                     subject: subject.clone(),
                     expected_context_fingerprint,
                     expected_recovery: plan.expected_recovery(),
                     active_list_keys: active_list_keys.to_vec(),
                     target_list_keys: plan.list_keys().to_vec(),
                     error: "missing pre-transaction POI for pending output".to_string(),
-                },
+                }),
             )
             .await
             .is_err()
@@ -1148,7 +1149,7 @@ pub(super) async fn force_resubmit_pending_output_poi_context(
                 db,
                 cache_store,
                 cfg,
-                OwnedPoiPrivateDelta::PendingSubmission {
+                OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
                     subject: subject.clone(),
                     expected_context_fingerprint,
                     expected_recovery: plan.expected_recovery(),
@@ -1160,7 +1161,7 @@ pub(super) async fn force_resubmit_pending_output_poi_context(
                         retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
                     },
                     now,
-                },
+                }),
             )
             .await
             .is_err()
@@ -1191,7 +1192,7 @@ pub(super) async fn force_resubmit_pending_output_poi_context(
                     db,
                     cache_store,
                     cfg,
-                    OwnedPoiPrivateDelta::PendingSubmission {
+                    OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
                         subject: subject.clone(),
                         expected_context_fingerprint,
                         expected_recovery: plan.expected_recovery(),
@@ -1204,7 +1205,7 @@ pub(super) async fn force_resubmit_pending_output_poi_context(
                             retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
                         },
                         now,
-                    },
+                    }),
                 )
                 .await
                 .is_err()
@@ -2694,7 +2695,7 @@ pub(super) async fn record_output_poi_recovery_failure(
         db,
         cache_store,
         cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             expected_output: ExpectedWalletOutput::new(candidate),
             active_list_keys: active_list_keys.to_vec(),
             target_list_keys: target_list_keys.to_vec(),
@@ -2710,7 +2711,7 @@ pub(super) async fn record_output_poi_recovery_failure(
             now,
             expected_corpus: None,
             replay_fence: None,
-        },
+        }),
     )
     .await
     .is_err()
@@ -2762,7 +2763,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
             db,
             cache_store,
             cfg,
-            OwnedPoiPrivateDelta::OutputRecovery {
+            OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
                 expected_output: ExpectedWalletOutput::new(wallet_utxo),
                 active_list_keys: active_list_keys.to_vec(),
                 target_list_keys: active_list_keys.to_vec(),
@@ -2773,7 +2774,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
                 now,
                 expected_corpus: None,
                 replay_fence: None,
-            },
+            }),
         )
         .await
         .is_err()

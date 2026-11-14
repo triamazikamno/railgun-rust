@@ -731,7 +731,7 @@ async fn source_block_reconstructs_consumed_exact_spend_candidate_and_preserves_
         reopened.as_ref(),
         reopened.as_ref(),
         &current.cfg,
-        OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+        OwnedPoiPrivateDelta::SenderCandidateMaterialization(SenderCandidateMaterializationDelta {
             expected_candidate: current.candidate.clone(),
             public_data_fence: fence,
             active_list_keys: vec![current.list_key],
@@ -750,7 +750,7 @@ async fn source_block_reconstructs_consumed_exact_spend_candidate_and_preserves_
             replacement_group: vec![(group.pending[0].clone(), Some(group.recoveries[0].clone()))],
             external_valid_substitutes: Vec::new(),
             unshield: None,
-        },
+        }),
     )
     .await
     .expect("materialize after restart");
@@ -900,23 +900,25 @@ async fn unresolved_group_replacement_is_atomic_and_rejects_stale_evidence() {
             store.as_ref(),
             store.as_ref(),
             &current.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                expected_candidate: current.candidate.clone(),
-                public_data_fence: fence,
-                active_list_keys: vec![current.list_key],
-                pending_updates: current.pending.clone(),
-                recovery_updates: current.recoveries.clone(),
-                owned_substitutes: Vec::new(),
-                proof_outputs: current
-                    .outputs
-                    .iter()
-                    .map(|output| output.poi.blinded_commitment)
-                    .collect(),
-                expected_corpus: corpus,
-                replacement_group: expected,
-                external_valid_substitutes: Vec::new(),
-                unshield: None,
-            },
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                SenderCandidateMaterializationDelta {
+                    expected_candidate: current.candidate.clone(),
+                    public_data_fence: fence,
+                    active_list_keys: vec![current.list_key],
+                    pending_updates: current.pending.clone(),
+                    recovery_updates: current.recoveries.clone(),
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: current
+                        .outputs
+                        .iter()
+                        .map(|output| output.poi.blinded_commitment)
+                        .collect(),
+                    expected_corpus: corpus,
+                    replacement_group: expected,
+                    external_valid_substitutes: Vec::new(),
+                    unshield: None,
+                },
+            ),
         )
         .await;
         if stale == "none" {
@@ -1117,29 +1119,33 @@ async fn external_siblings_keep_only_unresolved_output_and_list_targets() {
             .cloned()
             .zip(old.recoveries[..pending_count].iter().cloned().map(Some))
             .collect::<Vec<_>>();
-        let delta = |pending_updates| OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-            expected_candidate: current.candidate.clone(),
-            public_data_fence: fence.clone(),
-            active_list_keys: lists.clone(),
-            pending_updates,
-            recovery_updates: current.recoveries[..pending_count].to_vec(),
-            owned_substitutes: Vec::new(),
-            proof_outputs: current
-                .outputs
-                .iter()
-                .map(|output| output.poi.blinded_commitment)
-                .collect(),
-            expected_corpus: ExpectedPoiCorpusRevision {
-                corpus: corpus.clone(),
-                revision,
-            },
-            replacement_group: expected_group.clone(),
-            external_valid_substitutes: if heterogeneous_lists {
-                Vec::new()
-            } else {
-                vec![current.outputs[1].clone()]
-            },
-            unshield: None,
+        let delta = |pending_updates| {
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                SenderCandidateMaterializationDelta {
+                    expected_candidate: current.candidate.clone(),
+                    public_data_fence: fence.clone(),
+                    active_list_keys: lists.clone(),
+                    pending_updates,
+                    recovery_updates: current.recoveries[..pending_count].to_vec(),
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: current
+                        .outputs
+                        .iter()
+                        .map(|output| output.poi.blinded_commitment)
+                        .collect(),
+                    expected_corpus: ExpectedPoiCorpusRevision {
+                        corpus: corpus.clone(),
+                        revision,
+                    },
+                    replacement_group: expected_group.clone(),
+                    external_valid_substitutes: if heterogeneous_lists {
+                        Vec::new()
+                    } else {
+                        vec![current.outputs[1].clone()]
+                    },
+                    unshield: None,
+                },
+            )
         };
         let mut handle = test_wallet_handle(vec![current.input.clone()]);
         handle.cache_key = current.cfg.cache_key.clone();

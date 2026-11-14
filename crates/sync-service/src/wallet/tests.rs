@@ -46,11 +46,13 @@ use super::{
     ExpectedPoiCorpusRevision, ExpectedPoiListState, ExpectedPoiStatus, ExpectedRecordState,
     ExpectedWalletOutput, LocalPoiMerkleProofSource, LocalPoiStatusReader,
     OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OutputPoiRecoveryRequest, OutputPoiRecoveryRun, OwnedPoiPrivateDelta,
+    OutputPoiRecoveryRequest, OutputPoiRecoveryRun, OutputRecoveryDelta, OwnedPoiPrivateDelta,
     PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,
     PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter,
-    PendingOutputPoiValidationEvidence, PoiMaintenanceController, PoiPrivateApplyOutcome,
-    PoiStatusReader, RecoveredOutgoingSubmissionSibling, WALLET_POI_STATUS_BATCH_SIZE,
+    PendingOutputPoiValidationEvidence, PendingSubmissionDelta, PoiMaintenanceController,
+    PoiPrivateApplyOutcome, PoiStatusReader, PoiStatusRefreshDelta,
+    RecoveredOutgoingSubmissionDelta, RecoveredOutgoingSubmissionSibling,
+    SenderCandidateMaterializationDelta, VerifiedValidDelta, WALLET_POI_STATUS_BATCH_SIZE,
     WalletActorLifecycleCell, WalletHandle, WalletLiveMetadataFlush, WalletObservationPublisher,
     WalletPendingOverlay, WalletPendingSpent, WalletPersistState, WalletPoiRefreshSelection,
     WalletPoiRuntime, WalletPrivateApplyClient, WalletPrivateApplyRequest,
@@ -5228,7 +5230,7 @@ async fn delayed_remote_status_intent_does_not_overwrite_newer_local_status() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::PoiStatusRefresh {
+        OwnedPoiPrivateDelta::PoiStatusRefresh(PoiStatusRefreshDelta {
             active_list_keys: vec![list_key],
             expected_poi_by_blinded_commitment: BTreeMap::from([(
                 blinded_commitment,
@@ -5239,7 +5241,7 @@ async fn delayed_remote_status_intent_does_not_overwrite_newer_local_status() {
                 BTreeMap::from([(list_key, PoiStatus::Missing)]),
             )]),
             refreshed_at: 100,
-        },
+        }),
     )
     .await
     .expect("apply delayed remote status intent");
@@ -7006,22 +7008,24 @@ async fn owned_output_recovery_replays_source_rows_without_persisting_sender_sta
         .reset_public_cache()
         .await
         .expect("invalidate replay evidence");
-    let recovery_delta = |replay_fence| OwnedPoiPrivateDelta::OutputRecovery {
-        replay_fence,
-        expected_output: ExpectedWalletOutput::new(&change),
-        active_list_keys: active_lists.to_vec(),
-        target_list_keys: active_lists.to_vec(),
-        required_poi_status: ExpectedPoiStatus::Recoverable,
-        pending_update: Box::new(None),
-        expected_recovery: ExpectedRecordState::Absent,
-        action: OutputPoiRecoveryAction::Detected {
-            status: OutputPoiRecoveryStatus::Recoverable,
-            retry_after: None,
-            last_error: None,
-            increment_attempts: false,
-        },
-        now: 1,
-        expected_corpus: None,
+    let recovery_delta = |replay_fence| {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
+            replay_fence,
+            expected_output: ExpectedWalletOutput::new(&change),
+            active_list_keys: active_lists.to_vec(),
+            target_list_keys: active_lists.to_vec(),
+            required_poi_status: ExpectedPoiStatus::Recoverable,
+            pending_update: Box::new(None),
+            expected_recovery: ExpectedRecordState::Absent,
+            action: OutputPoiRecoveryAction::Detected {
+                status: OutputPoiRecoveryStatus::Recoverable,
+                retry_after: None,
+                last_error: None,
+                increment_attempts: false,
+            },
+            now: 1,
+            expected_corpus: None,
+        })
     };
     assert_eq!(
         apply_owned_poi_private_delta_on_actor(
@@ -8925,7 +8929,7 @@ async fn recovered_outgoing_group_final_apply_rechecks_every_predecessor() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::RecoveredOutgoingSubmission {
+        OwnedPoiPrivateDelta::RecoveredOutgoingSubmission(RecoveredOutgoingSubmissionDelta {
             external_valid_substitutes: Vec::new(),
             expected_corpus: None,
             siblings,
@@ -8937,7 +8941,7 @@ async fn recovered_outgoing_group_final_apply_rechecks_every_predecessor() {
                 retry_after: Duration::from_secs(30),
             },
             now: 12,
-        },
+        }),
     )
     .await
     .expect("reject stale grouped final apply");
@@ -12153,7 +12157,7 @@ async fn output_recovery_mixed_statuses_request_and_persist_only_recoverable_lis
             &store,
             &store,
             &cfg,
-            OwnedPoiPrivateDelta::OutputRecovery {
+            OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
                 replay_fence: None,
                 expected_output: ExpectedWalletOutput::new(&candidate),
                 active_list_keys: active_list_keys.to_vec(),
@@ -12169,7 +12173,7 @@ async fn output_recovery_mixed_statuses_request_and_persist_only_recoverable_lis
                 },
                 now: 10,
                 expected_corpus: None,
-            },
+            }),
         )
         .await
         .expect("persist mixed-status recovery intent");
@@ -12298,7 +12302,7 @@ async fn assert_valid_output_recovery_recovers_new_active_list(force_retry: bool
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             replay_fence: None,
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: active_list_keys.to_vec(),
@@ -12314,7 +12318,7 @@ async fn assert_valid_output_recovery_recovers_new_active_list(force_retry: bool
             },
             now: 10,
             expected_corpus: None,
-        },
+        }),
     )
     .await
     .expect("apply recovery for newly active list");
@@ -12471,8 +12475,8 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
     let expected_recovery =
         super::expected_recovery_state(Some(&recovery)).expect("recovery fingerprint");
     let cancel = CancellationToken::new();
-    let extension_delta =
-        |expected_corpus: Option<ExpectedPoiCorpusRevision>| OwnedPoiPrivateDelta::OutputRecovery {
+    let extension_delta = |expected_corpus: Option<ExpectedPoiCorpusRevision>| {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             replay_fence: None,
             expected_output: ExpectedWalletOutput::new(&current_output),
             active_list_keys: active_list_keys.to_vec(),
@@ -12486,7 +12490,8 @@ async fn output_recovery_extends_newly_missing_list_and_submits_only_it() {
             action: OutputPoiRecoveryAction::ExtendContext,
             now: 10,
             expected_corpus,
-        };
+        })
+    };
 
     let corpus_caches = WalletLocalPoiCaches::new();
     let corpus = PublicPoiCorpusHandle::new_for_test(corpus_caches.clone());
@@ -12697,7 +12702,7 @@ async fn output_recovery_extension_skips_concurrent_context_change() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             replay_fence: None,
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: vec![list_b],
@@ -12711,7 +12716,7 @@ async fn output_recovery_extension_skips_concurrent_context_change() {
             action: OutputPoiRecoveryAction::ExtendContext,
             now: 10,
             expected_corpus: None,
-        },
+        }),
     )
     .await
     .expect("apply stale recovery extension");
@@ -12815,7 +12820,7 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             replay_fence: None,
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: vec![list_key],
@@ -12834,7 +12839,7 @@ async fn force_regenerates_matching_terminal_context_for_same_list() {
             },
             now: 999,
             expected_corpus: None,
-        },
+        }),
     )
     .await
     .expect("apply forced terminal regeneration");
@@ -12933,7 +12938,7 @@ async fn force_terminal_regeneration_skips_concurrent_context_replacement() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             replay_fence: None,
             expected_output: ExpectedWalletOutput::new(&wallet_utxo),
             active_list_keys: vec![list_key],
@@ -12952,7 +12957,7 @@ async fn force_terminal_regeneration_skips_concurrent_context_replacement() {
             },
             now: 999,
             expected_corpus: None,
-        },
+        }),
     )
     .await
     .expect("apply stale forced terminal regeneration");
@@ -13121,7 +13126,7 @@ async fn recovery_actor_skips_when_output_becomes_valid_before_apply() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::OutputRecovery {
+        OwnedPoiPrivateDelta::OutputRecovery(OutputRecoveryDelta {
             replay_fence: None,
             expected_output,
             active_list_keys: vec![list_key],
@@ -13137,7 +13142,7 @@ async fn recovery_actor_skips_when_output_becomes_valid_before_apply() {
             },
             now: 10,
             expected_corpus: None,
-        },
+        }),
     )
     .await
     .expect("apply recovery intent");
@@ -13204,7 +13209,7 @@ async fn successful_submission_intent_survives_timestamp_only_poi_refresh() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::PendingSubmission {
+        OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output),
             expected_context_fingerprint,
             expected_recovery: ExpectedRecordState::Absent,
@@ -13216,7 +13221,7 @@ async fn successful_submission_intent_survives_timestamp_only_poi_refresh() {
                 retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
             },
             now: 10,
-        },
+        }),
     )
     .await
     .expect("apply successful submission intent");
@@ -13286,18 +13291,20 @@ async fn submission_workflow_projection_failure_aborts_before_commit_and_retry_c
         .expect("observation publisher")
         .publish_ppoi_workflow_status(workflow_before);
     let cancel = CancellationToken::new();
-    let submission_delta = || OwnedPoiPrivateDelta::PendingSubmission {
-        subject: PendingOutputPoiSubject::Owned(expected_output.clone()),
-        expected_context_fingerprint: expected_context_fingerprint.clone(),
-        expected_recovery: ExpectedRecordState::Absent,
-        active_list_keys: vec![list_key],
-        list_keys: vec![list_key],
-        predicate: PendingOutputPoiSubmissionPredicate::Missing,
-        merge_submitted_list_keys: true,
-        action: OutputPoiRecoveryAction::Submitted {
-            retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-        },
-        now: 10,
+    let submission_delta = || {
+        OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
+            subject: PendingOutputPoiSubject::Owned(expected_output.clone()),
+            expected_context_fingerprint: expected_context_fingerprint.clone(),
+            expected_recovery: ExpectedRecordState::Absent,
+            active_list_keys: vec![list_key],
+            list_keys: vec![list_key],
+            predicate: PendingOutputPoiSubmissionPredicate::Missing,
+            merge_submitted_list_keys: true,
+            action: OutputPoiRecoveryAction::Submitted {
+                retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+            },
+            now: 10,
+        })
     };
     cache_store.fail_pending_output_list_call(0);
     let commit_calls_before = cache_store.state().meta_calls;
@@ -13401,7 +13408,7 @@ async fn successful_submission_intent_preserves_newer_unrelated_list_status() {
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::PendingSubmission {
+        OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output),
             expected_context_fingerprint,
             expected_recovery: ExpectedRecordState::Absent,
@@ -13413,7 +13420,7 @@ async fn successful_submission_intent_preserves_newer_unrelated_list_status() {
                 retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
             },
             now: 10,
-        },
+        }),
     )
     .await
     .expect("apply successful submission intent");
@@ -13479,7 +13486,7 @@ async fn owned_status_refresh_validation_rejects_validity_downgrade_before_apply
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::VerifiedValid {
+        OwnedPoiPrivateDelta::VerifiedValid(VerifiedValidDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output),
             evidence: PendingOutputPoiValidationEvidence::OwnedStatusRefresh,
             expected_context_fingerprint,
@@ -13488,7 +13495,7 @@ async fn owned_status_refresh_validation_rejects_validity_downgrade_before_apply
             active_list_keys: vec![list_key],
             valid_list_keys: vec![list_key],
             now: 12,
-        },
+        }),
     )
     .await
     .expect("apply stale owned-status validation");
@@ -13557,7 +13564,7 @@ async fn stale_submission_behind_verified_valid_cannot_resurrect_or_downgrade() 
         super::expected_recovery_state(Some(&recovery)).expect("recovery fingerprint");
     let expected_output = ExpectedWalletOutput::new(&wallet_utxo);
     let expected_poi_list_state = ExpectedPoiListState::new(&wallet_utxo.utxo.poi, &[list_key]);
-    let stale_submission = OwnedPoiPrivateDelta::PendingSubmission {
+    let stale_submission = OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
         subject: PendingOutputPoiSubject::Owned(expected_output.clone()),
         expected_context_fingerprint: expected_context_fingerprint.clone(),
         expected_recovery,
@@ -13570,8 +13577,8 @@ async fn stale_submission_behind_verified_valid_cannot_resurrect_or_downgrade() 
             retry_after: Duration::from_secs(30),
         },
         now: 11,
-    };
-    let verified = OwnedPoiPrivateDelta::VerifiedValid {
+    });
+    let verified = OwnedPoiPrivateDelta::VerifiedValid(VerifiedValidDelta {
         subject: PendingOutputPoiSubject::Owned(expected_output),
         evidence: PendingOutputPoiValidationEvidence::SubmittedStatus,
         expected_context_fingerprint,
@@ -13581,7 +13588,7 @@ async fn stale_submission_behind_verified_valid_cannot_resurrect_or_downgrade() 
         active_list_keys: vec![list_key],
         valid_list_keys: vec![list_key],
         now: 12,
-    };
+    });
     let mut handle = test_wallet_handle(vec![wallet_utxo]);
     handle.cache_key = cfg.cache_key.clone();
     let cancel = CancellationToken::new();
@@ -13689,7 +13696,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::VerifiedValid {
+        OwnedPoiPrivateDelta::VerifiedValid(VerifiedValidDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output.clone()),
             evidence: PendingOutputPoiValidationEvidence::SubmittedStatus,
             expected_context_fingerprint: expected_context_fingerprint.clone(),
@@ -13698,7 +13705,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
             active_list_keys: vec![list_key],
             valid_list_keys: vec![list_key],
             now: 19,
-        },
+        }),
     )
     .await;
     assert!(matches!(
@@ -13722,7 +13729,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::VerifiedValid {
+        OwnedPoiPrivateDelta::VerifiedValid(VerifiedValidDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output.clone()),
             evidence: PendingOutputPoiValidationEvidence::SubmittedStatus,
             expected_context_fingerprint: expected_context_fingerprint.clone(),
@@ -13731,7 +13738,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
             active_list_keys: vec![list_key],
             valid_list_keys: vec![list_key],
             now: 20,
-        },
+        }),
     )
     .await
     .expect("apply stale-context verification");
@@ -13756,7 +13763,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::VerifiedValid {
+        OwnedPoiPrivateDelta::VerifiedValid(VerifiedValidDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output.clone()),
             evidence: PendingOutputPoiValidationEvidence::SubmittedStatus,
             expected_context_fingerprint: expected_context_fingerprint.clone(),
@@ -13765,7 +13772,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
             active_list_keys: vec![list_key],
             valid_list_keys: vec![list_key],
             now: 21,
-        },
+        }),
     )
     .await
     .expect("apply shield-blocked verification");
@@ -13791,7 +13798,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
         &store,
         &store,
         &cfg,
-        OwnedPoiPrivateDelta::VerifiedValid {
+        OwnedPoiPrivateDelta::VerifiedValid(VerifiedValidDelta {
             subject: PendingOutputPoiSubject::Owned(expected_output),
             evidence: PendingOutputPoiValidationEvidence::SubmittedStatus,
             expected_context_fingerprint,
@@ -13800,7 +13807,7 @@ async fn verified_valid_rejects_changed_context_or_shield_blocked_but_accepts_re
             active_list_keys: vec![list_key],
             valid_list_keys: vec![list_key],
             now: 22,
-        },
+        }),
     )
     .await
     .expect("apply recoverable-status verification");
@@ -14848,18 +14855,20 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
     handle.cache_key = cfg.cache_key.clone();
     let before = wallet_utxo_stable_identity(&input);
     let cancel = CancellationToken::new();
-    let delta = || OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-        expected_candidate: candidate.clone(),
-        public_data_fence: public_data_fence.clone(),
-        active_list_keys: vec![list_key],
-        pending_updates: vec![pending.clone()],
-        recovery_updates: vec![recovery.clone()],
-        owned_substitutes: Vec::new(),
-        proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
-        replacement_group: Vec::new(),
-        external_valid_substitutes: Vec::new(),
-        expected_corpus: current_poi_corpus_revision(),
-        unshield: None,
+    let delta = || {
+        OwnedPoiPrivateDelta::SenderCandidateMaterialization(SenderCandidateMaterializationDelta {
+            expected_candidate: candidate.clone(),
+            public_data_fence: public_data_fence.clone(),
+            active_list_keys: vec![list_key],
+            pending_updates: vec![pending.clone()],
+            recovery_updates: vec![recovery.clone()],
+            owned_substitutes: Vec::new(),
+            proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+            replacement_group: Vec::new(),
+            external_valid_substitutes: Vec::new(),
+            expected_corpus: current_poi_corpus_revision(),
+            unshield: None,
+        })
     };
 
     assert!(
@@ -14993,18 +15002,20 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
         candidate.source.block_timestamp + 1,
     )
     .await;
-    let row_delta = || OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-        expected_candidate: candidate.clone(),
-        public_data_fence: current_public_data_fence.clone(),
-        active_list_keys: vec![list_key],
-        pending_updates: vec![pending.clone()],
-        recovery_updates: vec![recovery.clone()],
-        owned_substitutes: Vec::new(),
-        proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
-        replacement_group: Vec::new(),
-        external_valid_substitutes: Vec::new(),
-        expected_corpus: current_poi_corpus_revision(),
-        unshield: None,
+    let row_delta = || {
+        OwnedPoiPrivateDelta::SenderCandidateMaterialization(SenderCandidateMaterializationDelta {
+            expected_candidate: candidate.clone(),
+            public_data_fence: current_public_data_fence.clone(),
+            active_list_keys: vec![list_key],
+            pending_updates: vec![pending.clone()],
+            recovery_updates: vec![recovery.clone()],
+            owned_substitutes: Vec::new(),
+            proof_outputs: sender_materialization_proof_outputs(std::slice::from_ref(&pending)),
+            replacement_group: Vec::new(),
+            external_valid_substitutes: Vec::new(),
+            expected_corpus: current_poi_corpus_revision(),
+            unshield: None,
+        })
     };
     assert_eq!(current_public_data_plane.current_epoch().value, 0);
     assert_eq!(
@@ -15032,7 +15043,7 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
     )
     .await;
     let final_delta = |expected_corpus: ExpectedPoiCorpusRevision| {
-        OwnedPoiPrivateDelta::SenderCandidateMaterialization {
+        OwnedPoiPrivateDelta::SenderCandidateMaterialization(SenderCandidateMaterializationDelta {
             expected_candidate: candidate.clone(),
             public_data_fence: final_public_data_fence.clone(),
             active_list_keys: vec![list_key],
@@ -15044,7 +15055,7 @@ async fn sender_materialization_atomically_installs_standard_records_without_bal
             external_valid_substitutes: Vec::new(),
             expected_corpus,
             unshield: None,
-        }
+        })
     };
     let corpus_caches = WalletLocalPoiCaches::new();
     let corpus = PublicPoiCorpusHandle::new_for_test(corpus_caches.clone());
@@ -15251,19 +15262,21 @@ async fn sender_materialization_consumes_exact_covered_and_mixed_candidates_with
                 store.as_ref(),
                 store.as_ref(),
                 &fixture.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                    expected_candidate: fixture.candidate.clone(),
-                    public_data_fence: fixture.fence.clone(),
-                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
-                    pending_updates: fixture.pending.clone(),
-                    recovery_updates: fixture.recoveries.clone(),
-                    owned_substitutes: Vec::new(),
-                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
-                    replacement_group: Vec::new(),
-                    external_valid_substitutes: Vec::new(),
-                    expected_corpus: current_poi_corpus_revision(),
-                    unshield: kept_unshield.clone(),
-                },
+                OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                    SenderCandidateMaterializationDelta {
+                        expected_candidate: fixture.candidate.clone(),
+                        public_data_fence: fixture.fence.clone(),
+                        active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                        pending_updates: fixture.pending.clone(),
+                        recovery_updates: fixture.recoveries.clone(),
+                        owned_substitutes: Vec::new(),
+                        proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                        replacement_group: Vec::new(),
+                        external_valid_substitutes: Vec::new(),
+                        expected_corpus: current_poi_corpus_revision(),
+                        unshield: kept_unshield.clone(),
+                    }
+                ),
             )
             .await
             .expect("consume covered candidate"),
@@ -15292,19 +15305,21 @@ async fn sender_materialization_consumes_exact_covered_and_mixed_candidates_with
                 store.as_ref(),
                 store.as_ref(),
                 &fixture.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                    expected_candidate: fixture.candidate.clone(),
-                    public_data_fence: fixture.fence.clone(),
-                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
-                    pending_updates: fixture.pending.clone(),
-                    recovery_updates: fixture.recoveries.clone(),
-                    owned_substitutes: Vec::new(),
-                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
-                    replacement_group: Vec::new(),
-                    external_valid_substitutes: Vec::new(),
-                    expected_corpus: current_poi_corpus_revision(),
-                    unshield: None,
-                },
+                OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                    SenderCandidateMaterializationDelta {
+                        expected_candidate: fixture.candidate.clone(),
+                        public_data_fence: fixture.fence.clone(),
+                        active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                        pending_updates: fixture.pending.clone(),
+                        recovery_updates: fixture.recoveries.clone(),
+                        owned_substitutes: Vec::new(),
+                        proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                        replacement_group: Vec::new(),
+                        external_valid_substitutes: Vec::new(),
+                        expected_corpus: current_poi_corpus_revision(),
+                        unshield: None,
+                    }
+                ),
             )
             .await
             .expect("replay consumed candidate"),
@@ -15428,19 +15443,21 @@ async fn sender_materialization_persists_only_external_output_and_requires_exact
             store.as_ref(),
             store.as_ref(),
             &fixture.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                expected_candidate: fixture.candidate.clone(),
-                public_data_fence: fixture.fence,
-                active_list_keys: external.required_poi_list_keys.clone(),
-                pending_updates: vec![external.clone()],
-                recovery_updates: vec![fixture.recoveries[0].clone()],
-                owned_substitutes: vec![expected_owned],
-                proof_outputs,
-                replacement_group: Vec::new(),
-                external_valid_substitutes: Vec::new(),
-                expected_corpus: current_poi_corpus_revision(),
-                unshield: None,
-            },
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                SenderCandidateMaterializationDelta {
+                    expected_candidate: fixture.candidate.clone(),
+                    public_data_fence: fixture.fence,
+                    active_list_keys: external.required_poi_list_keys.clone(),
+                    pending_updates: vec![external.clone()],
+                    recovery_updates: vec![fixture.recoveries[0].clone()],
+                    owned_substitutes: vec![expected_owned],
+                    proof_outputs,
+                    replacement_group: Vec::new(),
+                    external_valid_substitutes: Vec::new(),
+                    expected_corpus: current_poi_corpus_revision(),
+                    unshield: None,
+                },
+            ),
         )
         .await
         .expect("materialization apply result");
@@ -15569,19 +15586,21 @@ async fn sender_materialization_partial_or_conflicting_pair_retains_everything()
                 store.as_ref(),
                 store.as_ref(),
                 &fixture.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                    expected_candidate: fixture.candidate.clone(),
-                    public_data_fence: fixture.fence.clone(),
-                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
-                    pending_updates: fixture.pending.clone(),
-                    recovery_updates: fixture.recoveries.clone(),
-                    owned_substitutes: Vec::new(),
-                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
-                    replacement_group: Vec::new(),
-                    external_valid_substitutes: Vec::new(),
-                    expected_corpus: current_poi_corpus_revision(),
-                    unshield: None,
-                },
+                OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                    SenderCandidateMaterializationDelta {
+                        expected_candidate: fixture.candidate.clone(),
+                        public_data_fence: fixture.fence.clone(),
+                        active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                        pending_updates: fixture.pending.clone(),
+                        recovery_updates: fixture.recoveries.clone(),
+                        owned_substitutes: Vec::new(),
+                        proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                        replacement_group: Vec::new(),
+                        external_valid_substitutes: Vec::new(),
+                        expected_corpus: current_poi_corpus_revision(),
+                        unshield: None,
+                    }
+                ),
             )
             .await
             .expect("reject nonstandard predecessor"),
@@ -15652,19 +15671,21 @@ async fn sender_materialization_persistence_failure_retains_candidate_without_de
             store.as_ref(),
             &cache_store,
             &fixture.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                expected_candidate: fixture.candidate.clone(),
-                public_data_fence: fixture.fence,
-                active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
-                pending_updates: fixture.pending.clone(),
-                recovery_updates: fixture.recoveries,
-                owned_substitutes: Vec::new(),
-                proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
-                replacement_group: Vec::new(),
-                external_valid_substitutes: Vec::new(),
-                expected_corpus: current_poi_corpus_revision(),
-                unshield: None,
-            },
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                SenderCandidateMaterializationDelta {
+                    expected_candidate: fixture.candidate.clone(),
+                    public_data_fence: fixture.fence,
+                    active_list_keys: fixture.pending[0].required_poi_list_keys.clone(),
+                    pending_updates: fixture.pending.clone(),
+                    recovery_updates: fixture.recoveries,
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                    replacement_group: Vec::new(),
+                    external_valid_substitutes: Vec::new(),
+                    expected_corpus: current_poi_corpus_revision(),
+                    unshield: None,
+                }
+            ),
         )
         .await
         .is_err()
@@ -15786,19 +15807,21 @@ async fn mixed_replay_report_preserves_waiting_subject_after_another_group_is_re
             store.as_ref(),
             store.as_ref(),
             &fixture.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateMaterialization {
-                expected_candidate: fixture.candidate.clone(),
-                public_data_fence: fixture.fence.clone(),
-                active_list_keys: active_lists.to_vec(),
-                pending_updates: fixture.pending.clone(),
-                recovery_updates: fixture.recoveries.clone(),
-                owned_substitutes: Vec::new(),
-                proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
-                expected_corpus: current_poi_corpus_revision(),
-                replacement_group,
-                external_valid_substitutes: Vec::new(),
-                unshield: None,
-            },
+            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+                SenderCandidateMaterializationDelta {
+                    expected_candidate: fixture.candidate.clone(),
+                    public_data_fence: fixture.fence.clone(),
+                    active_list_keys: active_lists.to_vec(),
+                    pending_updates: fixture.pending.clone(),
+                    recovery_updates: fixture.recoveries.clone(),
+                    owned_substitutes: Vec::new(),
+                    proof_outputs: sender_materialization_proof_outputs(&fixture.pending),
+                    expected_corpus: current_poi_corpus_revision(),
+                    replacement_group,
+                    external_valid_substitutes: Vec::new(),
+                    unshield: None,
+                }
+            ),
         )
         .await
         .expect("durably replace only the qualified source group"),

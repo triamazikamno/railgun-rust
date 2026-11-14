@@ -99,9 +99,13 @@ use handle::{
     WalletPrivateRemoteAuthority, WalletPrivateRequest,
 };
 pub(crate) use handle::{
-    OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, WalletActorTokenAuthority,
-    WalletIndexedCatchUpLease, WalletPrivateApplyClient, WalletPrivateApplyRequest,
-    WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
+    LocallyValidPendingListsDelta, OutputRecoveryDelta, OwnedPoiPrivateDelta,
+    PendingContextTerminalDelta, PendingSubmissionDelta, PoiPrivateApplyOutcome,
+    PoiStatusRefreshDelta, RecoveredOutgoingSubmissionDelta, SenderCandidateLocallyValidDelta,
+    SenderCandidateMaterializationDelta, SenderCandidateReconstructionDelta,
+    SenderCandidateUnshieldUpdateDelta, SenderCandidateUnshieldValidatedDelta, VerifiedValidDelta,
+    WalletActorTokenAuthority, WalletIndexedCatchUpLease, WalletPrivateApplyClient,
+    WalletPrivateApplyRequest, WalletPrivateMutationAuthority, WalletPrivateMutationPermit,
 };
 use local_poi_cache::log_local_poi_cache_unavailable;
 use output_poi_recovery::{

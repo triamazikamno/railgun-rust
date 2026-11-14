@@ -1,10 +1,10 @@
 use super::{
     BTreeMap, BlindedCommitmentData, DbStore, EVM_CHAIN_TYPE, FixedBytes, Instant,
-    OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, PoiStatusReader, WALLET_POI_STATUS_BATCH_SIZE,
-    WalletBackfillRejectReason, WalletCacheStore, WalletConfig, WalletPoiRefreshSelection,
-    WalletPrivateMutationAuthority, WalletPrivatePoiClients, WalletPrivateRemoteError,
-    WalletPrivateRemoteStale, WalletUtxo, apply_poi_private_delta, blinded_commitment_type, debug,
-    now_epoch_secs, warn,
+    OwnedPoiPrivateDelta, PoiPrivateApplyOutcome, PoiStatusReader, PoiStatusRefreshDelta,
+    WALLET_POI_STATUS_BATCH_SIZE, WalletBackfillRejectReason, WalletCacheStore, WalletConfig,
+    WalletPoiRefreshSelection, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
+    WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo, apply_poi_private_delta,
+    blinded_commitment_type, debug, now_epoch_secs, warn,
 };
 use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 
@@ -230,12 +230,12 @@ pub(super) async fn refresh_wallet_poi_statuses_remote_authorized(
             db,
             cache_store,
             cfg,
-            OwnedPoiPrivateDelta::PoiStatusRefresh {
+            OwnedPoiPrivateDelta::PoiStatusRefresh(PoiStatusRefreshDelta {
                 active_list_keys: active_list_keys.to_vec(),
                 expected_poi_by_blinded_commitment,
                 statuses_by_blinded_commitment,
                 refreshed_at: now_epoch_secs(),
-            },
+            }),
         )
         .await,
         Ok(PoiPrivateApplyOutcome::Applied { utxo_changed: true })
