@@ -1164,384 +1164,401 @@ async fn recovered_outgoing_external_valid_evidence(
     (valid, Some(ExpectedPoiCorpusRevision { corpus, revision }))
 }
 
-async fn prepare_recovered_outgoing_submission_group(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    records: &[PendingOutputPoiContextRecord],
-    seed: &PendingOutputPoiContextRecord,
-    now: u64,
-    force_submission_retry: bool,
-) -> Result<Option<RecoveredOutgoingSubmissionGroup>, WalletCacheError> {
-    let Some(group_records) = recovered_outgoing_group_records(records, seed) else {
-        return Ok(None);
-    };
-    let Some(canonical) = group_records
-        .iter()
-        .min_by_key(|record| record.output_commitment)
-    else {
-        return Ok(None);
-    };
-    if canonical.output_commitment != seed.output_commitment {
-        return Ok(None);
-    }
-    let snapshot = authority
-        .wallet_utxos()
-        .await
-        .map_err(|_| WalletCacheError::Crypto)?;
-    let (external_valid, expected_corpus) =
-        recovered_outgoing_external_valid_evidence(public_data_plane, cfg, seed, active_list_keys)
-            .await;
-    let mut members = Vec::with_capacity(group_records.len());
-    for record in &group_records {
-        if record.observation.is_none() {
-            return Ok(None);
-        }
-        if record.terminal_error.is_some() {
-            return Ok(None);
-        }
-        let Some(identity) = record
-            .observation
-            .as_ref()
-            .and_then(|observation| pending_output_poi_submit_identity(record, observation))
-        else {
-            return Ok(None);
-        };
-        if record.required_poi_list_keys
-            != super::saved_poi_compatibility::unresolved_output_lists(
-                active_list_keys,
-                identity.derived_blinded_commitment,
-                &external_valid,
-            )
-        {
-            return Ok(None);
-        }
-        let Some(recovery) = cache_store.get_output_poi_recovery(
-            cfg.chain.chain_id,
-            &cfg.cache_key,
-            &record.output_commitment,
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(expected_recovery) = expected_recovery_state(Some(&recovery)) else {
-            return Ok(None);
-        };
-        let Some((subject, current_output)) =
-            current_pending_output_poi_subject(authority, cfg, record).await
-        else {
-            return Ok(None);
-        };
-        if !matches!(&subject, PendingOutputPoiSubject::External { .. }) || current_output.is_some()
-        {
-            return Ok(None);
-        }
-        let mut plan =
-            PendingOutputPoiSubmissionPlan::missing(record.missing_list_keys(), expected_recovery);
-        plan.retain_current_recoverable(
-            record,
+impl PendingOutputPoiSubmissionPass<'_> {
+    async fn prepare_recovered_outgoing_submission_group(
+        &self,
+        seed: &PendingOutputPoiContextRecord,
+        force_submission_retry: bool,
+    ) -> Result<Option<RecoveredOutgoingSubmissionGroup>, WalletCacheError> {
+        let Self {
+            authority,
+            public_data_plane,
+            cache_store,
+            cfg,
             active_list_keys,
-            current_output.as_ref().map(|output| &output.utxo.poi),
-        );
-        if plan.list_keys.is_empty()
-            && recovery.submission_retry_allowed(now, force_submission_retry)
-        {
-            plan = PendingOutputPoiSubmissionPlan::retry_submitted(
-                record.list_keys(),
-                plan.expected_recovery.clone(),
-                force_submission_retry,
+            records,
+            now,
+            ..
+        } = *self;
+        let Some(group_records) = recovered_outgoing_group_records(records, seed) else {
+            return Ok(None);
+        };
+        let Some(canonical) = group_records
+            .iter()
+            .min_by_key(|record| record.output_commitment)
+        else {
+            return Ok(None);
+        };
+        if canonical.output_commitment != seed.output_commitment {
+            return Ok(None);
+        }
+        let snapshot = authority
+            .wallet_utxos()
+            .await
+            .map_err(|_| WalletCacheError::Crypto)?;
+        let (external_valid, expected_corpus) = recovered_outgoing_external_valid_evidence(
+            public_data_plane,
+            cfg,
+            seed,
+            active_list_keys,
+        )
+        .await;
+        let mut members = Vec::with_capacity(group_records.len());
+        for record in &group_records {
+            if record.observation.is_none() {
+                return Ok(None);
+            }
+            if record.terminal_error.is_some() {
+                return Ok(None);
+            }
+            let Some(identity) = record
+                .observation
+                .as_ref()
+                .and_then(|observation| pending_output_poi_submit_identity(record, observation))
+            else {
+                return Ok(None);
+            };
+            if record.required_poi_list_keys
+                != super::saved_poi_compatibility::unresolved_output_lists(
+                    active_list_keys,
+                    identity.derived_blinded_commitment,
+                    &external_valid,
+                )
+            {
+                return Ok(None);
+            }
+            let Some(recovery) = cache_store.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &record.output_commitment,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(expected_recovery) = expected_recovery_state(Some(&recovery)) else {
+                return Ok(None);
+            };
+            let Some((subject, current_output)) =
+                current_pending_output_poi_subject(authority, cfg, record).await
+            else {
+                return Ok(None);
+            };
+            if !matches!(&subject, PendingOutputPoiSubject::External { .. })
+                || current_output.is_some()
+            {
+                return Ok(None);
+            }
+            let mut plan = PendingOutputPoiSubmissionPlan::missing(
+                record.missing_list_keys(),
+                expected_recovery,
             );
             plan.retain_current_recoverable(
                 record,
                 active_list_keys,
                 current_output.as_ref().map(|output| &output.utxo.poi),
             );
+            if plan.list_keys.is_empty()
+                && recovery.submission_retry_allowed(now, force_submission_retry)
+            {
+                plan = PendingOutputPoiSubmissionPlan::retry_submitted(
+                    record.list_keys(),
+                    plan.expected_recovery.clone(),
+                    force_submission_retry,
+                );
+                plan.retain_current_recoverable(
+                    record,
+                    active_list_keys,
+                    current_output.as_ref().map(|output| &output.utxo.poi),
+                );
+            }
+            let Some(expected_context_fingerprint) = pending_output_poi_context_fingerprint(record)
+            else {
+                return Ok(None);
+            };
+            members.push(RecoveredOutgoingSubmissionMember {
+                record: (*record).clone(),
+                subject,
+                plan,
+                expected_context_fingerprint,
+            });
         }
-        let Some(expected_context_fingerprint) = pending_output_poi_context_fingerprint(record)
-        else {
-            return Ok(None);
-        };
-        members.push(RecoveredOutgoingSubmissionMember {
-            record: (*record).clone(),
-            subject,
-            plan,
-            expected_context_fingerprint,
-        });
-    }
-    let list_keys = members
-        .iter()
-        .flat_map(|member| member.plan.list_keys().iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if list_keys.is_empty()
-        || expected_corpus.is_none()
-        || members.iter().any(|member| {
-            !saved_pending_context_matches_public_transaction(
-                public_data_plane,
-                cfg,
-                &member.record,
-                &member.record.list_keys(),
-            )
-        })
-    {
-        return Ok(None);
-    }
-    let Some(evidence) =
-        recovered_outgoing_group_evidence(&group_records, &snapshot, &list_keys, &external_valid)
-    else {
-        return Ok(None);
-    };
-    Ok(Some(RecoveredOutgoingSubmissionGroup {
-        members,
-        owned_substitutes: evidence
-            .owned_outputs
-            .into_iter()
-            .map(ExpectedWalletOutput::new)
-            .collect(),
-        expected_corpus,
-        external_valid_substitutes: evidence.external_valid_substitutes,
-        proofs: evidence.proofs,
-    }))
-}
-
-async fn recovered_outgoing_submission_group_current(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    group: &RecoveredOutgoingSubmissionGroup,
-) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
-    if authority.revalidate().is_err() {
-        return Ok(PendingOutputPoiPreflight::AuthorityStale);
-    }
-    let Some(seed) = group.members.first() else {
-        return Ok(PendingOutputPoiPreflight::NotCurrent);
-    };
-    let current_records =
-        cache_store.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)?;
-    let Some(current_group) = recovered_outgoing_group_records(&current_records, &seed.record)
-    else {
-        return Ok(PendingOutputPoiPreflight::NotCurrent);
-    };
-    let expected_fingerprints = group
-        .members
-        .iter()
-        .map(|member| member.expected_context_fingerprint.clone())
-        .collect::<BTreeSet<_>>();
-    let current_fingerprints = current_group
-        .iter()
-        .filter_map(|record| pending_output_poi_context_fingerprint(record))
-        .collect::<BTreeSet<_>>();
-    let snapshot = authority
-        .wallet_utxos()
-        .await
-        .map_err(|_| WalletCacheError::Crypto)?;
-    let list_keys = group
-        .proofs
-        .iter()
-        .map(|(list_key, _)| *list_key)
-        .collect::<Vec<_>>();
-    let external_valid = if let Some(expected) = &group.expected_corpus {
-        let outputs = group
-            .proofs
+        let list_keys = members
             .iter()
-            .flat_map(|(_, poi)| poi.blinded_commitments_out.iter().copied())
+            .flat_map(|member| member.plan.list_keys().iter().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let Some(valid) = super::saved_poi_compatibility::corpus_valid_outputs_by_list(
-            &expected.corpus,
-            cfg.chain.chain_id,
-            active_list_keys,
-            &outputs,
-        )
-        .await
-        else {
-            return Ok(PendingOutputPoiPreflight::NotCurrent);
-        };
-        valid
-    } else {
-        BTreeMap::new()
-    };
-    let current_evidence =
-        recovered_outgoing_group_evidence(&current_group, &snapshot, &list_keys, &external_valid);
-    if current_group.len() != group.members.len()
-        || current_fingerprints.len() != current_group.len()
-        || current_fingerprints != expected_fingerprints
-        || current_evidence.as_ref().is_none_or(|evidence| {
-            !recovered_outgoing_owned_substitutes_match(
-                &group.owned_substitutes,
-                &evidence.owned_outputs,
-            )
-        })
-    {
-        return Ok(PendingOutputPoiPreflight::NotCurrent);
-    }
-    for member in &group.members {
-        let Some(identity) = member.record.observation.as_ref().and_then(|observation| {
-            pending_output_poi_submit_identity(&member.record, observation)
-        }) else {
-            return Ok(PendingOutputPoiPreflight::NotCurrent);
-        };
-        if member.record.required_poi_list_keys
-            != super::saved_poi_compatibility::unresolved_output_lists(
-                active_list_keys,
-                identity.derived_blinded_commitment,
-                &external_valid,
-            )
-        {
-            return Ok(PendingOutputPoiPreflight::NotCurrent);
-        }
-        if member.plan.list_keys.is_empty() {
-            let recovery = cache_store.get_output_poi_recovery(
-                cfg.chain.chain_id,
-                &cfg.cache_key,
-                &member.record.output_commitment,
-            )?;
-            if !expected_recovery_matches(&member.plan.expected_recovery, recovery.as_ref())
-                || !recoverable_pending_submission_list_keys(
+        if list_keys.is_empty()
+            || expected_corpus.is_none()
+            || members.iter().any(|member| {
+                !saved_pending_context_matches_public_transaction(
+                    public_data_plane,
+                    cfg,
                     &member.record,
-                    active_list_keys,
-                    None,
-                    member.plan.predicate(),
+                    &member.record.list_keys(),
                 )
-                .is_empty()
-            {
-                return Ok(PendingOutputPoiPreflight::NotCurrent);
-            }
-            continue;
+            })
+        {
+            return Ok(None);
         }
-        match pending_output_poi_submission_plan_current(
+        let Some(evidence) = recovered_outgoing_group_evidence(
+            &group_records,
+            &snapshot,
+            &list_keys,
+            &external_valid,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(RecoveredOutgoingSubmissionGroup {
+            members,
+            owned_substitutes: evidence
+                .owned_outputs
+                .into_iter()
+                .map(ExpectedWalletOutput::new)
+                .collect(),
+            expected_corpus,
+            external_valid_substitutes: evidence.external_valid_substitutes,
+            proofs: evidence.proofs,
+        }))
+    }
+
+    async fn recovered_outgoing_submission_group_current(
+        &self,
+        group: &RecoveredOutgoingSubmissionGroup,
+    ) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
+        let Self {
             authority,
             public_data_plane,
             cache_store,
             cfg,
             active_list_keys,
-            &member.record,
-            &member.subject,
-            &member.plan,
-        )
-        .await?
-        {
-            PendingOutputPoiPreflight::Ready => {}
-            not_ready => return Ok(not_ready),
+            ..
+        } = *self;
+        if authority.revalidate().is_err() {
+            return Ok(PendingOutputPoiPreflight::AuthorityStale);
         }
-    }
-    // Acquire the corpus fence only after the wallet actor awaits above. A corpus writer
-    // may need that actor, so holding its read guard across an actor request can deadlock.
-    let Ok(_corpus_fence) = hold_expected_poi_corpus_revision(group.expected_corpus.as_ref()).await
-    else {
-        return Ok(PendingOutputPoiPreflight::NotCurrent);
-    };
-    let final_records =
-        cache_store.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)?;
-    let Some(final_group) = recovered_outgoing_group_records(&final_records, &seed.record) else {
-        return Ok(PendingOutputPoiPreflight::NotCurrent);
-    };
-    let final_fingerprints = final_group
-        .iter()
-        .filter_map(|record| pending_output_poi_context_fingerprint(record))
-        .collect::<BTreeSet<_>>();
-    if authority.revalidate().is_err()
-        || final_group.len() != group.members.len()
-        || final_fingerprints != expected_fingerprints
-    {
-        return Ok(PendingOutputPoiPreflight::NotCurrent);
-    }
-    for member in &group.members {
-        let recovery = cache_store.get_output_poi_recovery(
-            cfg.chain.chain_id,
-            &cfg.cache_key,
-            &member.record.output_commitment,
-        )?;
-        if !expected_recovery_matches(&member.plan.expected_recovery, recovery.as_ref()) {
+        let Some(seed) = group.members.first() else {
+            return Ok(PendingOutputPoiPreflight::NotCurrent);
+        };
+        let current_records =
+            cache_store.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)?;
+        let Some(current_group) = recovered_outgoing_group_records(&current_records, &seed.record)
+        else {
+            return Ok(PendingOutputPoiPreflight::NotCurrent);
+        };
+        let expected_fingerprints = group
+            .members
+            .iter()
+            .map(|member| member.expected_context_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let current_fingerprints = current_group
+            .iter()
+            .filter_map(|record| pending_output_poi_context_fingerprint(record))
+            .collect::<BTreeSet<_>>();
+        let snapshot = authority
+            .wallet_utxos()
+            .await
+            .map_err(|_| WalletCacheError::Crypto)?;
+        let list_keys = group
+            .proofs
+            .iter()
+            .map(|(list_key, _)| *list_key)
+            .collect::<Vec<_>>();
+        let external_valid = if let Some(expected) = &group.expected_corpus {
+            let outputs = group
+                .proofs
+                .iter()
+                .flat_map(|(_, poi)| poi.blinded_commitments_out.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let Some(valid) = super::saved_poi_compatibility::corpus_valid_outputs_by_list(
+                &expected.corpus,
+                cfg.chain.chain_id,
+                active_list_keys,
+                &outputs,
+            )
+            .await
+            else {
+                return Ok(PendingOutputPoiPreflight::NotCurrent);
+            };
+            valid
+        } else {
+            BTreeMap::new()
+        };
+        let current_evidence = recovered_outgoing_group_evidence(
+            &current_group,
+            &snapshot,
+            &list_keys,
+            &external_valid,
+        );
+        if current_group.len() != group.members.len()
+            || current_fingerprints.len() != current_group.len()
+            || current_fingerprints != expected_fingerprints
+            || current_evidence.as_ref().is_none_or(|evidence| {
+                !recovered_outgoing_owned_substitutes_match(
+                    &group.owned_substitutes,
+                    &evidence.owned_outputs,
+                )
+            })
+        {
             return Ok(PendingOutputPoiPreflight::NotCurrent);
         }
-    }
-    Ok(PendingOutputPoiPreflight::Ready)
-}
-
-async fn submit_recovered_outgoing_submission_group(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    group: &RecoveredOutgoingSubmissionGroup,
-    private_poi: &WalletPrivatePoiClients,
-    route: &mut Option<TransactProofRoute>,
-) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
-    let Some(leader) = group.members.first() else {
-        return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
-    };
-    let Some(txid_merkleroot_index) = leader.record.txid_merkleroot_index else {
-        return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
-    };
-    let forced = group
-        .members
-        .iter()
-        .filter_map(|member| member.plan.deferred_force_kind())
-        .max();
-    let Some(route) = transact_proof_route(
-        private_poi,
-        route,
-        cfg.chain.chain_id,
-        &leader.record,
-        forced,
-    )
-    .await
-    else {
-        return Ok(PendingOutputPoiRemoteAttempt::Deferred);
-    };
-    for (list_key, poi) in &group.proofs {
-        let result = private_poi
-            .submit_transact_proof(
-                route,
-                || async {
-                    Ok(matches!(
-                        recovered_outgoing_submission_group_current(
-                            authority,
-                            public_data_plane,
-                            cache_store,
-                            cfg,
-                            active_list_keys,
-                            group,
-                        )
-                        .await?,
-                        PendingOutputPoiPreflight::Ready
-                    ))
-                },
-                &leader.record.txid_version,
-                EVM_CHAIN_TYPE,
-                cfg.chain.chain_id,
-                list_key,
-                txid_merkleroot_index,
-                poi,
+        for member in &group.members {
+            let Some(identity) = member.record.observation.as_ref().and_then(|observation| {
+                pending_output_poi_submit_identity(&member.record, observation)
+            }) else {
+                return Ok(PendingOutputPoiPreflight::NotCurrent);
+            };
+            if member.record.required_poi_list_keys
+                != super::saved_poi_compatibility::unresolved_output_lists(
+                    active_list_keys,
+                    identity.derived_blinded_commitment,
+                    &external_valid,
+                )
+            {
+                return Ok(PendingOutputPoiPreflight::NotCurrent);
+            }
+            if member.plan.list_keys.is_empty() {
+                let recovery = cache_store.get_output_poi_recovery(
+                    cfg.chain.chain_id,
+                    &cfg.cache_key,
+                    &member.record.output_commitment,
+                )?;
+                if !expected_recovery_matches(&member.plan.expected_recovery, recovery.as_ref())
+                    || !recoverable_pending_submission_list_keys(
+                        &member.record,
+                        active_list_keys,
+                        None,
+                        member.plan.predicate(),
+                    )
+                    .is_empty()
+                {
+                    return Ok(PendingOutputPoiPreflight::NotCurrent);
+                }
+                continue;
+            }
+            match pending_output_poi_submission_plan_current(
+                authority,
+                public_data_plane,
+                cache_store,
+                cfg,
+                active_list_keys,
+                &member.record,
+                &member.subject,
+                &member.plan,
             )
-            .await;
-        match result {
-            Ok(()) => {}
-            Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Authority)) => {
-                return Ok(PendingOutputPoiRemoteAttempt::AuthorityStale);
-            }
-            Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Subject)) => {
-                return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
-            }
-            Err(WalletPrivateRemoteError::Check(error)) => return Err(error),
-            Err(WalletPrivateRemoteError::Remote(error)) => {
-                return Ok(PendingOutputPoiRemoteAttempt::Failed {
-                    error: error.to_string(),
-                });
+            .await?
+            {
+                PendingOutputPoiPreflight::Ready => {}
+                not_ready => return Ok(not_ready),
             }
         }
+        // Acquire the corpus fence only after the wallet actor awaits above. A corpus writer
+        // may need that actor, so holding its read guard across an actor request can deadlock.
+        let Ok(_corpus_fence) =
+            hold_expected_poi_corpus_revision(group.expected_corpus.as_ref()).await
+        else {
+            return Ok(PendingOutputPoiPreflight::NotCurrent);
+        };
+        let final_records =
+            cache_store.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)?;
+        let Some(final_group) = recovered_outgoing_group_records(&final_records, &seed.record)
+        else {
+            return Ok(PendingOutputPoiPreflight::NotCurrent);
+        };
+        let final_fingerprints = final_group
+            .iter()
+            .filter_map(|record| pending_output_poi_context_fingerprint(record))
+            .collect::<BTreeSet<_>>();
+        if authority.revalidate().is_err()
+            || final_group.len() != group.members.len()
+            || final_fingerprints != expected_fingerprints
+        {
+            return Ok(PendingOutputPoiPreflight::NotCurrent);
+        }
+        for member in &group.members {
+            let recovery = cache_store.get_output_poi_recovery(
+                cfg.chain.chain_id,
+                &cfg.cache_key,
+                &member.record.output_commitment,
+            )?;
+            if !expected_recovery_matches(&member.plan.expected_recovery, recovery.as_ref()) {
+                return Ok(PendingOutputPoiPreflight::NotCurrent);
+            }
+        }
+        Ok(PendingOutputPoiPreflight::Ready)
     }
-    Ok(PendingOutputPoiRemoteAttempt::Succeeded {
-        submitted_list_keys: group.proofs.iter().map(|(list_key, _)| *list_key).collect(),
-    })
+
+    async fn submit_recovered_outgoing_submission_group(
+        &self,
+        group: &RecoveredOutgoingSubmissionGroup,
+        route: &mut Option<TransactProofRoute>,
+    ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
+        let Self {
+            cfg, private_poi, ..
+        } = *self;
+        let Some(leader) = group.members.first() else {
+            return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
+        };
+        let Some(txid_merkleroot_index) = leader.record.txid_merkleroot_index else {
+            return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
+        };
+        let forced = group
+            .members
+            .iter()
+            .filter_map(|member| member.plan.deferred_force_kind())
+            .max();
+        let Some(route) = transact_proof_route(
+            private_poi,
+            route,
+            cfg.chain.chain_id,
+            &leader.record,
+            forced,
+        )
+        .await
+        else {
+            return Ok(PendingOutputPoiRemoteAttempt::Deferred);
+        };
+        for (list_key, poi) in &group.proofs {
+            let result = private_poi
+                .submit_transact_proof(
+                    route,
+                    || async {
+                        Ok(matches!(
+                            self.recovered_outgoing_submission_group_current(group)
+                                .await?,
+                            PendingOutputPoiPreflight::Ready
+                        ))
+                    },
+                    &leader.record.txid_version,
+                    EVM_CHAIN_TYPE,
+                    cfg.chain.chain_id,
+                    list_key,
+                    txid_merkleroot_index,
+                    poi,
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Authority)) => {
+                    return Ok(PendingOutputPoiRemoteAttempt::AuthorityStale);
+                }
+                Err(WalletPrivateRemoteError::Stale(WalletPrivateRemoteStale::Subject)) => {
+                    return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
+                }
+                Err(WalletPrivateRemoteError::Check(error)) => return Err(error),
+                Err(WalletPrivateRemoteError::Remote(error)) => {
+                    return Ok(PendingOutputPoiRemoteAttempt::Failed {
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(PendingOutputPoiRemoteAttempt::Succeeded {
+            submitted_list_keys: group.proofs.iter().map(|(list_key, _)| *list_key).collect(),
+        })
+    }
 }
 
 fn recoverable_pending_submission_list_keys(
@@ -1654,32 +1671,15 @@ impl PendingOutputPoiSubmissionPass<'_> {
     ) -> Result<ControlFlow<()>, WalletCacheError> {
         let force_submission_retry = self.force_retry(record);
         let chain_id = self.cfg.chain.chain_id;
-        let Some(group) = prepare_recovered_outgoing_submission_group(
-            self.authority,
-            self.public_data_plane,
-            self.cache_store,
-            self.cfg,
-            self.active_list_keys,
-            self.records,
-            record,
-            self.now,
-            force_submission_retry,
-        )
-        .await?
+        let Some(group) = self
+            .prepare_recovered_outgoing_submission_group(record, force_submission_retry)
+            .await?
         else {
             return Ok(ControlFlow::Continue(()));
         };
-        let remote_attempt = submit_recovered_outgoing_submission_group(
-            self.authority,
-            self.public_data_plane,
-            self.cache_store,
-            self.cfg,
-            self.active_list_keys,
-            &group,
-            self.private_poi,
-            &mut state.route,
-        )
-        .await?;
+        let remote_attempt = self
+            .submit_recovered_outgoing_submission_group(&group, &mut state.route)
+            .await?;
         debug!(
             chain_id,
             force_submission_retry,
@@ -1723,15 +1723,8 @@ impl PendingOutputPoiSubmissionPass<'_> {
                 ),
             };
         if !matches!(
-            recovered_outgoing_submission_group_current(
-                self.authority,
-                self.public_data_plane,
-                self.cache_store,
-                self.cfg,
-                self.active_list_keys,
-                &group,
-            )
-            .await?,
+            self.recovered_outgoing_submission_group_current(&group)
+                .await?,
             PendingOutputPoiPreflight::Ready
         ) {
             return Ok(ControlFlow::Continue(()));
@@ -1887,17 +1880,9 @@ impl PendingOutputPoiSubmissionPass<'_> {
             PendingOutputPoiRemoteAttempt::Succeeded {
                 submitted_list_keys,
             } => {
-                if !pending_output_poi_submission_side_effect_current(
-                    self.authority,
-                    self.public_data_plane,
-                    self.cache_store,
-                    record,
-                    self.cfg,
-                    self.active_list_keys,
-                    &subject,
-                    &plan,
-                )
-                .await?
+                if !self
+                    .pending_output_poi_submission_side_effect_current(record, &subject, &plan)
+                    .await?
                 {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -1936,17 +1921,9 @@ impl PendingOutputPoiSubmissionPass<'_> {
                 }
             }
             PendingOutputPoiRemoteAttempt::Failed { error } => {
-                if !pending_output_poi_submission_side_effect_current(
-                    self.authority,
-                    self.public_data_plane,
-                    self.cache_store,
-                    record,
-                    self.cfg,
-                    self.active_list_keys,
-                    &subject,
-                    &plan,
-                )
-                .await?
+                if !self
+                    .pending_output_poi_submission_side_effect_current(record, &subject, &plan)
+                    .await?
                 {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -2790,30 +2767,36 @@ pub(super) async fn pending_output_poi_submission_plan_current(
     Ok(PendingOutputPoiPreflight::Ready)
 }
 
-async fn pending_output_poi_submission_side_effect_current(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cache_store: &dyn WalletCacheStore,
-    expected: &PendingOutputPoiContextRecord,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    subject: &PendingOutputPoiSubject,
-    plan: &PendingOutputPoiSubmissionPlan,
-) -> Result<bool, WalletCacheError> {
-    Ok(matches!(
-        pending_output_poi_submission_plan_current(
+impl PendingOutputPoiSubmissionPass<'_> {
+    async fn pending_output_poi_submission_side_effect_current(
+        &self,
+        expected: &PendingOutputPoiContextRecord,
+        subject: &PendingOutputPoiSubject,
+        plan: &PendingOutputPoiSubmissionPlan,
+    ) -> Result<bool, WalletCacheError> {
+        let Self {
             authority,
             public_data_plane,
             cache_store,
             cfg,
             active_list_keys,
-            expected,
-            subject,
-            plan,
-        )
-        .await?,
-        PendingOutputPoiPreflight::Ready
-    ))
+            ..
+        } = *self;
+        Ok(matches!(
+            pending_output_poi_submission_plan_current(
+                authority,
+                public_data_plane,
+                cache_store,
+                cfg,
+                active_list_keys,
+                expected,
+                subject,
+                plan,
+            )
+            .await?,
+            PendingOutputPoiPreflight::Ready
+        ))
+    }
 }
 
 /// Sole production choke point for remote pending-output POI submission:
