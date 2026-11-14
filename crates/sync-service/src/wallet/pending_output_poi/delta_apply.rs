@@ -5,10 +5,11 @@ use crate::SenderTransactionCandidateUnshield;
 use crate::types::WalletBackfillRejectReason;
 
 use super::{
-    BTreeMap, BlindedCommitmentData, DbStore, ExpectedPoiStatus, FixedBytes,
-    LocallyValidPendingListsDelta, OutputPoiRecoveryAction, OutputPoiRecoveryStatus,
-    OutputRecoveryDelta, OwnedPoiPrivateDelta, PendingContextTerminalDelta, PendingOutputPoiRole,
-    PendingOutputPoiSubject, PendingOutputPoiSubjectMatch, PendingOutputPoiSubmissionKind,
+    BTreeMap, BlindedCommitmentData, DbStore, ExpectedPoiStatus, ExpectedRecordState, FixedBytes,
+    LocallyValidPendingListsDelta, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
+    OutputPoiRecoveryStatus, OutputRecoveryDelta, OwnedPoiPrivateDelta,
+    PendingContextTerminalDelta, PendingOutputPoiRole, PendingOutputPoiSubject,
+    PendingOutputPoiSubjectMatch, PendingOutputPoiSubmissionKind,
     PendingOutputPoiValidationEvidence, PendingSubmissionDelta, PoiPrivateApplyOutcome, PoiStatus,
     PoiStatusRefreshDelta, RecoveredOutgoingSubmissionDelta, SenderCandidateLocallyValidDelta,
     SenderCandidateMaterializationDelta, SenderCandidateReconstructionDelta,
@@ -127,6 +128,24 @@ fn active_apply_outcome(
     result.map_or(Ok(PoiPrivateApplyOutcome::Skipped), |committed| {
         committed.map(|()| PoiPrivateApplyOutcome::Applied { utxo_changed })
     })
+}
+
+/// Whether `list_keys` is a non-empty subset of the active lists.
+fn lists_are_active(active_list_keys: &[FixedBytes<32>], list_keys: &[FixedBytes<32>]) -> bool {
+    !list_keys.is_empty()
+        && list_keys
+            .iter()
+            .all(|list_key| active_list_keys.contains(list_key))
+}
+
+/// Whether the stored recovery is the expected one and, when present, came from `source_tx_hash`.
+fn recovery_matches_source(
+    expected: &ExpectedRecordState,
+    current: Option<&OutputPoiRecoveryRecord>,
+    source_tx_hash: FixedBytes<32>,
+) -> bool {
+    expected_recovery_matches(expected, current)
+        && current.is_none_or(|recovery| recovery.source_tx_hash == source_tx_hash)
 }
 
 /// Wallet state one exclusive apply holds while it folds a delta.
@@ -884,11 +903,7 @@ async fn apply_output_recovery(
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    if active_list_keys.is_empty()
-        || target_list_keys.is_empty()
-        || target_list_keys
-            .iter()
-            .any(|list_key| !active_list_keys.contains(list_key))
+    if !lists_are_active(&active_list_keys, &target_list_keys)
         || !expected_poi_status_matches(
             &wallet_utxo.utxo.poi,
             &target_list_keys,
@@ -924,15 +939,15 @@ async fn apply_output_recovery(
         .as_ref()
         .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
         && required_poi_status == ExpectedPoiStatus::Recoverable;
-    if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
-        || current_recovery
-            .as_ref()
-            .is_some_and(|record| record.source_tx_hash != wallet_utxo.utxo.source.tx_hash)
-        || (current_recovery
-            .as_ref()
-            .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
-            && !valid_recovery_is_stale_for_subset
-            && !matches!(&action, OutputPoiRecoveryAction::Valid))
+    if !recovery_matches_source(
+        &expected_recovery,
+        current_recovery.as_ref(),
+        wallet_utxo.utxo.source.tx_hash,
+    ) || (current_recovery
+        .as_ref()
+        .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
+        && !valid_recovery_is_stale_for_subset
+        && !matches!(&action, OutputPoiRecoveryAction::Valid))
     {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -1000,12 +1015,7 @@ fn apply_pending_submission(
         action,
         now,
     } = delta;
-    if active_list_keys.is_empty()
-        || list_keys.is_empty()
-        || list_keys
-            .iter()
-            .any(|list_key| !active_list_keys.contains(list_key))
-    {
+    if !lists_are_active(&active_list_keys, &list_keys) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -1044,21 +1054,17 @@ fn apply_pending_submission(
         &cfg.cache_key,
         &subject.output_commitment(),
     )?;
-    if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
-        || current_recovery
-            .as_ref()
-            .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
-    {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
     let Some(observation) = current_context.observation.clone() else {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    if current_recovery
+    if !recovery_matches_source(
+        &expected_recovery,
+        current_recovery.as_ref(),
+        observation.tx_hash,
+    ) || current_recovery
         .as_ref()
-        .is_some_and(|record| record.source_tx_hash != observation.tx_hash)
+        .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
     {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -1144,13 +1150,7 @@ async fn apply_recovered_outgoing_submission(
         action,
         now,
     } = delta;
-    if siblings.is_empty()
-        || active_list_keys.is_empty()
-        || list_keys.is_empty()
-        || list_keys
-            .iter()
-            .any(|list_key| !active_list_keys.contains(list_key))
-    {
+    if siblings.is_empty() || !lists_are_active(&active_list_keys, &list_keys) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -1385,12 +1385,7 @@ fn apply_pending_context_terminal(
         target_list_keys,
         error,
     } = delta;
-    if active_list_keys.is_empty()
-        || target_list_keys.is_empty()
-        || target_list_keys
-            .iter()
-            .any(|list_key| !active_list_keys.contains(list_key))
-    {
+    if !lists_are_active(&active_list_keys, &target_list_keys) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -1431,11 +1426,11 @@ fn apply_pending_context_terminal(
         &cfg.cache_key,
         &subject.output_commitment(),
     )?;
-    if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
-        || current_recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.source_tx_hash != observation.tx_hash)
-    {
+    if !recovery_matches_source(
+        &expected_recovery,
+        current_recovery.as_ref(),
+        observation.tx_hash,
+    ) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -1490,12 +1485,7 @@ async fn apply_locally_valid_pending_lists(
         now,
     } = delta;
     let output_commitment = subject.output_commitment();
-    if active_list_keys.is_empty()
-        || valid_list_keys.is_empty()
-        || valid_list_keys
-            .iter()
-            .any(|list_key| !active_list_keys.contains(list_key))
-    {
+    if !lists_are_active(&active_list_keys, &valid_list_keys) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -1532,11 +1522,11 @@ async fn apply_locally_valid_pending_lists(
         &cfg.cache_key,
         &output_commitment,
     )?;
-    if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
-        || current_recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.source_tx_hash != observation.tx_hash)
-    {
+    if !recovery_matches_source(
+        &expected_recovery,
+        current_recovery.as_ref(),
+        observation.tx_hash,
+    ) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -1734,11 +1724,7 @@ async fn apply_verified_valid(
             )
         }
     };
-    if active_list_keys.is_empty()
-        || valid_list_keys.is_empty()
-        || valid_list_keys
-            .iter()
-            .any(|list_key| !active_list_keys.contains(list_key))
+    if !lists_are_active(&active_list_keys, &valid_list_keys)
         || pending_output_poi_context_fingerprint(&current_context).as_ref()
             != Some(&expected_context_fingerprint)
         || valid_list_keys
@@ -1758,11 +1744,11 @@ async fn apply_verified_valid(
         &cfg.cache_key,
         &output_commitment,
     )?;
-    if !expected_recovery_matches(&expected_recovery, current_recovery.as_ref())
-        || current_recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.source_tx_hash != observation.tx_hash)
-    {
+    if !recovery_matches_source(
+        &expected_recovery,
+        current_recovery.as_ref(),
+        observation.tx_hash,
+    ) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
