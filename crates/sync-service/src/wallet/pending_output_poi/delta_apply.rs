@@ -8,6 +8,7 @@ use super::recovered_outgoing::{
     RecoveredOutgoingGroupEvidence, recovered_outgoing_group_evidence,
     recovered_outgoing_group_records, recovered_outgoing_owned_substitutes_match,
 };
+use super::workflow_status::wallet_ppoi_workflow_status_after_validation;
 use super::{
     BTreeMap, BlindedCommitmentData, DbStore, ExpectedPoiStatus, ExpectedRecordState,
     ExpectedWalletOutput, FixedBytes, LocallyValidPendingListsDelta, OutputPoiRecoveryAction,
@@ -31,7 +32,6 @@ use super::{
     prune_nonrecoverable_unsubmitted_poi_lists, recoverable_pending_submission_list_keys,
     saved_pending_context_is_compatible, sender_materialization_pending_matches,
     sender_materialization_recovery_matches, wallet_ppoi_workflow_status_after_mutations,
-    wallet_ppoi_workflow_status_after_validation,
 };
 
 /// Whether the stored sender candidate still equals `expected`; a missing record does not.
