@@ -16,19 +16,20 @@ use super::{
     SenderCandidateLocallyValidDelta, SenderCandidateMaterializationDelta,
     SenderCandidateReconstructionDelta, SenderCandidateUnshieldUpdateDelta,
     SenderCandidateUnshieldValidatedDelta, VerifiedValidDelta, WalletCacheError, WalletCacheStore,
-    WalletCheckpointMutation, WalletConfig, WalletPrivateCommit, WalletPrivateMutationAuthority,
-    WalletPrivateMutationPermit, WalletUtxo, WalletUtxoMutation, expected_pending_context_matches,
-    expected_pending_context_state, expected_poi_status_matches, expected_recovery_matches,
-    expected_recovery_state, hold_expected_poi_corpus_revision, new_output_poi_recovery_record,
-    new_pending_output_poi_recovery_record, output_poi_recovery_default_status,
-    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
-    pending_output_poi_subject_matches_snapshot, pending_output_poi_submit_identity,
-    pending_submission_predicate_matches, poi_statuses_are_recoverable_for_lists,
-    prune_nonrecoverable_unsubmitted_poi_lists, recoverable_pending_submission_list_keys,
-    recovered_outgoing_group_evidence, recovered_outgoing_group_records,
-    recovered_outgoing_owned_substitutes_match, saved_pending_context_is_compatible,
-    sender_materialization_pending_matches, sender_materialization_recovery_matches,
-    wallet_ppoi_workflow_status_after_mutations, wallet_ppoi_workflow_status_after_validation,
+    WalletCheckpointMutation, WalletConfig, WalletPpoiWorkflowProjection, WalletPrivateCommit,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletUtxo, WalletUtxoMutation,
+    expected_pending_context_matches, expected_pending_context_state, expected_poi_status_matches,
+    expected_recovery_matches, expected_recovery_state, hold_expected_poi_corpus_revision,
+    new_output_poi_recovery_record, new_pending_output_poi_recovery_record,
+    output_poi_recovery_default_status, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_subject_matches_snapshot,
+    pending_output_poi_submit_identity, pending_submission_predicate_matches,
+    poi_statuses_are_recoverable_for_lists, prune_nonrecoverable_unsubmitted_poi_lists,
+    recoverable_pending_submission_list_keys, recovered_outgoing_group_evidence,
+    recovered_outgoing_group_records, recovered_outgoing_owned_substitutes_match,
+    saved_pending_context_is_compatible, sender_materialization_pending_matches,
+    sender_materialization_recovery_matches, wallet_ppoi_workflow_status_after_mutations,
+    wallet_ppoi_workflow_status_after_validation,
 };
 
 /// Whether the stored sender candidate still equals `expected`; a missing record does not.
@@ -159,6 +160,76 @@ fn add_submitted_list_keys<'a>(
             context.submitted_poi_list_keys.push(*list_key);
         }
     }
+}
+
+/// What an active apply commits: private rows, the UTXO snapshot that replaces the wallet's
+/// when `utxos_changed`, and the workflow projection to publish.
+#[derive(Default)]
+struct ActiveApplyCommit<'a> {
+    snapshot: Vec<WalletUtxo>,
+    utxos_changed: bool,
+    pending_updates: &'a [PendingOutputPoiContextRecord],
+    pending_deletes: &'a [FixedBytes<32>],
+    recovery_updates: &'a [OutputPoiRecoveryRecord],
+    recovery_deletes: &'a [FixedBytes<32>],
+    workflow: Option<WalletPpoiWorkflowProjection>,
+}
+
+/// Commits `commit` under the UTXO write lock when UTXOs changed, then mirrors and notifies the
+/// new UTXOs and publishes the workflow projection.
+async fn commit_active_apply(
+    permit: WalletPrivateMutationPermit<'_>,
+    cache_store: &dyn WalletCacheStore,
+    commit: ActiveApplyCommit<'_>,
+) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+    let ActiveApplyCommit {
+        mut snapshot,
+        utxos_changed,
+        pending_updates,
+        pending_deletes,
+        recovery_updates,
+        recovery_deletes,
+        workflow,
+    } = commit;
+    let mut utxos_locked = if utxos_changed {
+        Some(permit.handle_utxos().write().await)
+    } else {
+        None
+    };
+    let result = permit.with_active_apply(|token| {
+        cache_store.commit_wallet_private_state(
+            WalletPrivateCommit::new(
+                &token,
+                &permit,
+                if utxos_changed {
+                    WalletUtxoMutation::Replace(&snapshot)
+                } else {
+                    WalletUtxoMutation::Preserve
+                },
+                WalletCheckpointMutation::Preserve,
+            )
+            .with_pending_output_context_updates(pending_updates)
+            .with_pending_output_context_deletes(pending_deletes)
+            .with_output_poi_recovery_updates(recovery_updates)
+            .with_output_poi_recovery_deletes(recovery_deletes),
+        )?;
+        if let Some(locked) = utxos_locked.as_mut() {
+            **locked = std::mem::take(&mut snapshot);
+            let overlay = permit
+                .pending_overlay()
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            permit.apply_notify_changed(&token, locked, &overlay);
+        }
+        if let Some(workflow) = workflow {
+            permit.apply_publish_ppoi_workflow_projection(&token, workflow);
+        }
+        Ok::<(), WalletCacheError>(())
+    });
+    drop(utxos_locked);
+    drop(permit);
+    active_apply_outcome(result, utxos_changed)
 }
 
 /// Wallet state one exclusive apply holds while it folds a delta.
@@ -1856,43 +1927,20 @@ async fn apply_locally_valid_pending_lists(
         &[],
         &[],
     )?;
-    let mut utxos_locked = if changed {
-        Some(permit.handle_utxos().write().await)
-    } else {
-        None
-    };
-    let result = permit.with_active_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                if changed {
-                    WalletUtxoMutation::Replace(&snapshot)
-                } else {
-                    WalletUtxoMutation::Preserve
-                },
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(&pending_updates)
-            .with_pending_output_context_deletes(&pending_deletes)
-            .with_output_poi_recovery_updates(&recovery_updates)
-            .with_output_poi_recovery_deletes(&recovery_deletes),
-        )?;
-        if let Some(locked) = utxos_locked.as_mut() {
-            locked.clone_from(&snapshot);
-            let overlay = permit
-                .pending_overlay()
-                .try_read()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
-            permit.apply_notify_changed(&token, locked, &overlay);
-        }
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(utxos_locked);
-    drop(permit);
-    active_apply_outcome(result, changed)
+    commit_active_apply(
+        permit,
+        cache_store,
+        ActiveApplyCommit {
+            snapshot,
+            utxos_changed: changed,
+            pending_updates: &pending_updates,
+            pending_deletes: &pending_deletes,
+            recovery_updates: &recovery_updates,
+            recovery_deletes: &recovery_deletes,
+            workflow: Some(workflow_status),
+        },
+    )
+    .await
 }
 
 async fn apply_verified_valid(
@@ -2082,46 +2130,19 @@ async fn apply_verified_valid(
     )?;
     let recovery_updates_owned = [recovery];
     let pending_deletes_owned = [output_commitment];
-    let mut utxos_locked = if changed {
-        Some(permit.handle_utxos().write().await)
-    } else {
-        None
-    };
-    let result = permit.with_active_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                if changed {
-                    WalletUtxoMutation::Replace(&snapshot)
-                } else {
-                    WalletUtxoMutation::Preserve
-                },
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_deletes(&pending_deletes_owned)
-            .with_output_poi_recovery_updates(&recovery_updates_owned),
-        )?;
-        if let Some(locked) = utxos_locked.as_mut() {
-            **locked = std::mem::take(&mut snapshot);
-        }
-        if changed {
-            let overlay = permit
-                .pending_overlay()
-                .try_read()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
-            let utxos = utxos_locked
-                .as_ref()
-                .map_or(&[] as &[WalletUtxo], |locked| locked.as_slice());
-            permit.apply_notify_changed(&token, utxos, &overlay);
-        }
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_candidate);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(utxos_locked);
-    drop(permit);
-    active_apply_outcome(result, changed)
+    commit_active_apply(
+        permit,
+        cache_store,
+        ActiveApplyCommit {
+            snapshot,
+            utxos_changed: changed,
+            pending_deletes: &pending_deletes_owned,
+            recovery_updates: &recovery_updates_owned,
+            workflow: Some(workflow_candidate),
+            ..ActiveApplyCommit::default()
+        },
+    )
+    .await
 }
 
 async fn apply_poi_status_refresh(
@@ -2162,24 +2183,14 @@ async fn apply_poi_status_refresh(
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    let mut utxos_locked = permit.handle_utxos().write().await;
-    let result = permit.with_active_apply(|token| {
-        cache_store.commit_wallet_private_state(WalletPrivateCommit::new(
-            &token,
-            &permit,
-            WalletUtxoMutation::Replace(&snapshot),
-            WalletCheckpointMutation::Preserve,
-        ))?;
-        *utxos_locked = snapshot;
-        let overlay = permit
-            .pending_overlay()
-            .try_read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        permit.apply_notify_changed(&token, &utxos_locked, &overlay);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(utxos_locked);
-    drop(permit);
-    active_apply_outcome(result, true)
+    commit_active_apply(
+        permit,
+        cache_store,
+        ActiveApplyCommit {
+            snapshot,
+            utxos_changed: true,
+            ..ActiveApplyCommit::default()
+        },
+    )
+    .await
 }
