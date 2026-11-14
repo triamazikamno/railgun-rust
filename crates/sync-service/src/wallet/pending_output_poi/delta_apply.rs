@@ -93,22 +93,16 @@ fn commit_sender_candidate_replacement(
         &candidate_updates,
         &candidate_deletes,
     )?;
-    let result = permit.with_durable_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                WalletUtxoMutation::Preserve,
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_sender_transaction_candidate_updates(&candidate_updates)
-            .with_sender_transaction_candidate_deletes(&candidate_deletes),
-        )?;
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(permit);
-    durable_apply_outcome(result)
+    commit_durable_apply(
+        permit,
+        cache_store,
+        PoiPrivateRows {
+            candidate_updates: &candidate_updates,
+            candidate_deletes: &candidate_deletes,
+            ..PoiPrivateRows::default()
+        },
+        workflow_status,
+    )
 }
 
 /// Outcome of a durable commit that leaves UTXOs unchanged; a rejected apply is an error.
@@ -162,16 +156,60 @@ fn add_submitted_list_keys<'a>(
     }
 }
 
+/// Private POI rows one commit writes; rows left at the default write nothing.
+#[derive(Clone, Copy, Default)]
+struct PoiPrivateRows<'a> {
+    pending_updates: &'a [PendingOutputPoiContextRecord],
+    pending_deletes: &'a [FixedBytes<32>],
+    recovery_updates: &'a [OutputPoiRecoveryRecord],
+    recovery_deletes: &'a [FixedBytes<32>],
+    candidate_updates: &'a [SenderTransactionCandidate],
+    candidate_deletes: &'a [FixedBytes<32>],
+}
+
+impl<'a> PoiPrivateRows<'a> {
+    const fn add_to<'c>(self, commit: WalletPrivateCommit<'c>) -> WalletPrivateCommit<'c>
+    where
+        'a: 'c,
+    {
+        commit
+            .with_pending_output_context_updates(self.pending_updates)
+            .with_pending_output_context_deletes(self.pending_deletes)
+            .with_output_poi_recovery_updates(self.recovery_updates)
+            .with_output_poi_recovery_deletes(self.recovery_deletes)
+            .with_sender_transaction_candidate_updates(self.candidate_updates)
+            .with_sender_transaction_candidate_deletes(self.candidate_deletes)
+    }
+}
+
+/// Commits `rows` durably with UTXOs preserved, publishes `workflow`, then drops the permit.
+fn commit_durable_apply(
+    permit: WalletPrivateMutationPermit<'_>,
+    cache_store: &dyn WalletCacheStore,
+    rows: PoiPrivateRows<'_>,
+    workflow: WalletPpoiWorkflowProjection,
+) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+    let result = permit.with_durable_apply(|token| {
+        cache_store.commit_wallet_private_state(rows.add_to(WalletPrivateCommit::new(
+            &token,
+            &permit,
+            WalletUtxoMutation::Preserve,
+            WalletCheckpointMutation::Preserve,
+        )))?;
+        permit.apply_publish_ppoi_workflow_projection(&token, workflow);
+        Ok::<(), WalletCacheError>(())
+    });
+    drop(permit);
+    durable_apply_outcome(result)
+}
+
 /// What an active apply commits: private rows, the UTXO snapshot that replaces the wallet's
 /// when `utxos_changed`, and the workflow projection to publish.
 #[derive(Default)]
 struct ActiveApplyCommit<'a> {
     snapshot: Vec<WalletUtxo>,
     utxos_changed: bool,
-    pending_updates: &'a [PendingOutputPoiContextRecord],
-    pending_deletes: &'a [FixedBytes<32>],
-    recovery_updates: &'a [OutputPoiRecoveryRecord],
-    recovery_deletes: &'a [FixedBytes<32>],
+    rows: PoiPrivateRows<'a>,
     workflow: Option<WalletPpoiWorkflowProjection>,
 }
 
@@ -185,10 +223,7 @@ async fn commit_active_apply(
     let ActiveApplyCommit {
         mut snapshot,
         utxos_changed,
-        pending_updates,
-        pending_deletes,
-        recovery_updates,
-        recovery_deletes,
+        rows,
         workflow,
     } = commit;
     let mut utxos_locked = if utxos_changed {
@@ -197,22 +232,16 @@ async fn commit_active_apply(
         None
     };
     let result = permit.with_active_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                if utxos_changed {
-                    WalletUtxoMutation::Replace(&snapshot)
-                } else {
-                    WalletUtxoMutation::Preserve
-                },
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(pending_updates)
-            .with_pending_output_context_deletes(pending_deletes)
-            .with_output_poi_recovery_updates(recovery_updates)
-            .with_output_poi_recovery_deletes(recovery_deletes),
-        )?;
+        cache_store.commit_wallet_private_state(rows.add_to(WalletPrivateCommit::new(
+            &token,
+            &permit,
+            if utxos_changed {
+                WalletUtxoMutation::Replace(&snapshot)
+            } else {
+                WalletUtxoMutation::Preserve
+            },
+            WalletCheckpointMutation::Preserve,
+        )))?;
         if let Some(locked) = utxos_locked.as_mut() {
             **locked = std::mem::take(&mut snapshot);
             let overlay = permit
@@ -922,24 +951,18 @@ async fn apply_sender_candidate_materialization(
         &candidate_updates,
         &candidate_deletes,
     )?;
-    let result = permit.with_durable_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                WalletUtxoMutation::Preserve,
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(&rows.absent_pending_updates)
-            .with_output_poi_recovery_updates(&rows.absent_recovery_updates)
-            .with_sender_transaction_candidate_updates(&candidate_updates)
-            .with_sender_transaction_candidate_deletes(&candidate_deletes),
-        )?;
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(permit);
-    durable_apply_outcome(result)
+    commit_durable_apply(
+        permit,
+        cache_store,
+        PoiPrivateRows {
+            pending_updates: &rows.absent_pending_updates,
+            recovery_updates: &rows.absent_recovery_updates,
+            candidate_updates: &candidate_updates,
+            candidate_deletes: &candidate_deletes,
+            ..PoiPrivateRows::default()
+        },
+        workflow_status,
+    )
 }
 
 async fn apply_sender_candidate_unshield_update(
@@ -1199,22 +1222,16 @@ async fn apply_output_recovery(
         &[],
         &[],
     )?;
-    let result = permit.with_durable_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                WalletUtxoMutation::Preserve,
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(&pending_updates)
-            .with_output_poi_recovery_updates(&recovery_updates),
-        )?;
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(permit);
-    durable_apply_outcome(result)
+    commit_durable_apply(
+        permit,
+        cache_store,
+        PoiPrivateRows {
+            pending_updates: &pending_updates,
+            recovery_updates: &recovery_updates,
+            ..PoiPrivateRows::default()
+        },
+        workflow_status,
+    )
 }
 
 fn apply_pending_submission(
@@ -1330,22 +1347,16 @@ fn apply_pending_submission(
         &[],
         &[],
     )?;
-    let result = permit.with_durable_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                WalletUtxoMutation::Preserve,
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(&pending_updates)
-            .with_output_poi_recovery_updates(&recovery_updates),
-        )?;
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(permit);
-    durable_apply_outcome(result)
+    commit_durable_apply(
+        permit,
+        cache_store,
+        PoiPrivateRows {
+            pending_updates: &pending_updates,
+            recovery_updates: &recovery_updates,
+            ..PoiPrivateRows::default()
+        },
+        workflow_status,
+    )
 }
 
 /// Wallet state a recovered outgoing submission's siblings are checked against.
@@ -1643,22 +1654,16 @@ async fn apply_recovered_outgoing_submission(
         &[],
         &[],
     )?;
-    let result = permit.with_durable_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                WalletUtxoMutation::Preserve,
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(&pending_updates)
-            .with_output_poi_recovery_updates(&recovery_updates),
-        )?;
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(permit);
-    durable_apply_outcome(result)
+    commit_durable_apply(
+        permit,
+        cache_store,
+        PoiPrivateRows {
+            pending_updates: &pending_updates,
+            recovery_updates: &recovery_updates,
+            ..PoiPrivateRows::default()
+        },
+        workflow_status,
+    )
 }
 
 fn apply_pending_context_terminal(
@@ -1743,21 +1748,15 @@ fn apply_pending_context_terminal(
         &[],
         &[],
     )?;
-    let result = permit.with_durable_apply(|token| {
-        cache_store.commit_wallet_private_state(
-            WalletPrivateCommit::new(
-                &token,
-                &permit,
-                WalletUtxoMutation::Preserve,
-                WalletCheckpointMutation::Preserve,
-            )
-            .with_pending_output_context_updates(&pending_updates),
-        )?;
-        permit.apply_publish_ppoi_workflow_projection(&token, workflow_status);
-        Ok::<(), WalletCacheError>(())
-    });
-    drop(permit);
-    durable_apply_outcome(result)
+    commit_durable_apply(
+        permit,
+        cache_store,
+        PoiPrivateRows {
+            pending_updates: &pending_updates,
+            ..PoiPrivateRows::default()
+        },
+        workflow_status,
+    )
 }
 
 async fn apply_locally_valid_pending_lists(
@@ -1933,10 +1932,13 @@ async fn apply_locally_valid_pending_lists(
         ActiveApplyCommit {
             snapshot,
             utxos_changed: changed,
-            pending_updates: &pending_updates,
-            pending_deletes: &pending_deletes,
-            recovery_updates: &recovery_updates,
-            recovery_deletes: &recovery_deletes,
+            rows: PoiPrivateRows {
+                pending_updates: &pending_updates,
+                pending_deletes: &pending_deletes,
+                recovery_updates: &recovery_updates,
+                recovery_deletes: &recovery_deletes,
+                ..PoiPrivateRows::default()
+            },
             workflow: Some(workflow_status),
         },
     )
@@ -2039,22 +2041,16 @@ async fn apply_verified_valid(
         )?;
         let pending_deletes = [output_commitment];
         let recovery_deletes = [output_commitment];
-        let result = permit.with_durable_apply(|token| {
-            cache_store.commit_wallet_private_state(
-                WalletPrivateCommit::new(
-                    &token,
-                    &permit,
-                    WalletUtxoMutation::Preserve,
-                    WalletCheckpointMutation::Preserve,
-                )
-                .with_pending_output_context_deletes(&pending_deletes)
-                .with_output_poi_recovery_deletes(&recovery_deletes),
-            )?;
-            permit.apply_publish_ppoi_workflow_projection(&token, workflow_candidate);
-            Ok::<(), WalletCacheError>(())
-        });
-        drop(permit);
-        return durable_apply_outcome(result);
+        return commit_durable_apply(
+            permit,
+            cache_store,
+            PoiPrivateRows {
+                pending_deletes: &pending_deletes,
+                recovery_deletes: &recovery_deletes,
+                ..PoiPrivateRows::default()
+            },
+            workflow_candidate,
+        );
     }
 
     let PendingOutputPoiSubject::Owned(expected_output) = subject else {
@@ -2136,10 +2132,12 @@ async fn apply_verified_valid(
         ActiveApplyCommit {
             snapshot,
             utxos_changed: changed,
-            pending_deletes: &pending_deletes_owned,
-            recovery_updates: &recovery_updates_owned,
+            rows: PoiPrivateRows {
+                pending_deletes: &pending_deletes_owned,
+                recovery_updates: &recovery_updates_owned,
+                ..PoiPrivateRows::default()
+            },
             workflow: Some(workflow_candidate),
-            ..ActiveApplyCommit::default()
         },
     )
     .await
