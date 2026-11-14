@@ -5,20 +5,20 @@ use crate::SenderTransactionCandidateUnshield;
 use crate::types::WalletBackfillRejectReason;
 
 use super::{
-    BTreeMap, BlindedCommitmentData, DbStore, ExpectedPoiStatus, ExpectedRecordState, FixedBytes,
-    LocallyValidPendingListsDelta, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
-    OutputPoiRecoveryStatus, OutputRecoveryDelta, OwnedPoiPrivateDelta,
-    PendingContextTerminalDelta, PendingOutputPoiRole, PendingOutputPoiSubject,
-    PendingOutputPoiSubjectMatch, PendingOutputPoiSubmissionKind,
-    PendingOutputPoiValidationEvidence, PendingSubmissionDelta, PoiPrivateApplyOutcome, PoiStatus,
-    PoiStatusRefreshDelta, RecoveredOutgoingSubmissionDelta, SenderCandidateLocallyValidDelta,
-    SenderCandidateMaterializationDelta, SenderCandidateReconstructionDelta,
-    SenderCandidateUnshieldUpdateDelta, SenderCandidateUnshieldValidatedDelta, VerifiedValidDelta,
-    WalletCacheError, WalletCacheStore, WalletCheckpointMutation, WalletConfig,
-    WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletUtxo,
-    WalletUtxoMutation, expected_pending_context_matches, expected_pending_context_state,
-    expected_poi_status_matches, expected_recovery_matches, expected_recovery_state,
-    hold_expected_poi_corpus_revision, new_output_poi_recovery_record,
+    BTreeMap, BlindedCommitmentData, DbStore, ExpectedPoiStatus, ExpectedRecordState,
+    ExpectedWalletOutput, FixedBytes, LocallyValidPendingListsDelta, OutputPoiRecoveryAction,
+    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, OutputRecoveryDelta, OwnedPoiPrivateDelta,
+    PendingContextTerminalDelta, PendingOutputPoiContextRecord, PendingOutputPoiObservation,
+    PendingOutputPoiRole, PendingOutputPoiSubject, PendingOutputPoiSubjectMatch,
+    PendingOutputPoiSubmissionKind, PendingOutputPoiValidationEvidence, PendingSubmissionDelta,
+    PoiPrivateApplyOutcome, PoiStatus, PoiStatusRefreshDelta, RecoveredOutgoingSubmissionDelta,
+    SenderCandidateLocallyValidDelta, SenderCandidateMaterializationDelta,
+    SenderCandidateReconstructionDelta, SenderCandidateUnshieldUpdateDelta,
+    SenderCandidateUnshieldValidatedDelta, VerifiedValidDelta, WalletCacheError, WalletCacheStore,
+    WalletCheckpointMutation, WalletConfig, WalletPrivateCommit, WalletPrivateMutationAuthority,
+    WalletPrivateMutationPermit, WalletUtxo, WalletUtxoMutation, expected_pending_context_matches,
+    expected_pending_context_state, expected_poi_status_matches, expected_recovery_matches,
+    expected_recovery_state, hold_expected_poi_corpus_revision, new_output_poi_recovery_record,
     new_pending_output_poi_recovery_record, output_poi_recovery_default_status,
     pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
     pending_output_poi_subject_matches_snapshot, pending_output_poi_submit_identity,
@@ -373,6 +373,307 @@ async fn apply_sender_candidate_locally_valid(
     )
 }
 
+fn candidate_blinded_commitments(candidate: &SenderTransactionCandidate) -> Vec<FixedBytes<32>> {
+    candidate
+        .outputs
+        .iter()
+        .filter_map(|output| {
+            output.note.as_ref().map(|note| {
+                super::Utxo::new(
+                    note.clone(),
+                    output.tree,
+                    output.position,
+                    candidate.source.clone(),
+                    super::UtxoCommitmentKind::Transact,
+                )
+                .poi
+                .blinded_commitment
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Rows and output identities a sender materialization covers so far.
+#[derive(Default)]
+struct SenderMaterializationRows {
+    output_commitments: BTreeSet<(u32, u64, FixedBytes<32>)>,
+    blinded_commitments: BTreeSet<FixedBytes<32>>,
+    absent_pending_updates: Vec<PendingOutputPoiContextRecord>,
+    absent_recovery_updates: Vec<OutputPoiRecoveryRecord>,
+}
+
+/// Wallet state and corpus results a sender materialization's rows are checked against.
+struct SenderMaterializationCheck<'a> {
+    cache_store: &'a dyn WalletCacheStore,
+    cfg: &'a WalletConfig,
+    snapshot: &'a [WalletUtxo],
+    candidate: &'a SenderTransactionCandidate,
+    active_list_keys: &'a [FixedBytes<32>],
+    valid_by_list: &'a BTreeMap<FixedBytes<32>, BTreeSet<FixedBytes<32>>>,
+    qualified_outputs: &'a BTreeSet<(u32, u64, FixedBytes<32>)>,
+    replacement_group: &'a [(
+        PendingOutputPoiContextRecord,
+        Option<OutputPoiRecoveryRecord>,
+    )],
+    external_valid: &'a BTreeSet<FixedBytes<32>>,
+}
+
+/// Each `record_*` method checks rows and records them; `false` means skip the materialization.
+impl SenderMaterializationCheck<'_> {
+    fn record_pending_rows(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        pending_updates: &[PendingOutputPoiContextRecord],
+        recovery_updates: &[OutputPoiRecoveryRecord],
+    ) -> Result<bool, WalletCacheError> {
+        for (pending, recovery) in pending_updates.iter().zip(recovery_updates) {
+            if !self.record_pending_row(rows, pending, recovery)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn record_owned_substitutes(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        owned_substitutes: &[ExpectedWalletOutput],
+    ) -> bool {
+        owned_substitutes
+            .iter()
+            .all(|expected| self.record_owned_substitute(rows, expected))
+    }
+
+    fn record_external_substitutes(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        outputs: &[super::Utxo],
+    ) -> Result<bool, WalletCacheError> {
+        for output in outputs {
+            if !self.record_external_substitute(rows, output)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn record_pending_row(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        pending: &PendingOutputPoiContextRecord,
+        recovery: &OutputPoiRecoveryRecord,
+    ) -> Result<bool, WalletCacheError> {
+        let Some(observation) = pending.observation.as_ref() else {
+            return Ok(false);
+        };
+        let Ok(output_tree) = u32::try_from(observation.output_tree) else {
+            return Ok(false);
+        };
+        let output_key = (
+            output_tree,
+            observation.output_position,
+            pending.output_commitment,
+        );
+        if !self.pending_row_matches_candidate(pending, recovery, observation)
+            || !self.qualified_outputs.contains(&output_key)
+            || !rows.output_commitments.insert(output_key)
+        {
+            return Ok(false);
+        }
+        let Some(identity) = pending_output_poi_submit_identity(pending, observation) else {
+            return Ok(false);
+        };
+        if pending.required_poi_list_keys
+            != super::saved_poi_compatibility::unresolved_output_lists(
+                self.active_list_keys,
+                identity.derived_blinded_commitment,
+                self.valid_by_list,
+            )
+        {
+            return Ok(false);
+        }
+        if !rows
+            .blinded_commitments
+            .insert(identity.derived_blinded_commitment)
+        {
+            return Ok(false);
+        }
+        if self.snapshot.iter().any(|output| {
+            !output.is_spent()
+                && output.utxo.tree == output_tree
+                && output.utxo.position == observation.output_position
+                && output.utxo.source == self.candidate.source
+                && output.utxo.poi.commitment == pending.output_commitment
+        }) {
+            return Ok(false);
+        }
+        self.record_stored_pending_row(rows, pending, recovery)
+    }
+
+    fn pending_row_matches_candidate(
+        &self,
+        pending: &PendingOutputPoiContextRecord,
+        recovery: &OutputPoiRecoveryRecord,
+        observation: &PendingOutputPoiObservation,
+    ) -> bool {
+        pending.chain_id == self.cfg.chain.chain_id
+            && pending.wallet_id == self.cfg.cache_key.as_str()
+            && pending.output_role == PendingOutputPoiRole::RecoveredOutgoing
+            && pending.source_operation_id.is_some()
+            && pending.txid_merkleroot_index.is_some()
+            && !pending.required_poi_list_keys.is_empty()
+            && observation.tx_hash == self.candidate.source.tx_hash
+            && observation.block_number == self.candidate.source.block_number
+            && observation.block_timestamp == self.candidate.source.block_timestamp
+            && recovery.chain_id == self.cfg.chain.chain_id
+            && recovery.wallet_id == self.cfg.cache_key.as_str()
+            && recovery.output_commitment == pending.output_commitment
+            && recovery.source_tx_hash == self.candidate.source.tx_hash
+    }
+
+    fn record_stored_pending_row(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        pending: &PendingOutputPoiContextRecord,
+        recovery: &OutputPoiRecoveryRecord,
+    ) -> Result<bool, WalletCacheError> {
+        let current_pending = self.cache_store.get_pending_output_poi_context(
+            self.cfg.chain.chain_id,
+            &self.cfg.cache_key,
+            &pending.output_commitment,
+        )?;
+        let current_recovery = self.cache_store.get_output_poi_recovery(
+            self.cfg.chain.chain_id,
+            &self.cfg.cache_key,
+            &pending.output_commitment,
+        )?;
+        match (current_pending, current_recovery) {
+            (None, None) => {
+                rows.absent_pending_updates.push(pending.clone());
+                rows.absent_recovery_updates.push(recovery.clone());
+            }
+            (Some(current_pending), current_recovery)
+                if self
+                    .replacement_group
+                    .iter()
+                    .any(|(expected, expected_recovery)| {
+                        expected.output_commitment == pending.output_commitment
+                            && expected_pending_context_state(Some(expected))
+                                == expected_pending_context_state(Some(&current_pending))
+                            && expected_recovery_state(expected_recovery.as_ref())
+                                == expected_recovery_state(current_recovery.as_ref())
+                    }) =>
+            {
+                rows.absent_pending_updates.push(pending.clone());
+                rows.absent_recovery_updates.push(recovery.clone());
+            }
+            (Some(current_pending), Some(current_recovery))
+                if sender_materialization_pending_matches(&current_pending, pending)
+                    && sender_materialization_recovery_matches(&current_recovery, recovery) => {}
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn record_owned_substitute(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        expected: &ExpectedWalletOutput,
+    ) -> bool {
+        let mut matches = self
+            .snapshot
+            .iter()
+            .filter(|output| expected.matches(output));
+        let Some(current) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some()
+            || current.utxo.source != self.candidate.source
+            || !rows
+                .output_commitments
+                .insert(expected.candidate_identity())
+            || !rows
+                .blinded_commitments
+                .insert(current.utxo.poi.blinded_commitment)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn record_external_substitute(
+        &self,
+        rows: &mut SenderMaterializationRows,
+        output: &super::Utxo,
+    ) -> Result<bool, WalletCacheError> {
+        let exact = self
+            .candidate
+            .outputs
+            .iter()
+            .filter(|candidate_output| {
+                candidate_output.tree == output.tree
+                    && candidate_output.position == output.position
+                    && candidate_output.commitment == output.poi.commitment
+                    && candidate_output
+                        .note
+                        .as_ref()
+                        .is_some_and(|note| note.commitment() == output.note.commitment())
+            })
+            .count();
+        if exact != 1
+            || output.source != self.candidate.source
+            || !self.external_valid.contains(&output.poi.blinded_commitment)
+            || !rows.output_commitments.insert((
+                output.tree,
+                output.position,
+                output.poi.commitment,
+            ))
+            || !rows
+                .blinded_commitments
+                .insert(output.poi.blinded_commitment)
+            || self
+                .cache_store
+                .get_pending_output_poi_context(
+                    self.cfg.chain.chain_id,
+                    &self.cfg.cache_key,
+                    &output.poi.commitment,
+                )?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// Whether rows sharing a railgun txid and input tree carry the same proof inputs.
+fn proof_groups_are_consistent(
+    pending_updates: &[PendingOutputPoiContextRecord],
+) -> Result<bool, WalletCacheError> {
+    let mut proof_groups = BTreeMap::new();
+    for pending in pending_updates {
+        let key = (pending.railgun_txid, pending.utxo_tree_in);
+        let material =
+            rmp_serde::to_vec(&(pending.txid_merkleroot_index, &pending.source_operation_id))?;
+        if proof_groups
+            .insert((key, None), material.clone())
+            .is_some_and(|old| old != material)
+        {
+            return Ok(false);
+        }
+        for (list_key, per_leaf) in &pending.pre_transaction_pois_per_txid_leaf_per_list {
+            let encoded = rmp_serde::to_vec(per_leaf)?;
+            if proof_groups
+                .insert((key, Some(*list_key)), encoded.clone())
+                .is_some_and(|old| old != encoded)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 async fn apply_sender_candidate_materialization(
     turn: PoiApplyTurn<'_>,
     delta: SenderCandidateMaterializationDelta,
@@ -436,23 +737,7 @@ async fn apply_sender_candidate_materialization(
             return Ok(stale);
         }
     };
-    let candidate_blinded = expected_candidate
-        .outputs
-        .iter()
-        .filter_map(|output| {
-            output.note.as_ref().map(|note| {
-                super::Utxo::new(
-                    note.clone(),
-                    output.tree,
-                    output.position,
-                    expected_candidate.source.clone(),
-                    super::UtxoCommitmentKind::Transact,
-                )
-                .poi
-                .blinded_commitment
-            })
-        })
-        .collect::<Vec<_>>();
+    let candidate_blinded = candidate_blinded_commitments(&expected_candidate);
     let Some(valid_by_list) = super::saved_poi_compatibility::corpus_valid_outputs_by_list(
         &expected_corpus.corpus,
         cfg.chain.chain_id,
@@ -494,189 +779,44 @@ async fn apply_sender_candidate_materialization(
         .filter(|output| output.note.is_some())
         .map(|output| (output.tree, output.position, output.commitment))
         .collect::<BTreeSet<_>>();
-    let mut output_commitments = BTreeSet::new();
-    let mut blinded_commitments = BTreeSet::new();
-    let mut absent_pending_updates = Vec::new();
-    let mut absent_recovery_updates = Vec::new();
-    for (pending, recovery) in pending_updates.iter().zip(&recovery_updates) {
-        let Some(observation) = pending.observation.as_ref() else {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        };
-        let Ok(output_tree) = u32::try_from(observation.output_tree) else {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        };
-        if pending.chain_id != cfg.chain.chain_id
-            || pending.wallet_id != cfg.cache_key.as_str()
-            || pending.output_role != PendingOutputPoiRole::RecoveredOutgoing
-            || pending.source_operation_id.is_none()
-            || pending.txid_merkleroot_index.is_none()
-            || pending.required_poi_list_keys.is_empty()
-            || observation.tx_hash != expected_candidate.source.tx_hash
-            || observation.block_number != expected_candidate.source.block_number
-            || observation.block_timestamp != expected_candidate.source.block_timestamp
-            || recovery.chain_id != cfg.chain.chain_id
-            || recovery.wallet_id != cfg.cache_key.as_str()
-            || recovery.output_commitment != pending.output_commitment
-            || recovery.source_tx_hash != expected_candidate.source.tx_hash
-            || !qualified_outputs.contains(&(
-                output_tree,
-                observation.output_position,
-                pending.output_commitment,
-            ))
-            || !output_commitments.insert((
-                output_tree,
-                observation.output_position,
-                pending.output_commitment,
-            ))
-        {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
-        let Some(identity) = pending_output_poi_submit_identity(pending, observation) else {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        };
-        if pending.required_poi_list_keys
-            != super::saved_poi_compatibility::unresolved_output_lists(
-                &active_list_keys,
-                identity.derived_blinded_commitment,
-                &valid_by_list,
-            )
-        {
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
-        if !blinded_commitments.insert(identity.derived_blinded_commitment) {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
-        if snapshot.iter().any(|output| {
-            !output.is_spent()
-                && output.utxo.tree == output_tree
-                && output.utxo.position == observation.output_position
-                && output.utxo.source == expected_candidate.source
-                && output.utxo.poi.commitment == pending.output_commitment
-        }) {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
-        let current_pending = cache_store.get_pending_output_poi_context(
-            cfg.chain.chain_id,
-            &cfg.cache_key,
-            &pending.output_commitment,
-        )?;
-        let current_recovery = cache_store.get_output_poi_recovery(
-            cfg.chain.chain_id,
-            &cfg.cache_key,
-            &pending.output_commitment,
-        )?;
-        match (current_pending, current_recovery) {
-            (None, None) => {
-                absent_pending_updates.push(pending.clone());
-                absent_recovery_updates.push(recovery.clone());
-            }
-            (Some(current_pending), current_recovery)
-                if replacement_group
-                    .iter()
-                    .any(|(expected, expected_recovery)| {
-                        expected.output_commitment == pending.output_commitment
-                            && expected_pending_context_state(Some(expected))
-                                == expected_pending_context_state(Some(&current_pending))
-                            && expected_recovery_state(expected_recovery.as_ref())
-                                == expected_recovery_state(current_recovery.as_ref())
-                    }) =>
-            {
-                absent_pending_updates.push(pending.clone());
-                absent_recovery_updates.push(recovery.clone());
-            }
-            (Some(current_pending), Some(current_recovery))
-                if sender_materialization_pending_matches(&current_pending, pending)
-                    && sender_materialization_recovery_matches(&current_recovery, recovery) => {}
-            _ => {
-                drop(permit);
-                return Ok(PoiPrivateApplyOutcome::Skipped);
-            }
-        }
+    let check = SenderMaterializationCheck {
+        cache_store,
+        cfg,
+        snapshot: &snapshot,
+        candidate: &expected_candidate,
+        active_list_keys: &active_list_keys,
+        valid_by_list: &valid_by_list,
+        qualified_outputs: &qualified_outputs,
+        replacement_group: &replacement_group,
+        external_valid: &external_valid,
+    };
+    let mut rows = SenderMaterializationRows::default();
+    if !check.record_pending_rows(&mut rows, &pending_updates, &recovery_updates)? {
+        drop(permit);
+        return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    for expected in &owned_substitutes {
-        let mut matches = snapshot.iter().filter(|output| expected.matches(output));
-        let Some(current) = matches.next() else {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        };
-        if matches.next().is_some()
-            || current.utxo.source != expected_candidate.source
-            || !output_commitments.insert(expected.candidate_identity())
-            || !blinded_commitments.insert(current.utxo.poi.blinded_commitment)
-        {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
+    if !check.record_owned_substitutes(&mut rows, &owned_substitutes) {
+        drop(permit);
+        return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    for output in &external_valid_substitutes {
-        let exact = expected_candidate
-            .outputs
-            .iter()
-            .filter(|candidate_output| {
-                candidate_output.tree == output.tree
-                    && candidate_output.position == output.position
-                    && candidate_output.commitment == output.poi.commitment
-                    && candidate_output
-                        .note
-                        .as_ref()
-                        .is_some_and(|note| note.commitment() == output.note.commitment())
-            })
-            .count();
-        if exact != 1
-            || output.source != expected_candidate.source
-            || !external_valid.contains(&output.poi.blinded_commitment)
-            || !output_commitments.insert((output.tree, output.position, output.poi.commitment))
-            || !blinded_commitments.insert(output.poi.blinded_commitment)
-            || cache_store
-                .get_pending_output_poi_context(
-                    cfg.chain.chain_id,
-                    &cfg.cache_key,
-                    &output.poi.commitment,
-                )?
-                .is_some()
-        {
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
+    if !check.record_external_substitutes(&mut rows, &external_valid_substitutes)? {
+        return Ok(PoiPrivateApplyOutcome::Skipped);
     }
     if pending_updates.iter().any(|pending| {
         !saved_pending_context_is_compatible(pending, &pending.required_poi_list_keys)
     }) {
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    let mut proof_groups = BTreeMap::new();
-    for pending in &pending_updates {
-        let key = (pending.railgun_txid, pending.utxo_tree_in);
-        let material =
-            rmp_serde::to_vec(&(pending.txid_merkleroot_index, &pending.source_operation_id))?;
-        if proof_groups
-            .insert((key, None), material.clone())
-            .is_some_and(|old| old != material)
-        {
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
-        for (list_key, per_leaf) in &pending.pre_transaction_pois_per_txid_leaf_per_list {
-            let encoded = rmp_serde::to_vec(per_leaf)?;
-            if proof_groups
-                .insert((key, Some(*list_key)), encoded.clone())
-                .is_some_and(|old| old != encoded)
-            {
-                return Ok(PoiPrivateApplyOutcome::Skipped);
-            }
-        }
+    if !proof_groups_are_consistent(&pending_updates)? {
+        return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    if output_commitments != qualified_outputs {
+    if rows.output_commitments != qualified_outputs {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
     let proof_outputs = proof_outputs.into_iter().collect::<BTreeSet<_>>();
-    if proof_outputs.len() != blinded_commitments.len()
-        || proof_outputs != blinded_commitments
+    if proof_outputs.len() != rows.blinded_commitments.len()
+        || proof_outputs != rows.blinded_commitments
         || !public_data_fence.is_current(expected_candidate.source.tx_hash)
     {
         drop(permit);
@@ -691,9 +831,9 @@ async fn apply_sender_candidate_materialization(
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &absent_pending_updates,
+        &rows.absent_pending_updates,
         &[],
-        &absent_recovery_updates,
+        &rows.absent_recovery_updates,
         &[],
         &candidate_updates,
         &candidate_deletes,
@@ -706,8 +846,8 @@ async fn apply_sender_candidate_materialization(
                 WalletUtxoMutation::Preserve,
                 WalletCheckpointMutation::Preserve,
             )
-            .with_pending_output_context_updates(&absent_pending_updates)
-            .with_output_poi_recovery_updates(&absent_recovery_updates)
+            .with_pending_output_context_updates(&rows.absent_pending_updates)
+            .with_output_poi_recovery_updates(&rows.absent_recovery_updates)
             .with_sender_transaction_candidate_updates(&candidate_updates)
             .with_sender_transaction_candidate_deletes(&candidate_deletes),
         )?;
