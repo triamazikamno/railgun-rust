@@ -54,6 +54,7 @@ use tokio::task::{JoinHandle, JoinSet};
 mod actor_loop;
 mod backfill_events;
 mod commit;
+mod indexed_catch_up;
 mod live_logs;
 mod local_pending_spent;
 mod output_poi;
@@ -72,8 +73,8 @@ use commit::{
     validate_restored_pending_reset,
 };
 use local_pending_spent::{
-    clear_local_pending_spent, expire_local_pending_spent, mark_local_pending_spent,
-    prune_local_pending_spent, wait_for_local_pending_spent_expiry,
+    clear_local_pending_spent, mark_local_pending_spent, prune_local_pending_spent,
+    wait_for_local_pending_spent_expiry,
 };
 use output_poi::{
     PendingOutputPoiTentativeAttemptTracker, commit_pending_output_contexts,
@@ -481,36 +482,9 @@ pub(crate) async fn prepare_wallet_worker(
         loop {
             tokio::select! {
                 () = actor.cancel.cancelled() => break,
-                expiry = wait_for_local_pending_spent_expiry(&actor.worker_handle) => {
-                    if let Err(error) = expire_local_pending_spent(
-                        &actor.worker_handle,
-                        &actor.cancel,
-                        actor.actor_state.reset_generation(),
-                        expiry,
-                    ).await {
-                        debug!(%error, cache_key = %actor.cfg.cache_key, "local pending-spend expiry skipped");
-                    }
-                }
+                expiry = wait_for_local_pending_spent_expiry(&actor.worker_handle) => actor.handle_local_pending_spent_expiry(expiry).await,
                 Some((token, signal)) = actor.accepted_backfill_liveness.next(), if !actor.accepted_backfill_liveness.is_empty() => actor.handle_backfill_owner_signal(token, signal).await,
-                Some(token) = actor.accepted_indexed_job_liveness.next(), if !actor.accepted_indexed_job_liveness.is_empty() => {
-                    let retired = actor.actor_state
-                        .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
-                            state.retire_job(token)
-                        })
-                        .unwrap_or(false);
-                    if retired {
-                        let authority = WalletPrivateMutationAuthority::new(
-                            &actor.worker_handle,
-                            actor.actor_state.reset_generation(),
-                            &actor.cancel,
-                        );
-                        if let Ok(permit) = authority.acquire().await
-                            && let Err(reason) = permit.publish_indexed_catch_up(None)
-                        {
-                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up abandonment status clear rejected");
-                        }
-                    }
-                }
+                Some(token) = actor.accepted_indexed_job_liveness.next(), if !actor.accepted_indexed_job_liveness.is_empty() => actor.handle_indexed_job_owner_dropped(token).await,
                 Some(apply_req) = private_apply_rx.recv() => actor.handle_private_apply(apply_req).await,
                 Some(done) = remote_done_rx.recv() => actor.handle_remote_done(done).await,
                 _ = pending_reset_retry.tick(), if actor.actor_state.pending_reset().is_some() => {
@@ -520,82 +494,7 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                 }
                 Some(refresh_request) = poi_refresh_rx.recv() => actor.handle_poi_refresh_request(refresh_request).await,
-                Some(command) = indexed_catch_up_status_rx.recv() => {
-                    let authority = WalletPrivateMutationAuthority::new(
-                        &actor.worker_handle,
-                        actor.actor_state.reset_generation(),
-                        &actor.cancel,
-                    );
-                    match authority.acquire().await {
-                        Ok(permit) => {
-                            match command {
-                                WalletIndexedCatchUpCommand::Claim { response } => {
-                                    let token =
-                                        actor.worker_handle.mint_sync_token(actor.actor_state.reset_generation());
-                                    let accepted = permit
-                                        .with_active_apply(|apply_token| {
-                                            actor.actor_state.transition(&apply_token, |mut state| {
-                                                state.accept_indexed_catch_up(token)
-                                            })
-                                        })
-                                        .unwrap_or(false);
-                                    let lease = if accepted {
-                                        let (liveness, receiver) = oneshot::channel();
-                                        actor.accepted_indexed_job_liveness
-                                            .push(accepted_indexed_job_owner_dropped(token, receiver));
-                                        Some(WalletIndexedCatchUpLease::for_actor_accepted_job(
-                                            token,
-                                            liveness,
-                                        ))
-                                    } else {
-                                        None
-                                    };
-                                    if let Err(lease) = response.send(lease) {
-                                        drop(lease);
-                                        let retired = permit
-                                            .with_active_apply(|apply_token| {
-                                                actor.actor_state.transition(&apply_token, |mut state| {
-                                                    state.retire_job(token)
-                                                })
-                                            })
-                                            .unwrap_or(false);
-                                        if retired
-                                            && let Err(reason) =
-                                                permit.publish_indexed_catch_up(None)
-                                        {
-                                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up dropped-claim status clear rejected");
-                                        }
-                                        debug!(cache_key = %actor.cfg.cache_key, ?token, "indexed wallet catch-up claim receiver dropped");
-                                    }
-                                }
-                                WalletIndexedCatchUpCommand::Publish { token, status } => {
-                                    let published = permit
-                                        .with_active_apply(|apply_token| {
-                                            actor.actor_state.transition(&apply_token, |mut state| {
-                                                state.publish_indexed_catch_up(token, status)
-                                            })
-                                        })
-                                        .unwrap_or(false);
-                                    if published {
-                                        if let Err(reason) =
-                                            permit.publish_indexed_catch_up(Some(status))
-                                        {
-                                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up status publication rejected");
-                                        }
-                                    } else {
-                                        debug!(cache_key = %actor.cfg.cache_key, ?token, "stale indexed wallet catch-up status publication ignored");
-                                    }
-                                }
-                            }
-                        }
-                        Err(reason) => {
-                            if let WalletIndexedCatchUpCommand::Claim { response } = command {
-                                let _ = response.send(None);
-                            }
-                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up status publication skipped");
-                        }
-                    }
-                }
+                Some(command) = indexed_catch_up_status_rx.recv() => actor.handle_indexed_catch_up_command(command).await,
                 Some(request) = private_request_rx.recv() => actor.handle_private_request(request).await,
                 Some(request) = pending_overlay_rx.recv() => actor.handle_pending_overlay(request).await,
                 revision = next_poi_corpus_revision(&mut actor.poi_corpus_revision_rx) => actor.handle_poi_corpus_revision(revision).await,

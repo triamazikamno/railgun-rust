@@ -171,3 +171,19 @@ pub(super) async fn clear_local_pending_spent(
         })
         .map_err(|reason| wallet_private_request_error(&reason))
 }
+
+impl WalletActorLoop<'_> {
+    /// Drops local pending-spend marks that expired at `expiry`.
+    pub(super) async fn handle_local_pending_spent_expiry(&self, expiry: u64) {
+        if let Err(error) = expire_local_pending_spent(
+            &self.worker_handle,
+            &self.cancel,
+            self.actor_state.reset_generation(),
+            expiry,
+        )
+        .await
+        {
+            debug!(%error, cache_key = %self.cfg.cache_key, "local pending-spend expiry skipped");
+        }
+    }
+}
