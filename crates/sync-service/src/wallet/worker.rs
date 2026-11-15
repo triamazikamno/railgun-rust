@@ -54,6 +54,7 @@ use tokio::task::{JoinHandle, JoinSet};
 mod actor_loop;
 mod backfill_events;
 mod commit;
+mod live_logs;
 mod local_pending_spent;
 mod output_poi;
 mod pending_overlay;
@@ -395,7 +396,6 @@ pub(crate) async fn prepare_wallet_worker(
         drop(snapshot);
 
         let backfill_complete_block: Option<u64> = None;
-        let mut live_receiver_lagged = false;
         let persist_state = WalletPersistState::default();
         let live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = Some(poi_runtime.public_client());
@@ -462,6 +462,7 @@ pub(crate) async fn prepare_wallet_worker(
             poi_corpus_handle,
             live_rx,
             poi_corpus_revision_rx,
+            live_receiver_lagged: false,
         };
         if actor.actor_state.pending_reset().is_some() && actor.try_drive_pending_reset(false).await.is_some() {
             signal_restored_reset_attempt(&mut startup_replay_tx);
@@ -939,197 +940,8 @@ pub(crate) async fn prepare_wallet_worker(
                 }
                 Some(event) = backfill_rx.recv() => actor.handle_backfill_event(event).await,
                 result = actor.live_rx.recv(), if actor.backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
-                    match result {
-                        Ok(batch) => {
-                            if actor.cfg.sync_to_block.is_some() {
-                                continue;
-                            }
-                            if actor.backfill_complete_block.is_none()
-                                || batch.to_block <= actor.last_scanned
-                            {
-                                live_receiver_lagged = false;
-                                continue;
-                            }
-                            let expected_from_block = actor.last_scanned.saturating_add(1);
-                            if batch.from_block > expected_from_block {
-                                warn!(
-                                    cache_key = %actor.cfg.cache_key,
-                                    expected_from_block,
-                                    batch_from_block = batch.from_block,
-                                    batch_to_block = batch.to_block,
-                                    live_receiver_lagged,
-                                    "wallet live log gap detected; requesting backfill"
-                                );
-                                let current_reset_generation = actor.actor_state.reset_generation();
-                                let token = actor.worker_handle.mint_sync_token(current_reset_generation);
-                                let accepted = actor.actor_state
-                                    .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
-                                        state.accept_target(token, batch.to_block)
-                                    })
-                                    .unwrap_or(false);
-                                if !accepted {
-                                    continue;
-                                }
-                                let (liveness, receiver) = oneshot::channel();
-                                actor.accepted_backfill_liveness
-                                    .push(accepted_backfill_owner_dropped(token, receiver));
-                                let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
-                                    token,
-                                    actor.backfill_sender.clone(),
-                                    liveness,
-                                    actor.cancel.clone(),
-                                )
-                                .activate();
-                                match actor.backfill_tx.try_send(BackfillRequest::add(
-                                    actor.cfg.cache_key.clone(),
-                                    expected_from_block,
-                                    batch.to_block,
-                                    true,
-                                    expected_from_block,
-                                    driver,
-                                )) {
-                                    Ok(()) => {
-                                        let _ = actor.actor_state.transition_active(
-                                            &actor.worker_handle,
-                                            &actor.cancel,
-                                            |mut state| state.backfill_dispatch_admitted(token),
-                                        );
-                                        actor.backfill_complete_block = None;
-                                        actor.live_rx = actor.live_rx.resubscribe();
-                                    }
-                                    Err(err) => {
-                                        warn!(?err, cache_key = %actor.cfg.cache_key, "failed to request wallet live gap backfill");
-                                        let _ = actor.actor_state.transition_active(
-                                            &actor.worker_handle,
-                                            &actor.cancel,
-                                            |mut state| {
-                                                state.fail_job_backfill_unavailable(token);
-                                            },
-                                        );
-                                    }
-                                }
-                                live_receiver_lagged = false;
-                                continue;
-                            }
-                            live_receiver_lagged = false;
-                            // POI status refresh is never inline on live scan (may be remote).
-                            // request_poi_maintenance runs after successful commit.
-                            let apply = match WalletScanApply::rows_from_log_batch(
-                                expected_from_block,
-                                batch.to_block,
-                                &batch,
-                                PublicScanSource::Rpc,
-                            ) {
-                                Ok(apply) => apply,
-                                Err(err) => {
-                                    warn!(?err, cache_key = %actor.cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to normalize wallet live logs");
-                                    continue;
-                                }
-                            };
-                            let current_reset_generation = actor.actor_state.reset_generation();
-                            let live_token = actor.worker_handle.mint_sync_token(current_reset_generation);
-                            let accepted = actor.actor_state
-                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
-                                    state.accept_target(live_token, batch.to_block)
-                                })
-                                .unwrap_or(false);
-                            if !accepted {
-                                continue;
-                            }
-                            let outcome = WalletScanCommitRequest {
-                                cache_store: actor.cache_store.as_ref(),
-                                cfg: &actor.cfg,
-                                utxos: &actor.utxos,
-                                worker_handle: &actor.worker_handle,
-                                apply,
-                                job_token: live_token,
-                                current_reset_generation,
-                                event_reset_generation: live_token.reset_generation(),
-                                actor_state: &mut actor.actor_state,
-                                cancel: &actor.cancel,
-                                last_scanned: &mut actor.last_scanned,
-                                persist_state: &mut actor.persist_state,
-                                live_metadata_flush: &mut actor.live_metadata_flush,
-                                public_data_plane: &actor.public_data_plane,
-                            }
-                            .commit()
-                            .await;
-                            match outcome.result {
-                                WalletBackfillApplyResult::Committed { .. }
-                                | WalletBackfillApplyResult::AlreadyCovered { .. } => {
-                                    let _ = actor.actor_state.transition_active(
-                                        &actor.worker_handle,
-                                        &actor.cancel,
-                                        |mut state| state.retire_job(live_token),
-                                    );
-                                    if outcome.changed && actor.poi_status_client.is_some() {
-                                        let _ = actor.request_poi_maintenance(false);
-                                    }
-                                }
-                                WalletBackfillApplyResult::Rejected {
-                                    reason: WalletBackfillRejectReason::PersistenceFailed,
-                                    ..
-                                } => {
-                                    // Keep the accepted live job as the owner of its exact failed
-                                    // range and let the normal backfill loop apply persistence backoff.
-                                    let (liveness, receiver) = oneshot::channel();
-                                    actor.accepted_backfill_liveness.push(
-                                        accepted_backfill_owner_dropped(live_token, receiver),
-                                    );
-                                    let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
-                                        live_token,
-                                        actor.backfill_sender.clone(),
-                                        liveness,
-                                        actor.cancel.clone(),
-                                    )
-                                    .activate();
-                                    let retry = BackfillRequest::add(
-                                        actor.cfg.cache_key.clone(),
-                                        expected_from_block,
-                                        batch.to_block,
-                                        false,
-                                        expected_from_block,
-                                        driver,
-                                    );
-                                    match actor.backfill_tx.try_send(retry) {
-                                        Ok(()) => {
-                                            let _ = actor.actor_state.transition_active(
-                                                &actor.worker_handle,
-                                                &actor.cancel,
-                                                |mut state| {
-                                                    state.backfill_dispatch_admitted(live_token)
-                                                },
-                                            );
-                                            actor.backfill_complete_block = None;
-                                            actor.live_rx = actor.live_rx.resubscribe();
-                                        }
-                                        Err(err) => {
-                                            warn!(?err, cache_key = %actor.cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to enqueue wallet live persistence retry");
-                                            let _ = actor.actor_state.transition_active(
-                                                &actor.worker_handle,
-                                                &actor.cancel,
-                                                |mut state| {
-                                                    state.fail_job_backfill_unavailable(live_token);
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                                WalletBackfillApplyResult::Rejected { reason, .. } => {
-                                    let _ = actor.actor_state.transition_active(
-                                        &actor.worker_handle,
-                                        &actor.cancel,
-                                        |mut state| state.retire_job(live_token),
-                                    );
-                                    warn!(?reason, cache_key = %actor.cfg.cache_key, "wallet live scan batch rejected");
-                                }
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            live_receiver_lagged = true;
-                            warn!(cache_key = %actor.cfg.cache_key, skipped, "wallet live log receiver lagged");
-                        }
+                    if actor.handle_live_logs(result).await.is_break() {
+                        break;
                     }
                 }
             }

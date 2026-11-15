@@ -68,6 +68,8 @@ pub(super) struct WalletActorLoop<'a> {
     /// Live log batches; a committed reset rewind replaces the subscription.
     pub(super) live_rx: broadcast::Receiver<SharedLogBatch>,
     pub(super) poi_corpus_revision_rx: Option<watch::Receiver<PoiCorpusRevision>>,
+    /// Whether the live receiver lagged since the cursor last caught up with it.
+    pub(super) live_receiver_lagged: bool,
 }
 
 /// What the pre-ready POI status refresh did, for the backfill completion log.
