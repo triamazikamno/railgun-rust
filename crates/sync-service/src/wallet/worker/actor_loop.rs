@@ -2,15 +2,18 @@ use railgun_wallet::Utxo;
 
 use crate::wallet::handle::WalletPrivateViewTicket;
 
+use super::poi_maintenance::current_ppoi_workflow_status_for_candidate_report;
 use super::{
     AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, Arc, BackfillEvent,
     BackfillRequest, CancellationToken, ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore,
     FixedBytes, FuturesUnordered, IndexedArtifactSourceConfig, Instant, LocalPoiStatusReader,
-    MerkleForest, PendingOutputPoiContextIntent, PendingWalletReset, PoiCorpusRevision,
-    PoiMaintenanceController, PoiRpcClient, RwLock, SharedLogBatch, WalletActorState,
-    WalletBackfillDoneOutcome, WalletBackfillGrant, WalletBackfillRejectReason, WalletCacheError,
-    WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletHandle,
-    WalletLiveMetadataFlush, WalletPendingSpentMarkOutcome, WalletPersistState,
+    MerkleForest, PendingOutputPoiContextIntent, PendingOutputPoiTentativeAttemptTracker,
+    PendingWalletReset, PoiCorpusRevision, PoiMaintenanceController, PoiMaintenanceOutcome,
+    PoiRemoteJobKey, PoiRpcClient, PublicPoiCorpusHandle, RwLock, SenderCandidateRecoveryReport,
+    SharedLogBatch, WalletActorCredential, WalletActorState, WalletBackfillDoneOutcome,
+    WalletBackfillGrant, WalletBackfillRejectReason, WalletCacheError, WalletCacheStore,
+    WalletCheckpointMutation, WalletConfig, WalletHandle, WalletLiveMetadataFlush,
+    WalletObservationPublisher, WalletPendingSpentMarkOutcome, WalletPersistState,
     WalletPoiJobTracker, WalletPoiRefreshSelection, WalletPoiRuntime,
     WalletPoiStatusRefreshCommitRequest, WalletPrivateApplyClient, WalletPrivateApplyRequest,
     WalletPrivateMutationAuthority, WalletPrivateRequest, WalletPrivateRequestError,
@@ -59,6 +62,9 @@ pub(super) struct WalletActorLoop<'a> {
     pub(super) last_poi_corpus_revision: PoiCorpusRevision,
     pub(super) blocked_shield_refresh_pending: bool,
     pub(super) poi_status_client: Option<&'a PoiRpcClient>,
+    pub(super) maintenance_observation: Arc<WalletObservationPublisher>,
+    pub(super) pending_output_poi_tentative_attempts: PendingOutputPoiTentativeAttemptTracker,
+    pub(super) poi_corpus_handle: Option<PublicPoiCorpusHandle>,
 }
 
 /// What the pre-ready POI status refresh did, for the backfill completion log.
@@ -569,6 +575,130 @@ impl WalletActorLoop<'_> {
         }
     }
 
+    /// Applies a remote job's result that re-entered the actor.
+    pub(super) async fn handle_remote_done(&mut self, done: WalletRemoteDone) {
+        match done {
+            WalletRemoteDone::PoiMaintenance {
+                credential,
+                key,
+                outcome,
+            } => {
+                self.handle_poi_maintenance_outcome(credential, key, *outcome)
+                    .await;
+            }
+            WalletRemoteDone::PoiMaintenanceAborted {
+                credential,
+                key,
+                reason,
+            } => self.handle_poi_maintenance_aborted(credential, key, reason),
+            WalletRemoteDone::PendingOutputPoiTentative { credential, result } => {
+                self.handle_tentative_pending_output_poi_result(credential, result)
+                    .await;
+            }
+        }
+    }
+
+    /// Applies a finished maintenance job's result, unless a newer actor owns the wallet.
+    async fn handle_poi_maintenance_outcome(
+        &mut self,
+        credential: WalletActorCredential,
+        key: PoiRemoteJobKey,
+        outcome: PoiMaintenanceOutcome,
+    ) {
+        // Always complete phase first (may start deferred force follow-up).
+        self.on_poi_maintenance_done(key);
+        if !credential.is_current(&self.worker_handle) {
+            debug!(
+                cache_key = %self.cfg.cache_key,
+                ?key,
+                "stale poi maintenance result dropped"
+            );
+            return;
+        }
+        if outcome.recovered > 0 {
+            let authority = WalletPrivateMutationAuthority::new(
+                &self.worker_handle,
+                self.actor_state.reset_generation(),
+                &self.cancel,
+            );
+            authority
+                .notify_changed_if(true, "poi_maintenance_remote_done")
+                .await;
+        }
+        let candidate_report_is_current =
+            self.publish_ppoi_workflow_status_for_report(&outcome.candidate_report);
+        if let Some(error) = outcome.recovery_error.as_ref() {
+            warn!(
+                ?error,
+                cache_key = %self.cfg.cache_key,
+                "wallet POI remote maintenance completed with candidate recovery error"
+            );
+        }
+        log_poi_maintenance_outcome(&self.cfg.cache_key, &outcome, candidate_report_is_current);
+    }
+
+    /// Publishes the PPOI workflow status, refined by `candidate_report` when the report
+    /// still matches the durable candidates. Returns whether it did.
+    fn publish_ppoi_workflow_status_for_report(
+        &self,
+        candidate_report: &SenderCandidateRecoveryReport,
+    ) -> bool {
+        let published = self.maintenance_observation.ppoi_workflow_status();
+        let candidate_report_is_current = self
+            .cache_store
+            .list_sender_transaction_candidates(self.cfg.chain.chain_id, &self.cfg.cache_key)
+            .is_ok_and(|candidates| {
+                candidate_report.matches_candidates(&candidates)
+                    && candidate_report
+                        .matches_pending_contexts(self.cache_store.as_ref(), &self.cfg)
+                        .unwrap_or(false)
+            });
+        let refined = if candidate_report_is_current {
+            current_ppoi_workflow_status_for_candidate_report(
+                self.cache_store.as_ref(),
+                &self.cfg,
+                &self.active_poi_list_keys,
+                published,
+                candidate_report,
+            )
+        } else {
+            None
+        };
+        let workflow_status = refined.unwrap_or_else(|| {
+            let mut status = published;
+            if status.awaiting_recovery == 0 {
+                status.awaiting_public_txid_data = 0;
+                status.awaiting_poi_data = 0;
+                status.retrying_recovery = 0;
+                status.recovery_needs_attention = 0;
+            }
+            status
+        });
+        self.maintenance_observation
+            .publish_ppoi_workflow_status(workflow_status);
+        candidate_report_is_current
+    }
+
+    fn handle_poi_maintenance_aborted(
+        &mut self,
+        credential: WalletActorCredential,
+        key: PoiRemoteJobKey,
+        reason: &'static str,
+    ) {
+        self.on_poi_maintenance_done(key);
+        if credential.is_current(&self.worker_handle) {
+            warn!(
+                category = reason,
+                "wallet POI maintenance aborted before completion"
+            );
+        } else {
+            debug!(
+                category = reason,
+                "stale wallet POI maintenance abort dropped"
+            );
+        }
+    }
+
     /// Commits a private POI delta that a remote job sent back to the actor.
     pub(super) async fn handle_private_apply(&self, apply_req: WalletPrivateApplyRequest) {
         let WalletPrivateApplyRequest {
@@ -687,4 +817,40 @@ impl WalletActorLoop<'_> {
         };
         let _ = reply.send(result);
     }
+}
+
+/// Logs a finished maintenance job's results.
+fn log_poi_maintenance_outcome(
+    cache_key: &str,
+    outcome: &PoiMaintenanceOutcome,
+    candidate_report_is_current: bool,
+) {
+    let candidate_report = &outcome.candidate_report;
+    debug!(
+        cache_key = %cache_key,
+        recovered = outcome.recovered,
+        candidate_materialized = candidate_report.materialized,
+        candidate_retired_locally_valid = candidate_report.retired_locally_valid,
+        candidate_awaiting_public_txid_data = candidate_report.awaiting_public_txid_data,
+        candidate_awaiting_poi_data = candidate_report.awaiting_poi_data,
+        candidate_retrying = candidate_report.retrying,
+        candidate_needs_attention = candidate_report.needs_attention,
+        candidate_covered_by_pending_contexts = candidate_report.covered_by_pending_contexts,
+        candidate_stale_revision_skips = candidate_report.stale_revision_skips,
+        candidate_unshield_awaiting_validation = candidate_report.unshield_awaiting_validation,
+        candidate_unshields_validated = candidate_report.unshields_validated,
+        candidate_report_is_current,
+        forced_pending_attempts = outcome.forced_pending_attempts,
+        submitted = outcome.submitted,
+        verified_completed = outcome.verified_completed,
+        verified_pending = outcome.verified_pending,
+        verified_errors = outcome.verified_errors,
+        candidate_recovery_succeeded = candidate_report_is_current
+            && outcome.recovery_error.is_none()
+            && candidate_report.awaiting_public_txid_data == 0
+            && candidate_report.awaiting_poi_data == 0
+            && candidate_report.retrying == 0
+            && candidate_report.needs_attention == 0,
+        "wallet POI remote maintenance complete"
+    );
 }

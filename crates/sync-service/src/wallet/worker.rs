@@ -76,8 +76,7 @@ use output_poi::{
     refresh_tentative_pending_output_poi_statuses, spawn_pending_output_poi_tentative_job,
 };
 use poi_maintenance::{
-    PoiMaintenanceOutcome, current_ppoi_workflow_status_for_candidate_report,
-    next_poi_corpus_revision, wallet_poi_refresh_interval,
+    PoiMaintenanceOutcome, next_poi_corpus_revision, wallet_poi_refresh_interval,
 };
 
 const fn wallet_private_request_error(
@@ -421,7 +420,7 @@ pub(crate) async fn prepare_wallet_worker(
         let private_apply = WalletPrivateApplyClient::new(private_apply_tx);
         let poi_maintenance = PoiMaintenanceController::new();
         // Tentative attempts are actor-lifetime only; safe-head maintenance never consults this set.
-        let mut pending_output_poi_tentative_attempts =
+        let pending_output_poi_tentative_attempts =
             PendingOutputPoiTentativeAttemptTracker::default();
         let mut actor = WalletActorLoop {
             cfg,
@@ -456,6 +455,9 @@ pub(crate) async fn prepare_wallet_worker(
             last_poi_corpus_revision,
             blocked_shield_refresh_pending,
             poi_status_client,
+            maintenance_observation,
+            pending_output_poi_tentative_attempts,
+            poi_corpus_handle,
         };
         if actor.actor_state.pending_reset().is_some() && actor.try_drive_pending_reset(&mut live_rx, false).await.is_some() {
             signal_restored_reset_attempt(&mut startup_replay_tx);
@@ -507,7 +509,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     |mut state| state.observe_poi_corpus_revision(true),
                                 );
                             }
-                            let _revision_fence = match poi_corpus_handle.as_ref() {
+                            let _revision_fence = match actor.poi_corpus_handle.as_ref() {
                                 Some(corpus) => Some(corpus.revision_read_fence().await),
                                 None => None,
                             };
@@ -599,177 +601,7 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                 }
                 Some(apply_req) = private_apply_rx.recv() => actor.handle_private_apply(apply_req).await,
-                Some(done) = remote_done_rx.recv() => {
-                    match done {
-                        WalletRemoteDone::PoiMaintenance {
-                            credential,
-                            key,
-                            outcome,
-                        } => {
-                            let PoiMaintenanceOutcome {
-                                recovered,
-                                candidate_report,
-                                recovery_error,
-                                forced_pending_attempts,
-                                submitted,
-                                verified_completed,
-                                verified_pending,
-                                verified_errors,
-                            } = *outcome;
-                            // Always complete phase first (may start deferred force follow-up).
-                            actor.on_poi_maintenance_done(key);
-                            if !credential.is_current(&actor.worker_handle) {
-                                debug!(
-                                    cache_key = %actor.cfg.cache_key,
-                                    ?key,
-                                    "stale poi maintenance result dropped"
-                                );
-                                continue;
-                            }
-                            if recovered > 0 {
-                                let authority = WalletPrivateMutationAuthority::new(
-                                    &actor.worker_handle,
-                                    actor.actor_state.reset_generation(),
-                                    &actor.cancel,
-                                );
-                                authority
-                                    .notify_changed_if(true, "poi_maintenance_remote_done")
-                                    .await;
-                            }
-                            let published = maintenance_observation.ppoi_workflow_status();
-                            let candidate_report_is_current = actor.cache_store
-                                .list_sender_transaction_candidates(
-                                    actor.cfg.chain.chain_id,
-                                    &actor.cfg.cache_key,
-                                )
-                                .is_ok_and(|candidates| {
-                                    candidate_report.matches_candidates(&candidates)
-                                        && candidate_report.matches_pending_contexts(actor.cache_store.as_ref(), &actor.cfg).unwrap_or(false)
-                                });
-                            let refined = if candidate_report_is_current {
-                                current_ppoi_workflow_status_for_candidate_report(
-                                    actor.cache_store.as_ref(),
-                                    &actor.cfg,
-                                    &actor.active_poi_list_keys,
-                                    published,
-                                    &candidate_report,
-                                )
-                            } else {
-                                None
-                            };
-                            let workflow_status = refined.unwrap_or_else(|| {
-                                let mut status = published;
-                                if status.awaiting_recovery == 0 {
-                                    status.awaiting_public_txid_data = 0;
-                                    status.awaiting_poi_data = 0;
-                                    status.retrying_recovery = 0;
-                                    status.recovery_needs_attention = 0;
-                                }
-                                status
-                            });
-                            maintenance_observation.publish_ppoi_workflow_status(workflow_status);
-                            if let Some(error) = recovery_error.as_ref() {
-                                warn!(
-                                    ?error,
-                                    cache_key = %actor.cfg.cache_key,
-                                    "wallet POI remote maintenance completed with candidate recovery error"
-                                );
-                            }
-                            debug!(
-                                cache_key = %actor.cfg.cache_key,
-                                recovered,
-                                candidate_materialized = candidate_report.materialized,
-                                candidate_retired_locally_valid = candidate_report.retired_locally_valid,
-                                candidate_awaiting_public_txid_data = candidate_report.awaiting_public_txid_data,
-                                candidate_awaiting_poi_data = candidate_report.awaiting_poi_data,
-                                candidate_retrying = candidate_report.retrying,
-                                candidate_needs_attention = candidate_report.needs_attention,
-                                candidate_covered_by_pending_contexts =
-                                    candidate_report.covered_by_pending_contexts,
-                                candidate_stale_revision_skips =
-                                    candidate_report.stale_revision_skips,
-                                candidate_unshield_awaiting_validation =
-                                    candidate_report.unshield_awaiting_validation,
-                                candidate_unshields_validated =
-                                    candidate_report.unshields_validated,
-                                candidate_report_is_current,
-                                forced_pending_attempts,
-                                submitted,
-                                verified_completed,
-                                verified_pending,
-                                verified_errors,
-                                candidate_recovery_succeeded = candidate_report_is_current
-                                    && recovery_error.is_none()
-                                    && candidate_report.awaiting_public_txid_data == 0
-                                    && candidate_report.awaiting_poi_data == 0
-                                    && candidate_report.retrying == 0
-                                    && candidate_report.needs_attention == 0,
-                                "wallet POI remote maintenance complete"
-                            );
-                        }
-                        WalletRemoteDone::PoiMaintenanceAborted {
-                            credential,
-                            key,
-                            reason,
-                        } => {
-                            actor.on_poi_maintenance_done(key);
-                            if credential.is_current(&actor.worker_handle) {
-                                warn!(
-                                    category = reason,
-                                    "wallet POI maintenance aborted before completion"
-                                );
-                            } else {
-                                debug!(
-                                    category = reason,
-                                    "stale wallet POI maintenance abort dropped"
-                                );
-                            }
-                        }
-                        WalletRemoteDone::PendingOutputPoiTentative {
-                            credential,
-                            result,
-                        } => {
-                            let PendingOutputPoiTentativeSubmissionResult {
-                                succeeded: _,
-                                accepted_candidates,
-                                retryable,
-                                accepted,
-                                missing_txid,
-                                remote_failure,
-                                context_stale,
-                                authority_stale: _authority_stale,
-                            } = result;
-                            if !credential.is_current(&actor.worker_handle) {
-                                debug!("stale tentative pending output POI result dropped");
-                                continue;
-                            }
-                            pending_output_poi_tentative_attempts
-                                .accept(credential.reset_generation, &accepted_candidates);
-                            pending_output_poi_tentative_attempts
-                                .release_retryable(credential.reset_generation, &retryable);
-                            if !accepted_candidates.is_empty() {
-                                refresh_tentative_pending_output_poi_statuses(
-                                    &actor.worker_handle,
-                                    &actor.cancel,
-                                    poi_corpus_handle.as_ref(),
-                                    &actor.cfg,
-                                    &actor.active_poi_list_keys,
-                                    credential.reset_generation,
-                                    &mut pending_output_poi_tentative_attempts,
-                                )
-                                .await;
-                            }
-                            info!(
-                                accepted,
-                                missing_txid,
-                                remote_failure,
-                                context_stale,
-                                retryable = retryable.len(),
-                                "tentative pending output POI submission complete"
-                            );
-                        }
-                    }
-                }
+                Some(done) = remote_done_rx.recv() => actor.handle_remote_done(done).await,
                 _ = pending_reset_retry.tick(), if actor.actor_state.pending_reset().is_some() => {
                     if let Some(outcome) = actor.try_drive_pending_reset(&mut live_rx, true).await {
                         debug!(?outcome.rewind, cache_key = %actor.cfg.cache_key, "wallet pending reset retry completed");
@@ -942,7 +774,7 @@ pub(crate) async fn prepare_wallet_worker(
                         );
                         continue;
                     }
-                    pending_output_poi_tentative_attempts
+                    actor.pending_output_poi_tentative_attempts
                         .clear_generation(current_reset_generation);
                     let authority = WalletPrivateMutationAuthority::new(
                         &actor.worker_handle,
@@ -974,7 +806,7 @@ pub(crate) async fn prepare_wallet_worker(
                     let mut tentative_observations = Vec::new();
                     let mut overlay = match request.update {
                         WalletPendingOverlayUpdate::Clear => {
-                            pending_output_poi_tentative_attempts.clear();
+                            actor.pending_output_poi_tentative_attempts.clear();
                             WalletPendingOverlay::default()
                         }
                         WalletPendingOverlayUpdate::PublicRows(rows) => {
@@ -992,7 +824,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 WalletScanRowsPayload::IndexedDeltaForTest { delta } => *delta,
                             };
                             tentative_observations = delta.commitment_observations.clone();
-                            pending_output_poi_tentative_attempts.prune_for_observations(
+                            actor.pending_output_poi_tentative_attempts.prune_for_observations(
                                 actor.actor_state.reset_generation(),
                                 &tentative_observations,
                             );
@@ -1015,7 +847,7 @@ pub(crate) async fn prepare_wallet_worker(
                             pending_overlay_from_delta(&actor.cfg, &confirmed, delta)
                         }
                     };
-                    pending_output_poi_tentative_attempts.apply_to_overlay(
+                    actor.pending_output_poi_tentative_attempts.apply_to_overlay(
                         actor.actor_state.reset_generation(),
                         &mut overlay,
                         now_epoch_secs(),
@@ -1058,7 +890,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     let reserved = candidates
                                         .into_iter()
                                         .filter(|candidate| {
-                                            pending_output_poi_tentative_attempts.reserve(
+                                            actor.pending_output_poi_tentative_attempts.reserve(
                                                 actor.actor_state.reset_generation(),
                                                 candidate.clone(),
                                             )
@@ -1107,7 +939,7 @@ pub(crate) async fn prepare_wallet_worker(
                             );
                         },
                     );
-                    let _revision_fence = match poi_corpus_handle.as_ref() {
+                    let _revision_fence = match actor.poi_corpus_handle.as_ref() {
                         Some(corpus) => Some(corpus.revision_read_fence().await),
                         None => None,
                     };
@@ -1117,11 +949,11 @@ pub(crate) async fn prepare_wallet_worker(
                     refresh_tentative_pending_output_poi_statuses(
                         &actor.worker_handle,
                         &actor.cancel,
-                        poi_corpus_handle.as_ref(),
+                        actor.poi_corpus_handle.as_ref(),
                         &actor.cfg,
                         &actor.active_poi_list_keys,
                         actor.actor_state.reset_generation(),
-                        &mut pending_output_poi_tentative_attempts,
+                        &mut actor.pending_output_poi_tentative_attempts,
                     )
                     .await;
                     let _ = actor.actor_state.transition_active(
@@ -1217,7 +1049,7 @@ pub(crate) async fn prepare_wallet_worker(
                             != actor.last_poi_corpus_revision.blocked_shields_revision;
                         actor.last_poi_corpus_revision = revision;
                     }
-                    let _revision_fence = match poi_corpus_handle.as_ref() {
+                    let _revision_fence = match actor.poi_corpus_handle.as_ref() {
                         Some(corpus) => Some(corpus.revision_read_fence().await),
                         None => None,
                     };
@@ -1555,7 +1387,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 WalletBackfillDoneOutcome::Finished {
                                     poi_corpus_revision,
                                 } => {
-                                    let _revision_fence = match poi_corpus_handle.as_ref() {
+                                    let _revision_fence = match actor.poi_corpus_handle.as_ref() {
                                         Some(corpus) => Some(corpus.revision_read_fence().await),
                                         None => None,
                                     };
@@ -1745,7 +1577,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 Ok(Ok(())) => {
                                     actor.accepted_backfill_liveness.clear();
                                     actor.accepted_indexed_job_liveness.clear();
-                                    pending_output_poi_tentative_attempts.clear();
+                                    actor.pending_output_poi_tentative_attempts.clear();
                                 }
                                 Ok(Err(err)) => {
                                     warn!(?err, cache_key = %actor.cfg.cache_key, intent_id, from_block, "failed to persist wallet reset acceptance");
