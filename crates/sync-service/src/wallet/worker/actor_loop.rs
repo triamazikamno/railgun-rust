@@ -65,6 +65,9 @@ pub(super) struct WalletActorLoop<'a> {
     pub(super) maintenance_observation: Arc<WalletObservationPublisher>,
     pub(super) pending_output_poi_tentative_attempts: PendingOutputPoiTentativeAttemptTracker,
     pub(super) poi_corpus_handle: Option<PublicPoiCorpusHandle>,
+    /// Live log batches; a committed reset rewind replaces the subscription.
+    pub(super) live_rx: broadcast::Receiver<SharedLogBatch>,
+    pub(super) poi_corpus_revision_rx: Option<watch::Receiver<PoiCorpusRevision>>,
 }
 
 /// What the pre-ready POI status refresh did, for the backfill completion log.
@@ -153,11 +156,9 @@ impl WalletActorLoop<'_> {
     }
 
     /// Reads the latest committed PPOI corpus revision and records what changed.
-    fn observe_poi_corpus_revision(
-        &mut self,
-        revision_rx: &mut watch::Receiver<PoiCorpusRevision>,
-    ) -> PoiCorpusRevision {
-        let revision = *revision_rx.borrow_and_update();
+    /// Returns `None` when the wallet has no corpus revision feed.
+    fn observe_poi_corpus_revision(&mut self) -> Option<PoiCorpusRevision> {
+        let revision = *self.poi_corpus_revision_rx.as_mut()?.borrow_and_update();
         let _ =
             self.actor_state
                 .transition_active(&self.worker_handle, &self.cancel, |mut state| {
@@ -166,7 +167,7 @@ impl WalletActorLoop<'_> {
         self.blocked_shield_refresh_pending |= revision.blocked_shields_revision
             != self.last_poi_corpus_revision.blocked_shields_revision;
         self.last_poi_corpus_revision = revision;
-        revision
+        Some(revision)
     }
 
     /// Finishes a backfill job: persists owed progress, refreshes POI statuses before
@@ -174,7 +175,6 @@ impl WalletActorLoop<'_> {
     /// requests POI maintenance.
     pub(super) async fn apply_backfill_done(
         &mut self,
-        poi_corpus_revision_rx: &mut Option<watch::Receiver<PoiCorpusRevision>>,
         last_block: u64,
         job_token: WalletSyncToken,
     ) -> WalletBackfillDoneOutcome {
@@ -186,7 +186,7 @@ impl WalletActorLoop<'_> {
             return WalletBackfillDoneOutcome::Rejected(reason);
         }
         let pre_ready = self
-            .refresh_poi_statuses_before_ready(poi_corpus_revision_rx, current_reset_generation)
+            .refresh_poi_statuses_before_ready(current_reset_generation)
             .await;
         if let Some(reason) = pre_ready.rejection {
             return WalletBackfillDoneOutcome::Rejected(reason);
@@ -216,7 +216,8 @@ impl WalletActorLoop<'_> {
             let _ = self.request_poi_maintenance(false);
         }
         WalletBackfillDoneOutcome::Finished {
-            poi_corpus_revision: poi_corpus_revision_rx
+            poi_corpus_revision: self
+                .poi_corpus_revision_rx
                 .as_ref()
                 .map(|_| self.last_poi_corpus_revision),
         }
@@ -281,14 +282,11 @@ impl WalletActorLoop<'_> {
     /// rejecting completion when the PPOI corpus moved underneath the refresh.
     async fn refresh_poi_statuses_before_ready(
         &mut self,
-        poi_corpus_revision_rx: &mut Option<watch::Receiver<PoiCorpusRevision>>,
         current_reset_generation: u64,
     ) -> PreReadyPoiRefresh {
         let mut pre_ready = PreReadyPoiRefresh::default();
         if self.poi_status_client.is_some() {
-            if let Some(revision_rx) = poi_corpus_revision_rx.as_mut() {
-                self.observe_poi_corpus_revision(revision_rx);
-            }
+            self.observe_poi_corpus_revision();
             let refresh_revision = self.last_poi_corpus_revision;
             let pre_ready_selection = self.pre_ready_poi_refresh_selection();
             if self
@@ -302,8 +300,9 @@ impl WalletActorLoop<'_> {
                 )
                 .await;
             }
-            if let Some(revision_rx) = poi_corpus_revision_rx.as_mut()
-                && self.observe_poi_corpus_revision(revision_rx) != refresh_revision
+            if self
+                .observe_poi_corpus_revision()
+                .is_some_and(|revision| revision != refresh_revision)
             {
                 pre_ready.rejection = Some(WalletBackfillRejectReason::ApplyFailed);
             }
@@ -401,7 +400,6 @@ impl WalletActorLoop<'_> {
     /// no reset is pending.
     pub(super) async fn try_drive_pending_reset(
         &mut self,
-        live_rx: &mut broadcast::Receiver<SharedLogBatch>,
         admit_replay: bool,
     ) -> Option<WalletResetCommitOutcome> {
         let pending = self.actor_state.pending_reset()?;
@@ -433,7 +431,7 @@ impl WalletActorLoop<'_> {
             if rewind_was_pending {
                 self.readiness_started = Instant::now();
                 self.backfill_complete_block = None;
-                *live_rx = live_rx.resubscribe();
+                self.live_rx = self.live_rx.resubscribe();
             }
 
             if admit_replay && self.actor_state.pending_reset_replay_admitted().is_none() {
