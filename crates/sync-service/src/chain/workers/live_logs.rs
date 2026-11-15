@@ -12,348 +12,349 @@ use super::{
     WalletScanRowsPayload, debug, min, sort_logs, warn, watch,
 };
 
+/// State the live log task works with across loop iterations.
+struct LiveLogLoop {
+    service: Arc<ChainService>,
+    rpcs: Arc<QueryRpcPool>,
+    archive_provider: Option<DynProvider>,
+    forest_last_rx: watch::Receiver<u64>,
+    safe_head_rx: watch::Receiver<u64>,
+    snapshot_path: PathBuf,
+    cancel: CancellationToken,
+    sources: IndexedForestSources,
+    stall: ForestStallTracker,
+    /// At most one far-behind attempt runs. Its slot is cleared when its
+    /// result is taken, so a finished handle is never polled again.
+    attempt: Option<FarBehindAttempt>,
+    /// A finished attempt's candidate, installed only after a conclusive
+    /// reorg check: one that confirms the stored forest block hash or
+    /// finds none to compare.
+    pending: Option<ForestCandidate>,
+}
+
 pub(in crate::chain) fn spawn_live_log_loop(
     service: Arc<ChainService>,
     rpcs: Arc<QueryRpcPool>,
     archive_provider: Option<DynProvider>,
-    mut forest_last_rx: watch::Receiver<u64>,
-    mut safe_head_rx: watch::Receiver<u64>,
+    forest_last_rx: watch::Receiver<u64>,
+    safe_head_rx: watch::Receiver<u64>,
     snapshot_path: PathBuf,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(
-        async move {
-            let chain_id = service.chain.deployment.chain_id;
-            let sources = IndexedForestSources::of(&service.chain);
-            let mut stall = ForestStallTracker::new(wallet_tail_fallback_stale_timeout(
-                service.chain.block_time,
-            ));
-            // At most one far-behind attempt runs. Its slot is cleared when its
-            // result is taken, so a finished handle is never polled again.
-            let mut attempt: Option<FarBehindAttempt> = None;
-            // A finished attempt's candidate, installed only after a conclusive
-            // reorg check: one that confirms the stored forest block hash or
-            // finds none to compare.
-            let mut pending: Option<ForestCandidate> = None;
-            loop {
-                let forest_block = *forest_last_rx.borrow();
-                let safe_head = *safe_head_rx.borrow();
-                stall.observe(
-                    forest_block,
-                    safe_head,
-                    service.chain.live_forest_lag(forest_block, safe_head),
-                    tokio::time::Instant::now(),
-                );
-                // A running attempt wakes the loop when it finishes, and no
-                // other attempt starts before then.
-                let attempt_deadline = if attempt.is_none() {
-                    stall.deadline(sources)
-                } else {
-                    None
-                };
-                let finished = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => break,
-                    result = far_behind_attempt_finished(&mut attempt) => {
-                        attempt.take().map(|finished| (finished, result))
-                    }
-                    _ = safe_head_rx.changed() => None,
-                    _ = forest_last_rx.changed() => None,
-                    () = sleep_until_stall_deadline(attempt_deadline) => None,
-                };
-                if let Some((finished, result)) = finished {
-                    let (candidate, finished_at) =
-                        far_behind_attempt_result(chain_id, &finished, result);
-                    stall.finish_far_behind_attempt(finished_at);
-                    if let Some(candidate) = candidate
-                        && let Some(old) = pending.replace(candidate)
-                    {
-                        log_far_behind_result(
-                            chain_id,
-                            *forest_last_rx.borrow(),
-                            old.target,
-                            "superseded",
-                        );
-                    }
-                }
+    let sources = IndexedForestSources::of(&service.chain);
+    let stall =
+        ForestStallTracker::new(wallet_tail_fallback_stale_timeout(service.chain.block_time));
+    let live_loop = LiveLogLoop {
+        service,
+        rpcs,
+        archive_provider,
+        forest_last_rx,
+        safe_head_rx,
+        snapshot_path,
+        cancel,
+        sources,
+        stall,
+        attempt: None,
+        pending: None,
+    };
+    tokio::spawn(live_loop.run().instrument(tracing::info_span!("sync_live")))
+}
 
-                let safe_head = *safe_head_rx.borrow();
-                if safe_head == 0 && service.chain.deployment.deployment_block > 0 {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
-                    }
-                    continue;
+impl LiveLogLoop {
+    async fn run(mut self) {
+        let chain_id = self.service.chain.deployment.chain_id;
+        loop {
+            let forest_block = *self.forest_last_rx.borrow();
+            let safe_head = *self.safe_head_rx.borrow();
+            self.stall.observe(
+                forest_block,
+                safe_head,
+                self.service.chain.live_forest_lag(forest_block, safe_head),
+                tokio::time::Instant::now(),
+            );
+            // A running attempt wakes the loop when it finishes, and no
+            // other attempt starts before then.
+            let attempt_deadline = if self.attempt.is_none() {
+                self.stall.deadline(self.sources)
+            } else {
+                None
+            };
+            let finished = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => break,
+                result = far_behind_attempt_finished(&mut self.attempt) => {
+                    self.attempt.take().map(|finished| (finished, result))
                 }
-                let last_processed = *forest_last_rx.borrow();
-                let now = tokio::time::Instant::now();
-                stall.observe(
-                    last_processed,
-                    safe_head,
-                    service.chain.live_forest_lag(last_processed, safe_head),
-                    now,
-                );
-                if last_processed >= safe_head {
-                    if let Some(candidate) = pending.take() {
-                        log_far_behind_result(
-                            chain_id,
-                            last_processed,
-                            candidate.target,
-                            "forest_at_safe_head",
-                        );
-                    }
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
-                    }
-                    continue;
+                _ = self.safe_head_rx.changed() => None,
+                _ = self.forest_last_rx.changed() => None,
+                () = sleep_until_stall_deadline(attempt_deadline) => None,
+            };
+            if let Some((finished, result)) = finished {
+                let (candidate, finished_at) =
+                    far_behind_attempt_result(chain_id, &finished, result);
+                self.stall.finish_far_behind_attempt(finished_at);
+                if let Some(candidate) = candidate
+                    && let Some(old) = self.pending.replace(candidate)
+                {
+                    log_far_behind_result(
+                        chain_id,
+                        *self.forest_last_rx.borrow(),
+                        old.target,
+                        "superseded",
+                    );
                 }
-                // The reorg check runs before any indexed attempt starts. A
-                // far-behind install or a stall fallback needs a conclusive
-                // check: one that confirms the stored forest block hash or
-                // finds none to compare. An attempt may still start after an
-                // inconclusive check, and a later rewind aborts it and
-                // discards its result.
-                let rpc = rpcs.random_provider();
-                let reorg_check_conclusive = if let Some(rpc) = rpc.as_ref() {
-                    let reorg_check = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = service.check_forest_reorg(
-                            &rpc.provider,
-                            archive_provider.as_ref(),
-                            rpc.index,
-                            &snapshot_path,
-                            safe_head,
-                            last_processed,
-                        ) => result,
-                    };
-                    let conclusive = match reorg_check {
-                        Ok(
-                            ForestMetaCheck::Match
-                            | ForestMetaCheck::Unchecked
-                            | ForestMetaCheck::StaleMeta,
-                        ) => true,
-                        Ok(ForestMetaCheck::Mismatch { .. }) => {
-                            // The rewind invalidates whatever an attempt built on.
-                            if abort_far_behind_attempt(&mut attempt).await {
-                                stall.finish_far_behind_attempt(tokio::time::Instant::now());
-                                debug!(
-                                    chain_id,
-                                    forest_block = last_processed,
-                                    cooldown_ms = INDEXED_TAIL_FALLBACK_COOLDOWN.as_millis(),
-                                    "far-behind live forest catch-up aborted by a reorg rewind"
-                                );
-                            }
-                            if let Some(candidate) = pending.take() {
-                                log_far_behind_result(
-                                    chain_id,
-                                    last_processed,
-                                    candidate.target,
-                                    "reorg_reset",
-                                );
-                            }
-                            true
-                        }
-                        // `check_forest_reorg` already logs the missing hash.
-                        Ok(ForestMetaCheck::Unconfirmed) => false,
-                        Err(err) => {
-                            debug!(
-                                err = %err.without_url(),
-                                rpc_index = rpc.index,
-                                "reorg check failed"
-                            );
-                            false
-                        }
-                    };
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    conclusive
-                } else {
-                    false
-                };
-                if reorg_check_conclusive && let Some(candidate) = pending.take() {
-                    let target = candidate.target;
-                    let progress = ForestProgressReporter::new(service.chain.progress_tx.as_ref());
-                    let outcome = install_live_forest_candidate(
-                        &service,
-                        &snapshot_path,
-                        candidate,
-                        &progress,
-                        LiveForestProgressCause::IndexedInstall,
-                    )
-                    .await;
-                    log_far_behind_result(chain_id, last_processed, target, outcome.as_str());
-                    if outcome == LiveForestInstall::Installed {
-                        continue;
-                    }
-                }
-                let last_processed = *forest_last_rx.borrow();
-                if last_processed >= safe_head {
-                    continue;
-                }
-                if attempt.is_none() {
-                    match stall.due(now, sources, rpc.is_some()) {
-                        Some(IndexedForestTrigger::FarBehind) => {
-                            // Live RPC paging below continues while it runs.
-                            attempt = Some(
-                                spawn_far_behind_attempt(
-                                    &service,
-                                    rpc.as_ref(),
-                                    archive_provider.as_ref(),
-                                    last_processed,
-                                    safe_head,
-                                )
-                                .await,
-                            );
-                        }
-                        Some(IndexedForestTrigger::Stall) if !reorg_check_conclusive => {
-                            // Retry after another stall period; live RPC
-                            // paging below continues meanwhile.
-                            stall.defer_next_attempt(tokio::time::Instant::now());
-                            debug!(
-                                forest_block = last_processed,
-                                safe_head,
-                                "live merkle forest stall fallback deferred after an inconclusive reorg check"
-                            );
-                        }
-                        Some(IndexedForestTrigger::Stall) => {
-                            let stalled_ms = stall.stalled_for(now).as_millis();
-                            let installed = tokio::select! {
-                                () = cancel.cancelled() => break,
-                                installed = run_live_squid_forest_fallback(
-                                    &service,
-                                    rpc.as_ref(),
-                                    archive_provider.as_ref(),
-                                    &snapshot_path,
-                                    last_processed,
-                                    safe_head,
-                                ) => installed,
-                            };
-                            let outcome = if installed.is_some() {
-                                "applied"
-                            } else {
-                                stall.defer_next_attempt(tokio::time::Instant::now());
-                                "not_applied"
-                            };
-                            debug!(
-                                stalled_ms,
-                                forest_block = last_processed,
-                                safe_head,
-                                target = ?installed,
-                                outcome,
-                                "live merkle forest stall fallback to Squid finished"
-                            );
-                            continue;
-                        }
-                        None => {}
-                    }
-                }
-                let Some(rpc) = rpc else {
-                    warn!("no healthy rpc providers available");
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(service.chain.sync.poll_interval) => {}
-                    }
-                    continue;
-                };
+            }
 
-                let from_block = last_processed.saturating_add(1);
-                let to_block = min(from_block + service.chain.sync.block_range - 1, safe_head);
-                let read_scope = service.begin_public_scan_read();
-                let logs_result = tokio::select! {
-                    () = cancel.cancelled() => break,
-                    result = service.chain.fetch_logs_for_range(
-                        &rpc,
-                        archive_provider.as_ref(),
-                        from_block,
-                        to_block,
-                        &cancel,
+            let safe_head = *self.safe_head_rx.borrow();
+            if safe_head == 0 && self.service.chain.deployment.deployment_block > 0 {
+                tokio::select! {
+                    () = self.cancel.cancelled() => break,
+                    () = tokio::time::sleep(self.service.chain.sync.poll_interval) => {}
+                }
+                continue;
+            }
+            let last_processed = *self.forest_last_rx.borrow();
+            let now = tokio::time::Instant::now();
+            self.stall.observe(
+                last_processed,
+                safe_head,
+                self.service
+                    .chain
+                    .live_forest_lag(last_processed, safe_head),
+                now,
+            );
+            if last_processed >= safe_head {
+                if let Some(candidate) = self.pending.take() {
+                    log_far_behind_result(
+                        chain_id,
+                        last_processed,
+                        candidate.target,
+                        "forest_at_safe_head",
+                    );
+                }
+                tokio::select! {
+                    () = self.cancel.cancelled() => break,
+                    () = tokio::time::sleep(self.service.chain.sync.poll_interval) => {}
+                }
+                continue;
+            }
+            // The reorg check runs before any indexed attempt starts. A
+            // far-behind install or a stall fallback needs a conclusive
+            // check: one that confirms the stored forest block hash or
+            // finds none to compare. An attempt may still start after an
+            // inconclusive check, and a later rewind aborts it and
+            // discards its result.
+            let rpc = self.rpcs.random_provider();
+            let reorg_check_conclusive = if let Some(rpc) = rpc.as_ref() {
+                let reorg_check = tokio::select! {
+                    () = self.cancel.cancelled() => break,
+                    result = self.service.check_forest_reorg(
+                        &rpc.provider,
+                        self.archive_provider.as_ref(),
+                        rpc.index,
+                        &self.snapshot_path,
+                        safe_head,
+                        last_processed,
                     ) => result,
                 };
-                match logs_result {
-                    Ok(mut logs) => {
-                        sort_logs(&mut logs);
-                        let block_timestamps = if logs.is_empty() {
-                            HashMap::new()
-                        } else {
-                            match tokio::select! {
-                                () = cancel.cancelled() => break,
-                                result = service.chain.fetch_log_block_timestamps(
-                                    &rpc.provider,
-                                    archive_provider.as_ref(),
-                                    &logs,
-                                ) => result,
-                            } {
-                                Ok(block_timestamps) => block_timestamps,
-                                Err(err) => {
-                                    let mark_unhealthy = err.should_mark_rpc_unhealthy();
-                                    warn!(
-                                        err = %err.without_url(),
-                                        rpc_index = rpc.index,
-                                        "failed to fetch log block timestamps"
-                                    );
-                                    if mark_unhealthy {
-                                        rpcs.mark_bad_provider(&rpc);
-                                    }
-                                    continue;
-                                }
-                            }
-                        };
-                        if let Some(archive_endpoint) = service
-                            .chain
-                            .archive_boundary_crossed_by(from_block, to_block)
-                        {
-                            match tokio::select! {
-                                () = cancel.cancelled() => break,
-                                result = service.chain.fetch_block_hash(
-                                    &rpc.provider,
-                                    archive_provider.as_ref(),
-                                    archive_endpoint,
-                                ) => result,
-                            } {
-                                Ok(Some(_)) => {}
-                                Ok(None) => {
-                                    warn!(
-                                        rpc_index = rpc.index,
-                                        archive_endpoint,
-                                        "live RPC range does not prove its archive boundary"
-                                    );
-                                    rpcs.mark_bad_provider(&rpc);
-                                    continue;
-                                }
-                                Err(err) => {
-                                    let mark_unhealthy = err.should_mark_rpc_unhealthy();
-                                    warn!(
-                                        err = %err.without_url(),
-                                        rpc_index = rpc.index,
-                                        archive_endpoint,
-                                        "failed to fetch live RPC archive-boundary hash"
-                                    );
-                                    if mark_unhealthy {
-                                        rpcs.mark_bad_provider(&rpc);
-                                    }
-                                    continue;
-                                }
-                            }
+                let conclusive = match reorg_check {
+                    Ok(
+                        ForestMetaCheck::Match
+                        | ForestMetaCheck::Unchecked
+                        | ForestMetaCheck::StaleMeta,
+                    ) => true,
+                    Ok(ForestMetaCheck::Mismatch { .. }) => {
+                        // The rewind invalidates whatever an attempt built on.
+                        if abort_far_behind_attempt(&mut self.attempt).await {
+                            self.stall
+                                .finish_far_behind_attempt(tokio::time::Instant::now());
+                            debug!(
+                                chain_id,
+                                forest_block = last_processed,
+                                cooldown_ms = INDEXED_TAIL_FALLBACK_COOLDOWN.as_millis(),
+                                "far-behind live forest catch-up aborted by a reorg rewind"
+                            );
                         }
-                        // One read suffices: `to_block` is already `finality_depth`
-                        // deep, and the next iteration's reorg check confirms it.
-                        let to_block_hash = match tokio::select! {
-                            () = cancel.cancelled() => break,
-                            result = service.chain.fetch_block_hash(
+                        if let Some(candidate) = self.pending.take() {
+                            log_far_behind_result(
+                                chain_id,
+                                last_processed,
+                                candidate.target,
+                                "reorg_reset",
+                            );
+                        }
+                        true
+                    }
+                    // `check_forest_reorg` already logs the missing hash.
+                    Ok(ForestMetaCheck::Unconfirmed) => false,
+                    Err(err) => {
+                        debug!(
+                            err = %err.without_url(),
+                            rpc_index = rpc.index,
+                            "reorg check failed"
+                        );
+                        false
+                    }
+                };
+                if self.cancel.is_cancelled() {
+                    break;
+                }
+                conclusive
+            } else {
+                false
+            };
+            if reorg_check_conclusive && let Some(candidate) = self.pending.take() {
+                let target = candidate.target;
+                let progress = ForestProgressReporter::new(self.service.chain.progress_tx.as_ref());
+                let outcome = install_live_forest_candidate(
+                    &self.service,
+                    &self.snapshot_path,
+                    candidate,
+                    &progress,
+                    LiveForestProgressCause::IndexedInstall,
+                )
+                .await;
+                log_far_behind_result(chain_id, last_processed, target, outcome.as_str());
+                if outcome == LiveForestInstall::Installed {
+                    continue;
+                }
+            }
+            let last_processed = *self.forest_last_rx.borrow();
+            if last_processed >= safe_head {
+                continue;
+            }
+            if self.attempt.is_none() {
+                match self.stall.due(now, self.sources, rpc.is_some()) {
+                    Some(IndexedForestTrigger::FarBehind) => {
+                        // Live RPC paging below continues while it runs.
+                        self.attempt = Some(
+                            spawn_far_behind_attempt(
+                                &self.service,
+                                rpc.as_ref(),
+                                self.archive_provider.as_ref(),
+                                last_processed,
+                                safe_head,
+                            )
+                            .await,
+                        );
+                    }
+                    Some(IndexedForestTrigger::Stall) if !reorg_check_conclusive => {
+                        // Retry after another stall period; live RPC
+                        // paging below continues meanwhile.
+                        self.stall.defer_next_attempt(tokio::time::Instant::now());
+                        debug!(
+                            forest_block = last_processed,
+                            safe_head,
+                            "live merkle forest stall fallback deferred after an inconclusive reorg check"
+                        );
+                    }
+                    Some(IndexedForestTrigger::Stall) => {
+                        let stalled_ms = self.stall.stalled_for(now).as_millis();
+                        let installed = tokio::select! {
+                            () = self.cancel.cancelled() => break,
+                            installed = run_live_squid_forest_fallback(
+                                &self.service,
+                                rpc.as_ref(),
+                                self.archive_provider.as_ref(),
+                                &self.snapshot_path,
+                                last_processed,
+                                safe_head,
+                            ) => installed,
+                        };
+                        let outcome = if installed.is_some() {
+                            "applied"
+                        } else {
+                            self.stall.defer_next_attempt(tokio::time::Instant::now());
+                            "not_applied"
+                        };
+                        debug!(
+                            stalled_ms,
+                            forest_block = last_processed,
+                            safe_head,
+                            target = ?installed,
+                            outcome,
+                            "live merkle forest stall fallback to Squid finished"
+                        );
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+            let Some(rpc) = rpc else {
+                warn!("no healthy rpc providers available");
+                tokio::select! {
+                    () = self.cancel.cancelled() => break,
+                    () = tokio::time::sleep(self.service.chain.sync.poll_interval) => {}
+                }
+                continue;
+            };
+
+            let from_block = last_processed.saturating_add(1);
+            let to_block = min(
+                from_block + self.service.chain.sync.block_range - 1,
+                safe_head,
+            );
+            let read_scope = self.service.begin_public_scan_read();
+            let logs_result = tokio::select! {
+                () = self.cancel.cancelled() => break,
+                result = self.service.chain.fetch_logs_for_range(
+                    &rpc,
+                    self.archive_provider.as_ref(),
+                    from_block,
+                    to_block,
+                    &self.cancel,
+                ) => result,
+            };
+            match logs_result {
+                Ok(mut logs) => {
+                    sort_logs(&mut logs);
+                    let block_timestamps = if logs.is_empty() {
+                        HashMap::new()
+                    } else {
+                        match tokio::select! {
+                            () = self.cancel.cancelled() => break,
+                            result = self.service.chain.fetch_log_block_timestamps(
                                 &rpc.provider,
-                                archive_provider.as_ref(),
-                                to_block,
+                                self.archive_provider.as_ref(),
+                                &logs,
                             ) => result,
                         } {
-                            Ok(Some(hash)) => Some(hash),
+                            Ok(block_timestamps) => block_timestamps,
+                            Err(err) => {
+                                let mark_unhealthy = err.should_mark_rpc_unhealthy();
+                                warn!(
+                                    err = %err.without_url(),
+                                    rpc_index = rpc.index,
+                                    "failed to fetch log block timestamps"
+                                );
+                                if mark_unhealthy {
+                                    self.rpcs.mark_bad_provider(&rpc);
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    if let Some(archive_endpoint) = self
+                        .service
+                        .chain
+                        .archive_boundary_crossed_by(from_block, to_block)
+                    {
+                        match tokio::select! {
+                            () = self.cancel.cancelled() => break,
+                            result = self.service.chain.fetch_block_hash(
+                                &rpc.provider,
+                                self.archive_provider.as_ref(),
+                                archive_endpoint,
+                            ) => result,
+                        } {
+                            Ok(Some(_)) => {}
                             Ok(None) => {
                                 warn!(
                                     rpc_index = rpc.index,
-                                    to_block, "live RPC range does not prove its endpoint"
+                                    archive_endpoint,
+                                    "live RPC range does not prove its archive boundary"
                                 );
-                                rpcs.mark_bad_provider(&rpc);
+                                self.rpcs.mark_bad_provider(&rpc);
                                 continue;
                             }
                             Err(err) => {
@@ -361,106 +362,137 @@ pub(in crate::chain) fn spawn_live_log_loop(
                                 warn!(
                                     err = %err.without_url(),
                                     rpc_index = rpc.index,
-                                    to_block,
-                                    "failed to fetch live RPC endpoint hash"
+                                    archive_endpoint,
+                                    "failed to fetch live RPC archive-boundary hash"
                                 );
                                 if mark_unhealthy {
-                                    rpcs.mark_bad_provider(&rpc);
+                                    self.rpcs.mark_bad_provider(&rpc);
                                 }
                                 continue;
                             }
-                        };
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        let batch = Arc::new(LogBatch {
-                            from_block,
-                            to_block,
-                            logs,
-                            block_timestamps,
-                            to_block_hash,
-                            read_scope,
-                        });
-
-                        let batch_hash = batch.to_block_hash;
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        if let Err(err) = service.apply_forest_updates(&batch).await {
-                            warn!(?err, "failed to apply forest updates");
-                        } else {
-                            if cancel.is_cancelled() {
-                                break;
-                            }
-                            let log_count = batch.logs.len();
-                            match WalletScanApply::rows_from_log_batch(
-                                from_block,
-                                to_block,
-                                &batch,
-                                service.rpc_scan_source_for_range(from_block),
-                            ) {
-                                Ok(apply) => {
-                                    service.record_public_scan_apply(&apply).await;
-                                    if let WalletScanRowsPayload::Rows(rows) = &apply.rows.payload {
-                                        service.poi_submitter.observe(rows).await;
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        ?err,
-                                        from_block,
-                                        to_block,
-                                        "failed to normalize recent public live rows"
-                                    );
-                                }
-                            }
-                            if service.live_log_tx.send(batch).is_err() {
-                                debug!(
-                                    from_block,
-                                    to_block, log_count, "failed to broadcast live log batch"
-                                );
-                            }
-                            service.publish_forest_progress(
-                                to_block,
-                                LiveForestProgressCause::RpcApply,
-                            );
-                            if cancel.is_cancelled() {
-                                break;
-                            }
-                            if let Err(err) = service
-                                .persist_forest_snapshot(&snapshot_path, to_block, batch_hash)
-                                .await
-                            {
-                                warn!(?err, "failed to persist forest snapshot");
-                            }
                         }
                     }
-                    Err(err) => {
-                        let mark_unhealthy = err.should_mark_rpc_unhealthy();
-                        if err.is_rpc_throttled() {
+                    // One read suffices: `to_block` is already `finality_depth`
+                    // deep, and the next iteration's reorg check confirms it.
+                    let to_block_hash = match tokio::select! {
+                        () = self.cancel.cancelled() => break,
+                        result = self.service.chain.fetch_block_hash(
+                            &rpc.provider,
+                            self.archive_provider.as_ref(),
+                            to_block,
+                        ) => result,
+                    } {
+                        Ok(Some(hash)) => Some(hash),
+                        Ok(None) => {
                             warn!(
                                 rpc_index = rpc.index,
-                                "rpc is throttled, will retry with another..."
+                                to_block, "live RPC range does not prove its endpoint"
                             );
-                        } else {
+                            self.rpcs.mark_bad_provider(&rpc);
+                            continue;
+                        }
+                        Err(err) => {
+                            let mark_unhealthy = err.should_mark_rpc_unhealthy();
                             warn!(
                                 err = %err.without_url(),
                                 rpc_index = rpc.index,
-                                "failed to fetch logs, retrying..."
+                                to_block,
+                                "failed to fetch live RPC endpoint hash"
+                            );
+                            if mark_unhealthy {
+                                self.rpcs.mark_bad_provider(&rpc);
+                            }
+                            continue;
+                        }
+                    };
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
+                    let batch = Arc::new(LogBatch {
+                        from_block,
+                        to_block,
+                        logs,
+                        block_timestamps,
+                        to_block_hash,
+                        read_scope,
+                    });
+
+                    let batch_hash = batch.to_block_hash;
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
+                    if let Err(err) = self.service.apply_forest_updates(&batch).await {
+                        warn!(?err, "failed to apply forest updates");
+                    } else {
+                        if self.cancel.is_cancelled() {
+                            break;
+                        }
+                        let log_count = batch.logs.len();
+                        match WalletScanApply::rows_from_log_batch(
+                            from_block,
+                            to_block,
+                            &batch,
+                            self.service.rpc_scan_source_for_range(from_block),
+                        ) {
+                            Ok(apply) => {
+                                self.service.record_public_scan_apply(&apply).await;
+                                if let WalletScanRowsPayload::Rows(rows) = &apply.rows.payload {
+                                    self.service.poi_submitter.observe(rows).await;
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    from_block,
+                                    to_block,
+                                    "failed to normalize recent public live rows"
+                                );
+                            }
+                        }
+                        if self.service.live_log_tx.send(batch).is_err() {
+                            debug!(
+                                from_block,
+                                to_block, log_count, "failed to broadcast live log batch"
                             );
                         }
-                        if mark_unhealthy {
-                            rpcs.mark_bad_provider(&rpc);
+                        self.service
+                            .publish_forest_progress(to_block, LiveForestProgressCause::RpcApply);
+                        if self.cancel.is_cancelled() {
+                            break;
+                        }
+                        if let Err(err) = self
+                            .service
+                            .persist_forest_snapshot(&self.snapshot_path, to_block, batch_hash)
+                            .await
+                        {
+                            warn!(?err, "failed to persist forest snapshot");
                         }
                     }
                 }
+                Err(err) => {
+                    let mark_unhealthy = err.should_mark_rpc_unhealthy();
+                    if err.is_rpc_throttled() {
+                        warn!(
+                            rpc_index = rpc.index,
+                            "rpc is throttled, will retry with another..."
+                        );
+                    } else {
+                        warn!(
+                            err = %err.without_url(),
+                            rpc_index = rpc.index,
+                            "failed to fetch logs, retrying..."
+                        );
+                    }
+                    if mark_unhealthy {
+                        self.rpcs.mark_bad_provider(&rpc);
+                    }
+                }
             }
-            // Every exit leaves through here: the attempt is aborted and its
-            // task dropped before the loop's own task completes.
-            abort_far_behind_attempt(&mut attempt).await;
         }
-        .instrument(tracing::info_span!("sync_live")),
-    )
+        // Every exit leaves through here: the attempt is aborted and its
+        // task dropped before the loop's own task completes.
+        abort_far_behind_attempt(&mut self.attempt).await;
+    }
 }
 
 /// Indexed sources the live forest loop can catch up from.
