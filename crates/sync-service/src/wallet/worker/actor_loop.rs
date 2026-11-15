@@ -6,23 +6,22 @@ use super::poi_maintenance::current_ppoi_workflow_status_for_candidate_report;
 use super::{
     AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, Arc, BackfillEvent,
     BackfillRequest, CancellationToken, ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore,
-    FixedBytes, FuturesUnordered, IndexedArtifactSourceConfig, Instant, LocalPoiStatusReader,
-    MerkleForest, PendingOutputPoiContextIntent, PendingOutputPoiTentativeAttemptTracker,
-    PendingWalletReset, PoiCorpusRevision, PoiMaintenanceController, PoiMaintenanceOutcome,
-    PoiRemoteJobKey, PoiRpcClient, PublicPoiCorpusHandle, RwLock, SenderCandidateRecoveryReport,
-    SharedLogBatch, WalletActorCredential, WalletActorState, WalletBackfillDoneOutcome,
-    WalletBackfillGrant, WalletBackfillRejectReason, WalletCacheError, WalletCacheStore,
-    WalletCheckpointMutation, WalletConfig, WalletHandle, WalletLiveMetadataFlush,
-    WalletObservationPublisher, WalletPendingSpentMarkOutcome, WalletPersistState,
-    WalletPoiJobTracker, WalletPoiRefreshSelection, WalletPoiRuntime,
-    WalletPoiStatusRefreshCommitRequest, WalletPrivateApplyClient, WalletPrivateApplyRequest,
-    WalletPrivateMutationAuthority, WalletPrivateRequest, WalletPrivateRequestError,
-    WalletProgressPersist, WalletRemoteDone, WalletResetCommitOutcome, WalletResetCommitRequest,
-    WalletResetReplayPlan, WalletResetRewindOutcome, WalletSyncToken, WalletUtxo,
-    accepted_backfill_owner_dropped, apply_owned_poi_private_delta_on_actor_with_active_lists,
-    broadcast, clear_local_pending_spent, commit_pending_output_contexts, debug, info,
-    mark_local_pending_spent, mpsc, oneshot, persist_wallet_reset_replay_admission_with_token,
-    reset_replay_from_block, wallet_poi_status_refresh_needed_for_selection, wallet_utxo_counts,
+    FixedBytes, FuturesUnordered, IndexedArtifactSourceConfig, Instant, MerkleForest,
+    PendingOutputPoiContextIntent, PendingOutputPoiTentativeAttemptTracker, PendingWalletReset,
+    PoiCorpusRevision, PoiMaintenanceController, PoiMaintenanceOutcome, PoiRemoteJobKey,
+    PoiRpcClient, PublicPoiCorpusHandle, RwLock, SenderCandidateRecoveryReport, SharedLogBatch,
+    WalletActorCredential, WalletActorState, WalletBackfillDoneOutcome, WalletBackfillGrant,
+    WalletBackfillRejectReason, WalletCacheError, WalletCacheStore, WalletCheckpointMutation,
+    WalletConfig, WalletHandle, WalletLiveMetadataFlush, WalletObservationPublisher,
+    WalletPendingSpentMarkOutcome, WalletPersistState, WalletPoiJobTracker,
+    WalletPoiRefreshSelection, WalletPoiRuntime, WalletPrivateApplyClient,
+    WalletPrivateApplyRequest, WalletPrivateMutationAuthority, WalletPrivateRequest,
+    WalletPrivateRequestError, WalletProgressPersist, WalletRemoteDone, WalletResetCommitOutcome,
+    WalletResetCommitRequest, WalletResetReplayPlan, WalletResetRewindOutcome, WalletSyncToken,
+    WalletUtxo, accepted_backfill_owner_dropped,
+    apply_owned_poi_private_delta_on_actor_with_active_lists, broadcast, clear_local_pending_spent,
+    commit_pending_output_contexts, debug, info, mark_local_pending_spent, mpsc, oneshot,
+    persist_wallet_reset_replay_admission_with_token, reset_replay_from_block, wallet_utxo_counts,
     warn, watch,
 };
 
@@ -82,96 +81,6 @@ struct PreReadyPoiRefresh {
 }
 
 impl WalletActorLoop<'_> {
-    /// Refreshes POI statuses from the local corpus when `selection` needs it.
-    /// Returns `None` when no refresh was attempted.
-    pub(super) async fn commit_local_poi_status_refresh(
-        &mut self,
-        selection: WalletPoiRefreshSelection,
-    ) -> Option<Result<bool, WalletBackfillRejectReason>> {
-        let reset_generation = self.actor_state.reset_generation();
-        let refresh_needed = self
-            .poi_status_refresh_needed(reset_generation, selection)
-            .await;
-        if refresh_needed {
-            if let Some(status_reader) = self.local_poi_status_reader().await {
-                Some(
-                    self.commit_poi_status_refresh(&status_reader, reset_generation, selection)
-                        .await,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Whether `selection` has POI statuses to refresh, or a failed refresh to retry.
-    async fn poi_status_refresh_needed(
-        &self,
-        reset_generation: u64,
-        selection: WalletPoiRefreshSelection,
-    ) -> bool {
-        let locked = self.utxos.read().await;
-        self.actor_state
-            .has_failed_poi_status_refresh(reset_generation, selection)
-            || wallet_poi_status_refresh_needed_for_selection(
-                &locked,
-                &self.active_poi_list_keys,
-                selection,
-            )
-    }
-
-    /// Actor-safe: only a local corpus reader, never the remote proxy or fallback.
-    async fn local_poi_status_reader(&self) -> Option<LocalPoiStatusReader> {
-        self.poi_runtime
-            .local_status_reader(
-                &self.public_data_plane,
-                &self.cfg,
-                &self.active_poi_list_keys,
-            )
-            .await
-    }
-
-    async fn commit_poi_status_refresh(
-        &mut self,
-        status_reader: &LocalPoiStatusReader,
-        reset_generation: u64,
-        selection: WalletPoiRefreshSelection,
-    ) -> Result<bool, WalletBackfillRejectReason> {
-        WalletPoiStatusRefreshCommitRequest {
-            cache_store: self.cache_store.as_ref(),
-            cfg: &self.cfg,
-            utxos: &self.utxos,
-            worker_handle: &self.worker_handle,
-            last_scanned: self.last_scanned,
-            reset_generation,
-            actor_state: &mut self.actor_state,
-            persist_state: &mut self.persist_state,
-            status_reader,
-            active_poi_list_keys: &self.active_poi_list_keys,
-            selection,
-            cancel: &self.cancel,
-        }
-        .commit()
-        .await
-    }
-
-    /// Reads the latest committed PPOI corpus revision and records what changed.
-    /// Returns `None` when the wallet has no corpus revision feed.
-    fn observe_poi_corpus_revision(&mut self) -> Option<PoiCorpusRevision> {
-        let revision = *self.poi_corpus_revision_rx.as_mut()?.borrow_and_update();
-        let _ =
-            self.actor_state
-                .transition_active(&self.worker_handle, &self.cancel, |mut state| {
-                    state.observe_poi_corpus_revision(revision != self.last_poi_corpus_revision);
-                });
-        self.blocked_shield_refresh_pending |= revision.blocked_shields_revision
-            != self.last_poi_corpus_revision.blocked_shields_revision;
-        self.last_poi_corpus_revision = revision;
-        Some(revision)
-    }
-
     /// Finishes a backfill job: persists owed progress, refreshes POI statuses before
     /// the wallet reports ready, marks the backfill complete, then refreshes again and
     /// requests POI maintenance.

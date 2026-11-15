@@ -72,6 +72,38 @@ impl WalletActorLoop<'_> {
         }
     }
 
+    /// Applies an accepted backfill job owner's final signal: a benign retirement of the
+    /// last job completes the backfill and catches up POI statuses; a lost driver reopens it.
+    pub(super) async fn handle_backfill_owner_signal(
+        &mut self,
+        token: WalletSyncToken,
+        signal: WalletBackfillOwnerSignal,
+    ) {
+        let WalletBackfillOwnerSignal {
+            disposition,
+            acknowledgement,
+        } = signal;
+        let changed = self
+            .actor_state
+            .transition_active(&self.worker_handle, &self.cancel, |mut state| {
+                state.apply_backfill_owner_disposition(token, disposition)
+            })
+            .unwrap_or(false);
+        if changed {
+            if disposition == WalletBackfillOwnerDisposition::BenignRetirement
+                && !self.actor_state.has_active_backfill_job()
+            {
+                self.backfill_complete_block = self.actor_state.completed_target_block();
+                self.refresh_poi_statuses_after_backfill_retirement().await;
+            } else if disposition == WalletBackfillOwnerDisposition::DriverLost {
+                self.backfill_complete_block = None;
+            }
+        }
+        if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(());
+        }
+    }
+
     /// Why a new backfill job for `token` is rejected, if it is: a stale token, or a
     /// reset still pending after driving it (a persistence failure when persistence
     /// failed, otherwise shutdown).
