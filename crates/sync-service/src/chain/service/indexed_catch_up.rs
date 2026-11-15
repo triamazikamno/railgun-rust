@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::chain::{
-    WalletIndexedCatchUpStatusGuard, artifact_failure_can_fallback_to_squid,
+    SyncError, WalletIndexedCatchUpStatusGuard, artifact_failure_can_fallback_to_squid,
     await_wallet_cancellation,
 };
 
@@ -136,6 +136,34 @@ impl IndexedCatchUpSession {
         match self {
             Self::Artifacts(session) => session.read_scope(),
             Self::Squid { session, .. } => session.read_scope(),
+        }
+    }
+
+    /// Reads the page for `from_block..=to_block` from artifacts, a held Squid page or a Squid
+    /// fetch. Only the fetch can be cancelled; `None` means `cancel` fired during it.
+    async fn read_page(
+        &mut self,
+        page_kind: IndexedWalletPageKind,
+        from_block: u64,
+        to_block: u64,
+        cancel: &CancellationToken,
+    ) -> Option<Result<IndexedWalletArtifactPageOutcome, SyncError>> {
+        match self {
+            Self::Artifacts(session) => Some(session.page_for_block_range(from_block, to_block)),
+            Self::Squid {
+                session,
+                held_pages,
+            } => {
+                if let Some(page) = take_held_squid_page(held_pages, from_block) {
+                    return Some(Ok(IndexedWalletArtifactPageOutcome::Page(page)));
+                }
+                let page = await_wallet_cancellation(
+                    cancel,
+                    IndexedWalletPage::fetch(session.client(), page_kind, from_block, to_block),
+                )
+                .await?;
+                Some(page.map(IndexedWalletArtifactPageOutcome::Page))
+            }
         }
     }
 }
@@ -673,34 +701,12 @@ impl ChainService {
             );
             let fetch_started = Instant::now();
             let read_scope = active.read_scope();
-            let page_result = match &mut active {
-                IndexedCatchUpSession::Artifacts(session) => {
-                    session.page_for_block_range(from_block, to_block)
-                }
-                IndexedCatchUpSession::Squid {
-                    session,
-                    held_pages,
-                } => {
-                    if let Some(page) = take_held_squid_page(held_pages, from_block) {
-                        Ok(IndexedWalletArtifactPageOutcome::Page(page))
-                    } else {
-                        let Some(page) = await_wallet_cancellation(
-                            cancel,
-                            IndexedWalletPage::fetch(
-                                session.client(),
-                                page_kind,
-                                from_block,
-                                to_block,
-                            ),
-                        )
-                        .await
-                        else {
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
-                        };
-                        page.map(IndexedWalletArtifactPageOutcome::Page)
-                    }
-                }
+            let Some(page_result) = active
+                .read_page(page_kind, from_block, to_block, cancel)
+                .await
+            else {
+                driver.retire(&cfg.cache_key).await;
+                return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
             };
             let page = match page_result {
                 Ok(IndexedWalletArtifactPageOutcome::Page(page)) => page,
