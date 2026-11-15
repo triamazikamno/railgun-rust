@@ -413,6 +413,8 @@ pub(crate) async fn prepare_wallet_worker(
             actor_state,
             persist_state,
             last_scanned,
+            db,
+            poi_submitter,
         };
         let mut accepted_backfill_liveness = FuturesUnordered::new();
         let mut accepted_indexed_job_liveness = FuturesUnordered::new();
@@ -832,14 +834,14 @@ pub(crate) async fn prepare_wallet_worker(
                         &poi_refreshing_tx,
                         &actor.worker_handle,
                         &actor.cancel,
-                        &db,
+                        &actor.db,
                         &actor.cache_store,
                         &actor.cfg,
                         &actor.public_data_plane,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         actor.poi_runtime,
-                        &poi_submitter,
+                        &actor.poi_submitter,
                         &forest,
                         &actor.utxos,
                         &actor.active_poi_list_keys,
@@ -996,25 +998,7 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                     }
                 }
-                Some(apply_req) = private_apply_rx.recv() => {
-                    let WalletPrivateApplyRequest {
-                        reset_generation,
-                        delta,
-                        reply,
-                    } = apply_req;
-                    let result = apply_owned_poi_private_delta_on_actor_with_active_lists(
-                        &actor.worker_handle,
-                        &actor.cancel,
-                        reset_generation,
-                        db.as_ref(),
-                        actor.cache_store.as_ref(),
-                        &actor.cfg,
-                        &actor.active_poi_list_keys,
-                        delta,
-                    )
-                    .await;
-                    let _ = reply.send(result);
-                }
+                Some(apply_req) = private_apply_rx.recv() => actor.handle_private_apply(apply_req).await,
                 Some(done) = remote_done_rx.recv() => {
                     match done {
                         WalletRemoteDone::PoiMaintenance {
@@ -1038,14 +1022,14 @@ pub(crate) async fn prepare_wallet_worker(
                                 &poi_refreshing_tx,
                                 &actor.worker_handle,
                                 &actor.cancel,
-                                &db,
+                                &actor.db,
                                 &actor.cache_store,
                                 &actor.cfg,
                                 &actor.public_data_plane,
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
                                 actor.poi_runtime,
-                                &poi_submitter,
+                                &actor.poi_submitter,
                                 &forest,
                                 &actor.utxos,
                                 &actor.active_poi_list_keys,
@@ -1153,14 +1137,14 @@ pub(crate) async fn prepare_wallet_worker(
                                 &poi_refreshing_tx,
                                 &actor.worker_handle,
                                 &actor.cancel,
-                                &db,
+                                &actor.db,
                                 &actor.cache_store,
                                 &actor.cfg,
                                 &actor.public_data_plane,
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
                                 actor.poi_runtime,
-                                &poi_submitter,
+                                &actor.poi_submitter,
                                 &forest,
                                 &actor.utxos,
                                 &actor.active_poi_list_keys,
@@ -1296,14 +1280,14 @@ pub(crate) async fn prepare_wallet_worker(
                         &poi_refreshing_tx,
                         &actor.worker_handle,
                         &actor.cancel,
-                        &db,
+                        &actor.db,
                         &actor.cache_store,
                         &actor.cfg,
                         &actor.public_data_plane,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         actor.poi_runtime,
-                        &poi_submitter,
+                        &actor.poi_submitter,
                         &forest,
                         &actor.utxos,
                         &actor.active_poi_list_keys,
@@ -1386,80 +1370,7 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                     }
                 }
-                Some(request) = private_request_rx.recv() => {
-                    match request {
-                        WalletPrivateRequest::MarkLocalPendingSpent {
-                            utxos,
-                            tx_hash,
-                            reply,
-                        } => {
-                            let result = match actor.actor_state.validate_pending_overlay_request(
-                                &actor.worker_handle,
-                                &actor.cancel,
-                            ) {
-                                Ok(reset_generation) => {
-                                    mark_local_pending_spent(
-                                        &actor.worker_handle,
-                                        &actor.cancel,
-                                        reset_generation,
-                                        utxos,
-                                        tx_hash,
-                                    )
-                                    .await
-                                }
-                                Err(err) => Err(err),
-                            };
-                            let _ = reply.send(result);
-                        }
-                        WalletPrivateRequest::ClearLocalPendingSpent { reply } => {
-                            let result = match actor.actor_state.validate_pending_overlay_request(
-                                &actor.worker_handle,
-                                &actor.cancel,
-                            ) {
-                                Ok(reset_generation) => {
-                                    clear_local_pending_spent(
-                                        &actor.worker_handle,
-                                        &actor.cancel,
-                                        reset_generation,
-                                    )
-                                    .await
-                                }
-                                Err(err) => Err(err),
-                            };
-                            let _ = reply.send(result);
-                        }
-                        WalletPrivateRequest::CreatePendingOutputContexts {
-                            ticket,
-                            contexts,
-                            reply,
-                        } => {
-                            let result = match actor.actor_state.validate_private_request(
-                                &actor.worker_handle,
-                                &actor.cancel,
-                                ticket,
-                                actor.last_scanned,
-                                false,
-                            ) {
-                                Ok(reset_generation) => {
-                                    commit_pending_output_contexts(
-                                        &actor.worker_handle,
-                                        &actor.cancel,
-                                        db.as_ref(),
-                                        actor.cache_store.as_ref(),
-                                        &actor.cfg,
-                                        reset_generation,
-                                        &actor.active_poi_list_keys,
-                                        &poi_submitter,
-                                        &contexts,
-                                    )
-                                    .await
-                                }
-                                Err(err) => Err(err),
-                            };
-                            let _ = reply.send(result);
-                        }
-                    }
-                }
+                Some(request) = private_request_rx.recv() => actor.handle_private_request(request).await,
                 Some(request) = pending_overlay_rx.recv() => {
                     let current_reset_generation = actor.actor_state.reset_generation();
                     let request_is_current = actor.actor_state.pending_reset().is_none()
@@ -1628,7 +1539,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 &actor.cache_store,
                                 &actor.cfg,
                                 actor.poi_runtime,
-                                &poi_submitter,
+                                &actor.poi_submitter,
                                 &actor.active_poi_list_keys,
                                 tentative_candidates,
                             );
@@ -1823,14 +1734,14 @@ pub(crate) async fn prepare_wallet_worker(
                         &poi_refreshing_tx,
                         &actor.worker_handle,
                         &actor.cancel,
-                        &db,
+                        &actor.db,
                         &actor.cache_store,
                         &actor.cfg,
                         &actor.public_data_plane,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
                         actor.poi_runtime,
-                        &poi_submitter,
+                        &actor.poi_submitter,
                         &forest,
                         &actor.utxos,
                         &actor.active_poi_list_keys,
@@ -2041,14 +1952,14 @@ pub(crate) async fn prepare_wallet_worker(
                                     &poi_refreshing_tx,
                                     &actor.worker_handle,
                                     &actor.cancel,
-                                    &db,
+                                    &actor.db,
                                     &actor.cache_store,
                                     &actor.cfg,
                                     &actor.public_data_plane,
                                     http_client.as_ref(),
                                     indexed_artifact_source.as_ref(),
                                     actor.poi_runtime,
-                                    &poi_submitter,
+                                    &actor.poi_submitter,
                                     &forest,
                                     &actor.utxos,
                                     &actor.active_poi_list_keys,
@@ -2494,14 +2405,14 @@ pub(crate) async fn prepare_wallet_worker(
                                             &poi_refreshing_tx,
                                             &actor.worker_handle,
                                             &actor.cancel,
-                                            &db,
+                                            &actor.db,
                                             &actor.cache_store,
                                             &actor.cfg,
                                             &actor.public_data_plane,
                                             http_client.as_ref(),
                                             indexed_artifact_source.as_ref(),
                                             actor.poi_runtime,
-                                            &poi_submitter,
+                                            &actor.poi_submitter,
                                             &forest,
                                             &actor.utxos,
                                             &actor.active_poi_list_keys,
