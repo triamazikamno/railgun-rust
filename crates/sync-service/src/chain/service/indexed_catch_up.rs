@@ -9,9 +9,10 @@ use super::{
     BackfillEvent, CancellationToken, ChainService, IndexedWalletArtifactPageOutcome,
     IndexedWalletArtifactSession, IndexedWalletCatchUpSourceOrder, IndexedWalletPage,
     IndexedWalletPageKind, Instant, PublicDataPlaneDiagnosticKind, PublicScanRange,
-    PublicScanSource, SquidIndexedWalletReadSession, SyncProgressSender, WalletBackfillStartResult,
-    WalletConfig, WalletIndexedCatchUpSource, WalletScanApply, WalletStartupSyncError,
-    WalletSyncContext, debug, info, mpsc, wallet_has_persistence_failure, warn,
+    PublicScanReadScope, PublicScanSource, SquidIndexedWalletReadSession, SyncProgressSender,
+    WalletBackfillStartResult, WalletConfig, WalletIndexedCatchUpSource, WalletScanApply,
+    WalletStartupSyncError, WalletSyncContext, debug, info, mpsc, wallet_has_persistence_failure,
+    warn,
 };
 
 /// Most rows the Squid wallet candidate holds while it races artifact
@@ -93,6 +94,50 @@ fn take_held_squid_page(
     }
     pages.clear();
     None
+}
+
+/// The indexed source a wallet catch-up reads pages from.
+enum IndexedCatchUpSession {
+    Artifacts(IndexedWalletArtifactSession),
+    /// Pages held from the startup race are used before Squid is asked again.
+    Squid {
+        session: SquidIndexedWalletReadSession,
+        held_pages: VecDeque<(u64, IndexedWalletPage)>,
+    },
+}
+
+impl IndexedCatchUpSession {
+    const fn squid(session: SquidIndexedWalletReadSession) -> Self {
+        Self::Squid {
+            session,
+            held_pages: VecDeque::new(),
+        }
+    }
+
+    const fn is_artifacts(&self) -> bool {
+        matches!(self, Self::Artifacts(_))
+    }
+
+    const fn source(&self) -> WalletIndexedCatchUpSource {
+        match self {
+            Self::Artifacts(_) => WalletIndexedCatchUpSource::IndexedArtifacts,
+            Self::Squid { .. } => WalletIndexedCatchUpSource::Squid,
+        }
+    }
+
+    const fn indexed_height(&self) -> u64 {
+        match self {
+            Self::Artifacts(session) => session.latest_indexed_block(),
+            Self::Squid { session, .. } => session.indexed_height(),
+        }
+    }
+
+    const fn read_scope(&self) -> PublicScanReadScope {
+        match self {
+            Self::Artifacts(session) => session.read_scope(),
+            Self::Squid { session, .. } => session.read_scope(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,8 +520,7 @@ impl ChainService {
             && self.chain.sync.indexed_artifact_source.is_some()
             && self.chain.sync.quick_sync_endpoint.is_some();
         let mut squid_race_winner = None;
-        let mut held_squid_pages = VecDeque::new();
-        let mut artifact_session = if squid_race_eligible {
+        let artifact_session = if squid_race_eligible {
             let Some(winner) = await_wallet_cancellation(
                 cancel,
                 self.race_indexed_wallet_catch_up_sources(
@@ -493,8 +537,7 @@ impl ChainService {
             match winner {
                 WalletCatchUpRaceWinner::Artifacts(session) => Some(session),
                 WalletCatchUpRaceWinner::Squid(candidate) => {
-                    held_squid_pages = candidate.pages;
-                    squid_race_winner = Some((candidate.session, candidate.target));
+                    squid_race_winner = Some(candidate);
                     None
                 }
                 // The existing post-artifact-failure path decides, as today.
@@ -529,58 +572,20 @@ impl ChainService {
             None
         };
         let catch_up_started = Instant::now();
-        let mut squid_session = None;
-        let (mut indexed_source, mut indexed_height, mut target, mut using_artifact) =
-            if source_order == IndexedWalletCatchUpSourceOrder::SquidFirst {
-                let Some(squid_probe) =
-                    await_wallet_cancellation(cancel, self.probe_squid_indexed_wallet_source(cfg))
-                        .await
-                else {
-                    return IndexedWalletCatchUpOutcome::Cancelled(last_scanned);
-                };
-                if let Some(session) = squid_probe {
-                    let height = session.indexed_height();
-                    let target = height.min(safe_head);
-                    if from_block <= target {
-                        squid_session = Some(session);
-                        (WalletIndexedCatchUpSource::Squid, height, target, false)
-                    } else {
-                        status_guard.set(
-                            WalletIndexedCatchUpSource::IndexedArtifacts,
-                            from_block,
-                            safe_head,
-                        );
-                        let Some(prepared) = await_wallet_cancellation(
-                            cancel,
-                            self.prepare_indexed_wallet_artifact_session(
-                                cfg,
-                                from_block,
-                                safe_head,
-                                artifact_progress_tx,
-                            ),
-                        )
-                        .await
-                        else {
-                            return IndexedWalletCatchUpOutcome::Cancelled(last_scanned);
-                        };
-                        artifact_session = prepared;
-                        let Some(session) = artifact_session.as_ref() else {
-                            self.record_public_scan_fallback(
-                                self.rpc_scan_source_for_range(from_block),
-                                PublicScanRange::new(from_block, safe_head),
-                                self.begin_public_scan_read(),
-                                "indexed wallet artifacts unavailable after Squid tail gap; falling back to RPC",
-                            )
-                            .await;
-                            return IndexedWalletCatchUpOutcome::Unavailable(last_scanned);
-                        };
-                        (
-                            WalletIndexedCatchUpSource::IndexedArtifacts,
-                            session.latest_indexed_block(),
-                            session.target_block(),
-                            true,
-                        )
-                    }
+        let (mut active, mut target) = if source_order
+            == IndexedWalletCatchUpSourceOrder::SquidFirst
+        {
+            let Some(squid_probe) =
+                await_wallet_cancellation(cancel, self.probe_squid_indexed_wallet_source(cfg))
+                    .await
+            else {
+                return IndexedWalletCatchUpOutcome::Cancelled(last_scanned);
+            };
+            if let Some(session) = squid_probe {
+                let height = session.indexed_height();
+                let target = height.min(safe_head);
+                if from_block <= target {
+                    (IndexedCatchUpSession::squid(session), target)
                 } else {
                     status_guard.set(
                         WalletIndexedCatchUpSource::IndexedArtifacts,
@@ -600,86 +605,96 @@ impl ChainService {
                     else {
                         return IndexedWalletCatchUpOutcome::Cancelled(last_scanned);
                     };
-                    artifact_session = prepared;
-                    let Some(session) = artifact_session.as_ref() else {
+                    let Some(session) = prepared else {
                         self.record_public_scan_fallback(
-                            self.rpc_scan_source_for_range(from_block),
-                            PublicScanRange::new(from_block, safe_head),
-                            self.begin_public_scan_read(),
-                            "indexed wallet sources unavailable; falling back to RPC",
-                        )
-                        .await;
+                                self.rpc_scan_source_for_range(from_block),
+                                PublicScanRange::new(from_block, safe_head),
+                                self.begin_public_scan_read(),
+                                "indexed wallet artifacts unavailable after Squid tail gap; falling back to RPC",
+                            )
+                            .await;
                         return IndexedWalletCatchUpOutcome::Unavailable(last_scanned);
                     };
-                    (
-                        WalletIndexedCatchUpSource::IndexedArtifacts,
-                        session.latest_indexed_block(),
-                        session.target_block(),
-                        true,
-                    )
+                    let target = session.target_block();
+                    (IndexedCatchUpSession::Artifacts(session), target)
                 }
-            } else if let Some(session) = artifact_session.as_ref() {
-                (
-                    WalletIndexedCatchUpSource::IndexedArtifacts,
-                    session.latest_indexed_block(),
-                    session.target_block(),
-                    true,
-                )
-            } else if let Some((session, target)) = squid_race_winner {
-                let height = session.indexed_height();
-                squid_session = Some(session);
-                (WalletIndexedCatchUpSource::Squid, height, target, false)
             } else {
-                let Some(squid_probe) =
-                    await_wallet_cancellation(cancel, self.probe_squid_indexed_wallet_source(cfg))
-                        .await
+                status_guard.set(
+                    WalletIndexedCatchUpSource::IndexedArtifacts,
+                    from_block,
+                    safe_head,
+                );
+                let Some(prepared) = await_wallet_cancellation(
+                    cancel,
+                    self.prepare_indexed_wallet_artifact_session(
+                        cfg,
+                        from_block,
+                        safe_head,
+                        artifact_progress_tx,
+                    ),
+                )
+                .await
                 else {
                     return IndexedWalletCatchUpOutcome::Cancelled(last_scanned);
                 };
-                let Some(session) = squid_probe else {
+                let Some(session) = prepared else {
                     self.record_public_scan_fallback(
                         self.rpc_scan_source_for_range(from_block),
                         PublicScanRange::new(from_block, safe_head),
                         self.begin_public_scan_read(),
-                        "Squid unavailable for indexed wallet catch-up; falling back to RPC",
+                        "indexed wallet sources unavailable; falling back to RPC",
                     )
                     .await;
                     return IndexedWalletCatchUpOutcome::Unavailable(last_scanned);
                 };
-                let height = session.indexed_height();
-                squid_session = Some(session);
-                (
-                    WalletIndexedCatchUpSource::Squid,
-                    height,
-                    height.min(safe_head),
-                    false,
-                )
-            };
-        status_guard.set(indexed_source, from_block, target);
-        let source_decision_read_scope = if using_artifact {
-            artifact_session
-                .as_ref()
-                .expect("artifact session is configured for artifact catch-up")
-                .read_scope()
+                let target = session.target_block();
+                (IndexedCatchUpSession::Artifacts(session), target)
+            }
+        } else if let Some(session) = artifact_session {
+            let target = session.target_block();
+            (IndexedCatchUpSession::Artifacts(session), target)
+        } else if let Some(candidate) = squid_race_winner {
+            (
+                IndexedCatchUpSession::Squid {
+                    session: candidate.session,
+                    held_pages: candidate.pages,
+                },
+                candidate.target,
+            )
         } else {
-            squid_session
-                .as_ref()
-                .expect("Squid session is configured for Squid catch-up")
-                .read_scope()
+            let Some(squid_probe) =
+                await_wallet_cancellation(cancel, self.probe_squid_indexed_wallet_source(cfg))
+                    .await
+            else {
+                return IndexedWalletCatchUpOutcome::Cancelled(last_scanned);
+            };
+            let Some(session) = squid_probe else {
+                self.record_public_scan_fallback(
+                    self.rpc_scan_source_for_range(from_block),
+                    PublicScanRange::new(from_block, safe_head),
+                    self.begin_public_scan_read(),
+                    "Squid unavailable for indexed wallet catch-up; falling back to RPC",
+                )
+                .await;
+                return IndexedWalletCatchUpOutcome::Unavailable(last_scanned);
+            };
+            let height = session.indexed_height();
+            (IndexedCatchUpSession::squid(session), height.min(safe_head))
         };
+        status_guard.set(active.source(), from_block, target);
         self.public_data_plane
             .record_source_decision(
                 PublicDataPlaneDiagnosticKind::SourceSelected,
-                indexed_source.into(),
+                active.source().into(),
                 PublicScanRange::new(from_block, target),
-                source_decision_read_scope,
+                active.read_scope(),
                 "indexed wallet catch-up source selected",
             )
             .await;
         info!(
             cache_key = %cfg.cache_key,
-            indexed_source = indexed_source.as_str(),
-            indexed_height,
+            indexed_source = active.source().as_str(),
+            indexed_height = active.indexed_height(),
             catch_up_ceiling = safe_head,
             from_block,
             target,
@@ -687,7 +702,7 @@ impl ChainService {
             "indexed wallet catch-up target"
         );
         if from_block > target {
-            let squid_tail = if using_artifact {
+            let squid_tail = if active.is_artifacts() {
                 let Some(squid_tail) = await_wallet_cancellation(
                     cancel,
                     self.probe_squid_tail_after_artifact(cfg, from_block, target, safe_head),
@@ -702,14 +717,10 @@ impl ChainService {
             };
             if let Some((session, squid_target)) = squid_tail {
                 let artifact_target = target;
-                indexed_height = session.indexed_height();
                 let squid_tail_read_scope = session.read_scope();
-                squid_session = Some(session);
-                artifact_session = None;
-                using_artifact = false;
-                indexed_source = WalletIndexedCatchUpSource::Squid;
+                active = IndexedCatchUpSession::squid(session);
                 target = squid_target;
-                status_guard.set(indexed_source, from_block, target);
+                status_guard.set(active.source(), from_block, target);
                 self.public_data_plane
                     .record_source_decision(
                         PublicDataPlaneDiagnosticKind::SourceFallback,
@@ -721,8 +732,8 @@ impl ChainService {
                     .await;
                 info!(
                     cache_key = %cfg.cache_key,
-                    indexed_source = indexed_source.as_str(),
-                    indexed_height,
+                    indexed_source = active.source().as_str(),
+                    indexed_height = active.indexed_height(),
                     safe_head,
                     from_block,
                     artifact_target,
@@ -756,7 +767,7 @@ impl ChainService {
         };
         loop {
             if from_block > target {
-                let squid_tail = if using_artifact {
+                let squid_tail = if active.is_artifacts() {
                     let Some(squid_tail) = await_wallet_cancellation(
                         cancel,
                         self.probe_squid_tail_after_artifact(cfg, from_block, target, safe_head),
@@ -774,14 +785,10 @@ impl ChainService {
                     break;
                 };
                 let artifact_target = target;
-                indexed_height = session.indexed_height();
                 let squid_tail_read_scope = session.read_scope();
-                squid_session = Some(session);
-                artifact_session = None;
-                using_artifact = false;
-                indexed_source = WalletIndexedCatchUpSource::Squid;
+                active = IndexedCatchUpSession::squid(session);
                 target = squid_target;
-                status_guard.set(indexed_source, from_block, target);
+                status_guard.set(active.source(), from_block, target);
                 self.public_data_plane
                     .record_source_decision(
                         PublicDataPlaneDiagnosticKind::SourceFallback,
@@ -793,8 +800,8 @@ impl ChainService {
                     .await;
                 info!(
                     cache_key = %cfg.cache_key,
-                    indexed_source = indexed_source.as_str(),
-                    indexed_height,
+                    indexed_source = active.source().as_str(),
+                    indexed_height = active.indexed_height(),
                     safe_head,
                     from_block,
                     artifact_target,
@@ -820,43 +827,35 @@ impl ChainService {
                 self.chain.sync.indexed_wallet_block_range,
             );
             let fetch_started = Instant::now();
-            let read_scope = if using_artifact {
-                artifact_session
-                    .as_ref()
-                    .expect("artifact session is configured for artifact catch-up")
-                    .read_scope()
-            } else {
-                squid_session
-                    .as_ref()
-                    .expect("Squid session is configured for Squid catch-up")
-                    .read_scope()
-            };
-            let page_result = if using_artifact {
-                artifact_session
-                    .as_ref()
-                    .expect("artifact session is configured for artifact catch-up")
-                    .page_for_block_range(from_block, to_block)
-            } else if let Some(page) = take_held_squid_page(&mut held_squid_pages, from_block) {
-                Ok(IndexedWalletArtifactPageOutcome::Page(page))
-            } else {
-                let Some(page) = await_wallet_cancellation(
-                    cancel,
-                    IndexedWalletPage::fetch(
-                        squid_session
-                            .as_ref()
-                            .expect("Squid session is configured for Squid catch-up")
-                            .client(),
-                        page_kind,
-                        from_block,
-                        to_block,
-                    ),
-                )
-                .await
-                else {
-                    driver.retire(&cfg.cache_key).await;
-                    return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
-                };
-                page.map(IndexedWalletArtifactPageOutcome::Page)
+            let read_scope = active.read_scope();
+            let page_result = match &mut active {
+                IndexedCatchUpSession::Artifacts(session) => {
+                    session.page_for_block_range(from_block, to_block)
+                }
+                IndexedCatchUpSession::Squid {
+                    session,
+                    held_pages,
+                } => {
+                    if let Some(page) = take_held_squid_page(held_pages, from_block) {
+                        Ok(IndexedWalletArtifactPageOutcome::Page(page))
+                    } else {
+                        let Some(page) = await_wallet_cancellation(
+                            cancel,
+                            IndexedWalletPage::fetch(
+                                session.client(),
+                                page_kind,
+                                from_block,
+                                to_block,
+                            ),
+                        )
+                        .await
+                        else {
+                            driver.retire(&cfg.cache_key).await;
+                            return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
+                        };
+                        page.map(IndexedWalletArtifactPageOutcome::Page)
+                    }
+                }
             };
             let page = match page_result {
                 Ok(IndexedWalletArtifactPageOutcome::Page(page)) => page,
@@ -877,7 +876,7 @@ impl ChainService {
                 Err(err) => {
                     let err = WalletStartupSyncError::from(err).without_url();
                     if artifact_failure_can_fallback_to_squid(
-                        using_artifact,
+                        active.is_artifacts(),
                         checkpoint,
                         last_scanned,
                     ) {
@@ -900,14 +899,10 @@ impl ChainService {
                             driver.retire(&cfg.cache_key).await;
                             return IndexedWalletCatchUpOutcome::Unavailable(checkpoint);
                         };
-                        indexed_height = session.indexed_height();
                         let fallback_read_scope = session.read_scope();
-                        squid_session = Some(session);
-                        artifact_session = None;
-                        using_artifact = false;
-                        indexed_source = WalletIndexedCatchUpSource::Squid;
-                        target = indexed_height.min(safe_head);
-                        status_guard.set(indexed_source, from_block, target);
+                        active = IndexedCatchUpSession::squid(session);
+                        target = active.indexed_height().min(safe_head);
+                        status_guard.set(active.source(), from_block, target);
                         self.public_data_plane
                             .record_source_decision(
                                 PublicDataPlaneDiagnosticKind::SourceFallback,
@@ -919,8 +914,8 @@ impl ChainService {
                             .await;
                         info!(
                             cache_key = %cfg.cache_key,
-                            indexed_source = indexed_source.as_str(),
-                            indexed_height,
+                            indexed_source = active.source().as_str(),
+                            indexed_height = active.indexed_height(),
                             safe_head,
                             from_block,
                             target,
@@ -930,8 +925,8 @@ impl ChainService {
                         if from_block > target {
                             debug!(
                                 cache_key = %cfg.cache_key,
-                                indexed_source = indexed_source.as_str(),
-                                indexed_height,
+                                indexed_source = active.source().as_str(),
+                                indexed_height = active.indexed_height(),
                                 target,
                                 elapsed_ms = catch_up_started.elapsed().as_millis(),
                                 "indexed wallet fallback skipped; cache already at target"
@@ -941,7 +936,7 @@ impl ChainService {
                         }
                         continue;
                     }
-                    if !using_artifact
+                    if !active.is_artifacts()
                         && source_order == IndexedWalletCatchUpSourceOrder::SquidFirst
                         && checkpoint == last_scanned
                     {
@@ -970,33 +965,26 @@ impl ChainService {
                             driver.retire(&cfg.cache_key).await;
                             return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
                         };
-                        artifact_session = prepared;
-                        let Some(session) = artifact_session.as_ref() else {
+                        let Some(session) = prepared else {
                             driver.retire(&cfg.cache_key).await;
                             return IndexedWalletCatchUpOutcome::Unavailable(checkpoint);
                         };
-                        squid_session = None;
-                        using_artifact = true;
-                        indexed_source = WalletIndexedCatchUpSource::IndexedArtifacts;
-                        indexed_height = session.latest_indexed_block();
                         target = session.target_block();
-                        status_guard.set(indexed_source, from_block, target);
+                        active = IndexedCatchUpSession::Artifacts(session);
+                        status_guard.set(active.source(), from_block, target);
                         self.public_data_plane
                             .record_source_decision(
                                 PublicDataPlaneDiagnosticKind::SourceFallback,
                                 PublicScanSource::IndexedArtifacts,
                                 PublicScanRange::new(from_block, target),
-                                artifact_session
-                                    .as_ref()
-                                    .expect("artifact session is configured for artifact catch-up")
-                                    .read_scope(),
+                                active.read_scope(),
                                 "Squid page failed before checkpoint",
                             )
                             .await;
                         info!(
                             cache_key = %cfg.cache_key,
-                            indexed_source = indexed_source.as_str(),
-                            indexed_height,
+                            indexed_source = active.source().as_str(),
+                            indexed_height = active.indexed_height(),
                             safe_head,
                             from_block,
                             target,
@@ -1006,8 +994,8 @@ impl ChainService {
                         if from_block > target {
                             debug!(
                                 cache_key = %cfg.cache_key,
-                                indexed_source = indexed_source.as_str(),
-                                indexed_height,
+                                indexed_source = active.source().as_str(),
+                                indexed_height = active.indexed_height(),
                                 target,
                                 elapsed_ms = catch_up_started.elapsed().as_millis(),
                                 "indexed wallet fallback skipped; cache already at target"
@@ -1020,7 +1008,7 @@ impl ChainService {
                     warn!(
                         err = %err,
                         cache_key = %cfg.cache_key,
-                        indexed_source = indexed_source.as_str(),
+                        indexed_source = active.source().as_str(),
                         fallback_from = checkpoint,
                         "indexed wallet catch-up page failed; using RPC backfill"
                     );
@@ -1062,7 +1050,7 @@ impl ChainService {
                 page_checkpoint,
                 page.into_scan_rows(),
                 read_scope,
-                indexed_source,
+                active.source(),
             );
             if let Err(err) = self.record_public_scan_apply_result(&apply).await {
                 debug!(
@@ -1099,7 +1087,7 @@ impl ChainService {
             checkpoint = committed_checkpoint;
             debug!(
                 cache_key = %cfg.cache_key,
-                indexed_source = indexed_source.as_str(),
+                indexed_source = active.source().as_str(),
                 page_kind = page_kind.as_str(),
                 from_block,
                 to_block,
@@ -1118,7 +1106,7 @@ impl ChainService {
             );
             from_block = checkpoint.saturating_add(1);
             if from_block <= target {
-                status_guard.set(indexed_source, from_block, target);
+                status_guard.set(active.source(), from_block, target);
             }
         }
         info!(
