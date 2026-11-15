@@ -4,8 +4,8 @@ use crate::chain::{
 };
 
 use super::{
-    Arc, BackfillRequest, CachedPublicScanApplyOutcome, ChainError, ChainService,
-    IndexedWalletCatchUpSourceOrder, Instant, Ordering, WalletBackfillFinishResult,
+    Arc, BackfillRequest, CachedPublicScanApplyOutcome, CancellationToken, ChainError,
+    ChainService, IndexedWalletCatchUpSourceOrder, Instant, Ordering, WalletBackfillFinishResult,
     WalletBackfillStartResult, WalletConfig, WalletHandle, WalletReadiness, WalletReadinessError,
     WalletShortStartupPlan, WalletSyncContext, debug, info, mpsc, oneshot,
     send_wallet_startup_events, wait_for_startup_sync_target, wait_for_wallet_ready,
@@ -286,8 +286,6 @@ impl ChainService {
         let service = Arc::clone(self);
         let catch_up_cfg = cfg.clone();
         let catch_up_handle = handle.clone();
-        let catch_up_cancel = cancel;
-        let catch_up_restored_pending_reset = restored_pending_reset;
         tokio::spawn(async move {
             let ctx = WalletSyncContext {
                 cfg: &catch_up_cfg,
@@ -295,300 +293,203 @@ impl ChainService {
                 handle: &catch_up_handle,
                 backfill_sender: &backfill_sender,
             };
-            if catch_up_restored_pending_reset
-                && !wait_for_wallet_ready(
-                    catch_up_handle.subscribe_observation(),
-                    catch_up_cancel.clone(),
-                )
-                .await
-            {
-                return;
-            }
-            let startup_target = if catch_up_restored_pending_reset {
-                wallet_sync_target(*service.safe_head_tx.borrow(), catch_up_cfg.sync_to_block)
-            } else {
-                sync_target
-            };
-            let Some(sync_target) = wait_for_startup_sync_target(
-                service.safe_head_tx.subscribe(),
-                catch_up_cfg.sync_to_block,
-                startup_target,
-                &catch_up_cancel,
-            )
-            .await
-            else {
-                return;
-            };
-
-            // Only schedule from one public view snapshot (cursor + generation).
-            let Some(startup) = catch_up_handle
-                .wait_schedulable_progress(&catch_up_cancel)
-                .await
-            else {
-                return;
-            };
-            let startup_target_lease = if sync_target > startup.last_scanned {
-                match catch_up_handle
-                    .reserve_sync_target(
-                        &catch_up_cfg.cache_key,
-                        &backfill_sender,
-                        startup,
-                        sync_target,
-                    )
-                    .await
-                {
-                    Ok(lease) => Some(lease),
-                    Err(reason) => {
-                        debug!(
-                            ?reason,
-                            cache_key = %catch_up_cfg.cache_key,
-                            sync_target,
-                            "wallet startup target reservation rejected"
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            let short_startup_plan = WalletShortStartupPlan::new(
-                start_block,
-                startup.last_scanned,
-                sync_target,
-                service.chain.sync.block_range,
-            );
-            let short_window_is_cached = if let Some(plan) = short_startup_plan {
-                service
-                    .public_data_plane
-                    .cached_wallet_scan_suffix(
-                        plan.acquisition.from_block,
-                        plan.acquisition.to_block,
-                    )
-                    .await
-                    .is_some()
-            } else {
-                true
-            };
-            let cached_outcome = if short_window_is_cached {
-                service
-                    .apply_cached_public_scan_coverage(
-                        ctx,
-                        startup.last_scanned,
-                        sync_target,
-                        startup,
-                    )
-                    .await
-            } else {
-                CachedPublicScanApplyOutcome {
-                    checkpoint: startup.last_scanned,
-                    finished: false,
-                }
-            };
-            if cached_outcome.finished {
-                return;
-            }
-            if wallet_has_persistence_failure(&catch_up_handle) {
-                let Some(progress) = catch_up_handle.revalidate_schedulable_progress(startup)
-                else {
-                    return;
-                };
-                service
-                    .enqueue_wallet_backfill(
-                        ctx,
-                        cached_outcome.checkpoint,
-                        sync_target,
-                        catch_up_cfg.sync_to_block.is_none(),
-                        progress,
-                        false,
-                        short_startup_plan,
-                    )
-                    .await;
-                return;
-            }
-            let Some(startup) = catch_up_handle.revalidate_schedulable_progress(startup) else {
-                return;
-            };
-            if service
-                .short_wallet_startup_sync(
-                    ctx,
-                    startup,
-                    sync_target,
-                    short_startup_plan,
-                    &catch_up_cancel,
-                )
-                .await
-            {
-                return;
-            }
-            if wallet_has_persistence_failure(&catch_up_handle) {
-                let Some(progress) = catch_up_handle.revalidate_schedulable_progress(startup)
-                else {
-                    return;
-                };
-                service
-                    .enqueue_wallet_backfill(
-                        ctx,
-                        progress.last_scanned,
-                        sync_target,
-                        catch_up_cfg.sync_to_block.is_none(),
-                        progress,
-                        false,
-                        short_startup_plan,
-                    )
-                    .await;
-                return;
-            }
-
-            let Some(checkpoint_progress) = catch_up_handle
-                .wait_schedulable_progress(&catch_up_cancel)
-                .await
-            else {
-                return;
-            };
-            let Some(progress) = startup.revalidate(Some(checkpoint_progress)) else {
-                debug!(
-                    cache_key = %catch_up_cfg.cache_key,
-                    startup_reset_generation = startup.reset_generation,
-                    current_reset_generation = checkpoint_progress.reset_generation,
-                    "wallet startup sync superseded by reset"
-                );
-                return;
-            };
-            let mut checkpoint = progress.last_scanned;
-            let mut cached_suffix = service
-                .public_data_plane
-                .cached_wallet_scan_suffix(
-                    wallet_backfill_from_block(checkpoint, start_block),
-                    sync_target,
-                )
+            service
+                .run_wallet_startup_catch_up(ctx, &cancel, restored_pending_reset, sync_target)
                 .await;
-            let cached_suffix_from = cached_suffix
-                .as_ref()
-                .and_then(|applies| applies.first())
-                .map(|apply| apply.from_block);
-            let historical_target =
-                wallet_remote_target_before_cached_suffix(sync_target, cached_suffix_from);
-            if let Some(cached_suffix_from) = cached_suffix_from {
-                debug!(
-                    cache_key = %catch_up_cfg.cache_key,
-                    checkpoint,
-                    historical_target,
-                    cached_suffix_from,
-                    sync_target,
-                    "historical wallet catch-up capped before cached public suffix"
-                );
-            }
-            if let Some(plan) = short_startup_plan
-                && catch_up_cfg.use_indexed_wallet_catch_up
+        });
+
+        Ok(handle)
+    }
+
+    /// Brings a newly registered wallet from its cursor to the startup sync target.
+    async fn run_wallet_startup_catch_up(
+        self: &Arc<Self>,
+        ctx: WalletSyncContext<'_>,
+        cancel: &CancellationToken,
+        restored_pending_reset: bool,
+        initial_sync_target: u64,
+    ) {
+        let WalletSyncContext {
+            cfg,
+            start_block,
+            handle,
+            backfill_sender,
+        } = ctx;
+        if restored_pending_reset
+            && !wait_for_wallet_ready(handle.subscribe_observation(), cancel.clone()).await
+        {
+            return;
+        }
+        let startup_target = if restored_pending_reset {
+            wallet_sync_target(*self.safe_head_tx.borrow(), cfg.sync_to_block)
+        } else {
+            initial_sync_target
+        };
+        let Some(sync_target) = wait_for_startup_sync_target(
+            self.safe_head_tx.subscribe(),
+            cfg.sync_to_block,
+            startup_target,
+            cancel,
+        )
+        .await
+        else {
+            return;
+        };
+
+        // Only schedule from one public view snapshot (cursor + generation).
+        let Some(startup) = handle.wait_schedulable_progress(cancel).await else {
+            return;
+        };
+        let startup_target_lease = if sync_target > startup.last_scanned {
+            match handle
+                .reserve_sync_target(&cfg.cache_key, backfill_sender, startup, sync_target)
+                .await
             {
-                match service
-                    .wallet_startup_artifact_candidate(&catch_up_cfg, plan, &catch_up_cancel)
-                    .await
-                {
-                    Ok(Some(candidate)) => {
-                        let acquisition_apply_count = candidate.acquisition_applies.len();
-                        if let Some(progress) = service
-                            .commit_and_deliver_short_startup_candidate(
-                                ctx,
-                                startup,
-                                sync_target,
-                                plan,
-                                candidate,
-                                &catch_up_cancel,
-                            )
-                            .await
-                        {
-                            debug!(
-                                cache_key = %catch_up_cfg.cache_key,
-                                acquisition_apply_count,
-                                "wallet startup artifact acquisition delivered"
-                            );
-                            if catch_up_cfg.sync_to_block.is_none() {
-                                service
-                                    .enqueue_wallet_backfill(
-                                        ctx,
-                                        sync_target,
-                                        sync_target,
-                                        true,
-                                        progress,
-                                        true,
-                                        None,
-                                    )
-                                    .await;
-                            }
-                            return;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        debug!(err = %err.without_url(), cache_key = %catch_up_cfg.cache_key, "wallet startup artifact fallback failed");
-                    }
+                Ok(lease) => Some(lease),
+                Err(reason) => {
+                    debug!(
+                        ?reason,
+                        cache_key = %cfg.cache_key,
+                        sync_target,
+                        "wallet startup target reservation rejected"
+                    );
+                    return;
                 }
             }
-            if short_startup_plan.is_none() && catch_up_cfg.use_indexed_wallet_catch_up {
-                checkpoint = service
-                    .indexed_wallet_catch_up(
-                        ctx,
-                        checkpoint,
-                        historical_target,
-                        &catch_up_cancel,
-                        IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
-                        false,
-                        progress,
-                    )
-                    .await;
-            } else if short_startup_plan.is_none() {
-                debug!(cache_key = %catch_up_cfg.cache_key, "indexed wallet catch-up disabled");
+        } else {
+            None
+        };
+        let short_startup_plan = WalletShortStartupPlan::new(
+            start_block,
+            startup.last_scanned,
+            sync_target,
+            self.chain.sync.block_range,
+        );
+        let short_window_is_cached = if let Some(plan) = short_startup_plan {
+            self.public_data_plane
+                .cached_wallet_scan_suffix(plan.acquisition.from_block, plan.acquisition.to_block)
+                .await
+                .is_some()
+        } else {
+            true
+        };
+        let cached_outcome = if short_window_is_cached {
+            self.apply_cached_public_scan_coverage(ctx, startup.last_scanned, sync_target, startup)
+                .await
+        } else {
+            CachedPublicScanApplyOutcome {
+                checkpoint: startup.last_scanned,
+                finished: false,
             }
-            if catch_up_cancel.is_cancelled() {
-                return;
-            }
-            // Superseded if view generation advanced or reset-pending (no public progress).
-            let Some(mut progress) = catch_up_handle.revalidate_schedulable_progress(startup)
-            else {
-                debug!(
-                    cache_key = %catch_up_cfg.cache_key,
-                    startup_reset_generation = startup.reset_generation,
-                    current_reset_generation = ?catch_up_handle
-                        .view_state()
-                        .reset_generation(),
-                    "wallet startup sync superseded by reset"
-                );
+        };
+        if cached_outcome.finished {
+            return;
+        }
+        if wallet_has_persistence_failure(handle) {
+            let Some(progress) = handle.revalidate_schedulable_progress(startup) else {
                 return;
             };
-            if short_startup_plan.is_none()
-                && checkpoint < sync_target
-                && let Some(suffix) = cached_suffix.take()
-                && suffix.first().is_some_and(|apply| {
-                    apply.from_block == wallet_backfill_from_block(checkpoint, start_block)
-                })
+            self.enqueue_wallet_backfill(
+                ctx,
+                cached_outcome.checkpoint,
+                sync_target,
+                cfg.sync_to_block.is_none(),
+                progress,
+                false,
+                short_startup_plan,
+            )
+            .await;
+            return;
+        }
+        let Some(startup) = handle.revalidate_schedulable_progress(startup) else {
+            return;
+        };
+        if self
+            .short_wallet_startup_sync(ctx, startup, sync_target, short_startup_plan, cancel)
+            .await
+        {
+            return;
+        }
+        if wallet_has_persistence_failure(handle) {
+            let Some(progress) = handle.revalidate_schedulable_progress(startup) else {
+                return;
+            };
+            self.enqueue_wallet_backfill(
+                ctx,
+                progress.last_scanned,
+                sync_target,
+                cfg.sync_to_block.is_none(),
+                progress,
+                false,
+                short_startup_plan,
+            )
+            .await;
+            return;
+        }
+
+        let Some(checkpoint_progress) = handle.wait_schedulable_progress(cancel).await else {
+            return;
+        };
+        let Some(progress) = startup.revalidate(Some(checkpoint_progress)) else {
+            debug!(
+                cache_key = %cfg.cache_key,
+                startup_reset_generation = startup.reset_generation,
+                current_reset_generation = checkpoint_progress.reset_generation,
+                "wallet startup sync superseded by reset"
+            );
+            return;
+        };
+        let mut checkpoint = progress.last_scanned;
+        let mut cached_suffix = self
+            .public_data_plane
+            .cached_wallet_scan_suffix(
+                wallet_backfill_from_block(checkpoint, start_block),
+                sync_target,
+            )
+            .await;
+        let cached_suffix_from = cached_suffix
+            .as_ref()
+            .and_then(|applies| applies.first())
+            .map(|apply| apply.from_block);
+        let historical_target =
+            wallet_remote_target_before_cached_suffix(sync_target, cached_suffix_from);
+        if let Some(cached_suffix_from) = cached_suffix_from {
+            debug!(
+                cache_key = %cfg.cache_key,
+                checkpoint,
+                historical_target,
+                cached_suffix_from,
+                sync_target,
+                "historical wallet catch-up capped before cached public suffix"
+            );
+        }
+        if let Some(plan) = short_startup_plan
+            && cfg.use_indexed_wallet_catch_up
+        {
+            match self
+                .wallet_startup_artifact_candidate(cfg, plan, cancel)
+                .await
             {
-                let suffix_applies = suffix.len();
-                let suffix_restaged = service.restage_captured_public_scan_applies(&suffix).await;
-                if suffix_restaged
-                    && send_wallet_startup_events(
-                        &catch_up_cfg.cache_key,
-                        suffix,
-                        Some(sync_target),
-                        progress,
-                        &backfill_sender,
-                        &catch_up_handle,
-                    )
-                    .await
-                {
-                    debug!(
-                        cache_key = %catch_up_cfg.cache_key,
-                        checkpoint,
-                        sync_target,
-                        suffix_applies,
-                        "captured public scan suffix delivered after historical catch-up"
-                    );
-                    if catch_up_cfg.sync_to_block.is_none()
-                        && let Some(progress) =
-                            catch_up_handle.revalidate_schedulable_progress(startup)
+                Ok(Some(candidate)) => {
+                    let acquisition_apply_count = candidate.acquisition_applies.len();
+                    if let Some(progress) = self
+                        .commit_and_deliver_short_startup_candidate(
+                            ctx,
+                            startup,
+                            sync_target,
+                            plan,
+                            candidate,
+                            cancel,
+                        )
+                        .await
                     {
-                        service
-                            .enqueue_wallet_backfill(
+                        debug!(
+                            cache_key = %cfg.cache_key,
+                            acquisition_apply_count,
+                            "wallet startup artifact acquisition delivered"
+                        );
+                        if cfg.sync_to_block.is_none() {
+                            self.enqueue_wallet_backfill(
                                 ctx,
                                 sync_target,
                                 sync_target,
@@ -598,38 +499,112 @@ impl ChainService {
                                 None,
                             )
                             .await;
+                        }
+                        return;
                     }
-                    return;
                 }
-                let Some(refreshed_progress) =
-                    catch_up_handle.revalidate_schedulable_progress(startup)
-                else {
-                    return;
-                };
-                checkpoint = refreshed_progress.last_scanned;
-                progress = refreshed_progress;
-                debug!(
-                    cache_key = %catch_up_cfg.cache_key,
-                    checkpoint,
-                    sync_target,
-                    "captured public scan suffix was rejected; continuing with normal backfill"
-                );
+                Ok(None) => {}
+                Err(err) => {
+                    debug!(err = %err.without_url(), cache_key = %cfg.cache_key, "wallet startup artifact fallback failed");
+                }
             }
-            service
-                .enqueue_wallet_backfill(
+        }
+        if short_startup_plan.is_none() && cfg.use_indexed_wallet_catch_up {
+            checkpoint = self
+                .indexed_wallet_catch_up(
                     ctx,
                     checkpoint,
-                    sync_target,
-                    catch_up_cfg.sync_to_block.is_none(),
+                    historical_target,
+                    cancel,
+                    IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
+                    false,
                     progress,
-                    !wallet_has_persistence_failure(&catch_up_handle),
-                    short_startup_plan,
                 )
                 .await;
-            drop(startup_target_lease);
-        });
-
-        Ok(handle)
+        } else if short_startup_plan.is_none() {
+            debug!(cache_key = %cfg.cache_key, "indexed wallet catch-up disabled");
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+        // Superseded if view generation advanced or reset-pending (no public progress).
+        let Some(mut progress) = handle.revalidate_schedulable_progress(startup) else {
+            debug!(
+                cache_key = %cfg.cache_key,
+                startup_reset_generation = startup.reset_generation,
+                current_reset_generation = ?handle
+                    .view_state()
+                    .reset_generation(),
+                "wallet startup sync superseded by reset"
+            );
+            return;
+        };
+        if short_startup_plan.is_none()
+            && checkpoint < sync_target
+            && let Some(suffix) = cached_suffix.take()
+            && suffix.first().is_some_and(|apply| {
+                apply.from_block == wallet_backfill_from_block(checkpoint, start_block)
+            })
+        {
+            let suffix_applies = suffix.len();
+            let suffix_restaged = self.restage_captured_public_scan_applies(&suffix).await;
+            if suffix_restaged
+                && send_wallet_startup_events(
+                    &cfg.cache_key,
+                    suffix,
+                    Some(sync_target),
+                    progress,
+                    backfill_sender,
+                    handle,
+                )
+                .await
+            {
+                debug!(
+                    cache_key = %cfg.cache_key,
+                    checkpoint,
+                    sync_target,
+                    suffix_applies,
+                    "captured public scan suffix delivered after historical catch-up"
+                );
+                if cfg.sync_to_block.is_none()
+                    && let Some(progress) = handle.revalidate_schedulable_progress(startup)
+                {
+                    self.enqueue_wallet_backfill(
+                        ctx,
+                        sync_target,
+                        sync_target,
+                        true,
+                        progress,
+                        true,
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+            let Some(refreshed_progress) = handle.revalidate_schedulable_progress(startup) else {
+                return;
+            };
+            checkpoint = refreshed_progress.last_scanned;
+            progress = refreshed_progress;
+            debug!(
+                cache_key = %cfg.cache_key,
+                checkpoint,
+                sync_target,
+                "captured public scan suffix was rejected; continuing with normal backfill"
+            );
+        }
+        self.enqueue_wallet_backfill(
+            ctx,
+            checkpoint,
+            sync_target,
+            cfg.sync_to_block.is_none(),
+            progress,
+            !wallet_has_persistence_failure(handle),
+            short_startup_plan,
+        )
+        .await;
+        drop(startup_target_lease);
     }
 
     pub(super) async fn enqueue_wallet_backfill(
