@@ -1,8 +1,8 @@
 use super::commit::wallet_scan_progress_update;
 use super::poi_maintenance::{
-    PoiMaintenanceAbortReason, ppoi_workflow_status_with_candidate_report,
-    run_poi_maintenance_with_watchdog, sync_poi_refreshing_from_controller,
-    wallet_poi_refresh_interval_with_period,
+    PoiMaintenanceAbortReason, current_ppoi_workflow_status_for_candidate_report,
+    ppoi_workflow_status_with_candidate_report, run_poi_maintenance_with_watchdog,
+    sync_poi_refreshing_from_controller, wallet_poi_refresh_interval_with_period,
 };
 use super::test_support::spawn_wallet_worker;
 use super::*;

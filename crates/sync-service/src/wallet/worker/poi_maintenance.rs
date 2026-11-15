@@ -105,80 +105,90 @@ fn poi_maintenance_credential(handle: &WalletHandle) -> Option<WalletActorCreden
     }
 }
 
-/// Actor entry: coalesce force intent and spawn at most one maintenance job.
-pub(super) fn request_poi_maintenance(
-    controller: &mut PoiMaintenanceController,
-    remote_done_tx: &mpsc::Sender<WalletRemoteDone>,
-    private_apply: &WalletPrivateApplyClient,
-    poi_jobs: &WalletPoiJobTracker,
-    poi_refreshing_tx: &watch::Sender<bool>,
-    handle: &WalletHandle,
-    cancel: &CancellationToken,
-    db: &Arc<DbStore>,
-    cache_store: &Arc<dyn WalletCacheStore>,
-    cfg: &WalletConfig,
-    public_data_plane: &ChainPublicDataPlane,
-    http_client: Option<&reqwest::Client>,
-    indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
-    poi_runtime: &WalletPoiRuntime,
-    poi_submitter: &ChainPoiSubmitterHandle,
-    forest: &Arc<RwLock<MerkleForest>>,
-    utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
-    active_poi_list_keys: &[FixedBytes<32>],
-    force_output_poi_recovery: bool,
-) -> bool {
-    let can_start = poi_maintenance_can_start(handle);
-    let credential = poi_maintenance_credential(handle);
-    let Some(spec) = controller.request(force_output_poi_recovery, can_start, credential) else {
-        if force_output_poi_recovery && controller.force_pending() && controller.is_running() {
-            debug!(
-                cache_key = %handle.cache_key,
-                "poi force maintenance deferred until in-flight job completes"
-            );
-        } else if controller.is_running() {
-            debug!(
-                cache_key = %handle.cache_key,
-                "poi maintenance already running; follow-up latched"
-            );
-        }
-        sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
-        return false;
-    };
+impl WalletActorLoop<'_> {
+    /// Actor entry: coalesce force intent and spawn at most one maintenance job.
+    pub(super) fn request_poi_maintenance(&mut self, force_output_poi_recovery: bool) -> bool {
+        let can_start = poi_maintenance_can_start(&self.worker_handle);
+        let credential = poi_maintenance_credential(&self.worker_handle);
+        let Some(spec) =
+            self.poi_maintenance
+                .request(force_output_poi_recovery, can_start, credential)
+        else {
+            if force_output_poi_recovery
+                && self.poi_maintenance.force_pending()
+                && self.poi_maintenance.is_running()
+            {
+                debug!(
+                    cache_key = %self.worker_handle.cache_key,
+                    "poi force maintenance deferred until in-flight job completes"
+                );
+            } else if self.poi_maintenance.is_running() {
+                debug!(
+                    cache_key = %self.worker_handle.cache_key,
+                    "poi maintenance already running; follow-up latched"
+                );
+            }
+            self.sync_poi_refreshing();
+            return false;
+        };
 
-    let client = poi_runtime.public_client().clone();
-    PoiMaintenanceJob {
-        handle: handle.clone(),
-        cancel: cancel.clone(),
-        credential: spec.credential,
-        key: spec.key,
-        done_tx: remote_done_tx.clone(),
-        apply_client: private_apply.clone(),
-        db: Arc::clone(db),
-        cache_store: Arc::clone(cache_store),
-        cfg: cfg.clone(),
-        public_data_plane: public_data_plane.clone(),
-        http_client: http_client.cloned(),
-        indexed_artifact_source: indexed_artifact_source.cloned(),
-        poi_client: client,
-        poi_is_indexed: poi_runtime.is_indexed_artifacts(),
-        poi_wallet_read_fallback: poi_runtime.wallet_read_fallback_enabled(),
-        poi_submitter: poi_submitter.clone(),
-        forest: Arc::clone(forest),
-        utxos: Arc::clone(utxos),
-        active_poi_list_keys: active_poi_list_keys.to_vec(),
-        force_output_poi_recovery: spec.force_output_poi_recovery,
-        unshield_attempts: controller.unshield_attempts(),
-        forced_deferrals: controller.forced_deferrals(),
+        let client = self.poi_runtime.public_client().clone();
+        PoiMaintenanceJob {
+            handle: self.worker_handle.clone(),
+            cancel: self.cancel.clone(),
+            credential: spec.credential,
+            key: spec.key,
+            done_tx: self.remote_done_tx.clone(),
+            apply_client: self.private_apply.clone(),
+            db: Arc::clone(&self.db),
+            cache_store: Arc::clone(&self.cache_store),
+            cfg: self.cfg.clone(),
+            public_data_plane: self.public_data_plane.clone(),
+            http_client: self.http_client.clone(),
+            indexed_artifact_source: self.indexed_artifact_source.clone(),
+            poi_client: client,
+            poi_is_indexed: self.poi_runtime.is_indexed_artifacts(),
+            poi_wallet_read_fallback: self.poi_runtime.wallet_read_fallback_enabled(),
+            poi_submitter: self.poi_submitter.clone(),
+            forest: Arc::clone(&self.forest),
+            utxos: Arc::clone(&self.utxos),
+            active_poi_list_keys: self.active_poi_list_keys.clone(),
+            force_output_poi_recovery: spec.force_output_poi_recovery,
+            unshield_attempts: self.poi_maintenance.unshield_attempts(),
+            forced_deferrals: self.poi_maintenance.forced_deferrals(),
+        }
+        .spawn(&self.poi_jobs);
+        debug!(
+            cache_key = %self.worker_handle.cache_key,
+            force = spec.force_output_poi_recovery,
+            ?spec.key,
+            "poi maintenance job started"
+        );
+        self.sync_poi_refreshing();
+        true
     }
-    .spawn(poi_jobs);
-    debug!(
-        cache_key = %handle.cache_key,
-        force = spec.force_output_poi_recovery,
-        ?spec.key,
-        "poi maintenance job started"
-    );
-    sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
-    true
+
+    /// Re-enter after remote job completion: clear phase, maybe start forced follow-up.
+    pub(super) fn on_poi_maintenance_done(&mut self, key: PoiRemoteJobKey) {
+        let force_follow_up = self.poi_maintenance.on_job_done(key);
+        self.sync_poi_refreshing();
+        if force_follow_up {
+            debug!(
+                cache_key = %self.worker_handle.cache_key,
+                "starting deferred force poi maintenance after prior job"
+            );
+            let _ = self.request_poi_maintenance(false); // force already latched in controller
+        }
+    }
+
+    fn sync_poi_refreshing(&self) {
+        sync_poi_refreshing_from_controller(
+            &self.poi_maintenance,
+            &self.poi_refreshing_tx,
+            &self.worker_handle,
+            &self.cancel,
+        );
+    }
 }
 
 /// Refine a current candidate report against the unrefined base derived from durable records.
@@ -226,59 +236,6 @@ pub(super) fn ppoi_workflow_status_with_candidate_report(
     status
 }
 
-/// Re-enter after remote job completion: clear phase, maybe start forced follow-up.
-pub(super) fn on_poi_maintenance_done(
-    controller: &mut PoiMaintenanceController,
-    remote_done_tx: &mpsc::Sender<WalletRemoteDone>,
-    private_apply: &WalletPrivateApplyClient,
-    poi_jobs: &WalletPoiJobTracker,
-    poi_refreshing_tx: &watch::Sender<bool>,
-    handle: &WalletHandle,
-    cancel: &CancellationToken,
-    db: &Arc<DbStore>,
-    cache_store: &Arc<dyn WalletCacheStore>,
-    cfg: &WalletConfig,
-    public_data_plane: &ChainPublicDataPlane,
-    http_client: Option<&reqwest::Client>,
-    indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
-    poi_runtime: &WalletPoiRuntime,
-    poi_submitter: &ChainPoiSubmitterHandle,
-    forest: &Arc<RwLock<MerkleForest>>,
-    utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
-    active_poi_list_keys: &[FixedBytes<32>],
-    key: PoiRemoteJobKey,
-) {
-    let force_follow_up = controller.on_job_done(key);
-    sync_poi_refreshing_from_controller(controller, poi_refreshing_tx, handle, cancel);
-    if force_follow_up {
-        debug!(
-            cache_key = %handle.cache_key,
-            "starting deferred force poi maintenance after prior job"
-        );
-        let _ = request_poi_maintenance(
-            controller,
-            remote_done_tx,
-            private_apply,
-            poi_jobs,
-            poi_refreshing_tx,
-            handle,
-            cancel,
-            db,
-            cache_store,
-            cfg,
-            public_data_plane,
-            http_client,
-            indexed_artifact_source,
-            poi_runtime,
-            poi_submitter,
-            forest,
-            utxos,
-            active_poi_list_keys,
-            false, // force already latched in controller
-        );
-    }
-}
-
 /// Inputs for a background POI maintenance job (remote I/O off the actor select loop).
 struct PoiMaintenanceJob {
     handle: WalletHandle,
@@ -311,15 +268,17 @@ struct PoiMaintenanceJob {
     forced_deferrals: DeferredForcedSubmissions,
 }
 
-struct PoiMaintenanceOutcome {
-    recovered: usize,
-    candidate_report: SenderCandidateRecoveryReport,
-    recovery_error: Option<PoiMaintenanceError>,
-    forced_pending_attempts: usize,
-    submitted: usize,
-    verified_completed: usize,
-    verified_pending: usize,
-    verified_errors: usize,
+/// What a finished POI maintenance job reports back to the actor.
+#[derive(Debug)]
+pub(super) struct PoiMaintenanceOutcome {
+    pub(super) recovered: usize,
+    pub(super) candidate_report: SenderCandidateRecoveryReport,
+    pub(super) recovery_error: Option<PoiMaintenanceError>,
+    pub(super) forced_pending_attempts: usize,
+    pub(super) submitted: usize,
+    pub(super) verified_completed: usize,
+    pub(super) verified_pending: usize,
+    pub(super) verified_errors: usize,
 }
 
 impl PoiMaintenanceJob {
@@ -335,14 +294,7 @@ impl PoiMaintenanceJob {
                 Ok(outcome) => WalletRemoteDone::PoiMaintenance {
                     credential,
                     key,
-                    recovered: outcome.recovered,
-                    candidate_report: Box::new(outcome.candidate_report),
-                    recovery_error: outcome.recovery_error,
-                    forced_pending_attempts: outcome.forced_pending_attempts,
-                    submitted: outcome.submitted,
-                    verified_completed: outcome.verified_completed,
-                    verified_pending: outcome.verified_pending,
-                    verified_errors: outcome.verified_errors,
+                    outcome: Box::new(outcome),
                 },
                 Err(reason) => {
                     warn!(

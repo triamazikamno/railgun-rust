@@ -46,8 +46,8 @@ use super::merkle_artifacts::run_merkle_artifact_catch_up_into;
 use super::poi_submitter::test_support::{RecordedSend, RecordingPoiTransport};
 use super::poi_submitter::{ChainPoiSubmitterDriver, ChainPoiSubmitterHandle};
 use super::service::{
-    IndexedWalletCatchUpOutcome, WalletShortStartupPlan, await_live_log_task_shutdown,
-    wait_for_startup_sync_target, wait_for_wallet_ready,
+    IndexedWalletCatchUpOutcome, WalletShortStartupPlan, WalletSyncContext,
+    await_live_log_task_shutdown, wait_for_startup_sync_target, wait_for_wallet_ready,
 };
 use super::workers::{
     ForestStallTracker, HEAD_READ_STAGGER, INDEXED_TAIL_FALLBACK_COOLDOWN, INITIAL_HEAD_DEADLINE,
@@ -5719,21 +5719,21 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
     .expect("spawn wallet worker");
 
     let catch_up = service.indexed_wallet_catch_up(
-        &wallet_cfg,
-        0,
+        WalletSyncContext {
+            cfg: &wallet_cfg,
+            start_block: 0,
+            handle: &handle,
+            backfill_sender: &wallet_backfill_tx,
+        },
         100,
         200,
-        &handle,
         &worker_cancel,
         IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
         true,
-        (
-            &wallet_backfill_tx,
-            crate::types::WalletSchedulableProgress {
-                last_scanned: 100,
-                reset_generation: 0,
-            },
-        ),
+        crate::types::WalletSchedulableProgress {
+            last_scanned: 100,
+            reset_generation: 0,
+        },
     );
     let release_race_page = async {
         wait_for_std_signal(
@@ -5924,21 +5924,21 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
     let catch_up = tokio::spawn(async move {
         catch_up_service
             .indexed_wallet_catch_up(
-                &catch_up_cfg,
-                0,
+                WalletSyncContext {
+                    cfg: &catch_up_cfg,
+                    start_block: 0,
+                    handle: &catch_up_handle,
+                    backfill_sender: &catch_up_sender,
+                },
                 100,
                 150,
-                &catch_up_handle,
                 &catch_up_cancel,
                 IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
                 true,
-                (
-                    &catch_up_sender,
-                    crate::types::WalletSchedulableProgress {
-                        last_scanned: 100,
-                        reset_generation: 0,
-                    },
-                ),
+                crate::types::WalletSchedulableProgress {
+                    last_scanned: 100,
+                    reset_generation: 0,
+                },
             )
             .await
     });
@@ -6131,21 +6131,21 @@ async fn indexed_catch_up_cancellation_is_typed_after_driver_acceptance() {
     let catch_up = tokio::spawn(async move {
         service
             .indexed_wallet_catch_up_outcome(
-                &cfg,
-                0,
+                WalletSyncContext {
+                    cfg: &cfg,
+                    start_block: 0,
+                    handle: &handle,
+                    backfill_sender: &sender,
+                },
                 100,
                 110,
-                &handle,
                 &cancel,
                 IndexedWalletCatchUpSourceOrder::SquidFirst,
                 true,
-                (
-                    &sender,
-                    crate::types::WalletSchedulableProgress {
-                        last_scanned: 100,
-                        reset_generation: 0,
-                    },
-                ),
+                crate::types::WalletSchedulableProgress {
+                    last_scanned: 100,
+                    reset_generation: 0,
+                },
             )
             .await
     });
@@ -7152,12 +7152,14 @@ async fn cached_public_coverage_partial_segment_does_not_publish_ready() {
 
     let outcome = service
         .apply_cached_public_scan_coverage(
-            &cfg,
-            0,
+            WalletSyncContext {
+                cfg: &cfg,
+                start_block: 0,
+                handle: &handle,
+                backfill_sender: &backfill_tx,
+            },
             100,
             200,
-            &handle,
-            &backfill_tx,
             crate::types::WalletSchedulableProgress {
                 last_scanned: 100,
                 reset_generation: 0,
@@ -8592,21 +8594,21 @@ impl IndexedCatchUpTestContext {
         tokio::spawn(async move {
             service
                 .indexed_wallet_catch_up(
-                    &cfg,
-                    0,
+                    WalletSyncContext {
+                        cfg: &cfg,
+                        start_block: 0,
+                        handle: &handle,
+                        backfill_sender: &sender,
+                    },
                     last_scanned,
                     safe_head,
-                    &handle,
                     &cancel,
                     source_order,
                     true,
-                    (
-                        &sender,
-                        crate::types::WalletSchedulableProgress {
-                            last_scanned,
-                            reset_generation: 0,
-                        },
-                    ),
+                    crate::types::WalletSchedulableProgress {
+                        last_scanned,
+                        reset_generation: 0,
+                    },
                 )
                 .await
         })

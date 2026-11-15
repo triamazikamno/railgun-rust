@@ -123,18 +123,57 @@ pub(super) fn spawn_pending_output_poi_tentative_job(
         )
         .await;
         let _ = done_tx
-            .send(WalletRemoteDone::PendingOutputPoiTentative {
-                credential,
-                retryable: result.retryable,
-                accepted_candidates: result.accepted_candidates,
-                accepted: result.accepted,
-                missing_txid: result.missing_txid,
-                remote_failure: result.remote_failure,
-                context_stale: result.context_stale,
-                authority_stale: result.authority_stale,
-            })
+            .send(WalletRemoteDone::PendingOutputPoiTentative { credential, result })
             .await;
     });
+}
+
+impl WalletActorLoop<'_> {
+    /// Records a tentative submission job's result and refreshes accepted candidates.
+    pub(super) async fn handle_tentative_pending_output_poi_result(
+        &mut self,
+        credential: WalletActorCredential,
+        result: PendingOutputPoiTentativeSubmissionResult,
+    ) {
+        let PendingOutputPoiTentativeSubmissionResult {
+            succeeded: _,
+            accepted_candidates,
+            retryable,
+            accepted,
+            missing_txid,
+            remote_failure,
+            context_stale,
+            authority_stale: _authority_stale,
+        } = result;
+        if !credential.is_current(&self.worker_handle) {
+            debug!("stale tentative pending output POI result dropped");
+            return;
+        }
+        self.pending_output_poi_tentative_attempts
+            .accept(credential.reset_generation, &accepted_candidates);
+        self.pending_output_poi_tentative_attempts
+            .release_retryable(credential.reset_generation, &retryable);
+        if !accepted_candidates.is_empty() {
+            refresh_tentative_pending_output_poi_statuses(
+                &self.worker_handle,
+                &self.cancel,
+                self.poi_corpus_handle.as_ref(),
+                &self.cfg,
+                &self.active_poi_list_keys,
+                credential.reset_generation,
+                &mut self.pending_output_poi_tentative_attempts,
+            )
+            .await;
+        }
+        info!(
+            accepted,
+            missing_txid,
+            remote_failure,
+            context_stale,
+            retryable = retryable.len(),
+            "tentative pending output POI submission complete"
+        );
+    }
 }
 
 #[derive(Default)]
