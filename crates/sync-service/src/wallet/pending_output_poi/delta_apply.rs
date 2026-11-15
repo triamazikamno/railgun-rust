@@ -16,22 +16,23 @@ use super::{
     PendingContextTerminalDelta, PendingOutputPoiContextRecord, PendingOutputPoiObservation,
     PendingOutputPoiRole, PendingOutputPoiSubject, PendingOutputPoiSubjectMatch,
     PendingOutputPoiSubmissionKind, PendingOutputPoiValidationEvidence, PendingSubmissionDelta,
-    PoiPrivateApplyOutcome, PoiStatus, PoiStatusRefreshDelta, RecoveredOutgoingSubmissionDelta,
-    RecoveredOutgoingSubmissionSibling, SenderCandidateLocallyValidDelta,
-    SenderCandidateMaterializationDelta, SenderCandidateReconstructionDelta,
-    SenderCandidateUnshieldUpdateDelta, SenderCandidateUnshieldValidatedDelta, VerifiedValidDelta,
-    WalletCacheError, WalletCacheStore, WalletCheckpointMutation, WalletConfig,
-    WalletPpoiWorkflowProjection, WalletPrivateCommit, WalletPrivateMutationAuthority,
-    WalletPrivateMutationPermit, WalletUtxo, WalletUtxoMutation, expected_pending_context_matches,
-    expected_pending_context_state, expected_poi_status_matches, expected_recovery_matches,
-    expected_recovery_state, hold_expected_poi_corpus_revision, new_output_poi_recovery_record,
-    new_pending_output_poi_recovery_record, output_poi_recovery_default_status,
-    pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
-    pending_output_poi_subject_matches_snapshot, pending_output_poi_submit_identity,
-    pending_submission_predicate_matches, poi_statuses_are_recoverable_for_lists,
-    prune_nonrecoverable_unsubmitted_poi_lists, recoverable_pending_submission_list_keys,
-    saved_pending_context_is_compatible, sender_materialization_pending_matches,
-    sender_materialization_recovery_matches, wallet_ppoi_workflow_status_after_mutations,
+    PoiPrivateApplyOutcome, PoiPrivateRows, PoiStatus, PoiStatusRefreshDelta,
+    RecoveredOutgoingSubmissionDelta, RecoveredOutgoingSubmissionSibling,
+    SenderCandidateLocallyValidDelta, SenderCandidateMaterializationDelta,
+    SenderCandidateReconstructionDelta, SenderCandidateUnshieldUpdateDelta,
+    SenderCandidateUnshieldValidatedDelta, VerifiedValidDelta, WalletCacheError, WalletCacheStore,
+    WalletCheckpointMutation, WalletConfig, WalletPpoiWorkflowProjection, WalletPrivateCommit,
+    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletUtxo, WalletUtxoMutation,
+    expected_pending_context_matches, expected_pending_context_state, expected_poi_status_matches,
+    expected_recovery_matches, expected_recovery_state, hold_expected_poi_corpus_revision,
+    new_output_poi_recovery_record, new_pending_output_poi_recovery_record,
+    output_poi_recovery_default_status, pending_output_poi_context_fingerprint,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_subject_matches_snapshot,
+    pending_output_poi_submit_identity, pending_submission_predicate_matches,
+    poi_statuses_are_recoverable_for_lists, prune_nonrecoverable_unsubmitted_poi_lists,
+    recoverable_pending_submission_list_keys, saved_pending_context_is_compatible,
+    sender_materialization_pending_matches, sender_materialization_recovery_matches,
+    wallet_ppoi_workflow_status_after_mutations,
 };
 
 /// Whether the stored sender candidate still equals `expected`; a missing record does not.
@@ -83,28 +84,19 @@ fn commit_sender_candidate_replacement(
         Some(replacement) => (vec![replacement], Vec::new()),
         None => (Vec::new(), vec![expected_candidate_id]),
     };
+    let rows = PoiPrivateRows {
+        candidate_updates: &candidate_updates,
+        candidate_deletes: &candidate_deletes,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         active_list_keys,
         validation_revision,
-        &[],
-        &[],
-        &[],
-        &[],
-        &candidate_updates,
-        &candidate_deletes,
+        rows,
     )?;
-    commit_durable_apply(
-        permit,
-        cache_store,
-        PoiPrivateRows {
-            candidate_updates: &candidate_updates,
-            candidate_deletes: &candidate_deletes,
-            ..PoiPrivateRows::default()
-        },
-        workflow_status,
-    )
+    commit_durable_apply(permit, cache_store, rows, workflow_status)
 }
 
 /// Outcome of a durable commit that leaves UTXOs unchanged; a rejected apply is an error.
@@ -156,17 +148,6 @@ fn add_submitted_list_keys<'a>(
             context.submitted_poi_list_keys.push(*list_key);
         }
     }
-}
-
-/// Private POI rows one commit writes; rows left at the default write nothing.
-#[derive(Clone, Copy, Default)]
-struct PoiPrivateRows<'a> {
-    pending_updates: &'a [PendingOutputPoiContextRecord],
-    pending_deletes: &'a [FixedBytes<32>],
-    recovery_updates: &'a [OutputPoiRecoveryRecord],
-    recovery_deletes: &'a [FixedBytes<32>],
-    candidate_updates: &'a [SenderTransactionCandidate],
-    candidate_deletes: &'a [FixedBytes<32>],
 }
 
 impl<'a> PoiPrivateRows<'a> {
@@ -941,30 +922,21 @@ async fn apply_sender_candidate_materialization(
         Some(replacement) => (vec![replacement], Vec::new()),
         None => (Vec::new(), vec![expected_candidate.semantic_id()]),
     };
+    let private_rows = PoiPrivateRows {
+        pending_updates: &rows.absent_pending_updates,
+        recovery_updates: &rows.absent_recovery_updates,
+        candidate_updates: &candidate_updates,
+        candidate_deletes: &candidate_deletes,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &rows.absent_pending_updates,
-        &[],
-        &rows.absent_recovery_updates,
-        &[],
-        &candidate_updates,
-        &candidate_deletes,
+        private_rows,
     )?;
-    commit_durable_apply(
-        permit,
-        cache_store,
-        PoiPrivateRows {
-            pending_updates: &rows.absent_pending_updates,
-            recovery_updates: &rows.absent_recovery_updates,
-            candidate_updates: &candidate_updates,
-            candidate_deletes: &candidate_deletes,
-            ..PoiPrivateRows::default()
-        },
-        workflow_status,
-    )
+    commit_durable_apply(permit, cache_store, private_rows, workflow_status)
 }
 
 async fn apply_sender_candidate_unshield_update(
@@ -1212,28 +1184,19 @@ async fn apply_output_recovery(
     recovery.apply_action(action, now);
     let pending_updates: Vec<_> = pending_update.into_iter().collect();
     let recovery_updates = [recovery];
+    let rows = PoiPrivateRows {
+        pending_updates: &pending_updates,
+        recovery_updates: &recovery_updates,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &pending_updates,
-        &[],
-        &recovery_updates,
-        &[],
-        &[],
-        &[],
+        rows,
     )?;
-    commit_durable_apply(
-        permit,
-        cache_store,
-        PoiPrivateRows {
-            pending_updates: &pending_updates,
-            recovery_updates: &recovery_updates,
-            ..PoiPrivateRows::default()
-        },
-        workflow_status,
-    )
+    commit_durable_apply(permit, cache_store, rows, workflow_status)
 }
 
 fn apply_pending_submission(
@@ -1337,28 +1300,19 @@ fn apply_pending_submission(
         .into_iter()
         .collect();
     let recovery_updates = [recovery];
+    let rows = PoiPrivateRows {
+        pending_updates: &pending_updates,
+        recovery_updates: &recovery_updates,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &pending_updates,
-        &[],
-        &recovery_updates,
-        &[],
-        &[],
-        &[],
+        rows,
     )?;
-    commit_durable_apply(
-        permit,
-        cache_store,
-        PoiPrivateRows {
-            pending_updates: &pending_updates,
-            recovery_updates: &recovery_updates,
-            ..PoiPrivateRows::default()
-        },
-        workflow_status,
-    )
+    commit_durable_apply(permit, cache_store, rows, workflow_status)
 }
 
 /// Wallet state a recovered outgoing submission's siblings are checked against.
@@ -1644,28 +1598,19 @@ async fn apply_recovered_outgoing_submission(
             pending_updates.push(context);
         }
     }
+    let rows = PoiPrivateRows {
+        pending_updates: &pending_updates,
+        recovery_updates: &recovery_updates,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &pending_updates,
-        &[],
-        &recovery_updates,
-        &[],
-        &[],
-        &[],
+        rows,
     )?;
-    commit_durable_apply(
-        permit,
-        cache_store,
-        PoiPrivateRows {
-            pending_updates: &pending_updates,
-            recovery_updates: &recovery_updates,
-            ..PoiPrivateRows::default()
-        },
-        workflow_status,
-    )
+    commit_durable_apply(permit, cache_store, rows, workflow_status)
 }
 
 fn apply_pending_context_terminal(
@@ -1738,27 +1683,18 @@ fn apply_pending_context_terminal(
     }
     current_context.terminal_error = Some(error);
     let pending_updates = [current_context];
+    let rows = PoiPrivateRows {
+        pending_updates: &pending_updates,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &pending_updates,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
+        rows,
     )?;
-    commit_durable_apply(
-        permit,
-        cache_store,
-        PoiPrivateRows {
-            pending_updates: &pending_updates,
-            ..PoiPrivateRows::default()
-        },
-        workflow_status,
-    )
+    commit_durable_apply(permit, cache_store, rows, workflow_status)
 }
 
 async fn apply_locally_valid_pending_lists(
@@ -1916,17 +1852,19 @@ async fn apply_locally_valid_pending_lists(
         );
         recovery_updates.push(recovery);
     }
+    let rows = PoiPrivateRows {
+        pending_updates: &pending_updates,
+        pending_deletes: &pending_deletes,
+        recovery_updates: &recovery_updates,
+        recovery_deletes: &recovery_deletes,
+        ..PoiPrivateRows::default()
+    };
     let workflow_status = wallet_ppoi_workflow_status_after_mutations(
         cache_store,
         cfg,
         &active_list_keys,
         permit.ppoi_workflow_status().validation_revision,
-        &pending_updates,
-        &pending_deletes,
-        &recovery_updates,
-        &recovery_deletes,
-        &[],
-        &[],
+        rows,
     )?;
     commit_active_apply(
         permit,
@@ -1934,13 +1872,7 @@ async fn apply_locally_valid_pending_lists(
         ActiveApplyCommit {
             snapshot,
             utxos_changed: changed,
-            rows: PoiPrivateRows {
-                pending_updates: &pending_updates,
-                pending_deletes: &pending_deletes,
-                recovery_updates: &recovery_updates,
-                recovery_deletes: &recovery_deletes,
-                ..PoiPrivateRows::default()
-            },
+            rows,
             workflow: Some(workflow_status),
         },
     )

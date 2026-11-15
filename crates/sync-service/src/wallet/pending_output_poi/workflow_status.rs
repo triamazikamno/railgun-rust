@@ -15,27 +15,33 @@ pub(in crate::wallet) struct WalletPpoiWorkflowProjection {
     pub(in crate::wallet) submissions: Arc<[WalletPpoiSubmissionStatus]>,
 }
 
+/// Private POI rows one commit writes; rows left at the default write nothing.
+#[derive(Clone, Copy, Default)]
+pub(in crate::wallet) struct PoiPrivateRows<'a> {
+    pub(in crate::wallet) pending_updates: &'a [PendingOutputPoiContextRecord],
+    pub(in crate::wallet) pending_deletes: &'a [FixedBytes<32>],
+    pub(in crate::wallet) recovery_updates: &'a [OutputPoiRecoveryRecord],
+    pub(in crate::wallet) recovery_deletes: &'a [FixedBytes<32>],
+    pub(in crate::wallet) candidate_updates: &'a [SenderTransactionCandidate],
+    pub(in crate::wallet) candidate_deletes: &'a [FixedBytes<32>],
+}
+
 pub(in crate::wallet) fn wallet_ppoi_workflow_status_after_mutations(
     cache_store: &dyn WalletCacheStore,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
     validation_revision: u64,
-    pending_updates: &[PendingOutputPoiContextRecord],
-    pending_deletes: &[FixedBytes<32>],
-    recovery_updates: &[OutputPoiRecoveryRecord],
-    recovery_deletes: &[FixedBytes<32>],
-    candidate_updates: &[SenderTransactionCandidate],
-    candidate_deletes: &[FixedBytes<32>],
+    rows: PoiPrivateRows<'_>,
 ) -> Result<WalletPpoiWorkflowProjection, WalletCacheError> {
     let mut recoveries = cache_store
         .list_output_poi_recoveries(cfg.chain.chain_id, &cfg.cache_key)?
         .into_iter()
         .map(|record| (record.output_commitment, record))
         .collect::<BTreeMap<_, _>>();
-    for recovery in recovery_updates {
+    for recovery in rows.recovery_updates {
         recoveries.insert(recovery.output_commitment, recovery.clone());
     }
-    for output_commitment in recovery_deletes {
+    for output_commitment in rows.recovery_deletes {
         recoveries.remove(output_commitment);
     }
     let mut contexts = cache_store
@@ -43,10 +49,10 @@ pub(in crate::wallet) fn wallet_ppoi_workflow_status_after_mutations(
         .into_iter()
         .map(|record| (record.output_commitment, record))
         .collect::<BTreeMap<_, _>>();
-    for context in pending_updates {
+    for context in rows.pending_updates {
         contexts.insert(context.output_commitment, context.clone());
     }
-    for output_commitment in pending_deletes {
+    for output_commitment in rows.pending_deletes {
         contexts.remove(output_commitment);
     }
     let mut candidates = cache_store
@@ -54,10 +60,10 @@ pub(in crate::wallet) fn wallet_ppoi_workflow_status_after_mutations(
         .into_iter()
         .map(|candidate| (candidate.semantic_id(), candidate))
         .collect::<BTreeMap<_, _>>();
-    for candidate in candidate_updates {
+    for candidate in rows.candidate_updates {
         candidates.insert(candidate.semantic_id(), candidate.clone());
     }
-    for candidate_id in candidate_deletes {
+    for candidate_id in rows.candidate_deletes {
         candidates.remove(candidate_id);
     }
     let mut status = WalletPpoiWorkflowStatus {
@@ -178,11 +184,10 @@ pub(super) fn wallet_ppoi_workflow_status_after_validation(
             .ppoi_workflow_status()
             .validation_revision
             .saturating_add(1),
-        &[],
-        &pending_deletes,
-        &[],
-        &recovery_deletes,
-        &[],
-        &[],
+        PoiPrivateRows {
+            pending_deletes: &pending_deletes,
+            recovery_deletes: &recovery_deletes,
+            ..PoiPrivateRows::default()
+        },
     )
 }

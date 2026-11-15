@@ -375,12 +375,13 @@ impl WalletResetCommitRequest<'_> {
             request.cfg,
             &active_list_keys,
             permit.ppoi_workflow_status().validation_revision,
-            &pending_output_rewind.context_updates,
-            &pending_context_deletes,
-            &[],
-            &output_recovery_deletes,
-            &[],
-            &sender_candidate_deletes,
+            PoiPrivateRows {
+                pending_updates: &pending_output_rewind.context_updates,
+                pending_deletes: &pending_context_deletes,
+                recovery_deletes: &output_recovery_deletes,
+                candidate_deletes: &sender_candidate_deletes,
+                ..PoiPrivateRows::default()
+            },
         ) {
             Ok(status) => status,
             Err(err) => {
@@ -935,12 +936,13 @@ impl WalletScanCommitRequest<'_> {
             request.cfg,
             &active_list_keys,
             permit.ppoi_workflow_status().validation_revision,
-            &pending_output_observation_updates.context_updates,
-            &outcome.spent_output_commitments,
-            &[],
-            &pending_output_observation_updates.recovery_deletes,
-            &sender_transaction_candidates,
-            &[],
+            PoiPrivateRows {
+                pending_updates: &pending_output_observation_updates.context_updates,
+                pending_deletes: &outcome.spent_output_commitments,
+                recovery_deletes: &pending_output_observation_updates.recovery_deletes,
+                candidate_updates: &sender_transaction_candidates,
+                ..PoiPrivateRows::default()
+            },
         ) {
             Ok(status) => status,
             Err(err) => {

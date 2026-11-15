@@ -196,12 +196,7 @@ pub(super) fn current_ppoi_workflow_status_for_candidate_report(
         cfg,
         active_list_keys,
         published.validation_revision,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
+        PoiPrivateRows::default(),
     )
     .ok()?
     .status;

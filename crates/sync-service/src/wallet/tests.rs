@@ -24,8 +24,8 @@ use super::output_poi_recovery::{
     preflight_local_output_poi_input_proofs, recoverable_output_poi_list_keys,
 };
 use super::pending_output_poi::{
-    pending_output_poi_observation_state_updates, pending_output_poi_submit_identity,
-    prepare_pending_output_poi_tentative_candidates,
+    PoiPrivateRows, pending_output_poi_observation_state_updates,
+    pending_output_poi_submit_identity, prepare_pending_output_poi_tentative_candidates,
     test_support::{
         pending_output_poi_observation_updates, process_pending_output_poi_observations,
         process_pending_output_poi_observations_inner, verify_submitted_pending_output_pois,
@@ -1505,12 +1505,7 @@ fn wallet_ppoi_workflow_status_for_test(
         cfg,
         active_list_keys,
         validation_revision,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
+        PoiPrivateRows::default(),
     )
     .expect("derive workflow status")
     .status
@@ -1636,12 +1631,7 @@ fn wallet_ppoi_workflow_status_classifies_only_observed_active_contexts() {
         &cfg,
         &[active_list],
         9,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
+        PoiPrivateRows::default(),
     )
     .expect("derive submission projection");
     assert_eq!(
@@ -1696,12 +1686,7 @@ fn wallet_ppoi_submission_projection_includes_change_without_external_workflow_c
         &cfg,
         &[active_list],
         0,
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
+        PoiPrivateRows::default(),
     )
     .expect("derive change submission projection");
     assert_eq!(
@@ -1755,12 +1740,10 @@ fn wallet_ppoi_workflow_status_transitions_candidate_output_without_double_count
         &cfg,
         &[active_list],
         0,
-        &[],
-        &[],
-        &[],
-        &[],
-        std::slice::from_ref(&candidate),
-        &[],
+        PoiPrivateRows {
+            candidate_updates: std::slice::from_ref(&candidate),
+            ..PoiPrivateRows::default()
+        },
     )
     .expect("derive candidate workflow status")
     .status;
@@ -1774,12 +1757,10 @@ fn wallet_ppoi_workflow_status_transitions_candidate_output_without_double_count
             &cfg,
             &[active_list],
             0,
-            &[],
-            &[],
-            &[],
-            &[],
-            std::slice::from_ref(candidate),
-            &[],
+            PoiPrivateRows {
+                candidate_updates: std::slice::from_ref(candidate),
+                ..PoiPrivateRows::default()
+            },
         )
         .expect("derive unshield workflow status")
         .status
@@ -1823,12 +1804,11 @@ fn wallet_ppoi_workflow_status_transitions_candidate_output_without_double_count
         &cfg,
         &[active_list],
         0,
-        &[materialized],
-        &[],
-        &[],
-        &[],
-        std::slice::from_ref(&candidate),
-        &[],
+        PoiPrivateRows {
+            pending_updates: &[materialized],
+            candidate_updates: std::slice::from_ref(&candidate),
+            ..PoiPrivateRows::default()
+        },
     )
     .expect("derive materialized workflow status")
     .status;
@@ -1889,12 +1869,10 @@ fn wallet_ppoi_workflow_status_keeps_matching_valid_recovery_awaiting_reconcilia
         &cfg,
         &[active_list],
         3,
-        &[],
-        &[],
-        std::slice::from_ref(&recovery),
-        &[],
-        &[],
-        &[],
+        PoiPrivateRows {
+            recovery_updates: std::slice::from_ref(&recovery),
+            ..PoiPrivateRows::default()
+        },
     )
     .expect("derive updated submission projection");
     assert_eq!(updated.submissions[0].last_submission_at, 8);
@@ -1904,12 +1882,10 @@ fn wallet_ppoi_workflow_status_keeps_matching_valid_recovery_awaiting_reconcilia
         &cfg,
         &[active_list],
         3,
-        &[],
-        &[],
-        &[],
-        std::slice::from_ref(&context.output_commitment),
-        &[],
-        &[],
+        PoiPrivateRows {
+            recovery_deletes: std::slice::from_ref(&context.output_commitment),
+            ..PoiPrivateRows::default()
+        },
     )
     .expect("derive deleted submission projection");
     assert!(deleted.submissions.is_empty());
@@ -1919,12 +1895,11 @@ fn wallet_ppoi_workflow_status_keeps_matching_valid_recovery_awaiting_reconcilia
         &cfg,
         &[active_list],
         4,
-        &[],
-        std::slice::from_ref(&context.output_commitment),
-        &[],
-        std::slice::from_ref(&context.output_commitment),
-        &[],
-        &[],
+        PoiPrivateRows {
+            pending_deletes: std::slice::from_ref(&context.output_commitment),
+            recovery_deletes: std::slice::from_ref(&context.output_commitment),
+            ..PoiPrivateRows::default()
+        },
     )
     .expect("derive validation deletion projection");
     assert!(validation_deleted.submissions.is_empty());
@@ -9273,12 +9248,7 @@ async fn pending_output_handoff_does_not_wait_for_chain_send_and_reports_chain_f
             &cfg,
             &[list_key],
             0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
+            PoiPrivateRows::default(),
         )
         .expect("workflow status")
         .status

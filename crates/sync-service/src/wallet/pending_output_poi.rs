@@ -49,7 +49,7 @@ pub(super) use tentative::{
 pub(super) use verification::reconcile_pending_output_poi_local_statuses;
 pub(super) use verification::verify_submitted_pending_output_pois_with_config_authorized;
 pub(super) use workflow_status::{
-    WalletPpoiWorkflowProjection, wallet_ppoi_workflow_status_after_mutations,
+    PoiPrivateRows, WalletPpoiWorkflowProjection, wallet_ppoi_workflow_status_after_mutations,
 };
 
 pub(super) async fn process_pending_output_poi_observations_authorized(
