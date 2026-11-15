@@ -2,18 +2,19 @@
 
 use crate::wallet::{
     PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingContextTerminalDelta,
-    PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubmissionPlan,
-    PendingSubmissionDelta, TransactProofRoute, current_pending_output_poi_subject,
-    pending_output_poi_context_fingerprint, pending_output_poi_submission_plan_current,
-    preflight_and_remote_submit_pending_output_poi,
+    PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubject,
+    PendingOutputPoiSubmissionPlan, PendingSubmissionDelta, TransactProofRoute, WalletCacheError,
+    current_pending_output_poi_subject, pending_output_poi_context_fingerprint,
+    pending_output_poi_submission_plan_current, preflight_and_remote_submit_pending_output_poi,
 };
 use std::collections::BTreeSet;
 
 use super::{
     Arc, ChainPublicDataPlane, DbStore, FixedBytes, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OutputPoiRecoveryAction, OwnedPoiPrivateDelta, PendingOutputPoiContextRecord, RwLock,
-    WalletCacheStore, WalletConfig, WalletPrivateMutationAuthority, WalletPrivatePoiClients,
-    WalletUtxo, apply_poi_private_delta, debug, expected_recovery_state, now_epoch_secs, warn,
+    OutputPoiRecoveryAction, OwnedPoiPrivateDelta, PendingOutputPoiContextRecord,
+    PoiPrivateApplyOutcome, RwLock, WalletCacheStore, WalletConfig, WalletPrivateMutationAuthority,
+    WalletPrivatePoiClients, WalletUtxo, apply_poi_private_delta, debug, expected_recovery_state,
+    now_epoch_secs, warn,
 };
 
 pub(in crate::wallet) async fn force_resubmit_matching_pending_output_pois_authorized(
@@ -185,127 +186,159 @@ pub(in crate::wallet) async fn force_resubmit_pending_output_poi_context(
         );
         return None;
     };
-    match &attempt {
-        PendingOutputPoiRemoteAttempt::NotCurrent
-        | PendingOutputPoiRemoteAttempt::Deferred
-        | PendingOutputPoiRemoteAttempt::AuthorityStale => {}
-        PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
-            if apply_poi_private_delta(
-                authority,
-                db,
-                cache_store,
-                cfg,
-                OwnedPoiPrivateDelta::PendingContextTerminal(PendingContextTerminalDelta {
-                    subject: subject.clone(),
-                    expected_context_fingerprint,
-                    expected_recovery: plan.expected_recovery(),
-                    active_list_keys: active_list_keys.to_vec(),
-                    target_list_keys: plan.list_keys().to_vec(),
-                    error: "missing pre-transaction POI for pending output".to_string(),
-                }),
-            )
-            .await
-            .is_err()
-            {
-                warn!(
-                    chain_id = cfg.chain.chain_id,
-                    "failed to mark pending output POI context terminal"
-                );
+    ForcedAttempt {
+        authority,
+        public_data_plane,
+        db,
+        cache_store,
+        cfg,
+        active_list_keys,
+        record,
+        subject,
+        plan,
+        expected_context_fingerprint,
+        now,
+    }
+    .record(&attempt)
+    .await;
+    Some(attempt)
+}
+
+/// A forced resubmission attempt's subject and plan, with the inputs recording its outcome needs.
+struct ForcedAttempt<'a> {
+    authority: &'a WalletPrivateMutationAuthority<'a>,
+    public_data_plane: &'a ChainPublicDataPlane,
+    db: &'a DbStore,
+    cache_store: &'a dyn WalletCacheStore,
+    cfg: &'a WalletConfig,
+    active_list_keys: &'a [FixedBytes<32>],
+    record: &'a PendingOutputPoiContextRecord,
+    subject: PendingOutputPoiSubject,
+    plan: PendingOutputPoiSubmissionPlan,
+    expected_context_fingerprint: Vec<u8>,
+    now: u64,
+}
+
+impl ForcedAttempt<'_> {
+    /// Records the attempt's outcome: a terminal context, or the submission result while the
+    /// plan is still ready.
+    async fn record(&self, attempt: &PendingOutputPoiRemoteAttempt) {
+        let (list_keys, action, submitted) = match attempt {
+            PendingOutputPoiRemoteAttempt::NotCurrent
+            | PendingOutputPoiRemoteAttempt::Deferred
+            | PendingOutputPoiRemoteAttempt::AuthorityStale => return,
+            PendingOutputPoiRemoteAttempt::MissingPreTransactionPois => {
+                self.mark_terminal().await;
+                return;
             }
+            PendingOutputPoiRemoteAttempt::Succeeded {
+                submitted_list_keys,
+            } => (
+                submitted_list_keys.clone(),
+                OutputPoiRecoveryAction::Submitted {
+                    retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+                },
+                true,
+            ),
+            PendingOutputPoiRemoteAttempt::Failed { error, .. } => (
+                self.plan.list_keys().to_vec(),
+                OutputPoiRecoveryAction::SubmitFailed {
+                    error: error.clone(),
+                    retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                },
+                false,
+            ),
+        };
+        if !self.plan_still_ready().await {
+            return;
         }
-        PendingOutputPoiRemoteAttempt::Succeeded {
-            submitted_list_keys,
-        } => {
-            if matches!(
-                pending_output_poi_submission_plan_current(
-                    authority,
-                    public_data_plane,
-                    cache_store,
-                    cfg,
-                    active_list_keys,
-                    record,
-                    &subject,
-                    &plan,
-                )
-                .await,
-                Ok(PendingOutputPoiPreflight::Ready)
-            ) && apply_poi_private_delta(
-                authority,
-                db,
-                cache_store,
-                cfg,
-                OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
-                    subject: subject.clone(),
-                    expected_context_fingerprint,
-                    expected_recovery: plan.expected_recovery(),
-                    active_list_keys: active_list_keys.to_vec(),
-                    list_keys: submitted_list_keys.clone(),
-                    predicate: plan.predicate(),
-                    merge_submitted_list_keys: true,
-                    action: OutputPoiRecoveryAction::Submitted {
-                        retry_after: PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-                    },
-                    now,
-                }),
-            )
-            .await
-            .is_err()
-            {
-                warn!(
-                    chain_id = cfg.chain.chain_id,
-                    "failed to persist resubmitted pending output POI state"
-                );
-            }
+        match self.persist_submission(list_keys, action, submitted).await {
+            Ok(_) => {}
+            Err(_) if submitted => warn!(
+                chain_id = self.cfg.chain.chain_id,
+                "failed to persist resubmitted pending output POI state"
+            ),
+            Err(_) => warn!(
+                chain_id = self.cfg.chain.chain_id,
+                "failed to persist failed pending output POI resubmission state"
+            ),
         }
-        PendingOutputPoiRemoteAttempt::Failed { error, .. } => {
-            if matches!(
-                pending_output_poi_submission_plan_current(
-                    authority,
-                    public_data_plane,
-                    cache_store,
-                    cfg,
-                    active_list_keys,
-                    record,
-                    &subject,
-                    &plan,
-                )
-                .await,
-                Ok(PendingOutputPoiPreflight::Ready)
-            ) {
-                if apply_poi_private_delta(
-                    authority,
-                    db,
-                    cache_store,
-                    cfg,
-                    OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
-                        subject: subject.clone(),
-                        expected_context_fingerprint,
-                        expected_recovery: plan.expected_recovery(),
-                        active_list_keys: active_list_keys.to_vec(),
-                        list_keys: plan.list_keys().to_vec(),
-                        predicate: plan.predicate(),
-                        merge_submitted_list_keys: false,
-                        action: OutputPoiRecoveryAction::SubmitFailed {
-                            error: error.clone(),
-                            retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                        },
-                        now,
-                    }),
-                )
-                .await
-                .is_err()
-                {
-                    warn!(
-                        chain_id = cfg.chain.chain_id,
-                        "failed to persist failed pending output POI resubmission state"
-                    );
-                }
-                warn!(
-                    chain_id = cfg.chain.chain_id,
-                    "forced pending output POI resubmission failed"
-                );
-            }
+        if !submitted {
+            warn!(
+                chain_id = self.cfg.chain.chain_id,
+                "forced pending output POI resubmission failed"
+            );
         }
     }
-    Some(attempt)
+
+    /// Marks the pending context terminal because its pre-transaction POIs are missing.
+    async fn mark_terminal(&self) {
+        if apply_poi_private_delta(
+            self.authority,
+            self.db,
+            self.cache_store,
+            self.cfg,
+            OwnedPoiPrivateDelta::PendingContextTerminal(PendingContextTerminalDelta {
+                subject: self.subject.clone(),
+                expected_context_fingerprint: self.expected_context_fingerprint.clone(),
+                expected_recovery: self.plan.expected_recovery(),
+                active_list_keys: self.active_list_keys.to_vec(),
+                target_list_keys: self.plan.list_keys().to_vec(),
+                error: "missing pre-transaction POI for pending output".to_string(),
+            }),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                chain_id = self.cfg.chain.chain_id,
+                "failed to mark pending output POI context terminal"
+            );
+        }
+    }
+
+    /// Whether the submission plan is still ready against current wallet and public state.
+    async fn plan_still_ready(&self) -> bool {
+        matches!(
+            pending_output_poi_submission_plan_current(
+                self.authority,
+                self.public_data_plane,
+                self.cache_store,
+                self.cfg,
+                self.active_list_keys,
+                self.record,
+                &self.subject,
+                &self.plan,
+            )
+            .await,
+            Ok(PendingOutputPoiPreflight::Ready)
+        )
+    }
+
+    /// Persists the submission result; submitted list keys are merged only on success.
+    async fn persist_submission(
+        &self,
+        list_keys: Vec<FixedBytes<32>>,
+        action: OutputPoiRecoveryAction,
+        submitted: bool,
+    ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+        apply_poi_private_delta(
+            self.authority,
+            self.db,
+            self.cache_store,
+            self.cfg,
+            OwnedPoiPrivateDelta::PendingSubmission(PendingSubmissionDelta {
+                subject: self.subject.clone(),
+                expected_context_fingerprint: self.expected_context_fingerprint.clone(),
+                expected_recovery: self.plan.expected_recovery(),
+                active_list_keys: self.active_list_keys.to_vec(),
+                list_keys,
+                predicate: self.plan.predicate(),
+                merge_submitted_list_keys: submitted,
+                action,
+                now: self.now,
+            }),
+        )
+        .await
+    }
 }
