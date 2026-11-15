@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use crate::chain::{
     WalletPoiRuntime, WalletRegistration, WalletWorkerServices, wallet_cache_store,
     wallet_finish_result_removes_cursor, wallet_finish_retry_request,
@@ -365,6 +367,34 @@ impl ChainService {
             sync_target,
             self.chain.sync.block_range,
         );
+        let ControlFlow::Continue(startup) = self
+            .try_cached_and_short_startup(ctx, cancel, startup, sync_target, short_startup_plan)
+            .await
+        else {
+            return;
+        };
+        self.continue_wallet_startup_catch_up(
+            ctx,
+            cancel,
+            startup,
+            sync_target,
+            short_startup_plan,
+        )
+        .await;
+        drop(startup_target_lease);
+    }
+
+    /// Applies cached public-scan coverage, then tries the short startup sync. `Break` ends
+    /// startup; `Continue` carries the revalidated startup ticket.
+    async fn try_cached_and_short_startup(
+        self: &Arc<Self>,
+        ctx: WalletSyncContext<'_>,
+        cancel: &CancellationToken,
+        startup: crate::types::WalletSchedulableProgress,
+        sync_target: u64,
+        short_startup_plan: Option<WalletShortStartupPlan>,
+    ) -> ControlFlow<(), crate::types::WalletSchedulableProgress> {
+        let WalletSyncContext { cfg, handle, .. } = ctx;
         let short_window_is_cached = if let Some(plan) = short_startup_plan {
             self.public_data_plane
                 .cached_wallet_scan_suffix(plan.acquisition.from_block, plan.acquisition.to_block)
@@ -383,11 +413,11 @@ impl ChainService {
             }
         };
         if cached_outcome.finished {
-            return;
+            return ControlFlow::Break(());
         }
         if wallet_has_persistence_failure(handle) {
             let Some(progress) = handle.revalidate_schedulable_progress(startup) else {
-                return;
+                return ControlFlow::Break(());
             };
             self.enqueue_wallet_backfill(
                 ctx,
@@ -399,20 +429,20 @@ impl ChainService {
                 short_startup_plan,
             )
             .await;
-            return;
+            return ControlFlow::Break(());
         }
         let Some(startup) = handle.revalidate_schedulable_progress(startup) else {
-            return;
+            return ControlFlow::Break(());
         };
         if self
             .short_wallet_startup_sync(ctx, startup, sync_target, short_startup_plan, cancel)
             .await
         {
-            return;
+            return ControlFlow::Break(());
         }
         if wallet_has_persistence_failure(handle) {
             let Some(progress) = handle.revalidate_schedulable_progress(startup) else {
-                return;
+                return ControlFlow::Break(());
             };
             self.enqueue_wallet_backfill(
                 ctx,
@@ -424,9 +454,27 @@ impl ChainService {
                 short_startup_plan,
             )
             .await;
-            return;
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(startup)
+    }
 
+    /// Runs historical catch-up from the wallet's checkpoint, delivers a captured public-scan
+    /// suffix when it lines up, and queues the remaining backfill.
+    async fn continue_wallet_startup_catch_up(
+        self: &Arc<Self>,
+        ctx: WalletSyncContext<'_>,
+        cancel: &CancellationToken,
+        startup: crate::types::WalletSchedulableProgress,
+        sync_target: u64,
+        short_startup_plan: Option<WalletShortStartupPlan>,
+    ) {
+        let WalletSyncContext {
+            cfg,
+            start_block,
+            handle,
+            backfill_sender,
+        } = ctx;
         let Some(checkpoint_progress) = handle.wait_schedulable_progress(cancel).await else {
             return;
         };
@@ -465,49 +513,11 @@ impl ChainService {
         }
         if let Some(plan) = short_startup_plan
             && cfg.use_indexed_wallet_catch_up
-        {
-            match self
-                .wallet_startup_artifact_candidate(cfg, plan, cancel)
+            && self
+                .try_wallet_startup_artifact_fallback(ctx, cancel, startup, sync_target, plan)
                 .await
-            {
-                Ok(Some(candidate)) => {
-                    let acquisition_apply_count = candidate.acquisition_applies.len();
-                    if let Some(progress) = self
-                        .commit_and_deliver_short_startup_candidate(
-                            ctx,
-                            startup,
-                            sync_target,
-                            plan,
-                            candidate,
-                            cancel,
-                        )
-                        .await
-                    {
-                        debug!(
-                            cache_key = %cfg.cache_key,
-                            acquisition_apply_count,
-                            "wallet startup artifact acquisition delivered"
-                        );
-                        if cfg.sync_to_block.is_none() {
-                            self.enqueue_wallet_backfill(
-                                ctx,
-                                sync_target,
-                                sync_target,
-                                true,
-                                progress,
-                                true,
-                                None,
-                            )
-                            .await;
-                        }
-                        return;
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    debug!(err = %err.without_url(), cache_key = %cfg.cache_key, "wallet startup artifact fallback failed");
-                }
-            }
+        {
+            return;
         }
         if short_startup_plan.is_none() && cfg.use_indexed_wallet_catch_up {
             checkpoint = self
@@ -604,7 +614,63 @@ impl ChainService {
             short_startup_plan,
         )
         .await;
-        drop(startup_target_lease);
+    }
+
+    /// Tries to fill the short startup window from indexed artifacts. Returns `true` when the
+    /// window was delivered, which ends startup.
+    async fn try_wallet_startup_artifact_fallback(
+        self: &Arc<Self>,
+        ctx: WalletSyncContext<'_>,
+        cancel: &CancellationToken,
+        startup: crate::types::WalletSchedulableProgress,
+        sync_target: u64,
+        plan: WalletShortStartupPlan,
+    ) -> bool {
+        let cfg = ctx.cfg;
+        match self
+            .wallet_startup_artifact_candidate(cfg, plan, cancel)
+            .await
+        {
+            Ok(Some(candidate)) => {
+                let acquisition_apply_count = candidate.acquisition_applies.len();
+                let Some(progress) = self
+                    .commit_and_deliver_short_startup_candidate(
+                        ctx,
+                        startup,
+                        sync_target,
+                        plan,
+                        candidate,
+                        cancel,
+                    )
+                    .await
+                else {
+                    return false;
+                };
+                debug!(
+                    cache_key = %cfg.cache_key,
+                    acquisition_apply_count,
+                    "wallet startup artifact acquisition delivered"
+                );
+                if cfg.sync_to_block.is_none() {
+                    self.enqueue_wallet_backfill(
+                        ctx,
+                        sync_target,
+                        sync_target,
+                        true,
+                        progress,
+                        true,
+                        None,
+                    )
+                    .await;
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                debug!(err = %err.without_url(), cache_key = %cfg.cache_key, "wallet startup artifact fallback failed");
+                false
+            }
+        }
     }
 
     pub(super) async fn enqueue_wallet_backfill(
