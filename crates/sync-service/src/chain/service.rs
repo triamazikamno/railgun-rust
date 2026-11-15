@@ -33,10 +33,14 @@ pub(super) use startup_sync::WalletShortStartupPlan;
 mod public_scan;
 use public_scan::CachedPublicScanApplyOutcome;
 
-mod indexed_catch_up;
-pub(super) use indexed_catch_up::WalletIndexedTailFallbackResult;
+mod catch_up_race;
 #[cfg(test)]
-pub(super) use indexed_catch_up::{IndexedWalletCatchUpOutcome, SquidWalletCandidateOutcome};
+pub(super) use catch_up_race::SquidWalletCandidateOutcome;
+
+mod indexed_catch_up;
+#[cfg(test)]
+pub(super) use indexed_catch_up::IndexedWalletCatchUpOutcome;
+pub(super) use indexed_catch_up::WalletIndexedTailFallbackResult;
 
 pub(in crate::chain) async fn send_wallet_reset(
     cache_key: &str,
