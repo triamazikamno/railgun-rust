@@ -5,11 +5,10 @@ use crate::chain::{
 };
 
 use super::{
-    Arc, BackfillEvent, CancellationToken, ChainService, Instant, PublicDataPlaneDiagnosticKind,
-    PublicScanRange, PublicScanSource, QuickSyncClient, RpcTargetPolicy, WalletConfig,
-    WalletHandle, WalletScanApply, WalletStartupSyncError, debug, info, mpsc,
-    send_wallet_startup_events, wait_or_cancel, wallet_backfill_from_block,
-    wallet_remote_target_before_cached_suffix, warn,
+    Arc, CancellationToken, ChainService, Instant, PublicDataPlaneDiagnosticKind, PublicScanRange,
+    PublicScanSource, QuickSyncClient, RpcTargetPolicy, WalletConfig, WalletScanApply,
+    WalletStartupSyncError, WalletSyncContext, debug, info, send_wallet_startup_events,
+    wait_or_cancel, wallet_backfill_from_block, wallet_remote_target_before_cached_suffix, warn,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,15 +49,15 @@ impl WalletShortStartupPlan {
 impl ChainService {
     pub(super) async fn short_wallet_startup_sync(
         self: &Arc<Self>,
-        cfg: &WalletConfig,
-        start_block: u64,
+        ctx: WalletSyncContext<'_>,
         progress: crate::types::WalletSchedulableProgress,
         sync_target: u64,
         plan: Option<WalletShortStartupPlan>,
-        backfill_sender: mpsc::Sender<BackfillEvent>,
-        handle: &WalletHandle,
         cancel: &CancellationToken,
     ) -> bool {
+        let WalletSyncContext {
+            cfg, start_block, ..
+        } = ctx;
         let last_scanned = progress.last_scanned;
         let Some(plan) = plan else {
             return false;
@@ -161,13 +160,11 @@ impl ChainService {
             let acquisition_apply_count = candidate.acquisition_applies.len();
             let committed_progress = self
                 .commit_and_deliver_short_startup_candidate(
-                    cfg,
+                    ctx,
                     progress,
                     sync_target,
                     plan,
                     candidate,
-                    &backfill_sender,
-                    handle,
                     cancel,
                 )
                 .await;
@@ -176,14 +173,11 @@ impl ChainService {
                 && follow_safe_head
             {
                 self.enqueue_wallet_backfill(
-                    cfg,
-                    start_block,
+                    ctx,
                     sync_target,
                     sync_target,
                     true,
-                    handle,
                     progress,
-                    backfill_sender.clone(),
                     true,
                     None,
                 )
@@ -222,15 +216,19 @@ impl ChainService {
 
     pub(super) async fn commit_and_deliver_short_startup_candidate(
         self: &Arc<Self>,
-        cfg: &WalletConfig,
+        ctx: WalletSyncContext<'_>,
         progress: crate::types::WalletSchedulableProgress,
         sync_target: u64,
         plan: WalletShortStartupPlan,
         candidate: WalletStartupSyncCandidate,
-        backfill_sender: &mpsc::Sender<BackfillEvent>,
-        handle: &WalletHandle,
         cancel: &CancellationToken,
     ) -> Option<crate::types::WalletSchedulableProgress> {
+        let WalletSyncContext {
+            cfg,
+            handle,
+            backfill_sender,
+            ..
+        } = ctx;
         if cancel.is_cancelled() {
             return None;
         }

@@ -3,12 +3,12 @@ use crate::chain::{
 };
 
 use super::{
-    Arc, BackfillEvent, CancellationToken, ChainConfig, ChainError, ChainService,
+    Arc, CancellationToken, ChainConfig, ChainError, ChainService,
     IndexedWalletArtifactPageOutcome, IndexedWalletArtifactSession, IndexedWalletPage,
     IndexedWalletPageKind, Instant, PublicDataPlaneDiagnosticKind, PublicScanRange,
     PublicScanReadScope, PublicScanSource, RpcTargetPolicy, WalletBackfillFinishResult,
-    WalletBackfillStartResult, WalletConfig, WalletHandle, WalletIndexedCatchUpSource,
-    WalletScanApply, WalletStartupSyncError, debug, mpsc, wallet_backfill_from_block, warn,
+    WalletBackfillStartResult, WalletIndexedCatchUpSource, WalletScanApply, WalletStartupSyncError,
+    WalletSyncContext, debug, wallet_backfill_from_block, warn,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -523,17 +523,15 @@ impl ChainService {
 
     pub(in crate::chain) async fn apply_cached_public_scan_coverage(
         &self,
-        cfg: &WalletConfig,
-        start_block: u64,
+        ctx: WalletSyncContext<'_>,
         last_scanned: u64,
         target_block: u64,
-        handle: &WalletHandle,
-        sender: &mpsc::Sender<BackfillEvent>,
         progress: crate::types::WalletSchedulableProgress,
     ) -> CachedPublicScanApplyOutcome {
+        let WalletSyncContext { cfg, handle, .. } = ctx;
         let mut checkpoint = last_scanned;
         let target_result = handle
-            .start_backfill(&cfg.cache_key, sender, progress, target_block)
+            .start_backfill(&cfg.cache_key, ctx.backfill_sender, progress, target_block)
             .await;
         let driver = match target_result {
             WalletBackfillStartResult::Accepted { grant, .. } => grant.activate(),
@@ -545,7 +543,7 @@ impl ChainService {
             }
         };
         loop {
-            let from_block = wallet_backfill_from_block(checkpoint, start_block);
+            let from_block = wallet_backfill_from_block(checkpoint, ctx.start_block);
             if from_block > target_block {
                 let result = driver.finish(&cfg.cache_key, target_block).await;
                 let finished = matches!(result, WalletBackfillFinishResult::Ready { .. });

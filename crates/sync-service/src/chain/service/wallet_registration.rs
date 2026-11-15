@@ -4,13 +4,13 @@ use crate::chain::{
 };
 
 use super::{
-    Arc, BackfillEvent, BackfillRequest, CachedPublicScanApplyOutcome, ChainError, ChainService,
+    Arc, BackfillRequest, CachedPublicScanApplyOutcome, ChainError, ChainService,
     IndexedWalletCatchUpSourceOrder, Instant, Ordering, WalletBackfillFinishResult,
     WalletBackfillStartResult, WalletConfig, WalletHandle, WalletReadiness, WalletReadinessError,
-    WalletShortStartupPlan, debug, info, mpsc, oneshot, send_wallet_startup_events,
-    wait_for_startup_sync_target, wait_for_wallet_ready, wallet_backfill_from_block,
-    wallet_has_persistence_failure, wallet_remote_target_before_cached_suffix, wallet_sync_target,
-    warn,
+    WalletShortStartupPlan, WalletSyncContext, debug, info, mpsc, oneshot,
+    send_wallet_startup_events, wait_for_startup_sync_target, wait_for_wallet_ready,
+    wallet_backfill_from_block, wallet_has_persistence_failure,
+    wallet_remote_target_before_cached_suffix, wallet_sync_target, warn,
 };
 
 impl ChainService {
@@ -289,6 +289,12 @@ impl ChainService {
         let catch_up_cancel = cancel;
         let catch_up_restored_pending_reset = restored_pending_reset;
         tokio::spawn(async move {
+            let ctx = WalletSyncContext {
+                cfg: &catch_up_cfg,
+                start_block,
+                handle: &catch_up_handle,
+                backfill_sender: &backfill_sender,
+            };
             if catch_up_restored_pending_reset
                 && !wait_for_wallet_ready(
                     catch_up_handle.subscribe_observation(),
@@ -366,12 +372,9 @@ impl ChainService {
             let cached_outcome = if short_window_is_cached {
                 service
                     .apply_cached_public_scan_coverage(
-                        &catch_up_cfg,
-                        start_block,
+                        ctx,
                         startup.last_scanned,
                         sync_target,
-                        &catch_up_handle,
-                        &backfill_sender,
                         startup,
                     )
                     .await
@@ -391,14 +394,11 @@ impl ChainService {
                 };
                 service
                     .enqueue_wallet_backfill(
-                        &catch_up_cfg,
-                        start_block,
+                        ctx,
                         cached_outcome.checkpoint,
                         sync_target,
                         catch_up_cfg.sync_to_block.is_none(),
-                        &catch_up_handle,
                         progress,
-                        backfill_sender,
                         false,
                         short_startup_plan,
                     )
@@ -410,13 +410,10 @@ impl ChainService {
             };
             if service
                 .short_wallet_startup_sync(
-                    &catch_up_cfg,
-                    start_block,
+                    ctx,
                     startup,
                     sync_target,
                     short_startup_plan,
-                    backfill_sender.clone(),
-                    &catch_up_handle,
                     &catch_up_cancel,
                 )
                 .await
@@ -430,14 +427,11 @@ impl ChainService {
                 };
                 service
                     .enqueue_wallet_backfill(
-                        &catch_up_cfg,
-                        start_block,
+                        ctx,
                         progress.last_scanned,
                         sync_target,
                         catch_up_cfg.sync_to_block.is_none(),
-                        &catch_up_handle,
                         progress,
-                        backfill_sender,
                         false,
                         short_startup_plan,
                     )
@@ -495,13 +489,11 @@ impl ChainService {
                         let acquisition_apply_count = candidate.acquisition_applies.len();
                         if let Some(progress) = service
                             .commit_and_deliver_short_startup_candidate(
-                                &catch_up_cfg,
+                                ctx,
                                 startup,
                                 sync_target,
                                 plan,
                                 candidate,
-                                &backfill_sender,
-                                &catch_up_handle,
                                 &catch_up_cancel,
                             )
                             .await
@@ -514,14 +506,11 @@ impl ChainService {
                             if catch_up_cfg.sync_to_block.is_none() {
                                 service
                                     .enqueue_wallet_backfill(
-                                        &catch_up_cfg,
-                                        start_block,
+                                        ctx,
                                         sync_target,
                                         sync_target,
                                         true,
-                                        &catch_up_handle,
                                         progress,
-                                        backfill_sender,
                                         true,
                                         None,
                                     )
@@ -539,15 +528,13 @@ impl ChainService {
             if short_startup_plan.is_none() && catch_up_cfg.use_indexed_wallet_catch_up {
                 checkpoint = service
                     .indexed_wallet_catch_up(
-                        &catch_up_cfg,
-                        start_block,
+                        ctx,
                         checkpoint,
                         historical_target,
-                        &catch_up_handle,
                         &catch_up_cancel,
                         IndexedWalletCatchUpSourceOrder::ArtifactsFirst,
                         false,
-                        (&backfill_sender, progress),
+                        progress,
                     )
                     .await;
             } else if short_startup_plan.is_none() {
@@ -602,14 +589,11 @@ impl ChainService {
                     {
                         service
                             .enqueue_wallet_backfill(
-                                &catch_up_cfg,
-                                start_block,
+                                ctx,
                                 sync_target,
                                 sync_target,
                                 true,
-                                &catch_up_handle,
                                 progress,
-                                backfill_sender,
                                 true,
                                 None,
                             )
@@ -633,14 +617,11 @@ impl ChainService {
             }
             service
                 .enqueue_wallet_backfill(
-                    &catch_up_cfg,
-                    start_block,
+                    ctx,
                     checkpoint,
                     sync_target,
                     catch_up_cfg.sync_to_block.is_none(),
-                    &catch_up_handle,
                     progress,
-                    backfill_sender,
                     !wallet_has_persistence_failure(&catch_up_handle),
                     short_startup_plan,
                 )
@@ -653,28 +634,23 @@ impl ChainService {
 
     pub(super) async fn enqueue_wallet_backfill(
         &self,
-        cfg: &WalletConfig,
-        start_block: u64,
+        ctx: WalletSyncContext<'_>,
         mut last_scanned: u64,
         sync_target: u64,
         follow_safe_head: bool,
-        handle: &WalletHandle,
         progress: crate::types::WalletSchedulableProgress,
-        backfill_sender: mpsc::Sender<BackfillEvent>,
         try_cached_coverage: bool,
         short_startup_plan: Option<WalletShortStartupPlan>,
     ) {
+        let WalletSyncContext {
+            cfg,
+            start_block,
+            handle,
+            backfill_sender,
+        } = ctx;
         if sync_target > 0 && try_cached_coverage && short_startup_plan.is_none() {
             let cached_outcome = self
-                .apply_cached_public_scan_coverage(
-                    cfg,
-                    start_block,
-                    last_scanned,
-                    sync_target,
-                    handle,
-                    &backfill_sender,
-                    progress,
-                )
+                .apply_cached_public_scan_coverage(ctx, last_scanned, sync_target, progress)
                 .await;
             last_scanned = cached_outcome.checkpoint;
             if cached_outcome.finished {
@@ -690,7 +666,7 @@ impl ChainService {
 
         if needs_backfill {
             let target_result = handle
-                .start_backfill(&cfg.cache_key, &backfill_sender, progress, sync_target)
+                .start_backfill(&cfg.cache_key, backfill_sender, progress, sync_target)
                 .await;
             debug!(?target_result, cache_key = %cfg.cache_key, "wallet target update result");
             let driver = match target_result {
@@ -739,7 +715,7 @@ impl ChainService {
             }
         } else {
             let start_result = handle
-                .start_backfill(&cfg.cache_key, &backfill_sender, progress, sync_target)
+                .start_backfill(&cfg.cache_key, backfill_sender, progress, sync_target)
                 .await;
             let result = match start_result {
                 WalletBackfillStartResult::Accepted { grant, .. } => {

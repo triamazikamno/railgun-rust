@@ -10,8 +10,8 @@ use super::{
     IndexedWalletArtifactSession, IndexedWalletCatchUpSourceOrder, IndexedWalletPage,
     IndexedWalletPageKind, Instant, PublicDataPlaneDiagnosticKind, PublicScanRange,
     PublicScanSource, SquidIndexedWalletReadSession, SyncProgressSender, WalletBackfillStartResult,
-    WalletConfig, WalletHandle, WalletIndexedCatchUpSource, WalletScanApply,
-    WalletStartupSyncError, debug, info, mpsc, wallet_has_persistence_failure, warn,
+    WalletConfig, WalletIndexedCatchUpSource, WalletScanApply, WalletStartupSyncError,
+    WalletSyncContext, debug, info, mpsc, wallet_has_persistence_failure, warn,
 };
 
 /// Most rows the Squid wallet candidate holds while it races artifact
@@ -149,15 +149,18 @@ impl ChainService {
         let started = Instant::now();
         let outcome = self
             .indexed_wallet_catch_up_outcome(
-                &cfg,
-                start_block,
+                WalletSyncContext {
+                    cfg: &cfg,
+                    start_block,
+                    handle: &handle,
+                    backfill_sender: sender,
+                },
                 last_scanned,
                 target_block,
-                &handle,
                 &cancel,
                 IndexedWalletCatchUpSourceOrder::SquidFirst,
                 true,
-                (sender, progress),
+                progress,
             )
             .await;
         if cancel.is_cancelled() {
@@ -394,30 +397,23 @@ impl ChainService {
 
     pub(in crate::chain) async fn indexed_wallet_catch_up(
         &self,
-        cfg: &WalletConfig,
-        start_block: u64,
+        ctx: WalletSyncContext<'_>,
         last_scanned: u64,
         safe_head: u64,
-        handle: &WalletHandle,
         cancel: &CancellationToken,
         source_order: IndexedWalletCatchUpSourceOrder,
         expose_status: bool,
-        queued_sender: (
-            &mpsc::Sender<BackfillEvent>,
-            crate::types::WalletSchedulableProgress,
-        ),
+        progress: crate::types::WalletSchedulableProgress,
     ) -> u64 {
         match self
             .indexed_wallet_catch_up_outcome(
-                cfg,
-                start_block,
+                ctx,
                 last_scanned,
                 safe_head,
-                handle,
                 cancel,
                 source_order,
                 expose_status,
-                queued_sender,
+                progress,
             )
             .await
         {
@@ -429,19 +425,20 @@ impl ChainService {
 
     pub(in crate::chain) async fn indexed_wallet_catch_up_outcome(
         &self,
-        cfg: &WalletConfig,
-        start_block: u64,
+        ctx: WalletSyncContext<'_>,
         last_scanned: u64,
         safe_head: u64,
-        handle: &WalletHandle,
         cancel: &CancellationToken,
         source_order: IndexedWalletCatchUpSourceOrder,
         expose_status: bool,
-        queued_sender: (
-            &mpsc::Sender<BackfillEvent>,
-            crate::types::WalletSchedulableProgress,
-        ),
+        progress: crate::types::WalletSchedulableProgress,
     ) -> IndexedWalletCatchUpOutcome {
+        let WalletSyncContext {
+            cfg,
+            start_block,
+            handle,
+            backfill_sender: sender,
+        } = ctx;
         if safe_head == 0 {
             debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
             return IndexedWalletCatchUpOutcome::Unavailable(last_scanned);
@@ -455,17 +452,8 @@ impl ChainService {
             debug!(cache_key = %cfg.cache_key, "indexed wallet catch-up already active");
             return IndexedWalletCatchUpOutcome::Unavailable(last_scanned);
         };
-        let (sender, progress) = queued_sender;
         let cached_outcome = self
-            .apply_cached_public_scan_coverage(
-                cfg,
-                start_block,
-                last_scanned,
-                safe_head,
-                handle,
-                sender,
-                progress,
-            )
+            .apply_cached_public_scan_coverage(ctx, last_scanned, safe_head, progress)
             .await;
         if cached_outcome.checkpoint > last_scanned {
             last_scanned = cached_outcome.checkpoint;

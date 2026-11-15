@@ -150,6 +150,15 @@ fn wallet_has_persistence_failure(handle: &WalletHandle) -> bool {
     )
 }
 
+/// The wallet a startup or catch-up step syncs and the channel its sync events go to.
+#[derive(Clone, Copy)]
+pub(in crate::chain) struct WalletSyncContext<'a> {
+    pub(in crate::chain) cfg: &'a WalletConfig,
+    pub(in crate::chain) start_block: u64,
+    pub(in crate::chain) handle: &'a WalletHandle,
+    pub(in crate::chain) backfill_sender: &'a mpsc::Sender<BackfillEvent>,
+}
+
 impl ChainService {
     pub(super) const fn chain_id(&self) -> u64 {
         self.chain.deployment.chain_id
