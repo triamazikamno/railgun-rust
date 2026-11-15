@@ -55,90 +55,124 @@ pub(in crate::chain) fn wallet_finish_retry_request(
     )
 }
 
-pub(in crate::chain) fn spawn_backfill_loop(
+/// State the backfill task works with across loop iterations.
+struct BackfillLoop {
     service: Arc<ChainService>,
-    mut backfill_rx: mpsc::Receiver<BackfillRequest>,
+    backfill_rx: mpsc::Receiver<BackfillRequest>,
     rpcs: Arc<QueryRpcPool>,
     archive_provider: Option<DynProvider>,
-    mut safe_head_rx: watch::Receiver<u64>,
+    safe_head_rx: watch::Receiver<u64>,
+    cancel: CancellationToken,
+    cursor: Option<WalletBackfillSlot>,
+}
+
+pub(in crate::chain) fn spawn_backfill_loop(
+    service: Arc<ChainService>,
+    backfill_rx: mpsc::Receiver<BackfillRequest>,
+    rpcs: Arc<QueryRpcPool>,
+    archive_provider: Option<DynProvider>,
+    safe_head_rx: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
-    let task = async move {
-        let mut cursor: Option<WalletBackfillSlot> = None;
+    let backfill_loop = BackfillLoop {
+        service,
+        backfill_rx,
+        rpcs,
+        archive_provider,
+        safe_head_rx,
+        cancel,
+        cursor: None,
+    };
+    tokio::spawn(
+        backfill_loop
+            .run()
+            .instrument(tracing::info_span!("sync_backfill")),
+    );
+}
+
+impl BackfillLoop {
+    async fn run(mut self) {
         loop {
-            if cancel.is_cancelled() {
+            if self.cancel.is_cancelled() {
                 break;
             }
-            drain_pending_backfill_requests_for_service(&service, &mut backfill_rx, &mut cursor)
-                .await;
-            if retire_cancelled_backfill_cursor(&mut cursor).await {
+            drain_pending_backfill_requests_for_service(
+                &self.service,
+                &mut self.backfill_rx,
+                &mut self.cursor,
+            )
+            .await;
+            if retire_cancelled_backfill_cursor(&mut self.cursor).await {
                 continue;
             }
 
-            if cursor.is_none() {
+            if self.cursor.is_none() {
                 tokio::select! {
-                    () = cancel.cancelled() => break,
-                    Some(request) = backfill_rx.recv() => {
-                        let active_actor = current_backfill_actor(&service).await;
+                    () = self.cancel.cancelled() => break,
+                    Some(request) = self.backfill_rx.recv() => {
+                        let active_actor = current_backfill_actor(&self.service).await;
                         apply_backfill_request(
-                            &mut cursor,
+                            &mut self.cursor,
                             request,
                             Instant::now(),
                             active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
                         )
                         .await;
                     }
-                    _ = safe_head_rx.changed() => {},
+                    _ = self.safe_head_rx.changed() => {},
                 }
                 // Re-enter the loop immediately so that pending requests in
-                // backfill_rx are picked up without an unnecessary poll_interval
+                // self.backfill_rx are picked up without an unnecessary poll_interval
                 // delay.
                 continue;
             }
 
-            let safe_head = *safe_head_rx.borrow();
-            cursor
+            let safe_head = *self.safe_head_rx.borrow();
+            self.cursor
                 .as_mut()
-                .expect("cursor installed")
+                .expect("self.cursor installed")
                 .cursor
                 .refresh_target(safe_head);
-            reconcile_retained_acquisition(&service, &mut cursor).await;
-            complete_cached_acquisition_without_delivery(&service, &mut cursor).await;
+            reconcile_retained_acquisition(&self.service, &mut self.cursor).await;
+            complete_cached_acquisition_without_delivery(&self.service, &mut self.cursor).await;
 
             let now = Instant::now();
-            if !cursor
+            if !self
+                .cursor
                 .as_ref()
-                .expect("cursor installed")
+                .expect("self.cursor installed")
                 .cursor
                 .is_runnable(now)
             {
-                let retry_at = cursor
+                let retry_at = self
+                    .cursor
                     .as_ref()
                     .and_then(|slot| slot.cursor.persistence_retry_at())
-                    .expect("deferred wallet cursor has retry deadline");
-                let actor_cancel = cursor
+                    .expect("deferred wallet self.cursor has retry deadline");
+                let actor_cancel = self
+                    .cursor
                     .as_ref()
-                    .expect("cursor installed")
+                    .expect("self.cursor installed")
                     .cursor
                     .driver
                     .cancellation_token();
                 tokio::select! {
-                    () = cancel.cancelled() => break,
+                    () = self.cancel.cancelled() => break,
                     () = actor_cancel.cancelled() => {
-                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                     }
-                    request = backfill_rx.recv() => {
+                    request = self.backfill_rx.recv() => {
                         let Some(request) = request else { break };
-                        let active_actor = current_backfill_actor(&service).await;
+                        let active_actor = current_backfill_actor(&self.service).await;
                         apply_backfill_request(
-                            &mut cursor,
+                            &mut self.cursor,
                             request,
                             Instant::now(),
                             active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
                         )
                         .await;
                     }
-                    changed = safe_head_rx.changed() => {
+                    changed = self.safe_head_rx.changed() => {
                         if changed.is_err() { break; }
                     }
                     () = tokio::time::sleep(retry_at.saturating_duration_since(Instant::now())) => {}
@@ -146,24 +180,26 @@ pub(in crate::chain) fn spawn_backfill_loop(
                 continue;
             }
 
-            if !reconcile_retained_acquisition(&service, &mut cursor).await {
+            if !reconcile_retained_acquisition(&self.service, &mut self.cursor).await {
                 continue;
             }
-            if cursor
+            if self
+                .cursor
                 .as_ref()
                 .is_some_and(|slot| slot.cursor.is_runnable(now) && slot.cursor.can_finish())
             {
-                // The cursor delivered its target, so the startup window's
+                // The self.cursor delivered its target, so the startup window's
                 // leading blocks can now be warmed without delaying the wallet.
-                if let Some((from_block, to_block)) = cursor
+                if let Some((from_block, to_block)) = self
+                    .cursor
                     .as_mut()
                     .and_then(|slot| slot.cursor.take_startup_warm_range())
                 {
-                    service
+                    self.service
                         .start_public_scan_window_warm(PublicScanRange::new(from_block, to_block))
                         .await;
                 }
-                let slot = cursor.as_ref().expect("cursor installed");
+                let slot = self.cursor.as_ref().expect("self.cursor installed");
                 let key = slot.cache_key.clone();
                 let cancellation = slot.cursor.driver.cancellation_token();
                 let Some(result) = await_wallet_cancellation(
@@ -172,7 +208,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                 )
                 .await
                 else {
-                    let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                    let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                     continue;
                 };
                 let remove_cursor = wallet_finish_result_removes_cursor(&result);
@@ -186,28 +222,28 @@ pub(in crate::chain) fn spawn_backfill_loop(
                 );
                 debug!(?result, cache_key = %key, remove_cursor, "wallet backfill finish result");
                 if remove_cursor {
-                    if let Some(slot) = cursor.take() {
+                    if let Some(slot) = self.cursor.take() {
                         slot.cursor.driver.retire(&key).await;
                     }
-                } else if let Some(slot) = cursor.as_mut() {
+                } else if let Some(slot) = self.cursor.as_mut() {
                     slot.cursor.retry_after_rejected_finish(committed_to);
                     if persistence_failed {
                         slot.cursor.defer_persistence_retry(
                             Instant::now(),
-                            service.chain.sync.poll_interval,
+                            self.service.chain.sync.poll_interval,
                         );
                     }
                 }
             }
 
             let now = Instant::now();
-            let indexed_tail_attempt = cursor.as_mut().and_then(|slot| {
+            let indexed_tail_attempt = self.cursor.as_mut().and_then(|slot| {
                 let cursor = &mut slot.cursor;
                 if !cursor.is_runnable(now)
                     || !cursor.should_try_indexed_tail_fallback(
-                        service.chain.block_time,
+                        self.service.chain.block_time,
                         INDEXED_TAIL_FALLBACK_RPC_PAGES
-                            .saturating_mul(service.chain.sync.block_range),
+                            .saturating_mul(self.service.chain.sync.block_range),
                         now,
                         INDEXED_TAIL_FALLBACK_MIN_STALL,
                         INDEXED_TAIL_FALLBACK_COOLDOWN,
@@ -232,9 +268,9 @@ pub(in crate::chain) fn spawn_backfill_loop(
             });
             let indexed_tail_attempt = match indexed_tail_attempt {
                 Some(attempt) => {
-                    // Short-lived read; the service call below takes the same lock.
+                    // Short-lived read; the self.service call below takes the same lock.
                     let enabled = {
-                        let wallet = service.wallet.read().await;
+                        let wallet = self.service.wallet.read().await;
                         wallet.as_ref().is_some_and(|registration| {
                             registration.cfg.cache_key.as_str() == attempt.0.as_str()
                                 && registration.cfg.use_indexed_wallet_catch_up
@@ -255,13 +291,15 @@ pub(in crate::chain) fn spawn_backfill_loop(
                     idle_secs = idle.as_secs(),
                     "indexed wallet tail fallback triggered"
                 );
-                let cancellation = cursor
+                let cancellation = self
+                    .cursor
                     .as_ref()
-                    .expect("cursor exists during indexed tail fallback")
+                    .expect("self.cursor exists during indexed tail fallback")
                     .cursor
                     .driver
                     .cancellation_token();
-                let tail_result = service
+                let tail_result = self
+                    .service
                     .try_indexed_wallet_tail_catch_up(
                         &key,
                         from_block,
@@ -271,13 +309,13 @@ pub(in crate::chain) fn spawn_backfill_loop(
                         &cancellation,
                     )
                     .await;
-                if let Some(slot) = cursor.as_mut() {
+                if let Some(slot) = self.cursor.as_mut() {
                     slot.cursor.mark_indexed_tail_attempt(Instant::now());
                 }
                 let checkpoint = match tail_result {
                     WalletIndexedTailFallbackResult::Completed(checkpoint) => checkpoint,
                     WalletIndexedTailFallbackResult::Cancelled => {
-                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                         continue;
                     }
                     WalletIndexedTailFallbackResult::Unavailable => {
@@ -290,8 +328,8 @@ pub(in crate::chain) fn spawn_backfill_loop(
                         continue;
                     }
                 };
-                let latest_safe_head = *safe_head_rx.borrow();
-                if let Some(slot) = cursor.as_mut()
+                let latest_safe_head = *self.safe_head_rx.borrow();
+                if let Some(slot) = self.cursor.as_mut()
                     && checkpoint >= slot.cursor.from_block
                 {
                     slot.cursor
@@ -300,16 +338,20 @@ pub(in crate::chain) fn spawn_backfill_loop(
                 }
             }
 
-            let latest_safe_head = *safe_head_rx.borrow();
-            if apply_cached_backfill_row(&service, &mut cursor, latest_safe_head).await {
+            let latest_safe_head = *self.safe_head_rx.borrow();
+            if apply_cached_backfill_row(&self.service, &mut self.cursor, latest_safe_head).await {
                 continue;
             }
 
             let now = Instant::now();
-            let Some(slot) = cursor.as_ref().filter(|slot| slot.cursor.is_runnable(now)) else {
+            let Some(slot) = self
+                .cursor
+                .as_ref()
+                .filter(|slot| slot.cursor.is_runnable(now))
+            else {
                 continue;
             };
-            let from_block = wallet_backfill_fetch_from_block(&service, &slot.cursor).await;
+            let from_block = wallet_backfill_fetch_from_block(&self.service, &slot.cursor).await;
             let target_block = slot.cursor.fetch_target_block();
             debug!(block = from_block, "scanning wallet events");
             if target_block == 0 {
@@ -320,22 +362,22 @@ pub(in crate::chain) fn spawn_backfill_loop(
                     debug!("safe_head is 0, waiting for head poller before backfill");
                     let actor_cancel = slot.cursor.driver.cancellation_token();
                     tokio::select! {
-                        () = cancel.cancelled() => break,
+                        () = self.cancel.cancelled() => break,
                         () = actor_cancel.cancelled() => {
-                            let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                            let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                         }
-                        request = backfill_rx.recv() => {
+                        request = self.backfill_rx.recv() => {
                             let Some(request) = request else { break };
-                            let active_actor = current_backfill_actor(&service).await;
+                            let active_actor = current_backfill_actor(&self.service).await;
                             apply_backfill_request(
-                                &mut cursor,
+                                &mut self.cursor,
                                 request,
                                 Instant::now(),
                                 active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
                             )
                             .await;
                         }
-                        changed = safe_head_rx.changed() => {
+                        changed = self.safe_head_rx.changed() => {
                             if changed.is_err() { break; }
                         }
                     }
@@ -343,10 +385,11 @@ pub(in crate::chain) fn spawn_backfill_loop(
                 continue;
             }
             let requested_to_block = min(
-                from_block + service.chain.sync.block_range - 1,
+                from_block + self.service.chain.sync.block_range - 1,
                 target_block,
             );
-            let cached_suffix_from = service
+            let cached_suffix_from = self
+                .service
                 .public_data_plane
                 .cached_wallet_scan_suffix(from_block, target_block)
                 .await
@@ -358,28 +401,29 @@ pub(in crate::chain) fn spawn_backfill_loop(
                     requested_to_block
                 }
             });
-            let cancellation = cursor
+            let cancellation = self
+                .cursor
                 .as_ref()
-                .expect("cursor installed before remote backfill")
+                .expect("self.cursor installed before remote backfill")
                 .cursor
                 .driver
                 .cancellation_token();
-            let Some(rpc) = rpcs.random_provider() else {
+            let Some(rpc) = self.rpcs.random_provider() else {
                 warn!("no healthy rpc providers available");
                 let _ = await_wallet_cancellation(
                     &cancellation,
-                    tokio::time::sleep(service.chain.sync.poll_interval),
+                    tokio::time::sleep(self.service.chain.sync.poll_interval),
                 )
                 .await;
                 continue;
             };
-            let read_scope = service.begin_public_scan_read();
+            let read_scope = self.service.begin_public_scan_read();
             let fetch_logs_started = Instant::now();
             let Some(logs_result) = await_wallet_cancellation(
                 &cancellation,
-                service.chain.fetch_logs_for_range(
+                self.service.chain.fetch_logs_for_range(
                     &rpc,
-                    archive_provider.as_ref(),
+                    self.archive_provider.as_ref(),
                     from_block,
                     to_block,
                     &cancellation,
@@ -387,7 +431,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
             )
             .await
             else {
-                let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                 continue;
             };
             match logs_result {
@@ -403,15 +447,15 @@ pub(in crate::chain) fn spawn_backfill_loop(
                     let timestamps_started = Instant::now();
                     let Some(timestamps_result) = await_wallet_cancellation(
                         &cancellation,
-                        service.chain.fetch_log_block_timestamps(
+                        self.service.chain.fetch_log_block_timestamps(
                             &rpc.provider,
-                            archive_provider.as_ref(),
+                            self.archive_provider.as_ref(),
                             &logs,
                         ),
                     )
                     .await
                     else {
-                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                         continue;
                     };
                     let block_timestamps = match timestamps_result {
@@ -424,11 +468,11 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                 "failed to fetch backfill log block timestamps"
                             );
                             if mark_unhealthy {
-                                rpcs.mark_bad_provider(&rpc);
+                                self.rpcs.mark_bad_provider(&rpc);
                             } else {
                                 let _ = await_wallet_cancellation(
                                     &cancellation,
-                                    tokio::time::sleep(service.chain.sync.poll_interval),
+                                    tokio::time::sleep(self.service.chain.sync.poll_interval),
                                 )
                                 .await;
                             }
@@ -442,21 +486,22 @@ pub(in crate::chain) fn spawn_backfill_loop(
                         elapsed_ms = timestamps_started.elapsed().as_millis(),
                         "fetched backfill log block timestamps"
                     );
-                    if let Some(archive_endpoint) = service
+                    if let Some(archive_endpoint) = self
+                        .service
                         .chain
                         .archive_boundary_crossed_by(from_block, to_block)
                     {
                         let Some(boundary_hash_result) = await_wallet_cancellation(
                             &cancellation,
-                            service.chain.fetch_block_hash(
+                            self.service.chain.fetch_block_hash(
                                 &rpc.provider,
-                                archive_provider.as_ref(),
+                                self.archive_provider.as_ref(),
                                 archive_endpoint,
                             ),
                         )
                         .await
                         else {
-                            let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                            let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                             continue;
                         };
                         match boundary_hash_result {
@@ -467,7 +512,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                     archive_endpoint,
                                     "backfill RPC range does not prove its archive boundary"
                                 );
-                                rpcs.mark_bad_provider(&rpc);
+                                self.rpcs.mark_bad_provider(&rpc);
                                 continue;
                             }
                             Err(err) => {
@@ -479,11 +524,11 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                     "failed to fetch backfill RPC archive-boundary hash"
                                 );
                                 if mark_unhealthy {
-                                    rpcs.mark_bad_provider(&rpc);
+                                    self.rpcs.mark_bad_provider(&rpc);
                                 } else {
                                     let _ = await_wallet_cancellation(
                                         &cancellation,
-                                        tokio::time::sleep(service.chain.sync.poll_interval),
+                                        tokio::time::sleep(self.service.chain.sync.poll_interval),
                                     )
                                     .await;
                                 }
@@ -494,15 +539,15 @@ pub(in crate::chain) fn spawn_backfill_loop(
                     let block_hash_started = Instant::now();
                     let Some(to_block_hash_result) = await_wallet_cancellation(
                         &cancellation,
-                        service.chain.fetch_block_hash(
+                        self.service.chain.fetch_block_hash(
                             &rpc.provider,
-                            archive_provider.as_ref(),
+                            self.archive_provider.as_ref(),
                             to_block,
                         ),
                     )
                     .await
                     else {
-                        let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                        let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                         continue;
                     };
                     let to_block_hash = match to_block_hash_result {
@@ -512,7 +557,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                 rpc_index = rpc.index,
                                 to_block, "backfill RPC does not cover requested endpoint"
                             );
-                            rpcs.mark_bad_provider(&rpc);
+                            self.rpcs.mark_bad_provider(&rpc);
                             continue;
                         }
                         Err(err) => {
@@ -524,11 +569,11 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                 "failed to fetch backfill block hash"
                             );
                             if mark_unhealthy {
-                                rpcs.mark_bad_provider(&rpc);
+                                self.rpcs.mark_bad_provider(&rpc);
                             } else {
                                 let _ = await_wallet_cancellation(
                                     &cancellation,
-                                    tokio::time::sleep(service.chain.sync.poll_interval),
+                                    tokio::time::sleep(self.service.chain.sync.poll_interval),
                                 )
                                 .await;
                             }
@@ -549,7 +594,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                         read_scope,
                     });
 
-                    let batch_source = service.rpc_scan_source_for_range(from_block);
+                    let batch_source = self.service.rpc_scan_source_for_range(from_block);
                     let normalized_apply = match WalletScanApply::rows_from_log_batch(
                         from_block,
                         to_block,
@@ -565,21 +610,22 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                 "failed to normalize public backfill rows for reuse"
                             );
                             abandon_intersecting_acquisition(
-                                &mut cursor,
+                                &mut self.cursor,
                                 PublicScanRange::new(from_block, to_block),
                             );
                             None
                         }
                     };
                     if let Some(apply) = normalized_apply.as_ref() {
-                        let candidate = if let Some(range) = cursor
+                        let candidate = if let Some(range) = self
+                            .cursor
                             .as_ref()
                             .and_then(|slot| slot.cursor.acquisition_range())
                             .filter(|range| {
                                 PublicScanRange::new(from_block, to_block)
                                     .intersects(PublicScanRange::new(range.0, range.1))
                             }) {
-                            wallet_scan_acquisition_candidate(&service, range, apply)
+                            wallet_scan_acquisition_candidate(&self.service, range, apply)
                                 .await
                                 .map(|applies| WalletScanAcquisitionCandidate {
                                     range: PublicScanRange::new(range.0, range.1),
@@ -589,7 +635,8 @@ pub(in crate::chain) fn spawn_backfill_loop(
                             None
                         };
                         let candidate_range = candidate.as_ref().map(|candidate| candidate.range);
-                        match service
+                        match self
+                            .service
                             .public_data_plane
                             .record_public_scan_apply_with_acquisition(apply, candidate.as_ref())
                             .await
@@ -601,7 +648,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                     match outcome {
                                         WalletScanAcquisitionOutcome::Retained => {
                                             finish_matching_acquisition(
-                                                &mut cursor,
+                                                &mut self.cursor,
                                                 (range.from_block, range.to_block),
                                             );
                                         }
@@ -612,7 +659,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                                 "abandoning non-retainable wallet scan warm acquisition"
                                             );
                                             abandon_matching_acquisition(
-                                                &mut cursor,
+                                                &mut self.cursor,
                                                 (range.from_block, range.to_block),
                                             );
                                         }
@@ -631,13 +678,14 @@ pub(in crate::chain) fn spawn_backfill_loop(
                             }
                         }
                     }
-                    complete_cached_acquisition_without_delivery(&service, &mut cursor).await;
+                    complete_cached_acquisition_without_delivery(&self.service, &mut self.cursor)
+                        .await;
 
-                    let latest_safe_head = *safe_head_rx.borrow();
-                    let key = cursor.as_ref().map(|slot| slot.cache_key.clone());
+                    let latest_safe_head = *self.safe_head_rx.borrow();
+                    let key = self.cursor.as_ref().map(|slot| slot.cache_key.clone());
                     if let Some(key) = key {
                         let Some((apply_from_block, apply_to_block)) =
-                            cursor.as_ref().and_then(|slot| {
+                            self.cursor.as_ref().and_then(|slot| {
                                 let cursor = &slot.cursor;
                                 if !cursor.is_runnable(Instant::now())
                                     || cursor.target_block == 0
@@ -652,7 +700,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                         else {
                             continue;
                         };
-                        let source = service.rpc_scan_source_for_range(apply_from_block);
+                        let source = self.service.rpc_scan_source_for_range(apply_from_block);
                         let apply = match WalletScanApply::rows_from_log_batch(
                             apply_from_block,
                             apply_to_block,
@@ -665,7 +713,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                 continue;
                             }
                         };
-                        service
+                        self.service
                             .public_data_plane
                             .record_source_decision(
                                 PublicDataPlaneDiagnosticKind::SourceSelected,
@@ -677,20 +725,20 @@ pub(in crate::chain) fn spawn_backfill_loop(
                             .await;
                         let Some(apply_result) = await_wallet_cancellation(
                             &cancellation,
-                            cursor
+                            self.cursor
                                 .as_ref()
-                                .expect("wallet cursor exists while applying")
+                                .expect("wallet self.cursor exists while applying")
                                 .cursor
                                 .driver
                                 .apply(&key, apply),
                         )
                         .await
                         else {
-                            let _ = retire_cancelled_backfill_cursor(&mut cursor).await;
+                            let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                             continue;
                         };
                         let mut remove_cursor = false;
-                        if let Some(slot) = cursor.as_mut() {
+                        if let Some(slot) = self.cursor.as_mut() {
                             let cursor = &mut slot.cursor;
                             if let Some(committed_to) = apply_result.accepted_committed_to() {
                                 match apply_result {
@@ -727,7 +775,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                         cursor.retry_after_rejected_apply(committed_to);
                                         cursor.defer_persistence_retry(
                                             Instant::now(),
-                                            service.chain.sync.poll_interval,
+                                            self.service.chain.sync.poll_interval,
                                         );
                                     }
                                     WalletBackfillApplyResult::Rejected {
@@ -751,7 +799,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
                                 }
                             }
                         }
-                        if remove_cursor && let Some(slot) = cursor.take() {
+                        if remove_cursor && let Some(slot) = self.cursor.take() {
                             slot.cursor.driver.retire(&key).await;
                         }
                     }
@@ -766,20 +814,19 @@ pub(in crate::chain) fn spawn_backfill_loop(
                         "failed to fetch backfill logs"
                     );
                     if mark_unhealthy {
-                        rpcs.mark_bad_provider(&rpc);
+                        self.rpcs.mark_bad_provider(&rpc);
                     } else {
                         let _ = await_wallet_cancellation(
                             &cancellation,
-                            tokio::time::sleep(service.chain.sync.poll_interval),
+                            tokio::time::sleep(self.service.chain.sync.poll_interval),
                         )
                         .await;
                     }
                 }
             }
         }
-        retire_backfill_loop_state(&mut cursor, &mut backfill_rx).await;
-    };
-    tokio::spawn(task.instrument(tracing::info_span!("sync_backfill")));
+        retire_backfill_loop_state(&mut self.cursor, &mut self.backfill_rx).await;
+    }
 }
 
 async fn retire_cancelled_backfill_cursor(cursor: &mut Option<WalletBackfillSlot>) -> bool {
