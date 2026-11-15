@@ -124,6 +124,14 @@ struct SelectedIndexedCatchUpSource {
     started: Instant,
 }
 
+/// The result of opening a catch-up source.
+enum OpenedIndexedSource {
+    /// The session and the block it can serve through.
+    Ready(IndexedCatchUpSession, u64),
+    Unavailable,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::chain) enum WalletIndexedTailFallbackResult {
     Completed(u64),
@@ -462,7 +470,7 @@ impl ChainService {
                 }
                 Err(err) => {
                     let err = WalletStartupSyncError::from(err).without_url();
-                    if artifact_failure_can_fallback_to_squid(
+                    let (opened, reason) = if artifact_failure_can_fallback_to_squid(
                         active.is_artifacts(),
                         checkpoint,
                         last_scanned,
@@ -473,53 +481,11 @@ impl ChainService {
                             fallback_from = checkpoint,
                             "indexed wallet artifact page failed before checkpoint; falling back to Squid"
                         );
-                        let Some(squid_probe) = await_wallet_cancellation(
-                            cancel,
-                            self.probe_squid_indexed_wallet_source(cfg),
-                        )
-                        .await
-                        else {
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
-                        };
-                        let Some(session) = squid_probe else {
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Unavailable(checkpoint);
-                        };
-                        active = IndexedCatchUpSession::squid(session);
-                        target = active.indexed_height().min(safe_head);
-                        self.record_indexed_source_fallback(
-                            &status_guard,
-                            &active,
-                            PublicScanRange::new(from_block, target),
+                        (
+                            self.probe_squid_catch_up_source(scope).await,
                             "artifact page failed before checkpoint",
                         )
-                        .await;
-                        info!(
-                            cache_key = %cfg.cache_key,
-                            indexed_source = active.source().as_str(),
-                            indexed_height = active.indexed_height(),
-                            safe_head,
-                            from_block,
-                            target,
-                            indexed_block_range = self.chain.sync.indexed_wallet_block_range,
-                            "indexed wallet fallback target"
-                        );
-                        if from_block > target {
-                            debug!(
-                                cache_key = %cfg.cache_key,
-                                indexed_source = active.source().as_str(),
-                                indexed_height = active.indexed_height(),
-                                target,
-                                elapsed_ms = catch_up_started.elapsed().as_millis(),
-                                "indexed wallet fallback skipped; cache already at target"
-                            );
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Completed(checkpoint);
-                        }
-                        continue;
-                    }
-                    if !active.is_artifacts()
+                    } else if !active.is_artifacts()
                         && source_order == IndexedWalletCatchUpSourceOrder::SquidFirst
                         && checkpoint == last_scanned
                     {
@@ -529,82 +495,76 @@ impl ChainService {
                             fallback_from = checkpoint,
                             "indexed wallet Squid page failed before checkpoint; falling back to artifacts"
                         );
-                        status_guard.set(
-                            WalletIndexedCatchUpSource::IndexedArtifacts,
-                            from_block,
-                            safe_head,
-                        );
-                        let Some(prepared) = await_wallet_cancellation(
-                            cancel,
-                            self.prepare_indexed_wallet_artifact_session(
-                                cfg,
-                                from_block,
-                                safe_head,
-                                artifact_progress_tx,
-                            ),
-                        )
-                        .await
-                        else {
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
-                        };
-                        let Some(session) = prepared else {
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Unavailable(checkpoint);
-                        };
-                        target = session.target_block();
-                        active = IndexedCatchUpSession::Artifacts(session);
-                        self.record_indexed_source_fallback(
-                            &status_guard,
-                            &active,
-                            PublicScanRange::new(from_block, target),
+                        (
+                            self.prepare_artifact_catch_up_source(scope, &status_guard, from_block)
+                                .await,
                             "Squid page failed before checkpoint",
                         )
+                    } else {
+                        warn!(
+                            err = %err,
+                            cache_key = %cfg.cache_key,
+                            indexed_source = active.source().as_str(),
+                            fallback_from = checkpoint,
+                            "indexed wallet catch-up page failed; using RPC backfill"
+                        );
+                        self.record_public_scan_fallback(
+                            self.rpc_scan_source_for_range(from_block),
+                            PublicScanRange::new(from_block, safe_head),
+                            self.begin_public_scan_read(),
+                            "indexed wallet catch-up page failed; falling back to RPC",
+                        )
                         .await;
-                        info!(
+                        driver.retire(&cfg.cache_key).await;
+                        return if cancel.is_cancelled() {
+                            IndexedWalletCatchUpOutcome::Cancelled(checkpoint)
+                        } else {
+                            IndexedWalletCatchUpOutcome::Unavailable(checkpoint)
+                        };
+                    };
+                    let (session, fallback_target) = match opened {
+                        OpenedIndexedSource::Ready(session, target) => (session, target),
+                        OpenedIndexedSource::Unavailable => {
+                            driver.retire(&cfg.cache_key).await;
+                            return IndexedWalletCatchUpOutcome::Unavailable(checkpoint);
+                        }
+                        OpenedIndexedSource::Cancelled => {
+                            driver.retire(&cfg.cache_key).await;
+                            return IndexedWalletCatchUpOutcome::Cancelled(checkpoint);
+                        }
+                    };
+                    active = session;
+                    target = fallback_target;
+                    self.record_indexed_source_fallback(
+                        &status_guard,
+                        &active,
+                        PublicScanRange::new(from_block, target),
+                        reason,
+                    )
+                    .await;
+                    info!(
+                        cache_key = %cfg.cache_key,
+                        indexed_source = active.source().as_str(),
+                        indexed_height = active.indexed_height(),
+                        safe_head,
+                        from_block,
+                        target,
+                        indexed_block_range = self.chain.sync.indexed_wallet_block_range,
+                        "indexed wallet fallback target"
+                    );
+                    if from_block > target {
+                        debug!(
                             cache_key = %cfg.cache_key,
                             indexed_source = active.source().as_str(),
                             indexed_height = active.indexed_height(),
-                            safe_head,
-                            from_block,
                             target,
-                            indexed_block_range = self.chain.sync.indexed_wallet_block_range,
-                            "indexed wallet fallback target"
+                            elapsed_ms = catch_up_started.elapsed().as_millis(),
+                            "indexed wallet fallback skipped; cache already at target"
                         );
-                        if from_block > target {
-                            debug!(
-                                cache_key = %cfg.cache_key,
-                                indexed_source = active.source().as_str(),
-                                indexed_height = active.indexed_height(),
-                                target,
-                                elapsed_ms = catch_up_started.elapsed().as_millis(),
-                                "indexed wallet fallback skipped; cache already at target"
-                            );
-                            driver.retire(&cfg.cache_key).await;
-                            return IndexedWalletCatchUpOutcome::Completed(checkpoint);
-                        }
-                        continue;
+                        driver.retire(&cfg.cache_key).await;
+                        return IndexedWalletCatchUpOutcome::Completed(checkpoint);
                     }
-                    warn!(
-                        err = %err,
-                        cache_key = %cfg.cache_key,
-                        indexed_source = active.source().as_str(),
-                        fallback_from = checkpoint,
-                        "indexed wallet catch-up page failed; using RPC backfill"
-                    );
-                    self.record_public_scan_fallback(
-                        self.rpc_scan_source_for_range(from_block),
-                        PublicScanRange::new(from_block, safe_head),
-                        self.begin_public_scan_read(),
-                        "indexed wallet catch-up page failed; falling back to RPC",
-                    )
-                    .await;
-                    driver.retire(&cfg.cache_key).await;
-                    return if cancel.is_cancelled() {
-                        IndexedWalletCatchUpOutcome::Cancelled(checkpoint)
-                    } else {
-                        IndexedWalletCatchUpOutcome::Unavailable(checkpoint)
-                    };
+                    continue;
                 }
             };
             let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
@@ -872,6 +832,56 @@ impl ChainService {
         from_block: u64,
         fallback_reason: &'static str,
     ) -> Result<(IndexedCatchUpSession, u64), IndexedWalletCatchUpOutcome> {
+        match self
+            .prepare_artifact_catch_up_source(scope, status_guard, from_block)
+            .await
+        {
+            OpenedIndexedSource::Ready(session, target) => Ok((session, target)),
+            OpenedIndexedSource::Unavailable => {
+                self.record_public_scan_fallback(
+                    self.rpc_scan_source_for_range(from_block),
+                    PublicScanRange::new(from_block, scope.safe_head),
+                    self.begin_public_scan_read(),
+                    fallback_reason,
+                )
+                .await;
+                Err(IndexedWalletCatchUpOutcome::Unavailable(scope.last_scanned))
+            }
+            OpenedIndexedSource::Cancelled => {
+                Err(IndexedWalletCatchUpOutcome::Cancelled(scope.last_scanned))
+            }
+        }
+    }
+
+    /// Probes Squid as the catch-up source.
+    async fn probe_squid_catch_up_source(
+        &self,
+        scope: IndexedCatchUpScope<'_>,
+    ) -> OpenedIndexedSource {
+        let Some(probe) = await_wallet_cancellation(
+            scope.cancel,
+            self.probe_squid_indexed_wallet_source(scope.cfg),
+        )
+        .await
+        else {
+            return OpenedIndexedSource::Cancelled;
+        };
+        let Some(session) = probe else {
+            return OpenedIndexedSource::Unavailable;
+        };
+        let session = IndexedCatchUpSession::squid(session);
+        let target = session.indexed_height().min(scope.safe_head);
+        OpenedIndexedSource::Ready(session, target)
+    }
+
+    /// Publishes the artifact status, then prepares artifacts as the catch-up source from
+    /// `from_block`.
+    async fn prepare_artifact_catch_up_source(
+        &self,
+        scope: IndexedCatchUpScope<'_>,
+        status_guard: &WalletIndexedCatchUpStatusGuard<'_>,
+        from_block: u64,
+    ) -> OpenedIndexedSource {
         status_guard.set(
             WalletIndexedCatchUpSource::IndexedArtifacts,
             from_block,
@@ -888,20 +898,13 @@ impl ChainService {
         )
         .await
         else {
-            return Err(IndexedWalletCatchUpOutcome::Cancelled(scope.last_scanned));
+            return OpenedIndexedSource::Cancelled;
         };
         let Some(session) = prepared else {
-            self.record_public_scan_fallback(
-                self.rpc_scan_source_for_range(from_block),
-                PublicScanRange::new(from_block, scope.safe_head),
-                self.begin_public_scan_read(),
-                fallback_reason,
-            )
-            .await;
-            return Err(IndexedWalletCatchUpOutcome::Unavailable(scope.last_scanned));
+            return OpenedIndexedSource::Unavailable;
         };
         let target = session.target_block();
-        Ok((IndexedCatchUpSession::Artifacts(session), target))
+        OpenedIndexedSource::Ready(IndexedCatchUpSession::Artifacts(session), target)
     }
 
     /// Publishes `active` as the catch-up source for `range` and records the switch to it as a
