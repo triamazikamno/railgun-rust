@@ -3,16 +3,20 @@ use railgun_wallet::Utxo;
 use crate::wallet::handle::WalletPrivateViewTicket;
 
 use super::{
-    AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, Arc, CancellationToken,
-    ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore, FixedBytes, FuturesUnordered,
-    PendingOutputPoiContextIntent, RwLock, WalletActorState, WalletBackfillRejectReason,
-    WalletCacheStore, WalletConfig, WalletHandle, WalletPendingSpentMarkOutcome,
-    WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
-    WalletPoiStatusRefreshCommitRequest, WalletPrivateApplyRequest, WalletPrivateRequest,
-    WalletPrivateRequestError, WalletUtxo,
-    apply_owned_poi_private_delta_on_actor_with_active_lists, clear_local_pending_spent,
-    commit_pending_output_contexts, mark_local_pending_spent, oneshot,
-    wallet_poi_status_refresh_needed_for_selection,
+    AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, Arc, BackfillEvent,
+    BackfillRequest, CancellationToken, ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore,
+    FixedBytes, FuturesUnordered, Instant, PendingOutputPoiContextIntent, PendingWalletReset,
+    RwLock, SharedLogBatch, WalletActorState, WalletBackfillGrant, WalletBackfillRejectReason,
+    WalletCacheError, WalletCacheStore, WalletConfig, WalletHandle, WalletLiveMetadataFlush,
+    WalletPendingSpentMarkOutcome, WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
+    WalletPoiStatusRefreshCommitRequest, WalletPrivateApplyRequest, WalletPrivateMutationAuthority,
+    WalletPrivateRequest, WalletPrivateRequestError, WalletResetCommitOutcome,
+    WalletResetCommitRequest, WalletResetReplayPlan, WalletResetRewindOutcome, WalletSyncToken,
+    WalletUtxo, accepted_backfill_owner_dropped,
+    apply_owned_poi_private_delta_on_actor_with_active_lists, broadcast, clear_local_pending_spent,
+    commit_pending_output_contexts, debug, mark_local_pending_spent, mpsc, oneshot,
+    persist_wallet_reset_replay_admission_with_token, reset_replay_from_block,
+    wallet_poi_status_refresh_needed_for_selection, warn,
 };
 
 /// State and services the wallet actor task works with across loop iterations.
@@ -34,6 +38,11 @@ pub(super) struct WalletActorLoop<'a> {
     /// Accepted jobs whose owners the actor watches so it can retire them.
     pub(super) accepted_backfill_liveness: FuturesUnordered<AcceptedBackfillOwnerDropped>,
     pub(super) accepted_indexed_job_liveness: FuturesUnordered<AcceptedIndexedJobOwnerDropped>,
+    pub(super) live_metadata_flush: WalletLiveMetadataFlush,
+    pub(super) readiness_started: Instant,
+    pub(super) backfill_complete_block: Option<u64>,
+    pub(super) backfill_sender: mpsc::Sender<BackfillEvent>,
+    pub(super) backfill_tx: mpsc::Sender<BackfillRequest>,
 }
 
 impl WalletActorLoop<'_> {
@@ -87,6 +96,185 @@ impl WalletActorLoop<'_> {
             }
         } else {
             None
+        }
+    }
+
+    /// Drives a pending wallet reset: commits its rewind and, with `admit_replay`,
+    /// admits its replay and retires the durable replay plan. Returns `None` when
+    /// no reset is pending.
+    pub(super) async fn try_drive_pending_reset(
+        &mut self,
+        live_rx: &mut broadcast::Receiver<SharedLogBatch>,
+        admit_replay: bool,
+    ) -> Option<WalletResetCommitOutcome> {
+        let pending = self.actor_state.pending_reset()?;
+        let rewind_was_pending = !self.actor_state.pending_reset_rewind_committed();
+        let outcome = if self.actor_state.pending_reset_rewind_committed() {
+            WalletResetCommitOutcome {
+                rewind: WalletResetRewindOutcome::Committed {
+                    committed_to: self.last_scanned,
+                },
+            }
+        } else {
+            WalletResetCommitRequest {
+                cache_store: self.cache_store.as_ref(),
+                cfg: &self.cfg,
+                utxos: &self.utxos,
+                worker_handle: &self.worker_handle,
+                pending,
+                highest_accepted_reset_intent: self.actor_state.highest_accepted_reset_intent(),
+                actor_state: &mut self.actor_state,
+                cancel: &self.cancel,
+                last_scanned: &mut self.last_scanned,
+                persist_state: &mut self.persist_state,
+                live_metadata_flush: &mut self.live_metadata_flush,
+            }
+            .commit()
+            .await
+        };
+        if outcome.rewind.committed() {
+            if rewind_was_pending {
+                self.readiness_started = Instant::now();
+                self.backfill_complete_block = None;
+                *live_rx = live_rx.resubscribe();
+            }
+
+            if admit_replay && self.actor_state.pending_reset_replay_admitted().is_none() {
+                self.admit_pending_reset_replay(pending);
+            }
+
+            if admit_replay && self.actor_state.pending_reset_replay_admitted().is_some() {
+                self.retire_pending_reset_replay_plan(pending).await;
+            }
+        }
+        Some(outcome)
+    }
+
+    /// Accepts the reset's replay target and records whether its replay was admitted.
+    fn admit_pending_reset_replay(&mut self, pending: PendingWalletReset) {
+        let replay_plan = pending.replay_plan();
+        let replay_from = reset_replay_from_block(self.last_scanned, replay_plan.start_block);
+        let token = self
+            .worker_handle
+            .mint_sync_token(self.actor_state.reset_generation());
+        let accepted = self
+            .actor_state
+            .transition_active(&self.worker_handle, &self.cancel, |mut state| {
+                state.accept_target(token, replay_plan.target_block)
+            })
+            .unwrap_or(false);
+        let admitted = if !accepted {
+            false
+        } else if replay_plan.target_block > 0 && replay_from > replay_plan.target_block {
+            let _ = self.actor_state.transition_active(
+                &self.worker_handle,
+                &self.cancel,
+                |mut state| state.complete_backfill_job(token),
+            );
+            self.backfill_complete_block = self.actor_state.completed_target_block();
+            true
+        } else {
+            self.dispatch_reset_replay_backfill(token, replay_from, replay_plan)
+        };
+        let _ =
+            self.actor_state
+                .transition_active(&self.worker_handle, &self.cancel, |mut state| {
+                    state.set_pending_reset_replay_admitted(
+                        admitted.then_some((token, replay_from)),
+                    );
+                });
+    }
+
+    /// Hands the reset replay to the backfill loop as an accepted job.
+    /// Returns whether the backfill loop took it.
+    fn dispatch_reset_replay_backfill(
+        &mut self,
+        token: WalletSyncToken,
+        replay_from: u64,
+        replay_plan: WalletResetReplayPlan,
+    ) -> bool {
+        let (liveness, receiver) = oneshot::channel();
+        self.accepted_backfill_liveness
+            .push(accepted_backfill_owner_dropped(token, receiver));
+        let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
+            token,
+            self.backfill_sender.clone(),
+            liveness,
+            self.cancel.clone(),
+        )
+        .activate();
+        let request = BackfillRequest::add(
+            self.cfg.cache_key.clone(),
+            replay_from,
+            replay_plan.target_block,
+            replay_plan.follow_safe_head,
+            replay_from,
+            driver,
+        );
+        match self.backfill_tx.try_send(request) {
+            Ok(()) => {
+                let _ = self.actor_state.transition_active(
+                    &self.worker_handle,
+                    &self.cancel,
+                    |mut state| state.backfill_dispatch_admitted(token),
+                );
+                true
+            }
+            Err(err) => {
+                warn!(?err, cache_key = %self.cfg.cache_key, replay_from, target_block = replay_plan.target_block, "wallet reset replay enqueue failed");
+                let _ = self.actor_state.transition_active(
+                    &self.worker_handle,
+                    &self.cancel,
+                    |mut state| {
+                        state.fail_job_backfill_unavailable(token);
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    /// Persists that the reset replay was admitted and clears the pending reset.
+    async fn retire_pending_reset_replay_plan(&mut self, pending: PendingWalletReset) {
+        let authority = WalletPrivateMutationAuthority::new(
+            &self.worker_handle,
+            self.actor_state.reset_generation(),
+            &self.cancel,
+        );
+        match authority.acquire().await {
+            Ok(permit) => {
+                let persist_result = permit.with_active_apply(|token| {
+                    persist_wallet_reset_replay_admission_with_token(
+                        &token,
+                        &permit,
+                        self.cache_store.as_ref(),
+                        &self.cfg,
+                        self.actor_state.highest_accepted_reset_intent(),
+                    )?;
+                    self.actor_state.transition(&token, |mut state| {
+                        state.durable_reset_replay_commit_ok(pending.intent_id());
+                        state.clear_pending_reset();
+                    });
+                    Ok::<(), WalletCacheError>(())
+                });
+                match persist_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!(?err, cache_key = %self.cfg.cache_key, intent_id = pending.intent_id(), "failed to retire durable wallet reset replay plan");
+                        let _ = permit.with_active_apply(|token| {
+                            self.actor_state.transition(&token, |mut state| {
+                                state.reset_replay_persist_failed(pending.intent_id());
+                            });
+                        });
+                    }
+                    Err(reason) => {
+                        debug!(?reason, cache_key = %self.cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement rejected");
+                    }
+                }
+            }
+            Err(reason) => {
+                debug!(?reason, cache_key = %self.cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement skipped");
+            }
         }
     }
 

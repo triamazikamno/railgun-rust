@@ -372,10 +372,10 @@ pub(crate) async fn prepare_wallet_worker(
         );
         drop(snapshot);
 
-        let mut backfill_complete_block: Option<u64> = None;
+        let backfill_complete_block: Option<u64> = None;
         let mut live_receiver_lagged = false;
         let persist_state = WalletPersistState::default();
-        let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
+        let live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = Some(poi_runtime.public_client());
         let mut pending_reset_retry = tokio::time::interval_at(
             tokio::time::Instant::now() + WALLET_RESET_RETRY_INTERVAL,
@@ -392,7 +392,7 @@ pub(crate) async fn prepare_wallet_worker(
             );
         }
 
-        let mut readiness_started = worker_started;
+        let readiness_started = worker_started;
         let (remote_done_tx, mut remote_done_rx) = mpsc::channel::<WalletRemoteDone>(8);
         // Jobs re-enter here for private POI commits; actor is sole UTXO mirror writer.
         let (private_apply_tx, mut private_apply_rx) =
@@ -418,174 +418,12 @@ pub(crate) async fn prepare_wallet_worker(
             poi_submitter,
             accepted_backfill_liveness: FuturesUnordered::new(),
             accepted_indexed_job_liveness: FuturesUnordered::new(),
+            live_metadata_flush,
+            readiness_started,
+            backfill_complete_block,
+            backfill_sender,
+            backfill_tx,
         };
-        macro_rules! try_drive_pending_reset {
-            ($admit_replay:expr) => {{
-                if let Some(pending) = actor.actor_state.pending_reset() {
-                    let rewind_was_pending = !actor.actor_state.pending_reset_rewind_committed();
-                    let outcome = if actor.actor_state.pending_reset_rewind_committed() {
-                        WalletResetCommitOutcome {
-                            rewind: WalletResetRewindOutcome::Committed {
-                                committed_to: actor.last_scanned,
-                            },
-                        }
-                    } else {
-                        WalletResetCommitRequest {
-                            cache_store: actor.cache_store.as_ref(),
-                            cfg: &actor.cfg,
-                            utxos: &actor.utxos,
-                            worker_handle: &actor.worker_handle,
-                            pending,
-                            highest_accepted_reset_intent: actor.actor_state
-                                .highest_accepted_reset_intent(),
-                            actor_state: &mut actor.actor_state,
-                            cancel: &actor.cancel,
-                            last_scanned: &mut actor.last_scanned,
-                            persist_state: &mut actor.persist_state,
-                            live_metadata_flush: &mut live_metadata_flush,
-                        }
-                        .commit()
-                        .await
-                    };
-                    if outcome.rewind.committed() {
-                        if rewind_was_pending {
-                            readiness_started = Instant::now();
-                            backfill_complete_block = None;
-                            live_rx = live_rx.resubscribe();
-                        }
-
-                        if $admit_replay && actor.actor_state.pending_reset_replay_admitted().is_none() {
-                            let replay_plan = pending.replay_plan();
-                            let replay_from =
-                                reset_replay_from_block(actor.last_scanned, replay_plan.start_block);
-                            let token =
-                                actor.worker_handle.mint_sync_token(actor.actor_state.reset_generation());
-                            let accepted = actor.actor_state
-                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
-                                    let accepted = state.accept_target(
-                                        token,
-                                        replay_plan.target_block,
-                                    );
-                                    accepted
-                                })
-                                .unwrap_or(false);
-                            let admitted = if !accepted {
-                                false
-                            } else if replay_plan.target_block > 0
-                                && replay_from > replay_plan.target_block
-                            {
-                                let _ = actor.actor_state.transition_active(
-                                    &actor.worker_handle,
-                                    &actor.cancel,
-                                    |mut state| state.complete_backfill_job(token),
-                                );
-                                backfill_complete_block = actor.actor_state.completed_target_block();
-                                true
-                            } else {
-                                let (liveness, receiver) = oneshot::channel();
-                                actor.accepted_backfill_liveness
-                                    .push(accepted_backfill_owner_dropped(token, receiver));
-                                let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
-                                    token,
-                                    backfill_sender.clone(),
-                                    liveness,
-                                    actor.cancel.clone(),
-                                )
-                                .activate();
-                                let request = BackfillRequest::add(
-                                    actor.cfg.cache_key.clone(),
-                                    replay_from,
-                                    replay_plan.target_block,
-                                    replay_plan.follow_safe_head,
-                                    replay_from,
-                                    driver,
-                                );
-                                match backfill_tx.try_send(request) {
-                                    Ok(()) => {
-                                        let _ = actor.actor_state.transition_active(
-                                            &actor.worker_handle,
-                                            &actor.cancel,
-                                            |mut state| state.backfill_dispatch_admitted(token),
-                                        );
-                                        true
-                                    }
-                                    Err(err) => {
-                                        warn!(?err, cache_key = %actor.cfg.cache_key, replay_from, target_block = replay_plan.target_block, "wallet reset replay enqueue failed");
-                                        let _ = actor.actor_state.transition_active(
-                                            &actor.worker_handle,
-                                            &actor.cancel,
-                                            |mut state| {
-                                                state.fail_job_backfill_unavailable(token);
-                                            },
-                                        );
-                                        false
-                                    }
-                                }
-                            };
-                            let _ = actor.actor_state.transition_active(
-                                &actor.worker_handle,
-                                &actor.cancel,
-                                |mut state| {
-                                    state.set_pending_reset_replay_admitted(
-                                        admitted.then_some((token, replay_from)),
-                                    );
-                                },
-                            );
-                        }
-
-                        if $admit_replay && actor.actor_state.pending_reset_replay_admitted().is_some() {
-                            let authority = WalletPrivateMutationAuthority::new(
-                                &actor.worker_handle,
-                                actor.actor_state.reset_generation(),
-                                &actor.cancel,
-                            );
-                            match authority.acquire().await {
-                                Ok(permit) => {
-                                    let persist_result = permit.with_active_apply(|token| {
-                                        persist_wallet_reset_replay_admission_with_token(
-                                            &token,
-                                            &permit,
-                                            actor.cache_store.as_ref(),
-                                            &actor.cfg,
-                                            actor.actor_state.highest_accepted_reset_intent(),
-                                        )?;
-                                        actor.actor_state.transition(&token, |mut state| {
-                                            state.durable_reset_replay_commit_ok(
-                                                pending.intent_id(),
-                                            );
-                                            state.clear_pending_reset();
-                                        });
-                                        Ok::<(), WalletCacheError>(())
-                                    });
-                                    match persist_result {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(err)) => {
-                                            warn!(?err, cache_key = %actor.cfg.cache_key, intent_id = pending.intent_id(), "failed to retire durable wallet reset replay plan");
-                                            let _ = permit.with_active_apply(|token| {
-                                                actor.actor_state.transition(&token, |mut state| {
-                                                    state.reset_replay_persist_failed(
-                                                        pending.intent_id(),
-                                                    );
-                                                });
-                                            });
-                                        }
-                                        Err(reason) => {
-                                            debug!(?reason, cache_key = %actor.cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement rejected");
-                                        }
-                                    }
-                                }
-                                Err(reason) => {
-                                    debug!(?reason, cache_key = %actor.cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement skipped");
-                                }
-                            }
-                        }
-                    }
-                    Some(outcome)
-                } else {
-                    None
-                }
-            }};
-        }
         macro_rules! apply_backfill_done {
             ($last_block:expr, $token:expr) => {{
                 let last_block = $last_block;
@@ -614,7 +452,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 },
                             ) {
                                 Ok(_) => {
-                                    live_metadata_flush.mark_persisted(actor.last_scanned, Instant::now());
+                                    actor.live_metadata_flush.mark_persisted(actor.last_scanned, Instant::now());
                                     Ok(())
                                 }
                                 Err(err) => {
@@ -763,7 +601,7 @@ pub(crate) async fn prepare_wallet_worker(
                 } else {
                 let snapshot = actor.utxos.read().await;
                 let (unspent, spent) = wallet_utxo_counts(&snapshot);
-                backfill_complete_block = Some(last_block);
+                actor.backfill_complete_block = Some(last_block);
                 info!(
                     cache_key = %actor.cfg.cache_key,
                     last_scanned = actor.last_scanned,
@@ -773,7 +611,7 @@ pub(crate) async fn prepare_wallet_worker(
                     pre_ready_poi_status_changed,
                     pre_ready_local_cache_available,
                     pre_ready_poi_status_refresh_elapsed_ms,
-                    ready_elapsed_ms = readiness_started.elapsed().as_millis(),
+                    ready_elapsed_ms = actor.readiness_started.elapsed().as_millis(),
                     worker_elapsed_ms = worker_started.elapsed().as_millis(),
                     "wallet backfill complete"
                 );
@@ -858,7 +696,7 @@ pub(crate) async fn prepare_wallet_worker(
                 }
             }};
         }
-        if actor.actor_state.pending_reset().is_some() && try_drive_pending_reset!(false).is_some() {
+        if actor.actor_state.pending_reset().is_some() && actor.try_drive_pending_reset(&mut live_rx, false).await.is_some() {
             signal_restored_reset_attempt(&mut startup_replay_tx);
         }
 
@@ -869,7 +707,7 @@ pub(crate) async fn prepare_wallet_worker(
             return;
         }
         if actor.actor_state.pending_reset().is_some() {
-            let _ = try_drive_pending_reset!(true);
+            let _ = actor.try_drive_pending_reset(&mut live_rx, true).await;
         }
         loop {
             tokio::select! {
@@ -898,7 +736,7 @@ pub(crate) async fn prepare_wallet_worker(
                         if disposition == WalletBackfillOwnerDisposition::BenignRetirement
                             && !actor.actor_state.has_active_backfill_job()
                         {
-                            backfill_complete_block = actor.actor_state.completed_target_block();
+                            actor.backfill_complete_block = actor.actor_state.completed_target_block();
                             if poi_corpus_revision_rx.as_ref().is_some_and(|revision_rx| {
                                 *revision_rx.borrow() != last_poi_corpus_revision
                             }) {
@@ -973,7 +811,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 }
                             }
                         } else if disposition == WalletBackfillOwnerDisposition::DriverLost {
-                            backfill_complete_block = None;
+                            actor.backfill_complete_block = None;
                         }
                     }
                     if let Some(acknowledgement) = acknowledgement {
@@ -1205,7 +1043,7 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                 }
                 _ = pending_reset_retry.tick(), if actor.actor_state.pending_reset().is_some() => {
-                    if let Some(outcome) = try_drive_pending_reset!(true) {
+                    if let Some(outcome) = actor.try_drive_pending_reset(&mut live_rx, true).await {
                         debug!(?outcome.rewind, cache_key = %actor.cfg.cache_key, "wallet pending reset retry completed");
                         signal_restored_reset_attempt(&mut startup_replay_tx);
                     }
@@ -1226,7 +1064,7 @@ pub(crate) async fn prepare_wallet_worker(
                         );
                         continue;
                     }
-                    if backfill_complete_block.is_none() {
+                    if actor.backfill_complete_block.is_none() {
                         let _ = poi_maintenance.request(
                             refresh_request.force_output_poi_recovery,
                             false,
@@ -1591,7 +1429,7 @@ pub(crate) async fn prepare_wallet_worker(
                         cache_key = %actor.cfg.cache_key,
                         revision = revision.revision,
                         blocked_shields_revision = revision.blocked_shields_revision,
-                        backfill_complete = backfill_complete_block.is_some(),
+                        backfill_complete = actor.backfill_complete_block.is_some(),
                         reset_pending = actor.actor_state.pending_reset().is_some(),
                         "committed PPOI corpus revision observed"
                     );
@@ -1599,7 +1437,7 @@ pub(crate) async fn prepare_wallet_worker(
                         != last_poi_corpus_revision.blocked_shields_revision;
                     last_poi_corpus_revision = revision;
                     blocked_shield_refresh_pending |= blocked_shields_changed;
-                    if backfill_complete_block.is_some()
+                    if actor.backfill_complete_block.is_some()
                         && actor.actor_state.pending_reset().is_none()
                         && let Some(result) = actor.commit_local_poi_status_refresh(
                             WalletPoiRefreshSelection::CorpusRevision {
@@ -1652,7 +1490,7 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                     }
                 }
-                _ = poi_status_refresh_interval.tick(), if poi_status_client.is_some() && backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
+                _ = poi_status_refresh_interval.tick(), if poi_status_client.is_some() && actor.backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
                     let Some(_client) = poi_status_client.as_ref() else {
                         continue;
                     };
@@ -1773,7 +1611,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 let _ = response.send(Err(reason));
                                 continue;
                             }
-                            if try_drive_pending_reset!(true).is_some()
+                            if actor.try_drive_pending_reset(&mut live_rx, true).await.is_some()
                                 && actor.actor_state.pending_reset().is_some()
                             {
                                 let reason = if actor.actor_state.has_persistence_failure() {
@@ -1798,7 +1636,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 .push(accepted_backfill_owner_dropped(token, receiver));
                             let lease = WalletSyncTargetLease::for_actor_accepted_job(
                                 token,
-                                backfill_sender.clone(),
+                                actor.backfill_sender.clone(),
                                 liveness,
                             );
                             if let Err(lease) = response.send(Ok(lease)) {
@@ -1822,7 +1660,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 });
                                 continue;
                             }
-                            if try_drive_pending_reset!(true).is_some()
+                            if actor.try_drive_pending_reset(&mut live_rx, true).await.is_some()
                                 && actor.actor_state.pending_reset().is_some()
                             {
                                 let reason = if actor.actor_state.has_persistence_failure() {
@@ -1851,13 +1689,13 @@ pub(crate) async fn prepare_wallet_worker(
                             let (liveness, receiver) = oneshot::channel();
                             actor.accepted_backfill_liveness
                                 .push(accepted_backfill_owner_dropped(token, receiver));
-                            backfill_complete_block = None;
+                            actor.backfill_complete_block = None;
                             let result = WalletBackfillStartResult::Accepted {
                                 committed_to: actor.last_scanned,
                                 target_block,
                                     grant: WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                         token,
-                                        backfill_sender.clone(),
+                                        actor.backfill_sender.clone(),
                                         liveness,
                                         actor.cancel.clone(),
                                     ),
@@ -1882,7 +1720,7 @@ pub(crate) async fn prepare_wallet_worker(
                             }
                         }
                         BackfillEvent::Apply { apply, token, response } => {
-                            if let Some(outcome) = try_drive_pending_reset!(true)
+                            if let Some(outcome) = actor.try_drive_pending_reset(&mut live_rx, true).await
                                 && actor.actor_state.pending_reset().is_some()
                             {
                                 let reason = match outcome.rewind {
@@ -1939,7 +1777,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 cancel: &actor.cancel,
                                 last_scanned: &mut actor.last_scanned,
                                 persist_state: &mut actor.persist_state,
-                                live_metadata_flush: &mut live_metadata_flush,
+                                live_metadata_flush: &mut actor.live_metadata_flush,
                                 public_data_plane: &actor.public_data_plane,
                             }
                             .commit()
@@ -1987,7 +1825,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 }
                                 continue;
                             }
-                            if let Some(outcome) = try_drive_pending_reset!(true)
+                            if let Some(outcome) = actor.try_drive_pending_reset(&mut live_rx, true).await
                                 && actor.actor_state.pending_reset().is_some()
                             {
                                 let reason = match outcome.rewind {
@@ -2030,7 +1868,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     reset_generation = current_reset_generation,
                                     "wallet target recorded; cursor has not reached target"
                                 );
-                                backfill_complete_block = None;
+                                actor.backfill_complete_block = None;
                                 let result = WalletBackfillFinishResult::Rejected {
                                     committed_to: actor.last_scanned,
                                     reason: WalletBackfillRejectReason::TargetNotReached {
@@ -2074,7 +1912,7 @@ pub(crate) async fn prepare_wallet_worker(
                                             .unwrap_or(false);
                                         if completed {
                                             if actor.actor_state.has_active_backfill_job() {
-                                                backfill_complete_block = None;
+                                                actor.backfill_complete_block = None;
                                             }
                                             WalletBackfillFinishResult::Ready {
                                                 committed_to: actor.last_scanned,
@@ -2262,7 +2100,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 }
                             }
                             drop(acceptance_permit);
-                            let outcome = try_drive_pending_reset!(true)
+                            let outcome = actor.try_drive_pending_reset(&mut live_rx, true).await
                                 .expect("pending reset was installed before commit");
                             // Accept already succeeded: public result is always Accepted.
                             let result =
@@ -2273,13 +2111,13 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                     }
                 }
-                result = live_rx.recv(), if backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
+                result = live_rx.recv(), if actor.backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
                     match result {
                         Ok(batch) => {
                             if actor.cfg.sync_to_block.is_some() {
                                 continue;
                             }
-                            if backfill_complete_block.is_none()
+                            if actor.backfill_complete_block.is_none()
                                 || batch.to_block <= actor.last_scanned
                             {
                                 live_receiver_lagged = false;
@@ -2310,12 +2148,12 @@ pub(crate) async fn prepare_wallet_worker(
                                     .push(accepted_backfill_owner_dropped(token, receiver));
                                 let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                     token,
-                                    backfill_sender.clone(),
+                                    actor.backfill_sender.clone(),
                                     liveness,
                                     actor.cancel.clone(),
                                 )
                                 .activate();
-                                match backfill_tx.try_send(BackfillRequest::add(
+                                match actor.backfill_tx.try_send(BackfillRequest::add(
                                     actor.cfg.cache_key.clone(),
                                     expected_from_block,
                                     batch.to_block,
@@ -2329,7 +2167,7 @@ pub(crate) async fn prepare_wallet_worker(
                                             &actor.cancel,
                                             |mut state| state.backfill_dispatch_admitted(token),
                                         );
-                                        backfill_complete_block = None;
+                                        actor.backfill_complete_block = None;
                                         live_rx = live_rx.resubscribe();
                                     }
                                     Err(err) => {
@@ -2384,7 +2222,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 cancel: &actor.cancel,
                                 last_scanned: &mut actor.last_scanned,
                                 persist_state: &mut actor.persist_state,
-                                live_metadata_flush: &mut live_metadata_flush,
+                                live_metadata_flush: &mut actor.live_metadata_flush,
                                 public_data_plane: &actor.public_data_plane,
                             }
                             .commit()
@@ -2433,7 +2271,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     );
                                     let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                         live_token,
-                                        backfill_sender.clone(),
+                                        actor.backfill_sender.clone(),
                                         liveness,
                                         actor.cancel.clone(),
                                     )
@@ -2446,7 +2284,7 @@ pub(crate) async fn prepare_wallet_worker(
                                         expected_from_block,
                                         driver,
                                     );
-                                    match backfill_tx.try_send(retry) {
+                                    match actor.backfill_tx.try_send(retry) {
                                         Ok(()) => {
                                             let _ = actor.actor_state.transition_active(
                                                 &actor.worker_handle,
@@ -2455,7 +2293,7 @@ pub(crate) async fn prepare_wallet_worker(
                                                     state.backfill_dispatch_admitted(live_token)
                                                 },
                                             );
-                                            backfill_complete_block = None;
+                                            actor.backfill_complete_block = None;
                                             live_rx = live_rx.resubscribe();
                                         }
                                         Err(err) => {
