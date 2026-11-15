@@ -75,7 +75,7 @@ use output_poi::{
 };
 use poi_maintenance::{
     current_ppoi_workflow_status_for_candidate_report, next_poi_corpus_revision,
-    on_poi_maintenance_done, request_poi_maintenance, wallet_poi_refresh_interval,
+    wallet_poi_refresh_interval,
 };
 
 const fn wallet_private_request_error(
@@ -398,7 +398,7 @@ pub(crate) async fn prepare_wallet_worker(
         let (private_apply_tx, mut private_apply_rx) =
             mpsc::channel::<WalletPrivateApplyRequest>(32);
         let private_apply = WalletPrivateApplyClient::new(private_apply_tx);
-        let mut poi_maintenance = PoiMaintenanceController::new();
+        let poi_maintenance = PoiMaintenanceController::new();
         // Tentative attempts are actor-lifetime only; safe-head maintenance never consults this set.
         let mut pending_output_poi_tentative_attempts =
             PendingOutputPoiTentativeAttemptTracker::default();
@@ -423,6 +423,14 @@ pub(crate) async fn prepare_wallet_worker(
             backfill_complete_block,
             backfill_sender,
             backfill_tx,
+            poi_maintenance,
+            remote_done_tx,
+            private_apply,
+            poi_jobs,
+            poi_refreshing_tx,
+            http_client,
+            indexed_artifact_source,
+            forest,
         };
         macro_rules! apply_backfill_done {
             ($last_block:expr, $token:expr) => {{
@@ -665,27 +673,7 @@ pub(crate) async fn prepare_wallet_worker(
                             }
                         }
                     }
-                    let _ = request_poi_maintenance(
-                        &mut poi_maintenance,
-                        &remote_done_tx,
-                        &private_apply,
-                        &poi_jobs,
-                        &poi_refreshing_tx,
-                        &actor.worker_handle,
-                        &actor.cancel,
-                        &actor.db,
-                        &actor.cache_store,
-                        &actor.cfg,
-                        &actor.public_data_plane,
-                        http_client.as_ref(),
-                        indexed_artifact_source.as_ref(),
-                        actor.poi_runtime,
-                        &actor.poi_submitter,
-                        &forest,
-                        &actor.utxos,
-                        &actor.active_poi_list_keys,
-                        false,
-                    );
+                    let _ = actor.request_poi_maintenance(false);
                 }
                 WalletBackfillDoneOutcome::Finished {
                     poi_corpus_revision: poi_corpus_revision_rx
@@ -853,27 +841,7 @@ pub(crate) async fn prepare_wallet_worker(
                             verified_errors,
                         } => {
                             // Always complete phase first (may start deferred force follow-up).
-                            on_poi_maintenance_done(
-                                &mut poi_maintenance,
-                                &remote_done_tx,
-                                &private_apply,
-                                &poi_jobs,
-                                &poi_refreshing_tx,
-                                &actor.worker_handle,
-                                &actor.cancel,
-                                &actor.db,
-                                &actor.cache_store,
-                                &actor.cfg,
-                                &actor.public_data_plane,
-                                http_client.as_ref(),
-                                indexed_artifact_source.as_ref(),
-                                actor.poi_runtime,
-                                &actor.poi_submitter,
-                                &forest,
-                                &actor.utxos,
-                                &actor.active_poi_list_keys,
-                                key,
-                            );
+                            actor.on_poi_maintenance_done(key);
                             if !credential.is_current(&actor.worker_handle) {
                                 debug!(
                                     cache_key = %actor.cfg.cache_key,
@@ -968,27 +936,7 @@ pub(crate) async fn prepare_wallet_worker(
                             key,
                             reason,
                         } => {
-                            on_poi_maintenance_done(
-                                &mut poi_maintenance,
-                                &remote_done_tx,
-                                &private_apply,
-                                &poi_jobs,
-                                &poi_refreshing_tx,
-                                &actor.worker_handle,
-                                &actor.cancel,
-                                &actor.db,
-                                &actor.cache_store,
-                                &actor.cfg,
-                                &actor.public_data_plane,
-                                http_client.as_ref(),
-                                indexed_artifact_source.as_ref(),
-                                actor.poi_runtime,
-                                &actor.poi_submitter,
-                                &forest,
-                                &actor.utxos,
-                                &actor.active_poi_list_keys,
-                                key,
-                            );
+                            actor.on_poi_maintenance_done(key);
                             if credential.is_current(&actor.worker_handle) {
                                 warn!(
                                     category = reason,
@@ -1053,7 +1001,7 @@ pub(crate) async fn prepare_wallet_worker(
                         continue;
                     };
                     if actor.actor_state.pending_reset().is_some() {
-                        let _ = poi_maintenance.request(
+                        let _ = actor.poi_maintenance.request(
                             refresh_request.force_output_poi_recovery,
                             false,
                             None,
@@ -1065,7 +1013,7 @@ pub(crate) async fn prepare_wallet_worker(
                         continue;
                     }
                     if actor.backfill_complete_block.is_none() {
-                        let _ = poi_maintenance.request(
+                        let _ = actor.poi_maintenance.request(
                             refresh_request.force_output_poi_recovery,
                             false,
                             None,
@@ -1111,27 +1059,7 @@ pub(crate) async fn prepare_wallet_worker(
                             }
                         }
                     }
-                    let _ = request_poi_maintenance(
-                        &mut poi_maintenance,
-                        &remote_done_tx,
-                        &private_apply,
-                        &poi_jobs,
-                        &poi_refreshing_tx,
-                        &actor.worker_handle,
-                        &actor.cancel,
-                        &actor.db,
-                        &actor.cache_store,
-                        &actor.cfg,
-                        &actor.public_data_plane,
-                        http_client.as_ref(),
-                        indexed_artifact_source.as_ref(),
-                        actor.poi_runtime,
-                        &actor.poi_submitter,
-                        &forest,
-                        &actor.utxos,
-                        &actor.active_poi_list_keys,
-                        refresh_request.force_output_poi_recovery,
-                    );
+                    let _ = actor.request_poi_maintenance(refresh_request.force_output_poi_recovery);
                 }
                 Some(command) = indexed_catch_up_status_rx.recv() => {
                     let authority = WalletPrivateMutationAuthority::new(
@@ -1371,10 +1299,10 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                         if !tentative_candidates.is_empty() {
                             spawn_pending_output_poi_tentative_job(
-                                &poi_jobs,
+                                &actor.poi_jobs,
                                 &actor.worker_handle,
                                 &actor.cancel,
-                                &remote_done_tx,
+                                &actor.remote_done_tx,
                                 &actor.cache_store,
                                 &actor.cfg,
                                 actor.poi_runtime,
@@ -1565,27 +1493,7 @@ pub(crate) async fn prepare_wallet_worker(
                             );
                         }
                     }
-                    let _ = request_poi_maintenance(
-                        &mut poi_maintenance,
-                        &remote_done_tx,
-                        &private_apply,
-                        &poi_jobs,
-                        &poi_refreshing_tx,
-                        &actor.worker_handle,
-                        &actor.cancel,
-                        &actor.db,
-                        &actor.cache_store,
-                        &actor.cfg,
-                        &actor.public_data_plane,
-                        http_client.as_ref(),
-                        indexed_artifact_source.as_ref(),
-                        actor.poi_runtime,
-                        &actor.poi_submitter,
-                        &forest,
-                        &actor.utxos,
-                        &actor.active_poi_list_keys,
-                        false,
-                    );
+                    let _ = actor.request_poi_maintenance(false);
                 }
                 Some(event) = backfill_rx.recv() => {
                     match event {
@@ -1596,7 +1504,7 @@ pub(crate) async fn prepare_wallet_worker(
                         #[cfg(test)]
                         BackfillEvent::HoldTrackedPoiJobForTest { sentinel, started } => {
                             let held_data_plane = actor.public_data_plane.clone();
-                            poi_jobs.spawn(async move {
+                            actor.poi_jobs.spawn(async move {
                                 let _held = (held_data_plane, sentinel);
                                 let _ = started.send(());
                                 std::future::pending::<()>().await;
@@ -1783,27 +1691,7 @@ pub(crate) async fn prepare_wallet_worker(
                             .commit()
                             .await;
                             if outcome.changed && poi_status_client.is_some() {
-                                let _ = request_poi_maintenance(
-                                    &mut poi_maintenance,
-                                    &remote_done_tx,
-                                    &private_apply,
-                                    &poi_jobs,
-                                    &poi_refreshing_tx,
-                                    &actor.worker_handle,
-                                    &actor.cancel,
-                                    &actor.db,
-                                    &actor.cache_store,
-                                    &actor.cfg,
-                                    &actor.public_data_plane,
-                                    http_client.as_ref(),
-                                    indexed_artifact_source.as_ref(),
-                                    actor.poi_runtime,
-                                    &actor.poi_submitter,
-                                    &forest,
-                                    &actor.utxos,
-                                    &actor.active_poi_list_keys,
-                                    false,
-                                );
+                                let _ = actor.request_poi_maintenance(false);
                             }
                             if let Err(err) = response.send(outcome.result) {
                                 debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send wallet scan apply result");
@@ -2064,7 +1952,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     |mut state| state.accept_reset(accepted_pending_reset),
                                 );
                                 // Force intent is generation-scoped; do not carry across rewind.
-                                poi_maintenance.clear_force_on_reset();
+                                actor.poi_maintenance.clear_force_on_reset();
                                 if clear_indexed_catch_up {
                                     acceptance_permit
                                         .apply_publish_indexed_catch_up(&token, None);
@@ -2236,27 +2124,7 @@ pub(crate) async fn prepare_wallet_worker(
                                         |mut state| state.retire_job(live_token),
                                     );
                                     if outcome.changed && poi_status_client.is_some() {
-                                        let _ = request_poi_maintenance(
-                                            &mut poi_maintenance,
-                                            &remote_done_tx,
-                                            &private_apply,
-                                            &poi_jobs,
-                                            &poi_refreshing_tx,
-                                            &actor.worker_handle,
-                                            &actor.cancel,
-                                            &actor.db,
-                                            &actor.cache_store,
-                                            &actor.cfg,
-                                            &actor.public_data_plane,
-                                            http_client.as_ref(),
-                                            indexed_artifact_source.as_ref(),
-                                            actor.poi_runtime,
-                                            &actor.poi_submitter,
-                                            &forest,
-                                            &actor.utxos,
-                                            &actor.active_poi_list_keys,
-                                            false,
-                                        );
+                                        let _ = actor.request_poi_maintenance(false);
                                     }
                                 }
                                 WalletBackfillApplyResult::Rejected {

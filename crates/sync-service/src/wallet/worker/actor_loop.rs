@@ -5,18 +5,20 @@ use crate::wallet::handle::WalletPrivateViewTicket;
 use super::{
     AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, Arc, BackfillEvent,
     BackfillRequest, CancellationToken, ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore,
-    FixedBytes, FuturesUnordered, Instant, PendingOutputPoiContextIntent, PendingWalletReset,
-    RwLock, SharedLogBatch, WalletActorState, WalletBackfillGrant, WalletBackfillRejectReason,
+    FixedBytes, FuturesUnordered, IndexedArtifactSourceConfig, Instant, MerkleForest,
+    PendingOutputPoiContextIntent, PendingWalletReset, PoiMaintenanceController, RwLock,
+    SharedLogBatch, WalletActorState, WalletBackfillGrant, WalletBackfillRejectReason,
     WalletCacheError, WalletCacheStore, WalletConfig, WalletHandle, WalletLiveMetadataFlush,
-    WalletPendingSpentMarkOutcome, WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
-    WalletPoiStatusRefreshCommitRequest, WalletPrivateApplyRequest, WalletPrivateMutationAuthority,
-    WalletPrivateRequest, WalletPrivateRequestError, WalletResetCommitOutcome,
+    WalletPendingSpentMarkOutcome, WalletPersistState, WalletPoiJobTracker,
+    WalletPoiRefreshSelection, WalletPoiRuntime, WalletPoiStatusRefreshCommitRequest,
+    WalletPrivateApplyClient, WalletPrivateApplyRequest, WalletPrivateMutationAuthority,
+    WalletPrivateRequest, WalletPrivateRequestError, WalletRemoteDone, WalletResetCommitOutcome,
     WalletResetCommitRequest, WalletResetReplayPlan, WalletResetRewindOutcome, WalletSyncToken,
     WalletUtxo, accepted_backfill_owner_dropped,
     apply_owned_poi_private_delta_on_actor_with_active_lists, broadcast, clear_local_pending_spent,
     commit_pending_output_contexts, debug, mark_local_pending_spent, mpsc, oneshot,
     persist_wallet_reset_replay_admission_with_token, reset_replay_from_block,
-    wallet_poi_status_refresh_needed_for_selection, warn,
+    wallet_poi_status_refresh_needed_for_selection, warn, watch,
 };
 
 /// State and services the wallet actor task works with across loop iterations.
@@ -43,6 +45,14 @@ pub(super) struct WalletActorLoop<'a> {
     pub(super) backfill_complete_block: Option<u64>,
     pub(super) backfill_sender: mpsc::Sender<BackfillEvent>,
     pub(super) backfill_tx: mpsc::Sender<BackfillRequest>,
+    pub(super) poi_maintenance: PoiMaintenanceController,
+    pub(super) remote_done_tx: mpsc::Sender<WalletRemoteDone>,
+    pub(super) private_apply: WalletPrivateApplyClient,
+    pub(super) poi_jobs: WalletPoiJobTracker,
+    pub(super) poi_refreshing_tx: watch::Sender<bool>,
+    pub(super) http_client: Option<reqwest::Client>,
+    pub(super) indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
+    pub(super) forest: Arc<RwLock<MerkleForest>>,
 }
 
 impl WalletActorLoop<'_> {
