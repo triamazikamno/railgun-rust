@@ -5,14 +5,16 @@ use broadcaster_core::contracts::railgun::{
     CommitmentPreimage, Transaction, executeCall, relayCall, transactCall,
 };
 
+use crate::chain::PublicScanRows;
 use crate::txid_cache::TxidPublicCacheTransaction;
+use crate::types::PublicDataPlaneEpoch;
 use crate::wallet::{DenseMerkleTree, RailgunSpendSigner, SenderTransactionCandidate};
 
 use super::{
     Arc, ChainScope, ChainType, DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, FixedBytes, InputWitness,
     Instant, LocalPoiMerkleProofSource, MerkleForest, Note,
     OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-    OutputPoiRecoveryRequest, OutputPoiRecoveryStatus, PrivateInputs,
+    OutputPoiRecoveryRecord, OutputPoiRecoveryRequest, OutputPoiRecoveryStatus, PrivateInputs,
     PublicCacheTxidRefreshRequest, PublicInputs, PublicTxidCacheKey, PublicTxidTransaction,
     RecoveryChunk, RecoveryFailure, TREE_LEAF_COUNT, TransactionPlanChunk, U256, Utxo,
     UtxoCommitmentKind, WalletConfig, WalletNullifierIndex, WalletUtxo, debug,
@@ -49,80 +51,27 @@ pub(in crate::wallet) struct PublicTxidRecoveryBuildRequest<'a> {
 pub(in crate::wallet) async fn build_output_poi_recovery_chunk_from_public_cache(
     input: PublicTxidRecoveryBuildRequest<'_>,
 ) -> Result<RecoveryChunk, RecoveryFailure> {
-    let PublicTxidRecoveryBuildRequest {
-        request,
-        candidate,
-        source_tx_hash,
-        output_commitment,
-        wallet_nullifiers,
-        required_poi_list_keys,
-        spending_public_key,
-        candidate_started,
-    } = input;
-    let current_recovery = request
-        .cache_store
-        .get_output_poi_recovery(
-            request.cfg.chain.chain_id,
-            &request.cfg.cache_key,
-            &output_commitment,
-        )
-        .map_err(|err| {
-            RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::TxFetchFailed,
-                format!("load cached recovery state failed: {err}"),
-                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-            )
-        })?;
-    if !output_poi_recovery_source_matches_candidate(current_recovery.as_ref(), candidate) {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            "cached recovery source transaction does not match current output",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
-    let cache_key = PublicTxidCacheKey::new(
-        ChainScope {
-            chain_type: ChainType::Evm,
-            chain_id: request.cfg.chain.chain_id,
-            railgun_contract: request.cfg.chain.contract,
-        },
-        DEFAULT_TXID_VERSION,
-    );
+    let request = input.request;
+    let current_recovery = input.current_recovery()?;
     let public_epoch = request.public_data_plane.current_epoch();
-    let rows = public_txid_rows_for_outer_hash(
-        PublicCacheTxidRefreshRequest {
-            public_data_plane: request.public_data_plane,
-            cfg: request.cfg,
-            poi_client: request.poi_client,
-            http_client: request.http_client,
-            indexed_artifact_source: request.indexed_artifact_source,
-            cache_key,
-        },
-        source_tx_hash,
-    )
-    .await?;
+    let rows = input.public_rows().await?;
     let cached_transactions = current_recovery
         .as_ref()
         .and_then(|record| record.tx_input.as_deref())
         .and_then(|input| decode_railgun_transactions(input).ok())
         .unwrap_or_default();
 
-    if !request
-        .candidate_still_current(candidate, required_poi_list_keys)
-        .await
-    {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
+    input
+        .ensure_candidate_current(
             "output POI recovery candidate changed while resolving public TXID data",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
+        )
+        .await?;
     let sender_candidate = request
         .cache_store
         .get_sender_transaction_candidate(
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
-            &source_tx_hash,
+            &input.source_tx_hash,
         )
         .map_err(|err| {
             RecoveryFailure::retryable(
@@ -131,109 +80,14 @@ pub(in crate::wallet) async fn build_output_poi_recovery_chunk_from_public_cache
                 OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
             )
         })?;
-    let recovery_chunk = build_output_poi_recovery_chunk_from_public_rows(
-        candidate,
-        wallet_nullifiers,
-        &rows,
-        sender_candidate.as_ref(),
-        &cached_transactions,
-        &request.forest,
-        required_poi_list_keys,
-        spending_public_key,
-        &request.cfg.scan_keys,
-    )
-    .await;
-    let recovery_chunk = match recovery_chunk {
-        Err(failure)
-            if failure.category == "sender_output_notes_unavailable"
-                && wallet_nullifiers
-                    .wallet_utxos
-                    .iter()
-                    .any(|input| input.spent.as_ref() == Some(&candidate.utxo.source)) =>
-        {
-            let replay_failure = |category, message| {
-                RecoveryFailure::retryable_category(
-                    OutputPoiRecoveryStatus::TxFetchFailed,
-                    category,
-                    message,
-                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                )
-            };
-            let source_rows = match request
-                .public_data_plane
-                .output_poi_source_block_rows(candidate.utxo.source.block_number)
-                .await
-            {
-                Ok(crate::chain::PublicScanRowsAnswer::Rows(rows)) => rows,
-                Ok(_) => {
-                    return Err(replay_failure(
-                        "sender_source_rows_unavailable",
-                        "sender output source block is not available in public artifacts",
-                    ));
-                }
-                Err(_) => {
-                    return Err(replay_failure(
-                        "sender_source_rows_fetch_failed",
-                        "sender output source block could not be loaded from public artifacts",
-                    ));
-                }
-            };
-            if request.authority.revalidate().is_err()
-                || source_rows.range.from_block > candidate.utxo.source.block_number
-                || source_rows.range.to_block < candidate.utxo.source.block_number
-                || source_rows.epoch != public_epoch
-                || request.public_data_plane.current_epoch() != public_epoch
-            {
-                return Err(replay_failure(
-                    "sender_source_rows_stale",
-                    "sender output source block changed while reconstructing recovery notes",
-                ));
-            }
-            let delta =
-                crate::wallet::WalletLogDelta::from_rows(&source_rows.rows, &request.cfg.scan_keys);
-            let nullifiers = delta
-                .nullifiers
-                .into_iter()
-                .map(|spent| ((spent.tree, spent.nullifier), spent.source))
-                .collect();
-            let candidates = crate::wallet::delta::sender_scan_candidate_inputs(
-                wallet_nullifiers.wallet_utxos,
-                request.cfg.scan_keys.nullifying_key,
-                &nullifiers,
-                delta.sender_scan_outputs,
-                &request.cfg.scan_keys,
-            );
-            let mut candidates = candidates
-                .into_iter()
-                .filter(|sender| sender.source == candidate.utxo.source);
-            let Some(sender) = candidates.next() else {
-                return Err(failure);
-            };
-            if candidates.next().is_some() {
-                return Err(failure);
-            }
-            let sender = sender
-                .into_record(request.cfg.chain.chain_id, request.cfg.cache_key.clone())
-                .map_err(|_| failure)?;
-            let mut chunk = build_output_poi_recovery_chunk_from_public_rows(
-                candidate,
-                wallet_nullifiers,
-                &rows,
-                Some(&sender),
-                &cached_transactions,
-                &request.forest,
-                required_poi_list_keys,
-                spending_public_key,
-                &request.cfg.scan_keys,
-            )
-            .await?;
-            chunk.replay_fence = Some(
-                crate::wallet::saved_poi_compatibility::SenderCandidateReplayFence {
-                    public_data_plane: request.public_data_plane.clone(),
-                    epoch: public_epoch,
-                },
-            );
-            chunk
+    let recovery_chunk = match input
+        .chunk_from_rows(&rows, sender_candidate.as_ref(), &cached_transactions)
+        .await
+    {
+        Err(failure) if input.sender_notes_replayable(&failure) => {
+            input
+                .replay_sender_chunk(&rows, &cached_transactions, public_epoch, failure)
+                .await?
         }
         result => result?,
     };
@@ -249,65 +103,270 @@ pub(in crate::wallet) async fn build_output_poi_recovery_chunk_from_public_cache
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
-    if !request
-        .candidate_still_current(candidate, required_poi_list_keys)
-        .await
-    {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
+    input
+        .ensure_candidate_current(
             "output POI recovery candidate changed while building recovery chunk",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
-    if let Some((local_proof_source, ..)) = request
-        .local_proof_source_if_ready(required_poi_list_keys)
-        .await
-    {
-        let preflight_started = Instant::now();
-        match preflight_local_recovery_chunk_input_proofs(
-            Some(&local_proof_source),
-            request.cfg,
-            &recovery_chunk,
-            required_poi_list_keys,
         )
-        .await
-        {
-            Ok(()) => {
-                debug!(
-                    chain_id = request.cfg.chain.chain_id,
-                    preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
-                    candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
-                    "output POI recovery local proof preflight complete"
-                );
-            }
-            Err(failure) => {
-                warn!(
-                    chain_id = request.cfg.chain.chain_id,
-                    preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
-                    candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
-                    "output POI recovery local proof preflight failed"
-                );
-                return Err(failure);
-            }
-        }
-    }
-    if !request
-        .candidate_still_current(candidate, required_poi_list_keys)
-        .await
-    {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
+        .await?;
+    input.preflight_local_proofs(&recovery_chunk).await?;
+    input
+        .ensure_candidate_current(
             "output POI recovery candidate changed while resolving public TXID data",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
+        )
+        .await?;
 
     debug!(
         chain_id = request.cfg.chain.chain_id,
-        candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+        candidate_elapsed_ms = input.candidate_started.elapsed().as_millis(),
         "output POI recovery public TXID data resolved"
     );
     Ok(recovery_chunk)
+}
+
+impl PublicTxidRecoveryBuildRequest<'_> {
+    /// Loads the cached recovery record and checks that its source still matches the candidate.
+    fn current_recovery(&self) -> Result<Option<OutputPoiRecoveryRecord>, RecoveryFailure> {
+        let request = self.request;
+        let current_recovery = request
+            .cache_store
+            .get_output_poi_recovery(
+                request.cfg.chain.chain_id,
+                &request.cfg.cache_key,
+                &self.output_commitment,
+            )
+            .map_err(|err| {
+                RecoveryFailure::retryable(
+                    OutputPoiRecoveryStatus::TxFetchFailed,
+                    format!("load cached recovery state failed: {err}"),
+                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                )
+            })?;
+        if !output_poi_recovery_source_matches_candidate(current_recovery.as_ref(), self.candidate)
+        {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::TxFetchFailed,
+                "cached recovery source transaction does not match current output",
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            ));
+        }
+        Ok(current_recovery)
+    }
+
+    /// Fetches the validated public TXID rows for the candidate's source transaction.
+    async fn public_rows(&self) -> Result<Vec<PublicTxidTransaction>, RecoveryFailure> {
+        let request = self.request;
+        let cache_key = PublicTxidCacheKey::new(
+            ChainScope {
+                chain_type: ChainType::Evm,
+                chain_id: request.cfg.chain.chain_id,
+                railgun_contract: request.cfg.chain.contract,
+            },
+            DEFAULT_TXID_VERSION,
+        );
+        public_txid_rows_for_outer_hash(
+            PublicCacheTxidRefreshRequest {
+                public_data_plane: request.public_data_plane,
+                cfg: request.cfg,
+                poi_client: request.poi_client,
+                http_client: request.http_client,
+                indexed_artifact_source: request.indexed_artifact_source,
+                cache_key,
+            },
+            self.source_tx_hash,
+        )
+        .await
+    }
+
+    /// Fails with a retryable `changed` error when the candidate no longer matches wallet state.
+    async fn ensure_candidate_current(&self, changed: &'static str) -> Result<(), RecoveryFailure> {
+        if !self
+            .request
+            .candidate_still_current(self.candidate, self.required_poi_list_keys)
+            .await
+        {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::TxFetchFailed,
+                changed,
+                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds the recovery chunk from public rows, optionally using sender output notes.
+    async fn chunk_from_rows(
+        &self,
+        rows: &[PublicTxidTransaction],
+        sender_candidate: Option<&SenderTransactionCandidate>,
+        cached_transactions: &[Transaction],
+    ) -> Result<RecoveryChunk, RecoveryFailure> {
+        build_output_poi_recovery_chunk_from_public_rows(
+            self.candidate,
+            self.wallet_nullifiers,
+            rows,
+            sender_candidate,
+            cached_transactions,
+            &self.request.forest,
+            self.required_poi_list_keys,
+            self.spending_public_key,
+            &self.request.cfg.scan_keys,
+        )
+        .await
+    }
+
+    /// Whether missing sender output notes may be recovered by replaying the source block.
+    fn sender_notes_replayable(&self, failure: &RecoveryFailure) -> bool {
+        failure.category == "sender_output_notes_unavailable"
+            && self
+                .wallet_nullifiers
+                .wallet_utxos
+                .iter()
+                .any(|input| input.spent.as_ref() == Some(&self.candidate.utxo.source))
+    }
+
+    /// Rebuilds the chunk from sender notes replayed from the source block, fenced to its epoch.
+    async fn replay_sender_chunk(
+        &self,
+        rows: &[PublicTxidTransaction],
+        cached_transactions: &[Transaction],
+        public_epoch: PublicDataPlaneEpoch,
+        failure: RecoveryFailure,
+    ) -> Result<RecoveryChunk, RecoveryFailure> {
+        let request = self.request;
+        let source_rows = match request
+            .public_data_plane
+            .output_poi_source_block_rows(self.candidate.utxo.source.block_number)
+            .await
+        {
+            Ok(crate::chain::PublicScanRowsAnswer::Rows(source_rows)) => source_rows,
+            Ok(_) => {
+                return Err(sender_replay_failure(
+                    "sender_source_rows_unavailable",
+                    "sender output source block is not available in public artifacts",
+                ));
+            }
+            Err(_) => {
+                return Err(sender_replay_failure(
+                    "sender_source_rows_fetch_failed",
+                    "sender output source block could not be loaded from public artifacts",
+                ));
+            }
+        };
+        if request.authority.revalidate().is_err()
+            || !self.source_rows_cover_epoch(&source_rows, public_epoch)
+        {
+            return Err(sender_replay_failure(
+                "sender_source_rows_stale",
+                "sender output source block changed while reconstructing recovery notes",
+            ));
+        }
+        let Some(sender) = self.replayed_sender(&source_rows) else {
+            return Err(failure);
+        };
+        let mut chunk = self
+            .chunk_from_rows(rows, Some(&sender), cached_transactions)
+            .await?;
+        chunk.replay_fence = Some(
+            crate::wallet::saved_poi_compatibility::SenderCandidateReplayFence {
+                public_data_plane: request.public_data_plane.clone(),
+                epoch: public_epoch,
+            },
+        );
+        Ok(chunk)
+    }
+
+    /// Whether the source rows cover the candidate's block and the public epoch is unchanged.
+    fn source_rows_cover_epoch(
+        &self,
+        source_rows: &PublicScanRows,
+        public_epoch: PublicDataPlaneEpoch,
+    ) -> bool {
+        let block = self.candidate.utxo.source.block_number;
+        source_rows.range.from_block <= block
+            && block <= source_rows.range.to_block
+            && source_rows.epoch == public_epoch
+            && self.request.public_data_plane.current_epoch() == public_epoch
+    }
+
+    /// Returns the single sender candidate replayed from the source rows for the candidate.
+    fn replayed_sender(&self, source_rows: &PublicScanRows) -> Option<SenderTransactionCandidate> {
+        let request = self.request;
+        let delta =
+            crate::wallet::WalletLogDelta::from_rows(&source_rows.rows, &request.cfg.scan_keys);
+        let nullifiers = delta
+            .nullifiers
+            .into_iter()
+            .map(|spent| ((spent.tree, spent.nullifier), spent.source))
+            .collect();
+        let candidates = crate::wallet::delta::sender_scan_candidate_inputs(
+            self.wallet_nullifiers.wallet_utxos,
+            request.cfg.scan_keys.nullifying_key,
+            &nullifiers,
+            delta.sender_scan_outputs,
+            &request.cfg.scan_keys,
+        );
+        let mut candidates = candidates
+            .into_iter()
+            .filter(|sender| sender.source == self.candidate.utxo.source);
+        let sender = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        sender
+            .into_record(request.cfg.chain.chain_id, request.cfg.cache_key.clone())
+            .ok()
+    }
+
+    /// Preflights local POI proofs for the chunk's inputs when a local proof source is ready.
+    async fn preflight_local_proofs(
+        &self,
+        recovery_chunk: &RecoveryChunk,
+    ) -> Result<(), RecoveryFailure> {
+        let request = self.request;
+        if let Some((local_proof_source, ..)) = request
+            .local_proof_source_if_ready(self.required_poi_list_keys)
+            .await
+        {
+            let preflight_started = Instant::now();
+            match preflight_local_recovery_chunk_input_proofs(
+                Some(&local_proof_source),
+                request.cfg,
+                recovery_chunk,
+                self.required_poi_list_keys,
+            )
+            .await
+            {
+                Ok(()) => {
+                    debug!(
+                        chain_id = request.cfg.chain.chain_id,
+                        preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
+                        candidate_elapsed_ms = self.candidate_started.elapsed().as_millis(),
+                        "output POI recovery local proof preflight complete"
+                    );
+                }
+                Err(failure) => {
+                    warn!(
+                        chain_id = request.cfg.chain.chain_id,
+                        preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
+                        candidate_elapsed_ms = self.candidate_started.elapsed().as_millis(),
+                        "output POI recovery local proof preflight failed"
+                    );
+                    return Err(failure);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builds a retryable sender-replay failure with the given category and message.
+fn sender_replay_failure(category: &'static str, message: &'static str) -> RecoveryFailure {
+    RecoveryFailure::retryable_category(
+        OutputPoiRecoveryStatus::TxFetchFailed,
+        category,
+        message,
+        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    )
 }
 
 pub(in crate::wallet) fn decode_railgun_transactions(
