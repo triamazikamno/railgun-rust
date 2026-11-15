@@ -3,7 +3,8 @@ use railgun_wallet::Utxo;
 use crate::wallet::handle::WalletPrivateViewTicket;
 
 use super::{
-    Arc, CancellationToken, ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore, FixedBytes,
+    AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, Arc, CancellationToken,
+    ChainPoiSubmitterHandle, ChainPublicDataPlane, DbStore, FixedBytes, FuturesUnordered,
     PendingOutputPoiContextIntent, RwLock, WalletActorState, WalletBackfillRejectReason,
     WalletCacheStore, WalletConfig, WalletHandle, WalletPendingSpentMarkOutcome,
     WalletPersistState, WalletPoiRefreshSelection, WalletPoiRuntime,
@@ -30,6 +31,9 @@ pub(super) struct WalletActorLoop<'a> {
     pub(super) last_scanned: u64,
     pub(super) db: Arc<DbStore>,
     pub(super) poi_submitter: ChainPoiSubmitterHandle,
+    /// Accepted jobs whose owners the actor watches so it can retire them.
+    pub(super) accepted_backfill_liveness: FuturesUnordered<AcceptedBackfillOwnerDropped>,
+    pub(super) accepted_indexed_job_liveness: FuturesUnordered<AcceptedIndexedJobOwnerDropped>,
 }
 
 impl WalletActorLoop<'_> {

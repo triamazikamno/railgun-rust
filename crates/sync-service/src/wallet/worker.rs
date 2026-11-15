@@ -57,9 +57,10 @@ mod poi_maintenance;
 
 use actor_loop::WalletActorLoop;
 use commit::{
-    WALLET_RESET_RETRY_INTERVAL, WalletBackfillDoneOutcome, WalletPoiStatusRefreshCommitRequest,
-    WalletResetCommitOutcome, WalletResetCommitRequest, WalletResetRewindOutcome,
-    WalletScanCommitRequest, accepted_backfill_owner_dropped, accepted_indexed_job_owner_dropped,
+    AcceptedBackfillOwnerDropped, AcceptedIndexedJobOwnerDropped, WALLET_RESET_RETRY_INTERVAL,
+    WalletBackfillDoneOutcome, WalletPoiStatusRefreshCommitRequest, WalletResetCommitOutcome,
+    WalletResetCommitRequest, WalletResetRewindOutcome, WalletScanCommitRequest,
+    accepted_backfill_owner_dropped, accepted_indexed_job_owner_dropped,
     persist_wallet_reset_acceptance_with_token, persist_wallet_reset_replay_admission_with_token,
     reset_replay_from_block, reset_result_after_accept, signal_restored_reset_attempt,
     validate_restored_pending_reset,
@@ -415,9 +416,9 @@ pub(crate) async fn prepare_wallet_worker(
             last_scanned,
             db,
             poi_submitter,
+            accepted_backfill_liveness: FuturesUnordered::new(),
+            accepted_indexed_job_liveness: FuturesUnordered::new(),
         };
-        let mut accepted_backfill_liveness = FuturesUnordered::new();
-        let mut accepted_indexed_job_liveness = FuturesUnordered::new();
         macro_rules! try_drive_pending_reset {
             ($admit_replay:expr) => {{
                 if let Some(pending) = actor.actor_state.pending_reset() {
@@ -482,7 +483,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 true
                             } else {
                                 let (liveness, receiver) = oneshot::channel();
-                                accepted_backfill_liveness
+                                actor.accepted_backfill_liveness
                                     .push(accepted_backfill_owner_dropped(token, receiver));
                                 let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                     token,
@@ -883,7 +884,7 @@ pub(crate) async fn prepare_wallet_worker(
                         debug!(%error, cache_key = %actor.cfg.cache_key, "local pending-spend expiry skipped");
                     }
                 }
-                Some((token, signal)) = accepted_backfill_liveness.next(), if !accepted_backfill_liveness.is_empty() => {
+                Some((token, signal)) = actor.accepted_backfill_liveness.next(), if !actor.accepted_backfill_liveness.is_empty() => {
                     let WalletBackfillOwnerSignal {
                         disposition,
                         acknowledgement,
@@ -979,7 +980,7 @@ pub(crate) async fn prepare_wallet_worker(
                         let _ = acknowledgement.send(());
                     }
                 }
-                Some(token) = accepted_indexed_job_liveness.next(), if !accepted_indexed_job_liveness.is_empty() => {
+                Some(token) = actor.accepted_indexed_job_liveness.next(), if !actor.accepted_indexed_job_liveness.is_empty() => {
                     let retired = actor.actor_state
                         .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                             state.retire_job(token)
@@ -1315,7 +1316,7 @@ pub(crate) async fn prepare_wallet_worker(
                                         .unwrap_or(false);
                                     let lease = if accepted {
                                         let (liveness, receiver) = oneshot::channel();
-                                        accepted_indexed_job_liveness
+                                        actor.accepted_indexed_job_liveness
                                             .push(accepted_indexed_job_owner_dropped(token, receiver));
                                         Some(WalletIndexedCatchUpLease::for_actor_accepted_job(
                                             token,
@@ -1793,7 +1794,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 continue;
                             }
                             let (liveness, receiver) = oneshot::channel();
-                            accepted_backfill_liveness
+                            actor.accepted_backfill_liveness
                                 .push(accepted_backfill_owner_dropped(token, receiver));
                             let lease = WalletSyncTargetLease::for_actor_accepted_job(
                                 token,
@@ -1848,7 +1849,7 @@ pub(crate) async fn prepare_wallet_worker(
                                 continue;
                             }
                             let (liveness, receiver) = oneshot::channel();
-                            accepted_backfill_liveness
+                            actor.accepted_backfill_liveness
                                 .push(accepted_backfill_owner_dropped(token, receiver));
                             backfill_complete_block = None;
                             let result = WalletBackfillStartResult::Accepted {
@@ -2234,8 +2235,8 @@ pub(crate) async fn prepare_wallet_worker(
                             });
                             match accept_result {
                                 Ok(Ok(())) => {
-                                    accepted_backfill_liveness.clear();
-                                    accepted_indexed_job_liveness.clear();
+                                    actor.accepted_backfill_liveness.clear();
+                                    actor.accepted_indexed_job_liveness.clear();
                                     pending_output_poi_tentative_attempts.clear();
                                 }
                                 Ok(Err(err)) => {
@@ -2305,7 +2306,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     continue;
                                 }
                                 let (liveness, receiver) = oneshot::channel();
-                                accepted_backfill_liveness
+                                actor.accepted_backfill_liveness
                                     .push(accepted_backfill_owner_dropped(token, receiver));
                                 let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                     token,
@@ -2427,7 +2428,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     // Keep the accepted live job as the owner of its exact failed
                                     // range and let the normal backfill loop apply persistence backoff.
                                     let (liveness, receiver) = oneshot::channel();
-                                    accepted_backfill_liveness.push(
+                                    actor.accepted_backfill_liveness.push(
                                         accepted_backfill_owner_dropped(live_token, receiver),
                                     );
                                     let driver = WalletBackfillGrant::for_actor_accepted_job_with_cancel(

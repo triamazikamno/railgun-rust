@@ -1,5 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use std::pin::Pin;
 
 pub(super) struct WalletScanCommitRequest<'a> {
     pub(super) cache_store: &'a dyn WalletCacheStore,
@@ -223,23 +224,37 @@ pub(super) fn persist_wallet_reset_acceptance_with_token(
     cache_store.put_wallet_sync_actor_state(WalletSyncActorStateCommit::new(token, permit, &state))
 }
 
-pub(super) async fn accepted_backfill_owner_dropped(
+/// Resolves when an accepted backfill job's owner reports back or goes away.
+/// Boxed so the actor loop can hold these futures in a named collection, and
+/// `Sync` so the actor loop stays `Sync` for its `&self` handlers.
+pub(super) type AcceptedBackfillOwnerDropped =
+    Pin<Box<dyn Future<Output = (WalletSyncToken, WalletBackfillOwnerSignal)> + Send + Sync>>;
+
+/// Resolves when an accepted indexed catch-up job's owner goes away.
+pub(super) type AcceptedIndexedJobOwnerDropped =
+    Pin<Box<dyn Future<Output = WalletSyncToken> + Send + Sync>>;
+
+pub(super) fn accepted_backfill_owner_dropped(
     token: WalletSyncToken,
     receiver: oneshot::Receiver<WalletBackfillOwnerSignal>,
-) -> (WalletSyncToken, WalletBackfillOwnerSignal) {
-    let signal = receiver.await.unwrap_or(WalletBackfillOwnerSignal {
-        disposition: WalletBackfillOwnerDisposition::DriverLost,
-        acknowledgement: None,
-    });
-    (token, signal)
+) -> AcceptedBackfillOwnerDropped {
+    Box::pin(async move {
+        let signal = receiver.await.unwrap_or(WalletBackfillOwnerSignal {
+            disposition: WalletBackfillOwnerDisposition::DriverLost,
+            acknowledgement: None,
+        });
+        (token, signal)
+    })
 }
 
-pub(super) async fn accepted_indexed_job_owner_dropped(
+pub(super) fn accepted_indexed_job_owner_dropped(
     token: WalletSyncToken,
     receiver: oneshot::Receiver<()>,
-) -> WalletSyncToken {
-    let _ = receiver.await;
-    token
+) -> AcceptedIndexedJobOwnerDropped {
+    Box::pin(async move {
+        let _ = receiver.await;
+        token
+    })
 }
 
 impl WalletPoiRuntime {
