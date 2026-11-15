@@ -1,9 +1,9 @@
 //! The wallet backfill loop, which runs queued RPC backfill and cached scan acquisitions.
 
 use crate::chain::{
-    PublicDataPlaneDiagnosticKind, PublicScanRange, WalletBackfill, WalletBackfillApplyResult,
-    WalletBackfillDriver, WalletBackfillFinishResult, WalletBackfillRejectReason,
-    WalletIndexedTailFallbackResult, WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome,
+    PublicDataPlaneDiagnosticKind, PublicScanRange, WalletBackfill, WalletBackfillDriver,
+    WalletBackfillFinishResult, WalletBackfillRejectReason, WalletIndexedTailFallbackResult,
+    WalletScanAcquisitionCandidate, WalletScanAcquisitionOutcome,
 };
 
 use super::{
@@ -695,68 +695,19 @@ impl BackfillLoop {
                             let _ = retire_cancelled_backfill_cursor(&mut self.cursor).await;
                             continue;
                         };
-                        let mut remove_cursor = false;
-                        if let Some(slot) = self.cursor.as_mut() {
-                            let cursor = &mut slot.cursor;
-                            if let Some(committed_to) = apply_result.accepted_committed_to() {
-                                match apply_result {
-                                    WalletBackfillApplyResult::Committed { .. } => cursor
-                                        .mark_progress(
-                                            committed_to.saturating_add(1),
-                                            Instant::now(),
-                                        ),
-                                    WalletBackfillApplyResult::AlreadyCovered { .. } => cursor
-                                        .mark_already_covered(
-                                            committed_to.saturating_add(1),
-                                            Instant::now(),
-                                        ),
-                                    WalletBackfillApplyResult::Rejected { .. } => unreachable!(),
+                        let remove_cursor = match self.cursor.as_mut() {
+                            Some(slot) => {
+                                if apply_result.accepted_committed_to().is_none() {
+                                    warn!(?apply_result, cache_key = %key, "wallet backfill logs rejected");
                                 }
-                                cursor.refresh_target(latest_safe_head);
-                            } else {
-                                warn!(?apply_result, cache_key = %key, "wallet backfill logs rejected");
-                                match apply_result {
-                                    WalletBackfillApplyResult::Rejected {
-                                        reason:
-                                            WalletBackfillRejectReason::NonContiguous {
-                                                expected_from,
-                                                ..
-                                            },
-                                        ..
-                                    } => {
-                                        cursor.mark_progress(expected_from, Instant::now());
-                                    }
-                                    WalletBackfillApplyResult::Rejected {
-                                        committed_to,
-                                        reason: WalletBackfillRejectReason::PersistenceFailed,
-                                    } => {
-                                        cursor.retry_after_rejected_apply(committed_to);
-                                        cursor.defer_persistence_retry(
-                                            Instant::now(),
-                                            self.service.chain.sync.poll_interval,
-                                        );
-                                    }
-                                    WalletBackfillApplyResult::Rejected {
-                                        reason:
-                                            WalletBackfillRejectReason::StaleGeneration { .. }
-                                            | WalletBackfillRejectReason::Shutdown,
-                                        ..
-                                    } => {
-                                        remove_cursor = true;
-                                    }
-                                    WalletBackfillApplyResult::Rejected {
-                                        reason:
-                                            WalletBackfillRejectReason::StaleDataPlaneEpoch { .. },
-                                        ..
-                                    } => {
-                                        cursor.restore_retained_acquisition();
-                                    }
-                                    WalletBackfillApplyResult::Rejected { .. }
-                                    | WalletBackfillApplyResult::Committed { .. }
-                                    | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
-                                }
+                                slot.cursor.record_apply_result(
+                                    &apply_result,
+                                    latest_safe_head,
+                                    self.service.chain.sync.poll_interval,
+                                )
                             }
-                        }
+                            None => false,
+                        };
                         if remove_cursor && let Some(slot) = self.cursor.take() {
                             slot.cursor.driver.retire(&key).await;
                         }
@@ -880,55 +831,19 @@ async fn apply_cached_backfill_row(
             .driver
             .apply(&key, apply)
             .await;
-        let mut remove_cursor = false;
-        if let Some(slot) = cursor.as_mut() {
-            let cursor = &mut slot.cursor;
-            if let Some(committed_to) = apply_result.accepted_committed_to() {
-                match apply_result {
-                    WalletBackfillApplyResult::Committed { .. } => {
-                        cursor.mark_progress(committed_to.saturating_add(1), Instant::now());
-                    }
-                    WalletBackfillApplyResult::AlreadyCovered { .. } => {
-                        cursor.mark_already_covered(committed_to.saturating_add(1), Instant::now());
-                    }
-                    WalletBackfillApplyResult::Rejected { .. } => unreachable!(),
+        let remove_cursor = match cursor.as_mut() {
+            Some(slot) => {
+                if apply_result.accepted_committed_to().is_none() {
+                    warn!(?apply_result, cache_key = %key, "cached wallet backfill rows rejected");
                 }
-                cursor.refresh_target(safe_head);
-            } else {
-                warn!(?apply_result, cache_key = %key, "cached wallet backfill rows rejected");
-                match apply_result {
-                    WalletBackfillApplyResult::Rejected {
-                        reason: WalletBackfillRejectReason::NonContiguous { expected_from, .. },
-                        ..
-                    } => cursor.mark_progress(expected_from, Instant::now()),
-                    WalletBackfillApplyResult::Rejected {
-                        committed_to,
-                        reason: WalletBackfillRejectReason::PersistenceFailed,
-                    } => {
-                        cursor.retry_after_rejected_apply(committed_to);
-                        cursor.defer_persistence_retry(
-                            Instant::now(),
-                            service.chain.sync.poll_interval,
-                        );
-                    }
-                    WalletBackfillApplyResult::Rejected {
-                        reason:
-                            WalletBackfillRejectReason::StaleGeneration { .. }
-                            | WalletBackfillRejectReason::Shutdown,
-                        ..
-                    } => remove_cursor = true,
-                    WalletBackfillApplyResult::Rejected {
-                        reason: WalletBackfillRejectReason::StaleDataPlaneEpoch { .. },
-                        ..
-                    } => {
-                        cursor.restore_retained_acquisition();
-                    }
-                    WalletBackfillApplyResult::Rejected { .. }
-                    | WalletBackfillApplyResult::Committed { .. }
-                    | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
-                }
+                slot.cursor.record_apply_result(
+                    &apply_result,
+                    safe_head,
+                    service.chain.sync.poll_interval,
+                )
             }
-        }
+            None => false,
+        };
         if remove_cursor && let Some(slot) = cursor.take() {
             slot.cursor.driver.retire(&key).await;
         }

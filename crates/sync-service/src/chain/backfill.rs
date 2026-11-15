@@ -8,9 +8,10 @@ use super::{
     DynProvider, FixedBytes, ForestMetaCheck, ForestReorgDecision, HashMap, HashSet, Instant, Log,
     LogRangeFetch, LogSpanEndpoint, MerkleForest, MerkleForestDbExt, MerkleForestSnapshot,
     Ordering, Path, PersistError, Provider, ProviderHandle, SNAPSHOT_VERSION, SharedLogBatch,
-    WalletBackfillDriver, WalletResetReplayPlan, anchor_file_name, build_provider_with_http_client,
-    debug, fetch_logs_for_range_with_provider, info, parse_anchor_block,
-    wallet_reorg_backfill_from_block, wallet_sync_target, warn,
+    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillRejectReason,
+    WalletResetReplayPlan, anchor_file_name, build_provider_with_http_client, debug,
+    fetch_logs_for_range_with_provider, info, parse_anchor_block, wallet_reorg_backfill_from_block,
+    wallet_sync_target, warn,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -253,6 +254,59 @@ impl WalletBackfill {
         let delay = base_delay.saturating_mul(multiplier).min(max_delay);
         let retry_at = now.checked_add(delay).unwrap_or(now);
         self.run_state = WalletBackfillRunState::PersistenceBackoff { attempt, retry_at };
+    }
+
+    /// Moves the cursor on after the wallet answered an apply: an accepted result advances it
+    /// and refreshes the target to `safe_head`; a rejection rebases, backs off or restores the
+    /// retained acquisition. Returns whether the cursor must be removed.
+    pub(super) fn record_apply_result(
+        &mut self,
+        result: &WalletBackfillApplyResult,
+        safe_head: u64,
+        poll_interval: Duration,
+    ) -> bool {
+        if let Some(committed_to) = result.accepted_committed_to() {
+            match result {
+                WalletBackfillApplyResult::Committed { .. } => {
+                    self.mark_progress(committed_to.saturating_add(1), Instant::now());
+                }
+                WalletBackfillApplyResult::AlreadyCovered { .. } => {
+                    self.mark_already_covered(committed_to.saturating_add(1), Instant::now());
+                }
+                WalletBackfillApplyResult::Rejected { .. } => unreachable!(),
+            }
+            self.refresh_target(safe_head);
+            return false;
+        }
+        match *result {
+            WalletBackfillApplyResult::Rejected {
+                reason: WalletBackfillRejectReason::NonContiguous { expected_from, .. },
+                ..
+            } => self.mark_progress(expected_from, Instant::now()),
+            WalletBackfillApplyResult::Rejected {
+                committed_to,
+                reason: WalletBackfillRejectReason::PersistenceFailed,
+            } => {
+                self.retry_after_rejected_apply(committed_to);
+                self.defer_persistence_retry(Instant::now(), poll_interval);
+            }
+            WalletBackfillApplyResult::Rejected {
+                reason:
+                    WalletBackfillRejectReason::StaleGeneration { .. }
+                    | WalletBackfillRejectReason::Shutdown,
+                ..
+            } => return true,
+            WalletBackfillApplyResult::Rejected {
+                reason: WalletBackfillRejectReason::StaleDataPlaneEpoch { .. },
+                ..
+            } => {
+                self.restore_retained_acquisition();
+            }
+            WalletBackfillApplyResult::Rejected { .. }
+            | WalletBackfillApplyResult::Committed { .. }
+            | WalletBackfillApplyResult::AlreadyCovered { .. } => {}
+        }
+        false
     }
 
     pub(super) const fn mark_indexed_tail_attempt(&mut self, now: Instant) {
