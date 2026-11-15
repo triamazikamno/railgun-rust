@@ -49,11 +49,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use tokio::task::{JoinHandle, JoinSet};
 
+mod actor_loop;
 mod commit;
 mod local_pending_spent;
 mod output_poi;
 mod poi_maintenance;
 
+use actor_loop::WalletActorLoop;
 use commit::{
     WALLET_RESET_RETRY_INTERVAL, WalletBackfillDoneOutcome, WalletPoiStatusRefreshCommitRequest,
     WalletResetCommitOutcome, WalletResetCommitRequest, WalletResetRewindOutcome,
@@ -356,7 +358,7 @@ pub(crate) async fn prepare_wallet_worker(
     let actor_worker = tokio::spawn(async move {
         let mut startup_replay_tx = startup_replay_tx;
         let worker_started = Instant::now();
-        let mut last_scanned = initial_last_scanned;
+        let last_scanned = initial_last_scanned;
         let snapshot = utxos.read().await;
         let (unspent, spent) = wallet_utxo_counts(&snapshot);
         info!(
@@ -371,7 +373,7 @@ pub(crate) async fn prepare_wallet_worker(
 
         let mut backfill_complete_block: Option<u64> = None;
         let mut live_receiver_lagged = false;
-        let mut persist_state = WalletPersistState::default();
+        let persist_state = WalletPersistState::default();
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = Some(poi_runtime.public_client());
         let mut pending_reset_retry = tokio::time::interval_at(
@@ -399,76 +401,44 @@ pub(crate) async fn prepare_wallet_worker(
         // Tentative attempts are actor-lifetime only; safe-head maintenance never consults this set.
         let mut pending_output_poi_tentative_attempts =
             PendingOutputPoiTentativeAttemptTracker::default();
-        let mut actor_state = actor_state;
+        let mut actor = WalletActorLoop {
+            cfg,
+            cache_store,
+            utxos,
+            worker_handle,
+            cancel,
+            poi_runtime: &poi_runtime,
+            public_data_plane,
+            active_poi_list_keys,
+            actor_state,
+            persist_state,
+            last_scanned,
+        };
         let mut accepted_backfill_liveness = FuturesUnordered::new();
         let mut accepted_indexed_job_liveness = FuturesUnordered::new();
-        macro_rules! commit_local_poi_status_refresh {
-            ($selection:expr) => {{
-                let selection = $selection;
-                let reset_generation = actor_state.reset_generation();
-                let refresh_needed = {
-                    let locked = utxos.read().await;
-                    actor_state.has_failed_poi_status_refresh(reset_generation, selection)
-                        || wallet_poi_status_refresh_needed_for_selection(
-                            &locked,
-                            &active_poi_list_keys,
-                            selection,
-                        )
-                };
-                if refresh_needed {
-                    if let Some(status_reader) = poi_runtime
-                        .local_status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
-                        .await
-                    {
-                        Some(
-                            (WalletPoiStatusRefreshCommitRequest {
-                                cache_store: cache_store.as_ref(),
-                                cfg: &cfg,
-                                utxos: &utxos,
-                                worker_handle: &worker_handle,
-                                last_scanned,
-                                reset_generation,
-                                actor_state: &mut actor_state,
-                                persist_state: &mut persist_state,
-                                status_reader: &status_reader,
-                                active_poi_list_keys: &active_poi_list_keys,
-                                selection,
-                                cancel: &cancel,
-                            })
-                            .commit()
-                            .await,
-                        )
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }};
-        }
         macro_rules! try_drive_pending_reset {
             ($admit_replay:expr) => {{
-                if let Some(pending) = actor_state.pending_reset() {
-                    let rewind_was_pending = !actor_state.pending_reset_rewind_committed();
-                    let outcome = if actor_state.pending_reset_rewind_committed() {
+                if let Some(pending) = actor.actor_state.pending_reset() {
+                    let rewind_was_pending = !actor.actor_state.pending_reset_rewind_committed();
+                    let outcome = if actor.actor_state.pending_reset_rewind_committed() {
                         WalletResetCommitOutcome {
                             rewind: WalletResetRewindOutcome::Committed {
-                                committed_to: last_scanned,
+                                committed_to: actor.last_scanned,
                             },
                         }
                     } else {
                         WalletResetCommitRequest {
-                            cache_store: cache_store.as_ref(),
-                            cfg: &cfg,
-                            utxos: &utxos,
-                            worker_handle: &worker_handle,
+                            cache_store: actor.cache_store.as_ref(),
+                            cfg: &actor.cfg,
+                            utxos: &actor.utxos,
+                            worker_handle: &actor.worker_handle,
                             pending,
-                            highest_accepted_reset_intent: actor_state
+                            highest_accepted_reset_intent: actor.actor_state
                                 .highest_accepted_reset_intent(),
-                            actor_state: &mut actor_state,
-                            cancel: &cancel,
-                            last_scanned: &mut last_scanned,
-                            persist_state: &mut persist_state,
+                            actor_state: &mut actor.actor_state,
+                            cancel: &actor.cancel,
+                            last_scanned: &mut actor.last_scanned,
+                            persist_state: &mut actor.persist_state,
                             live_metadata_flush: &mut live_metadata_flush,
                         }
                         .commit()
@@ -481,14 +451,14 @@ pub(crate) async fn prepare_wallet_worker(
                             live_rx = live_rx.resubscribe();
                         }
 
-                        if $admit_replay && actor_state.pending_reset_replay_admitted().is_none() {
+                        if $admit_replay && actor.actor_state.pending_reset_replay_admitted().is_none() {
                             let replay_plan = pending.replay_plan();
                             let replay_from =
-                                reset_replay_from_block(last_scanned, replay_plan.start_block);
+                                reset_replay_from_block(actor.last_scanned, replay_plan.start_block);
                             let token =
-                                worker_handle.mint_sync_token(actor_state.reset_generation());
-                            let accepted = actor_state
-                                .transition_active(&worker_handle, &cancel, |mut state| {
+                                actor.worker_handle.mint_sync_token(actor.actor_state.reset_generation());
+                            let accepted = actor.actor_state
+                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                     let accepted = state.accept_target(
                                         token,
                                         replay_plan.target_block,
@@ -501,12 +471,12 @@ pub(crate) async fn prepare_wallet_worker(
                             } else if replay_plan.target_block > 0
                                 && replay_from > replay_plan.target_block
                             {
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| state.complete_backfill_job(token),
                                 );
-                                backfill_complete_block = actor_state.completed_target_block();
+                                backfill_complete_block = actor.actor_state.completed_target_block();
                                 true
                             } else {
                                 let (liveness, receiver) = oneshot::channel();
@@ -516,11 +486,11 @@ pub(crate) async fn prepare_wallet_worker(
                                     token,
                                     backfill_sender.clone(),
                                     liveness,
-                                    cancel.clone(),
+                                    actor.cancel.clone(),
                                 )
                                 .activate();
                                 let request = BackfillRequest::add(
-                                    cfg.cache_key.clone(),
+                                    actor.cfg.cache_key.clone(),
                                     replay_from,
                                     replay_plan.target_block,
                                     replay_plan.follow_safe_head,
@@ -529,18 +499,18 @@ pub(crate) async fn prepare_wallet_worker(
                                 );
                                 match backfill_tx.try_send(request) {
                                     Ok(()) => {
-                                        let _ = actor_state.transition_active(
-                                            &worker_handle,
-                                            &cancel,
+                                        let _ = actor.actor_state.transition_active(
+                                            &actor.worker_handle,
+                                            &actor.cancel,
                                             |mut state| state.backfill_dispatch_admitted(token),
                                         );
                                         true
                                     }
                                     Err(err) => {
-                                        warn!(?err, cache_key = %cfg.cache_key, replay_from, target_block = replay_plan.target_block, "wallet reset replay enqueue failed");
-                                        let _ = actor_state.transition_active(
-                                            &worker_handle,
-                                            &cancel,
+                                        warn!(?err, cache_key = %actor.cfg.cache_key, replay_from, target_block = replay_plan.target_block, "wallet reset replay enqueue failed");
+                                        let _ = actor.actor_state.transition_active(
+                                            &actor.worker_handle,
+                                            &actor.cancel,
                                             |mut state| {
                                                 state.fail_job_backfill_unavailable(token);
                                             },
@@ -549,9 +519,9 @@ pub(crate) async fn prepare_wallet_worker(
                                     }
                                 }
                             };
-                            let _ = actor_state.transition_active(
-                                &worker_handle,
-                                &cancel,
+                            let _ = actor.actor_state.transition_active(
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 |mut state| {
                                     state.set_pending_reset_replay_admitted(
                                         admitted.then_some((token, replay_from)),
@@ -560,11 +530,11 @@ pub(crate) async fn prepare_wallet_worker(
                             );
                         }
 
-                        if $admit_replay && actor_state.pending_reset_replay_admitted().is_some() {
+                        if $admit_replay && actor.actor_state.pending_reset_replay_admitted().is_some() {
                             let authority = WalletPrivateMutationAuthority::new(
-                                &worker_handle,
-                                actor_state.reset_generation(),
-                                &cancel,
+                                &actor.worker_handle,
+                                actor.actor_state.reset_generation(),
+                                &actor.cancel,
                             );
                             match authority.acquire().await {
                                 Ok(permit) => {
@@ -572,11 +542,11 @@ pub(crate) async fn prepare_wallet_worker(
                                         persist_wallet_reset_replay_admission_with_token(
                                             &token,
                                             &permit,
-                                            cache_store.as_ref(),
-                                            &cfg,
-                                            actor_state.highest_accepted_reset_intent(),
+                                            actor.cache_store.as_ref(),
+                                            &actor.cfg,
+                                            actor.actor_state.highest_accepted_reset_intent(),
                                         )?;
-                                        actor_state.transition(&token, |mut state| {
+                                        actor.actor_state.transition(&token, |mut state| {
                                             state.durable_reset_replay_commit_ok(
                                                 pending.intent_id(),
                                             );
@@ -587,9 +557,9 @@ pub(crate) async fn prepare_wallet_worker(
                                     match persist_result {
                                         Ok(Ok(())) => {}
                                         Ok(Err(err)) => {
-                                            warn!(?err, cache_key = %cfg.cache_key, intent_id = pending.intent_id(), "failed to retire durable wallet reset replay plan");
+                                            warn!(?err, cache_key = %actor.cfg.cache_key, intent_id = pending.intent_id(), "failed to retire durable wallet reset replay plan");
                                             let _ = permit.with_active_apply(|token| {
-                                                actor_state.transition(&token, |mut state| {
+                                                actor.actor_state.transition(&token, |mut state| {
                                                     state.reset_replay_persist_failed(
                                                         pending.intent_id(),
                                                     );
@@ -597,12 +567,12 @@ pub(crate) async fn prepare_wallet_worker(
                                             });
                                         }
                                         Err(reason) => {
-                                            debug!(?reason, cache_key = %cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement rejected");
+                                            debug!(?reason, cache_key = %actor.cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement rejected");
                                         }
                                     }
                                 }
                                 Err(reason) => {
-                                    debug!(?reason, cache_key = %cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement skipped");
+                                    debug!(?reason, cache_key = %actor.cfg.cache_key, intent_id = pending.intent_id(), "wallet reset replay-plan retirement skipped");
                                 }
                             }
                         }
@@ -617,42 +587,42 @@ pub(crate) async fn prepare_wallet_worker(
             ($last_block:expr, $token:expr) => {{
                 let last_block = $last_block;
                 let job_token = $token;
-                let current_reset_generation = actor_state.reset_generation();
-                let should_persist = persist_state.needs_full_persist
-                    || persist_state.pending_cache_reset.is_some();
+                let current_reset_generation = actor.actor_state.reset_generation();
+                let should_persist = actor.persist_state.needs_full_persist
+                    || actor.persist_state.pending_cache_reset.is_some();
                 let authority = WalletPrivateMutationAuthority::new(
-                    &worker_handle,
+                    &actor.worker_handle,
                     current_reset_generation,
-                    &cancel,
+                    &actor.cancel,
                 );
-                let snapshot = utxos.read().await;
+                let snapshot = actor.utxos.read().await;
                 let persist_result = if should_persist {
                     match authority.acquire().await {
                         Ok(permit) => {
-                            let persisted = match persist_state.persist_progress(
-                                cache_store.as_ref(),
+                            let persisted = match actor.persist_state.persist_progress(
+                                actor.cache_store.as_ref(),
                                 &permit,
                                 WalletProgressPersist {
-                                    cache_key: &cfg.cache_key,
+                                    cache_key: &actor.cfg.cache_key,
                                     snapshot: &snapshot,
-                                    last_scanned,
+                                    last_scanned: actor.last_scanned,
                                     checkpoint: WalletCheckpointMutation::Preserve,
                                     changed: false,
                                 },
                             ) {
                                 Ok(_) => {
-                                    live_metadata_flush.mark_persisted(last_scanned, Instant::now());
+                                    live_metadata_flush.mark_persisted(actor.last_scanned, Instant::now());
                                     Ok(())
                                 }
                                 Err(err) => {
-                                    warn!(?err, cache_key = %cfg.cache_key, "failed to update wallet cache metadata");
+                                    warn!(?err, cache_key = %actor.cfg.cache_key, "failed to update wallet cache metadata");
                                     Err(WalletBackfillRejectReason::PersistenceFailed)
                                 }
                             };
                             persisted
                         }
                         Err(reason) => {
-                            warn!(?reason, cache_key = %cfg.cache_key, "wallet target metadata persist rejected");
+                            warn!(?reason, cache_key = %actor.cfg.cache_key, "wallet target metadata persist rejected");
                             Err(reason)
                         }
                     }
@@ -662,9 +632,9 @@ pub(crate) async fn prepare_wallet_worker(
                 drop(snapshot);
                 if let Err(reason) = persist_result {
                     WalletBackfillDoneOutcome::Rejected(reason)
-                } else if let Err(reason) = actor_state.transition_active(
-                    &worker_handle,
-                    &cancel,
+                } else if let Err(reason) = actor.actor_state.transition_active(
+                    &actor.worker_handle,
+                    &actor.cancel,
                     |mut state| state.durable_backfill_completion_commit_ok(job_token),
                 ) {
                     WalletBackfillDoneOutcome::Rejected(reason)
@@ -676,9 +646,9 @@ pub(crate) async fn prepare_wallet_worker(
                 if poi_status_client.is_some() {
                     if let Some(revision_rx) = poi_corpus_revision_rx.as_mut() {
                         let revision = *revision_rx.borrow_and_update();
-                        let _ = actor_state.transition_active(
-                            &worker_handle,
-                            &cancel,
+                        let _ = actor.actor_state.transition_active(
+                            &actor.worker_handle,
+                            &actor.cancel,
                             |mut state| {
                                 state.observe_poi_corpus_revision(
                                     revision != last_poi_corpus_revision,
@@ -698,37 +668,37 @@ pub(crate) async fn prepare_wallet_worker(
                         WalletPoiRefreshSelection::RequiredOrRecoverable
                     };
                     let refresh_needed = {
-                        let locked = utxos.read().await;
-                        actor_state.has_failed_poi_status_refresh(
+                        let locked = actor.utxos.read().await;
+                        actor.actor_state.has_failed_poi_status_refresh(
                             current_reset_generation,
                             pre_ready_selection,
                         ) || wallet_poi_status_refresh_needed_for_selection(
                             &locked,
-                            &active_poi_list_keys,
+                            &actor.active_poi_list_keys,
                             pre_ready_selection,
                         )
                     };
                     if refresh_needed {
                         // Actor-safe: only local corpus (never remote proxy/fallback).
-                        if let Some(status_reader) = poi_runtime
-                            .local_status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                        if let Some(status_reader) = actor.poi_runtime
+                            .local_status_reader(&actor.public_data_plane, &actor.cfg, &actor.active_poi_list_keys)
                             .await
                         {
                             pre_ready_local_cache_available = true;
                             let status_refresh_started = Instant::now();
                             match (WalletPoiStatusRefreshCommitRequest {
-                                cache_store: cache_store.as_ref(),
-                                cfg: &cfg,
-                                utxos: &utxos,
-                                worker_handle: &worker_handle,
-                                last_scanned,
+                                cache_store: actor.cache_store.as_ref(),
+                                cfg: &actor.cfg,
+                                utxos: &actor.utxos,
+                                worker_handle: &actor.worker_handle,
+                                last_scanned: actor.last_scanned,
                                 reset_generation: current_reset_generation,
-                                actor_state: &mut actor_state,
-                                persist_state: &mut persist_state,
+                                actor_state: &mut actor.actor_state,
+                                persist_state: &mut actor.persist_state,
                                 status_reader: &status_reader,
-                                active_poi_list_keys: &active_poi_list_keys,
+                                active_poi_list_keys: &actor.active_poi_list_keys,
                                 selection: pre_ready_selection,
-                                cancel: &cancel,
+                                cancel: &actor.cancel,
                             })
                             .commit()
                             .await
@@ -737,14 +707,14 @@ pub(crate) async fn prepare_wallet_worker(
                                     pre_ready_poi_status_changed = changed;
                                 }
                                 Err(reason) => {
-                                    warn!(?reason, cache_key = %cfg.cache_key, "pre-ready wallet POI status refresh rejected");
+                                    warn!(?reason, cache_key = %actor.cfg.cache_key, "pre-ready wallet POI status refresh rejected");
                                     pre_ready_poi_status_rejection = Some(reason);
                                 }
                             }
                             pre_ready_poi_status_refresh_elapsed_ms =
                                 status_refresh_started.elapsed().as_millis();
                             debug!(
-                                cache_key = %cfg.cache_key,
+                                cache_key = %actor.cfg.cache_key,
                                 changed = pre_ready_poi_status_changed,
                                 status_refresh_elapsed_ms = pre_ready_poi_status_refresh_elapsed_ms,
                                 "pre-ready wallet POI status refresh visible"
@@ -757,9 +727,9 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                     if let Some(revision_rx) = poi_corpus_revision_rx.as_mut() {
                         let revision = *revision_rx.borrow_and_update();
-                        let _ = actor_state.transition_active(
-                            &worker_handle,
-                            &cancel,
+                        let _ = actor.actor_state.transition_active(
+                            &actor.worker_handle,
+                            &actor.cancel,
                             |mut state| {
                                 state.observe_poi_corpus_revision(
                                     revision != last_poi_corpus_revision,
@@ -776,9 +746,9 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                     if pre_ready_poi_status_rejection.is_none() {
                         blocked_shield_refresh_pending = false;
-                        let _ = actor_state.transition_active(
-                            &worker_handle,
-                            &cancel,
+                        let _ = actor.actor_state.transition_active(
+                            &actor.worker_handle,
+                            &actor.cancel,
                             |mut state| state.set_poi_corpus_refresh_pending(false),
                         );
                     }
@@ -788,12 +758,12 @@ pub(crate) async fn prepare_wallet_worker(
                 if let Some(reason) = pre_ready_poi_status_rejection {
                     WalletBackfillDoneOutcome::Rejected(reason)
                 } else {
-                let snapshot = utxos.read().await;
+                let snapshot = actor.utxos.read().await;
                 let (unspent, spent) = wallet_utxo_counts(&snapshot);
                 backfill_complete_block = Some(last_block);
                 info!(
-                    cache_key = %cfg.cache_key,
-                    last_scanned,
+                    cache_key = %actor.cfg.cache_key,
+                    last_scanned = actor.last_scanned,
                     total = snapshot.len(),
                     unspent,
                     spent,
@@ -810,47 +780,47 @@ pub(crate) async fn prepare_wallet_worker(
                 if poi_status_client.is_some() {
                     let post_ready_selection = WalletPoiRefreshSelection::RequiredOrRecoverable;
                     let refresh_needed = {
-                        let locked = utxos.read().await;
-                        actor_state.has_failed_poi_status_refresh(
+                        let locked = actor.utxos.read().await;
+                        actor.actor_state.has_failed_poi_status_refresh(
                             current_reset_generation,
                             post_ready_selection,
                         ) || wallet_poi_status_refresh_needed_for_selection(
                             &locked,
-                            &active_poi_list_keys,
+                            &actor.active_poi_list_keys,
                             post_ready_selection,
                         )
                     };
                     if refresh_needed
-                        && let Some(status_reader) = poi_runtime
-                            .local_status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                        && let Some(status_reader) = actor.poi_runtime
+                            .local_status_reader(&actor.public_data_plane, &actor.cfg, &actor.active_poi_list_keys)
                             .await
                     {
                         match (WalletPoiStatusRefreshCommitRequest {
-                            cache_store: cache_store.as_ref(),
-                            cfg: &cfg,
-                            utxos: &utxos,
-                            worker_handle: &worker_handle,
-                            last_scanned,
+                            cache_store: actor.cache_store.as_ref(),
+                            cfg: &actor.cfg,
+                            utxos: &actor.utxos,
+                            worker_handle: &actor.worker_handle,
+                            last_scanned: actor.last_scanned,
                             reset_generation: current_reset_generation,
-                            actor_state: &mut actor_state,
-                            persist_state: &mut persist_state,
+                            actor_state: &mut actor.actor_state,
+                            persist_state: &mut actor.persist_state,
                             status_reader: &status_reader,
-                            active_poi_list_keys: &active_poi_list_keys,
+                            active_poi_list_keys: &actor.active_poi_list_keys,
                             selection: post_ready_selection,
-                            cancel: &cancel,
+                            cancel: &actor.cancel,
                         })
                         .commit()
                         .await
                         {
                             Ok(changed) => {
                                 debug!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     changed,
                                     "post-ready local wallet POI status refresh committed"
                                 );
                             }
                             Err(reason) => {
-                                warn!(?reason, cache_key = %cfg.cache_key, "post-ready wallet POI status refresh rejected");
+                                warn!(?reason, cache_key = %actor.cfg.cache_key, "post-ready wallet POI status refresh rejected");
                             }
                         }
                     }
@@ -860,19 +830,19 @@ pub(crate) async fn prepare_wallet_worker(
                         &private_apply,
                         &poi_jobs,
                         &poi_refreshing_tx,
-                        &worker_handle,
-                        &cancel,
+                        &actor.worker_handle,
+                        &actor.cancel,
                         &db,
-                        &cache_store,
-                        &cfg,
-                        &public_data_plane,
+                        &actor.cache_store,
+                        &actor.cfg,
+                        &actor.public_data_plane,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
-                        &poi_runtime,
+                        actor.poi_runtime,
                         &poi_submitter,
                         &forest,
-                        &utxos,
-                        &active_poi_list_keys,
+                        &actor.utxos,
+                        &actor.active_poi_list_keys,
                         false,
                     );
                 }
@@ -885,7 +855,7 @@ pub(crate) async fn prepare_wallet_worker(
                 }
             }};
         }
-        if actor_state.pending_reset().is_some() && try_drive_pending_reset!(false).is_some() {
+        if actor.actor_state.pending_reset().is_some() && try_drive_pending_reset!(false).is_some() {
             signal_restored_reset_attempt(&mut startup_replay_tx);
         }
 
@@ -895,20 +865,20 @@ pub(crate) async fn prepare_wallet_worker(
         if !activated {
             return;
         }
-        if actor_state.pending_reset().is_some() {
+        if actor.actor_state.pending_reset().is_some() {
             let _ = try_drive_pending_reset!(true);
         }
         loop {
             tokio::select! {
-                () = cancel.cancelled() => break,
-                expiry = wait_for_local_pending_spent_expiry(&worker_handle) => {
+                () = actor.cancel.cancelled() => break,
+                expiry = wait_for_local_pending_spent_expiry(&actor.worker_handle) => {
                     if let Err(error) = expire_local_pending_spent(
-                        &worker_handle,
-                        &cancel,
-                        actor_state.reset_generation(),
+                        &actor.worker_handle,
+                        &actor.cancel,
+                        actor.actor_state.reset_generation(),
                         expiry,
                     ).await {
-                        debug!(%error, cache_key = %cfg.cache_key, "local pending-spend expiry skipped");
+                        debug!(%error, cache_key = %actor.cfg.cache_key, "local pending-spend expiry skipped");
                     }
                 }
                 Some((token, signal)) = accepted_backfill_liveness.next(), if !accepted_backfill_liveness.is_empty() => {
@@ -916,22 +886,22 @@ pub(crate) async fn prepare_wallet_worker(
                         disposition,
                         acknowledgement,
                     } = signal;
-                    let changed = actor_state
-                        .transition_active(&worker_handle, &cancel, |mut state| {
+                    let changed = actor.actor_state
+                        .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                             state.apply_backfill_owner_disposition(token, disposition)
                         })
                         .unwrap_or(false);
                     if changed {
                         if disposition == WalletBackfillOwnerDisposition::BenignRetirement
-                            && !actor_state.has_active_backfill_job()
+                            && !actor.actor_state.has_active_backfill_job()
                         {
-                            backfill_complete_block = actor_state.completed_target_block();
+                            backfill_complete_block = actor.actor_state.completed_target_block();
                             if poi_corpus_revision_rx.as_ref().is_some_and(|revision_rx| {
                                 *revision_rx.borrow() != last_poi_corpus_revision
                             }) {
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| state.observe_poi_corpus_revision(true),
                                 );
                             }
@@ -944,33 +914,33 @@ pub(crate) async fn prepare_wallet_worker(
                                 let blocked_shields_changed = revision.blocked_shields_revision
                                     != last_poi_corpus_revision.blocked_shields_revision;
                                 let revision_changed = revision != last_poi_corpus_revision;
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| {
                                         state.observe_poi_corpus_revision(revision_changed);
                                     },
                                 );
                                 last_poi_corpus_revision = revision;
                                 blocked_shield_refresh_pending |= blocked_shields_changed;
-                                if actor_state.poi_corpus_refresh_pending() {
+                                if actor.actor_state.poi_corpus_refresh_pending() {
                                     let selection = WalletPoiRefreshSelection::CorpusRevision {
                                         blocked_shields_changed: blocked_shield_refresh_pending,
                                     };
-                                    let result = commit_local_poi_status_refresh!(selection);
+                                    let result = actor.commit_local_poi_status_refresh(selection).await;
                                     let refresh_still_needed = result.is_none() && {
-                                        let locked = utxos.read().await;
+                                        let locked = actor.utxos.read().await;
                                         wallet_poi_status_refresh_needed_for_selection(
                                             &locked,
-                                            &active_poi_list_keys,
+                                            &actor.active_poi_list_keys,
                                             selection,
                                         )
                                     };
                                     match result {
                                         None if refresh_still_needed => {
-                                            let _ = actor_state.transition_active(
-                                                &worker_handle,
-                                                &cancel,
+                                            let _ = actor.actor_state.transition_active(
+                                                &actor.worker_handle,
+                                                &actor.cancel,
                                                 |mut state| {
                                                     state.set_poi_corpus_refresh_pending(true);
                                                 },
@@ -978,19 +948,19 @@ pub(crate) async fn prepare_wallet_worker(
                                         }
                                         Some(Ok(_)) | None => {
                                             blocked_shield_refresh_pending = false;
-                                            let _ = actor_state.transition_active(
-                                                &worker_handle,
-                                                &cancel,
+                                            let _ = actor.actor_state.transition_active(
+                                                &actor.worker_handle,
+                                                &actor.cancel,
                                                 |mut state| {
                                                     state.set_poi_corpus_refresh_pending(false);
                                                 },
                                             );
                                         }
                                         Some(Err(reason)) => {
-                                            warn!(?reason, cache_key = %cfg.cache_key, "target retirement POI status refresh rejected");
-                                            let _ = actor_state.transition_active(
-                                                &worker_handle,
-                                                &cancel,
+                                            warn!(?reason, cache_key = %actor.cfg.cache_key, "target retirement POI status refresh rejected");
+                                            let _ = actor.actor_state.transition_active(
+                                                &actor.worker_handle,
+                                                &actor.cancel,
                                                 |mut state| {
                                                     state.set_poi_corpus_refresh_pending(true);
                                                 },
@@ -1008,21 +978,21 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                 }
                 Some(token) = accepted_indexed_job_liveness.next(), if !accepted_indexed_job_liveness.is_empty() => {
-                    let retired = actor_state
-                        .transition_active(&worker_handle, &cancel, |mut state| {
+                    let retired = actor.actor_state
+                        .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                             state.retire_job(token)
                         })
                         .unwrap_or(false);
                     if retired {
                         let authority = WalletPrivateMutationAuthority::new(
-                            &worker_handle,
-                            actor_state.reset_generation(),
-                            &cancel,
+                            &actor.worker_handle,
+                            actor.actor_state.reset_generation(),
+                            &actor.cancel,
                         );
                         if let Ok(permit) = authority.acquire().await
                             && let Err(reason) = permit.publish_indexed_catch_up(None)
                         {
-                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up abandonment status clear rejected");
+                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up abandonment status clear rejected");
                         }
                     }
                 }
@@ -1033,13 +1003,13 @@ pub(crate) async fn prepare_wallet_worker(
                         reply,
                     } = apply_req;
                     let result = apply_owned_poi_private_delta_on_actor_with_active_lists(
-                        &worker_handle,
-                        &cancel,
+                        &actor.worker_handle,
+                        &actor.cancel,
                         reset_generation,
                         db.as_ref(),
-                        cache_store.as_ref(),
-                        &cfg,
-                        &active_poi_list_keys,
+                        actor.cache_store.as_ref(),
+                        &actor.cfg,
+                        &actor.active_poi_list_keys,
                         delta,
                     )
                     .await;
@@ -1066,24 +1036,24 @@ pub(crate) async fn prepare_wallet_worker(
                                 &private_apply,
                                 &poi_jobs,
                                 &poi_refreshing_tx,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 &db,
-                                &cache_store,
-                                &cfg,
-                                &public_data_plane,
+                                &actor.cache_store,
+                                &actor.cfg,
+                                &actor.public_data_plane,
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
-                                &poi_runtime,
+                                actor.poi_runtime,
                                 &poi_submitter,
                                 &forest,
-                                &utxos,
-                                &active_poi_list_keys,
+                                &actor.utxos,
+                                &actor.active_poi_list_keys,
                                 key,
                             );
-                            if !credential.is_current(&worker_handle) {
+                            if !credential.is_current(&actor.worker_handle) {
                                 debug!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     ?key,
                                     "stale poi maintenance result dropped"
                                 );
@@ -1091,29 +1061,29 @@ pub(crate) async fn prepare_wallet_worker(
                             }
                             if recovered > 0 {
                                 let authority = WalletPrivateMutationAuthority::new(
-                                    &worker_handle,
-                                    actor_state.reset_generation(),
-                                    &cancel,
+                                    &actor.worker_handle,
+                                    actor.actor_state.reset_generation(),
+                                    &actor.cancel,
                                 );
                                 authority
                                     .notify_changed_if(true, "poi_maintenance_remote_done")
                                     .await;
                             }
                             let published = maintenance_observation.ppoi_workflow_status();
-                            let candidate_report_is_current = cache_store
+                            let candidate_report_is_current = actor.cache_store
                                 .list_sender_transaction_candidates(
-                                    cfg.chain.chain_id,
-                                    &cfg.cache_key,
+                                    actor.cfg.chain.chain_id,
+                                    &actor.cfg.cache_key,
                                 )
                                 .is_ok_and(|candidates| {
                                     candidate_report.matches_candidates(&candidates)
-                                        && candidate_report.matches_pending_contexts(cache_store.as_ref(), &cfg).unwrap_or(false)
+                                        && candidate_report.matches_pending_contexts(actor.cache_store.as_ref(), &actor.cfg).unwrap_or(false)
                                 });
                             let refined = if candidate_report_is_current {
                                 current_ppoi_workflow_status_for_candidate_report(
-                                    cache_store.as_ref(),
-                                    &cfg,
-                                    &active_poi_list_keys,
+                                    actor.cache_store.as_ref(),
+                                    &actor.cfg,
+                                    &actor.active_poi_list_keys,
                                     published,
                                     &candidate_report,
                                 )
@@ -1134,12 +1104,12 @@ pub(crate) async fn prepare_wallet_worker(
                             if let Some(error) = recovery_error.as_ref() {
                                 warn!(
                                     ?error,
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     "wallet POI remote maintenance completed with candidate recovery error"
                                 );
                             }
                             debug!(
-                                cache_key = %cfg.cache_key,
+                                cache_key = %actor.cfg.cache_key,
                                 recovered,
                                 candidate_materialized = candidate_report.materialized,
                                 candidate_retired_locally_valid = candidate_report.retired_locally_valid,
@@ -1181,22 +1151,22 @@ pub(crate) async fn prepare_wallet_worker(
                                 &private_apply,
                                 &poi_jobs,
                                 &poi_refreshing_tx,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 &db,
-                                &cache_store,
-                                &cfg,
-                                &public_data_plane,
+                                &actor.cache_store,
+                                &actor.cfg,
+                                &actor.public_data_plane,
                                 http_client.as_ref(),
                                 indexed_artifact_source.as_ref(),
-                                &poi_runtime,
+                                actor.poi_runtime,
                                 &poi_submitter,
                                 &forest,
-                                &utxos,
-                                &active_poi_list_keys,
+                                &actor.utxos,
+                                &actor.active_poi_list_keys,
                                 key,
                             );
-                            if credential.is_current(&worker_handle) {
+                            if credential.is_current(&actor.worker_handle) {
                                 warn!(
                                     category = reason,
                                     "wallet POI maintenance aborted before completion"
@@ -1218,7 +1188,7 @@ pub(crate) async fn prepare_wallet_worker(
                             context_stale,
                             authority_stale: _authority_stale,
                         } => {
-                            if !credential.is_current(&worker_handle) {
+                            if !credential.is_current(&actor.worker_handle) {
                                 debug!("stale tentative pending output POI result dropped");
                                 continue;
                             }
@@ -1228,11 +1198,11 @@ pub(crate) async fn prepare_wallet_worker(
                                 .release_retryable(credential.reset_generation, &retryable);
                             if !accepted_candidates.is_empty() {
                                 refresh_tentative_pending_output_poi_statuses(
-                                    &worker_handle,
-                                    &cancel,
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     poi_corpus_handle.as_ref(),
-                                    &cfg,
-                                    &active_poi_list_keys,
+                                    &actor.cfg,
+                                    &actor.active_poi_list_keys,
                                     credential.reset_generation,
                                     &mut pending_output_poi_tentative_attempts,
                                 )
@@ -1249,9 +1219,9 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                     }
                 }
-                _ = pending_reset_retry.tick(), if actor_state.pending_reset().is_some() => {
+                _ = pending_reset_retry.tick(), if actor.actor_state.pending_reset().is_some() => {
                     if let Some(outcome) = try_drive_pending_reset!(true) {
-                        debug!(?outcome.rewind, cache_key = %cfg.cache_key, "wallet pending reset retry completed");
+                        debug!(?outcome.rewind, cache_key = %actor.cfg.cache_key, "wallet pending reset retry completed");
                         signal_restored_reset_attempt(&mut startup_replay_tx);
                     }
                 }
@@ -1259,14 +1229,14 @@ pub(crate) async fn prepare_wallet_worker(
                     let Some(_client) = poi_status_client.as_ref() else {
                         continue;
                     };
-                    if actor_state.pending_reset().is_some() {
+                    if actor.actor_state.pending_reset().is_some() {
                         let _ = poi_maintenance.request(
                             refresh_request.force_output_poi_recovery,
                             false,
                             None,
                         );
                         debug!(
-                            cache_key = %cfg.cache_key,
+                            cache_key = %actor.cfg.cache_key,
                             "wallet POI refresh latched while reset commit is pending"
                         );
                         continue;
@@ -1278,43 +1248,43 @@ pub(crate) async fn prepare_wallet_worker(
                             None,
                         );
                         debug!(
-                            cache_key = %cfg.cache_key,
+                            cache_key = %actor.cfg.cache_key,
                             "wallet POI refresh latched until backfill complete"
                         );
                         continue;
                     }
-                    let current_reset_generation = actor_state.reset_generation();
+                    let current_reset_generation = actor.actor_state.reset_generation();
                     // Local-only status refresh on actor; remote readers must not block the loop.
-                    if let Some(status_reader) = poi_runtime
-                        .local_status_reader(&public_data_plane, &cfg, &active_poi_list_keys)
+                    if let Some(status_reader) = actor.poi_runtime
+                        .local_status_reader(&actor.public_data_plane, &actor.cfg, &actor.active_poi_list_keys)
                         .await
                     {
                         match (WalletPoiStatusRefreshCommitRequest {
-                            cache_store: cache_store.as_ref(),
-                            cfg: &cfg,
-                            utxos: &utxos,
-                            worker_handle: &worker_handle,
-                            last_scanned,
+                            cache_store: actor.cache_store.as_ref(),
+                            cfg: &actor.cfg,
+                            utxos: &actor.utxos,
+                            worker_handle: &actor.worker_handle,
+                            last_scanned: actor.last_scanned,
                             reset_generation: current_reset_generation,
-                            actor_state: &mut actor_state,
-                            persist_state: &mut persist_state,
+                            actor_state: &mut actor.actor_state,
+                            persist_state: &mut actor.persist_state,
                             status_reader: &status_reader,
-                            active_poi_list_keys: &active_poi_list_keys,
+                            active_poi_list_keys: &actor.active_poi_list_keys,
                             selection: WalletPoiRefreshSelection::Recoverable,
-                            cancel: &cancel,
+                            cancel: &actor.cancel,
                         })
                         .commit()
                         .await
                         {
                             Ok(changed) => {
                                 debug!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     changed,
                                     "manual local wallet POI status refresh committed"
                                 );
                             }
                             Err(reason) => {
-                                warn!(?reason, cache_key = %cfg.cache_key, "manual wallet POI status refresh rejected");
+                                warn!(?reason, cache_key = %actor.cfg.cache_key, "manual wallet POI status refresh rejected");
                             }
                         }
                     }
@@ -1324,37 +1294,37 @@ pub(crate) async fn prepare_wallet_worker(
                         &private_apply,
                         &poi_jobs,
                         &poi_refreshing_tx,
-                        &worker_handle,
-                        &cancel,
+                        &actor.worker_handle,
+                        &actor.cancel,
                         &db,
-                        &cache_store,
-                        &cfg,
-                        &public_data_plane,
+                        &actor.cache_store,
+                        &actor.cfg,
+                        &actor.public_data_plane,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
-                        &poi_runtime,
+                        actor.poi_runtime,
                         &poi_submitter,
                         &forest,
-                        &utxos,
-                        &active_poi_list_keys,
+                        &actor.utxos,
+                        &actor.active_poi_list_keys,
                         refresh_request.force_output_poi_recovery,
                     );
                 }
                 Some(command) = indexed_catch_up_status_rx.recv() => {
                     let authority = WalletPrivateMutationAuthority::new(
-                        &worker_handle,
-                        actor_state.reset_generation(),
-                        &cancel,
+                        &actor.worker_handle,
+                        actor.actor_state.reset_generation(),
+                        &actor.cancel,
                     );
                     match authority.acquire().await {
                         Ok(permit) => {
                             match command {
                                 WalletIndexedCatchUpCommand::Claim { response } => {
                                     let token =
-                                        worker_handle.mint_sync_token(actor_state.reset_generation());
+                                        actor.worker_handle.mint_sync_token(actor.actor_state.reset_generation());
                                     let accepted = permit
                                         .with_active_apply(|apply_token| {
-                                            actor_state.transition(&apply_token, |mut state| {
+                                            actor.actor_state.transition(&apply_token, |mut state| {
                                                 state.accept_indexed_catch_up(token)
                                             })
                                         })
@@ -1374,7 +1344,7 @@ pub(crate) async fn prepare_wallet_worker(
                                         drop(lease);
                                         let retired = permit
                                             .with_active_apply(|apply_token| {
-                                                actor_state.transition(&apply_token, |mut state| {
+                                                actor.actor_state.transition(&apply_token, |mut state| {
                                                     state.retire_job(token)
                                                 })
                                             })
@@ -1383,15 +1353,15 @@ pub(crate) async fn prepare_wallet_worker(
                                             && let Err(reason) =
                                                 permit.publish_indexed_catch_up(None)
                                         {
-                                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up dropped-claim status clear rejected");
+                                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up dropped-claim status clear rejected");
                                         }
-                                        debug!(cache_key = %cfg.cache_key, ?token, "indexed wallet catch-up claim receiver dropped");
+                                        debug!(cache_key = %actor.cfg.cache_key, ?token, "indexed wallet catch-up claim receiver dropped");
                                     }
                                 }
                                 WalletIndexedCatchUpCommand::Publish { token, status } => {
                                     let published = permit
                                         .with_active_apply(|apply_token| {
-                                            actor_state.transition(&apply_token, |mut state| {
+                                            actor.actor_state.transition(&apply_token, |mut state| {
                                                 state.publish_indexed_catch_up(token, status)
                                             })
                                         })
@@ -1400,10 +1370,10 @@ pub(crate) async fn prepare_wallet_worker(
                                         if let Err(reason) =
                                             permit.publish_indexed_catch_up(Some(status))
                                         {
-                                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status publication rejected");
+                                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up status publication rejected");
                                         }
                                     } else {
-                                        debug!(cache_key = %cfg.cache_key, ?token, "stale indexed wallet catch-up status publication ignored");
+                                        debug!(cache_key = %actor.cfg.cache_key, ?token, "stale indexed wallet catch-up status publication ignored");
                                     }
                                 }
                             }
@@ -1412,7 +1382,7 @@ pub(crate) async fn prepare_wallet_worker(
                             if let WalletIndexedCatchUpCommand::Claim { response } = command {
                                 let _ = response.send(None);
                             }
-                            debug!(?reason, cache_key = %cfg.cache_key, "indexed wallet catch-up status publication skipped");
+                            debug!(?reason, cache_key = %actor.cfg.cache_key, "indexed wallet catch-up status publication skipped");
                         }
                     }
                 }
@@ -1423,14 +1393,14 @@ pub(crate) async fn prepare_wallet_worker(
                             tx_hash,
                             reply,
                         } => {
-                            let result = match actor_state.validate_pending_overlay_request(
-                                &worker_handle,
-                                &cancel,
+                            let result = match actor.actor_state.validate_pending_overlay_request(
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 Ok(reset_generation) => {
                                     mark_local_pending_spent(
-                                        &worker_handle,
-                                        &cancel,
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         reset_generation,
                                         utxos,
                                         tx_hash,
@@ -1442,14 +1412,14 @@ pub(crate) async fn prepare_wallet_worker(
                             let _ = reply.send(result);
                         }
                         WalletPrivateRequest::ClearLocalPendingSpent { reply } => {
-                            let result = match actor_state.validate_pending_overlay_request(
-                                &worker_handle,
-                                &cancel,
+                            let result = match actor.actor_state.validate_pending_overlay_request(
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 Ok(reset_generation) => {
                                     clear_local_pending_spent(
-                                        &worker_handle,
-                                        &cancel,
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         reset_generation,
                                     )
                                     .await
@@ -1463,22 +1433,22 @@ pub(crate) async fn prepare_wallet_worker(
                             contexts,
                             reply,
                         } => {
-                            let result = match actor_state.validate_private_request(
-                                &worker_handle,
-                                &cancel,
+                            let result = match actor.actor_state.validate_private_request(
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 ticket,
-                                last_scanned,
+                                actor.last_scanned,
                                 false,
                             ) {
                                 Ok(reset_generation) => {
                                     commit_pending_output_contexts(
-                                        &worker_handle,
-                                        &cancel,
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         db.as_ref(),
-                                        cache_store.as_ref(),
-                                        &cfg,
+                                        actor.cache_store.as_ref(),
+                                        &actor.cfg,
                                         reset_generation,
-                                        &active_poi_list_keys,
+                                        &actor.active_poi_list_keys,
                                         &poi_submitter,
                                         &contexts,
                                     )
@@ -1491,25 +1461,25 @@ pub(crate) async fn prepare_wallet_worker(
                     }
                 }
                 Some(request) = pending_overlay_rx.recv() => {
-                    let current_reset_generation = actor_state.reset_generation();
-                    let request_is_current = actor_state.pending_reset().is_none()
+                    let current_reset_generation = actor.actor_state.reset_generation();
+                    let request_is_current = actor.actor_state.pending_reset().is_none()
                         && request.reset_generation == current_reset_generation
-                        && request.last_scanned == last_scanned;
+                        && request.last_scanned == actor.last_scanned;
                     let accepted = request_is_current
-                        && actor_state
-                            .transition_active(&worker_handle, &cancel, |mut state| {
+                        && actor.actor_state
+                            .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                 state.accept_pending_overlay(request.token, request.last_scanned)
                             })
                             .unwrap_or(false);
                     if !accepted {
                         debug!(
-                            cache_key = %cfg.cache_key,
+                            cache_key = %actor.cfg.cache_key,
                             token = ?request.token,
                             request_reset_generation = request.reset_generation,
                             current_reset_generation,
                             request_last_scanned = request.last_scanned,
-                            current_last_scanned = last_scanned,
-                            pending_reset = actor_state.pending_reset().is_some(),
+                            current_last_scanned = actor.last_scanned,
+                            pending_reset = actor.actor_state.pending_reset().is_some(),
                             "ignoring stale pending overlay update"
                         );
                         continue;
@@ -1517,27 +1487,27 @@ pub(crate) async fn prepare_wallet_worker(
                     pending_output_poi_tentative_attempts
                         .clear_generation(current_reset_generation);
                     let authority = WalletPrivateMutationAuthority::new(
-                        &worker_handle,
+                        &actor.worker_handle,
                         current_reset_generation,
-                        &cancel,
+                        &actor.cancel,
                     );
                     let permit = match authority.acquire().await {
                         Ok(guard) => guard,
                         Err(reason) => {
-                            debug!(?reason, cache_key = %cfg.cache_key, "pending overlay update rejected");
-                            let _ = actor_state.transition_active(
-                                &worker_handle,
-                                &cancel,
+                            debug!(?reason, cache_key = %actor.cfg.cache_key, "pending overlay update rejected");
+                            let _ = actor.actor_state.transition_active(
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 |mut state| state.retire_job(request.token),
                             );
                             continue;
                         }
                     };
-                    if !actor_state.pending_overlay_is_current(request.token, request.last_scanned)
+                    if !actor.actor_state.pending_overlay_is_current(request.token, request.last_scanned)
                         || permit.revalidate().is_err()
                     {
                         let _ = permit.with_active_apply(|token| {
-                            actor_state.transition(&token, |mut state| {
+                            actor.actor_state.transition(&token, |mut state| {
                                 state.retire_job(request.token);
                             });
                         });
@@ -1552,7 +1522,7 @@ pub(crate) async fn prepare_wallet_worker(
                         WalletPendingOverlayUpdate::PublicRows(rows) => {
                             let delta = match rows.payload {
                                 WalletScanRowsPayload::Rows(rows) => {
-                                    WalletLogDelta::from_rows(&rows, &cfg.scan_keys)
+                                    WalletLogDelta::from_rows(&rows, &actor.cfg.scan_keys)
                                 }
                                 WalletScanRowsPayload::EmptyCoverage => WalletLogDelta {
                                     utxos: Vec::new(),
@@ -1565,39 +1535,39 @@ pub(crate) async fn prepare_wallet_worker(
                             };
                             tentative_observations = delta.commitment_observations.clone();
                             pending_output_poi_tentative_attempts.prune_for_observations(
-                                actor_state.reset_generation(),
+                                actor.actor_state.reset_generation(),
                                 &tentative_observations,
                             );
                             let delta = WalletLogDelta {
                                 commitment_observations: Vec::new(),
                                 ..delta
                             };
-                            let confirmed = utxos.read().await;
-                            if !actor_state
+                            let confirmed = actor.utxos.read().await;
+                            if !actor.actor_state
                                 .pending_overlay_is_current(request.token, request.last_scanned)
                                 || permit.revalidate().is_err()
                             {
                                 let _ = permit.with_active_apply(|token| {
-                                    actor_state.transition(&token, |mut state| {
+                                    actor.actor_state.transition(&token, |mut state| {
                                         state.retire_job(request.token);
                                     });
                                 });
                                 continue;
                             }
-                            pending_overlay_from_delta(&cfg, &confirmed, delta)
+                            pending_overlay_from_delta(&actor.cfg, &confirmed, delta)
                         }
                     };
                     pending_output_poi_tentative_attempts.apply_to_overlay(
-                        actor_state.reset_generation(),
+                        actor.actor_state.reset_generation(),
                         &mut overlay,
                         now_epoch_secs(),
                     );
                     let changed = match permit.replace_chain_pending_overlay(overlay).await {
                         Ok(changed) => changed,
                         Err(reason) => {
-                            debug!(?reason, cache_key = %cfg.cache_key, "pending overlay update rejected before publication");
+                            debug!(?reason, cache_key = %actor.cfg.cache_key, "pending overlay update rejected before publication");
                             let _ = permit.with_active_apply(|token| {
-                                actor_state.transition(&token, |mut state| {
+                                actor.actor_state.transition(&token, |mut state| {
                                     state.retire_job(request.token);
                                 });
                             });
@@ -1605,10 +1575,10 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                     };
                     if let Err(reason) = permit.notify_if_changed(changed).await {
-                        debug!(?reason, cache_key = %cfg.cache_key, "pending overlay revision publication rejected");
+                        debug!(?reason, cache_key = %actor.cfg.cache_key, "pending overlay revision publication rejected");
                     }
                     let _ = permit.with_active_apply(|token| {
-                        actor_state.transition(&token, |mut state| {
+                        actor.actor_state.transition(&token, |mut state| {
                             state.retire_job(request.token);
                         });
                     });
@@ -1619,9 +1589,9 @@ pub(crate) async fn prepare_wallet_worker(
                         let mut reserved_count = 0;
                         let tentative_candidates =
                             match prepare_pending_output_poi_tentative_candidates(
-                                cache_store.as_ref(),
-                                &cfg,
-                                &active_poi_list_keys,
+                                actor.cache_store.as_ref(),
+                                &actor.cfg,
+                                &actor.active_poi_list_keys,
                                 &tentative_observations,
                             )
                             {
@@ -1631,7 +1601,7 @@ pub(crate) async fn prepare_wallet_worker(
                                         .into_iter()
                                         .filter(|candidate| {
                                             pending_output_poi_tentative_attempts.reserve(
-                                                actor_state.reset_generation(),
+                                                actor.actor_state.reset_generation(),
                                                 candidate.clone(),
                                             )
                                         })
@@ -1652,14 +1622,14 @@ pub(crate) async fn prepare_wallet_worker(
                         if !tentative_candidates.is_empty() {
                             spawn_pending_output_poi_tentative_job(
                                 &poi_jobs,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 &remote_done_tx,
-                                &cache_store,
-                                &cfg,
-                                &poi_runtime,
+                                &actor.cache_store,
+                                &actor.cfg,
+                                actor.poi_runtime,
                                 &poi_submitter,
-                                &active_poi_list_keys,
+                                &actor.active_poi_list_keys,
                                 tentative_candidates,
                             );
                         }
@@ -1670,9 +1640,9 @@ pub(crate) async fn prepare_wallet_worker(
                         poi_corpus_revision_rx = None;
                         continue;
                     };
-                    let _ = actor_state.transition_active(
-                        &worker_handle,
-                        &cancel,
+                    let _ = actor.actor_state.transition_active(
+                        &actor.worker_handle,
+                        &actor.cancel,
                         |mut state| {
                             state.observe_poi_corpus_revision(
                                 revision != last_poi_corpus_revision,
@@ -1687,18 +1657,18 @@ pub(crate) async fn prepare_wallet_worker(
                         revision = *revision_rx.borrow_and_update();
                     }
                     refresh_tentative_pending_output_poi_statuses(
-                        &worker_handle,
-                        &cancel,
+                        &actor.worker_handle,
+                        &actor.cancel,
                         poi_corpus_handle.as_ref(),
-                        &cfg,
-                        &active_poi_list_keys,
-                        actor_state.reset_generation(),
+                        &actor.cfg,
+                        &actor.active_poi_list_keys,
+                        actor.actor_state.reset_generation(),
                         &mut pending_output_poi_tentative_attempts,
                     )
                     .await;
-                    let _ = actor_state.transition_active(
-                        &worker_handle,
-                        &cancel,
+                    let _ = actor.actor_state.transition_active(
+                        &actor.worker_handle,
+                        &actor.cancel,
                         |mut state| {
                             state.observe_poi_corpus_revision(
                                 revision != last_poi_corpus_revision,
@@ -1706,11 +1676,11 @@ pub(crate) async fn prepare_wallet_worker(
                         },
                     );
                     debug!(
-                        cache_key = %cfg.cache_key,
+                        cache_key = %actor.cfg.cache_key,
                         revision = revision.revision,
                         blocked_shields_revision = revision.blocked_shields_revision,
                         backfill_complete = backfill_complete_block.is_some(),
-                        reset_pending = actor_state.pending_reset().is_some(),
+                        reset_pending = actor.actor_state.pending_reset().is_some(),
                         "committed PPOI corpus revision observed"
                     );
                     let blocked_shields_changed = revision.blocked_shields_revision
@@ -1718,23 +1688,23 @@ pub(crate) async fn prepare_wallet_worker(
                     last_poi_corpus_revision = revision;
                     blocked_shield_refresh_pending |= blocked_shields_changed;
                     if backfill_complete_block.is_some()
-                        && actor_state.pending_reset().is_none()
-                        && let Some(result) = commit_local_poi_status_refresh!(
+                        && actor.actor_state.pending_reset().is_none()
+                        && let Some(result) = actor.commit_local_poi_status_refresh(
                             WalletPoiRefreshSelection::CorpusRevision {
                                 blocked_shields_changed: blocked_shield_refresh_pending,
                             }
-                        )
+                        ).await
                     {
                         match result {
                             Ok(changed) => {
                                 blocked_shield_refresh_pending = false;
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| state.set_poi_corpus_refresh_pending(false),
                                 );
                                 debug!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     revision = revision.revision,
                                     changed,
                                     "corpus revision local wallet POI status refresh committed"
@@ -1742,43 +1712,43 @@ pub(crate) async fn prepare_wallet_worker(
                             }
                             Err(reason) => warn!(
                                 ?reason,
-                                cache_key = %cfg.cache_key,
+                                cache_key = %actor.cfg.cache_key,
                                 revision = revision.revision,
                                 "corpus revision wallet POI status refresh rejected"
                             ),
                         }
                     }
-                    if actor_state.poi_corpus_refresh_pending() {
+                    if actor.actor_state.poi_corpus_refresh_pending() {
                         let selection = WalletPoiRefreshSelection::CorpusRevision {
                             blocked_shields_changed: blocked_shield_refresh_pending,
                         };
                         let refresh_still_needed = {
-                            let locked = utxos.read().await;
+                            let locked = actor.utxos.read().await;
                             wallet_poi_status_refresh_needed_for_selection(
                                 &locked,
-                                &active_poi_list_keys,
+                                &actor.active_poi_list_keys,
                                 selection,
                             )
                         };
                         if !refresh_still_needed {
                             blocked_shield_refresh_pending = false;
-                            let _ = actor_state.transition_active(
-                                &worker_handle,
-                                &cancel,
+                            let _ = actor.actor_state.transition_active(
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 |mut state| state.set_poi_corpus_refresh_pending(false),
                             );
                         }
                     }
                 }
-                _ = poi_status_refresh_interval.tick(), if poi_status_client.is_some() && backfill_complete_block.is_some() && actor_state.pending_reset().is_none() => {
+                _ = poi_status_refresh_interval.tick(), if poi_status_client.is_some() && backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
                     let Some(_client) = poi_status_client.as_ref() else {
                         continue;
                     };
                     if let Some(revision_rx) = poi_corpus_revision_rx.as_mut() {
                         let revision = *revision_rx.borrow_and_update();
-                        let _ = actor_state.transition_active(
-                            &worker_handle,
-                            &cancel,
+                        let _ = actor.actor_state.transition_active(
+                            &actor.worker_handle,
+                            &actor.cancel,
                             |mut state| {
                                 state.observe_poi_corpus_revision(
                                     revision != last_poi_corpus_revision,
@@ -1794,55 +1764,53 @@ pub(crate) async fn prepare_wallet_worker(
                         None => None,
                     };
                     let now = now_epoch_secs();
-                    let selection = if actor_state.poi_corpus_refresh_pending()
+                    let selection = if actor.actor_state.poi_corpus_refresh_pending()
                         || blocked_shield_refresh_pending
                     {
                         WalletPoiRefreshSelection::CorpusRevision {
                             blocked_shields_changed: blocked_shield_refresh_pending,
                         }
-                    } else if let Some(failed_selection) = actor_state
-                        .failed_poi_status_refresh_selection(actor_state.reset_generation())
+                    } else if let Some(failed_selection) = actor.actor_state
+                        .failed_poi_status_refresh_selection(actor.actor_state.reset_generation())
                     {
                         failed_selection
                     } else {
                         WalletPoiRefreshSelection::RecoverableStale { now }
                     };
-                    if let Some(result) = commit_local_poi_status_refresh!(
-                        selection
-                    ) {
+                    if let Some(result) = actor.commit_local_poi_status_refresh(selection).await {
                         match result {
                             Ok(changed) => {
                                 blocked_shield_refresh_pending = false;
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| state.set_poi_corpus_refresh_pending(false),
                                 );
                                 debug!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     changed,
                                     "periodic local wallet POI status refresh committed"
                                 );
                             }
                             Err(reason) => {
-                                warn!(?reason, cache_key = %cfg.cache_key, "periodic wallet POI status refresh rejected");
+                                warn!(?reason, cache_key = %actor.cfg.cache_key, "periodic wallet POI status refresh rejected");
                             }
                         }
                     }
-                    if actor_state.poi_corpus_refresh_pending() {
+                    if actor.actor_state.poi_corpus_refresh_pending() {
                         let refresh_still_needed = {
-                            let locked = utxos.read().await;
+                            let locked = actor.utxos.read().await;
                             wallet_poi_status_refresh_needed_for_selection(
                                 &locked,
-                                &active_poi_list_keys,
+                                &actor.active_poi_list_keys,
                                 selection,
                             )
                         };
                         if !refresh_still_needed {
                             blocked_shield_refresh_pending = false;
-                            let _ = actor_state.transition_active(
-                                &worker_handle,
-                                &cancel,
+                            let _ = actor.actor_state.transition_active(
+                                &actor.worker_handle,
+                                &actor.cancel,
                                 |mut state| state.set_poi_corpus_refresh_pending(false),
                             );
                         }
@@ -1853,19 +1821,19 @@ pub(crate) async fn prepare_wallet_worker(
                         &private_apply,
                         &poi_jobs,
                         &poi_refreshing_tx,
-                        &worker_handle,
-                        &cancel,
+                        &actor.worker_handle,
+                        &actor.cancel,
                         &db,
-                        &cache_store,
-                        &cfg,
-                        &public_data_plane,
+                        &actor.cache_store,
+                        &actor.cfg,
+                        &actor.public_data_plane,
                         http_client.as_ref(),
                         indexed_artifact_source.as_ref(),
-                        &poi_runtime,
+                        actor.poi_runtime,
                         &poi_submitter,
                         &forest,
-                        &utxos,
-                        &active_poi_list_keys,
+                        &actor.utxos,
+                        &actor.active_poi_list_keys,
                         false,
                     );
                 }
@@ -1877,7 +1845,7 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                         #[cfg(test)]
                         BackfillEvent::HoldTrackedPoiJobForTest { sentinel, started } => {
-                            let held_data_plane = public_data_plane.clone();
+                            let held_data_plane = actor.public_data_plane.clone();
                             poi_jobs.spawn(async move {
                                 let _held = (held_data_plane, sentinel);
                                 let _ = started.send(());
@@ -1885,18 +1853,18 @@ pub(crate) async fn prepare_wallet_worker(
                             });
                         }
                         BackfillEvent::ReserveTarget { target_block, token, response } => {
-                            if let Err(reason) = actor_state.validate_sync_token_current(
+                            if let Err(reason) = actor.actor_state.validate_sync_token_current(
                                 token,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 let _ = response.send(Err(reason));
                                 continue;
                             }
                             if try_drive_pending_reset!(true).is_some()
-                                && actor_state.pending_reset().is_some()
+                                && actor.actor_state.pending_reset().is_some()
                             {
-                                let reason = if actor_state.has_persistence_failure() {
+                                let reason = if actor.actor_state.has_persistence_failure() {
                                     WalletBackfillRejectReason::PersistenceFailed
                                 } else {
                                     WalletBackfillRejectReason::Shutdown
@@ -1904,8 +1872,8 @@ pub(crate) async fn prepare_wallet_worker(
                                 let _ = response.send(Err(reason));
                                 continue;
                             }
-                            let accepted = actor_state
-                                .transition_active(&worker_handle, &cancel, |mut state| {
+                            let accepted = actor.actor_state
+                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                     state.accept_sync_target(token, target_block)
                                 })
                                 .unwrap_or(false);
@@ -1923,47 +1891,47 @@ pub(crate) async fn prepare_wallet_worker(
                             );
                             if let Err(lease) = response.send(Ok(lease)) {
                                 drop(lease);
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| state.retire_job(token),
                                 );
                             }
                         }
                         BackfillEvent::Start { target_block, token, response } => {
-                            if let Err(reason) = actor_state.validate_sync_token_current(
+                            if let Err(reason) = actor.actor_state.validate_sync_token_current(
                                 token,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 let _ = response.send(WalletBackfillStartResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 });
                                 continue;
                             }
                             if try_drive_pending_reset!(true).is_some()
-                                && actor_state.pending_reset().is_some()
+                                && actor.actor_state.pending_reset().is_some()
                             {
-                                let reason = if actor_state.has_persistence_failure() {
+                                let reason = if actor.actor_state.has_persistence_failure() {
                                     WalletBackfillRejectReason::PersistenceFailed
                                 } else {
                                     WalletBackfillRejectReason::Shutdown
                                 };
                                 let _ = response.send(WalletBackfillStartResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 });
                                 continue;
                             }
-                            let accepted = actor_state
-                                .transition_active(&worker_handle, &cancel, |mut state| {
+                            let accepted = actor.actor_state
+                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                     state.accept_target(token, target_block)
                                 })
                                 .unwrap_or(false);
                             if !accepted {
                                 let _ = response.send(WalletBackfillStartResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason: WalletBackfillRejectReason::Shutdown,
                                 });
                                 continue;
@@ -1973,94 +1941,94 @@ pub(crate) async fn prepare_wallet_worker(
                                 .push(accepted_backfill_owner_dropped(token, receiver));
                             backfill_complete_block = None;
                             let result = WalletBackfillStartResult::Accepted {
-                                committed_to: last_scanned,
+                                committed_to: actor.last_scanned,
                                 target_block,
                                     grant: WalletBackfillGrant::for_actor_accepted_job_with_cancel(
                                         token,
                                         backfill_sender.clone(),
                                         liveness,
-                                        cancel.clone(),
+                                        actor.cancel.clone(),
                                     ),
                             };
                             match response.send(result) {
                                 Ok(()) => {
-                                    let _ = actor_state.transition_active(
-                                        &worker_handle,
-                                        &cancel,
+                                    let _ = actor.actor_state.transition_active(
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         |mut state| state.backfill_dispatch_admitted(token),
                                     );
                                 }
                                 Err(result) => {
                                     drop(result);
-                                    let _ = actor_state.transition_active(
-                                        &worker_handle,
-                                        &cancel,
+                                    let _ = actor.actor_state.transition_active(
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         |mut state| state.retire_job(token),
                                     );
-                                    debug!(cache_key = %cfg.cache_key, ?token, "wallet backfill start receiver dropped");
+                                    debug!(cache_key = %actor.cfg.cache_key, ?token, "wallet backfill start receiver dropped");
                                 }
                             }
                         }
                         BackfillEvent::Apply { apply, token, response } => {
                             if let Some(outcome) = try_drive_pending_reset!(true)
-                                && actor_state.pending_reset().is_some()
+                                && actor.actor_state.pending_reset().is_some()
                             {
                                 let reason = match outcome.rewind {
                                     WalletResetRewindOutcome::Deferred { reason, .. } => reason,
                                     WalletResetRewindOutcome::Committed { .. }
-                                        if actor_state.has_persistence_failure() =>
+                                        if actor.actor_state.has_persistence_failure() =>
                                     {
                                         WalletBackfillRejectReason::PersistenceFailed
                                     }
                                     WalletResetRewindOutcome::Committed { .. } =>
                                         WalletBackfillRejectReason::Shutdown,
                                 };
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| {
                                         state.retire_job(token);
                                     },
                                 );
                                 let result = WalletBackfillApplyResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send pending-reset wallet scan apply result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send pending-reset wallet scan apply result");
                                 }
                                 continue;
                             }
-                            let current_reset_generation = actor_state.reset_generation();
-                            if let Err(reason) = actor_state.validate_active_backfill_token(
+                            let current_reset_generation = actor.actor_state.reset_generation();
+                            if let Err(reason) = actor.actor_state.validate_active_backfill_token(
                                 token,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 let result = WalletBackfillApplyResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send inactive wallet scan apply result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send inactive wallet scan apply result");
                                 }
                                 continue;
                             }
                             let outcome = WalletScanCommitRequest {
-                                cache_store: cache_store.as_ref(),
-                                cfg: &cfg,
-                                utxos: &utxos,
-                                worker_handle: &worker_handle,
+                                cache_store: actor.cache_store.as_ref(),
+                                cfg: &actor.cfg,
+                                utxos: &actor.utxos,
+                                worker_handle: &actor.worker_handle,
                                 apply,
                                 job_token: token,
                                 current_reset_generation,
                                 event_reset_generation: token.reset_generation(),
-                                actor_state: &mut actor_state,
-                                cancel: &cancel,
-                                last_scanned: &mut last_scanned,
-                                persist_state: &mut persist_state,
+                                actor_state: &mut actor.actor_state,
+                                cancel: &actor.cancel,
+                                last_scanned: &mut actor.last_scanned,
+                                persist_state: &mut actor.persist_state,
                                 live_metadata_flush: &mut live_metadata_flush,
-                                public_data_plane: &public_data_plane,
+                                public_data_plane: &actor.public_data_plane,
                             }
                             .commit()
                             .await;
@@ -2071,49 +2039,49 @@ pub(crate) async fn prepare_wallet_worker(
                                     &private_apply,
                                     &poi_jobs,
                                     &poi_refreshing_tx,
-                                    &worker_handle,
-                                    &cancel,
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     &db,
-                                    &cache_store,
-                                    &cfg,
-                                    &public_data_plane,
+                                    &actor.cache_store,
+                                    &actor.cfg,
+                                    &actor.public_data_plane,
                                     http_client.as_ref(),
                                     indexed_artifact_source.as_ref(),
-                                    &poi_runtime,
+                                    actor.poi_runtime,
                                     &poi_submitter,
                                     &forest,
-                                    &utxos,
-                                    &active_poi_list_keys,
+                                    &actor.utxos,
+                                    &actor.active_poi_list_keys,
                                     false,
                                 );
                             }
                             if let Err(err) = response.send(outcome.result) {
-                                debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet scan apply result");
+                                debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send wallet scan apply result");
                             }
                         }
                         BackfillEvent::Finish { target_block, token, response } => {
-                            let current_reset_generation = actor_state.reset_generation();
-                            if let Err(reason) = actor_state.validate_active_backfill_token(
+                            let current_reset_generation = actor.actor_state.reset_generation();
+                            if let Err(reason) = actor.actor_state.validate_active_backfill_token(
                                 token,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 let result = WalletBackfillFinishResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send stale wallet target result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send stale wallet target result");
                                 }
                                 continue;
                             }
                             if let Some(outcome) = try_drive_pending_reset!(true)
-                                && actor_state.pending_reset().is_some()
+                                && actor.actor_state.pending_reset().is_some()
                             {
                                 let reason = match outcome.rewind {
                                     WalletResetRewindOutcome::Deferred { reason, .. } => reason,
                                     WalletResetRewindOutcome::Committed { .. }
-                                        if actor_state.has_persistence_failure() =>
+                                        if actor.actor_state.has_persistence_failure() =>
                                     {
                                         WalletBackfillRejectReason::PersistenceFailed
                                     }
@@ -2121,44 +2089,44 @@ pub(crate) async fn prepare_wallet_worker(
                                         WalletBackfillRejectReason::Shutdown,
                                 };
                                 let result = WalletBackfillFinishResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send pending-reset wallet target result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send pending-reset wallet target result");
                                 }
                                 continue;
                             }
-                            let Some(required_target) = actor_state
-                                .transition_active(&worker_handle, &cancel, |mut state| {
+                            let Some(required_target) = actor.actor_state
+                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                     state.update_target(token, target_block)
                                 })
                                 .ok()
                                 .flatten()
                             else {
                                 let _ = response.send(WalletBackfillFinishResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason: WalletBackfillRejectReason::Shutdown,
                                 });
                                 continue;
                             };
-                            if required_target == 0 || required_target > last_scanned {
+                            if required_target == 0 || required_target > actor.last_scanned {
                                 debug!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     target_block = required_target,
-                                    last_scanned,
+                                    last_scanned = actor.last_scanned,
                                     reset_generation = current_reset_generation,
                                     "wallet target recorded; cursor has not reached target"
                                 );
                                 backfill_complete_block = None;
                                 let result = WalletBackfillFinishResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason: WalletBackfillRejectReason::TargetNotReached {
                                         target_block: required_target,
                                     },
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send pending wallet target result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send pending wallet target result");
                                 }
                                 continue;
                             }
@@ -2181,36 +2149,36 @@ pub(crate) async fn prepare_wallet_worker(
                                         })
                                     {
                                         WalletBackfillFinishResult::Rejected {
-                                            committed_to: last_scanned,
+                                            committed_to: actor.last_scanned,
                                             reason: WalletBackfillRejectReason::ApplyFailed,
                                         }
                                     } else {
-                                        let completed = actor_state
+                                        let completed = actor.actor_state
                                             .transition_active(
-                                                &worker_handle,
-                                                &cancel,
+                                                &actor.worker_handle,
+                                                &actor.cancel,
                                                 |mut state| state.complete_backfill_job(token),
                                             )
                                             .unwrap_or(false);
                                         if completed {
-                                            if actor_state.has_active_backfill_job() {
+                                            if actor.actor_state.has_active_backfill_job() {
                                                 backfill_complete_block = None;
                                             }
                                             WalletBackfillFinishResult::Ready {
-                                                committed_to: last_scanned,
+                                                committed_to: actor.last_scanned,
                                             }
                                         } else {
                                             WalletBackfillFinishResult::Rejected {
-                                                committed_to: last_scanned,
+                                                committed_to: actor.last_scanned,
                                                 reason: WalletBackfillRejectReason::Shutdown,
                                             }
                                         }
                                     }
                                 }
                                 WalletBackfillDoneOutcome::Rejected(reason) => {
-                                    let _ = actor_state.transition_active(
-                                        &worker_handle,
-                                        &cancel,
+                                    let _ = actor.actor_state.transition_active(
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         |mut state| {
                                             if reason == WalletBackfillRejectReason::PersistenceFailed {
                                                 state.backfill_completion_persist_failed(token);
@@ -2220,26 +2188,26 @@ pub(crate) async fn prepare_wallet_worker(
                                         },
                                     );
                                     WalletBackfillFinishResult::Rejected {
-                                        committed_to: last_scanned,
+                                        committed_to: actor.last_scanned,
                                         reason,
                                     }
                                 }
                             };
                             if let Err(err) = response.send(result) {
-                                debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet target result");
+                                debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send wallet target result");
                             }
                         }
                         BackfillEvent::JobFailed { token, reason, response } => {
-                            if actor_state.validate_active_backfill_token(
+                            if actor.actor_state.validate_active_backfill_token(
                                 token,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                             )
                             .is_ok()
                             {
-                                let _ = actor_state.transition_active(
-                                    &worker_handle,
-                                    &cancel,
+                                let _ = actor.actor_state.transition_active(
+                                    &actor.worker_handle,
+                                    &actor.cancel,
                                     |mut state| match reason {
                                         WalletReadinessError::BackfillUnavailable => {
                                             state.fail_job_backfill_unavailable(token)
@@ -2257,60 +2225,60 @@ pub(crate) async fn prepare_wallet_worker(
                             let _ = response.send(());
                         }
                         BackfillEvent::Reset { token, from_block, replay_plan, response } => {
-                            if let Err(reason) = actor_state.validate_reset_token_current(
+                            if let Err(reason) = actor.actor_state.validate_reset_token_current(
                                 token,
-                                &worker_handle,
-                                &cancel,
+                                &actor.worker_handle,
+                                &actor.cancel,
                             ) {
                                 let result = WalletBackfillResetResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason,
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send shutdown wallet reset result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send shutdown wallet reset result");
                                 }
                                 continue;
                             }
                             let intent_id = token.intent_id();
 
-                            if intent_id <= actor_state.highest_accepted_reset_intent() {
+                            if intent_id <= actor.actor_state.highest_accepted_reset_intent() {
                                 let result = WalletBackfillResetResult::Rejected {
-                                    committed_to: last_scanned,
+                                    committed_to: actor.last_scanned,
                                     reason: WalletBackfillRejectReason::StaleResetIntent {
-                                        accepted: actor_state.highest_accepted_reset_intent(),
+                                        accepted: actor.actor_state.highest_accepted_reset_intent(),
                                         actual: intent_id,
                                     },
                                 };
                                 if let Err(err) = response.send(result) {
-                                    debug!(?err, cache_key = %cfg.cache_key, "failed to send stale wallet reset result");
+                                    debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send stale wallet reset result");
                                 }
                                 continue;
                             }
-                            let current_reset_generation = actor_state.reset_generation();
+                            let current_reset_generation = actor.actor_state.reset_generation();
                             let acceptance_authority = WalletPrivateMutationAuthority::new(
-                                &worker_handle,
+                                &actor.worker_handle,
                                 current_reset_generation,
-                                &cancel,
+                                &actor.cancel,
                             );
                             let acceptance_permit = match acceptance_authority.acquire().await {
                                 Ok(permit) => permit,
                                 Err(reason) => {
                                     let result = WalletBackfillResetResult::Rejected {
-                                        committed_to: last_scanned,
+                                        committed_to: actor.last_scanned,
                                         reason,
                                     };
                                     if let Err(err) = response.send(result) {
-                                        debug!(?err, cache_key = %cfg.cache_key, "failed to send reset authority rejection");
+                                        debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send reset authority rejection");
                                     }
                                     continue;
                                 }
                             };
-                            let reset_from_block = actor_state.pending_reset()
+                            let reset_from_block = actor.actor_state.pending_reset()
                                 .map_or(from_block, |pending| {
                                     pending.rewind_from_block().min(from_block)
                                 });
                             let replay_plan = PendingWalletReset::merge_replay_plan(
-                                actor_state.pending_reset(),
+                                actor.actor_state.pending_reset(),
                                 replay_plan,
                             );
                             let next_reset_generation = current_reset_generation.wrapping_add(1);
@@ -2326,8 +2294,8 @@ pub(crate) async fn prepare_wallet_worker(
                                 persist_wallet_reset_acceptance_with_token(
                                     &token,
                                     &acceptance_permit,
-                                    cache_store.as_ref(),
-                                    &cfg,
+                                    actor.cache_store.as_ref(),
+                                    &actor.cfg,
                                     intent_id,
                                     accepted_pending_reset,
                                 )?;
@@ -2340,7 +2308,7 @@ pub(crate) async fn prepare_wallet_worker(
                                     from_block: reset_from,
                                     reset_generation: next_reset_generation,
                                 };
-                                let clear_indexed_catch_up = actor_state.transition_with_view(
+                                let clear_indexed_catch_up = actor.actor_state.transition_with_view(
                                     &token,
                                     reset_view,
                                     |mut state| state.accept_reset(accepted_pending_reset),
@@ -2360,23 +2328,23 @@ pub(crate) async fn prepare_wallet_worker(
                                     pending_output_poi_tentative_attempts.clear();
                                 }
                                 Ok(Err(err)) => {
-                                    warn!(?err, cache_key = %cfg.cache_key, intent_id, from_block, "failed to persist wallet reset acceptance");
+                                    warn!(?err, cache_key = %actor.cfg.cache_key, intent_id, from_block, "failed to persist wallet reset acceptance");
                                     let result = WalletBackfillResetResult::Rejected {
-                                        committed_to: last_scanned,
+                                        committed_to: actor.last_scanned,
                                         reason: WalletBackfillRejectReason::PersistenceFailed,
                                     };
                                     if let Err(err) = response.send(result) {
-                                        debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet reset persistence failure");
+                                        debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send wallet reset persistence failure");
                                     }
                                     continue;
                                 }
                                 Err(reason) => {
                                     let result = WalletBackfillResetResult::Rejected {
-                                        committed_to: last_scanned,
+                                        committed_to: actor.last_scanned,
                                         reason,
                                     };
                                     if let Err(err) = response.send(result) {
-                                        debug!(?err, cache_key = %cfg.cache_key, "failed to send reset acceptance rejection");
+                                        debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send reset acceptance rejection");
                                     }
                                     continue;
                                 }
@@ -2388,37 +2356,37 @@ pub(crate) async fn prepare_wallet_worker(
                             let result =
                                 reset_result_after_accept(next_reset_generation, outcome);
                             if let Err(err) = response.send(result) {
-                                debug!(?err, cache_key = %cfg.cache_key, "failed to send wallet reset result");
+                                debug!(?err, cache_key = %actor.cfg.cache_key, "failed to send wallet reset result");
                             }
                         }
                     }
                 }
-                result = live_rx.recv(), if backfill_complete_block.is_some() && actor_state.pending_reset().is_none() => {
+                result = live_rx.recv(), if backfill_complete_block.is_some() && actor.actor_state.pending_reset().is_none() => {
                     match result {
                         Ok(batch) => {
-                            if cfg.sync_to_block.is_some() {
+                            if actor.cfg.sync_to_block.is_some() {
                                 continue;
                             }
                             if backfill_complete_block.is_none()
-                                || batch.to_block <= last_scanned
+                                || batch.to_block <= actor.last_scanned
                             {
                                 live_receiver_lagged = false;
                                 continue;
                             }
-                            let expected_from_block = last_scanned.saturating_add(1);
+                            let expected_from_block = actor.last_scanned.saturating_add(1);
                             if batch.from_block > expected_from_block {
                                 warn!(
-                                    cache_key = %cfg.cache_key,
+                                    cache_key = %actor.cfg.cache_key,
                                     expected_from_block,
                                     batch_from_block = batch.from_block,
                                     batch_to_block = batch.to_block,
                                     live_receiver_lagged,
                                     "wallet live log gap detected; requesting backfill"
                                 );
-                                let current_reset_generation = actor_state.reset_generation();
-                                let token = worker_handle.mint_sync_token(current_reset_generation);
-                                let accepted = actor_state
-                                    .transition_active(&worker_handle, &cancel, |mut state| {
+                                let current_reset_generation = actor.actor_state.reset_generation();
+                                let token = actor.worker_handle.mint_sync_token(current_reset_generation);
+                                let accepted = actor.actor_state
+                                    .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                         state.accept_target(token, batch.to_block)
                                     })
                                     .unwrap_or(false);
@@ -2432,11 +2400,11 @@ pub(crate) async fn prepare_wallet_worker(
                                     token,
                                     backfill_sender.clone(),
                                     liveness,
-                                    cancel.clone(),
+                                    actor.cancel.clone(),
                                 )
                                 .activate();
                                 match backfill_tx.try_send(BackfillRequest::add(
-                                    cfg.cache_key.clone(),
+                                    actor.cfg.cache_key.clone(),
                                     expected_from_block,
                                     batch.to_block,
                                     true,
@@ -2444,19 +2412,19 @@ pub(crate) async fn prepare_wallet_worker(
                                     driver,
                                 )) {
                                     Ok(()) => {
-                                        let _ = actor_state.transition_active(
-                                            &worker_handle,
-                                            &cancel,
+                                        let _ = actor.actor_state.transition_active(
+                                            &actor.worker_handle,
+                                            &actor.cancel,
                                             |mut state| state.backfill_dispatch_admitted(token),
                                         );
                                         backfill_complete_block = None;
                                         live_rx = live_rx.resubscribe();
                                     }
                                     Err(err) => {
-                                        warn!(?err, cache_key = %cfg.cache_key, "failed to request wallet live gap backfill");
-                                        let _ = actor_state.transition_active(
-                                            &worker_handle,
-                                            &cancel,
+                                        warn!(?err, cache_key = %actor.cfg.cache_key, "failed to request wallet live gap backfill");
+                                        let _ = actor.actor_state.transition_active(
+                                            &actor.worker_handle,
+                                            &actor.cancel,
                                             |mut state| {
                                                 state.fail_job_backfill_unavailable(token);
                                             },
@@ -2477,14 +2445,14 @@ pub(crate) async fn prepare_wallet_worker(
                             ) {
                                 Ok(apply) => apply,
                                 Err(err) => {
-                                    warn!(?err, cache_key = %cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to normalize wallet live logs");
+                                    warn!(?err, cache_key = %actor.cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to normalize wallet live logs");
                                     continue;
                                 }
                             };
-                            let current_reset_generation = actor_state.reset_generation();
-                            let live_token = worker_handle.mint_sync_token(current_reset_generation);
-                            let accepted = actor_state
-                                .transition_active(&worker_handle, &cancel, |mut state| {
+                            let current_reset_generation = actor.actor_state.reset_generation();
+                            let live_token = actor.worker_handle.mint_sync_token(current_reset_generation);
+                            let accepted = actor.actor_state
+                                .transition_active(&actor.worker_handle, &actor.cancel, |mut state| {
                                     state.accept_target(live_token, batch.to_block)
                                 })
                                 .unwrap_or(false);
@@ -2492,29 +2460,29 @@ pub(crate) async fn prepare_wallet_worker(
                                 continue;
                             }
                             let outcome = WalletScanCommitRequest {
-                                cache_store: cache_store.as_ref(),
-                                cfg: &cfg,
-                                utxos: &utxos,
-                                worker_handle: &worker_handle,
+                                cache_store: actor.cache_store.as_ref(),
+                                cfg: &actor.cfg,
+                                utxos: &actor.utxos,
+                                worker_handle: &actor.worker_handle,
                                 apply,
                                 job_token: live_token,
                                 current_reset_generation,
                                 event_reset_generation: live_token.reset_generation(),
-                                actor_state: &mut actor_state,
-                                cancel: &cancel,
-                                last_scanned: &mut last_scanned,
-                                persist_state: &mut persist_state,
+                                actor_state: &mut actor.actor_state,
+                                cancel: &actor.cancel,
+                                last_scanned: &mut actor.last_scanned,
+                                persist_state: &mut actor.persist_state,
                                 live_metadata_flush: &mut live_metadata_flush,
-                                public_data_plane: &public_data_plane,
+                                public_data_plane: &actor.public_data_plane,
                             }
                             .commit()
                             .await;
                             match outcome.result {
                                 WalletBackfillApplyResult::Committed { .. }
                                 | WalletBackfillApplyResult::AlreadyCovered { .. } => {
-                                    let _ = actor_state.transition_active(
-                                        &worker_handle,
-                                        &cancel,
+                                    let _ = actor.actor_state.transition_active(
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         |mut state| state.retire_job(live_token),
                                     );
                                     if outcome.changed && poi_status_client.is_some() {
@@ -2524,19 +2492,19 @@ pub(crate) async fn prepare_wallet_worker(
                                             &private_apply,
                                             &poi_jobs,
                                             &poi_refreshing_tx,
-                                            &worker_handle,
-                                            &cancel,
+                                            &actor.worker_handle,
+                                            &actor.cancel,
                                             &db,
-                                            &cache_store,
-                                            &cfg,
-                                            &public_data_plane,
+                                            &actor.cache_store,
+                                            &actor.cfg,
+                                            &actor.public_data_plane,
                                             http_client.as_ref(),
                                             indexed_artifact_source.as_ref(),
-                                            &poi_runtime,
+                                            actor.poi_runtime,
                                             &poi_submitter,
                                             &forest,
-                                            &utxos,
-                                            &active_poi_list_keys,
+                                            &actor.utxos,
+                                            &actor.active_poi_list_keys,
                                             false,
                                         );
                                     }
@@ -2555,11 +2523,11 @@ pub(crate) async fn prepare_wallet_worker(
                                         live_token,
                                         backfill_sender.clone(),
                                         liveness,
-                                        cancel.clone(),
+                                        actor.cancel.clone(),
                                     )
                                     .activate();
                                     let retry = BackfillRequest::add(
-                                        cfg.cache_key.clone(),
+                                        actor.cfg.cache_key.clone(),
                                         expected_from_block,
                                         batch.to_block,
                                         false,
@@ -2568,9 +2536,9 @@ pub(crate) async fn prepare_wallet_worker(
                                     );
                                     match backfill_tx.try_send(retry) {
                                         Ok(()) => {
-                                            let _ = actor_state.transition_active(
-                                                &worker_handle,
-                                                &cancel,
+                                            let _ = actor.actor_state.transition_active(
+                                                &actor.worker_handle,
+                                                &actor.cancel,
                                                 |mut state| {
                                                     state.backfill_dispatch_admitted(live_token)
                                                 },
@@ -2579,10 +2547,10 @@ pub(crate) async fn prepare_wallet_worker(
                                             live_rx = live_rx.resubscribe();
                                         }
                                         Err(err) => {
-                                            warn!(?err, cache_key = %cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to enqueue wallet live persistence retry");
-                                            let _ = actor_state.transition_active(
-                                                &worker_handle,
-                                                &cancel,
+                                            warn!(?err, cache_key = %actor.cfg.cache_key, from_block = expected_from_block, to_block = batch.to_block, "failed to enqueue wallet live persistence retry");
+                                            let _ = actor.actor_state.transition_active(
+                                                &actor.worker_handle,
+                                                &actor.cancel,
                                                 |mut state| {
                                                     state.fail_job_backfill_unavailable(live_token);
                                                 },
@@ -2591,19 +2559,19 @@ pub(crate) async fn prepare_wallet_worker(
                                     }
                                 }
                                 WalletBackfillApplyResult::Rejected { reason, .. } => {
-                                    let _ = actor_state.transition_active(
-                                        &worker_handle,
-                                        &cancel,
+                                    let _ = actor.actor_state.transition_active(
+                                        &actor.worker_handle,
+                                        &actor.cancel,
                                         |mut state| state.retire_job(live_token),
                                     );
-                                    warn!(?reason, cache_key = %cfg.cache_key, "wallet live scan batch rejected");
+                                    warn!(?reason, cache_key = %actor.cfg.cache_key, "wallet live scan batch rejected");
                                 }
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             live_receiver_lagged = true;
-                            warn!(cache_key = %cfg.cache_key, skipped, "wallet live log receiver lagged");
+                            warn!(cache_key = %actor.cfg.cache_key, skipped, "wallet live log receiver lagged");
                         }
                     }
                 }
@@ -2611,14 +2579,14 @@ pub(crate) async fn prepare_wallet_worker(
         }
         // Cancellation and terminal observation share the lifecycle fence. Registration
         // retirement may win first, in which case this epilogue cannot publish again.
-        let _ = worker_handle.publish_terminal_shutdown_if_allowed(|token| {
-            actor_state.transition_terminal_shutdown(
+        let _ = actor.worker_handle.publish_terminal_shutdown_if_allowed(|token| {
+            actor.actor_state.transition_terminal_shutdown(
                 &token,
                 WalletInactiveReason::Shutdown,
-                worker_handle.authority_reset_generation(),
+                actor.worker_handle.authority_reset_generation(),
             );
-            if let Err(err) = worker_handle.indexed_catch_up_tx.send(None) {
-                debug!(?err, cache_key = %cfg.cache_key, "failed to clear indexed wallet catch-up status on shutdown");
+            if let Err(err) = actor.worker_handle.indexed_catch_up_tx.send(None) {
+                debug!(?err, cache_key = %actor.cfg.cache_key, "failed to clear indexed wallet catch-up status on shutdown");
             }
         });
     }
