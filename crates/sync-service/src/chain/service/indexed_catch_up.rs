@@ -9,7 +9,7 @@ use super::{
     BackfillEvent, CancellationToken, ChainService, IndexedWalletArtifactPageOutcome,
     IndexedWalletArtifactSession, IndexedWalletCatchUpSourceOrder, IndexedWalletPage,
     IndexedWalletPageKind, Instant, PublicDataPlaneDiagnosticKind, PublicScanRange,
-    PublicScanReadScope, PublicScanSource, SquidIndexedWalletReadSession, SyncProgressSender,
+    PublicScanReadScope, SquidIndexedWalletReadSession, SyncProgressSender,
     WalletBackfillStartResult, WalletConfig, WalletIndexedCatchUpSource, WalletScanApply,
     WalletStartupSyncError, WalletSyncContext, debug, info, mpsc, wallet_has_persistence_failure,
     warn,
@@ -570,19 +570,15 @@ impl ChainService {
             };
             if let Some((session, squid_target)) = squid_tail {
                 let artifact_target = target;
-                let squid_tail_read_scope = session.read_scope();
                 active = IndexedCatchUpSession::squid(session);
                 target = squid_target;
-                status_guard.set(active.source(), from_block, target);
-                self.public_data_plane
-                    .record_source_decision(
-                        PublicDataPlaneDiagnosticKind::SourceFallback,
-                        PublicScanSource::Squid,
-                        PublicScanRange::new(from_block, target),
-                        squid_tail_read_scope,
-                        "artifact source exhausted before Squid tail",
-                    )
-                    .await;
+                self.record_indexed_source_fallback(
+                    &status_guard,
+                    &active,
+                    PublicScanRange::new(from_block, target),
+                    "artifact source exhausted before Squid tail",
+                )
+                .await;
                 info!(
                     cache_key = %cfg.cache_key,
                     indexed_source = active.source().as_str(),
@@ -638,19 +634,15 @@ impl ChainService {
                     break;
                 };
                 let artifact_target = target;
-                let squid_tail_read_scope = session.read_scope();
                 active = IndexedCatchUpSession::squid(session);
                 target = squid_target;
-                status_guard.set(active.source(), from_block, target);
-                self.public_data_plane
-                    .record_source_decision(
-                        PublicDataPlaneDiagnosticKind::SourceFallback,
-                        PublicScanSource::Squid,
-                        PublicScanRange::new(from_block, target),
-                        squid_tail_read_scope,
-                        "artifact source exhausted before Squid tail",
-                    )
-                    .await;
+                self.record_indexed_source_fallback(
+                    &status_guard,
+                    &active,
+                    PublicScanRange::new(from_block, target),
+                    "artifact source exhausted before Squid tail",
+                )
+                .await;
                 info!(
                     cache_key = %cfg.cache_key,
                     indexed_source = active.source().as_str(),
@@ -752,19 +744,15 @@ impl ChainService {
                             driver.retire(&cfg.cache_key).await;
                             return IndexedWalletCatchUpOutcome::Unavailable(checkpoint);
                         };
-                        let fallback_read_scope = session.read_scope();
                         active = IndexedCatchUpSession::squid(session);
                         target = active.indexed_height().min(safe_head);
-                        status_guard.set(active.source(), from_block, target);
-                        self.public_data_plane
-                            .record_source_decision(
-                                PublicDataPlaneDiagnosticKind::SourceFallback,
-                                PublicScanSource::Squid,
-                                PublicScanRange::new(from_block, target),
-                                fallback_read_scope,
-                                "artifact page failed before checkpoint",
-                            )
-                            .await;
+                        self.record_indexed_source_fallback(
+                            &status_guard,
+                            &active,
+                            PublicScanRange::new(from_block, target),
+                            "artifact page failed before checkpoint",
+                        )
+                        .await;
                         info!(
                             cache_key = %cfg.cache_key,
                             indexed_source = active.source().as_str(),
@@ -824,16 +812,13 @@ impl ChainService {
                         };
                         target = session.target_block();
                         active = IndexedCatchUpSession::Artifacts(session);
-                        status_guard.set(active.source(), from_block, target);
-                        self.public_data_plane
-                            .record_source_decision(
-                                PublicDataPlaneDiagnosticKind::SourceFallback,
-                                PublicScanSource::IndexedArtifacts,
-                                PublicScanRange::new(from_block, target),
-                                active.read_scope(),
-                                "Squid page failed before checkpoint",
-                            )
-                            .await;
+                        self.record_indexed_source_fallback(
+                            &status_guard,
+                            &active,
+                            PublicScanRange::new(from_block, target),
+                            "Squid page failed before checkpoint",
+                        )
+                        .await;
                         info!(
                             cache_key = %cfg.cache_key,
                             indexed_source = active.source().as_str(),
@@ -1175,5 +1160,26 @@ impl ChainService {
         };
         let target = session.target_block();
         Ok((IndexedCatchUpSession::Artifacts(session), target))
+    }
+
+    /// Publishes `active` as the catch-up source for `range` and records the switch to it as a
+    /// source fallback with `reason`.
+    async fn record_indexed_source_fallback(
+        &self,
+        status_guard: &WalletIndexedCatchUpStatusGuard<'_>,
+        active: &IndexedCatchUpSession,
+        range: PublicScanRange,
+        reason: &'static str,
+    ) {
+        status_guard.set(active.source(), range.from_block, range.to_block);
+        self.public_data_plane
+            .record_source_decision(
+                PublicDataPlaneDiagnosticKind::SourceFallback,
+                active.source().into(),
+                range,
+                active.read_scope(),
+                reason,
+            )
+            .await;
     }
 }
