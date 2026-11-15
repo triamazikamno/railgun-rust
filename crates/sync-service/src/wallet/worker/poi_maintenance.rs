@@ -268,15 +268,17 @@ struct PoiMaintenanceJob {
     forced_deferrals: DeferredForcedSubmissions,
 }
 
-struct PoiMaintenanceOutcome {
-    recovered: usize,
-    candidate_report: SenderCandidateRecoveryReport,
-    recovery_error: Option<PoiMaintenanceError>,
-    forced_pending_attempts: usize,
-    submitted: usize,
-    verified_completed: usize,
-    verified_pending: usize,
-    verified_errors: usize,
+/// What a finished POI maintenance job reports back to the actor.
+#[derive(Debug)]
+pub(super) struct PoiMaintenanceOutcome {
+    pub(super) recovered: usize,
+    pub(super) candidate_report: SenderCandidateRecoveryReport,
+    pub(super) recovery_error: Option<PoiMaintenanceError>,
+    pub(super) forced_pending_attempts: usize,
+    pub(super) submitted: usize,
+    pub(super) verified_completed: usize,
+    pub(super) verified_pending: usize,
+    pub(super) verified_errors: usize,
 }
 
 impl PoiMaintenanceJob {
@@ -292,14 +294,7 @@ impl PoiMaintenanceJob {
                 Ok(outcome) => WalletRemoteDone::PoiMaintenance {
                     credential,
                     key,
-                    recovered: outcome.recovered,
-                    candidate_report: Box::new(outcome.candidate_report),
-                    recovery_error: outcome.recovery_error,
-                    forced_pending_attempts: outcome.forced_pending_attempts,
-                    submitted: outcome.submitted,
-                    verified_completed: outcome.verified_completed,
-                    verified_pending: outcome.verified_pending,
-                    verified_errors: outcome.verified_errors,
+                    outcome: Box::new(outcome),
                 },
                 Err(reason) => {
                     warn!(

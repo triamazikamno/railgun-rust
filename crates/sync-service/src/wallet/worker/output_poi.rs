@@ -123,16 +123,7 @@ pub(super) fn spawn_pending_output_poi_tentative_job(
         )
         .await;
         let _ = done_tx
-            .send(WalletRemoteDone::PendingOutputPoiTentative {
-                credential,
-                retryable: result.retryable,
-                accepted_candidates: result.accepted_candidates,
-                accepted: result.accepted,
-                missing_txid: result.missing_txid,
-                remote_failure: result.remote_failure,
-                context_stale: result.context_stale,
-                authority_stale: result.authority_stale,
-            })
+            .send(WalletRemoteDone::PendingOutputPoiTentative { credential, result })
             .await;
     });
 }

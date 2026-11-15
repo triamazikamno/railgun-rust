@@ -3,8 +3,9 @@
 //! Invariants:
 //! 1. Only the wallet actor mutates private durable state and publishes mirrors.
 //! 2. Actor turns do local work / spawn remote jobs; they do not await remote POI/RPC.
-//! 3. Remote POI jobs re-enter via [`crate::wallet::WalletPrivateApplyClient`] (or
-//!    [`WalletRemoteDone`]) for durable apply; jobs never write UTXO mirrors directly.
+//! 3. Remote POI jobs re-enter via [`crate::wallet::WalletPrivateApplyClient`] (or the
+//!    worker's `WalletRemoteDone` messages) for durable apply; jobs never write UTXO mirrors
+//!    directly.
 //! 4. Remote results apply only if actor credential is still current.
 //! 5. While durable pending reset is set, published private view is fenced; chain
 //!    scheduling uses public `schedulable_progress` / `wait_schedulable_progress` only
@@ -1488,38 +1489,6 @@ pub(crate) struct PoiRemoteJobKey {
 pub(crate) enum PoiRemoteJobKind {
     /// Verify submitted + optional force-resubmit + recovery + submit observations.
     Maintenance,
-}
-
-/// Remote work completion messages re-entering the wallet actor (never applied off-loop bookkeeping only).
-#[derive(Debug)]
-pub(crate) enum WalletRemoteDone {
-    PoiMaintenance {
-        credential: WalletActorCredential,
-        key: PoiRemoteJobKey,
-        recovered: usize,
-        candidate_report: Box<super::SenderCandidateRecoveryReport>,
-        recovery_error: Option<super::PoiMaintenanceError>,
-        forced_pending_attempts: usize,
-        submitted: usize,
-        verified_completed: usize,
-        verified_pending: usize,
-        verified_errors: usize,
-    },
-    PoiMaintenanceAborted {
-        credential: WalletActorCredential,
-        key: PoiRemoteJobKey,
-        reason: &'static str,
-    },
-    PendingOutputPoiTentative {
-        credential: WalletActorCredential,
-        retryable: Vec<super::PendingOutputPoiTentativeAttemptKey>,
-        accepted_candidates: Vec<super::PendingOutputPoiTentativeCandidate>,
-        accepted: usize,
-        missing_txid: usize,
-        remote_failure: usize,
-        context_stale: usize,
-        authority_stale: bool,
-    },
 }
 
 #[cfg(test)]

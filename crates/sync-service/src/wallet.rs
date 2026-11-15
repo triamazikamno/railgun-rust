@@ -82,7 +82,7 @@ use actor::{PendingWalletReset, WalletActorState};
 pub(crate) use actor::{
     PoiRemoteJobKey, WalletActorApplyToken, WalletActorCommitToken, WalletActorCredential,
     WalletActorLifecycle, WalletActorLifecycleCell, WalletActorTerminalToken,
-    WalletObservationPublisher, WalletRemoteDone,
+    WalletObservationPublisher,
 };
 use delta::{
     apply_wallet_delta_to_vec_with_outcome, chain_pending_overlay_matches, rewind_wallet_utxos,

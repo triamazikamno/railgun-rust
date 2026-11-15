@@ -1,5 +1,7 @@
 use super::handle::LOCAL_PENDING_SPENT_TTL;
-use super::pending_output_poi::pending_output_poi_handoff_context;
+use super::pending_output_poi::{
+    PendingOutputPoiTentativeSubmissionResult, pending_output_poi_handoff_context,
+};
 use super::{
     Arc, AtomicU64, BackfillEvent, CancellationToken, ChainError, ChainPublicDataPlane, DbStore,
     DeferredForcedSubmissions, Duration, FixedBytes, FuturesUnordered, HashSet,
@@ -22,9 +24,9 @@ use super::{
     WalletPrivateApplyRequest, WalletPrivateCommit, WalletPrivateMutationAuthority,
     WalletPrivateMutationPermit, WalletPrivatePoiClients, WalletPrivateRequest,
     WalletPrivateRequestError, WalletProgressPersist, WalletProgressPrivateEffects,
-    WalletReadinessError, WalletRemoteDone, WalletResetReplayPlan, WalletResetRewindStatus,
-    WalletScanApply, WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncActorStateRecord,
-    WalletSyncToken, WalletUtxo, WalletUtxoMutation, WalletViewState, WalletWorkerServices,
+    WalletReadinessError, WalletResetReplayPlan, WalletResetRewindStatus, WalletScanApply,
+    WalletScanRowsPayload, WalletSyncActorStateCommit, WalletSyncActorStateRecord, WalletSyncToken,
+    WalletUtxo, WalletUtxoMutation, WalletViewState, WalletWorkerServices,
     apply_owned_poi_private_delta_on_actor_with_active_lists,
     apply_wallet_delta_to_vec_with_outcome, broadcast, chain_pending_overlay_matches, debug,
     default_active_poi_list_keys, force_resubmit_matching_pending_output_pois_authorized, info,
@@ -74,8 +76,8 @@ use output_poi::{
     refresh_tentative_pending_output_poi_statuses, spawn_pending_output_poi_tentative_job,
 };
 use poi_maintenance::{
-    current_ppoi_workflow_status_for_candidate_report, next_poi_corpus_revision,
-    wallet_poi_refresh_interval,
+    PoiMaintenanceOutcome, current_ppoi_workflow_status_for_candidate_report,
+    next_poi_corpus_revision, wallet_poi_refresh_interval,
 };
 
 const fn wallet_private_request_error(
@@ -157,6 +159,25 @@ impl Drop for PreparedWalletWorker {
             self.cancel.cancel();
         }
     }
+}
+
+/// Remote work completion messages re-entering the wallet actor (never applied off-loop bookkeeping only).
+#[derive(Debug)]
+enum WalletRemoteDone {
+    PoiMaintenance {
+        credential: WalletActorCredential,
+        key: PoiRemoteJobKey,
+        outcome: Box<PoiMaintenanceOutcome>,
+    },
+    PoiMaintenanceAborted {
+        credential: WalletActorCredential,
+        key: PoiRemoteJobKey,
+        reason: &'static str,
+    },
+    PendingOutputPoiTentative {
+        credential: WalletActorCredential,
+        result: PendingOutputPoiTentativeSubmissionResult,
+    },
 }
 
 /// Background POI jobs started by the wallet actor.
@@ -583,15 +604,18 @@ pub(crate) async fn prepare_wallet_worker(
                         WalletRemoteDone::PoiMaintenance {
                             credential,
                             key,
-                            recovered,
-                            candidate_report,
-                            recovery_error,
-                            forced_pending_attempts,
-                            submitted,
-                            verified_completed,
-                            verified_pending,
-                            verified_errors,
+                            outcome,
                         } => {
+                            let PoiMaintenanceOutcome {
+                                recovered,
+                                candidate_report,
+                                recovery_error,
+                                forced_pending_attempts,
+                                submitted,
+                                verified_completed,
+                                verified_pending,
+                                verified_errors,
+                            } = *outcome;
                             // Always complete phase first (may start deferred force follow-up).
                             actor.on_poi_maintenance_done(key);
                             if !credential.is_current(&actor.worker_handle) {
@@ -703,14 +727,18 @@ pub(crate) async fn prepare_wallet_worker(
                         }
                         WalletRemoteDone::PendingOutputPoiTentative {
                             credential,
-                            accepted_candidates,
-                            retryable,
-                            accepted,
-                            missing_txid,
-                            remote_failure,
-                            context_stale,
-                            authority_stale: _authority_stale,
+                            result,
                         } => {
+                            let PendingOutputPoiTentativeSubmissionResult {
+                                succeeded: _,
+                                accepted_candidates,
+                                retryable,
+                                accepted,
+                                missing_txid,
+                                remote_failure,
+                                context_stale,
+                                authority_stale: _authority_stale,
+                            } = result;
                             if !credential.is_current(&actor.worker_handle) {
                                 debug!("stale tentative pending output POI result dropped");
                                 continue;

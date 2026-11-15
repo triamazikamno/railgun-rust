@@ -41,7 +41,8 @@ mod workflow_status;
 use delta_apply::apply_poi_private_delta_inline;
 pub(super) use tentative::{
     PendingOutputPoiTentativeAttemptKey, PendingOutputPoiTentativeCandidate,
-    PendingOutputPoiTentativeLocalStatus, prepare_pending_output_poi_tentative_candidates,
+    PendingOutputPoiTentativeLocalStatus, PendingOutputPoiTentativeSubmissionResult,
+    prepare_pending_output_poi_tentative_candidates,
     read_pending_output_poi_tentative_local_statuses,
     submit_pending_output_poi_tentative_candidates,
 };
