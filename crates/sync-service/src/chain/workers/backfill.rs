@@ -9,9 +9,9 @@ use crate::chain::{
 use super::{
     Arc, BackfillRequest, CancellationToken, ChainService, DynProvider,
     INDEXED_TAIL_FALLBACK_COOLDOWN, INDEXED_TAIL_FALLBACK_MIN_STALL, Instant, Instrument, LogBatch,
-    PublicScanSource, QueryRpcPool, WalletScanApply, WalletScanRows, WalletScanRowsPayload,
-    await_wallet_cancellation, debug, info, min, mpsc, sort_logs, wallet_backfill_lag_blocks, warn,
-    watch,
+    ProviderHandle, PublicScanSource, QueryRpcPool, WalletScanApply, WalletScanRows,
+    WalletScanRowsPayload, await_wallet_cancellation, debug, info, min, mpsc, sort_logs,
+    wallet_backfill_lag_blocks, warn, watch,
 };
 
 /// Remaining RPC backfill pages above which the indexed tail fallback is
@@ -110,19 +110,12 @@ impl BackfillLoop {
                 tokio::select! {
                     () = self.cancel.cancelled() => break,
                     Some(request) = self.backfill_rx.recv() => {
-                        let active_actor = current_backfill_actor(&self.service).await;
-                        apply_backfill_request(
-                            &mut self.cursor,
-                            request,
-                            Instant::now(),
-                            active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
-                        )
-                        .await;
+                        accept_backfill_request(&self.service, &mut self.cursor, request).await;
                     }
                     _ = self.safe_head_rx.changed() => {},
                 }
                 // Re-enter the loop immediately so that pending requests in
-                // self.backfill_rx are picked up without an unnecessary poll_interval
+                // backfill_rx are picked up without an unnecessary poll_interval
                 // delay.
                 continue;
             }
@@ -130,7 +123,7 @@ impl BackfillLoop {
             let safe_head = *self.safe_head_rx.borrow();
             self.cursor
                 .as_mut()
-                .expect("self.cursor installed")
+                .expect("cursor installed")
                 .cursor
                 .refresh_target(safe_head);
             reconcile_retained_acquisition(&self.service, &mut self.cursor).await;
@@ -140,7 +133,7 @@ impl BackfillLoop {
             if !self
                 .cursor
                 .as_ref()
-                .expect("self.cursor installed")
+                .expect("cursor installed")
                 .cursor
                 .is_runnable(now)
             {
@@ -148,11 +141,11 @@ impl BackfillLoop {
                     .cursor
                     .as_ref()
                     .and_then(|slot| slot.cursor.persistence_retry_at())
-                    .expect("deferred wallet self.cursor has retry deadline");
+                    .expect("deferred wallet cursor has retry deadline");
                 let actor_cancel = self
                     .cursor
                     .as_ref()
-                    .expect("self.cursor installed")
+                    .expect("cursor installed")
                     .cursor
                     .driver
                     .cancellation_token();
@@ -163,14 +156,7 @@ impl BackfillLoop {
                     }
                     request = self.backfill_rx.recv() => {
                         let Some(request) = request else { break };
-                        let active_actor = current_backfill_actor(&self.service).await;
-                        apply_backfill_request(
-                            &mut self.cursor,
-                            request,
-                            Instant::now(),
-                            active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
-                        )
-                        .await;
+                        accept_backfill_request(&self.service, &mut self.cursor, request).await;
                     }
                     changed = self.safe_head_rx.changed() => {
                         if changed.is_err() { break; }
@@ -188,7 +174,7 @@ impl BackfillLoop {
                 .as_ref()
                 .is_some_and(|slot| slot.cursor.is_runnable(now) && slot.cursor.can_finish())
             {
-                // The self.cursor delivered its target, so the startup window's
+                // The cursor delivered its target, so the startup window's
                 // leading blocks can now be warmed without delaying the wallet.
                 if let Some((from_block, to_block)) = self
                     .cursor
@@ -199,7 +185,7 @@ impl BackfillLoop {
                         .start_public_scan_window_warm(PublicScanRange::new(from_block, to_block))
                         .await;
                 }
-                let slot = self.cursor.as_ref().expect("self.cursor installed");
+                let slot = self.cursor.as_ref().expect("cursor installed");
                 let key = slot.cache_key.clone();
                 let cancellation = slot.cursor.driver.cancellation_token();
                 let Some(result) = await_wallet_cancellation(
@@ -268,7 +254,7 @@ impl BackfillLoop {
             });
             let indexed_tail_attempt = match indexed_tail_attempt {
                 Some(attempt) => {
-                    // Short-lived read; the self.service call below takes the same lock.
+                    // Short-lived read; the service call below takes the same lock.
                     let enabled = {
                         let wallet = self.service.wallet.read().await;
                         wallet.as_ref().is_some_and(|registration| {
@@ -294,7 +280,7 @@ impl BackfillLoop {
                 let cancellation = self
                     .cursor
                     .as_ref()
-                    .expect("self.cursor exists during indexed tail fallback")
+                    .expect("cursor exists during indexed tail fallback")
                     .cursor
                     .driver
                     .cancellation_token();
@@ -368,14 +354,7 @@ impl BackfillLoop {
                         }
                         request = self.backfill_rx.recv() => {
                             let Some(request) = request else { break };
-                            let active_actor = current_backfill_actor(&self.service).await;
-                            apply_backfill_request(
-                                &mut self.cursor,
-                                request,
-                                Instant::now(),
-                                active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
-                            )
-                            .await;
+                            accept_backfill_request(&self.service, &mut self.cursor, request).await;
                         }
                         changed = self.safe_head_rx.changed() => {
                             if changed.is_err() { break; }
@@ -404,7 +383,7 @@ impl BackfillLoop {
             let cancellation = self
                 .cursor
                 .as_ref()
-                .expect("self.cursor installed before remote backfill")
+                .expect("cursor installed before remote backfill")
                 .cursor
                 .driver
                 .cancellation_token();
@@ -467,15 +446,8 @@ impl BackfillLoop {
                                 rpc_index = rpc.index,
                                 "failed to fetch backfill log block timestamps"
                             );
-                            if mark_unhealthy {
-                                self.rpcs.mark_bad_provider(&rpc);
-                            } else {
-                                let _ = await_wallet_cancellation(
-                                    &cancellation,
-                                    tokio::time::sleep(self.service.chain.sync.poll_interval),
-                                )
+                            self.back_off_after_rpc_error(&rpc, mark_unhealthy, &cancellation)
                                 .await;
-                            }
                             continue;
                         }
                     };
@@ -523,15 +495,8 @@ impl BackfillLoop {
                                     archive_endpoint,
                                     "failed to fetch backfill RPC archive-boundary hash"
                                 );
-                                if mark_unhealthy {
-                                    self.rpcs.mark_bad_provider(&rpc);
-                                } else {
-                                    let _ = await_wallet_cancellation(
-                                        &cancellation,
-                                        tokio::time::sleep(self.service.chain.sync.poll_interval),
-                                    )
+                                self.back_off_after_rpc_error(&rpc, mark_unhealthy, &cancellation)
                                     .await;
-                                }
                                 continue;
                             }
                         }
@@ -568,15 +533,8 @@ impl BackfillLoop {
                                 to_block,
                                 "failed to fetch backfill block hash"
                             );
-                            if mark_unhealthy {
-                                self.rpcs.mark_bad_provider(&rpc);
-                            } else {
-                                let _ = await_wallet_cancellation(
-                                    &cancellation,
-                                    tokio::time::sleep(self.service.chain.sync.poll_interval),
-                                )
+                            self.back_off_after_rpc_error(&rpc, mark_unhealthy, &cancellation)
                                 .await;
-                            }
                             continue;
                         }
                     };
@@ -727,7 +685,7 @@ impl BackfillLoop {
                             &cancellation,
                             self.cursor
                                 .as_ref()
-                                .expect("wallet self.cursor exists while applying")
+                                .expect("wallet cursor exists while applying")
                                 .cursor
                                 .driver
                                 .apply(&key, apply),
@@ -813,19 +771,31 @@ impl BackfillLoop {
                         to_block,
                         "failed to fetch backfill logs"
                     );
-                    if mark_unhealthy {
-                        self.rpcs.mark_bad_provider(&rpc);
-                    } else {
-                        let _ = await_wallet_cancellation(
-                            &cancellation,
-                            tokio::time::sleep(self.service.chain.sync.poll_interval),
-                        )
+                    self.back_off_after_rpc_error(&rpc, mark_unhealthy, &cancellation)
                         .await;
-                    }
                 }
             }
         }
         retire_backfill_loop_state(&mut self.cursor, &mut self.backfill_rx).await;
+    }
+
+    /// Marks `rpc` bad when the error says so; otherwise waits a poll interval unless the
+    /// cursor is cancelled first.
+    async fn back_off_after_rpc_error(
+        &self,
+        rpc: &ProviderHandle,
+        mark_unhealthy: bool,
+        cancellation: &CancellationToken,
+    ) {
+        if mark_unhealthy {
+            self.rpcs.mark_bad_provider(rpc);
+        } else {
+            let _ = await_wallet_cancellation(
+                cancellation,
+                tokio::time::sleep(self.service.chain.sync.poll_interval),
+            )
+            .await;
+        }
     }
 }
 
@@ -1166,15 +1136,24 @@ async fn drain_pending_backfill_requests_for_service(
     cursor: &mut Option<WalletBackfillSlot>,
 ) {
     while let Ok(request) = backfill_rx.try_recv() {
-        let active_actor = current_backfill_actor(service).await;
-        apply_backfill_request(
-            cursor,
-            request,
-            Instant::now(),
-            active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
-        )
-        .await;
+        accept_backfill_request(service, cursor, request).await;
     }
+}
+
+/// Applies a queued backfill request against the wallet actor registered now.
+async fn accept_backfill_request(
+    service: &ChainService,
+    cursor: &mut Option<WalletBackfillSlot>,
+    request: BackfillRequest,
+) {
+    let active_actor = current_backfill_actor(service).await;
+    apply_backfill_request(
+        cursor,
+        request,
+        Instant::now(),
+        active_actor.as_ref().map(|(key, id)| (key.as_str(), *id)),
+    )
+    .await;
 }
 
 async fn current_backfill_actor(service: &ChainService) -> Option<(String, u64)> {
