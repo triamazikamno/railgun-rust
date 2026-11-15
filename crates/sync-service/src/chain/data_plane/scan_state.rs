@@ -201,6 +201,13 @@ impl ChainPublicDataPlaneState {
         }
     }
 
+    /// Publishes the coverage and row pages of a snapshot staged from
+    /// [`Self::transaction_snapshot`]; diagnostics and POI corpora stay live.
+    pub(super) fn commit_snapshot(&mut self, staged: Self) {
+        self.coverage = staged.coverage;
+        self.recent_scan_rows = staged.recent_scan_rows;
+    }
+
     pub(super) fn insert_canonical_coverage(&mut self, record: PublicScanCoverageRecord) {
         self.coverage.insert_canonical(record);
     }

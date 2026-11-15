@@ -80,70 +80,18 @@ impl ChainPublicDataPlane {
         let mut state = self.state.lock().await;
         let current_epoch = self.current_epoch();
         let base = state.transaction_snapshot();
-        let mut ordinary = base.transaction_snapshot();
-        if let Err(error) = Self::stage_wallet_scan_apply(&mut ordinary, current_epoch, apply, &[])
-        {
-            if matches!(&error, PublicDataPlaneError::StaleEpoch { .. }) {
-                Self::push_stale_coverage_diagnostic(
-                    &mut state,
-                    current_epoch,
-                    apply.rows.source,
-                    PublicScanRange::new(apply.from_block, apply.to_block),
-                );
-            }
-            return Err(error);
-        }
-        Self::ensure_recent_scan_row_page_limit(&ordinary)?;
-        let (final_staged, outcome) = if let Some(candidate) = candidate {
-            let proposed_ranges = [candidate.range];
-            let mut trial = base.transaction_snapshot();
-            let proposal_result = (|| {
-                Self::stage_wallet_scan_apply(&mut trial, current_epoch, apply, &proposed_ranges)?;
-                if !Self::cached_wallet_scan_is_exact(&trial, candidate.range, current_epoch)
-                    || trial.recent_scan_rows.len() > RECENT_PUBLIC_SCAN_ROW_PAGE_LIMIT
-                {
-                    let mut validation_state = base.transaction_snapshot();
-                    let compacted = Self::compact_completed_wallet_scan_acquisition(
-                        &mut validation_state,
-                        current_epoch,
-                        candidate.range,
-                        &candidate.applies,
-                    )?;
-                    Self::stage_compacted_wallet_scan_acquisition(
-                        &mut trial,
-                        current_epoch,
-                        &compacted,
-                        &proposed_ranges,
-                    )?;
-                }
-                Self::ensure_recent_scan_row_page_limit(&trial)?;
-                if !Self::cached_wallet_scan_is_exact(&trial, candidate.range, current_epoch) {
-                    return Err(PublicDataPlaneError::InvalidCompletedAcquisition {
-                        reason: "accepted acquisition is not exactly replayable".to_string(),
-                    });
-                }
-                Ok(())
-            })();
-            match proposal_result {
-                Ok(()) => (trial, Some(WalletScanAcquisitionOutcome::Retained)),
-                Err(error) => {
-                    let outcome = if matches!(
-                        &error,
-                        PublicDataPlaneError::CompletedAcquisitionRowPageLimit { .. }
-                    ) {
-                        WalletScanAcquisitionOutcome::NonRetainable(error)
-                    } else {
-                        WalletScanAcquisitionOutcome::Rejected(error)
-                    };
-                    (ordinary, Some(outcome))
+        let ordinary = Self::stage_ordinary_apply(&mut state, &base, current_epoch, apply)?;
+        let (final_staged, outcome) = match candidate {
+            Some(candidate) => {
+                match Self::stage_retained_acquisition(&base, current_epoch, apply, candidate) {
+                    Ok(trial) => (trial, Some(WalletScanAcquisitionOutcome::Retained)),
+                    Err(error) => (ordinary, Some(rejected_acquisition_outcome(error))),
                 }
             }
-        } else {
-            (ordinary, None)
+            None => (ordinary, None),
         };
 
-        state.coverage = final_staged.coverage;
-        state.recent_scan_rows = final_staged.recent_scan_rows;
+        state.commit_snapshot(final_staged);
         state.push_diagnostic(PublicDataPlaneDiagnostic {
             kind: PublicDataPlaneDiagnosticKind::CoverageRecorded,
             source: Some(apply.rows.source),
@@ -155,6 +103,69 @@ impl ChainPublicDataPlane {
             epoch: current_epoch,
         });
         Ok((current_epoch, outcome))
+    }
+
+    /// Stages `apply` alone into a snapshot of `base`. A stale epoch is also
+    /// reported on `live_state`, since diagnostics on the snapshot are dropped.
+    fn stage_ordinary_apply(
+        live_state: &mut ChainPublicDataPlaneState,
+        base: &ChainPublicDataPlaneState,
+        current_epoch: PublicDataPlaneEpoch,
+        apply: &WalletScanApply,
+    ) -> Result<ChainPublicDataPlaneState, PublicDataPlaneError> {
+        let mut ordinary = base.transaction_snapshot();
+        if let Err(error) = Self::stage_wallet_scan_apply(&mut ordinary, current_epoch, apply, &[])
+        {
+            if matches!(&error, PublicDataPlaneError::StaleEpoch { .. }) {
+                Self::push_stale_coverage_diagnostic(
+                    live_state,
+                    current_epoch,
+                    apply.rows.source,
+                    PublicScanRange::new(apply.from_block, apply.to_block),
+                );
+            }
+            return Err(error);
+        }
+        Self::ensure_recent_scan_row_page_limit(&ordinary)?;
+        Ok(ordinary)
+    }
+
+    /// Stages `apply` into a snapshot of `base` that also keeps `candidate`
+    /// exactly replayable, compacting the candidate's applies only when the
+    /// apply alone does not.
+    fn stage_retained_acquisition(
+        base: &ChainPublicDataPlaneState,
+        current_epoch: PublicDataPlaneEpoch,
+        apply: &WalletScanApply,
+        candidate: &WalletScanAcquisitionCandidate,
+    ) -> Result<ChainPublicDataPlaneState, PublicDataPlaneError> {
+        let proposed_ranges = [candidate.range];
+        let mut trial = base.transaction_snapshot();
+        Self::stage_wallet_scan_apply(&mut trial, current_epoch, apply, &proposed_ranges)?;
+        if !Self::cached_wallet_scan_is_exact(&trial, candidate.range, current_epoch)
+            || trial.recent_scan_rows.len() > RECENT_PUBLIC_SCAN_ROW_PAGE_LIMIT
+        {
+            let mut validation_state = base.transaction_snapshot();
+            let compacted = Self::compact_completed_wallet_scan_acquisition(
+                &mut validation_state,
+                current_epoch,
+                candidate.range,
+                &candidate.applies,
+            )?;
+            Self::stage_compacted_wallet_scan_acquisition(
+                &mut trial,
+                current_epoch,
+                &compacted,
+                &proposed_ranges,
+            )?;
+        }
+        Self::ensure_recent_scan_row_page_limit(&trial)?;
+        if !Self::cached_wallet_scan_is_exact(&trial, candidate.range, current_epoch) {
+            return Err(PublicDataPlaneError::InvalidCompletedAcquisition {
+                reason: "accepted acquisition is not exactly replayable".to_string(),
+            });
+        }
+        Ok(trial)
     }
 
     pub(crate) async fn commit_completed_wallet_scan_acquisition(
@@ -205,8 +216,7 @@ impl ChainPublicDataPlane {
                 reason: "compacted acquisition is not exactly replayable".to_string(),
             });
         }
-        state.coverage = staged.coverage;
-        state.recent_scan_rows = staged.recent_scan_rows;
+        state.commit_snapshot(staged);
         state.push_diagnostic(PublicDataPlaneDiagnostic {
             kind: PublicDataPlaneDiagnosticKind::CoverageRecorded,
             source: None,
@@ -280,11 +290,7 @@ impl ChainPublicDataPlane {
         let mut expected_from = range.from_block;
         for (index, apply) in applies.iter().enumerate() {
             let apply_range = PublicScanRange::new(apply.from_block, apply.to_block);
-            if !apply_range.is_valid()
-                || apply.from_block != expected_from
-                || apply.to_block > range.to_block
-                || !apply.rows.covers(apply.from_block, apply.to_block)
-            {
+            if !apply_continues_acquisition(apply, expected_from, range) {
                 return Err(PublicDataPlaneError::InvalidCompletedAcquisition {
                     reason: format!(
                         "apply {index} does not exactly continue {}..={}",
@@ -314,22 +320,7 @@ impl ChainPublicDataPlane {
                     });
                 }
             };
-            if let Some(run) = compacted.last_mut()
-                && run.source == apply.rows.source
-                && run.epoch == apply.read_scope.epoch()
-            {
-                run.range.to_block = apply.to_block;
-                run.to_block_hash = apply.rows.to_block_hash;
-                append_wallet_scan_input_rows(&mut run.rows, rows);
-            } else {
-                compacted.push(PublicScanRows {
-                    range: apply_range,
-                    source: apply.rows.source,
-                    to_block_hash: apply.rows.to_block_hash,
-                    rows,
-                    epoch: apply.read_scope.epoch(),
-                });
-            }
+            push_compacted_run(&mut compacted, apply, apply_range, rows);
             if index + 1 < applies.len() {
                 expected_from = apply.to_block.checked_add(1).ok_or_else(|| {
                     PublicDataPlaneError::InvalidCompletedAcquisition {
@@ -664,6 +655,58 @@ impl ChainPublicDataPlane {
             expected: current_epoch.value,
             actual: captured_epoch.value,
         })
+    }
+}
+
+/// A row-page overflow makes a candidate acquisition non-retainable; any
+/// other staging failure rejects it.
+const fn rejected_acquisition_outcome(error: PublicDataPlaneError) -> WalletScanAcquisitionOutcome {
+    if matches!(
+        &error,
+        PublicDataPlaneError::CompletedAcquisitionRowPageLimit { .. }
+    ) {
+        WalletScanAcquisitionOutcome::NonRetainable(error)
+    } else {
+        WalletScanAcquisitionOutcome::Rejected(error)
+    }
+}
+
+/// Whether `apply` is a valid range that starts at `expected_from`, ends
+/// within `acquisition` and carries rows for all of its blocks.
+const fn apply_continues_acquisition(
+    apply: &WalletScanApply,
+    expected_from: u64,
+    acquisition: PublicScanRange,
+) -> bool {
+    PublicScanRange::new(apply.from_block, apply.to_block).is_valid()
+        && apply.from_block == expected_from
+        && apply.to_block <= acquisition.to_block
+        && apply.rows.covers(apply.from_block, apply.to_block)
+}
+
+/// Extends the last run with `apply` when it has the same source and read
+/// epoch, otherwise starts a new run.
+fn push_compacted_run(
+    compacted: &mut Vec<PublicScanRows>,
+    apply: &WalletScanApply,
+    apply_range: PublicScanRange,
+    rows: WalletScanInputRows,
+) {
+    if let Some(run) = compacted.last_mut()
+        && run.source == apply.rows.source
+        && run.epoch == apply.read_scope.epoch()
+    {
+        run.range.to_block = apply.to_block;
+        run.to_block_hash = apply.rows.to_block_hash;
+        append_wallet_scan_input_rows(&mut run.rows, rows);
+    } else {
+        compacted.push(PublicScanRows {
+            range: apply_range,
+            source: apply.rows.source,
+            to_block_hash: apply.rows.to_block_hash,
+            rows,
+            epoch: apply.read_scope.epoch(),
+        });
     }
 }
 
