@@ -1307,6 +1307,332 @@ fn persisted_root_and_validation_provenance_must_match_payload() {
     fs::remove_dir_all(root_dir).expect("remove temp DB root");
 }
 
+const LEGACY_REJECTED: &str = "legacy artifact evidence does not identify the configured publisher";
+const ATTESTED_REJECTED: &str =
+    "publisher-attested evidence does not match the serving artifact tip";
+const LIST_REJECTED: &str = "list-signed evidence does not match the public range corpus";
+const MIXED_REJECTED: &str = "mixed publisher/list evidence does not match corpus boundaries";
+const V4_REJECTED: &str = "v4 publisher evidence does not match the serving corpus";
+const MIXED_V4_REJECTED: &str = "mixed v4 publisher/list evidence does not match corpus boundaries";
+const INDEXED: PoiCacheRecordSource = PoiCacheRecordSource::IndexedArtifacts;
+const RPC: PoiCacheRecordSource = PoiCacheRecordSource::PublicRpc;
+
+type AttestedRule = fn(&ProvenanceFixture, u64) -> PoiCorpusValidationRecord;
+type MixedRule = fn(&ProvenanceFixture, u64, u64) -> PoiCorpusValidationRecord;
+
+/// Provenance evidence over a three-event corpus, whose payload tip is 2.
+struct ProvenanceFixture {
+    identity: PoiCacheIdentity,
+    cache: PoiCache,
+    base: PoiArtifactCacheRecord,
+    publisher: FixedBytes<32>,
+    other: FixedBytes<32>,
+    manifest_root: FixedBytes<32>,
+}
+
+impl ProvenanceFixture {
+    fn new() -> Self {
+        let identity = test_identity();
+        let cache = test_cache(&identity, &[0x31, 0x32, 0x33]);
+        assert_eq!(cache.progress().next_event_index, 3);
+        let root = test_cache_root(&cache);
+        let entry = test_entry(&identity, 2, root.0);
+        let base = persisted_cache(&identity, cache.clone(), 2, root, &entry).record;
+        Self {
+            identity,
+            cache,
+            base,
+            publisher: FixedBytes::from([0x51; 32]),
+            other: FixedBytes::from([0x52; 32]),
+            manifest_root: FixedBytes::from([0x61; 32]),
+        }
+    }
+
+    /// A record from `source` carrying `validation`, serving the manifest root
+    /// at `artifact_tip` when there is one.
+    fn record(
+        &self,
+        source: PoiCacheRecordSource,
+        artifact_tip: Option<u64>,
+        validation: PoiCorpusValidationRecord,
+    ) -> PoiArtifactCacheRecord {
+        PoiArtifactCacheRecord {
+            source,
+            validation,
+            artifact_tip_index: artifact_tip,
+            artifact_tip_root: artifact_tip.map(|_| self.manifest_root),
+            ..self.base.clone()
+        }
+    }
+
+    /// The rejection reason for `record`, or `None` when its evidence is accepted.
+    fn verdict(
+        &self,
+        record: &PoiArtifactCacheRecord,
+        expected_publisher: Option<FixedBytes<32>>,
+    ) -> Option<&'static str> {
+        match validate_corpus_provenance(record, &self.cache, expected_publisher) {
+            Ok(()) => None,
+            Err(PoiArtifactError::PersistedValidationProvenance { reason }) => Some(reason),
+            Err(error) => panic!("unexpected error {error} for {:?}", record.validation),
+        }
+    }
+
+    fn list_signed(&self, from_index: u64) -> PoiCorpusValidationRecord {
+        PoiCorpusValidationRecord::ListSignedRanges {
+            list_key: self.identity.list_key,
+            from_index,
+        }
+    }
+
+    fn attested(&self, tip: u64) -> PoiCorpusValidationRecord {
+        PoiCorpusValidationRecord::PublisherAttested {
+            publisher_pubkey: self.publisher,
+            manifest_sequence: 1,
+            manifest_root: self.manifest_root,
+            artifact_tip_index: tip,
+        }
+    }
+
+    fn mixed(&self, tip: u64, from: u64) -> PoiCorpusValidationRecord {
+        PoiCorpusValidationRecord::PublisherAndListSigned {
+            publisher_pubkey: self.publisher,
+            manifest_sequence: 1,
+            manifest_root: self.manifest_root,
+            artifact_tip_index: tip,
+            list_key: self.identity.list_key,
+            list_signed_from_index: from,
+        }
+    }
+
+    fn v4(&self, tip: u64) -> PoiCorpusValidationRecord {
+        PoiCorpusValidationRecord::PublisherAttestedV4 {
+            publisher_pubkey: self.publisher,
+            manifest_sequence: 1,
+            manifest_body_hash: Some(FixedBytes::from([0x81; 32])),
+            manifest_root: self.manifest_root,
+            artifact_tip_index: tip,
+            format_version: FORMAT_VERSION,
+            checkpoint_catalog: v4_catalog(),
+        }
+    }
+
+    fn mixed_v4(&self, tip: u64, from: u64) -> PoiCorpusValidationRecord {
+        PoiCorpusValidationRecord::PublisherV4AndListSigned {
+            publisher_pubkey: self.publisher,
+            manifest_sequence: 1,
+            manifest_body_hash: Some(FixedBytes::from([0x81; 32])),
+            manifest_root: self.manifest_root,
+            artifact_tip_index: tip,
+            format_version: FORMAT_VERSION,
+            checkpoint_catalog: v4_catalog(),
+            list_key: self.identity.list_key,
+            list_signed_from_index: from,
+        }
+    }
+}
+
+/// A copy of `record` with one change applied.
+fn edited(
+    record: &PoiArtifactCacheRecord,
+    edit: impl FnOnce(&mut PoiArtifactCacheRecord),
+) -> PoiArtifactCacheRecord {
+    let mut record = record.clone();
+    edit(&mut record);
+    record
+}
+
+fn v4_catalog() -> PoiV4CatalogIdentityRecord {
+    PoiV4CatalogIdentityRecord {
+        cid: "catalog".to_string(),
+        sha256: FixedBytes::ZERO,
+        byte_size: 1,
+        descriptor_hash: FixedBytes::from([0x71; 32]),
+    }
+}
+
+#[test]
+fn legacy_and_list_signed_provenance_rules() {
+    let fx = ProvenanceFixture::new();
+    let publisher = Some(fx.publisher);
+    let legacy = |source, tip| fx.record(source, tip, PoiCorpusValidationRecord::Legacy);
+    assert_eq!(fx.verdict(&legacy(INDEXED, Some(2)), None), None);
+    assert_eq!(
+        fx.verdict(&legacy(INDEXED, Some(2)), publisher),
+        Some(LEGACY_REJECTED)
+    );
+    assert_eq!(fx.verdict(&legacy(RPC, None), publisher), None);
+
+    let list = |source, tip, from| fx.record(source, tip, fx.list_signed(from));
+    assert_eq!(fx.verdict(&list(RPC, None, 0), Some(fx.other)), None);
+    assert_eq!(
+        fx.verdict(&list(RPC, None, 3), None),
+        None,
+        "from corpus end"
+    );
+    let rejected = [
+        ("past corpus end", list(RPC, None, 4)),
+        ("from artifacts", list(INDEXED, None, 0)),
+        ("with artifact tip", list(RPC, Some(2), 0)),
+        (
+            "for another list",
+            edited(&list(RPC, None, 0), |r| r.list_key = fx.other),
+        ),
+    ];
+    for (case, record) in rejected {
+        assert_eq!(fx.verdict(&record, None), Some(LIST_REJECTED), "{case}");
+    }
+}
+
+#[test]
+fn publisher_attested_provenance_rules() {
+    let fx = ProvenanceFixture::new();
+    let publisher = Some(fx.publisher);
+    let rules: [(AttestedRule, &str); 2] = [
+        (ProvenanceFixture::attested, ATTESTED_REJECTED),
+        (ProvenanceFixture::v4, V4_REJECTED),
+    ];
+    for (rule, reason) in rules {
+        let valid = fx.record(INDEXED, Some(2), rule(&fx, 2));
+        assert_eq!(fx.verdict(&valid, publisher), None, "{reason}");
+        assert_eq!(fx.verdict(&valid, None), None, "{reason}");
+        assert_eq!(
+            fx.verdict(&valid, Some(fx.other)),
+            Some(reason),
+            "another publisher"
+        );
+        let rejected = [
+            ("public range", fx.record(RPC, Some(2), rule(&fx, 2))),
+            (
+                "record tip index differs",
+                edited(&valid, |r| r.artifact_tip_index = Some(1)),
+            ),
+            (
+                "record tip root differs",
+                edited(&valid, |r| r.artifact_tip_root = Some(fx.other)),
+            ),
+            // Evidence and record agree on a tip below the payload tip.
+            (
+                "below payload tip",
+                fx.record(INDEXED, Some(1), rule(&fx, 1)),
+            ),
+        ];
+        for (case, record) in rejected {
+            assert_eq!(fx.verdict(&record, publisher), Some(reason), "{case}");
+        }
+    }
+}
+
+#[test]
+fn mixed_publisher_and_list_provenance_rules() {
+    let fx = ProvenanceFixture::new();
+    let publisher = Some(fx.publisher);
+    let rules: [(MixedRule, &str); 2] = [
+        (ProvenanceFixture::mixed, MIXED_REJECTED),
+        (ProvenanceFixture::mixed_v4, MIXED_V4_REJECTED),
+    ];
+    for (rule, reason) in rules {
+        let valid = fx.record(RPC, Some(2), rule(&fx, 2, 3));
+        assert_eq!(
+            fx.verdict(&valid, publisher),
+            None,
+            "{reason}: suffix from corpus end"
+        );
+        assert_eq!(
+            fx.verdict(&valid, None),
+            None,
+            "{reason}: no publisher configured"
+        );
+        let interior = fx.record(RPC, Some(0), rule(&fx, 0, 1));
+        assert_eq!(
+            fx.verdict(&interior, publisher),
+            None,
+            "{reason}: interior suffix"
+        );
+        assert_eq!(
+            fx.verdict(&valid, Some(fx.other)),
+            Some(reason),
+            "another publisher"
+        );
+        let rejected = [
+            (
+                "from artifacts",
+                fx.record(INDEXED, Some(2), rule(&fx, 2, 3)),
+            ),
+            (
+                "record tip index differs",
+                edited(&valid, |r| r.artifact_tip_index = Some(1)),
+            ),
+            (
+                "record tip root differs",
+                edited(&valid, |r| r.artifact_tip_root = Some(fx.other)),
+            ),
+            // The tip and suffix bounds only fail together on a consistent record.
+            (
+                "tip at corpus end",
+                fx.record(RPC, Some(3), rule(&fx, 3, 4)),
+            ),
+            (
+                "gap before suffix",
+                fx.record(RPC, Some(0), rule(&fx, 0, 2)),
+            ),
+            ("another list", edited(&valid, |r| r.list_key = fx.other)),
+        ];
+        for (case, record) in rejected {
+            assert_eq!(fx.verdict(&record, publisher), Some(reason), "{case}");
+        }
+    }
+}
+
+#[test]
+fn v4_provenance_requires_a_complete_manifest() {
+    let fx = ProvenanceFixture::new();
+    let v4_records = [
+        (fx.record(INDEXED, Some(2), fx.v4(2)), V4_REJECTED),
+        (
+            fx.record(RPC, Some(2), fx.mixed_v4(2, 3)),
+            MIXED_V4_REJECTED,
+        ),
+    ];
+    for (valid, reason) in v4_records {
+        for clause in 0..5 {
+            let mut broken = valid.clone();
+            break_v4_manifest_clause(&mut broken.validation, clause);
+            assert_eq!(
+                fx.verdict(&broken, Some(fx.publisher)),
+                Some(reason),
+                "clause {clause}"
+            );
+        }
+    }
+}
+
+/// Breaks one of the five v4 manifest-completeness clauses of v4 evidence.
+fn break_v4_manifest_clause(validation: &mut PoiCorpusValidationRecord, clause: usize) {
+    let (PoiCorpusValidationRecord::PublisherAttestedV4 {
+        format_version,
+        manifest_body_hash,
+        checkpoint_catalog,
+        ..
+    }
+    | PoiCorpusValidationRecord::PublisherV4AndListSigned {
+        format_version,
+        manifest_body_hash,
+        checkpoint_catalog,
+        ..
+    }) = validation
+    else {
+        panic!("v4 evidence expected");
+    };
+    match clause {
+        0 => *format_version += 1,
+        1 => *manifest_body_hash = None,
+        2 => checkpoint_catalog.cid.clear(),
+        3 => checkpoint_catalog.byte_size = 0,
+        _ => checkpoint_catalog.descriptor_hash = FixedBytes::ZERO,
+    }
+}
+
 #[test]
 fn materialized_corpus_rejects_validated_roots_that_do_not_match_forest() {
     let identity = test_identity();

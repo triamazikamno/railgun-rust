@@ -1351,50 +1351,36 @@ fn validate_corpus_provenance(
     cache: &PoiCache,
     expected_publisher_pubkey: Option<FixedBytes<32>>,
 ) -> Result<(), PoiArtifactError> {
-    let next_event_index = cache.progress().next_event_index;
-    let payload_tip_index = next_event_index.saturating_sub(1);
-
-    match &record.validation {
-        PoiCorpusValidationRecord::Legacy => {
-            if expected_publisher_pubkey.is_some()
-                && matches!(record.source, PoiCacheRecordSource::IndexedArtifacts)
-            {
-                return Err(PoiArtifactError::PersistedValidationProvenance {
-                    reason: "legacy artifact evidence does not identify the configured publisher",
-                });
-            }
-        }
+    let provenance = CorpusProvenance {
+        record,
+        expected_publisher_pubkey,
+        next_event_index: cache.progress().next_event_index,
+    };
+    let (valid, reason) = match &record.validation {
+        PoiCorpusValidationRecord::Legacy => (
+            provenance.legacy_allowed(),
+            "legacy artifact evidence does not identify the configured publisher",
+        ),
         PoiCorpusValidationRecord::PublisherAttested {
             publisher_pubkey,
             manifest_root,
             artifact_tip_index,
             ..
-        } => {
-            if expected_publisher_pubkey.is_some_and(|expected| expected != *publisher_pubkey)
-                || !matches!(record.source, PoiCacheRecordSource::IndexedArtifacts)
-                || record.artifact_tip_index != Some(*artifact_tip_index)
-                || record.artifact_tip_root != Some(*manifest_root)
-                || *artifact_tip_index != payload_tip_index
-            {
-                return Err(PoiArtifactError::PersistedValidationProvenance {
-                    reason: "publisher-attested evidence does not match the serving artifact tip",
-                });
-            }
-        }
+        } => (
+            provenance.publisher_attested_allowed(
+                publisher_pubkey,
+                *manifest_root,
+                *artifact_tip_index,
+            ),
+            "publisher-attested evidence does not match the serving artifact tip",
+        ),
         PoiCorpusValidationRecord::ListSignedRanges {
             list_key,
             from_index,
-        } => {
-            if !matches!(record.source, PoiCacheRecordSource::PublicRpc)
-                || list_key != &record.list_key
-                || record.artifact_tip_index.is_some()
-                || *from_index > next_event_index
-            {
-                return Err(PoiArtifactError::PersistedValidationProvenance {
-                    reason: "list-signed evidence does not match the public range corpus",
-                });
-            }
-        }
+        } => (
+            provenance.list_signed_allowed(list_key, *from_index),
+            "list-signed evidence does not match the public range corpus",
+        ),
         PoiCorpusValidationRecord::PublisherAndListSigned {
             publisher_pubkey,
             manifest_root,
@@ -1402,21 +1388,18 @@ fn validate_corpus_provenance(
             list_key,
             list_signed_from_index,
             ..
-        } => {
-            if expected_publisher_pubkey.is_some_and(|expected| expected != *publisher_pubkey)
-                || !matches!(record.source, PoiCacheRecordSource::PublicRpc)
-                || list_key != &record.list_key
-                || record.artifact_tip_index != Some(*artifact_tip_index)
-                || record.artifact_tip_root != Some(*manifest_root)
-                || *artifact_tip_index >= next_event_index
-                || *list_signed_from_index != artifact_tip_index.saturating_add(1)
-                || *list_signed_from_index > next_event_index
-            {
-                return Err(PoiArtifactError::PersistedValidationProvenance {
-                    reason: "mixed publisher/list evidence does not match corpus boundaries",
-                });
-            }
-        }
+        } => (
+            provenance.publisher_prefix_allowed(
+                publisher_pubkey,
+                *manifest_root,
+                *artifact_tip_index,
+            ) && provenance.list_suffix_follows(
+                list_key,
+                *list_signed_from_index,
+                *artifact_tip_index,
+            ),
+            "mixed publisher/list evidence does not match corpus boundaries",
+        ),
         PoiCorpusValidationRecord::PublisherAttestedV4 {
             publisher_pubkey,
             manifest_body_hash,
@@ -1425,23 +1408,18 @@ fn validate_corpus_provenance(
             format_version,
             checkpoint_catalog,
             ..
-        } => {
-            if expected_publisher_pubkey.is_some_and(|expected| expected != *publisher_pubkey)
-                || !matches!(record.source, PoiCacheRecordSource::IndexedArtifacts)
-                || record.artifact_tip_index != Some(*artifact_tip_index)
-                || record.artifact_tip_root != Some(*manifest_root)
-                || *artifact_tip_index != payload_tip_index
-                || *format_version != poi::artifacts::v4::FORMAT_VERSION
-                || manifest_body_hash.is_none()
-                || checkpoint_catalog.cid.is_empty()
-                || checkpoint_catalog.byte_size == 0
-                || checkpoint_catalog.descriptor_hash == FixedBytes::ZERO
-            {
-                return Err(PoiArtifactError::PersistedValidationProvenance {
-                    reason: "v4 publisher evidence does not match the serving corpus",
-                });
-            }
-        }
+        } => (
+            provenance.publisher_attested_allowed(
+                publisher_pubkey,
+                *manifest_root,
+                *artifact_tip_index,
+            ) && v4_manifest_complete(
+                *format_version,
+                manifest_body_hash.as_ref(),
+                checkpoint_catalog,
+            ),
+            "v4 publisher evidence does not match the serving corpus",
+        ),
         PoiCorpusValidationRecord::PublisherV4AndListSigned {
             publisher_pubkey,
             manifest_body_hash,
@@ -1452,28 +1430,124 @@ fn validate_corpus_provenance(
             list_key,
             list_signed_from_index,
             ..
-        } => {
-            if expected_publisher_pubkey.is_some_and(|expected| expected != *publisher_pubkey)
-                || !matches!(record.source, PoiCacheRecordSource::PublicRpc)
-                || record.artifact_tip_index != Some(*artifact_tip_index)
-                || record.artifact_tip_root != Some(*manifest_root)
-                || *artifact_tip_index >= next_event_index
-                || *format_version != poi::artifacts::v4::FORMAT_VERSION
-                || manifest_body_hash.is_none()
-                || checkpoint_catalog.cid.is_empty()
-                || checkpoint_catalog.byte_size == 0
-                || checkpoint_catalog.descriptor_hash == FixedBytes::ZERO
-                || list_key != &record.list_key
-                || *list_signed_from_index != artifact_tip_index.saturating_add(1)
-                || *list_signed_from_index > next_event_index
-            {
-                return Err(PoiArtifactError::PersistedValidationProvenance {
-                    reason: "mixed v4 publisher/list evidence does not match corpus boundaries",
-                });
-            }
-        }
+        } => (
+            provenance.publisher_prefix_allowed(
+                publisher_pubkey,
+                *manifest_root,
+                *artifact_tip_index,
+            ) && v4_manifest_complete(
+                *format_version,
+                manifest_body_hash.as_ref(),
+                checkpoint_catalog,
+            ) && provenance.list_suffix_follows(
+                list_key,
+                *list_signed_from_index,
+                *artifact_tip_index,
+            ),
+            "mixed v4 publisher/list evidence does not match corpus boundaries",
+        ),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(PoiArtifactError::PersistedValidationProvenance { reason })
     }
-    Ok(())
+}
+
+/// What a persisted corpus record's validation evidence is checked against.
+struct CorpusProvenance<'a> {
+    record: &'a PoiArtifactCacheRecord,
+    expected_publisher_pubkey: Option<FixedBytes<32>>,
+    next_event_index: u64,
+}
+
+impl CorpusProvenance<'_> {
+    const fn payload_tip_index(&self) -> u64 {
+        self.next_event_index.saturating_sub(1)
+    }
+
+    fn sourced_from(&self, source: PoiCacheRecordSource) -> bool {
+        self.record.source == source
+    }
+
+    /// The configured publisher, if any, signed the evidence, and the record
+    /// serves its artifact tip.
+    fn publisher_serves_tip(
+        &self,
+        publisher_pubkey: &FixedBytes<32>,
+        manifest_root: FixedBytes<32>,
+        artifact_tip_index: u64,
+    ) -> bool {
+        self.expected_publisher_pubkey
+            .is_none_or(|expected| expected == *publisher_pubkey)
+            && self.record.artifact_tip_index == Some(artifact_tip_index)
+            && self.record.artifact_tip_root == Some(manifest_root)
+    }
+
+    /// The list-signed range covers this record's list, starts right after the
+    /// artifact tip and does not start past the corpus.
+    fn list_suffix_follows(
+        &self,
+        list_key: &FixedBytes<32>,
+        list_signed_from_index: u64,
+        artifact_tip_index: u64,
+    ) -> bool {
+        *list_key == self.record.list_key
+            && list_signed_from_index == artifact_tip_index.saturating_add(1)
+            && list_signed_from_index <= self.next_event_index
+    }
+
+    /// Legacy evidence names no publisher, so it cannot back an artifact corpus
+    /// once a publisher is configured.
+    fn legacy_allowed(&self) -> bool {
+        !(self.expected_publisher_pubkey.is_some()
+            && self.sourced_from(PoiCacheRecordSource::IndexedArtifacts))
+    }
+
+    fn list_signed_allowed(&self, list_key: &FixedBytes<32>, from_index: u64) -> bool {
+        self.sourced_from(PoiCacheRecordSource::PublicRpc)
+            && *list_key == self.record.list_key
+            && self.record.artifact_tip_index.is_none()
+            && from_index <= self.next_event_index
+    }
+
+    /// Publisher evidence for an artifact corpus that ends at its artifact tip.
+    fn publisher_attested_allowed(
+        &self,
+        publisher_pubkey: &FixedBytes<32>,
+        manifest_root: FixedBytes<32>,
+        artifact_tip_index: u64,
+    ) -> bool {
+        self.publisher_serves_tip(publisher_pubkey, manifest_root, artifact_tip_index)
+            && self.sourced_from(PoiCacheRecordSource::IndexedArtifacts)
+            && artifact_tip_index == self.payload_tip_index()
+    }
+
+    /// Publisher evidence for the artifact prefix of a public range corpus.
+    fn publisher_prefix_allowed(
+        &self,
+        publisher_pubkey: &FixedBytes<32>,
+        manifest_root: FixedBytes<32>,
+        artifact_tip_index: u64,
+    ) -> bool {
+        self.publisher_serves_tip(publisher_pubkey, manifest_root, artifact_tip_index)
+            && self.sourced_from(PoiCacheRecordSource::PublicRpc)
+            && artifact_tip_index < self.next_event_index
+    }
+}
+
+/// V4 publisher evidence names the v4 format, its manifest body and a usable
+/// checkpoint catalog.
+fn v4_manifest_complete(
+    format_version: u16,
+    manifest_body_hash: Option<&FixedBytes<32>>,
+    checkpoint_catalog: &PoiV4CatalogIdentityRecord,
+) -> bool {
+    format_version == poi::artifacts::v4::FORMAT_VERSION
+        && manifest_body_hash.is_some()
+        && !checkpoint_catalog.cid.is_empty()
+        && checkpoint_catalog.byte_size != 0
+        && checkpoint_catalog.descriptor_hash != FixedBytes::ZERO
 }
 
 fn validate_persisted_record(
