@@ -151,6 +151,12 @@ impl ExpectedPoiCorpusBase {
         }
     }
 
+    /// Whether a commit against this base writes a fresh corpus instead of
+    /// extending a valid one.
+    const fn replaces_corpus(self) -> bool {
+        matches!(self, Self::NoValidCorpus | Self::Corrupt { .. })
+    }
+
     const fn journal_revision(self) -> Option<u64> {
         match self {
             Self::NoValidCorpus | Self::ImplicitBase { .. } => Some(0),
@@ -1002,13 +1008,7 @@ pub(crate) fn load_poi_rpc_health(
     generation: u64,
     legacy_last_successful_rpc_sync_at_ms: Option<u64>,
 ) -> Result<Option<u64>, PoiArtifactError> {
-    let current_generation = db.poi_artifact_cache_generation()?;
-    if current_generation != generation {
-        return Err(PoiArtifactError::StalePublicCacheGeneration {
-            expected: current_generation,
-            actual: generation,
-        });
-    }
+    ensure_current_cache_generation(db, generation)?;
     match db.inspect_poi_corpus_rpc_health(
         identity.chain_type,
         identity.chain_id,
@@ -1045,13 +1045,7 @@ pub(crate) fn record_poi_rpc_success(
     identity: &PoiCacheIdentity,
     generation: u64,
 ) -> Result<(), PoiArtifactError> {
-    let current_generation = db.poi_artifact_cache_generation()?;
-    if current_generation != generation {
-        return Err(PoiArtifactError::StalePublicCacheGeneration {
-            expected: current_generation,
-            actual: generation,
-        });
-    }
+    ensure_current_cache_generation(db, generation)?;
     db.put_poi_corpus_rpc_health(&PoiCorpusRpcHealthRecord {
         chain_type: identity.chain_type,
         chain_id: identity.chain_id,
@@ -1809,13 +1803,7 @@ pub(crate) fn persist_prepared_corpus(
         starting_record,
         starting_head,
     } = candidate;
-    let current_generation = db.poi_artifact_cache_generation()?;
-    if cache_generation != current_generation {
-        return Err(PoiArtifactError::StalePublicCacheGeneration {
-            expected: current_generation,
-            actual: cache_generation,
-        });
-    }
+    ensure_current_cache_generation(db, cache_generation)?;
     if db.root_dir() != db_root.as_path() {
         return Err(PoiArtifactError::PersistedIdentityMismatch);
     }
@@ -2001,6 +1989,81 @@ fn persist_public_rpc_cache_with_publisher(
 ) -> Result<PublicRpcPersistResult, PoiArtifactError> {
     let anchored_append =
         validate_public_rpc_starting_head(expected_base, starting_record, starting_head)?;
+    let mut record = public_rpc_corpus_record(&cache, cache_generation, range_start_index)?;
+    if !public_rpc_delta_fits(delta, &cache, blocked_shields.as_deref()) {
+        return Err(PoiArtifactError::PersistedArtifactMetadata {
+            reason: "public RPC journal delta does not match its candidate",
+        });
+    }
+    if let Some(existing) = starting_record {
+        if !starting_record_continues(existing, &record, delta, expected_base) {
+            return Ok(PublicRpcPersistResult::Stale);
+        }
+        merge_public_rpc_provenance(&mut record, existing.clone());
+    } else if !expected_base.replaces_corpus() {
+        return Err(PoiArtifactError::PersistedArtifactMetadata {
+            reason: "public RPC journal append lost its starting metadata",
+        });
+    }
+    let validation_started = Instant::now();
+    if anchored_append {
+        validate_anchored_corpus(&record, &cache, publisher_pubkey)?;
+    } else {
+        validate_materialized_corpus(&record, &cache, publisher_pubkey)?;
+    }
+    let validation_elapsed = validation_started.elapsed();
+    ensure_current_cache_generation(db, cache_generation)?;
+    let current_tip_index = record.current_tip_index;
+    let (outcome, preparation_elapsed, transaction_elapsed) = PublicRpcJournalWrite {
+        db,
+        cache: &cache,
+        delta,
+        blocked_shields: blocked_shields.as_deref(),
+        expected_base,
+    }
+    .commit(record)?;
+    if let PoiCorpusJournalCommitOutcome::Applied(commit) = &outcome {
+        debug!(
+            chain_id = cache.identity().chain_id,
+            current_tip_index,
+            prior_revision = ?expected_base.journal_revision(),
+            journal_revision = commit.head.revision,
+            delta_events = delta.events.len(),
+            delta_leaves = delta.leaves.len(),
+            delta_bytes = commit.delta.as_ref().map_or(0, |delta| delta.payload.len()),
+            blocked_bytes = commit
+                .blocked
+                .as_ref()
+                .map_or(0, |blocked| blocked.payload.len()),
+            anchored_validation = anchored_append,
+            preparation_elapsed_ms = preparation_elapsed.as_millis(),
+            validation_elapsed_ms = validation_elapsed.as_millis(),
+            transaction_elapsed_ms = transaction_elapsed.as_millis(),
+            "PPOI corpus journal append complete"
+        );
+    }
+    public_rpc_persist_result(outcome, cache, blocked_shields, cache_generation)
+}
+
+/// Rejects work prepared for a public cache generation that a reset has since replaced.
+fn ensure_current_cache_generation(db: &DbStore, generation: u64) -> Result<(), PoiArtifactError> {
+    let current_generation = db.poi_artifact_cache_generation()?;
+    if current_generation != generation {
+        return Err(PoiArtifactError::StalePublicCacheGeneration {
+            expected: current_generation,
+            actual: generation,
+        });
+    }
+    Ok(())
+}
+
+/// The `ListSignedRanges` corpus record for a public-range candidate, serving
+/// the cache's current tip.
+fn public_rpc_corpus_record(
+    cache: &PoiCache,
+    cache_generation: u64,
+    range_start_index: u64,
+) -> Result<PoiArtifactCacheRecord, PoiArtifactError> {
     let identity = cache.identity().clone();
     let current_tip_index = cache.progress().next_event_index.saturating_sub(1);
     let (tree_number, _) = normalize_tree_position(0, current_tip_index);
@@ -2009,28 +2072,7 @@ fn persist_public_rpc_cache_with_publisher(
         .ok_or(PoiArtifactError::PersistedRootsNotValidated)?
         .get(&tree_number)
         .ok_or(PoiArtifactError::MissingCacheRoot { tree_number })?;
-    if delta.identity != identity
-        || delta.event_end_cursor != cache.progress().next_event_index
-        || delta.leaf_end_cursor != cache.progress().next_leaf_index
-        || delta.events.len() > POI_RPC_EVENT_LIMIT
-        || delta.leaves.len() > POI_RPC_LEAF_LIMIT
-        || delta
-            .event_end_cursor
-            .saturating_sub(delta.event_start_cursor)
-            > POI_RPC_EVENT_LIMIT as u64
-        || delta
-            .leaf_end_cursor
-            .saturating_sub(delta.leaf_start_cursor)
-            > POI_RPC_LEAF_LIMIT as u64
-        || blocked_shields
-            .as_ref()
-            .is_some_and(|blocked| blocked.len() > POI_BLOCKED_SHIELD_LIMIT)
-    {
-        return Err(PoiArtifactError::PersistedArtifactMetadata {
-            reason: "public RPC journal delta does not match its candidate",
-        });
-    }
-    let mut record = PoiArtifactCacheRecord {
+    Ok(PoiArtifactCacheRecord {
         chain_type: identity.chain_type,
         chain_id: identity.chain_id,
         txid_version: identity.txid_version.clone(),
@@ -2052,112 +2094,110 @@ fn persist_public_rpc_cache_with_publisher(
         cache_payload: Vec::new(),
         legacy_last_successful_rpc_sync_at_ms: None,
         updated_at: 0,
-    };
-    if let Some(existing) = starting_record {
-        if existing.current_tip_index > record.current_tip_index
-            || existing.current_tip_index.saturating_add(1) != delta.event_start_cursor
-            || Some(existing.current_tip_root) != expected_base_current_root(expected_base)
-        {
-            return Ok(PublicRpcPersistResult::Stale);
+    })
+}
+
+/// Whether the journal delta covers exactly the candidate's new events and
+/// leaves, within the public RPC page and blocked-shield limits.
+fn public_rpc_delta_fits(
+    delta: &PoiCacheJournalDelta,
+    cache: &PoiCache,
+    blocked_shields: Option<&[BlockedShield]>,
+) -> bool {
+    delta.identity == *cache.identity()
+        && delta.event_end_cursor == cache.progress().next_event_index
+        && delta.leaf_end_cursor == cache.progress().next_leaf_index
+        && delta.events.len() <= POI_RPC_EVENT_LIMIT
+        && delta.leaves.len() <= POI_RPC_LEAF_LIMIT
+        && delta
+            .event_end_cursor
+            .saturating_sub(delta.event_start_cursor)
+            <= POI_RPC_EVENT_LIMIT as u64
+        && delta
+            .leaf_end_cursor
+            .saturating_sub(delta.leaf_start_cursor)
+            <= POI_RPC_LEAF_LIMIT as u64
+        && blocked_shields.is_none_or(|blocked| blocked.len() <= POI_BLOCKED_SHIELD_LIMIT)
+}
+
+/// Whether the stored starting record is the journal state the delta extends:
+/// not ahead of the candidate, ending right before the delta, and at the
+/// expected base's tip root.
+fn starting_record_continues(
+    existing: &PoiArtifactCacheRecord,
+    record: &PoiArtifactCacheRecord,
+    delta: &PoiCacheJournalDelta,
+    expected_base: ExpectedPoiCorpusBase,
+) -> bool {
+    existing.current_tip_index <= record.current_tip_index
+        && existing.current_tip_index.saturating_add(1) == delta.event_start_cursor
+        && Some(existing.current_tip_root) == expected_base_current_root(expected_base)
+}
+
+/// The journal write for one validated public-range corpus record.
+struct PublicRpcJournalWrite<'a> {
+    db: &'a DbStore,
+    cache: &'a PoiCache,
+    delta: &'a PoiCacheJournalDelta,
+    blocked_shields: Option<&'a [BlockedShield]>,
+    expected_base: ExpectedPoiCorpusBase,
+}
+
+impl PublicRpcJournalWrite<'_> {
+    /// Writes `record` as a new base when the expected base holds no valid
+    /// corpus, otherwise appends it to the journal. Returns the outcome with
+    /// the preparation and transaction times.
+    fn commit(
+        &self,
+        record: PoiArtifactCacheRecord,
+    ) -> Result<(PoiCorpusJournalCommitOutcome, Duration, Duration), PoiArtifactError> {
+        let preparation_started = Instant::now();
+        let condition = PoiCorpusJournalCommitCondition {
+            expected_generation: record.cache_generation,
+            expected_publisher: None,
+            expected_manifest_hash: None,
+            expected_state: self.expected_base.into_db_state(),
+        };
+        if self.expected_base.replaces_corpus() {
+            self.rebase(record, condition, preparation_started)
+        } else {
+            self.append(record, condition, preparation_started)
         }
-        merge_public_rpc_provenance(&mut record, existing.clone());
-    } else if !matches!(
-        expected_base,
-        ExpectedPoiCorpusBase::NoValidCorpus | ExpectedPoiCorpusBase::Corrupt { .. }
-    ) {
-        return Err(PoiArtifactError::PersistedArtifactMetadata {
-            reason: "public RPC journal append lost its starting metadata",
-        });
     }
-    let validation_started = Instant::now();
-    if anchored_append {
-        validate_anchored_corpus(&record, &cache, publisher_pubkey)?;
-    } else {
-        validate_materialized_corpus(&record, &cache, publisher_pubkey)?;
-    }
-    let validation_elapsed = validation_started.elapsed();
-    let delta_event_count = delta.events.len();
-    let delta_leaf_count = delta.leaves.len();
-    let current_generation = db.poi_artifact_cache_generation()?;
-    if cache_generation != current_generation {
-        return Err(PoiArtifactError::StalePublicCacheGeneration {
-            expected: current_generation,
-            actual: cache_generation,
-        });
-    }
-    let preparation_started = Instant::now();
-    let commit_expected_state = expected_base.into_db_state();
-    let (outcome, preparation_elapsed, transaction_elapsed) = if matches!(
-        expected_base,
-        ExpectedPoiCorpusBase::NoValidCorpus | ExpectedPoiCorpusBase::Corrupt { .. }
-    ) {
-        let mut base = record;
-        base.cache_payload = cache.to_bytes()?;
+
+    fn rebase(
+        &self,
+        mut base: PoiArtifactCacheRecord,
+        condition: PoiCorpusJournalCommitCondition,
+        preparation_started: Instant,
+    ) -> Result<(PoiCorpusJournalCommitOutcome, Duration, Duration), PoiArtifactError> {
+        base.cache_payload = self.cache.to_bytes()?;
         let preparation_elapsed = preparation_started.elapsed();
         let transaction_started = Instant::now();
-        let outcome = db.rebase_poi_corpus_journal_if_current(
+        let outcome = self.db.rebase_poi_corpus_journal_if_current(
             base,
-            cache.progress().next_event_index,
-            cache.progress().next_leaf_index,
-            PoiCorpusJournalCommitCondition {
-                expected_generation: cache_generation,
-                expected_publisher: None,
-                expected_manifest_hash: None,
-                expected_state: commit_expected_state,
-            },
+            self.cache.progress().next_event_index,
+            self.cache.progress().next_leaf_index,
+            condition,
         )?;
-        (outcome, preparation_elapsed, transaction_started.elapsed())
-    } else {
-        let stored_delta = (!delta.is_empty()).then(|| {
-            Ok::<_, PoiArtifactError>(PoiCorpusJournalDeltaRecord {
-                format_version: 0,
-                chain_type: identity.chain_type,
-                chain_id: identity.chain_id,
-                txid_version: identity.txid_version.clone(),
-                list_key: identity.list_key,
-                cache_generation,
-                revision: 0,
-                previous_revision: 0,
-                base_revision: 0,
-                event_start_cursor: delta.event_start_cursor,
-                event_end_cursor: delta.event_end_cursor,
-                leaf_start_cursor: delta.leaf_start_cursor,
-                leaf_end_cursor: delta.leaf_end_cursor,
-                start_tip_root: expected_base_current_root(expected_base).ok_or(
-                    PoiArtifactError::PersistedArtifactMetadata {
-                        reason: "journal append has no expected starting root",
-                    },
-                )?,
-                end_tip_root: current_tip_root,
-                payload: delta.to_bytes()?,
-                updated_at: 0,
-            })
-        });
-        let stored_delta = stored_delta.transpose()?;
-        let blocked = blocked_shields
-            .as_deref()
-            .map(|blocked_shields| {
-                Ok::<_, PoiArtifactError>(PoiCorpusBlockedSnapshotRecord {
-                    format_version: 0,
-                    chain_type: identity.chain_type,
-                    chain_id: identity.chain_id,
-                    txid_version: identity.txid_version.clone(),
-                    list_key: identity.list_key,
-                    cache_generation,
-                    revision: 0,
-                    payload_hash: FixedBytes::ZERO,
-                    payload: encode_blocked_shields_snapshot(blocked_shields)?,
-                    updated_at: 0,
-                })
-            })
-            .transpose()?;
+        Ok((outcome, preparation_elapsed, transaction_started.elapsed()))
+    }
+
+    fn append(
+        &self,
+        record: PoiArtifactCacheRecord,
+        condition: PoiCorpusJournalCommitCondition,
+        preparation_started: Instant,
+    ) -> Result<(PoiCorpusJournalCommitOutcome, Duration, Duration), PoiArtifactError> {
+        let stored_delta = self.journal_delta_record(&record)?;
+        let blocked = self.blocked_snapshot_record(&record)?;
         let head = PoiCorpusJournalHeadRecord {
             format_version: 0,
             revision: 0,
             base_revision: 0,
             base_payload_hash: FixedBytes::ZERO,
-            event_cursor: cache.progress().next_event_index,
-            leaf_cursor: cache.progress().next_leaf_index,
+            event_cursor: self.cache.progress().next_event_index,
+            leaf_cursor: self.cache.progress().next_leaf_index,
             blocked_revision: None,
             blocked_payload_hash: None,
             delta_count: 0,
@@ -2166,49 +2206,90 @@ fn persist_public_rpc_cache_with_publisher(
         };
         let preparation_elapsed = preparation_started.elapsed();
         let transaction_started = Instant::now();
-        let outcome = db.append_poi_corpus_journal_if_current(
-            head,
-            stored_delta,
-            blocked,
-            PoiCorpusJournalCommitCondition {
-                expected_generation: cache_generation,
-                expected_publisher: None,
-                expected_manifest_hash: None,
-                expected_state: commit_expected_state,
-            },
-        )?;
-        (outcome, preparation_elapsed, transaction_started.elapsed())
-    };
+        let outcome =
+            self.db
+                .append_poi_corpus_journal_if_current(head, stored_delta, blocked, condition)?;
+        Ok((outcome, preparation_elapsed, transaction_started.elapsed()))
+    }
+
+    /// The stored delta record for a non-empty delta, from the expected base's
+    /// tip root to the corpus record's.
+    fn journal_delta_record(
+        &self,
+        corpus: &PoiArtifactCacheRecord,
+    ) -> Result<Option<PoiCorpusJournalDeltaRecord>, PoiArtifactError> {
+        let delta = self.delta;
+        (!delta.is_empty())
+            .then(|| {
+                Ok::<_, PoiArtifactError>(PoiCorpusJournalDeltaRecord {
+                    format_version: 0,
+                    chain_type: corpus.chain_type,
+                    chain_id: corpus.chain_id,
+                    txid_version: corpus.txid_version.clone(),
+                    list_key: corpus.list_key,
+                    cache_generation: corpus.cache_generation,
+                    revision: 0,
+                    previous_revision: 0,
+                    base_revision: 0,
+                    event_start_cursor: delta.event_start_cursor,
+                    event_end_cursor: delta.event_end_cursor,
+                    leaf_start_cursor: delta.leaf_start_cursor,
+                    leaf_end_cursor: delta.leaf_end_cursor,
+                    start_tip_root: expected_base_current_root(self.expected_base).ok_or(
+                        PoiArtifactError::PersistedArtifactMetadata {
+                            reason: "journal append has no expected starting root",
+                        },
+                    )?,
+                    end_tip_root: corpus.current_tip_root,
+                    payload: delta.to_bytes()?,
+                    updated_at: 0,
+                })
+            })
+            .transpose()
+    }
+
+    /// The blocked-shields snapshot record, when the candidate carries one.
+    fn blocked_snapshot_record(
+        &self,
+        corpus: &PoiArtifactCacheRecord,
+    ) -> Result<Option<PoiCorpusBlockedSnapshotRecord>, PoiArtifactError> {
+        self.blocked_shields
+            .map(|blocked_shields| {
+                Ok::<_, PoiArtifactError>(PoiCorpusBlockedSnapshotRecord {
+                    format_version: 0,
+                    chain_type: corpus.chain_type,
+                    chain_id: corpus.chain_id,
+                    txid_version: corpus.txid_version.clone(),
+                    list_key: corpus.list_key,
+                    cache_generation: corpus.cache_generation,
+                    revision: 0,
+                    payload_hash: FixedBytes::ZERO,
+                    payload: encode_blocked_shields_snapshot(blocked_shields)?,
+                    updated_at: 0,
+                })
+            })
+            .transpose()
+    }
+}
+
+/// Maps a public-range journal commit outcome to the persist result, handing
+/// the candidate back when the journal needs compaction first.
+fn public_rpc_persist_result(
+    outcome: PoiCorpusJournalCommitOutcome,
+    cache: PoiCache,
+    blocked_shields: Option<Vec<BlockedShield>>,
+    cache_generation: u64,
+) -> Result<PublicRpcPersistResult, PoiArtifactError> {
     match outcome {
-        PoiCorpusJournalCommitOutcome::Applied(commit) => {
-            debug!(
-                chain_id = identity.chain_id,
-                current_tip_index,
-                prior_revision = ?expected_base.journal_revision(),
-                journal_revision = commit.head.revision,
-                delta_events = delta_event_count,
-                delta_leaves = delta_leaf_count,
-                delta_bytes = commit.delta.as_ref().map_or(0, |delta| delta.payload.len()),
-                blocked_bytes = commit
-                    .blocked
-                    .as_ref()
-                    .map_or(0, |blocked| blocked.payload.len()),
-                anchored_validation = anchored_append,
-                preparation_elapsed_ms = preparation_elapsed.as_millis(),
-                validation_elapsed_ms = validation_elapsed.as_millis(),
-                transaction_elapsed_ms = transaction_elapsed.as_millis(),
-                "PPOI corpus journal append complete"
-            );
-            Ok(PublicRpcPersistResult::Applied(Box::new(
-                PersistedPoiArtifactCache {
-                    record: commit.head.corpus.clone(),
-                    cache,
-                    cache_generation,
-                    journal_head: Some(commit.head.clone()),
-                    compaction_recommended: commit.compaction_recommended,
-                },
-            )))
-        }
+        PoiCorpusJournalCommitOutcome::Applied(commit) => Ok(PublicRpcPersistResult::Applied(
+            Box::new(PersistedPoiArtifactCache {
+                record: commit.head.corpus.clone(),
+                cache,
+                cache_generation,
+                journal_head: Some(commit.head.clone()),
+                compaction_recommended: commit.compaction_recommended,
+            }),
+        )),
         PoiCorpusJournalCommitOutcome::CorpusConflict => Ok(PublicRpcPersistResult::Stale),
         PoiCorpusJournalCommitOutcome::CompactionRequired => Ok(
             PublicRpcPersistResult::CompactionRequired(Box::new(PendingPublicRpcCommit {
