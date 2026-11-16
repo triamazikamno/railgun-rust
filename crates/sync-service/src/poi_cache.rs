@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1668,43 +1669,128 @@ struct PoiCacheCandidateJob {
     poi_artifact_persistence: PoiArtifactPersistenceHandle,
 }
 
-async fn produce_chain_poi_cache_candidates(
-    mut job: PoiCacheCandidateJob,
-) -> PreparedPoiCacheBatch {
-    let client = job.http_client.clone().unwrap_or_default();
-    let rpc_client = wallet_poi_status_client(&job.poi_rpc_url, job.http_client.as_ref());
-    let mut candidates = Vec::with_capacity(job.active_list_keys.len());
-    let mut source_outcomes = Vec::with_capacity(job.active_list_keys.len());
-    let mut errors = Vec::new();
-    let mut observed_manifest = None;
-    let mut actual_scope = job.scope;
-    for (list_index, list_key) in job.active_list_keys.iter().copied().enumerate() {
-        let plan = job
+impl PoiCacheCandidateJob {
+    /// Takes the list's installed and preloaded caches out of the job and
+    /// returns its persisted cache with the corpus base it expects, loading
+    /// the stored candidate when none was preloaded.
+    fn take_persisted_cache(
+        &mut self,
+        list_key: FixedBytes<32>,
+        identity: &PoiCacheIdentity,
+    ) -> Result<(Option<PersistedPoiArtifactCache>, ExpectedPoiCorpusBase), PoiArtifactError> {
+        let installed_cache = self.baseline.remove(&list_key);
+        match self.preloaded_caches.remove(&list_key) {
+            Some(persisted) => {
+                let expected = persisted.expected_base();
+                Ok((Some(persisted), expected))
+            }
+            None => load_persisted_cache_candidate_for_publisher(
+                self.db.as_ref(),
+                identity,
+                self.artifact_config.trusted_publisher_pubkey,
+                installed_cache,
+                self.installed_head_anchors.get(&list_key),
+            ),
+        }
+    }
+}
+
+async fn produce_chain_poi_cache_candidates(job: PoiCacheCandidateJob) -> PreparedPoiCacheBatch {
+    let mut producer = PoiCacheCandidateProducer::new(job);
+    let list_keys = producer.job.active_list_keys.clone();
+    for (list_index, list_key) in list_keys.into_iter().enumerate() {
+        let Some((plan, artifact, public_range)) = producer.list_start(list_index, list_key) else {
+            continue;
+        };
+        let step = if producer.job.scope.events && plan.use_artifact {
+            producer.artifact_first(artifact, public_range).await
+        } else {
+            producer.range_first(plan, artifact, public_range).await
+        };
+        if step.is_break() {
+            break;
+        }
+    }
+    producer.finish()
+}
+
+/// One list's artifact candidate inputs, with the list's position in the attempt.
+struct ArtifactCandidateRequest {
+    list_index: usize,
+    list_key: FixedBytes<32>,
+    identity: PoiCacheIdentity,
+    persisted: Option<PersistedPoiArtifactCache>,
+    expected_base: ExpectedPoiCorpusBase,
+}
+
+/// The cache one list's public-range catch-up starts from, and what its
+/// candidate persists against.
+struct PublicRangeStart {
+    cache: PoiCache,
+    range_start_index: u64,
+    expected_base: ExpectedPoiCorpusBase,
+    starting_record: Option<PoiArtifactCacheRecord>,
+    starting_head: Option<PoiCorpusJournalHeadRecord>,
+}
+
+/// A candidate job in progress: its clients and the batch built so far.
+struct PoiCacheCandidateProducer {
+    job: PoiCacheCandidateJob,
+    client: reqwest::Client,
+    rpc_client: PoiRpcClient,
+    candidates: Vec<PreparedPoiCacheCandidate>,
+    source_outcomes: Vec<PoiListSourceOutcome>,
+    errors: Vec<String>,
+    observed_manifest: Option<ObservedManifest>,
+    actual_scope: PoiCacheSyncScope,
+}
+
+impl PoiCacheCandidateProducer {
+    fn new(job: PoiCacheCandidateJob) -> Self {
+        let client = job.http_client.clone().unwrap_or_default();
+        let rpc_client = wallet_poi_status_client(&job.poi_rpc_url, job.http_client.as_ref());
+        Self {
+            client,
+            rpc_client,
+            candidates: Vec::with_capacity(job.active_list_keys.len()),
+            source_outcomes: Vec::with_capacity(job.active_list_keys.len()),
+            errors: Vec::new(),
+            observed_manifest: None,
+            actual_scope: job.scope,
+            job,
+        }
+    }
+
+    /// The list's source plan and starting points, taking its installed and
+    /// preloaded caches out of the job. `None`, with the error recorded, when
+    /// its persisted cache fails to load.
+    fn list_start(
+        &mut self,
+        list_index: usize,
+        list_key: FixedBytes<32>,
+    ) -> Option<(
+        PoiListAttemptPlan,
+        ArtifactCandidateRequest,
+        PublicRangeStart,
+    )> {
+        let plan = self
+            .job
             .source_plans
             .get(&list_key)
             .copied()
             .expect("active POI list has a source plan");
-        let identity =
-            PoiCacheIdentity::new(EVM_CHAIN_TYPE, job.chain_id, DEFAULT_TXID_VERSION, list_key);
-        let installed_cache = job.baseline.remove(&list_key);
-        let (persisted, expected_base) = match job.preloaded_caches.remove(&list_key) {
-            Some(persisted) => {
-                let expected = persisted.expected_base();
-                (Some(persisted), expected)
+        let identity = PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            self.job.chain_id,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        );
+        let (persisted, expected_base) = match self.job.take_persisted_cache(list_key, &identity) {
+            Ok(persisted) => persisted,
+            Err(err) => {
+                self.errors.push(err.to_string());
+                return None;
             }
-            None => match load_persisted_cache_candidate_for_publisher(
-                job.db.as_ref(),
-                &identity,
-                job.artifact_config.trusted_publisher_pubkey,
-                installed_cache,
-                job.installed_head_anchors.get(&list_key),
-            ) {
-                Ok(observed) => observed,
-                Err(err) => {
-                    errors.push(err.to_string());
-                    continue;
-                }
-            },
         };
         let starting_record = persisted
             .as_ref()
@@ -1728,195 +1814,203 @@ async fn produce_chain_poi_cache_candidates(
                     ),
                 )
             };
-        let range_start_index = baseline_cache.progress().next_event_index;
+        let public_range = PublicRangeStart {
+            range_start_index: baseline_cache.progress().next_event_index,
+            cache: baseline_cache,
+            expected_base,
+            starting_record,
+            starting_head,
+        };
+        let artifact = ArtifactCandidateRequest {
+            list_index,
+            list_key,
+            identity,
+            persisted: artifact_starting,
+            expected_base,
+        };
+        Some((plan, artifact, public_range))
+    }
 
-        if job.scope.events && plan.use_artifact {
-            match Box::pin(prepare_artifact_candidate(
-                &job,
-                &client,
-                list_index,
-                list_key,
-                identity,
-                artifact_starting,
-                expected_base,
-                &mut observed_manifest,
-            ))
-            .await
-            {
-                Ok(candidate) => {
-                    actual_scope = actual_scope.union(PoiCacheSyncScope::FULL);
-                    if let Some(candidate) = candidate {
-                        candidates.push(candidate);
-                    }
-                    source_outcomes.push(PoiListSourceOutcome {
-                        list_key,
-                        rpc: None,
-                        artifact_succeeded: true,
-                    });
-                }
-                Err(artifact_error)
-                    if matches!(&artifact_error, PoiArtifactError::Cancelled)
-                        || job.cancel.is_cancelled() =>
-                {
-                    errors.push(artifact_error.to_string());
-                    break;
-                }
-                Err(artifact_error) => {
-                    warn!(chain_id = job.chain_id, list_key = %hex::encode(list_key), %artifact_error, "artifact candidate failed; trying public range fallback");
-                    match public_rpc_candidate_cache(&rpc_client, baseline_cache, job.scope).await {
-                        Ok(result) => {
-                            source_outcomes.push(PoiListSourceOutcome {
-                                list_key,
-                                rpc: Some(PoiRpcAttemptOutcome::Succeeded {
-                                    backlog_large: result.outcome.event_page_budget_exhausted,
-                                }),
-                                artifact_succeeded: false,
-                            });
-                            if let Some(candidate) = result.candidate {
-                                candidates.push(PreparedPoiCacheCandidate {
-                                    list_key,
-                                    cache: Some(candidate.cache),
-                                    persistence: PreparedPoiCachePersistence::PublicRpc {
-                                        prepared: Box::new(PreparedPublicRpcPersistence {
-                                            range_start_index,
-                                            expected_base,
-                                            starting_record: starting_record.clone(),
-                                            starting_head: starting_head.clone(),
-                                            delta: candidate.delta,
-                                            blocked_shields: candidate.blocked_shields,
-                                        }),
-                                    },
-                                });
-                            }
-                        }
-                        Err(rpc_error) => {
-                            source_outcomes.push(PoiListSourceOutcome {
-                                list_key,
-                                rpc: Some(PoiRpcAttemptOutcome::Failed),
-                                artifact_succeeded: false,
-                            });
-                            let rpc_error = poi_cache_error_diagnostic(&rpc_error);
-                            errors.push(format!(
-                                "artifact refresh failed: {artifact_error}; public range catch-up failed: {rpc_error}"
-                            ));
-                        }
-                    }
-                }
+    /// Prepares the list from the artifact, falling back to the public range
+    /// when the artifact fails for a reason other than cancellation.
+    async fn artifact_first(
+        &mut self,
+        artifact: ArtifactCandidateRequest,
+        public_range: PublicRangeStart,
+    ) -> ControlFlow<()> {
+        let list_key = artifact.list_key;
+        match Box::pin(prepare_artifact_candidate(
+            &self.job,
+            &self.client,
+            artifact,
+            &mut self.observed_manifest,
+        ))
+        .await
+        {
+            Ok(candidate) => self.record_artifact(list_key, candidate, None),
+            Err(artifact_error) if self.artifact_cancelled(&artifact_error) => {
+                self.errors.push(artifact_error.to_string());
+                return ControlFlow::Break(());
             }
-        } else {
-            emit_candidate_progress(
-                &job,
-                list_index,
-                list_key,
-                PoiArtifactCachePhase::LiveTailing,
-                baseline_cache.progress().next_event_index.checked_sub(1),
-                None,
-            );
-            match public_rpc_candidate_cache(&rpc_client, baseline_cache, job.scope).await {
-                Ok(result) => {
-                    source_outcomes.push(PoiListSourceOutcome {
+            Err(artifact_error) => {
+                warn!(chain_id = self.job.chain_id, list_key = %hex::encode(list_key), %artifact_error, "artifact candidate failed; trying public range fallback");
+                if let Err(rpc_error) = self.catch_up_public_range(list_key, public_range).await {
+                    let rpc_error = poi_cache_error_diagnostic(&rpc_error);
+                    self.record_sources_failed(
                         list_key,
-                        rpc: Some(PoiRpcAttemptOutcome::Succeeded {
-                            backlog_large: result.outcome.event_page_budget_exhausted,
-                        }),
-                        artifact_succeeded: false,
-                    });
-                    if let Some(candidate) = result.candidate {
-                        candidates.push(PreparedPoiCacheCandidate {
-                            list_key,
-                            cache: Some(candidate.cache),
-                            persistence: PreparedPoiCachePersistence::PublicRpc {
-                                prepared: Box::new(PreparedPublicRpcPersistence {
-                                    range_start_index,
-                                    expected_base,
-                                    starting_record: starting_record.clone(),
-                                    starting_head: starting_head.clone(),
-                                    delta: candidate.delta,
-                                    blocked_shields: candidate.blocked_shields,
-                                }),
-                            },
-                        });
-                    }
-                }
-                Err(rpc_error) if plan.artifact_after_rpc_failure => {
-                    match Box::pin(prepare_artifact_candidate(
-                        &job,
-                        &client,
-                        list_index,
-                        list_key,
-                        identity,
-                        artifact_starting,
-                        expected_base,
-                        &mut observed_manifest,
-                    ))
-                    .await
-                    {
-                        Ok(candidate) => {
-                            actual_scope = actual_scope.union(PoiCacheSyncScope::FULL);
-                            if let Some(candidate) = candidate {
-                                candidates.push(candidate);
-                            }
-                            source_outcomes.push(PoiListSourceOutcome {
-                                list_key,
-                                rpc: Some(PoiRpcAttemptOutcome::Failed),
-                                artifact_succeeded: true,
-                            });
-                        }
-                        Err(artifact_error)
-                            if matches!(&artifact_error, PoiArtifactError::Cancelled)
-                                || job.cancel.is_cancelled() =>
-                        {
-                            errors.push(artifact_error.to_string());
-                            break;
-                        }
-                        Err(artifact_error) => {
-                            source_outcomes.push(PoiListSourceOutcome {
-                                list_key,
-                                rpc: Some(PoiRpcAttemptOutcome::Failed),
-                                artifact_succeeded: false,
-                            });
-                            let rpc_error = poi_cache_error_diagnostic(&rpc_error);
-                            errors.push(format!(
-                                "public range catch-up failed: {rpc_error}; artifact refresh failed: {artifact_error}"
-                            ));
-                        }
-                    }
-                }
-                Err(rpc_error) => {
-                    source_outcomes.push(PoiListSourceOutcome {
-                        list_key,
-                        rpc: Some(PoiRpcAttemptOutcome::Failed),
-                        artifact_succeeded: false,
-                    });
-                    errors.push(format!(
-                        "public range catch-up failed: {}",
-                        poi_cache_error_diagnostic(&rpc_error)
-                    ));
+                        format!(
+                            "artifact refresh failed: {artifact_error}; public range catch-up failed: {rpc_error}"
+                        ),
+                    );
                 }
             }
         }
+        ControlFlow::Continue(())
     }
-    let result = if errors.is_empty() {
+
+    /// Catches the list up over the public range, falling back to the
+    /// artifact when the range fails and the plan allows it.
+    async fn range_first(
+        &mut self,
+        plan: PoiListAttemptPlan,
+        artifact: ArtifactCandidateRequest,
+        public_range: PublicRangeStart,
+    ) -> ControlFlow<()> {
+        let list_key = artifact.list_key;
+        emit_candidate_progress(
+            &self.job,
+            artifact.list_index,
+            list_key,
+            PoiArtifactCachePhase::LiveTailing,
+            public_range
+                .cache
+                .progress()
+                .next_event_index
+                .checked_sub(1),
+            None,
+        );
+        let Err(rpc_error) = self.catch_up_public_range(list_key, public_range).await else {
+            return ControlFlow::Continue(());
+        };
+        let rpc_error = poi_cache_error_diagnostic(&rpc_error);
+        if !plan.artifact_after_rpc_failure {
+            self.record_sources_failed(
+                list_key,
+                format!("public range catch-up failed: {rpc_error}"),
+            );
+            return ControlFlow::Continue(());
+        }
+        match Box::pin(prepare_artifact_candidate(
+            &self.job,
+            &self.client,
+            artifact,
+            &mut self.observed_manifest,
+        ))
+        .await
+        {
+            Ok(candidate) => {
+                self.record_artifact(list_key, candidate, Some(PoiRpcAttemptOutcome::Failed));
+            }
+            Err(artifact_error) if self.artifact_cancelled(&artifact_error) => {
+                self.errors.push(artifact_error.to_string());
+                return ControlFlow::Break(());
+            }
+            Err(artifact_error) => self.record_sources_failed(
+                list_key,
+                format!(
+                    "public range catch-up failed: {rpc_error}; artifact refresh failed: {artifact_error}"
+                ),
+            ),
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Runs the list's public-range catch-up and records its success; a
+    /// failure is returned unrecorded.
+    async fn catch_up_public_range(
+        &mut self,
+        list_key: FixedBytes<32>,
+        start: PublicRangeStart,
+    ) -> Result<(), PoiCacheError> {
+        let result =
+            public_rpc_candidate_cache(&self.rpc_client, start.cache, self.job.scope).await?;
+        self.source_outcomes.push(PoiListSourceOutcome {
+            list_key,
+            rpc: Some(PoiRpcAttemptOutcome::Succeeded {
+                backlog_large: result.outcome.event_page_budget_exhausted,
+            }),
+            artifact_succeeded: false,
+        });
+        if let Some(candidate) = result.candidate {
+            self.candidates.push(PreparedPoiCacheCandidate {
+                list_key,
+                cache: Some(candidate.cache),
+                persistence: PreparedPoiCachePersistence::PublicRpc {
+                    prepared: Box::new(PreparedPublicRpcPersistence {
+                        range_start_index: start.range_start_index,
+                        expected_base: start.expected_base,
+                        starting_record: start.starting_record,
+                        starting_head: start.starting_head,
+                        delta: candidate.delta,
+                        blocked_shields: candidate.blocked_shields,
+                    }),
+                },
+            });
+        }
         Ok(())
-    } else {
-        Err(errors.join("; "))
-    };
-    PreparedPoiCacheBatch {
-        candidates,
-        source_outcomes,
-        actual_scope,
-        result,
+    }
+
+    /// Records an artifact success after `rpc`, the public-range outcome that preceded it.
+    fn record_artifact(
+        &mut self,
+        list_key: FixedBytes<32>,
+        candidate: Option<PreparedPoiCacheCandidate>,
+        rpc: Option<PoiRpcAttemptOutcome>,
+    ) {
+        self.actual_scope = self.actual_scope.union(PoiCacheSyncScope::FULL);
+        if let Some(candidate) = candidate {
+            self.candidates.push(candidate);
+        }
+        self.source_outcomes.push(PoiListSourceOutcome {
+            list_key,
+            rpc,
+            artifact_succeeded: true,
+        });
+    }
+
+    /// Records that every source tried for the list failed.
+    fn record_sources_failed(&mut self, list_key: FixedBytes<32>, error: String) {
+        self.source_outcomes.push(PoiListSourceOutcome {
+            list_key,
+            rpc: Some(PoiRpcAttemptOutcome::Failed),
+            artifact_succeeded: false,
+        });
+        self.errors.push(error);
+    }
+
+    fn artifact_cancelled(&self, error: &PoiArtifactError) -> bool {
+        matches!(error, PoiArtifactError::Cancelled) || self.job.cancel.is_cancelled()
+    }
+
+    fn finish(self) -> PreparedPoiCacheBatch {
+        let result = if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors.join("; "))
+        };
+        PreparedPoiCacheBatch {
+            candidates: self.candidates,
+            source_outcomes: self.source_outcomes,
+            actual_scope: self.actual_scope,
+            result,
+        }
     }
 }
 
 async fn prepare_artifact_candidate(
     job: &PoiCacheCandidateJob,
     client: &reqwest::Client,
-    list_index: usize,
-    list_key: FixedBytes<32>,
-    identity: PoiCacheIdentity,
-    persisted: Option<PersistedPoiArtifactCache>,
-    expected_base: ExpectedPoiCorpusBase,
+    request: ArtifactCandidateRequest,
     observed_manifest: &mut Option<ObservedManifest>,
 ) -> Result<Option<PreparedPoiCacheCandidate>, PoiArtifactError> {
     let ingestor = PoiArtifactIngestor::new(job.artifact_config.clone(), client.clone())
@@ -1932,7 +2026,7 @@ async fn prepare_artifact_candidate(
                 let list_progress = list_progress_with_active_event(
                     &active_list_keys,
                     &baseline,
-                    list_key,
+                    request.list_key,
                     event.current_event_index,
                     event.target_event_index,
                 );
@@ -1942,9 +2036,9 @@ async fn prepare_artifact_candidate(
                         generation,
                         chain_id,
                         event.phase,
-                        list_index,
+                        request.list_index,
                         active_list_keys.len(),
-                        Some(list_key),
+                        Some(request.list_key),
                         event.current_event_index,
                         event.target_event_index,
                         list_progress,
@@ -1965,18 +2059,18 @@ async fn prepare_artifact_candidate(
     let prepared = ingestor
         .prepare_cache_with_observed_manifest(
             &job.poi_artifact_persistence,
-            identity,
+            request.identity,
             observed_manifest
                 .as_ref()
                 .expect("observed manifest initialized"),
-            persisted,
-            expected_base,
+            request.persisted,
+            request.expected_base,
             job.generation,
             &job.cancel,
         )
         .await?;
     Ok(prepared.map(|prepared| PreparedPoiCacheCandidate {
-        list_key,
+        list_key: request.list_key,
         cache: None,
         persistence: PreparedPoiCachePersistence::Artifact {
             prepared: Box::new(prepared),
