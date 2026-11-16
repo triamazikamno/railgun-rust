@@ -320,15 +320,31 @@ fn half_open_probe_ownership_controls_cancellation() {
     drop(current);
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use blake2b_simd::Params;
 use bytes::Bytes;
+use chrono::Utc;
+use cid::Cid;
 use ipld_dagpb::{PbLink, PbNode};
 use libp2p_identity::Keypair;
 use multihash_codetable::{Code, MultihashDigest};
+use poi::SensitiveUrl;
 use quick_protobuf::Writer;
+use url::Url;
+
+use crate::car::{RetrievalLimits, decode_car_blocks, reconstruct_file};
+use crate::fetcher::ipns::verify_ipns_record_candidate;
+use crate::http::{
+    HttpAttemptTimeouts, car_gateway_url, fetch_response_bytes,
+    fetch_response_bytes_reporting_headers, fetch_response_bytes_with_timeouts,
+    ipns_record_gateway_url,
+};
+use crate::pool::{GatewayHealth, opaque_gateway_id, rank_for, recover_mutex};
 
 fn sensitive_server_url(mut url: Url) -> SensitiveUrl {
     url.set_path("/endpoint-sentinel");
