@@ -1,6 +1,7 @@
 //! Staging and installing POI cache candidates, and loading persisted corpora.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::time::Instant;
 
 use alloy::hex;
@@ -27,7 +28,7 @@ use super::progress::{
     completion_progress_from_caches, publish_current_attempt_phase,
     send_poi_artifact_cache_progress,
 };
-use super::source_health::PoiRpcAttemptOutcome;
+use super::source_health::{PoiListSourceOutcome, PoiRpcAttemptOutcome};
 use super::{
     ChainPoiCacheCoordinator, EVM_CHAIN_TYPE, PoiCacheServiceError, acquire_corpus_write_fence,
 };
@@ -49,62 +50,39 @@ pub(super) async fn finish_chain_poi_cache_attempt(
         result: network_result,
         ..
     } = batch;
+    let shutdown = || FinishedPoiCacheAttempt {
+        result: Err(PoiCacheServiceError::Shutdown { attempt_id }),
+        compactions: Vec::new(),
+    };
     let mut commit_result = validate_artifact_manifest_sequences(
         candidates
             .iter()
             .filter_map(|candidate| candidate.persistence.artifact_manifest_sequence()),
     );
-    let candidates_valid = commit_result.is_ok();
-    if candidates_valid && !candidates.is_empty() {
-        publish_current_attempt_phase(
-            task,
-            attempt_id,
-            generation,
-            PoiArtifactCachePhase::Persisting,
-        );
-    }
-    if candidates_valid {
-        for outcome in &source_outcomes {
-            if task.cancel.is_cancelled() {
-                return FinishedPoiCacheAttempt {
-                    result: Err(PoiCacheServiceError::Shutdown { attempt_id }),
-                    compactions: Vec::new(),
-                };
-            }
-            if !matches!(outcome.rpc, Some(PoiRpcAttemptOutcome::Succeeded { .. })) {
-                continue;
-            }
-            let identity = PoiCacheIdentity::new(
-                EVM_CHAIN_TYPE,
-                task.chain_id,
-                DEFAULT_TXID_VERSION,
-                outcome.list_key,
-            );
-            if let Err(error) = record_poi_rpc_success(task.db.as_ref(), &identity, generation) {
-                commit_result = Err(PoiCacheServiceError::Refresh {
-                    reason: error.to_string(),
-                });
-                break;
-            }
-        }
-    }
     let mut staged = Vec::new();
-    if candidates_valid {
-        for candidate in candidates {
-            if task.cancel.is_cancelled() {
-                return FinishedPoiCacheAttempt {
-                    result: Err(PoiCacheServiceError::Shutdown { attempt_id }),
-                    compactions: Vec::new(),
-                };
-            }
-            match stage_poi_cache_candidate(task, attempt_id, generation, candidate).await {
-                Ok(Some(candidate)) => staged.push(candidate),
-                Ok(None) => {}
-                Err(error) => {
-                    commit_result = Err(error);
-                    break;
-                }
-            }
+    if commit_result.is_ok() {
+        if !candidates.is_empty() {
+            publish_current_attempt_phase(
+                task,
+                attempt_id,
+                generation,
+                PoiArtifactCachePhase::Persisting,
+            );
+        }
+        let ControlFlow::Continue(recorded) =
+            record_rpc_successes(task, generation, &source_outcomes)
+        else {
+            return shutdown();
+        };
+        commit_result = recorded;
+        let ControlFlow::Continue((staged_now, staging)) =
+            stage_candidates(task, attempt_id, generation, candidates).await
+        else {
+            return shutdown();
+        };
+        staged = staged_now;
+        if let Err(error) = staging {
+            commit_result = Err(error);
         }
     }
     let result = commit_result
@@ -123,6 +101,65 @@ pub(super) async fn finish_chain_poi_cache_attempt(
         result,
         compactions,
     }
+}
+
+/// Records each public-range success of the attempt. `Break` when the
+/// coordinator was cancelled first; the first store error stops recording and
+/// is returned in `Continue`.
+fn record_rpc_successes(
+    task: &ChainPoiCacheCoordinator,
+    generation: u64,
+    outcomes: &[PoiListSourceOutcome],
+) -> ControlFlow<(), Result<(), PoiCacheServiceError>> {
+    for outcome in outcomes {
+        if task.cancel.is_cancelled() {
+            return ControlFlow::Break(());
+        }
+        if !matches!(outcome.rpc, Some(PoiRpcAttemptOutcome::Succeeded { .. })) {
+            continue;
+        }
+        let identity = PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            task.chain_id,
+            DEFAULT_TXID_VERSION,
+            outcome.list_key,
+        );
+        if let Err(error) = record_poi_rpc_success(task.db.as_ref(), &identity, generation) {
+            return ControlFlow::Continue(Err(PoiCacheServiceError::Refresh {
+                reason: error.to_string(),
+            }));
+        }
+    }
+    ControlFlow::Continue(Ok(()))
+}
+
+/// Stages the attempt's candidates in order. `Break` when the coordinator was
+/// cancelled first; a staging error stops at that candidate and is returned
+/// with the candidates staged before it.
+async fn stage_candidates(
+    task: &ChainPoiCacheCoordinator,
+    attempt_id: PoiArtifactCacheAttemptId,
+    generation: u64,
+    candidates: Vec<PreparedPoiCacheCandidate>,
+) -> ControlFlow<
+    (),
+    (
+        Vec<StagedPoiCacheCandidate>,
+        Result<(), PoiCacheServiceError>,
+    ),
+> {
+    let mut staged = Vec::new();
+    for candidate in candidates {
+        if task.cancel.is_cancelled() {
+            return ControlFlow::Break(());
+        }
+        match stage_poi_cache_candidate(task, attempt_id, generation, candidate).await {
+            Ok(Some(candidate)) => staged.push(candidate),
+            Ok(None) => {}
+            Err(error) => return ControlFlow::Continue((staged, Err(error))),
+        }
+    }
+    ControlFlow::Continue((staged, Ok(())))
 }
 
 pub(super) fn validate_artifact_manifest_sequences(
@@ -249,37 +286,10 @@ pub(super) async fn apply_staged_poi_cache_batch(
         .installed_head_anchors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut installed_any = false;
-    let mut blocked_shields_changed = false;
-    let mut compactions = Vec::new();
-    for candidate in staged {
-        let changed = caches.get(&candidate.list_key).is_none_or(|current| {
-            current.progress() != candidate.cache.progress()
-                || !current.blocked_shields_match(&candidate.cache)
-        });
-        if let Some(compaction) = candidate.compaction {
-            compactions.push(compaction);
-        }
-        if !changed {
-            if let Some(head) = candidate.journal_head {
-                installed_head_anchors.insert(candidate.list_key, head);
-            }
-            continue;
-        }
-        let blocked_changed = caches
-            .get(&candidate.list_key)
-            .is_none_or(|current| !current.blocked_shields_match(&candidate.cache));
-        if install_cache_if_not_behind(&mut caches, candidate.list_key, candidate.cache) {
-            if let Some(head) = candidate.journal_head {
-                installed_head_anchors.insert(candidate.list_key, head);
-            }
-            installed_any = true;
-            blocked_shields_changed |= blocked_changed;
-        }
-    }
-    if installed_any {
+    let installed = install_staged_candidates(&mut caches, &mut installed_head_anchors, staged);
+    if installed.installed_any {
         task.local_caches
-            .publish_committed_revision(blocked_shields_changed);
+            .publish_committed_revision(installed.blocked_shields_changed);
     }
     let graph_progress = task
         .progress_tx
@@ -300,7 +310,56 @@ pub(super) async fn apply_staged_poi_cache_batch(
     );
     send_poi_artifact_cache_progress(&task.progress_tx, progress);
     drop(publication);
-    Ok(compactions)
+    Ok(installed.compactions)
+}
+
+/// What installing an attempt's staged candidates changed.
+struct StagedInstall {
+    installed_any: bool,
+    blocked_shields_changed: bool,
+    compactions: Vec<PoiCorpusCompactionRequest>,
+}
+
+/// Installs each staged candidate that changes its list's cache and is not
+/// behind it, recording journal heads for unchanged and installed candidates.
+fn install_staged_candidates(
+    caches: &mut BTreeMap<FixedBytes<32>, PoiCache>,
+    installed_head_anchors: &mut BTreeMap<FixedBytes<32>, PoiCorpusJournalHeadRecord>,
+    staged: Vec<StagedPoiCacheCandidate>,
+) -> StagedInstall {
+    let mut installed_any = false;
+    let mut blocked_shields_changed = false;
+    let mut compactions = Vec::new();
+    for candidate in staged {
+        let changed = caches.get(&candidate.list_key).is_none_or(|current| {
+            current.progress() != candidate.cache.progress()
+                || !current.blocked_shields_match(&candidate.cache)
+        });
+        if let Some(compaction) = candidate.compaction {
+            compactions.push(compaction);
+        }
+        if !changed {
+            if let Some(head) = candidate.journal_head {
+                installed_head_anchors.insert(candidate.list_key, head);
+            }
+            continue;
+        }
+        let blocked_changed = caches
+            .get(&candidate.list_key)
+            .is_none_or(|current| !current.blocked_shields_match(&candidate.cache));
+        if install_cache_if_not_behind(caches, candidate.list_key, candidate.cache) {
+            if let Some(head) = candidate.journal_head {
+                installed_head_anchors.insert(candidate.list_key, head);
+            }
+            installed_any = true;
+            blocked_shields_changed |= blocked_changed;
+        }
+    }
+    StagedInstall {
+        installed_any,
+        blocked_shields_changed,
+        compactions,
+    }
 }
 
 pub(super) fn install_cache_if_not_behind(
