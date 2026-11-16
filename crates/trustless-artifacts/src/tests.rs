@@ -324,6 +324,7 @@ use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::time::{Duration, UNIX_EPOCH};
 
+use bytes::Bytes;
 use ipld_dagpb::{PbLink, PbNode};
 use libp2p_identity::Keypair;
 use multihash_codetable::{Code, MultihashDigest};
