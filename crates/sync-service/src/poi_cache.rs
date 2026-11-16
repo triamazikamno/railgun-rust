@@ -1075,58 +1075,10 @@ async fn run_chain_poi_cache_coordinator(
     let chain_id = task.chain_id;
     let generation = task.cache_generation;
     let startup_attempt_id = task.runtime.next_attempt_id();
-    {
-        let publication = task
-            .runtime
-            .publication_fence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if publication.shutdown || task.cancel.is_cancelled() {
-            return;
-        }
-        let _ = send_poi_artifact_cache_progress_for_generation(
-            &task.progress_tx,
-            generation,
-            new_poi_artifact_cache_progress(
-                startup_attempt_id,
-                generation,
-                chain_id,
-                PoiArtifactCachePhase::LoadingPersisted,
-                0,
-                task.active_list_keys.len(),
-                None,
-                None,
-                None,
-                poi_cache_list_progress_for_keys(&task.active_list_keys),
-                PoiArtifactCacheGraphProgress::default(),
-                false,
-                None,
-            ),
-        );
+    if !publish_persisted_cache_loading(&task, startup_attempt_id) {
+        return;
     }
-    let preload_started = Instant::now();
-    let loaded = load_persisted_chain_poi_caches(
-        task.db.as_ref(),
-        chain_id,
-        &task.active_list_keys,
-        task.artifact_config.trusted_publisher_pubkey,
-    );
-    task.preloaded_caches =
-        apply_loaded_persisted_chain_poi_caches(&task, loaded, preload_started, startup_attempt_id)
-            .await;
-    {
-        let mut anchors = task
-            .installed_head_anchors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *anchors = task
-            .preloaded_caches
-            .iter()
-            .filter_map(|(list_key, persisted)| {
-                persisted.journal_head.clone().map(|head| (*list_key, head))
-            })
-            .collect();
-    }
+    preload_persisted_chain_poi_caches(&mut task, startup_attempt_id).await;
     if publish_chain_poi_cache_ready_and_acknowledge_initialization(
         &task.progress_tx,
         chain_id,
@@ -1143,217 +1095,323 @@ async fn run_chain_poi_cache_coordinator(
     {
         return;
     }
-    let mut health = source_health_for_lists(
+    let health = source_health_for_lists(
         task.db.as_ref(),
         chain_id,
         generation,
         &task.active_list_keys,
         &task.preloaded_caches,
     );
-    let mut active = None;
-    let mut public_cache_reset = None;
-    let mut compaction_lane = PoiCorpusCompactionLane::default();
-    let mut maintenance = PoiCacheMaintenanceSchedule::new(TokioInstant::now());
+    let mut coordinator = ChainPoiCacheCoordinatorLoop {
+        generation,
+        health,
+        active: None,
+        public_cache_reset: None,
+        compaction_lane: PoiCorpusCompactionLane::default(),
+        maintenance: PoiCacheMaintenanceSchedule::new(TokioInstant::now()),
+        task,
+    };
     info!(
         chain_id,
-        list_count = task.active_list_keys.len(),
+        list_count = coordinator.task.active_list_keys.len(),
         "starting chain-owned POI cache coordinator"
     );
-    if start_chain_poi_cache_attempt(
-        &mut task,
-        &mut active,
-        generation,
-        &health,
-        PoiCacheSyncScope::FULL,
-        None,
-    )
-    .await
-    .is_err()
-    {
-        maintenance.record_failure(PoiCacheSyncScope::FULL, TokioInstant::now());
-    }
+    coordinator.start_full_sync().await;
+    coordinator.run().await;
+    info!(chain_id, "chain-owned POI cache coordinator stopped");
+}
 
-    loop {
-        tokio::select! {
-            biased;
-            () = task.cancel.cancelled() => {
-                cancel_active_attempt(&mut active, |attempt_id| {
-                    PoiCacheServiceError::Shutdown { attempt_id }
-                });
-                cancel_poi_corpus_compaction_lane(&mut compaction_lane);
-                break;
-            }
-            command = task.command_rx.recv() => {
-                let Some(command) = command else {
-                    cancel_active_attempt(&mut active, |attempt_id| {
+/// Publishes the startup `LoadingPersisted` progress under the publication
+/// fence; false once shutdown has begun or the coordinator is cancelled.
+fn publish_persisted_cache_loading(
+    task: &ChainPoiCacheCoordinator,
+    attempt_id: PoiArtifactCacheAttemptId,
+) -> bool {
+    let publication = task
+        .runtime
+        .publication_fence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if publication.shutdown || task.cancel.is_cancelled() {
+        return false;
+    }
+    let _ = send_poi_artifact_cache_progress_for_generation(
+        &task.progress_tx,
+        task.cache_generation,
+        new_poi_artifact_cache_progress(
+            attempt_id,
+            task.cache_generation,
+            task.chain_id,
+            PoiArtifactCachePhase::LoadingPersisted,
+            0,
+            task.active_list_keys.len(),
+            None,
+            None,
+            None,
+            poi_cache_list_progress_for_keys(&task.active_list_keys),
+            PoiArtifactCacheGraphProgress::default(),
+            false,
+            None,
+        ),
+    );
+    true
+}
+
+/// Loads the persisted caches into the coordinator and installs their journal
+/// heads as the installed head anchors.
+async fn preload_persisted_chain_poi_caches(
+    task: &mut ChainPoiCacheCoordinator,
+    startup_attempt_id: PoiArtifactCacheAttemptId,
+) {
+    let preload_started = Instant::now();
+    let loaded = load_persisted_chain_poi_caches(
+        task.db.as_ref(),
+        task.chain_id,
+        &task.active_list_keys,
+        task.artifact_config.trusted_publisher_pubkey,
+    );
+    task.preloaded_caches =
+        apply_loaded_persisted_chain_poi_caches(task, loaded, preload_started, startup_attempt_id)
+            .await;
+    let mut anchors = task
+        .installed_head_anchors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *anchors = task
+        .preloaded_caches
+        .iter()
+        .filter_map(|(list_key, persisted)| {
+            persisted.journal_head.clone().map(|head| (*list_key, head))
+        })
+        .collect();
+}
+
+/// A running chain POI cache coordinator and the state its loop carries between turns.
+struct ChainPoiCacheCoordinatorLoop {
+    generation: u64,
+    health: BTreeMap<FixedBytes<32>, PoiSourceHealth>,
+    active: Option<ActivePoiCacheAttempt>,
+    public_cache_reset: Option<CancellationToken>,
+    compaction_lane: PoiCorpusCompactionLane,
+    maintenance: PoiCacheMaintenanceSchedule,
+    // Declared last so that the loop state, including any compaction job, drops first.
+    task: ChainPoiCacheCoordinator,
+}
+
+impl ChainPoiCacheCoordinatorLoop {
+    /// Serves commands, attempt and compaction completions, maintenance and
+    /// reset releases until cancelled or the command channel closes.
+    async fn run(&mut self) {
+        loop {
+            tokio::select! {
+                biased;
+                () = self.task.cancel.cancelled() => {
+                    cancel_active_attempt(&mut self.active, |attempt_id| {
                         PoiCacheServiceError::Shutdown { attempt_id }
                     });
+                    cancel_poi_corpus_compaction_lane(&mut self.compaction_lane);
                     break;
-                };
-                match command {
-                    ChainPoiCacheCommand::UpdateDemand { actor_id, demand } => {
-                        let _ = apply_poi_cache_demand_update(
-                            &mut maintenance,
-                            actor_id,
-                            demand,
-                            TokioInstant::now(),
-                        );
-                    }
-                    ChainPoiCacheCommand::Retry { scope, admission } => {
-                        clear_released_public_cache_reset(&mut public_cache_reset);
-                        if public_cache_reset.is_some()
-                            || task.runtime.public_cache_reset_gate.try_read().is_err()
-                        {
-                            let _ = admission.send(Err(PoiCacheServiceError::CorpusResetInProgress));
-                            continue;
-                        }
-                        let replacement_scope = replacement_poi_cache_scope(scope, active.as_ref());
-                        cancel_active_attempt(&mut active, |attempt_id| {
-                            PoiCacheServiceError::AttemptSuperseded { attempt_id }
+                }
+                command = self.task.command_rx.recv() => {
+                    let Some(command) = command else {
+                        cancel_active_attempt(&mut self.active, |attempt_id| {
+                            PoiCacheServiceError::Shutdown { attempt_id }
                         });
-                        let (completion, completed) = oneshot::channel();
-                        match start_chain_poi_cache_attempt(
-                            &mut task,
-                            &mut active,
-                            generation,
-                            &health,
-                            replacement_scope,
-                            Some(completion),
-                        )
-                        .await {
-                            Ok(attempt_id) => {
-                                let publication = task
-                                    .runtime
-                                    .publication_fence
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if publication.shutdown || task.cancel.is_cancelled() {
-                                    drop(publication);
-                                    cancel_active_attempt(&mut active, |attempt_id| {
-                                        PoiCacheServiceError::Shutdown { attempt_id }
-                                    });
-                                    let _ = admission.send(Err(PoiCacheServiceError::Shutdown {
-                                        attempt_id,
-                                    }));
-                                } else {
-                                    let _ = admission.send(Ok(PoiCacheRetryHandle {
-                                        attempt_id,
-                                        completion: completed,
-                                    }));
-                                }
-                            }
-                            Err(error) => {
-                                maintenance.record_failure(
-                                    replacement_scope,
-                                    TokioInstant::now(),
-                                );
-                                let _ = admission.send(Err(error));
-                            }
-                        }
-                    }
-                    ChainPoiCacheCommand::QuiesceForPublicCacheReset { lease, response } => {
-                        public_cache_reset = Some(lease);
-                        cancel_active_attempt(&mut active, |attempt_id| {
-                            PoiCacheServiceError::StaleAttempt { attempt_id }
-                        });
-                        cancel_poi_corpus_compaction_lane(&mut compaction_lane);
-                        let _ = response.send(());
-                    }
-                }
-            }
-            event = task.job_rx.recv() => {
-                let Some(event) = event else { continue };
-                publish_active_attempt_progress(&task, active.as_ref(), event);
-            }
-            completion = wait_for_active_attempt(&mut active) => {
-                let finished = active.take().expect("completed POI cache attempt is active");
-                let attempt_id = finished.id;
-                let attempt_generation = finished.generation;
-                let attempt_scope = finished.scope;
-                let actual_scope = completion.actual_scope;
-                let source_outcomes = completion.source_outcomes.clone();
-                let finished_attempt = finish_chain_poi_cache_attempt(
-                    &task,
-                    attempt_id,
-                    attempt_generation,
-                    completion,
-                )
-                .await;
-                let FinishedPoiCacheAttempt {
-                    result: attempt_result,
-                    compactions,
-                } = finished_attempt;
-                if !matches!(
-                    &attempt_result,
-                    Err(PoiCacheServiceError::Shutdown { .. })
-                ) {
-                    record_list_source_outcomes(&mut health, &source_outcomes);
-                }
-                if attempt_result.is_ok() {
-                    maintenance.record_success(actual_scope, TokioInstant::now());
-                } else {
-                    maintenance.record_failure(attempt_scope, TokioInstant::now());
-                }
-                let retry_completion = drop_completed_attempt(finished);
-                if let Some(response) = retry_completion {
-                    let publication = task
-                        .runtime
-                        .publication_fence
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let attempt_result = if publication.shutdown || task.cancel.is_cancelled() {
-                        Err(PoiCacheServiceError::Shutdown { attempt_id })
-                    } else {
-                        attempt_result
+                        break;
                     };
-                    let _ = response.send(attempt_result);
+                    self.handle_command(command).await;
                 }
-                enqueue_poi_corpus_compactions(&mut compaction_lane, compactions);
-                start_next_poi_corpus_compaction(&task, &mut compaction_lane, generation);
-            }
-            completion = wait_for_active_poi_corpus_compaction(&mut compaction_lane) => {
-                compaction_lane.active.take();
-                finish_background_poi_corpus_compaction(&task, generation, completion).await;
-                start_next_poi_corpus_compaction(&task, &mut compaction_lane, generation);
-            }
-            () = tokio::time::sleep_until(maintenance.next_deadline()), if active.is_none()
-                && public_cache_reset.is_none() => {
-                let now = TokioInstant::now();
-                if let Some(scope) = maintenance.due_scope(now)
-                    && start_chain_poi_cache_attempt(
-                        &mut task,
-                        &mut active,
-                        generation,
-                        &health,
-                        scope,
-                        None,
-                    )
-                    .await
-                    .is_err()
-                {
-                    maintenance.record_failure(scope, now);
+                event = self.task.job_rx.recv() => {
+                    let Some(event) = event else { continue };
+                    publish_active_attempt_progress(&self.task, self.active.as_ref(), event);
                 }
-            }
-            () = wait_for_public_cache_reset_release(&mut public_cache_reset),
-                if active.is_none() => {
-                public_cache_reset = None;
-                if start_chain_poi_cache_attempt(
-                    &mut task,
-                    &mut active,
-                    generation,
-                    &health,
-                    PoiCacheSyncScope::FULL,
-                    None,
-                )
-                .await
-                .is_err()
-                {
-                    maintenance.record_failure(PoiCacheSyncScope::FULL, TokioInstant::now());
+                completion = wait_for_active_attempt(&mut self.active) => {
+                    self.finish_active_attempt(completion).await;
+                }
+                completion = wait_for_active_poi_corpus_compaction(&mut self.compaction_lane) => {
+                    self.compaction_lane.active.take();
+                    finish_background_poi_corpus_compaction(&self.task, self.generation, completion)
+                        .await;
+                    start_next_poi_corpus_compaction(
+                        &self.task,
+                        &mut self.compaction_lane,
+                        self.generation,
+                    );
+                }
+                () = tokio::time::sleep_until(self.maintenance.next_deadline()),
+                    if self.active.is_none() && self.public_cache_reset.is_none() => {
+                    self.start_due_maintenance().await;
+                }
+                () = wait_for_public_cache_reset_release(&mut self.public_cache_reset),
+                    if self.active.is_none() => {
+                    self.public_cache_reset = None;
+                    self.start_full_sync().await;
                 }
             }
         }
     }
-    info!(chain_id, "chain-owned POI cache coordinator stopped");
+
+    async fn start_attempt(
+        &mut self,
+        scope: PoiCacheSyncScope,
+        retry_completion: Option<oneshot::Sender<Result<(), PoiCacheServiceError>>>,
+    ) -> Result<PoiArtifactCacheAttemptId, PoiCacheServiceError> {
+        start_chain_poi_cache_attempt(
+            &mut self.task,
+            &mut self.active,
+            self.generation,
+            &self.health,
+            scope,
+            retry_completion,
+        )
+        .await
+    }
+
+    /// Starts a full sync, recording a failure to start it.
+    async fn start_full_sync(&mut self) {
+        if self
+            .start_attempt(PoiCacheSyncScope::FULL, None)
+            .await
+            .is_err()
+        {
+            self.maintenance
+                .record_failure(PoiCacheSyncScope::FULL, TokioInstant::now());
+        }
+    }
+
+    /// Starts the maintenance attempt that is due, recording a failure to start it.
+    async fn start_due_maintenance(&mut self) {
+        let now = TokioInstant::now();
+        if let Some(scope) = self.maintenance.due_scope(now)
+            && self.start_attempt(scope, None).await.is_err()
+        {
+            self.maintenance.record_failure(scope, now);
+        }
+    }
+
+    async fn handle_command(&mut self, command: ChainPoiCacheCommand) {
+        match command {
+            ChainPoiCacheCommand::UpdateDemand { actor_id, demand } => {
+                let _ = apply_poi_cache_demand_update(
+                    &mut self.maintenance,
+                    actor_id,
+                    demand,
+                    TokioInstant::now(),
+                );
+            }
+            ChainPoiCacheCommand::Retry { scope, admission } => {
+                self.admit_retry(scope, admission).await;
+            }
+            ChainPoiCacheCommand::QuiesceForPublicCacheReset { lease, response } => {
+                self.public_cache_reset = Some(lease);
+                cancel_active_attempt(&mut self.active, |attempt_id| {
+                    PoiCacheServiceError::StaleAttempt { attempt_id }
+                });
+                cancel_poi_corpus_compaction_lane(&mut self.compaction_lane);
+                let _ = response.send(());
+            }
+        }
+    }
+
+    /// Replaces the active attempt with a retry over `scope` and answers its admission.
+    async fn admit_retry(
+        &mut self,
+        scope: PoiCacheSyncScope,
+        admission: oneshot::Sender<Result<PoiCacheRetryHandle, PoiCacheServiceError>>,
+    ) {
+        clear_released_public_cache_reset(&mut self.public_cache_reset);
+        if self.public_cache_reset.is_some()
+            || self
+                .task
+                .runtime
+                .public_cache_reset_gate
+                .try_read()
+                .is_err()
+        {
+            let _ = admission.send(Err(PoiCacheServiceError::CorpusResetInProgress));
+            return;
+        }
+        let replacement_scope = replacement_poi_cache_scope(scope, self.active.as_ref());
+        cancel_active_attempt(&mut self.active, |attempt_id| {
+            PoiCacheServiceError::AttemptSuperseded { attempt_id }
+        });
+        let (completion, completed) = oneshot::channel();
+        match self
+            .start_attempt(replacement_scope, Some(completion))
+            .await
+        {
+            Ok(attempt_id) => {
+                let publication = self
+                    .task
+                    .runtime
+                    .publication_fence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if publication.shutdown || self.task.cancel.is_cancelled() {
+                    drop(publication);
+                    cancel_active_attempt(&mut self.active, |attempt_id| {
+                        PoiCacheServiceError::Shutdown { attempt_id }
+                    });
+                    let _ = admission.send(Err(PoiCacheServiceError::Shutdown { attempt_id }));
+                } else {
+                    let _ = admission.send(Ok(PoiCacheRetryHandle {
+                        attempt_id,
+                        completion: completed,
+                    }));
+                }
+            }
+            Err(error) => {
+                self.maintenance
+                    .record_failure(replacement_scope, TokioInstant::now());
+                let _ = admission.send(Err(error));
+            }
+        }
+    }
+
+    /// Installs the completed attempt's batch, records its source health and
+    /// maintenance outcome, answers its retry, and queues its compactions.
+    async fn finish_active_attempt(&mut self, completion: PreparedPoiCacheBatch) {
+        let finished = self
+            .active
+            .take()
+            .expect("completed POI cache attempt is active");
+        let attempt_id = finished.id;
+        let attempt_generation = finished.generation;
+        let attempt_scope = finished.scope;
+        let actual_scope = completion.actual_scope;
+        let source_outcomes = completion.source_outcomes.clone();
+        let FinishedPoiCacheAttempt {
+            result: attempt_result,
+            compactions,
+        } = finish_chain_poi_cache_attempt(&self.task, attempt_id, attempt_generation, completion)
+            .await;
+        if !matches!(&attempt_result, Err(PoiCacheServiceError::Shutdown { .. })) {
+            record_list_source_outcomes(&mut self.health, &source_outcomes);
+        }
+        if attempt_result.is_ok() {
+            self.maintenance
+                .record_success(actual_scope, TokioInstant::now());
+        } else {
+            self.maintenance
+                .record_failure(attempt_scope, TokioInstant::now());
+        }
+        if let Some(response) = drop_completed_attempt(finished) {
+            let publication = self
+                .task
+                .runtime
+                .publication_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let attempt_result = if publication.shutdown || self.task.cancel.is_cancelled() {
+                Err(PoiCacheServiceError::Shutdown { attempt_id })
+            } else {
+                attempt_result
+            };
+            let _ = response.send(attempt_result);
+        }
+        enqueue_poi_corpus_compactions(&mut self.compaction_lane, compactions);
+        start_next_poi_corpus_compaction(&self.task, &mut self.compaction_lane, self.generation);
+    }
 }
 
 fn clear_released_public_cache_reset(reset: &mut Option<CancellationToken>) {
