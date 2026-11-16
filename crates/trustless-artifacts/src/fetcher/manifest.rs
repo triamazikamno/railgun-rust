@@ -62,20 +62,17 @@ impl TrustlessArtifactFetcher<'_> {
 
         let gateway_count = self.gateways.len();
         let preferred_gateway_index = preferred_gateway_index.map(|index| index % gateway_count);
-        let mut next_gateway_index = 0;
-        let mut reserved_identities = HashSet::with_capacity(gateway_count);
-        let mut requests: FuturesUnordered<ManifestCidRequest<'_>> = FuturesUnordered::new();
-        let mut last_error = None;
+        ManifestCidRace::new(self, cid)
+            .run(preferred_gateway_index)
+            .await
+    }
 
-        let Some(gateway_attempt) = self.pool.select_excluding(
-            &self.gateway_ids,
-            GatewayCapability::ManifestCid,
-            preferred_gateway_index,
-            &reserved_identities,
-        ) else {
-            return Err(TrustlessArtifactError::NoGateways);
-        };
-        reserved_identities.insert(gateway_attempt.identity);
+    fn manifest_cid_request(
+        &self,
+        cid: Cid,
+        ordinal: usize,
+        gateway_attempt: GatewayAttempt,
+    ) -> ManifestCidRequest<'_> {
         let gateway_index = gateway_attempt.index;
         let gateway = self.gateways.expose(gateway_index);
         let url = if cid.codec() == RAW_CODEC {
@@ -85,185 +82,8 @@ impl TrustlessArtifactFetcher<'_> {
         };
         let source = TrustlessHttpSource::Gateway {
             index: gateway_index,
-            count: gateway_count,
+            count: self.gateways.len(),
         };
-        requests.push(self.manifest_cid_request(
-            cid,
-            gateway_index,
-            0,
-            url,
-            source,
-            gateway_attempt,
-        ));
-        next_gateway_index += 1;
-        let mut next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
-
-        while next_gateway_index < gateway_count || !requests.is_empty() {
-            if requests.is_empty() {
-                let Some(gateway_attempt) = self.pool.select_excluding(
-                    &self.gateway_ids,
-                    GatewayCapability::ManifestCid,
-                    None,
-                    &reserved_identities,
-                ) else {
-                    break;
-                };
-                reserved_identities.insert(gateway_attempt.identity);
-                let gateway_index = gateway_attempt.index;
-                let gateway = self.gateways.expose(gateway_index);
-                let url = if cid.codec() == RAW_CODEC {
-                    raw_gateway_url(gateway, &cid)
-                } else {
-                    car_gateway_url(gateway, &cid)
-                };
-                let source = TrustlessHttpSource::Gateway {
-                    index: gateway_index,
-                    count: gateway_count,
-                };
-                let ordinal = next_gateway_index;
-                requests.push(self.manifest_cid_request(
-                    cid,
-                    gateway_index,
-                    ordinal,
-                    url,
-                    source,
-                    gateway_attempt,
-                ));
-                next_gateway_index += 1;
-                next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
-                continue;
-            }
-
-            // Every eligible gateway may start an attempt, one hedge delay apart,
-            // while earlier attempts are still pending.
-            if next_gateway_index < gateway_count {
-                tokio::select! {
-                    biased;
-                    result = requests.next() => {
-                        let Some((gateway_index, ordinal, elapsed_ms, result)) = result else { continue };
-                        match result {
-                            Ok(bytes) => {
-                                debug!(
-                                    gateway_index,
-                                    gateway_count,
-                                    cid = %cid,
-                                    bytes = bytes.len(),
-                                    elapsed_ms,
-                                    attempt = manifest_attempt_role(ordinal),
-                                    representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
-                                    "verified CID gateway fetch succeeded"
-                                );
-                                return Ok(TrustlessArtifactFetchResult {
-                                    verified_cid: cid.to_string(),
-                                    bytes,
-                                    gateway_index,
-                                    gateway_count,
-                                });
-                            }
-                            Err(error) => {
-                                debug!(
-                                    ?error,
-                                    gateway_index,
-                                    gateway_count,
-                                    cid = %cid,
-                                    elapsed_ms,
-                                    attempt = manifest_attempt_role(ordinal),
-                                    representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
-                                    "verified CID gateway fetch failed"
-                                );
-                                last_error = Some(error);
-                                // A failed request launches the next gateway immediately; do not wait for the hedge timer.
-                                next_launch_at = tokio::time::Instant::now();
-                            }
-                        }
-                    }
-                    () = tokio::time::sleep_until(next_launch_at) => {
-                        let Some(gateway_attempt) = self.pool.select_excluding(
-                            &self.gateway_ids,
-                            GatewayCapability::ManifestCid,
-                            None,
-                            &reserved_identities,
-                        )
-                        else {
-                            next_gateway_index = gateway_count;
-                            continue;
-                        };
-                        reserved_identities.insert(gateway_attempt.identity);
-                        let gateway_index = gateway_attempt.index;
-                        let gateway = self.gateways.expose(gateway_index);
-                        let url = if cid.codec() == RAW_CODEC {
-                            raw_gateway_url(gateway, &cid)
-                        } else {
-                            car_gateway_url(gateway, &cid)
-                        };
-                        let source = TrustlessHttpSource::Gateway {
-                            index: gateway_index,
-                            count: gateway_count,
-                        };
-                        let ordinal = next_gateway_index;
-                        requests.push(self.manifest_cid_request(
-                            cid,
-                            gateway_index,
-                            ordinal,
-                            url,
-                            source,
-                            gateway_attempt,
-                        ));
-                        next_gateway_index += 1;
-                        next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
-                    }
-                }
-            } else if let Some((gateway_index, ordinal, elapsed_ms, result)) = requests.next().await
-            {
-                match result {
-                    Ok(bytes) => {
-                        debug!(
-                            gateway_index,
-                            gateway_count,
-                            cid = %cid,
-                            bytes = bytes.len(),
-                            elapsed_ms,
-                            attempt = manifest_attempt_role(ordinal),
-                            representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
-                            "verified CID gateway fetch succeeded"
-                        );
-                        return Ok(TrustlessArtifactFetchResult {
-                            verified_cid: cid.to_string(),
-                            bytes,
-                            gateway_index,
-                            gateway_count,
-                        });
-                    }
-                    Err(error) => {
-                        debug!(
-                            ?error,
-                            gateway_index,
-                            gateway_count,
-                            cid = %cid,
-                            elapsed_ms,
-                            attempt = manifest_attempt_role(ordinal),
-                            representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
-                            "verified CID gateway fetch failed"
-                        );
-                        last_error = Some(error);
-                        next_launch_at = tokio::time::Instant::now();
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or(TrustlessArtifactError::NoGateways))
-    }
-
-    fn manifest_cid_request(
-        &self,
-        cid: Cid,
-        gateway_index: usize,
-        ordinal: usize,
-        url: Url,
-        source: TrustlessHttpSource,
-        gateway_attempt: GatewayAttempt,
-    ) -> ManifestCidRequest<'_> {
         Box::pin(async move {
             let attempt_started = Instant::now();
             let result = self.fetch_verified_cid_from_url(cid, &url, source).await;
@@ -302,6 +122,139 @@ impl TrustlessArtifactFetcher<'_> {
         } else {
             self.fetch_cid_bytes_from_url(cid, url, source, limits, None)
                 .await
+        }
+    }
+}
+
+/// One manifest CID fetch. Every eligible gateway may start an attempt, one
+/// hedge delay apart, while earlier attempts are still pending. The first
+/// verified body wins.
+struct ManifestCidRace<'f, 'a> {
+    fetcher: &'f TrustlessArtifactFetcher<'a>,
+    cid: Cid,
+    gateway_count: usize,
+    next_gateway_index: usize,
+    reserved_identities: HashSet<u64>,
+    requests: FuturesUnordered<ManifestCidRequest<'f>>,
+    last_error: Option<TrustlessArtifactError>,
+    next_launch_at: tokio::time::Instant,
+}
+
+impl<'f, 'a> ManifestCidRace<'f, 'a> {
+    fn new(fetcher: &'f TrustlessArtifactFetcher<'a>, cid: Cid) -> Self {
+        let gateway_count = fetcher.gateways.len();
+        Self {
+            fetcher,
+            cid,
+            gateway_count,
+            next_gateway_index: 0,
+            reserved_identities: HashSet::with_capacity(gateway_count),
+            requests: FuturesUnordered::new(),
+            last_error: None,
+            // Overwritten by the first launch before the loop reads it.
+            next_launch_at: tokio::time::Instant::now(),
+        }
+    }
+
+    async fn run(
+        mut self,
+        preferred_gateway_index: Option<usize>,
+    ) -> Result<TrustlessArtifactFetchResult, TrustlessArtifactError> {
+        self.launch(preferred_gateway_index);
+        while self.next_gateway_index < self.gateway_count || !self.requests.is_empty() {
+            if self.requests.is_empty() {
+                self.launch(None);
+                continue;
+            }
+
+            // Every eligible gateway may start an attempt, one hedge delay apart,
+            // while earlier attempts are still pending.
+            let outcome = if self.next_gateway_index < self.gateway_count {
+                tokio::select! {
+                    biased;
+                    result = self.requests.next() => result,
+                    () = tokio::time::sleep_until(self.next_launch_at) => {
+                        self.launch(None);
+                        continue;
+                    }
+                }
+            } else {
+                self.requests.next().await
+            };
+            let Some(outcome) = outcome else { continue };
+            if let Some(result) = self.settle(outcome) {
+                return Ok(result);
+            }
+        }
+
+        Err(self
+            .last_error
+            .unwrap_or(TrustlessArtifactError::NoGateways))
+    }
+
+    /// Starts an attempt on the next eligible gateway. When none remains, no
+    /// further attempt starts, and the race ends once pending attempts settle.
+    fn launch(&mut self, preferred_gateway_index: Option<usize>) {
+        let Some(gateway_attempt) = self.fetcher.pool.select_excluding(
+            &self.fetcher.gateway_ids,
+            GatewayCapability::ManifestCid,
+            preferred_gateway_index,
+            &self.reserved_identities,
+        ) else {
+            self.next_gateway_index = self.gateway_count;
+            return;
+        };
+        self.reserved_identities.insert(gateway_attempt.identity);
+        self.requests.push(self.fetcher.manifest_cid_request(
+            self.cid,
+            self.next_gateway_index,
+            gateway_attempt,
+        ));
+        self.next_gateway_index += 1;
+        self.next_launch_at = tokio::time::Instant::now() + MANIFEST_CID_HEDGE_DELAY;
+    }
+
+    /// Logs a settled attempt and returns the fetch result if it succeeded.
+    fn settle(
+        &mut self,
+        (gateway_index, ordinal, elapsed_ms, result): ManifestCidRequestResult,
+    ) -> Option<TrustlessArtifactFetchResult> {
+        let (cid, gateway_count) = (self.cid, self.gateway_count);
+        match result {
+            Ok(bytes) => {
+                debug!(
+                    gateway_index,
+                    gateway_count,
+                    cid = %cid,
+                    bytes = bytes.len(),
+                    elapsed_ms,
+                    attempt = manifest_attempt_role(ordinal),
+                    representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
+                    "verified CID gateway fetch succeeded"
+                );
+                Some(TrustlessArtifactFetchResult {
+                    verified_cid: cid.to_string(),
+                    bytes,
+                    gateway_index,
+                    gateway_count,
+                })
+            }
+            Err(error) => {
+                debug!(
+                    ?error,
+                    gateway_index,
+                    gateway_count,
+                    cid = %cid,
+                    elapsed_ms,
+                    attempt = manifest_attempt_role(ordinal),
+                    representation = if cid.codec() == RAW_CODEC { "raw" } else { "car" },
+                    "verified CID gateway fetch failed"
+                );
+                self.last_error = Some(error);
+                // A failed request launches the next gateway immediately; do not wait for the hedge timer.
+                self.next_launch_at = tokio::time::Instant::now();
+                None
+            }
         }
     }
 }
