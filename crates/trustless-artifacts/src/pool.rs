@@ -92,6 +92,86 @@ pub(crate) struct GatewayPoolState {
     generation: u64,
 }
 
+impl GatewayPoolState {
+    /// Returns a current-generation reservation's in-flight slot and the
+    /// half-open probes it owns, and returns its capability and gateway-wide
+    /// health entries.
+    fn release_reservation(
+        &mut self,
+        reservation: Reservation,
+    ) -> (&mut GatewayHealth, Option<&mut GatewayHealth>) {
+        let health = self
+            .health
+            .entry((reservation.identity, reservation.capability))
+            .or_insert_with(GatewayHealth::new);
+        health.in_flight = health.in_flight.saturating_sub(1);
+        if reservation.owns_half_open {
+            health.half_open = false;
+        }
+        let mut gateway_health = self.gateway_health.get_mut(&reservation.identity);
+        if reservation.owns_gateway_half_open
+            && let Some(gateway_health) = gateway_health.as_mut()
+        {
+            gateway_health.half_open = false;
+        }
+        (health, gateway_health)
+    }
+
+    /// Releases a cancelled reservation. Returns the current generation
+    /// instead when the reservation predates a reset.
+    fn release_attempt(&mut self, reservation: Reservation) -> Option<u64> {
+        if self.generation != reservation.generation {
+            return Some(self.generation);
+        }
+        self.release_reservation(reservation);
+        None
+    }
+
+    /// Releases a settled reservation and records its outcome. Returns the
+    /// current generation instead when the reservation predates a reset.
+    fn settle_attempt(
+        &mut self,
+        reservation: Reservation,
+        outcome: AttemptOutcome,
+    ) -> Result<Settlement, u64> {
+        if self.generation != reservation.generation {
+            return Err(self.generation);
+        }
+        let (health, gateway_health) = self.release_reservation(reservation);
+        Ok(match outcome {
+            AttemptOutcome::Success => {
+                let capability_recovered = health.clear_failures() || reservation.owns_half_open;
+                let gateway_recovered = gateway_health.is_some_and(GatewayHealth::clear_failures)
+                    || reservation.owns_gateway_half_open;
+                Settlement::Recovered(
+                    (capability_recovered || gateway_recovered)
+                        .then_some(health_scope(capability_recovered, gateway_recovered)),
+                )
+            }
+            AttemptOutcome::GatewayFailure => {
+                let (failure_count, cooldown_ms) = self
+                    .gateway_health
+                    .entry(reservation.identity)
+                    .or_insert_with(GatewayHealth::new)
+                    .record_failure(Instant::now());
+                Settlement::Cooled {
+                    failure_count,
+                    cooldown_ms,
+                    scope: "gateway",
+                }
+            }
+            AttemptOutcome::CapabilityFailure => {
+                let (failure_count, cooldown_ms) = health.record_failure(Instant::now());
+                Settlement::Cooled {
+                    failure_count,
+                    cooldown_ms,
+                    scope: "capability",
+                }
+            }
+        })
+    }
+}
+
 /// Which health entries an outcome or selection involves, for diagnostics.
 const fn health_scope(capability: bool, gateway: bool) -> &'static str {
     match (capability, gateway) {
@@ -175,18 +255,54 @@ impl std::fmt::Debug for GatewayAttempt {
     }
 }
 
+/// What a reserved attempt holds in the pool, copied from its
+/// `GatewayAttempt` when the attempt settles or is cancelled.
+#[derive(Debug, Clone, Copy)]
+struct Reservation {
+    identity: u64,
+    capability: GatewayCapability,
+    generation: u64,
+    owns_half_open: bool,
+    owns_gateway_half_open: bool,
+    index: usize,
+}
+
+/// How a reserved attempt ended.
+#[derive(Debug, Clone, Copy)]
+enum AttemptOutcome {
+    Success,
+    /// A content-specific failure, which cools only the requested capability.
+    CapabilityFailure,
+    /// A failure showing that the gateway is unreachable, which cools it for
+    /// every capability.
+    GatewayFailure,
+}
+
+impl AttemptOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::CapabilityFailure | Self::GatewayFailure => "failure",
+        }
+    }
+}
+
+/// The health change a settled attempt made, for diagnostics.
+enum Settlement {
+    /// The scope of the entries a success recovered, if any.
+    Recovered(Option<&'static str>),
+    /// The failure count, cooldown and scope of the entry a failure cooled.
+    Cooled {
+        failure_count: u32,
+        cooldown_ms: u128,
+        scope: &'static str,
+    },
+}
+
 impl GatewayPool {
     #[must_use]
     pub fn new() -> Self {
-        let seed = next_pool_seed();
-        Self {
-            state: Arc::new(Mutex::new(GatewayPoolState {
-                health: HashMap::new(),
-                gateway_health: HashMap::new(),
-                seed,
-                generation: 0,
-            })),
-        }
+        Self::from_seed(next_pool_seed())
     }
 
     /// Clears health and cooldown state and reseeds this session's ranking.
@@ -209,6 +325,10 @@ impl GatewayPool {
 
     #[cfg(test)]
     pub(crate) fn with_seed_for_test(seed: u64) -> Self {
+        Self::from_seed(seed)
+    }
+
+    fn from_seed(seed: u64) -> Self {
         Self {
             state: Arc::new(Mutex::new(GatewayPoolState {
                 health: HashMap::new(),
@@ -387,37 +507,16 @@ impl GatewayPool {
         Some(attempt)
     }
 
-    fn release(
-        &self,
-        identity: u64,
-        capability: GatewayCapability,
-        generation: u64,
-        owns_half_open: bool,
-        owns_gateway_half_open: bool,
-        gateway_index: usize,
-    ) {
-        let stale_generation = {
-            let mut guard = recover_mutex(&self.state);
-            let state = &mut *guard;
-            if state.generation == generation {
-                let health = state
-                    .health
-                    .entry((identity, capability))
-                    .or_insert_with(GatewayHealth::new);
-                health.in_flight = health.in_flight.saturating_sub(1);
-                if owns_half_open {
-                    health.half_open = false;
-                }
-                if owns_gateway_half_open
-                    && let Some(gateway_health) = state.gateway_health.get_mut(&identity)
-                {
-                    gateway_health.half_open = false;
-                }
-                None
-            } else {
-                Some(state.generation)
-            }
-        };
+    fn release(&self, reservation: Reservation) {
+        let stale_generation = recover_mutex(&self.state).release_attempt(reservation);
+        let Reservation {
+            capability,
+            generation,
+            owns_half_open,
+            owns_gateway_half_open,
+            index: gateway_index,
+            ..
+        } = reservation;
         if let Some(current_generation) = stale_generation {
             debug!(
                 gateway_index,
@@ -443,70 +542,26 @@ impl GatewayPool {
     /// and the gateway-wide entry. A gateway-wide failure cools the gateway
     /// for every capability and leaves the capability entry's failures
     /// unchanged; any other failure cools only this capability.
-    fn finish(
-        &self,
-        identity: u64,
-        capability: GatewayCapability,
-        generation: u64,
-        owns_half_open: bool,
-        owns_gateway_half_open: bool,
-        gateway_index: usize,
-        success: bool,
-        gateway_wide_failure: bool,
-    ) {
-        let transition = {
-            let mut guard = recover_mutex(&self.state);
-            let state = &mut *guard;
-            if state.generation == generation {
-                let health = state
-                    .health
-                    .entry((identity, capability))
-                    .or_insert_with(GatewayHealth::new);
-                health.in_flight = health.in_flight.saturating_sub(1);
-                if owns_half_open {
-                    health.half_open = false;
-                }
-                let mut gateway_health = state.gateway_health.get_mut(&identity);
-                if owns_gateway_half_open && let Some(gateway_health) = gateway_health.as_mut() {
-                    gateway_health.half_open = false;
-                }
-                if success {
-                    let capability_recovered = health.clear_failures() || owns_half_open;
-                    let gateway_recovered = gateway_health
-                        .is_some_and(GatewayHealth::clear_failures)
-                        || owns_gateway_half_open;
-                    Ok((
-                        (capability_recovered || gateway_recovered)
-                            .then_some(health_scope(capability_recovered, gateway_recovered)),
-                        None,
-                    ))
-                } else if gateway_wide_failure {
-                    let (failure_count, cooldown_ms) = state
-                        .gateway_health
-                        .entry(identity)
-                        .or_insert_with(GatewayHealth::new)
-                        .record_failure(Instant::now());
-                    Ok((None, Some((failure_count, cooldown_ms, "gateway"))))
-                } else {
-                    let (failure_count, cooldown_ms) = health.record_failure(Instant::now());
-                    Ok((None, Some((failure_count, cooldown_ms, "capability"))))
-                }
-            } else {
-                Err(state.generation)
-            }
-        };
-        match transition {
+    fn finish(&self, reservation: Reservation, outcome: AttemptOutcome) {
+        let settlement = recover_mutex(&self.state).settle_attempt(reservation, outcome);
+        let Reservation {
+            capability,
+            generation,
+            index: gateway_index,
+            ..
+        } = reservation;
+        match settlement {
             Err(current_generation) => {
                 debug!(
                     gateway_index,
                     ?capability,
                     attempt_generation = generation,
                     current_generation,
-                    outcome = if success { "success" } else { "failure" },
+                    outcome = outcome.label(),
                     "stale gateway attempt outcome ignored after pool reset"
                 );
             }
-            Ok((Some(scope), _)) => {
+            Ok(Settlement::Recovered(Some(scope))) => {
                 debug!(
                     gateway_index,
                     ?capability,
@@ -514,7 +569,11 @@ impl GatewayPool {
                     "gateway recovered after successful attempt"
                 );
             }
-            Ok((None, Some((failure_count, cooldown_ms, scope)))) => {
+            Ok(Settlement::Cooled {
+                failure_count,
+                cooldown_ms,
+                scope,
+            }) => {
                 debug!(
                     gateway_index,
                     ?capability,
@@ -524,7 +583,7 @@ impl GatewayPool {
                     "gateway entered cooldown after failure"
                 );
             }
-            Ok((None, None)) => {}
+            Ok(Settlement::Recovered(None)) => {}
         }
     }
 }
@@ -550,49 +609,42 @@ impl SelectionCandidate {
 }
 
 impl GatewayAttempt {
-    pub fn success(mut self) {
-        self.pool.finish(
-            self.identity,
-            self.capability,
-            self.generation,
-            self.owns_half_open,
-            self.owns_gateway_half_open,
-            self.index,
-            true,
-            false,
-        );
-        self.completed = true;
+    pub fn success(self) {
+        self.settle(AttemptOutcome::Success);
     }
 
     /// Records a failed attempt. A failure showing that the gateway is
     /// unreachable cools it for every capability; any other failure cools
     /// only this attempt's capability.
-    pub fn failure(mut self, error: &TrustlessArtifactError) {
-        self.pool.finish(
-            self.identity,
-            self.capability,
-            self.generation,
-            self.owns_half_open,
-            self.owns_gateway_half_open,
-            self.index,
-            false,
-            is_gateway_wide_failure(error),
-        );
+    pub fn failure(self, error: &TrustlessArtifactError) {
+        self.settle(if is_gateway_wide_failure(error) {
+            AttemptOutcome::GatewayFailure
+        } else {
+            AttemptOutcome::CapabilityFailure
+        });
+    }
+
+    fn settle(mut self, outcome: AttemptOutcome) {
+        self.pool.finish(self.reservation(), outcome);
         self.completed = true;
+    }
+
+    const fn reservation(&self) -> Reservation {
+        Reservation {
+            identity: self.identity,
+            capability: self.capability,
+            generation: self.generation,
+            owns_half_open: self.owns_half_open,
+            owns_gateway_half_open: self.owns_gateway_half_open,
+            index: self.index,
+        }
     }
 }
 
 impl Drop for GatewayAttempt {
     fn drop(&mut self) {
         if !self.completed {
-            self.pool.release(
-                self.identity,
-                self.capability,
-                self.generation,
-                self.owns_half_open,
-                self.owns_gateway_half_open,
-                self.index,
-            );
+            self.pool.release(self.reservation());
         }
     }
 }
