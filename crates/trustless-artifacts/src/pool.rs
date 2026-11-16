@@ -170,6 +170,118 @@ impl GatewayPoolState {
             }
         })
     }
+
+    /// Chooses a gateway for the request and reserves it: counts the attempt
+    /// in flight and takes any half-open probe whose cooldown has expired.
+    /// Returns the reservation and the chosen candidate as it was before the
+    /// reservation.
+    fn reserve(
+        &mut self,
+        request: &SelectionRequest<'_>,
+        now: Instant,
+    ) -> Option<(Reservation, SelectionCandidate)> {
+        let chosen = self.choose(request, now)?;
+        let generation = self.generation;
+        let health = self
+            .health
+            .entry((chosen.identity, request.capability))
+            .or_insert_with(GatewayHealth::new);
+        let owns_half_open = health.takes_half_open_probe(now);
+        health.in_flight = health.in_flight.saturating_add(1);
+        if owns_half_open {
+            health.half_open = true;
+        }
+        let owns_gateway_half_open =
+            self.gateway_health
+                .get_mut(&chosen.identity)
+                .is_some_and(|gateway_health| {
+                    let owns = gateway_health.takes_half_open_probe(now);
+                    if owns {
+                        gateway_health.half_open = true;
+                    }
+                    owns
+                });
+        let reservation = Reservation {
+            identity: chosen.identity,
+            capability: request.capability,
+            generation,
+            owns_half_open,
+            owns_gateway_half_open,
+            index: chosen.index,
+        };
+        Some((reservation, chosen))
+    }
+
+    /// Chooses the healthy candidate that is preferred, then least loaded,
+    /// then best ranked. Without one, and unless the policy is
+    /// `HealthyOnly`, it falls back to a cooling candidate.
+    fn choose(&self, request: &SelectionRequest<'_>, now: Instant) -> Option<SelectionCandidate> {
+        let candidates = self.candidates(request, now);
+        let healthy = candidates
+            .iter()
+            .filter(|candidate| !candidate.cooling())
+            .min_by_key(|candidate| {
+                (
+                    u8::from(request.preferred_gateway_index != Some(candidate.index)),
+                    candidate.in_flight,
+                    candidate.rank,
+                )
+            });
+        healthy
+            .or_else(|| {
+                if request.policy == GatewaySelectionPolicy::HealthyOnly {
+                    return None;
+                }
+                // The least-bad cooling gateway is the one whose longer
+                // remaining cooldown, capability or gateway-wide, ends first.
+                candidates
+                    .iter()
+                    .filter(|candidate| candidate.in_flight == 0)
+                    .min_by_key(|candidate| {
+                        (candidate.cooldown_ms, candidate.in_flight, candidate.rank)
+                    })
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .min_by_key(|candidate| (candidate.in_flight, candidate.rank))
+                    })
+            })
+            .copied()
+    }
+
+    /// The request's gateways that are not excluded, in configured order,
+    /// with their current health.
+    fn candidates(&self, request: &SelectionRequest<'_>, now: Instant) -> Vec<SelectionCandidate> {
+        let mut candidates = Vec::with_capacity(request.gateway_ids.len());
+        for (index, &identity) in request.gateway_ids.iter().enumerate() {
+            if request.excluded_identities.contains(&identity) {
+                continue;
+            }
+            let health = self
+                .health
+                .get(&(identity, request.capability))
+                .copied()
+                .unwrap_or_else(GatewayHealth::new);
+            let gateway_health = self
+                .gateway_health
+                .get(&identity)
+                .copied()
+                .unwrap_or_else(GatewayHealth::new);
+            candidates.push(SelectionCandidate {
+                index,
+                identity,
+                rank: rank_for(self.seed, identity),
+                in_flight: health.in_flight,
+                cooldown_ms: health
+                    .remaining_cooldown_ms(now)
+                    .max(gateway_health.remaining_cooldown_ms(now)),
+                half_open: health.half_open || gateway_health.half_open,
+                capability_cooling: health.is_cooling(now),
+                gateway_cooling: gateway_health.is_cooling(now),
+            });
+        }
+        candidates
+    }
 }
 
 /// Which health entries an outcome or selection involves, for diagnostics.
@@ -380,124 +492,42 @@ impl GatewayPool {
         policy: GatewaySelectionPolicy,
     ) -> Option<GatewayAttempt> {
         let now = Instant::now();
-        let (attempt, probe, fallback) = {
-            let mut guard = recover_mutex(&self.state);
-            let state = &mut *guard;
-            let mut candidates = Vec::with_capacity(gateway_ids.len());
-            for (index, &identity) in gateway_ids.iter().enumerate() {
-                if excluded_identities.contains(&identity) {
-                    continue;
-                }
-                let health = state
-                    .health
-                    .get(&(identity, capability))
-                    .copied()
-                    .unwrap_or_else(GatewayHealth::new);
-                let gateway_health = state
-                    .gateway_health
-                    .get(&identity)
-                    .copied()
-                    .unwrap_or_else(GatewayHealth::new);
-                candidates.push(SelectionCandidate {
-                    index,
-                    identity,
-                    rank: rank_for(state.seed, identity),
-                    in_flight: health.in_flight,
-                    cooldown_ms: health
-                        .remaining_cooldown_ms(now)
-                        .max(gateway_health.remaining_cooldown_ms(now)),
-                    half_open: health.half_open || gateway_health.half_open,
-                    capability_cooling: health.is_cooling(now),
-                    gateway_cooling: gateway_health.is_cooling(now),
-                });
-            }
-            let healthy = candidates
-                .iter()
-                .filter(|candidate| !candidate.cooling())
-                .min_by_key(|candidate| {
-                    (
-                        u8::from(preferred_gateway_index != Some(candidate.index)),
-                        candidate.in_flight,
-                        candidate.rank,
-                    )
-                });
-            let chosen = healthy.or_else(|| {
-                if policy == GatewaySelectionPolicy::HealthyOnly {
-                    return None;
-                }
-                // The least-bad cooling gateway is the one whose longer
-                // remaining cooldown, capability or gateway-wide, ends first.
-                candidates
-                    .iter()
-                    .filter(|candidate| candidate.in_flight == 0)
-                    .min_by_key(|candidate| {
-                        (candidate.cooldown_ms, candidate.in_flight, candidate.rank)
-                    })
-                    .or_else(|| {
-                        candidates
-                            .iter()
-                            .min_by_key(|candidate| (candidate.in_flight, candidate.rank))
-                    })
-            })?;
-            let chosen = *chosen;
-            let generation = state.generation;
-            let health = state
-                .health
-                .entry((chosen.identity, capability))
-                .or_insert_with(GatewayHealth::new);
-            let owns_half_open = health.takes_half_open_probe(now);
-            health.in_flight = health.in_flight.saturating_add(1);
-            if owns_half_open {
-                health.half_open = true;
-            }
-            let owns_gateway_half_open = state
-                .gateway_health
-                .get_mut(&chosen.identity)
-                .is_some_and(|gateway_health| {
-                    let owns = gateway_health.takes_half_open_probe(now);
-                    if owns {
-                        gateway_health.half_open = true;
-                    }
-                    owns
-                });
-            let fallback = chosen.cooling().then_some((
-                chosen.index,
-                chosen.cooldown_ms,
-                chosen.in_flight,
-                chosen.half_open,
-                health_scope(chosen.capability_cooling, chosen.gateway_cooling),
-            ));
-            (
-                GatewayAttempt {
-                    pool: self.clone(),
-                    identity: chosen.identity,
-                    capability,
-                    generation,
-                    owns_half_open,
-                    owns_gateway_half_open,
-                    index: chosen.index,
-                    completed: false,
-                },
-                (owns_half_open || owns_gateway_half_open).then_some((
-                    chosen.index,
-                    health_scope(owns_half_open, owns_gateway_half_open),
-                )),
-                fallback,
-            )
+        let request = SelectionRequest {
+            gateway_ids,
+            capability,
+            preferred_gateway_index,
+            excluded_identities,
+            policy,
         };
-        if let Some((gateway_index, scope)) = probe {
+        let (reservation, chosen) = recover_mutex(&self.state).reserve(&request, now)?;
+        let attempt = GatewayAttempt::from_reservation(self.clone(), reservation);
+        let Reservation {
+            owns_half_open,
+            owns_gateway_half_open,
+            ..
+        } = reservation;
+        let SelectionCandidate {
+            index: gateway_index,
+            cooldown_ms,
+            in_flight,
+            half_open,
+            capability_cooling,
+            gateway_cooling,
+            ..
+        } = chosen;
+        if owns_half_open || owns_gateway_half_open {
             debug!(
                 gateway_index,
                 ?capability,
-                scope,
+                scope = health_scope(owns_half_open, owns_gateway_half_open),
                 "gateway cooldown expired; reserved owning half-open probe"
             );
         }
-        if let Some((gateway_index, cooldown_ms, in_flight, half_open, scope)) = fallback {
+        if chosen.cooling() {
             debug!(
                 gateway_index,
                 ?capability,
-                scope,
+                scope = health_scope(capability_cooling, gateway_cooling),
                 cooldown_ms,
                 in_flight,
                 half_open,
@@ -588,6 +618,15 @@ impl GatewayPool {
     }
 }
 
+/// The inputs of one gateway selection.
+struct SelectionRequest<'r> {
+    gateway_ids: &'r [u64],
+    capability: GatewayCapability,
+    preferred_gateway_index: Option<usize>,
+    excluded_identities: &'r HashSet<u64>,
+    policy: GatewaySelectionPolicy,
+}
+
 /// A selectable gateway with the health that decides its ranking.
 #[derive(Debug, Clone, Copy)]
 struct SelectionCandidate {
@@ -627,6 +666,19 @@ impl GatewayAttempt {
     fn settle(mut self, outcome: AttemptOutcome) {
         self.pool.finish(self.reservation(), outcome);
         self.completed = true;
+    }
+
+    const fn from_reservation(pool: GatewayPool, reservation: Reservation) -> Self {
+        Self {
+            pool,
+            identity: reservation.identity,
+            capability: reservation.capability,
+            generation: reservation.generation,
+            owns_half_open: reservation.owns_half_open,
+            owns_gateway_half_open: reservation.owns_gateway_half_open,
+            index: reservation.index,
+            completed: false,
+        }
     }
 
     const fn reservation(&self) -> Reservation {
