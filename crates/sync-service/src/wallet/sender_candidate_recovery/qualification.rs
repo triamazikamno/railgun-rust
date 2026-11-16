@@ -2,14 +2,15 @@
 
 use std::collections::BTreeSet;
 
+use crate::txid_cache::TxidPublicCacheTransaction;
 use crate::types::PublicDataPlaneEpoch;
 use crate::wallet::output_poi_recovery::{
     PublicCacheTxidRefreshRequest, refresh_public_txid_cache,
 };
 use crate::wallet::{
-    FixedBytes, OutputPoiRecoveryRequest, PublicTxidCacheKey, PublicTxidTransaction,
+    FixedBytes, Note, OutputPoiRecoveryRequest, PublicTxidCacheKey, PublicTxidTransaction,
     SenderTransactionCandidate, SenderTransactionCandidateSpend, TREE_LEAF_COUNT,
-    TxidPublicCacheError, Utxo, UtxoCommitmentKind, WalletUtxo, debug, warn,
+    TxidPublicCacheError, U256, Utxo, UtxoCommitmentKind, WalletUtxo, debug, warn,
 };
 
 use super::{
@@ -170,39 +171,52 @@ pub(super) fn qualify_sender_candidate(
     if candidate.validate().is_err() || rows.is_empty() {
         return Ok(None);
     }
-    let mut qualified = Vec::new();
-    let mut consumed_outputs = BTreeSet::new();
-    let mut consumed_spends = BTreeSet::new();
-    let mut qualified_nullifiers = BTreeSet::new();
+    let mut qualifier = SenderCandidateQualifier {
+        candidate,
+        wallet_utxos,
+        scan_keys,
+        qualified: Vec::new(),
+        consumed_outputs: BTreeSet::new(),
+        consumed_spends: BTreeSet::new(),
+        qualified_nullifiers: BTreeSet::new(),
+    };
     for row in rows {
-        match qualify_sender_row_inputs(candidate, wallet_utxos, scan_keys, &row)? {
-            SenderRowQualification::Foreign => continue,
+        qualifier.add_row(row)?;
+    }
+    Ok(qualifier.finish())
+}
+
+/// The rows of one candidate qualified so far, and the wallet spends and candidate outputs they
+/// consumed.
+struct SenderCandidateQualifier<'q> {
+    candidate: &'q SenderTransactionCandidate,
+    wallet_utxos: &'q [WalletUtxo],
+    scan_keys: &'q railgun_wallet::scan::WalletScanKeys,
+    qualified: Vec<QualifiedSenderTransaction>,
+    consumed_outputs: BTreeSet<(u32, u64, FixedBytes<32>)>,
+    consumed_spends: BTreeSet<SenderTransactionCandidateSpend>,
+    qualified_nullifiers: BTreeSet<U256>,
+}
+
+impl SenderCandidateQualifier<'_> {
+    /// Qualify one public row. A row without wallet inputs is skipped; a row that does not match
+    /// the candidate is an error.
+    fn add_row(&mut self, row: PublicTxidTransaction) -> Result<(), ()> {
+        match qualify_sender_row_inputs(self.candidate, self.wallet_utxos, self.scan_keys, &row)? {
+            SenderRowQualification::Foreign => return Ok(()),
             SenderRowQualification::WalletAuthored => {}
         }
         let transaction = &row.transaction;
-        if transaction.transaction_hash != candidate.source.tx_hash
-            || transaction.block_number != candidate.source.block_number
+        if (transaction.transaction_hash, transaction.block_number)
+            != (
+                self.candidate.source.tx_hash,
+                self.candidate.source.block_number,
+            )
             || transaction.utxo_tree_in > u64::from(u32::MAX)
         {
             return Err(());
         }
-        for nullifier in &transaction.nullifiers {
-            if !qualified_nullifiers.insert(*nullifier) {
-                return Err(());
-            }
-            let input = wallet_utxos
-                .iter()
-                .find(|wallet_utxo| {
-                    u64::from(wallet_utxo.utxo.tree) == transaction.utxo_tree_in
-                        && wallet_utxo.utxo.nullifier(scan_keys.nullifying_key) == *nullifier
-                })
-                .ok_or(())?;
-            consumed_spends.insert(SenderTransactionCandidateSpend {
-                tree: input.utxo.tree,
-                position: input.utxo.position,
-                commitment: input.utxo.poi.commitment,
-            });
-        }
+        self.consume_inputs(transaction)?;
         let private_output_count = transaction
             .commitments
             .len()
@@ -213,6 +227,51 @@ pub(super) fn qualify_sender_candidate(
             return Err(());
         }
         let output_start_global = transaction.output_start_global();
+        let (outputs, output_notes) =
+            self.consume_outputs(transaction, output_start_global, private_output_count)?;
+        self.qualified.push(QualifiedSenderTransaction {
+            txid_index: row.txid_index,
+            public_row: row,
+            output_start_global,
+            outputs,
+            output_notes,
+        });
+        Ok(())
+    }
+
+    /// Record the wallet spends of `transaction`. Each nullifier must be new to the candidate and
+    /// belong to a wallet UTXO.
+    fn consume_inputs(&mut self, transaction: &TxidPublicCacheTransaction) -> Result<(), ()> {
+        for nullifier in &transaction.nullifiers {
+            if !self.qualified_nullifiers.insert(*nullifier) {
+                return Err(());
+            }
+            let input = self
+                .wallet_utxos
+                .iter()
+                .find(|wallet_utxo| {
+                    u64::from(wallet_utxo.utxo.tree) == transaction.utxo_tree_in
+                        && wallet_utxo.utxo.nullifier(self.scan_keys.nullifying_key) == *nullifier
+                })
+                .ok_or(())?;
+            self.consumed_spends
+                .insert(SenderTransactionCandidateSpend {
+                    tree: input.utxo.tree,
+                    position: input.utxo.position,
+                    commitment: input.utxo.poi.commitment,
+                });
+        }
+        Ok(())
+    }
+
+    /// The UTXOs and notes of the first `private_output_count` commitments of `transaction`. Each
+    /// must be a candidate output with a note, consumed at most once per candidate.
+    fn consume_outputs(
+        &mut self,
+        transaction: &TxidPublicCacheTransaction,
+        output_start_global: u128,
+        private_output_count: usize,
+    ) -> Result<(Vec<Utxo>, Vec<Note>), ()> {
         let mut outputs = Vec::with_capacity(private_output_count);
         let mut output_notes = Vec::with_capacity(private_output_count);
         for (offset, commitment) in transaction
@@ -227,50 +286,57 @@ pub(super) fn qualify_sender_candidate(
             let tree = u32::try_from(global / u128::from(TREE_LEAF_COUNT)).map_err(|_| ())?;
             let position = u64::try_from(global % u128::from(TREE_LEAF_COUNT)).map_err(|_| ())?;
             let commitment = FixedBytes::from(commitment.to_be_bytes::<32>());
-            let output = candidate
+            let output = self
+                .candidate
                 .outputs
                 .iter()
                 .find(|output| {
-                    output.tree == tree
-                        && output.position == position
-                        && output.commitment == commitment
+                    (output.tree, output.position, output.commitment)
+                        == (tree, position, commitment)
                 })
                 .ok_or(())?;
             let note = output.note.clone().ok_or(())?;
-            if !consumed_outputs.insert((tree, position, commitment)) {
+            if !self.consumed_outputs.insert((tree, position, commitment)) {
                 return Err(());
             }
             outputs.push(Utxo::new(
                 note.clone(),
                 tree,
                 position,
-                candidate.source.clone(),
+                self.candidate.source.clone(),
                 UtxoCommitmentKind::Transact,
             ));
             output_notes.push(note);
         }
-        qualified.push(QualifiedSenderTransaction {
-            txid_index: row.txid_index,
-            public_row: row,
-            output_start_global,
-            outputs,
-            output_notes,
-        });
+        Ok((outputs, output_notes))
     }
-    if qualified.is_empty()
-        || consumed_spends.len() != candidate.wallet_spends.len()
-        || candidate
+
+    /// The qualified rows, or `None` when they do not cover every wallet spend and every output
+    /// with a note.
+    fn finish(self) -> Option<Vec<QualifiedSenderTransaction>> {
+        let Self {
+            candidate,
+            qualified,
+            consumed_outputs,
+            consumed_spends,
+            ..
+        } = self;
+        if qualified.is_empty() || consumed_spends.len() != candidate.wallet_spends.len() {
+            return None;
+        }
+        if candidate
             .wallet_spends
             .iter()
             .any(|spend| !consumed_spends.contains(spend))
-        || candidate.outputs.iter().any(|output| {
+        {
+            return None;
+        }
+        let uncovered_output = candidate.outputs.iter().any(|output| {
             output.note.is_some()
                 && !consumed_outputs.contains(&(output.tree, output.position, output.commitment))
-        })
-    {
-        return Ok(None);
+        });
+        (!uncovered_output).then_some(qualified)
     }
-    Ok(Some(qualified))
 }
 
 pub(super) fn qualify_sender_row_inputs(

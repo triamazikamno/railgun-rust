@@ -35,32 +35,7 @@ pub(crate) fn classify_sender_candidate_for_local_retirement(
     if candidate.outputs.is_empty() {
         return None;
     }
-
-    let expected_spends = candidate
-        .wallet_spends
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if expected_spends.len() != candidate.wallet_spends.len() {
-        return None;
-    }
-    let actual_spend_entries = wallet_utxos
-        .iter()
-        .filter(|wallet_utxo| wallet_utxo.spent.as_ref() == Some(&candidate.source))
-        .map(|wallet_utxo| SenderTransactionCandidateSpend {
-            tree: wallet_utxo.utxo.tree,
-            position: wallet_utxo.utxo.position,
-            commitment: wallet_utxo.utxo.poi.commitment,
-        })
-        .collect::<Vec<_>>();
-    let actual_spends = actual_spend_entries
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if actual_spends.len() != actual_spend_entries.len() {
-        return None;
-    }
-    if actual_spends != expected_spends {
+    if !sender_candidate_wallet_spends_match(candidate, wallet_utxos) {
         return None;
     }
 
@@ -73,45 +48,7 @@ pub(crate) fn classify_sender_candidate_for_local_retirement(
         let exact_wallet_matches = wallet_utxos
             .iter()
             .filter(|wallet_utxo| {
-                let Some(note) = output.note.as_ref() else {
-                    return wallet_utxo.utxo.source == candidate.source
-                        && wallet_utxo.utxo.tree == output.tree
-                        && wallet_utxo.utxo.position == output.position
-                        && wallet_utxo.utxo.poi.commitment == output.commitment
-                        && wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Transact
-                        && wallet_utxo.utxo.poi.npk
-                            == FixedBytes::from(
-                                Note::npk_for(
-                                    scan_keys.master_public_key,
-                                    wallet_utxo.utxo.note.random,
-                                )
-                                .to_be_bytes::<32>(),
-                            )
-                        && sender_candidate_poi_identity_matches(
-                            &wallet_utxo.utxo.poi,
-                            &Utxo::new(
-                                wallet_utxo.utxo.note.clone(),
-                                output.tree,
-                                output.position,
-                                candidate.source.clone(),
-                                UtxoCommitmentKind::Transact,
-                            )
-                            .poi,
-                        );
-                };
-                let recomputed = Utxo::new(
-                    note.clone(),
-                    output.tree,
-                    output.position,
-                    candidate.source.clone(),
-                    UtxoCommitmentKind::Transact,
-                );
-                wallet_utxo.utxo.source == candidate.source
-                    && wallet_utxo.utxo.tree == output.tree
-                    && wallet_utxo.utxo.position == output.position
-                    && sender_candidate_poi_identity_matches(&wallet_utxo.utxo.poi, &recomputed.poi)
-                    && wallet_utxo.utxo.note.npk
-                        == Note::npk_for(scan_keys.master_public_key, note.random)
+                wallet_utxo_matches_sender_output(candidate, scan_keys, output, wallet_utxo)
             })
             .count();
 
@@ -140,6 +77,84 @@ pub(crate) fn classify_sender_candidate_for_local_retirement(
         ));
     }
     Some(SenderCandidateLocalClassification { external_outputs })
+}
+
+/// Whether the wallet UTXOs spent by the candidate's source are exactly its wallet spends, with
+/// no duplicate on either side.
+fn sender_candidate_wallet_spends_match(
+    candidate: &SenderTransactionCandidate,
+    wallet_utxos: &[WalletUtxo],
+) -> bool {
+    let expected_spends = candidate
+        .wallet_spends
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if expected_spends.len() != candidate.wallet_spends.len() {
+        return false;
+    }
+    let actual_spend_entries = wallet_utxos
+        .iter()
+        .filter(|wallet_utxo| wallet_utxo.spent.as_ref() == Some(&candidate.source))
+        .map(|wallet_utxo| SenderTransactionCandidateSpend {
+            tree: wallet_utxo.utxo.tree,
+            position: wallet_utxo.utxo.position,
+            commitment: wallet_utxo.utxo.poi.commitment,
+        })
+        .collect::<Vec<_>>();
+    let actual_spends = actual_spend_entries
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    actual_spends.len() == actual_spend_entries.len() && actual_spends == expected_spends
+}
+
+/// Whether `wallet_utxo` is the wallet's copy of `output`: the same source, location and POI
+/// identity, with an NPK of the scan key. Without a candidate note, the wallet note's commitment
+/// must also match.
+fn wallet_utxo_matches_sender_output(
+    candidate: &SenderTransactionCandidate,
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+    output: &crate::SenderTransactionCandidateOutput,
+    wallet_utxo: &WalletUtxo,
+) -> bool {
+    if (
+        &wallet_utxo.utxo.source,
+        wallet_utxo.utxo.tree,
+        wallet_utxo.utxo.position,
+    ) != (&candidate.source, output.tree, output.position)
+    {
+        return false;
+    }
+    let Some(note) = output.note.as_ref() else {
+        return wallet_utxo.utxo.poi.commitment == output.commitment
+            && wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Transact
+            && wallet_utxo.utxo.poi.npk
+                == FixedBytes::from(
+                    Note::npk_for(scan_keys.master_public_key, wallet_utxo.utxo.note.random)
+                        .to_be_bytes::<32>(),
+                )
+            && sender_candidate_poi_identity_matches(
+                &wallet_utxo.utxo.poi,
+                &Utxo::new(
+                    wallet_utxo.utxo.note.clone(),
+                    output.tree,
+                    output.position,
+                    candidate.source.clone(),
+                    UtxoCommitmentKind::Transact,
+                )
+                .poi,
+            );
+    };
+    let recomputed = Utxo::new(
+        note.clone(),
+        output.tree,
+        output.position,
+        candidate.source.clone(),
+        UtxoCommitmentKind::Transact,
+    );
+    sender_candidate_poi_identity_matches(&wallet_utxo.utxo.poi, &recomputed.poi)
+        && wallet_utxo.utxo.note.npk == Note::npk_for(scan_keys.master_public_key, note.random)
 }
 
 fn sender_candidate_poi_identity_matches(

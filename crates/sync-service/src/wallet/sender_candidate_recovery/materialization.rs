@@ -13,13 +13,13 @@ use crate::wallet::output_poi_recovery::{
 use crate::wallet::saved_poi_compatibility::saved_pending_context_is_compatible;
 use crate::wallet::{
     DEFAULT_TXID_VERSION, Duration, EVM_CHAIN_TYPE, ExpectedPoiCorpusRevision,
-    ExpectedWalletOutput, FixedBytes, Instant, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
-    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OUTPUT_POI_RECOVERY_VERIFY_PROOF,
-    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryRequest,
-    OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole,
-    PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
-    SenderTransactionCandidate, U256, Utxo, WalletUtxo, debug, generate_post_transaction_pois, hex,
-    now_epoch_secs,
+    ExpectedWalletOutput, FixedBytes, Instant, LocalPoiMerkleProofSource,
+    OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    OUTPUT_POI_RECOVERY_VERIFY_PROOF, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
+    OutputPoiRecoveryRequest, OutputPoiRecoveryStatus, PendingOutputPoiContextRecord,
+    PendingOutputPoiRole, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
+    PreTransactionPoiMap, SenderTransactionCandidate, U256, Utxo, WalletUtxo, debug,
+    generate_post_transaction_pois, hex, now_epoch_secs,
 };
 
 use super::unshield::sender_unshield_railgun_txid;
@@ -92,8 +92,8 @@ impl SenderCandidateProver<'_> {
             candidate,
             wallet_nullifiers,
             spending_public_key,
-            prover,
             proof_source_resolution,
+            ..
         } = *self;
         if !sender_candidate_still_current(
             request.authority,
@@ -138,6 +138,27 @@ impl SenderCandidateProver<'_> {
             request.active_list_keys,
         )
         .await?;
+        let (txid_data, pre_transaction_pois) = self
+            .prove_recovery_chunk(qualified, &recovery_chunk, source)
+            .await?;
+        Ok(Some(ProvedSenderTransaction {
+            recovery_chunk,
+            txid_data,
+            pre_transaction_pois,
+        }))
+    }
+
+    /// Read the TXID data of a preflighted recovery chunk, generate its POI proofs and check them
+    /// against the current verifier.
+    async fn prove_recovery_chunk(
+        &self,
+        qualified: &QualifiedSenderTransaction,
+        recovery_chunk: &RecoveryChunk,
+        source: &LocalPoiMerkleProofSource,
+    ) -> Result<(RecoveredOutputTxidData, PreTransactionPoiMap), RecoveryFailure> {
+        let Self {
+            request, prover, ..
+        } = *self;
         let txid_data =
             recovered_output_txid_data_from_public_cache(PublicCacheTxidRecoveryRequest {
                 public_data_plane: request.public_data_plane,
@@ -145,7 +166,7 @@ impl SenderCandidateProver<'_> {
                 poi_client: request.poi_client,
                 http_client: request.http_client,
                 indexed_artifact_source: request.indexed_artifact_source,
-                recovery_chunk: &recovery_chunk,
+                recovery_chunk,
                 started: Instant::now(),
             })
             .await?;
@@ -193,11 +214,7 @@ impl SenderCandidateProver<'_> {
                 OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
             ));
         }
-        Ok(Some(ProvedSenderTransaction {
-            recovery_chunk,
-            txid_data,
-            pre_transaction_pois,
-        }))
+        Ok((txid_data, pre_transaction_pois))
     }
 
     /// Prove the candidate's transactions and collect the records that materialize its outputs.
