@@ -6,15 +6,15 @@ use std::collections::BTreeSet;
 use crate::wallet::pending_output_poi::{
     BTreeMap, BlindedCommitmentData, ExpectedWalletOutput, FixedBytes, OutputPoiRecoveryRecord,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
-    PoiPrivateApplyOutcome, PoiPrivateRows, SenderCandidateLocallyValidDelta,
-    SenderCandidateMaterializationDelta, SenderCandidateReconstructionDelta,
-    SenderCandidateUnshieldUpdateDelta, SenderCandidateUnshieldValidatedDelta, Utxo,
-    UtxoCommitmentKind, WalletCacheError, WalletCacheStore, WalletConfig,
-    WalletPrivateMutationPermit, WalletUtxo, expected_pending_context_state,
-    expected_recovery_state, hold_expected_poi_corpus_revision, pending_output_poi_submit_identity,
-    saved_pending_context_is_compatible, saved_poi_compatibility, sender_candidate_recovery,
-    sender_materialization_pending_matches, sender_materialization_recovery_matches,
-    wallet_ppoi_workflow_status_after_mutations,
+    PoiPrivateApplyOutcome, PoiPrivateRows, PublicPoiCorpusHandle,
+    SenderCandidateLocallyValidDelta, SenderCandidateMaterializationDelta,
+    SenderCandidateReconstructionDelta, SenderCandidateUnshieldUpdateDelta,
+    SenderCandidateUnshieldValidatedDelta, Utxo, UtxoCommitmentKind, WalletCacheError,
+    WalletCacheStore, WalletConfig, WalletPrivateMutationPermit, WalletUtxo,
+    expected_pending_context_state, expected_recovery_state, hold_expected_poi_corpus_revision,
+    pending_output_poi_submit_identity, saved_pending_context_is_compatible,
+    saved_poi_compatibility, sender_candidate_recovery, sender_materialization_pending_matches,
+    sender_materialization_recovery_matches, wallet_ppoi_workflow_status_after_mutations,
 };
 use crate::{SenderTransactionCandidate, SenderTransactionCandidateUnshield};
 
@@ -52,34 +52,79 @@ fn handed_off_sender_candidate(
     }
 }
 
-/// Candidate-only commit that writes `replacement`, or deletes the expected candidate without
-/// one. The caller holds every fence the commit needs; the permit drops after it.
-fn commit_sender_candidate_replacement(
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
+/// What a candidate-only commit writes to, and the validation revision its workflow status
+/// counts from.
+struct SenderCandidateCommit<'a> {
+    cache_store: &'a dyn WalletCacheStore,
+    cfg: &'a WalletConfig,
+    active_list_keys: &'a [FixedBytes<32>],
     validation_revision: u64,
-    permit: WalletPrivateMutationPermit<'_>,
+}
+
+impl SenderCandidateCommit<'_> {
+    /// Candidate-only commit that writes `replacement`, or deletes the expected candidate without
+    /// one. The caller holds every fence the commit needs; the permit drops after it.
+    fn commit(
+        self,
+        permit: WalletPrivateMutationPermit<'_>,
+        expected_candidate_id: FixedBytes<32>,
+        replacement: Option<SenderTransactionCandidate>,
+    ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+        let (candidate_updates, candidate_deletes) =
+            sender_candidate_rows(expected_candidate_id, replacement);
+        let rows = PoiPrivateRows {
+            candidate_updates: &candidate_updates,
+            candidate_deletes: &candidate_deletes,
+            ..PoiPrivateRows::default()
+        };
+        let workflow_status = wallet_ppoi_workflow_status_after_mutations(
+            self.cache_store,
+            self.cfg,
+            self.active_list_keys,
+            self.validation_revision,
+            rows,
+        )?;
+        commit_durable_apply(permit, self.cache_store, rows, workflow_status)
+    }
+}
+
+/// The candidate rows that write `replacement`, or delete the expected candidate without one.
+fn sender_candidate_rows(
     expected_candidate_id: FixedBytes<32>,
     replacement: Option<SenderTransactionCandidate>,
-) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
-    let (candidate_updates, candidate_deletes) = match replacement {
+) -> (Vec<SenderTransactionCandidate>, Vec<FixedBytes<32>>) {
+    match replacement {
         Some(replacement) => (vec![replacement], Vec::new()),
         None => (Vec::new(), vec![expected_candidate_id]),
-    };
-    let rows = PoiPrivateRows {
-        candidate_updates: &candidate_updates,
-        candidate_deletes: &candidate_deletes,
-        ..PoiPrivateRows::default()
-    };
-    let workflow_status = wallet_ppoi_workflow_status_after_mutations(
-        cache_store,
-        cfg,
+    }
+}
+
+/// Whether the candidate belongs to this wallet's chain and cache.
+fn sender_candidate_is_for_wallet(
+    candidate: &SenderTransactionCandidate,
+    cfg: &WalletConfig,
+) -> bool {
+    candidate.chain_id == cfg.chain.chain_id && candidate.wallet_id == cfg.cache_key
+}
+
+/// Whether every one of `datas` is Valid on every active list in the local corpus.
+async fn corpus_holds_all_valid(
+    corpus: &PublicPoiCorpusHandle,
+    chain_id: u64,
+    active_list_keys: &[FixedBytes<32>],
+    datas: &[BlindedCommitmentData],
+) -> Result<bool, WalletCacheError> {
+    let valid = saved_poi_compatibility::corpus_valid_blinded_commitments(
+        corpus,
+        chain_id,
         active_list_keys,
-        validation_revision,
-        rows,
-    )?;
-    commit_durable_apply(permit, cache_store, rows, workflow_status)
+        datas,
+    )
+    .await
+    .map_err(|_| WalletCacheError::Crypto)?;
+    Ok(datas
+        .iter()
+        .all(|data| valid.contains(&data.blinded_commitment)))
 }
 
 pub(super) async fn apply_sender_candidate_reconstruction(
@@ -93,41 +138,15 @@ pub(super) async fn apply_sender_candidate_reconstruction(
         cfg,
         active_list_keys,
     } = turn;
-    let SenderCandidateReconstructionDelta {
-        candidate,
-        replay_fence,
-        expected_group,
-    } = delta;
-    let _public_commit_guard = replay_fence.public_data_plane.acquire_commit_guard().await;
-    if candidate.validate().is_err()
-        || candidate.chain_id != cfg.chain.chain_id
-        || candidate.wallet_id != cfg.cache_key
-        || replay_fence.public_data_plane.current_epoch() != replay_fence.epoch
-        || expected_group.is_empty()
-        || !sender_candidate_recovery::sender_candidate_matches_wallet_snapshot(
-            &candidate, &snapshot,
-        )
-        || !saved_poi_compatibility::saved_sender_group_is_current(
-            cache_store,
-            cfg,
-            &candidate.source,
-            &expected_group,
-        )?
-        || expected_group.iter().any(|(record, _)| {
-            record.observation.as_ref().is_none_or(|observation| {
-                !candidate.outputs.iter().any(|output| {
-                    u64::from(output.tree) == observation.output_tree
-                        && output.position == observation.output_position
-                        && output.commitment == record.output_commitment
-                        && output.note.as_ref().is_some_and(|note| {
-                            FixedBytes::from(note.npk.to_be_bytes::<32>()) == record.output_npk
-                        })
-                })
-            })
-        })
-    {
+    let _public_commit_guard = delta
+        .replay_fence
+        .public_data_plane
+        .acquire_commit_guard()
+        .await;
+    if !reconstruction_is_current(cache_store, cfg, &snapshot, &delta)? {
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
+    let candidate = delta.candidate;
     if let Some(current) = cache_store.get_sender_transaction_candidate(
         cfg.chain.chain_id,
         &cfg.cache_key,
@@ -143,15 +162,72 @@ pub(super) async fn apply_sender_candidate_reconstruction(
             },
         );
     }
-    commit_sender_candidate_replacement(
+    SenderCandidateCommit {
         cache_store,
         cfg,
         active_list_keys,
-        permit.ppoi_workflow_status().validation_revision,
-        permit,
-        candidate.semantic_id(),
-        Some(candidate),
+        validation_revision: permit.ppoi_workflow_status().validation_revision,
+    }
+    .commit(permit, candidate.semantic_id(), Some(candidate))
+}
+
+/// Whether a reconstructed candidate is valid for this wallet under a current replay fence, and
+/// its expected group is still stored and observes the candidate's outputs.
+fn reconstruction_is_current(
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    snapshot: &[WalletUtxo],
+    delta: &SenderCandidateReconstructionDelta,
+) -> Result<bool, WalletCacheError> {
+    let SenderCandidateReconstructionDelta {
+        candidate,
+        replay_fence,
+        expected_group,
+    } = delta;
+    if candidate.validate().is_err() || !sender_candidate_is_for_wallet(candidate, cfg) {
+        return Ok(false);
+    }
+    if replay_fence.public_data_plane.current_epoch() != replay_fence.epoch
+        || expected_group.is_empty()
+    {
+        return Ok(false);
+    }
+    Ok(
+        sender_candidate_recovery::sender_candidate_matches_wallet_snapshot(candidate, snapshot)
+            && saved_poi_compatibility::saved_sender_group_is_current(
+                cache_store,
+                cfg,
+                &candidate.source,
+                expected_group,
+            )?
+            && expected_group_observes_candidate(candidate, expected_group),
     )
+}
+
+/// Whether every expected record is observed at one of the candidate's outputs, with its
+/// commitment and note NPK.
+fn expected_group_observes_candidate(
+    candidate: &SenderTransactionCandidate,
+    expected_group: &[(
+        PendingOutputPoiContextRecord,
+        Option<OutputPoiRecoveryRecord>,
+    )],
+) -> bool {
+    expected_group.iter().all(|(record, _)| {
+        record.observation.as_ref().is_some_and(|observation| {
+            candidate.outputs.iter().any(|output| {
+                (u64::from(output.tree), output.position, output.commitment)
+                    == (
+                        observation.output_tree,
+                        observation.output_position,
+                        record.output_commitment,
+                    )
+                    && output.note.as_ref().is_some_and(|note| {
+                        FixedBytes::from(note.npk.to_be_bytes::<32>()) == record.output_npk
+                    })
+            })
+        })
+    })
 }
 
 pub(super) async fn apply_sender_candidate_locally_valid(
@@ -176,15 +252,7 @@ pub(super) async fn apply_sender_candidate_locally_valid(
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
     if active_list_keys.is_empty()
-        || expected_candidate.chain_id != cfg.chain.chain_id
-        || expected_candidate.wallet_id != cfg.cache_key
-        || sender_candidate_recovery::classify_sender_candidate_for_local_retirement(
-            &expected_candidate,
-            &snapshot,
-            &cfg.scan_keys,
-        )
-        .is_none()
-        || !stored_sender_candidate_matches(cache_store, cfg, &expected_candidate)?
+        || !locally_retirable_candidate_is_stored(cache_store, cfg, &snapshot, &expected_candidate)?
     {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
@@ -207,31 +275,42 @@ pub(super) async fn apply_sender_candidate_locally_valid(
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    let valid = saved_poi_compatibility::corpus_valid_blinded_commitments(
+    if !corpus_holds_all_valid(
         &corpus,
         cfg.chain.chain_id,
         active_list_keys,
         &classification.external_outputs,
     )
-    .await
-    .map_err(|_| WalletCacheError::Crypto)?;
-    if !classification
-        .external_outputs
-        .iter()
-        .all(|data| valid.contains(&data.blinded_commitment))
+    .await?
     {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    commit_sender_candidate_replacement(
+    SenderCandidateCommit {
         cache_store,
         cfg,
         active_list_keys,
-        permit.ppoi_workflow_status().validation_revision,
-        permit,
-        expected_candidate.semantic_id(),
-        replacement,
-    )
+        validation_revision: permit.ppoi_workflow_status().validation_revision,
+    }
+    .commit(permit, expected_candidate.semantic_id(), replacement)
+}
+
+/// Whether the candidate belongs to this wallet, still classifies for local retirement against
+/// the snapshot, and is still the stored candidate.
+fn locally_retirable_candidate_is_stored(
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    snapshot: &[WalletUtxo],
+    candidate: &SenderTransactionCandidate,
+) -> Result<bool, WalletCacheError> {
+    Ok(sender_candidate_is_for_wallet(candidate, cfg)
+        && sender_candidate_recovery::classify_sender_candidate_for_local_retirement(
+            candidate,
+            snapshot,
+            &cfg.scan_keys,
+        )
+        .is_some()
+        && stored_sender_candidate_matches(cache_store, cfg, candidate)?)
 }
 
 fn candidate_blinded_commitments(candidate: &SenderTransactionCandidate) -> Vec<FixedBytes<32>> {
@@ -679,7 +758,8 @@ impl SenderMaterialization<'_> {
             drop(permit);
             return Ok(PoiPrivateApplyOutcome::Skipped);
         }
-        let (candidate_updates, candidate_deletes) = self.candidate_rows(replacement);
+        let (candidate_updates, candidate_deletes) =
+            sender_candidate_rows(delta.expected_candidate.semantic_id(), replacement);
         let private_rows = PoiPrivateRows {
             pending_updates: &rows.absent_pending_updates,
             recovery_updates: &rows.absent_recovery_updates,
@@ -746,20 +826,6 @@ impl SenderMaterialization<'_> {
                 &self.delta.expected_candidate.source,
                 &self.delta.replacement_group,
             )?)
-    }
-
-    /// The candidate rows to commit: the kept replacement, or the expected candidate's deletion.
-    fn candidate_rows(
-        &self,
-        replacement: Option<SenderTransactionCandidate>,
-    ) -> (Vec<SenderTransactionCandidate>, Vec<FixedBytes<32>>) {
-        match replacement {
-            Some(replacement) => (vec![replacement], Vec::new()),
-            None => (
-                Vec::new(),
-                vec![self.delta.expected_candidate.semantic_id()],
-            ),
-        }
     }
 
     /// Identities of the candidate outputs that carry a note; the rows must cover exactly these.
@@ -833,8 +899,7 @@ pub(super) async fn apply_sender_candidate_unshield_update(
         public_data_fence,
         replacement,
     } = delta;
-    if expected_candidate.chain_id != cfg.chain.chain_id
-        || expected_candidate.wallet_id != cfg.cache_key
+    if !sender_candidate_is_for_wallet(&expected_candidate, cfg)
         || !sender_candidate_recovery::sender_candidate_matches_wallet_snapshot(
             &expected_candidate,
             &snapshot,
@@ -862,15 +927,13 @@ pub(super) async fn apply_sender_candidate_unshield_update(
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    commit_sender_candidate_replacement(
+    SenderCandidateCommit {
         cache_store,
         cfg,
         active_list_keys,
-        permit.ppoi_workflow_status().validation_revision,
-        permit,
-        expected_candidate.semantic_id(),
-        replacement,
-    )
+        validation_revision: permit.ppoi_workflow_status().validation_revision,
+    }
+    .commit(permit, expected_candidate.semantic_id(), replacement)
 }
 
 pub(super) async fn apply_sender_candidate_unshield_validated(
@@ -894,15 +957,11 @@ pub(super) async fn apply_sender_candidate_unshield_validated(
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    if active_list_keys.is_empty()
-        || expected_candidate.chain_id != cfg.chain.chain_id
-        || expected_candidate.wallet_id != cfg.cache_key
-        || validated.is_empty()
-        || validated.len() != validated_txids.len()
-        || !validated
-            .iter()
-            .all(|txid| unshield.railgun_txids.contains(txid))
-    {
+    if active_list_keys.is_empty() || !sender_candidate_is_for_wallet(&expected_candidate, cfg) {
+        drop(permit);
+        return Ok(PoiPrivateApplyOutcome::Skipped);
+    }
+    if !validated_txids_are_pending(&validated, &validated_txids, unshield) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -916,15 +975,7 @@ pub(super) async fn apply_sender_candidate_unshield_validated(
         .iter()
         .map(|txid| BlindedCommitmentData::unshield(*txid))
         .collect::<Vec<_>>();
-    let valid = saved_poi_compatibility::corpus_valid_blinded_commitments(
-        &corpus,
-        cfg.chain.chain_id,
-        active_list_keys,
-        &datas,
-    )
-    .await
-    .map_err(|_| WalletCacheError::Crypto)?;
-    if !validated.is_subset(&valid) {
+    if !corpus_holds_all_valid(&corpus, cfg.chain.chain_id, active_list_keys, &datas).await? {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
@@ -936,16 +987,28 @@ pub(super) async fn apply_sender_candidate_unshield_validated(
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    commit_sender_candidate_replacement(
+    SenderCandidateCommit {
         cache_store,
         cfg,
         active_list_keys,
-        permit
+        validation_revision: permit
             .ppoi_workflow_status()
             .validation_revision
             .saturating_add(u64::try_from(validated.len()).unwrap_or(u64::MAX)),
-        permit,
-        expected_candidate.semantic_id(),
-        replacement,
-    )
+    }
+    .commit(permit, expected_candidate.semantic_id(), replacement)
+}
+
+/// Whether the validated TXIDs are distinct, non-empty and all still part of the candidate's
+/// unshield work.
+fn validated_txids_are_pending(
+    validated: &BTreeSet<FixedBytes<32>>,
+    validated_txids: &[FixedBytes<32>],
+    unshield: &SenderTransactionCandidateUnshield,
+) -> bool {
+    !validated.is_empty()
+        && validated.len() == validated_txids.len()
+        && validated
+            .iter()
+            .all(|txid| unshield.railgun_txids.contains(txid))
 }
