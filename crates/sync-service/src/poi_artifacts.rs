@@ -1808,94 +1808,19 @@ pub(crate) fn persist_prepared_corpus(
         return Err(PoiArtifactError::PersistedIdentityMismatch);
     }
     let identity = cache.identity().clone();
-    if identity.chain_type != entry.scope.chain_type
-        || identity.chain_id != entry.scope.chain_id
-        || identity.txid_version != entry.scope.txid_version
-        || identity.list_key != entry.scope.list_key
-    {
+    if !entry_scope_matches(&identity, &entry) {
         return Err(PoiArtifactError::PersistedIdentityMismatch);
     }
-    let artifact_tip_index = entry
-        .current_tip_index
-        .ok_or(PoiArtifactError::EmptyPersistedCorpus)?;
-    let manifest_root = entry
-        .current_root
-        .ok_or(PoiArtifactError::EmptyPersistedCorpus)?;
-    let current_tip_index = cache.progress().next_event_index.saturating_sub(1);
-    let (tree_number, _) = normalize_tree_position(0, current_tip_index);
-    let current_tip_root = *cache
-        .validated_roots()
-        .ok_or(PoiArtifactError::PersistedRootsNotValidated)?
-        .get(&tree_number)
-        .ok_or(PoiArtifactError::MissingCacheRoot { tree_number })?;
-    let valid_tip = if preserve_ahead_events {
-        current_tip_index > artifact_tip_index
-            && cache.root_at_global_index(artifact_tip_index) == Some(manifest_root)
-    } else {
-        current_tip_index == artifact_tip_index && current_tip_root == manifest_root
-    };
-    if !valid_tip {
+    let evidence = ArtifactCorpusEvidence::new(&entry, &publication, cache_generation, &cache)?;
+    if !evidence.served_by(&cache, preserve_ahead_events) {
         return Err(PoiArtifactError::PersistedArtifactRootMismatch {
-            tip_index: artifact_tip_index,
+            tip_index: evidence.artifact_tip_index,
         });
     }
     let record = if preserve_ahead_events {
-        let mut record = starting_record.ok_or(PoiArtifactError::PersistedArtifactMetadata {
-            reason: "ahead blocked-only refresh lost its starting provenance",
-        })?;
-        if record.current_tip_index != current_tip_index
-            || record.current_tip_root != current_tip_root
-            || record.cache_generation != cache_generation
-        {
-            return Err(PoiArtifactError::PersistedArtifactMetadata {
-                reason: "ahead blocked-only refresh changed its durable event boundary",
-            });
-        }
-        record.legacy_observed_manifest_sequence = record
-            .legacy_observed_manifest_sequence
-            .max(publication.sequence);
-        record.blocked_shields_descriptor = descriptor_record(&entry.blocked_shields.artifact);
-        record.updated_at = 0;
-        record
+        evidence.ahead_refresh_record(starting_record)?
     } else {
-        let catalog_descriptor = &entry.checkpoint_catalog;
-        let descriptor_bytes =
-            serde_json::to_vec(catalog_descriptor).map_err(PoiArtifactError::Json)?;
-        let catalog_descriptor_hash: [u8; 32] = Sha256::digest(descriptor_bytes).into();
-        let validation = PoiCorpusValidationRecord::PublisherAttestedV4 {
-            publisher_pubkey: publication.publisher_pubkey,
-            manifest_sequence: publication.sequence,
-            manifest_body_hash: Some(publication.manifest_body_hash),
-            manifest_root,
-            artifact_tip_index,
-            format_version: poi::artifacts::v4::FORMAT_VERSION,
-            checkpoint_catalog: PoiV4CatalogIdentityRecord {
-                cid: catalog_descriptor.artifact.cid.clone(),
-                sha256: catalog_descriptor.artifact.sha256,
-                byte_size: catalog_descriptor.artifact.byte_size,
-                descriptor_hash: FixedBytes::from(catalog_descriptor_hash),
-            },
-        };
-        PoiArtifactCacheRecord {
-            chain_type: identity.chain_type,
-            chain_id: identity.chain_id,
-            txid_version: identity.txid_version.clone(),
-            list_key: identity.list_key,
-            cache_generation,
-            source: PoiCacheRecordSource::IndexedArtifacts,
-            validation,
-            legacy_observed_manifest_sequence: publication.sequence,
-            base_descriptor: empty_descriptor_record(),
-            applied_delta_descriptors: Vec::new(),
-            blocked_shields_descriptor: descriptor_record(&entry.blocked_shields.artifact),
-            artifact_tip_index: Some(artifact_tip_index),
-            artifact_tip_root: Some(manifest_root),
-            current_tip_index,
-            current_tip_root,
-            cache_payload: Vec::new(),
-            legacy_last_successful_rpc_sync_at_ms: None,
-            updated_at: 0,
-        }
+        evidence.v4_record(&identity)?
     };
     CorpusRebase {
         db,
@@ -1907,6 +1832,148 @@ pub(crate) fn persist_prepared_corpus(
         expected_manifest_hash: Some(publication.manifest_body_hash),
     }
     .persist_monotonic(PreparedPoiCorpus::new(record, cache)?)
+}
+
+/// Whether the manifest entry covers the same corpus identity as the cache.
+fn entry_scope_matches(identity: &PoiCacheIdentity, entry: &ManifestEntry) -> bool {
+    identity.chain_type == entry.scope.chain_type
+        && identity.chain_id == entry.scope.chain_id
+        && identity.txid_version == entry.scope.txid_version
+        && identity.list_key == entry.scope.list_key
+}
+
+/// The cache's current tip index and its validated root.
+fn cache_current_tip(cache: &PoiCache) -> Result<(u64, FixedBytes<32>), PoiArtifactError> {
+    let current_tip_index = cache.progress().next_event_index.saturating_sub(1);
+    let (tree_number, _) = normalize_tree_position(0, current_tip_index);
+    let current_tip_root = *cache
+        .validated_roots()
+        .ok_or(PoiArtifactError::PersistedRootsNotValidated)?
+        .get(&tree_number)
+        .ok_or(PoiArtifactError::MissingCacheRoot { tree_number })?;
+    Ok((current_tip_index, current_tip_root))
+}
+
+/// A verified manifest entry's claims about a candidate corpus, and the tip
+/// the candidate cache serves.
+struct ArtifactCorpusEvidence<'a> {
+    entry: &'a ManifestEntry,
+    publication: &'a PublicationId,
+    cache_generation: u64,
+    artifact_tip_index: u64,
+    manifest_root: FixedBytes<32>,
+    current_tip_index: u64,
+    current_tip_root: FixedBytes<32>,
+}
+
+impl<'a> ArtifactCorpusEvidence<'a> {
+    fn new(
+        entry: &'a ManifestEntry,
+        publication: &'a PublicationId,
+        cache_generation: u64,
+        cache: &PoiCache,
+    ) -> Result<Self, PoiArtifactError> {
+        let artifact_tip_index = entry
+            .current_tip_index
+            .ok_or(PoiArtifactError::EmptyPersistedCorpus)?;
+        let manifest_root = entry
+            .current_root
+            .ok_or(PoiArtifactError::EmptyPersistedCorpus)?;
+        let (current_tip_index, current_tip_root) = cache_current_tip(cache)?;
+        Ok(Self {
+            entry,
+            publication,
+            cache_generation,
+            artifact_tip_index,
+            manifest_root,
+            current_tip_index,
+            current_tip_root,
+        })
+    }
+
+    /// Whether the cache serves the artifact tip: exactly at its current tip,
+    /// or, for an ahead refresh, as a historical root below it.
+    fn served_by(&self, cache: &PoiCache, preserve_ahead_events: bool) -> bool {
+        if preserve_ahead_events {
+            self.current_tip_index > self.artifact_tip_index
+                && cache.root_at_global_index(self.artifact_tip_index) == Some(self.manifest_root)
+        } else {
+            self.current_tip_index == self.artifact_tip_index
+                && self.current_tip_root == self.manifest_root
+        }
+    }
+
+    /// The starting record refreshed for a blocked-only manifest update that
+    /// keeps the durable events ahead of the artifact tip.
+    fn ahead_refresh_record(
+        &self,
+        starting_record: Option<PoiArtifactCacheRecord>,
+    ) -> Result<PoiArtifactCacheRecord, PoiArtifactError> {
+        let mut record = starting_record.ok_or(PoiArtifactError::PersistedArtifactMetadata {
+            reason: "ahead blocked-only refresh lost its starting provenance",
+        })?;
+        let boundary_unchanged = record.current_tip_index == self.current_tip_index
+            && record.current_tip_root == self.current_tip_root
+            && record.cache_generation == self.cache_generation;
+        if !boundary_unchanged {
+            return Err(PoiArtifactError::PersistedArtifactMetadata {
+                reason: "ahead blocked-only refresh changed its durable event boundary",
+            });
+        }
+        record.legacy_observed_manifest_sequence = record
+            .legacy_observed_manifest_sequence
+            .max(self.publication.sequence);
+        record.blocked_shields_descriptor = descriptor_record(&self.entry.blocked_shields.artifact);
+        record.updated_at = 0;
+        Ok(record)
+    }
+
+    /// The `PublisherAttestedV4` corpus record for a cache that ends at the
+    /// artifact tip.
+    fn v4_record(
+        &self,
+        identity: &PoiCacheIdentity,
+    ) -> Result<PoiArtifactCacheRecord, PoiArtifactError> {
+        let publication = self.publication;
+        let catalog_descriptor = &self.entry.checkpoint_catalog;
+        let descriptor_bytes =
+            serde_json::to_vec(catalog_descriptor).map_err(PoiArtifactError::Json)?;
+        let catalog_descriptor_hash: [u8; 32] = Sha256::digest(descriptor_bytes).into();
+        let validation = PoiCorpusValidationRecord::PublisherAttestedV4 {
+            publisher_pubkey: publication.publisher_pubkey,
+            manifest_sequence: publication.sequence,
+            manifest_body_hash: Some(publication.manifest_body_hash),
+            manifest_root: self.manifest_root,
+            artifact_tip_index: self.artifact_tip_index,
+            format_version: poi::artifacts::v4::FORMAT_VERSION,
+            checkpoint_catalog: PoiV4CatalogIdentityRecord {
+                cid: catalog_descriptor.artifact.cid.clone(),
+                sha256: catalog_descriptor.artifact.sha256,
+                byte_size: catalog_descriptor.artifact.byte_size,
+                descriptor_hash: FixedBytes::from(catalog_descriptor_hash),
+            },
+        };
+        Ok(PoiArtifactCacheRecord {
+            chain_type: identity.chain_type,
+            chain_id: identity.chain_id,
+            txid_version: identity.txid_version.clone(),
+            list_key: identity.list_key,
+            cache_generation: self.cache_generation,
+            source: PoiCacheRecordSource::IndexedArtifacts,
+            validation,
+            legacy_observed_manifest_sequence: publication.sequence,
+            base_descriptor: empty_descriptor_record(),
+            applied_delta_descriptors: Vec::new(),
+            blocked_shields_descriptor: descriptor_record(&self.entry.blocked_shields.artifact),
+            artifact_tip_index: Some(self.artifact_tip_index),
+            artifact_tip_root: Some(self.manifest_root),
+            current_tip_index: self.current_tip_index,
+            current_tip_root: self.current_tip_root,
+            cache_payload: Vec::new(),
+            legacy_last_successful_rpc_sync_at_ms: None,
+            updated_at: 0,
+        })
+    }
 }
 
 const fn expected_base_current_root(expected: ExpectedPoiCorpusBase) -> Option<FixedBytes<32>> {
@@ -2065,13 +2132,7 @@ fn public_rpc_corpus_record(
     range_start_index: u64,
 ) -> Result<PoiArtifactCacheRecord, PoiArtifactError> {
     let identity = cache.identity().clone();
-    let current_tip_index = cache.progress().next_event_index.saturating_sub(1);
-    let (tree_number, _) = normalize_tree_position(0, current_tip_index);
-    let current_tip_root = *cache
-        .validated_roots()
-        .ok_or(PoiArtifactError::PersistedRootsNotValidated)?
-        .get(&tree_number)
-        .ok_or(PoiArtifactError::MissingCacheRoot { tree_number })?;
+    let (current_tip_index, current_tip_root) = cache_current_tip(cache)?;
     Ok(PoiArtifactCacheRecord {
         chain_type: identity.chain_type,
         chain_id: identity.chain_id,
