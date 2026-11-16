@@ -340,7 +340,7 @@ pub(in crate::wallet) async fn process_sender_candidate_unshields(
     inputs: SenderUnshieldInputs<'_>,
 ) {
     let SenderUnshieldInputs {
-        mut candidate,
+        candidate,
         eligible,
         valid,
         qualified,
@@ -349,9 +349,7 @@ pub(in crate::wallet) async fn process_sender_candidate_unshields(
         proof_source_resolution,
         mut cached_proofs,
     } = inputs;
-    let candidate_id = candidate.semantic_id();
     let stored = sender_candidate_unshield_txids(&candidate);
-    let eligible_count = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
     let Some(valid) = valid else {
         let unknown = eligible.union(&stored).count();
         report.retrying = report
@@ -361,225 +359,43 @@ pub(in crate::wallet) async fn process_sender_candidate_unshields(
     };
     let target = unresolved_sender_unshield_txids(&eligible, &stored, Some(&valid));
     live.extend(target.iter().copied());
-    if target != stored {
-        let outputs_handed_off = candidate
-            .unshield
-            .as_ref()
-            .is_some_and(|unshield| unshield.outputs_handed_off);
-        let Ok(replacement) = sender_candidate_with_remaining_unshield(
-            &candidate,
-            target.iter().copied().collect(),
-            outputs_handed_off,
-        ) else {
-            report.needs_attention = report.needs_attention.saturating_add(eligible_count);
-            return;
-        };
-        match apply_poi_private_delta(
-            request.authority,
-            request.db,
-            request.cache_store,
-            request.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate(
-                SenderCandidateUnshieldUpdateDelta {
-                    expected_candidate: candidate,
-                    public_data_fence: public_data_fence.clone(),
-                    replacement: replacement.clone(),
-                },
-            ),
-        )
-        .await
-        {
-            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {}
-            Ok(
-                PoiPrivateApplyOutcome::Skipped
-                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
-            ) => return,
-            Err(_) => {
-                report.needs_attention = report.needs_attention.saturating_add(eligible_count);
-                return;
-            }
-        }
-        let Some(replacement) = replacement else {
-            report.expected_candidates.remove(&candidate_id);
-            return;
-        };
-        track_sender_candidate(report, &replacement);
-        candidate = replacement;
-    }
-
+    let mut run = SenderUnshieldRun {
+        request,
+        report,
+        attempts,
+        qualified,
+        wallet_nullifiers,
+        public_data_fence,
+        proof_source_resolution,
+        candidate_id: candidate.semantic_id(),
+        eligible_count: u64::try_from(eligible.len()).unwrap_or(u64::MAX),
+        submitted: 0,
+        waiting: 0,
+    };
+    let Some(candidate) = run.reconcile(candidate, &stored, &target).await else {
+        return;
+    };
     let completed = target
         .intersection(&valid)
         .copied()
         .collect::<BTreeSet<_>>();
-    if !completed.is_empty() {
-        // `valid` is nonempty only after a read from this local corpus.
-        let OutputPoiProofSourceResolution::Local { corpus, .. } = proof_source_resolution else {
-            return;
-        };
-        let Some(unshield) = candidate.unshield.as_ref() else {
-            return;
-        };
-        let Ok(next) = sender_candidate_after_unshield_validation(&candidate, unshield, &completed)
-        else {
-            report.needs_attention = report.needs_attention.saturating_add(eligible_count);
-            return;
-        };
-        match apply_poi_private_delta(
-            request.authority,
-            request.db,
-            request.cache_store,
-            request.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateUnshieldValidated(
-                SenderCandidateUnshieldValidatedDelta {
-                    expected_candidate: candidate,
-                    validated_txids: completed.iter().copied().collect(),
-                    corpus: corpus.clone(),
-                },
-            ),
-        )
-        .await
-        {
-            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
-                report.unshields_validated =
-                    report.unshields_validated.saturating_add(completed.len());
-            }
-            Ok(
-                PoiPrivateApplyOutcome::Skipped
-                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
-            ) => return,
-            Err(_) => {
-                report.needs_attention = report.needs_attention.saturating_add(eligible_count);
-                return;
-            }
-        }
-        let Some(next) = next else {
-            report.expected_candidates.remove(&candidate_id);
-            return;
-        };
-        track_sender_candidate(report, &next);
-        candidate = next;
-    }
-
-    let mut submitted = 0_u64;
-    let mut waiting = 0_u64;
+    let Some(candidate) = run.complete(candidate, &completed).await else {
+        return;
+    };
     let unresolved = request.private_poi.submission_order(
         target.difference(&valid).copied().collect::<Vec<_>>(),
         |_| 1,
     );
     for txid in unresolved {
-        if let Some(outcome) = attempts.waiting(txid, Instant::now(), request.force_retry) {
-            waiting = waiting.saturating_add(1);
-            match outcome {
-                SenderUnshieldAttemptOutcome::Submitted => {
-                    report.unshield_awaiting_validation =
-                        report.unshield_awaiting_validation.saturating_add(1);
-                }
-                SenderUnshieldAttemptOutcome::Retrying => {
-                    report.retrying = report.retrying.saturating_add(1);
-                }
-                SenderUnshieldAttemptOutcome::NeedsAttention => {
-                    report.needs_attention = report.needs_attention.saturating_add(1);
-                }
-            }
-            continue;
-        }
-        // A cached proof, or what proving this TXID needs.
-        let proof = if let Some(cached) = cached_proofs.remove(&txid) {
-            Ok(cached)
-        } else {
-            let (Some(spending_public_key), Some(prover)) = (
-                request.cfg.spending_public_key,
-                request.cfg.poi_recovery_prover.as_ref(),
-            ) else {
-                report.retrying = report.retrying.saturating_add(1);
-                continue;
-            };
-            let Some(transaction) = qualified.iter().find(|transaction| {
-                transaction.public_row.transaction.has_unshield
-                    && sender_unshield_railgun_txid(transaction) == txid
-            }) else {
-                report.awaiting_public_txid_data =
-                    report.awaiting_public_txid_data.saturating_add(1);
-                continue;
-            };
-            Err((spending_public_key, prover, transaction))
-        };
-        // Reserve before proving, so that a deferral wastes no proof.
-        let route = match request
-            .private_poi
-            .reserve_transact_route(
-                request.cfg.chain.chain_id,
-                U256::from_be_bytes(txid.0),
-                None,
-            )
-            .await
-        {
-            Ok(route) => route,
-            Err(deferred) => {
-                attempts.record(
-                    txid,
-                    SenderUnshieldAttemptOutcome::Retrying,
-                    deferred.retry_after(),
-                );
-                report.retrying = report.retrying.saturating_add(1);
-                continue;
-            }
-        };
-        let (txid_merkleroot_index, pre_transaction_pois) = match proof {
-            Ok(cached) => cached,
-            Err((spending_public_key, prover, transaction)) => {
-                let candidate_prover = SenderCandidateProver {
-                    request,
-                    candidate: &candidate,
-                    wallet_nullifiers,
-                    spending_public_key,
-                    prover,
-                    proof_source_resolution,
-                };
-                match candidate_prover.prove(transaction).await {
-                    Ok(Some(proved)) => (
-                        proved.txid_data.poi_data.txid_merkleroot_index,
-                        proved.pre_transaction_pois,
-                    ),
-                    Ok(None) => continue,
-                    Err(failure) => {
-                        record_sender_unshield_failure(report, attempts, txid, &failure);
-                        continue;
-                    }
-                }
-            }
-        };
-        match submit_sender_unshield_transaction_pois(
-            request,
-            &route,
-            &candidate,
-            public_data_fence,
-            txid_merkleroot_index,
-            &pre_transaction_pois,
-        )
-        .await
-        {
-            Ok(true) => {
-                attempts.record(
-                    txid,
-                    SenderUnshieldAttemptOutcome::Submitted,
-                    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
-                );
-                report.unshield_awaiting_validation =
-                    report.unshield_awaiting_validation.saturating_add(1);
-                submitted = submitted.saturating_add(1);
-            }
-            Ok(false) => report.retrying = report.retrying.saturating_add(1),
-            Err(failure) => record_sender_unshield_failure(report, attempts, txid, &failure),
-        }
+        run.submit(&candidate, &mut cached_proofs, txid).await;
     }
     debug!(
         chain_id = request.cfg.chain.chain_id,
         eligible = eligible.len(),
         unresolved = target.len(),
         validated = completed.len(),
-        submitted,
-        waiting,
+        submitted = run.submitted,
+        waiting = run.waiting,
         "sender candidate unshield work processed"
     );
 }
@@ -609,59 +425,360 @@ fn record_sender_unshield_failure(
     }
 }
 
-pub(super) async fn submit_sender_unshield_transaction_pois(
-    request: &OutputPoiRecoveryRequest<'_>,
-    route: &TransactProofRoute,
-    candidate: &SenderTransactionCandidate,
-    public_data_fence: &SenderCandidatePublicDataFence,
-    txid_merkleroot_index: u64,
-    pre_transaction_pois: &PreTransactionPoiMap,
-) -> Result<bool, RecoveryFailure> {
-    if !saved_poi_map_is_compatible(pre_transaction_pois, request.active_list_keys) {
-        return Ok(false);
-    }
-    for list_key in request.active_list_keys {
-        let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
-            return Ok(false);
+/// One candidate's unshield work: its shared inputs and the report it counts into.
+struct SenderUnshieldRun<'r> {
+    request: &'r OutputPoiRecoveryRequest<'r>,
+    report: &'r mut SenderCandidateRecoveryReport,
+    attempts: &'r SenderUnshieldAttempts,
+    qualified: &'r [QualifiedSenderTransaction],
+    wallet_nullifiers: &'r WalletNullifierIndex<'r>,
+    public_data_fence: &'r SenderCandidatePublicDataFence,
+    proof_source_resolution: &'r OutputPoiProofSourceResolution,
+    /// The original candidate's id, which both retirement paths remove.
+    candidate_id: FixedBytes<32>,
+    eligible_count: u64,
+    /// TXIDs submitted in this run.
+    submitted: u64,
+    /// TXIDs skipped because an earlier attempt still paces them.
+    waiting: u64,
+}
+
+/// Where the proof of an unresolved unshield TXID comes from.
+enum SenderUnshieldProofSource<'r> {
+    /// Built during materialization, with its TXID merkleroot index.
+    Cached((u64, PreTransactionPoiMap)),
+    /// What proving the TXID needs.
+    Prove {
+        spending_public_key: [U256; 2],
+        prover: &'r railgun_wallet::prover::ProverService,
+        transaction: &'r QualifiedSenderTransaction,
+    },
+}
+
+impl<'r> SenderUnshieldRun<'r> {
+    /// Rewrites the stored unshield TXIDs to `target`. Returns the candidate to continue with, or
+    /// `None` when the work stops.
+    async fn reconcile(
+        &mut self,
+        candidate: SenderTransactionCandidate,
+        stored: &BTreeSet<FixedBytes<32>>,
+        target: &BTreeSet<FixedBytes<32>>,
+    ) -> Option<SenderTransactionCandidate> {
+        if target == stored {
+            return Some(candidate);
+        }
+        let outputs_handed_off = candidate
+            .unshield
+            .as_ref()
+            .is_some_and(|unshield| unshield.outputs_handed_off);
+        let Ok(replacement) = sender_candidate_with_remaining_unshield(
+            &candidate,
+            target.iter().copied().collect(),
+            outputs_handed_off,
+        ) else {
+            self.report.needs_attention = self
+                .report
+                .needs_attention
+                .saturating_add(self.eligible_count);
+            return None;
         };
-        for poi in per_leaf.values() {
-            match request
-                .private_poi
-                .submit_transact_proof(
-                    route,
-                    || async {
-                        Ok::<bool, std::convert::Infallible>(
-                            public_data_fence.is_current(candidate.source.tx_hash)
-                                && sender_candidate_still_current(
-                                    request.authority,
-                                    request.cache_store,
-                                    request.cfg,
-                                    candidate,
-                                )
-                                .await,
-                        )
-                    },
-                    DEFAULT_TXID_VERSION,
-                    EVM_CHAIN_TYPE,
-                    request.cfg.chain.chain_id,
-                    list_key,
-                    txid_merkleroot_index,
-                    poi,
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(WalletPrivateRemoteError::Stale(_)) => return Ok(false),
-                Err(WalletPrivateRemoteError::Check(error)) => match error {},
-                Err(WalletPrivateRemoteError::Remote(_)) => {
-                    return Err(RecoveryFailure::retryable(
-                        OutputPoiRecoveryStatus::SubmitFailed,
-                        "sender unshield POI submission failed",
-                        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                    ));
+        let delta = OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate(
+            SenderCandidateUnshieldUpdateDelta {
+                expected_candidate: candidate,
+                public_data_fence: self.public_data_fence.clone(),
+                replacement: replacement.clone(),
+            },
+        );
+        self.apply_update(delta, replacement, 0).await
+    }
+
+    /// Completes the `completed` unshield TXIDs, which are Valid locally. Returns the candidate to
+    /// continue with, or `None` when the work stops.
+    async fn complete(
+        &mut self,
+        candidate: SenderTransactionCandidate,
+        completed: &BTreeSet<FixedBytes<32>>,
+    ) -> Option<SenderTransactionCandidate> {
+        if completed.is_empty() {
+            return Some(candidate);
+        }
+        // `valid` is nonempty only after a read from this local corpus.
+        let OutputPoiProofSourceResolution::Local { corpus, .. } = self.proof_source_resolution
+        else {
+            return None;
+        };
+        let unshield = candidate.unshield.as_ref()?;
+        let Ok(next) = sender_candidate_after_unshield_validation(&candidate, unshield, completed)
+        else {
+            self.report.needs_attention = self
+                .report
+                .needs_attention
+                .saturating_add(self.eligible_count);
+            return None;
+        };
+        let delta = OwnedPoiPrivateDelta::SenderCandidateUnshieldValidated(
+            SenderCandidateUnshieldValidatedDelta {
+                expected_candidate: candidate,
+                validated_txids: completed.iter().copied().collect(),
+                corpus: corpus.clone(),
+            },
+        );
+        self.apply_update(delta, next, completed.len()).await
+    }
+
+    /// Applies a candidate update and adds `validated` to the report once it applies. Returns the
+    /// candidate to continue with, or `None` when the update is skipped or fails or the candidate
+    /// retires.
+    async fn apply_update(
+        &mut self,
+        delta: OwnedPoiPrivateDelta,
+        next: Option<SenderTransactionCandidate>,
+        validated: usize,
+    ) -> Option<SenderTransactionCandidate> {
+        match apply_poi_private_delta(
+            self.request.authority,
+            self.request.db,
+            self.request.cache_store,
+            self.request.cfg,
+            delta,
+        )
+        .await
+        {
+            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                self.report.unshields_validated =
+                    self.report.unshields_validated.saturating_add(validated);
+            }
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => return None,
+            Err(_) => {
+                self.report.needs_attention = self
+                    .report
+                    .needs_attention
+                    .saturating_add(self.eligible_count);
+                return None;
+            }
+        }
+        let Some(next) = next else {
+            self.report.expected_candidates.remove(&self.candidate_id);
+            return None;
+        };
+        track_sender_candidate(self.report, &next);
+        Some(next)
+    }
+
+    /// Proves and submits one unresolved unshield TXID, unless an earlier attempt still paces it.
+    async fn submit(
+        &mut self,
+        candidate: &SenderTransactionCandidate,
+        cached_proofs: &mut BTreeMap<FixedBytes<32>, (u64, PreTransactionPoiMap)>,
+        txid: FixedBytes<32>,
+    ) {
+        if self.attempt_waiting(txid) {
+            return;
+        }
+        let Some(source) = self.proof_source(cached_proofs, txid) else {
+            return;
+        };
+        // Reserve before proving, so that a deferral wastes no proof.
+        let route = match self
+            .request
+            .private_poi
+            .reserve_transact_route(
+                self.request.cfg.chain.chain_id,
+                U256::from_be_bytes(txid.0),
+                None,
+            )
+            .await
+        {
+            Ok(route) => route,
+            Err(deferred) => {
+                self.attempts.record(
+                    txid,
+                    SenderUnshieldAttemptOutcome::Retrying,
+                    deferred.retry_after(),
+                );
+                self.report.retrying = self.report.retrying.saturating_add(1);
+                return;
+            }
+        };
+        let Some(proof) = self.proof(candidate, txid, source).await else {
+            return;
+        };
+        match self.submit_pois(&route, candidate, &proof).await {
+            Ok(true) => {
+                self.attempts.record(
+                    txid,
+                    SenderUnshieldAttemptOutcome::Submitted,
+                    PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+                );
+                self.report.unshield_awaiting_validation =
+                    self.report.unshield_awaiting_validation.saturating_add(1);
+                self.submitted = self.submitted.saturating_add(1);
+            }
+            Ok(false) => self.report.retrying = self.report.retrying.saturating_add(1),
+            Err(failure) => {
+                record_sender_unshield_failure(self.report, self.attempts, txid, &failure);
+            }
+        }
+    }
+
+    /// Counts `txid` by its last outcome and returns `true` when an earlier attempt still paces
+    /// it.
+    fn attempt_waiting(&mut self, txid: FixedBytes<32>) -> bool {
+        let Some(outcome) = self
+            .attempts
+            .waiting(txid, Instant::now(), self.request.force_retry)
+        else {
+            return false;
+        };
+        self.waiting = self.waiting.saturating_add(1);
+        match outcome {
+            SenderUnshieldAttemptOutcome::Submitted => {
+                self.report.unshield_awaiting_validation =
+                    self.report.unshield_awaiting_validation.saturating_add(1);
+            }
+            SenderUnshieldAttemptOutcome::Retrying => {
+                self.report.retrying = self.report.retrying.saturating_add(1);
+            }
+            SenderUnshieldAttemptOutcome::NeedsAttention => {
+                self.report.needs_attention = self.report.needs_attention.saturating_add(1);
+            }
+        }
+        true
+    }
+
+    /// The cached proof of `txid`, or what proving it needs. `None` after counting a TXID that
+    /// cannot be proved yet.
+    fn proof_source(
+        &mut self,
+        cached_proofs: &mut BTreeMap<FixedBytes<32>, (u64, PreTransactionPoiMap)>,
+        txid: FixedBytes<32>,
+    ) -> Option<SenderUnshieldProofSource<'r>> {
+        if let Some(cached) = cached_proofs.remove(&txid) {
+            return Some(SenderUnshieldProofSource::Cached(cached));
+        }
+        let (Some(spending_public_key), Some(prover)) = (
+            self.request.cfg.spending_public_key,
+            self.request.cfg.poi_recovery_prover.as_ref(),
+        ) else {
+            self.report.retrying = self.report.retrying.saturating_add(1);
+            return None;
+        };
+        let Some(transaction) = self.qualified.iter().find(|transaction| {
+            transaction.public_row.transaction.has_unshield
+                && sender_unshield_railgun_txid(transaction) == txid
+        }) else {
+            self.report.awaiting_public_txid_data =
+                self.report.awaiting_public_txid_data.saturating_add(1);
+            return None;
+        };
+        Some(SenderUnshieldProofSource::Prove {
+            spending_public_key,
+            prover,
+            transaction,
+        })
+    }
+
+    /// The TXID merkleroot index and proofs to submit for `txid`, or `None` when proving went
+    /// stale or failed.
+    async fn proof(
+        &mut self,
+        candidate: &SenderTransactionCandidate,
+        txid: FixedBytes<32>,
+        source: SenderUnshieldProofSource<'_>,
+    ) -> Option<(u64, PreTransactionPoiMap)> {
+        match source {
+            SenderUnshieldProofSource::Cached(cached) => Some(cached),
+            SenderUnshieldProofSource::Prove {
+                spending_public_key,
+                prover,
+                transaction,
+            } => {
+                let candidate_prover = SenderCandidateProver {
+                    request: self.request,
+                    candidate,
+                    wallet_nullifiers: self.wallet_nullifiers,
+                    spending_public_key,
+                    prover,
+                    proof_source_resolution: self.proof_source_resolution,
+                };
+                match candidate_prover.prove(transaction).await {
+                    Ok(Some(proved)) => Some((
+                        proved.txid_data.poi_data.txid_merkleroot_index,
+                        proved.pre_transaction_pois,
+                    )),
+                    Ok(None) => None,
+                    Err(failure) => {
+                        record_sender_unshield_failure(self.report, self.attempts, txid, &failure);
+                        None
+                    }
                 }
             }
         }
     }
-    Ok(true)
+
+    /// Submits the proof of one unshield TXID on every active list. `Ok(false)` when the proofs do
+    /// not fit the active lists or the submission went stale.
+    async fn submit_pois(
+        &self,
+        route: &TransactProofRoute,
+        candidate: &SenderTransactionCandidate,
+        proof: &(u64, PreTransactionPoiMap),
+    ) -> Result<bool, RecoveryFailure> {
+        let Self {
+            request,
+            public_data_fence,
+            ..
+        } = *self;
+        let &(txid_merkleroot_index, ref pre_transaction_pois) = proof;
+        if !saved_poi_map_is_compatible(pre_transaction_pois, request.active_list_keys) {
+            return Ok(false);
+        }
+        for list_key in request.active_list_keys {
+            let Some(per_leaf) = pre_transaction_pois.get(list_key) else {
+                return Ok(false);
+            };
+            for poi in per_leaf.values() {
+                match request
+                    .private_poi
+                    .submit_transact_proof(
+                        route,
+                        || async {
+                            Ok::<bool, std::convert::Infallible>(
+                                public_data_fence.is_current(candidate.source.tx_hash)
+                                    && sender_candidate_still_current(
+                                        request.authority,
+                                        request.cache_store,
+                                        request.cfg,
+                                        candidate,
+                                    )
+                                    .await,
+                            )
+                        },
+                        DEFAULT_TXID_VERSION,
+                        EVM_CHAIN_TYPE,
+                        request.cfg.chain.chain_id,
+                        list_key,
+                        txid_merkleroot_index,
+                        poi,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(WalletPrivateRemoteError::Stale(_)) => return Ok(false),
+                    Err(WalletPrivateRemoteError::Check(error)) => match error {},
+                    Err(WalletPrivateRemoteError::Remote(_)) => {
+                        return Err(RecoveryFailure::retryable(
+                            OutputPoiRecoveryStatus::SubmitFailed,
+                            "sender unshield POI submission failed",
+                            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
 }
