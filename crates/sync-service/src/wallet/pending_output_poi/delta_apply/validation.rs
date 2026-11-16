@@ -7,24 +7,16 @@ use crate::wallet::pending_output_poi::{
     PendingContextTerminalDelta, PendingOutputPoiContextRecord, PendingOutputPoiSubject,
     PendingOutputPoiSubjectMatch, PendingOutputPoiValidationEvidence, PoiPrivateApplyOutcome,
     PoiPrivateRows, PoiStatus, PoiStatusRefreshDelta, VerifiedValidDelta, WalletCacheError,
-    WalletCacheStore, WalletConfig, WalletPpoiWorkflowProjection, WalletPrivateMutationPermit,
-    WalletUtxo, new_output_poi_recovery_record, output_poi_recovery_default_status,
+    WalletConfig, WalletPpoiWorkflowProjection, WalletPrivateMutationPermit, WalletUtxo,
+    new_output_poi_recovery_record, output_poi_recovery_default_status,
     pending_output_poi_context_fingerprint, pending_output_poi_subject_matches_snapshot,
-    poi_statuses_are_recoverable_for_lists, wallet_ppoi_workflow_status_after_mutations,
+    poi_statuses_are_recoverable_for_lists,
 };
 
 use super::{
-    ActiveApplyCommit, PoiApplyTurn, commit_active_apply, commit_durable_apply, lists_are_active,
-    recovery_matches_source,
+    ActiveApplyCommit, PendingOutputStore, PoiApplyTurn, commit_active_apply, commit_durable_apply,
+    lists_are_active, recovery_matches_source,
 };
-
-/// Where a pending output delta reads its stored context and recovery.
-#[derive(Clone, Copy)]
-struct PendingOutputStore<'a> {
-    cache_store: &'a dyn WalletCacheStore,
-    cfg: &'a WalletConfig,
-    output_commitment: FixedBytes<32>,
-}
 
 /// A stored context, its snapshot match and its recovery, after a delta's checks.
 struct CheckedPendingOutput {
@@ -34,14 +26,6 @@ struct CheckedPendingOutput {
 }
 
 impl PendingOutputStore<'_> {
-    fn context(self) -> Result<Option<PendingOutputPoiContextRecord>, WalletCacheError> {
-        self.cache_store.get_pending_output_poi_context(
-            self.cfg.chain.chain_id,
-            &self.cfg.cache_key,
-            &self.output_commitment,
-        )
-    }
-
     /// The checked pending output, when the context has an observation and the stored recovery
     /// is `expected_recovery` and came from the observed source transaction.
     fn checked(
@@ -53,11 +37,7 @@ impl PendingOutputStore<'_> {
         let Some(observation) = context.observation.as_ref() else {
             return Ok(None);
         };
-        let recovery = self.cache_store.get_output_poi_recovery(
-            self.cfg.chain.chain_id,
-            &self.cfg.cache_key,
-            &self.output_commitment,
-        )?;
+        let recovery = self.recovery()?;
         if !recovery_matches_source(expected_recovery, recovery.as_ref(), observation.tx_hash) {
             return Ok(None);
         }
@@ -66,21 +46,6 @@ impl PendingOutputStore<'_> {
             subject_match,
             recovery,
         }))
-    }
-
-    fn workflow_after_mutations(
-        self,
-        permit: &WalletPrivateMutationPermit<'_>,
-        active_list_keys: &[FixedBytes<32>],
-        rows: PoiPrivateRows<'_>,
-    ) -> Result<WalletPpoiWorkflowProjection, WalletCacheError> {
-        wallet_ppoi_workflow_status_after_mutations(
-            self.cache_store,
-            self.cfg,
-            active_list_keys,
-            permit.ppoi_workflow_status().validation_revision,
-            rows,
-        )
     }
 
     fn workflow_after_validation(

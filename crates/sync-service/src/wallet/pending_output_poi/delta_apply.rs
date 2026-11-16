@@ -2,10 +2,10 @@ use crate::types::WalletBackfillRejectReason;
 
 use super::{
     DbStore, ExpectedRecordState, FixedBytes, OutputPoiRecoveryRecord, OwnedPoiPrivateDelta,
-    PoiPrivateApplyOutcome, PoiPrivateRows, WalletCacheError, WalletCacheStore,
-    WalletCheckpointMutation, WalletConfig, WalletPpoiWorkflowProjection, WalletPrivateCommit,
-    WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletUtxo, WalletUtxoMutation,
-    expected_recovery_matches,
+    PendingOutputPoiContextRecord, PoiPrivateApplyOutcome, PoiPrivateRows, WalletCacheError,
+    WalletCacheStore, WalletCheckpointMutation, WalletConfig, WalletPpoiWorkflowProjection,
+    WalletPrivateCommit, WalletPrivateMutationAuthority, WalletPrivateMutationPermit, WalletUtxo,
+    WalletUtxoMutation, expected_recovery_matches, wallet_ppoi_workflow_status_after_mutations,
 };
 
 mod sender_candidate;
@@ -156,6 +156,47 @@ async fn commit_active_apply(
     drop(utxos_locked);
     drop(permit);
     active_apply_outcome(result, utxos_changed)
+}
+
+/// Where a pending output delta reads its stored context and recovery.
+#[derive(Clone, Copy)]
+struct PendingOutputStore<'a> {
+    cache_store: &'a dyn WalletCacheStore,
+    cfg: &'a WalletConfig,
+    output_commitment: FixedBytes<32>,
+}
+
+impl PendingOutputStore<'_> {
+    fn context(self) -> Result<Option<PendingOutputPoiContextRecord>, WalletCacheError> {
+        self.cache_store.get_pending_output_poi_context(
+            self.cfg.chain.chain_id,
+            &self.cfg.cache_key,
+            &self.output_commitment,
+        )
+    }
+
+    fn recovery(self) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError> {
+        self.cache_store.get_output_poi_recovery(
+            self.cfg.chain.chain_id,
+            &self.cfg.cache_key,
+            &self.output_commitment,
+        )
+    }
+
+    fn workflow_after_mutations(
+        self,
+        permit: &WalletPrivateMutationPermit<'_>,
+        active_list_keys: &[FixedBytes<32>],
+        rows: PoiPrivateRows<'_>,
+    ) -> Result<WalletPpoiWorkflowProjection, WalletCacheError> {
+        wallet_ppoi_workflow_status_after_mutations(
+            self.cache_store,
+            self.cfg,
+            active_list_keys,
+            permit.ppoi_workflow_status().validation_revision,
+            rows,
+        )
+    }
 }
 
 /// Wallet state one exclusive apply holds while it folds a delta.

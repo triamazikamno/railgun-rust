@@ -7,14 +7,15 @@ use crate::wallet::pending_output_poi::recovered_outgoing::{
     recovered_outgoing_group_records, recovered_outgoing_owned_substitutes_match,
 };
 use crate::wallet::pending_output_poi::{
-    BTreeMap, ExpectedPoiStatus, ExpectedWalletOutput, FixedBytes, OutputPoiRecoveryAction,
-    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, OutputRecoveryDelta,
+    BTreeMap, ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, FixedBytes,
+    OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, OutputRecoveryDelta,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
-    PendingOutputPoiSubject, PendingOutputPoiSubmissionKind, PendingSubmissionDelta,
-    PoiPrivateApplyOutcome, PoiPrivateRows, RecoveredOutgoingSubmissionDelta,
-    RecoveredOutgoingSubmissionSibling, WalletCacheError, WalletCacheStore, WalletConfig,
-    WalletUtxo, expected_pending_context_matches, expected_poi_status_matches,
-    expected_recovery_matches, hold_expected_poi_corpus_revision, new_output_poi_recovery_record,
+    PendingOutputPoiSubject, PendingOutputPoiSubjectMatch, PendingOutputPoiSubmissionKind,
+    PendingSubmissionDelta, PoiPrivateApplyOutcome, PoiPrivateRows,
+    RecoveredOutgoingSubmissionDelta, RecoveredOutgoingSubmissionSibling, WalletCacheError,
+    WalletCacheStore, WalletConfig, WalletPrivateMutationPermit, WalletUtxo,
+    expected_pending_context_matches, expected_poi_status_matches, expected_recovery_matches,
+    hold_expected_poi_corpus_revision, new_output_poi_recovery_record,
     new_pending_output_poi_recovery_record, output_poi_recovery_default_status,
     pending_output_poi_context_fingerprint, pending_output_poi_context_matches_wallet_utxo,
     pending_output_poi_subject_matches_snapshot, pending_output_poi_submit_identity,
@@ -24,7 +25,10 @@ use crate::wallet::pending_output_poi::{
     wallet_ppoi_workflow_status_after_mutations,
 };
 
-use super::{PoiApplyTurn, commit_durable_apply, lists_are_active, recovery_matches_source};
+use super::{
+    PendingOutputStore, PoiApplyTurn, commit_durable_apply, lists_are_active,
+    recovery_matches_source,
+};
 
 /// Adds each list key the context does not already record as submitted.
 fn add_submitted_list_keys<'a>(
@@ -49,24 +53,13 @@ pub(super) async fn apply_output_recovery(
         cfg,
         ..
     } = turn;
-    let OutputRecoveryDelta {
-        expected_output,
-        active_list_keys,
-        target_list_keys,
-        required_poi_status,
-        pending_update,
-        expected_recovery,
-        action,
-        now,
-        expected_corpus,
-        replay_fence,
-    } = delta;
     // Match sender reconstruction lock ordering: public data, then corpus, then commit.
-    let _public_commit_guard = match replay_fence.as_ref() {
+    let _public_commit_guard = match delta.replay_fence.as_ref() {
         Some(fence) => Some(fence.public_data_plane.acquire_commit_guard().await),
         None => None,
     };
-    if replay_fence
+    if delta
+        .replay_fence
         .as_ref()
         .is_some_and(|fence| fence.public_data_plane.current_epoch() != fence.epoch)
     {
@@ -74,93 +67,115 @@ pub(super) async fn apply_output_recovery(
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
     // Held through the commit when this record consumes a local proof.
-    let _revision_fence = match hold_expected_poi_corpus_revision(expected_corpus.as_ref()).await {
-        Ok(revision_fence) => revision_fence,
-        Err(stale) => {
-            drop(permit);
-            return Ok(stale);
-        }
-    };
-    let Some(wallet_utxo) = snapshot
-        .iter()
-        .find(|wallet_utxo| expected_output.matches(wallet_utxo))
-    else {
+    let _revision_fence =
+        match hold_expected_poi_corpus_revision(delta.expected_corpus.as_ref()).await {
+            Ok(revision_fence) => revision_fence,
+            Err(stale) => {
+                drop(permit);
+                return Ok(stale);
+            }
+        };
+    let Some(wallet_utxo) = recovery_target_output(&snapshot, &delta) else {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    if !lists_are_active(&active_list_keys, &target_list_keys)
-        || !expected_poi_status_matches(
-            &wallet_utxo.utxo.poi,
-            &target_list_keys,
-            required_poi_status,
-        )
-    {
+    let store = PendingOutputStore {
+        cache_store,
+        cfg,
+        output_commitment: delta.expected_output.output_commitment(),
+    };
+    if !pending_update_is_current(store, wallet_utxo, &delta)? {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-
-    let pending_update = if let Some((expected_pending, update)) = *pending_update {
-        let current = cache_store.get_pending_output_poi_context(
-            cfg.chain.chain_id,
-            &cfg.cache_key,
-            &expected_output.output_commitment(),
-        )?;
-        if !expected_pending_context_matches(&expected_pending, current.as_ref())
-            || !pending_output_poi_context_matches_wallet_utxo(cfg, wallet_utxo, &update)
-        {
-            drop(permit);
-            return Ok(PoiPrivateApplyOutcome::Skipped);
-        }
-        Some(update)
-    } else {
-        None
-    };
-    let current_recovery = cache_store.get_output_poi_recovery(
-        cfg.chain.chain_id,
-        &cfg.cache_key,
-        &expected_output.output_commitment(),
-    )?;
-    let valid_recovery_is_stale_for_subset = current_recovery
-        .as_ref()
-        .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
-        && required_poi_status == ExpectedPoiStatus::Recoverable;
-    if !recovery_matches_source(
-        &expected_recovery,
-        current_recovery.as_ref(),
-        wallet_utxo.utxo.source.tx_hash,
-    ) || (current_recovery
-        .as_ref()
-        .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
-        && !valid_recovery_is_stale_for_subset
-        && !matches!(&action, OutputPoiRecoveryAction::Valid))
-    {
+    let Some(mut recovery) = checked_output_recovery(store, wallet_utxo, &delta)? else {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    let mut recovery = current_recovery.unwrap_or_else(|| {
-        new_output_poi_recovery_record(
-            cfg,
-            wallet_utxo,
-            output_poi_recovery_default_status(&action),
-            now,
-        )
-    });
-    recovery.apply_action(action, now);
-    let pending_updates: Vec<_> = pending_update.into_iter().collect();
+    };
+    recovery.apply_action(delta.action, delta.now);
+    let pending_updates: Vec<_> = (*delta.pending_update)
+        .map(|(_, update)| update)
+        .into_iter()
+        .collect();
     let recovery_updates = [recovery];
     let rows = PoiPrivateRows {
         pending_updates: &pending_updates,
         recovery_updates: &recovery_updates,
         ..PoiPrivateRows::default()
     };
-    let workflow_status = wallet_ppoi_workflow_status_after_mutations(
-        cache_store,
-        cfg,
-        &active_list_keys,
-        permit.ppoi_workflow_status().validation_revision,
-        rows,
-    )?;
+    let workflow_status = store.workflow_after_mutations(&permit, &delta.active_list_keys, rows)?;
     commit_durable_apply(permit, cache_store, rows, workflow_status)
+}
+
+/// The snapshot UTXO of the expected output, when the target lists are active and its POI status
+/// is the required one.
+fn recovery_target_output<'s>(
+    snapshot: &'s [WalletUtxo],
+    delta: &OutputRecoveryDelta,
+) -> Option<&'s WalletUtxo> {
+    let wallet_utxo = snapshot
+        .iter()
+        .find(|wallet_utxo| delta.expected_output.matches(wallet_utxo))?;
+    (lists_are_active(&delta.active_list_keys, &delta.target_list_keys)
+        && expected_poi_status_matches(
+            &wallet_utxo.utxo.poi,
+            &delta.target_list_keys,
+            delta.required_poi_status,
+        ))
+    .then_some(wallet_utxo)
+}
+
+/// Whether the delta's pending update, if any, still replaces the expected stored context and
+/// matches the output's UTXO. The context is read only when there is an update.
+fn pending_update_is_current(
+    store: PendingOutputStore<'_>,
+    wallet_utxo: &WalletUtxo,
+    delta: &OutputRecoveryDelta,
+) -> Result<bool, WalletCacheError> {
+    let Some((expected_pending, update)) = &*delta.pending_update else {
+        return Ok(true);
+    };
+    let current = store.context()?;
+    Ok(
+        expected_pending_context_matches(expected_pending, current.as_ref())
+            && pending_output_poi_context_matches_wallet_utxo(store.cfg, wallet_utxo, update),
+    )
+}
+
+/// The output's stored recovery, or a new one, when the stored recovery is the expected one from
+/// the output's source. A Valid recovery is replaced only by a Valid action, or by a recovery of
+/// a Recoverable subset.
+fn checked_output_recovery(
+    store: PendingOutputStore<'_>,
+    wallet_utxo: &WalletUtxo,
+    delta: &OutputRecoveryDelta,
+) -> Result<Option<OutputPoiRecoveryRecord>, WalletCacheError> {
+    let current_recovery = store.recovery()?;
+    let current_is_valid = current_recovery
+        .as_ref()
+        .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid);
+    let valid_recovery_is_stale_for_subset =
+        current_is_valid && delta.required_poi_status == ExpectedPoiStatus::Recoverable;
+    if !recovery_matches_source(
+        &delta.expected_recovery,
+        current_recovery.as_ref(),
+        wallet_utxo.utxo.source.tx_hash,
+    ) {
+        return Ok(None);
+    }
+    let replaces_valid = valid_recovery_is_stale_for_subset
+        || matches!(&delta.action, OutputPoiRecoveryAction::Valid);
+    if current_is_valid && !replaces_valid {
+        return Ok(None);
+    }
+    Ok(Some(current_recovery.unwrap_or_else(|| {
+        new_output_poi_recovery_record(
+            store.cfg,
+            wallet_utxo,
+            output_poi_recovery_default_status(&delta.action),
+            delta.now,
+        )
+    })))
 }
 
 pub(super) fn apply_pending_submission(
@@ -174,93 +189,40 @@ pub(super) fn apply_pending_submission(
         cfg,
         ..
     } = turn;
-    let PendingSubmissionDelta {
-        subject,
-        expected_context_fingerprint,
-        expected_recovery,
-        active_list_keys,
-        list_keys,
-        predicate,
-        merge_submitted_list_keys,
-        action,
-        now,
-    } = delta;
-    if !lists_are_active(&active_list_keys, &list_keys) {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    let Some(mut current_context) = cache_store.get_pending_output_poi_context(
-        cfg.chain.chain_id,
-        &cfg.cache_key,
-        &subject.output_commitment(),
-    )?
-    else {
+    let store = PendingOutputStore {
+        cache_store,
+        cfg,
+        output_commitment: delta.subject.output_commitment(),
+    };
+    let Some(checked) = check_pending_submission(store, &snapshot, &delta)? else {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     };
-    if pending_output_poi_context_fingerprint(&current_context).as_ref()
-        != Some(&expected_context_fingerprint)
-        || current_context.terminal_error.is_some()
-        || !pending_submission_predicate_matches(&current_context, &list_keys, predicate)
-    {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    let Some(subject_match) =
-        pending_output_poi_subject_matches_snapshot(cfg, &snapshot, &current_context, &subject)
-    else {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    };
-    if subject_match
-        .poi()
-        .is_some_and(|poi| !poi_statuses_are_recoverable_for_lists(poi, &list_keys))
-    {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    let current_recovery = cache_store.get_output_poi_recovery(
-        cfg.chain.chain_id,
-        &cfg.cache_key,
-        &subject.output_commitment(),
-    )?;
-    let Some(observation) = current_context.observation.clone() else {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    };
-    if !recovery_matches_source(
-        &expected_recovery,
-        current_recovery.as_ref(),
-        observation.tx_hash,
-    ) || current_recovery
-        .as_ref()
-        .is_some_and(|record| record.status == OutputPoiRecoveryStatus::Valid)
-    {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    if merge_submitted_list_keys {
-        add_submitted_list_keys(&mut current_context, &list_keys);
+    let CheckedSubmission {
+        mut context,
+        subject_match,
+        recovery,
+        observation,
+    } = checked;
+    if delta.merge_submitted_list_keys {
+        add_submitted_list_keys(&mut context, &delta.list_keys);
         if let Some(poi) = subject_match.poi() {
-            prune_nonrecoverable_unsubmitted_poi_lists(
-                &mut current_context,
-                poi,
-                &active_list_keys,
-            );
+            prune_nonrecoverable_unsubmitted_poi_lists(&mut context, poi, &delta.active_list_keys);
         }
     }
-    let mut recovery = current_recovery.unwrap_or_else(|| {
+    let mut recovery = recovery.unwrap_or_else(|| {
         new_pending_output_poi_recovery_record(
             cfg.chain.chain_id,
-            &current_context,
+            &context,
             &observation,
-            output_poi_recovery_default_status(&action),
-            now,
+            output_poi_recovery_default_status(&delta.action),
+            delta.now,
         )
     });
-    recovery.apply_action(action, now);
-    let pending_updates: Vec<_> = merge_submitted_list_keys
-        .then_some(current_context)
+    recovery.apply_action(delta.action, delta.now);
+    let pending_updates: Vec<_> = delta
+        .merge_submitted_list_keys
+        .then_some(context)
         .into_iter()
         .collect();
     let recovery_updates = [recovery];
@@ -269,14 +231,80 @@ pub(super) fn apply_pending_submission(
         recovery_updates: &recovery_updates,
         ..PoiPrivateRows::default()
     };
-    let workflow_status = wallet_ppoi_workflow_status_after_mutations(
-        cache_store,
-        cfg,
-        &active_list_keys,
-        permit.ppoi_workflow_status().validation_revision,
-        rows,
-    )?;
+    let workflow_status = store.workflow_after_mutations(&permit, &delta.active_list_keys, rows)?;
     commit_durable_apply(permit, cache_store, rows, workflow_status)
+}
+
+/// A stored context, its snapshot match, its recovery and its observation, after a pending
+/// submission's checks.
+struct CheckedSubmission {
+    context: PendingOutputPoiContextRecord,
+    subject_match: PendingOutputPoiSubjectMatch,
+    recovery: Option<OutputPoiRecoveryRecord>,
+    observation: PendingOutputPoiObservation,
+}
+
+fn check_pending_submission(
+    store: PendingOutputStore<'_>,
+    snapshot: &[WalletUtxo],
+    delta: &PendingSubmissionDelta,
+) -> Result<Option<CheckedSubmission>, WalletCacheError> {
+    if !lists_are_active(&delta.active_list_keys, &delta.list_keys) {
+        return Ok(None);
+    }
+    let Some(context) = store.context()? else {
+        return Ok(None);
+    };
+    if !context_accepts_submission(&context, delta) {
+        return Ok(None);
+    }
+    let Some(subject_match) =
+        pending_output_poi_subject_matches_snapshot(store.cfg, snapshot, &context, &delta.subject)
+    else {
+        return Ok(None);
+    };
+    if subject_match
+        .poi()
+        .is_some_and(|poi| !poi_statuses_are_recoverable_for_lists(poi, &delta.list_keys))
+    {
+        return Ok(None);
+    }
+    let recovery = store.recovery()?;
+    let Some(observation) = context.observation.clone() else {
+        return Ok(None);
+    };
+    if !submission_recovery_is_current(&delta.expected_recovery, recovery.as_ref(), &observation) {
+        return Ok(None);
+    }
+    Ok(Some(CheckedSubmission {
+        context,
+        subject_match,
+        recovery,
+        observation,
+    }))
+}
+
+/// Whether the context still has the expected fingerprint, is not terminal and matches the
+/// submission predicate for the delta's lists.
+fn context_accepts_submission(
+    context: &PendingOutputPoiContextRecord,
+    delta: &PendingSubmissionDelta,
+) -> bool {
+    pending_output_poi_context_fingerprint(context).as_ref()
+        == Some(&delta.expected_context_fingerprint)
+        && context.terminal_error.is_none()
+        && pending_submission_predicate_matches(context, &delta.list_keys, delta.predicate)
+}
+
+/// Whether the stored recovery is the expected one from the observed source and is not yet
+/// Valid.
+fn submission_recovery_is_current(
+    expected_recovery: &ExpectedRecordState,
+    recovery: Option<&OutputPoiRecoveryRecord>,
+    observation: &PendingOutputPoiObservation,
+) -> bool {
+    recovery_matches_source(expected_recovery, recovery, observation.tx_hash)
+        && recovery.is_none_or(|record| record.status != OutputPoiRecoveryStatus::Valid)
 }
 
 /// Wallet state a recovered outgoing submission's siblings are checked against.
@@ -463,116 +491,190 @@ pub(super) async fn apply_recovered_outgoing_submission(
         cfg,
         ..
     } = turn;
-    let RecoveredOutgoingSubmissionDelta {
-        siblings,
-        owned_substitutes,
-        external_valid_substitutes,
-        expected_corpus,
-        active_list_keys,
-        list_keys,
-        merge_submitted_list_keys,
-        action,
-        now,
-    } = delta;
-    if siblings.is_empty() || !lists_are_active(&active_list_keys, &list_keys) {
+    if delta.siblings.is_empty() || !lists_are_active(&delta.active_list_keys, &delta.list_keys) {
         drop(permit);
         return Ok(PoiPrivateApplyOutcome::Skipped);
     }
-    let _corpus_fence = match hold_expected_poi_corpus_revision(expected_corpus.as_ref()).await {
-        Ok(fence) => fence,
-        Err(stale) => return Ok(stale),
-    };
-    let planned_union = siblings
-        .iter()
-        .flat_map(|sibling| sibling.plan.list_keys().iter().copied())
-        .collect::<BTreeSet<_>>();
-    if list_keys.iter().copied().collect::<BTreeSet<_>>() != planned_union {
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    let check = RecoveredOutgoingCheck {
+    RecoveredOutgoingSubmission {
         cache_store,
         cfg,
-        snapshot: &snapshot,
-        active_list_keys: &active_list_keys,
-        now,
-    };
-    let Some((current_contexts, current_recoveries)) = check.current_sibling_records(&siblings)?
-    else {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    };
-    let Some(seed) = current_contexts.first() else {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    };
-    let all_contexts =
-        cache_store.list_pending_output_poi_contexts(cfg.chain.chain_id, &cfg.cache_key)?;
-    let Some(current_group) = recovered_outgoing_group_records(&all_contexts, seed) else {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    };
-    let external_valid = if let Some(expected) = &expected_corpus {
-        let outputs = group_blinded_outputs(&current_group);
-        let Some(valid) = saved_poi_compatibility::corpus_valid_outputs_by_list(
-            &expected.corpus,
-            cfg.chain.chain_id,
-            &active_list_keys,
-            &outputs,
-        )
-        .await
+        snapshot,
+        delta,
+    }
+    .validate_and_commit(permit)
+    .await
+}
+
+/// A recovered outgoing submission delta and the wallet state it is checked against.
+struct RecoveredOutgoingSubmission<'a> {
+    cache_store: &'a dyn WalletCacheStore,
+    cfg: &'a WalletConfig,
+    snapshot: Vec<WalletUtxo>,
+    delta: RecoveredOutgoingSubmissionDelta,
+}
+
+impl RecoveredOutgoingSubmission<'_> {
+    /// Validates the siblings and their group under the corpus fence, then commits their rows.
+    /// Each skip keeps its permit release order relative to the fence.
+    async fn validate_and_commit(
+        &self,
+        permit: WalletPrivateMutationPermit<'_>,
+    ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+        let delta = &self.delta;
+        let _corpus_fence =
+            match hold_expected_poi_corpus_revision(delta.expected_corpus.as_ref()).await {
+                Ok(fence) => fence,
+                Err(stale) => return Ok(stale),
+            };
+        if !self.planned_lists_match() {
+            return Ok(PoiPrivateApplyOutcome::Skipped);
+        }
+        let Some((current_contexts, current_recoveries)) =
+            self.check().current_sibling_records(&delta.siblings)?
         else {
+            drop(permit);
             return Ok(PoiPrivateApplyOutcome::Skipped);
         };
-        valid
-    } else {
-        BTreeMap::new()
-    };
-    if !group_requires_unresolved_lists(&current_group, &active_list_keys, &external_valid) {
-        return Ok(PoiPrivateApplyOutcome::Skipped);
-    }
-    let current_evidence =
-        recovered_outgoing_group_evidence(&current_group, &snapshot, &list_keys, &external_valid);
-    if current_group.len() != current_contexts.len()
-        || current_evidence.as_ref().is_none_or(|evidence| {
-            !evidence_matches_substitutes(evidence, &owned_substitutes, &external_valid_substitutes)
-        })
-    {
-        drop(permit);
-        return Ok(PoiPrivateApplyOutcome::Skipped);
+        let Some(seed) = current_contexts.first() else {
+            drop(permit);
+            return Ok(PoiPrivateApplyOutcome::Skipped);
+        };
+        let all_contexts = self
+            .cache_store
+            .list_pending_output_poi_contexts(self.cfg.chain.chain_id, &self.cfg.cache_key)?;
+        let Some(current_group) = recovered_outgoing_group_records(&all_contexts, seed) else {
+            drop(permit);
+            return Ok(PoiPrivateApplyOutcome::Skipped);
+        };
+        let Some(external_valid) = self.unresolved_group_valid(&current_group).await else {
+            return Ok(PoiPrivateApplyOutcome::Skipped);
+        };
+        if !self.group_evidence_matches(&current_group, current_contexts.len(), &external_valid) {
+            drop(permit);
+            return Ok(PoiPrivateApplyOutcome::Skipped);
+        }
+        let (pending_updates, recovery_updates) = self.rows(current_contexts, current_recoveries);
+        let rows = PoiPrivateRows {
+            pending_updates: &pending_updates,
+            recovery_updates: &recovery_updates,
+            ..PoiPrivateRows::default()
+        };
+        let workflow_status = wallet_ppoi_workflow_status_after_mutations(
+            self.cache_store,
+            self.cfg,
+            &delta.active_list_keys,
+            permit.ppoi_workflow_status().validation_revision,
+            rows,
+        )?;
+        commit_durable_apply(permit, self.cache_store, rows, workflow_status)
     }
 
-    let mut pending_updates = Vec::with_capacity(current_contexts.len());
-    let mut recovery_updates = Vec::with_capacity(current_contexts.len());
-    for ((mut context, mut recovery), sibling) in current_contexts
-        .into_iter()
-        .zip(current_recoveries)
-        .zip(&siblings)
-    {
-        let member_lists = list_keys
+    /// Whether the delta's lists are exactly the union of its siblings' planned lists.
+    fn planned_lists_match(&self) -> bool {
+        let planned_union = self
+            .delta
+            .siblings
             .iter()
-            .filter(|list_key| sibling.plan.list_keys.contains(list_key))
-            .collect::<Vec<_>>();
-        if member_lists.is_empty() {
-            continue;
-        }
-        recovery.apply_action(action.clone(), now);
-        recovery_updates.push(recovery);
-        if merge_submitted_list_keys {
-            add_submitted_list_keys(&mut context, member_lists);
-            pending_updates.push(context);
+            .flat_map(|sibling| sibling.plan.list_keys().iter().copied())
+            .collect::<BTreeSet<_>>();
+        self.delta
+            .list_keys
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            == planned_union
+    }
+
+    fn check(&self) -> RecoveredOutgoingCheck<'_> {
+        RecoveredOutgoingCheck {
+            cache_store: self.cache_store,
+            cfg: self.cfg,
+            snapshot: &self.snapshot,
+            active_list_keys: &self.delta.active_list_keys,
+            now: self.delta.now,
         }
     }
-    let rows = PoiPrivateRows {
-        pending_updates: &pending_updates,
-        recovery_updates: &recovery_updates,
-        ..PoiPrivateRows::default()
-    };
-    let workflow_status = wallet_ppoi_workflow_status_after_mutations(
-        cache_store,
-        cfg,
-        &active_list_keys,
-        permit.ppoi_workflow_status().validation_revision,
-        rows,
-    )?;
-    commit_durable_apply(permit, cache_store, rows, workflow_status)
+
+    /// The group's outputs by active list on which they are Valid, when every member still
+    /// requires exactly its unresolved lists; `None` when the corpus read fails or a member does
+    /// not.
+    async fn unresolved_group_valid(
+        &self,
+        group: &[&PendingOutputPoiContextRecord],
+    ) -> Option<BTreeMap<FixedBytes<32>, BTreeSet<FixedBytes<32>>>> {
+        let external_valid = if let Some(expected) = &self.delta.expected_corpus {
+            let outputs = group_blinded_outputs(group);
+            saved_poi_compatibility::corpus_valid_outputs_by_list(
+                &expected.corpus,
+                self.cfg.chain.chain_id,
+                &self.delta.active_list_keys,
+                &outputs,
+            )
+            .await?
+        } else {
+            BTreeMap::new()
+        };
+        group_requires_unresolved_lists(group, &self.delta.active_list_keys, &external_valid)
+            .then_some(external_valid)
+    }
+
+    /// Whether the group has one member per sibling and its current evidence names exactly the
+    /// delta's substitutes.
+    fn group_evidence_matches(
+        &self,
+        group: &[&PendingOutputPoiContextRecord],
+        member_count: usize,
+        external_valid: &BTreeMap<FixedBytes<32>, BTreeSet<FixedBytes<32>>>,
+    ) -> bool {
+        let current_evidence = recovered_outgoing_group_evidence(
+            group,
+            &self.snapshot,
+            &self.delta.list_keys,
+            external_valid,
+        );
+        group.len() == member_count
+            && current_evidence.as_ref().is_some_and(|evidence| {
+                evidence_matches_substitutes(
+                    evidence,
+                    &self.delta.owned_substitutes,
+                    &self.delta.external_valid_substitutes,
+                )
+            })
+    }
+
+    /// The context and recovery updates of each sibling that has lists in the delta, in sibling
+    /// order.
+    fn rows(
+        &self,
+        current_contexts: Vec<PendingOutputPoiContextRecord>,
+        current_recoveries: Vec<OutputPoiRecoveryRecord>,
+    ) -> (
+        Vec<PendingOutputPoiContextRecord>,
+        Vec<OutputPoiRecoveryRecord>,
+    ) {
+        let delta = &self.delta;
+        let mut pending_updates = Vec::with_capacity(current_contexts.len());
+        let mut recovery_updates = Vec::with_capacity(current_contexts.len());
+        for ((mut context, mut recovery), sibling) in current_contexts
+            .into_iter()
+            .zip(current_recoveries)
+            .zip(&delta.siblings)
+        {
+            let member_lists = delta
+                .list_keys
+                .iter()
+                .filter(|list_key| sibling.plan.list_keys.contains(list_key))
+                .collect::<Vec<_>>();
+            if member_lists.is_empty() {
+                continue;
+            }
+            recovery.apply_action(delta.action.clone(), delta.now);
+            recovery_updates.push(recovery);
+            if delta.merge_submitted_list_keys {
+                add_submitted_list_keys(&mut context, member_lists);
+                pending_updates.push(context);
+            }
+        }
+        (pending_updates, recovery_updates)
+    }
 }
