@@ -5,7 +5,7 @@ use super::saved_poi_compatibility::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
-use std::sync::PoisonError;
+use std::sync::{OnceLock, PoisonError};
 
 use crate::SenderTransactionCandidateError;
 use crate::chain::{ChainPublicDataPlaneCommitGuard, PublicTxidDataAuthority};
@@ -681,7 +681,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
         unshield_attempts,
     } = request;
     let output_request = &output_recovery;
-    let mut report = SenderCandidateRecoveryReport {
+    let report = SenderCandidateRecoveryReport {
         expected_candidates: candidates
             .iter()
             .filter_map(|candidate| {
@@ -693,7 +693,7 @@ pub(super) async fn materialize_sender_transaction_candidates(
             .collect(),
         ..SenderCandidateRecoveryReport::default()
     };
-    let mut live_unshields = candidates
+    let live_unshields = candidates
         .iter()
         .flat_map(sender_candidate_unshield_txids)
         .collect::<BTreeSet<_>>();
@@ -715,14 +715,8 @@ pub(super) async fn materialize_sender_transaction_candidates(
         },
         DEFAULT_TXID_VERSION,
     );
-    let mut public_txid_cache_refreshed = None;
     // Built on first qualification: candidates still awaiting public data need no nullifiers.
-    let wallet_nullifier_index = std::sync::OnceLock::new();
-    let wallet_nullifiers = || {
-        wallet_nullifier_index.get_or_init(|| {
-            WalletNullifierIndex::new(output_request.wallet_utxos, &output_request.cfg.scan_keys)
-        })
-    };
+    let wallet_nullifier_index = OnceLock::new();
     // Weighted by unshield count, so that with the per-candidate shuffle the
     // first unshield tried is uniform over every candidate's unshields.
     let candidates = output_request
@@ -730,298 +724,353 @@ pub(super) async fn materialize_sender_transaction_candidates(
         .submission_order(candidates, |candidate| {
             sender_candidate_unshield_txids(candidate).len()
         });
+    let mut scan = SenderCandidateScan {
+        request: output_request,
+        unshield_attempts,
+        report,
+        live_unshields,
+        cache_key,
+        public_txid_cache_refreshed: None,
+        wallet_nullifier_index: &wallet_nullifier_index,
+    };
     for candidate in candidates {
-        let candidate_id = candidate.semantic_id();
-        let output_count = u64::try_from(candidate.outputs.len())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let stored_unshields = sender_candidate_unshield_txids(&candidate);
+        scan.recover(candidate).await;
+    }
+    scan.finish()
+}
+
+/// One sender candidate recovery scan: the request, the report it builds and the caches its
+/// candidates share.
+struct SenderCandidateScan<'r, 'a> {
+    request: &'r OutputPoiRecoveryRequest<'a>,
+    unshield_attempts: &'r SenderUnshieldAttempts,
+    report: SenderCandidateRecoveryReport,
+    live_unshields: BTreeSet<FixedBytes<32>>,
+    cache_key: PublicTxidCacheKey,
+    public_txid_cache_refreshed: Option<bool>,
+    /// Held by reference so candidate work can keep the index across scan mutations.
+    wallet_nullifier_index: &'r OnceLock<WalletNullifierIndex<'a>>,
+}
+
+/// A qualified candidate's public data and unshield state, shared by its recovery paths.
+struct QualifiedSenderRecovery<'w> {
+    candidate_id: FixedBytes<32>,
+    output_count: u64,
+    qualified: &'w [QualifiedSenderTransaction],
+    public_data_fence: &'w SenderCandidatePublicDataFence,
+    data_epoch: PublicDataPlaneEpoch,
+    proof_source_resolution: &'w OutputPoiProofSourceResolution,
+    wallet_nullifiers: &'w WalletNullifierIndex<'w>,
+    stored_unshields: BTreeSet<FixedBytes<32>>,
+    eligible: BTreeSet<FixedBytes<32>>,
+    valid: Option<BTreeSet<FixedBytes<32>>>,
+    /// Unshield TXIDs a replacement candidate keeps.
+    unresolved: BTreeSet<FixedBytes<32>>,
+}
+
+impl<'w> QualifiedSenderRecovery<'w> {
+    fn into_unshield_inputs(
+        self,
+        candidate: SenderTransactionCandidate,
+        cached_proofs: BTreeMap<FixedBytes<32>, (u64, PreTransactionPoiMap)>,
+    ) -> SenderUnshieldInputs<'w> {
+        SenderUnshieldInputs {
+            candidate,
+            eligible: self.eligible,
+            valid: self.valid,
+            qualified: self.qualified,
+            wallet_nullifiers: self.wallet_nullifiers,
+            public_data_fence: self.public_data_fence,
+            proof_source_resolution: self.proof_source_resolution,
+            cached_proofs,
+        }
+    }
+}
+
+impl<'r, 'a> SenderCandidateScan<'r, 'a> {
+    fn wallet_nullifiers(&self) -> &'r WalletNullifierIndex<'a> {
+        let request = self.request;
+        let index: &'r OnceLock<_> = self.wallet_nullifier_index;
+        index
+            .get_or_init(|| WalletNullifierIndex::new(request.wallet_utxos, &request.cfg.scan_keys))
+    }
+
+    /// Qualify one candidate and run the recovery path its state selects.
+    async fn recover(&mut self, candidate: SenderTransactionCandidate) {
         // Outputs already belong to pending-output maintenance; only unshield work remains.
         let handed_off = candidate
             .unshield
             .as_ref()
             .is_some_and(|unshield| unshield.outputs_handed_off);
         let pending_count = if handed_off {
-            u64::try_from(stored_unshields.len()).unwrap_or(u64::MAX)
+            u64::try_from(sender_candidate_unshield_txids(&candidate).len()).unwrap_or(u64::MAX)
         } else {
-            output_count
+            sender_candidate_output_count(&candidate)
         };
         let coverage = if handed_off {
             None
         } else {
-            sender_candidate_coverage(output_request, &candidate).await
+            sender_candidate_coverage(self.request, &candidate).await
         };
-        if output_request.active_list_keys.is_empty() {
-            if let Some(coverage) = coverage {
-                record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
-            } else {
-                report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(pending_count);
-            }
-            continue;
-        }
-        let proof_source_resolution = output_request
-            .resolve_proof_source(output_request.active_list_keys)
+        let Some((proof_source_resolution, qualified)) = self
+            .qualify_or_wait(&candidate, coverage, pending_count)
+            .await
+        else {
+            return;
+        };
+        let work = self
+            .qualified_recovery(&candidate, &proof_source_resolution, &qualified)
             .await;
+        if handed_off {
+            self.process_unshields(work.into_unshield_inputs(candidate, BTreeMap::new()))
+                .await;
+        } else {
+            self.recover_owned_outputs(candidate, coverage, work).await;
+        }
+    }
+
+    /// Resolve the proof source and qualify the candidate from public rows. A candidate that
+    /// cannot qualify yet is counted as covered or waiting.
+    async fn qualify_or_wait(
+        &mut self,
+        candidate: &SenderTransactionCandidate,
+        coverage: Option<SenderCandidateCoverage>,
+        pending_count: u64,
+    ) -> Option<(OutputPoiProofSourceResolution, QualifiedSenderCandidate)> {
+        let request = self.request;
+        if request.active_list_keys.is_empty() {
+            self.record_coverage_or(coverage, |report| {
+                report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(pending_count);
+            });
+            return None;
+        }
+        let proof_source_resolution = request.resolve_proof_source(request.active_list_keys).await;
         if matches!(
             &proof_source_resolution,
             OutputPoiProofSourceResolution::Unavailable
         ) {
-            if let Some(coverage) = coverage {
-                record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
-            } else {
-                log_local_poi_cache_unavailable(output_request.cfg, "sender_candidate_recovery");
+            self.record_coverage_or(coverage, |report| {
+                log_local_poi_cache_unavailable(request.cfg, "sender_candidate_recovery");
                 report.awaiting_poi_data = report.awaiting_poi_data.saturating_add(pending_count);
-            }
-            continue;
+            });
+            return None;
         }
-        let QualifiedSenderCandidate {
-            qualified,
-            public_data_fence,
-            data_epoch,
-        } = match qualify_sender_candidate_from_public_rows(
-            output_request,
-            &candidate,
-            &cache_key,
-            &mut public_txid_cache_refreshed,
+        match qualify_sender_candidate_from_public_rows(
+            request,
+            candidate,
+            &self.cache_key,
+            &mut self.public_txid_cache_refreshed,
         )
         .await
         {
-            Ok(qualified) => qualified,
+            Ok(qualified) => Some((proof_source_resolution, qualified)),
             Err(pending) => {
-                if let Some(coverage) = coverage {
-                    record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
-                } else {
-                    pending.record(&mut report, pending_count);
-                }
-                continue;
+                self.record_coverage_or(coverage, |report| pending.record(report, pending_count));
+                None
             }
-        };
-        let wallet_nullifiers = wallet_nullifiers();
+        }
+    }
+
+    /// Count a covered candidate, or let `uncovered` count one that is still waiting.
+    fn record_coverage_or(
+        &mut self,
+        coverage: Option<SenderCandidateCoverage>,
+        uncovered: impl FnOnce(&mut SenderCandidateRecoveryReport),
+    ) {
+        if let Some(coverage) = coverage {
+            record_covered_sender_candidate(&mut self.report, self.request.cfg, coverage);
+        } else {
+            uncovered(&mut self.report);
+        }
+    }
+
+    /// The qualified candidate's unshield eligibility, with the inputs its recovery paths share.
+    async fn qualified_recovery<'w>(
+        &self,
+        candidate: &SenderTransactionCandidate,
+        proof_source_resolution: &'w OutputPoiProofSourceResolution,
+        qualified: &'w QualifiedSenderCandidate,
+    ) -> QualifiedSenderRecovery<'w>
+    where
+        'r: 'w,
+    {
+        let request = self.request;
+        let wallet_nullifiers = self.wallet_nullifiers();
         let corpus_blocked = corpus_shield_blocked_unshield_inputs(
-            output_request,
-            &proof_source_resolution,
-            &qualified,
+            request,
+            proof_source_resolution,
+            &qualified.qualified,
             wallet_nullifiers,
         )
         .await;
         let eligible = eligible_sender_unshield_txids(
-            &qualified,
+            &qualified.qualified,
             wallet_nullifiers,
-            output_request.active_list_keys,
+            request.active_list_keys,
             &corpus_blocked,
         );
-        let valid =
-            sender_unshield_valid_txids(output_request, &proof_source_resolution, &eligible).await;
-        if handed_off {
-            process_sender_candidate_unshields(
-                output_request,
-                &mut report,
-                unshield_attempts,
-                &mut live_unshields,
-                SenderUnshieldInputs {
-                    candidate,
-                    eligible,
-                    valid,
-                    qualified: &qualified,
-                    wallet_nullifiers,
-                    public_data_fence: &public_data_fence,
-                    proof_source_resolution: &proof_source_resolution,
-                    cached_proofs: BTreeMap::new(),
-                },
-            )
-            .await;
-            continue;
-        }
-        let work = unresolved_sender_unshield_txids(&eligible, &stored_unshields, valid.as_ref());
-        let unshield_inputs = |candidate, valid, cached_proofs| SenderUnshieldInputs {
-            candidate,
-            eligible: eligible.clone(),
-            valid,
-            qualified: &qualified,
+        let valid = sender_unshield_valid_txids(request, proof_source_resolution, &eligible).await;
+        let stored_unshields = sender_candidate_unshield_txids(candidate);
+        let unresolved =
+            unresolved_sender_unshield_txids(&eligible, &stored_unshields, valid.as_ref());
+        QualifiedSenderRecovery {
+            candidate_id: candidate.semantic_id(),
+            output_count: sender_candidate_output_count(candidate),
+            qualified: &qualified.qualified,
+            public_data_fence: &qualified.public_data_fence,
+            data_epoch: qualified.data_epoch,
+            proof_source_resolution,
             wallet_nullifiers,
-            public_data_fence: &public_data_fence,
-            proof_source_resolution: &proof_source_resolution,
-            cached_proofs,
-        };
+            stored_unshields,
+            eligible,
+            valid,
+            unresolved,
+        }
+    }
 
+    /// Recover a candidate that still owns its outputs: skip a covered one, otherwise retire,
+    /// update or materialize it.
+    async fn recover_owned_outputs(
+        &mut self,
+        candidate: SenderTransactionCandidate,
+        coverage: Option<SenderCandidateCoverage>,
+        work: QualifiedSenderRecovery<'_>,
+    ) {
         if let Some(coverage) = coverage {
-            record_covered_sender_candidate(&mut report, output_request.cfg, coverage);
-            if !eligible.is_empty() || !stored_unshields.is_empty() {
-                process_sender_candidate_unshields(
-                    output_request,
-                    &mut report,
-                    unshield_attempts,
-                    &mut live_unshields,
-                    unshield_inputs(candidate, valid, BTreeMap::new()),
-                )
-                .await;
+            record_covered_sender_candidate(&mut self.report, self.request.cfg, coverage);
+            if !work.eligible.is_empty() || !work.stored_unshields.is_empty() {
+                self.process_unshields(work.into_unshield_inputs(candidate, BTreeMap::new()))
+                    .await;
             }
-            continue;
-        }
-
-        if let Some(corpus) = locally_valid_sender_candidate(output_request, &candidate).await {
-            // Retiring needs proof that no eligible unshield is unresolved.
-            if !eligible.is_empty() && valid.is_none() {
-                report.retrying = report.retrying.saturating_add(1);
-                continue;
-            }
-            let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work) else {
-                report.needs_attention = report.needs_attention.saturating_add(output_count);
-                continue;
-            };
-            let apply_result = apply_poi_private_delta(
-                output_request.authority,
-                output_request.db,
-                output_request.cache_store,
-                output_request.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateLocallyValid(
-                    SenderCandidateLocallyValidDelta {
-                        expected_candidate: candidate,
-                        corpus,
-                        public_data_fence: public_data_fence.clone(),
-                        unshield: replacement
-                            .as_ref()
-                            .and_then(|replacement| replacement.unshield.clone()),
-                    },
-                ),
-            )
-            .await;
-            match apply_result {
-                Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
-                    if let Some(replacement) = replacement {
-                        track_sender_candidate(&mut report, &replacement);
-                        process_sender_candidate_unshields(
-                            output_request,
-                            &mut report,
-                            unshield_attempts,
-                            &mut live_unshields,
-                            unshield_inputs(replacement, valid, BTreeMap::new()),
-                        )
-                        .await;
-                    } else {
-                        report.retired_locally_valid =
-                            report.retired_locally_valid.saturating_add(1);
-                        report.expected_candidates.remove(&candidate_id);
-                    }
-                }
-                Ok(
-                    PoiPrivateApplyOutcome::Skipped
-                    | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
-                ) => {}
-                Err(_) => {
-                    report.needs_attention = report.needs_attention.saturating_add(output_count);
-                }
-            }
-            continue;
-        }
-
-        if qualified
+        } else if let Some(corpus) = locally_valid_sender_candidate(self.request, &candidate).await
+        {
+            self.retire_locally_valid(candidate, corpus, work).await;
+        } else if work
+            .qualified
             .iter()
             .all(|transaction| transaction.outputs.is_empty())
         {
-            let eligible_count = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
-            if !eligible.is_empty() && valid.is_none() {
-                report.retrying = report.retrying.saturating_add(eligible_count);
-                continue;
-            }
-            // No replacement retires the candidate: a blocked refund or an already-valid unshield.
-            let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work) else {
-                report.needs_attention = report.needs_attention.saturating_add(output_count);
-                continue;
-            };
-            let apply_result = apply_poi_private_delta(
-                output_request.authority,
-                output_request.db,
-                output_request.cache_store,
-                output_request.cfg,
-                OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate(
-                    SenderCandidateUnshieldUpdateDelta {
-                        expected_candidate: candidate,
-                        public_data_fence: public_data_fence.clone(),
-                        replacement: replacement.clone(),
-                    },
-                ),
-            )
-            .await;
-            match apply_result {
-                Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
-                    if let Some(replacement) = replacement {
-                        track_sender_candidate(&mut report, &replacement);
-                        process_sender_candidate_unshields(
-                            output_request,
-                            &mut report,
-                            unshield_attempts,
-                            &mut live_unshields,
-                            unshield_inputs(replacement, valid, BTreeMap::new()),
-                        )
-                        .await;
-                    } else {
-                        report.expected_candidates.remove(&candidate_id);
-                    }
-                }
-                Ok(
-                    PoiPrivateApplyOutcome::Skipped
-                    | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
-                ) => {}
-                Err(_) => {
-                    report.needs_attention =
-                        report.needs_attention.saturating_add(eligible_count.max(1));
-                }
-            }
-            continue;
+            self.update_unshield_only(candidate, work).await;
+        } else {
+            self.materialize(candidate, work).await;
         }
+    }
 
-        let Some(spending_public_key) = output_request.cfg.spending_public_key else {
-            report.retrying = report.retrying.saturating_add(output_count);
-            continue;
+    /// Retire a candidate whose outputs are already Valid locally; a replacement keeps its
+    /// unresolved unshield work.
+    async fn retire_locally_valid(
+        &mut self,
+        candidate: SenderTransactionCandidate,
+        corpus: PublicPoiCorpusHandle,
+        work: QualifiedSenderRecovery<'_>,
+    ) {
+        // Retiring needs proof that no eligible unshield is unresolved.
+        if !work.eligible.is_empty() && work.valid.is_none() {
+            self.report.retrying = self.report.retrying.saturating_add(1);
+            return;
+        }
+        let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work.unresolved)
+        else {
+            self.report.needs_attention = self
+                .report
+                .needs_attention
+                .saturating_add(work.output_count);
+            return;
         };
-        let Some(prover) = output_request.cfg.poi_recovery_prover.as_ref() else {
-            report.retrying = report.retrying.saturating_add(output_count);
-            continue;
-        };
-        let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work) else {
-            report.needs_attention = report.needs_attention.saturating_add(output_count);
-            continue;
-        };
-        let prepared = match prepare_sender_candidate_materialization(
-            output_request,
-            &candidate,
-            &qualified,
-            spending_public_key,
-            prover,
-            &proof_source_resolution,
-            &work,
-        )
-        .await
-        {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => continue,
-            Err(failure) => {
-                warn!(
-                    chain_id = output_request.cfg.chain.chain_id,
-                    status = ?failure.status,
-                    retryable = failure.retry_after.is_some(),
-                    failure_category = failure.category,
-                    "sender candidate recovery preparation failed"
-                );
-                if failure.retry_after.is_some() {
-                    report.retrying = report.retrying.saturating_add(output_count);
-                } else {
-                    report.needs_attention = report.needs_attention.saturating_add(output_count);
+        let apply_result = self
+            .apply_delta(OwnedPoiPrivateDelta::SenderCandidateLocallyValid(
+                SenderCandidateLocallyValidDelta {
+                    expected_candidate: candidate,
+                    corpus,
+                    public_data_fence: work.public_data_fence.clone(),
+                    unshield: replacement
+                        .as_ref()
+                        .and_then(|replacement| replacement.unshield.clone()),
+                },
+            ))
+            .await;
+        match apply_result {
+            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                if replacement.is_none() {
+                    self.report.retired_locally_valid =
+                        self.report.retired_locally_valid.saturating_add(1);
                 }
-                continue;
+                self.finish_applied(replacement, work, BTreeMap::new())
+                    .await;
             }
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => {}
+            Err(_) => {
+                self.report.needs_attention = self
+                    .report
+                    .needs_attention
+                    .saturating_add(work.output_count);
+            }
+        }
+    }
+
+    /// Update a candidate whose qualified transactions have no outputs left, so only its
+    /// unshield work remains.
+    async fn update_unshield_only(
+        &mut self,
+        candidate: SenderTransactionCandidate,
+        work: QualifiedSenderRecovery<'_>,
+    ) {
+        let eligible_count = u64::try_from(work.eligible.len()).unwrap_or(u64::MAX);
+        if !work.eligible.is_empty() && work.valid.is_none() {
+            self.report.retrying = self.report.retrying.saturating_add(eligible_count);
+            return;
+        }
+        // No replacement retires the candidate: a blocked refund or an already-valid unshield.
+        let Ok(replacement) = sender_candidate_with_unshield_work(&candidate, &work.unresolved)
+        else {
+            self.report.needs_attention = self
+                .report
+                .needs_attention
+                .saturating_add(work.output_count);
+            return;
         };
-        if output_request.public_data_plane.current_epoch() != data_epoch
-            || !sender_candidate_still_current(
-                output_request.authority,
-                output_request.cache_store,
-                output_request.cfg,
-                &candidate,
-            )
-            .await
-        {
-            continue;
+        let apply_result = self
+            .apply_delta(OwnedPoiPrivateDelta::SenderCandidateUnshieldUpdate(
+                SenderCandidateUnshieldUpdateDelta {
+                    expected_candidate: candidate,
+                    public_data_fence: work.public_data_fence.clone(),
+                    replacement: replacement.clone(),
+                },
+            ))
+            .await;
+        match apply_result {
+            Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
+                self.finish_applied(replacement, work, BTreeMap::new())
+                    .await;
+            }
+            Ok(
+                PoiPrivateApplyOutcome::Skipped
+                | PoiPrivateApplyOutcome::SkippedStaleCorpusRevision,
+            ) => {}
+            Err(_) => {
+                self.report.needs_attention = self
+                    .report
+                    .needs_attention
+                    .saturating_add(eligible_count.max(1));
+            }
+        }
+    }
+
+    /// Prove and persist the candidate's outputs, then continue any replacement's unshield work.
+    async fn materialize(
+        &mut self,
+        candidate: SenderTransactionCandidate,
+        work: QualifiedSenderRecovery<'_>,
+    ) {
+        let Some((replacement, prepared)) = self.prepare_materialization(&candidate, &work).await
+        else {
+            return;
+        };
+        if !self.still_current(&candidate, work.data_epoch).await {
+            return;
         }
         let PreparedSenderCandidateMaterialization {
             pending_updates,
@@ -1037,16 +1086,12 @@ pub(super) async fn materialize_sender_transaction_candidates(
             .iter()
             .map(|(context, _)| context.output_commitment)
             .collect::<Vec<_>>();
-        let apply_result = apply_poi_private_delta(
-            output_request.authority,
-            output_request.db,
-            output_request.cache_store,
-            output_request.cfg,
-            OwnedPoiPrivateDelta::SenderCandidateMaterialization(
+        let apply_result = self
+            .apply_delta(OwnedPoiPrivateDelta::SenderCandidateMaterialization(
                 SenderCandidateMaterializationDelta {
                     expected_candidate: candidate,
-                    public_data_fence: public_data_fence.clone(),
-                    active_list_keys: output_request.active_list_keys.to_vec(),
+                    public_data_fence: work.public_data_fence.clone(),
+                    active_list_keys: self.request.active_list_keys.to_vec(),
                     pending_updates,
                     recovery_updates,
                     owned_substitutes,
@@ -1058,54 +1103,187 @@ pub(super) async fn materialize_sender_transaction_candidates(
                         .as_ref()
                         .and_then(|replacement| replacement.unshield.clone()),
                 },
-            ),
-        )
-        .await;
+            ))
+            .await;
         match apply_result {
             Ok(PoiPrivateApplyOutcome::Applied { .. }) => {
-                report.materialized = report.materialized.saturating_add(1);
-                report
+                self.report.materialized = self.report.materialized.saturating_add(1);
+                self.report
                     .satisfied_pending_contexts
                     .extend(satisfied_pending_contexts);
-                if let Some(replacement) = replacement {
-                    track_sender_candidate(&mut report, &replacement);
-                    process_sender_candidate_unshields(
-                        output_request,
-                        &mut report,
-                        unshield_attempts,
-                        &mut live_unshields,
-                        unshield_inputs(replacement, valid, unshield_proofs),
-                    )
+                self.finish_applied(replacement, work, unshield_proofs)
                     .await;
-                } else {
-                    report.expected_candidates.remove(&candidate_id);
-                }
             }
             Ok(PoiPrivateApplyOutcome::SkippedStaleCorpusRevision) => {
-                report.stale_revision_skips = report.stale_revision_skips.saturating_add(1);
-                report.retrying = report.retrying.saturating_add(output_count);
+                self.report.stale_revision_skips =
+                    self.report.stale_revision_skips.saturating_add(1);
+                self.report.retrying = self.report.retrying.saturating_add(work.output_count);
             }
             Ok(PoiPrivateApplyOutcome::Skipped) => {}
-            Err(_) => report.needs_attention = report.needs_attention.saturating_add(output_count),
+            Err(_) => {
+                self.report.needs_attention = self
+                    .report
+                    .needs_attention
+                    .saturating_add(work.output_count);
+            }
         }
     }
-    unshield_attempts.retain(&live_unshields);
-    debug!(
-        chain_id = output_request.cfg.chain.chain_id,
-        materialized = report.materialized,
-        retired_locally_valid = report.retired_locally_valid,
-        awaiting_public_txid_data = report.awaiting_public_txid_data,
-        awaiting_poi_data = report.awaiting_poi_data,
-        retrying = report.retrying,
-        needs_attention = report.needs_attention,
-        covered_by_pending_contexts = report.covered_by_pending_contexts,
-        stale_revision_skips = report.stale_revision_skips,
-        unshield_awaiting_validation = report.unshield_awaiting_validation,
-        unshields_validated = report.unshields_validated,
-        expected_candidates = report.expected_candidates.len(),
-        "sender candidate recovery scan complete"
-    );
-    report
+
+    /// The replacement candidate and the prepared materialization, or `None` after counting a
+    /// candidate that cannot be prepared now.
+    async fn prepare_materialization(
+        &mut self,
+        candidate: &SenderTransactionCandidate,
+        work: &QualifiedSenderRecovery<'_>,
+    ) -> Option<(
+        Option<SenderTransactionCandidate>,
+        PreparedSenderCandidateMaterialization,
+    )> {
+        let request = self.request;
+        let Some(spending_public_key) = request.cfg.spending_public_key else {
+            self.report.retrying = self.report.retrying.saturating_add(work.output_count);
+            return None;
+        };
+        let Some(prover) = request.cfg.poi_recovery_prover.as_ref() else {
+            self.report.retrying = self.report.retrying.saturating_add(work.output_count);
+            return None;
+        };
+        let Ok(replacement) = sender_candidate_with_unshield_work(candidate, &work.unresolved)
+        else {
+            self.report.needs_attention = self
+                .report
+                .needs_attention
+                .saturating_add(work.output_count);
+            return None;
+        };
+        match prepare_sender_candidate_materialization(
+            request,
+            candidate,
+            work.qualified,
+            spending_public_key,
+            prover,
+            work.proof_source_resolution,
+            &work.unresolved,
+        )
+        .await
+        {
+            Ok(Some(prepared)) => Some((replacement, prepared)),
+            Ok(None) => None,
+            Err(failure) => {
+                warn!(
+                    chain_id = request.cfg.chain.chain_id,
+                    status = ?failure.status,
+                    retryable = failure.retry_after.is_some(),
+                    failure_category = failure.category,
+                    "sender candidate recovery preparation failed"
+                );
+                if failure.retry_after.is_some() {
+                    self.report.retrying = self.report.retrying.saturating_add(work.output_count);
+                } else {
+                    self.report.needs_attention = self
+                        .report
+                        .needs_attention
+                        .saturating_add(work.output_count);
+                }
+                None
+            }
+        }
+    }
+
+    /// Whether the public data and the stored candidate are still the ones preparation used.
+    async fn still_current(
+        &self,
+        candidate: &SenderTransactionCandidate,
+        data_epoch: PublicDataPlaneEpoch,
+    ) -> bool {
+        let request = self.request;
+        request.public_data_plane.current_epoch() == data_epoch
+            && sender_candidate_still_current(
+                request.authority,
+                request.cache_store,
+                request.cfg,
+                candidate,
+            )
+            .await
+    }
+
+    async fn apply_delta(
+        &self,
+        delta: OwnedPoiPrivateDelta,
+    ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
+        let request = self.request;
+        apply_poi_private_delta(
+            request.authority,
+            request.db,
+            request.cache_store,
+            request.cfg,
+            delta,
+        )
+        .await
+    }
+
+    async fn process_unshields(&mut self, inputs: SenderUnshieldInputs<'_>) {
+        process_sender_candidate_unshields(
+            self.request,
+            &mut self.report,
+            self.unshield_attempts,
+            &mut self.live_unshields,
+            inputs,
+        )
+        .await;
+    }
+
+    /// After an applied update, track the replacement and continue its unshield work, or drop
+    /// the retired candidate from the expected set.
+    async fn finish_applied(
+        &mut self,
+        replacement: Option<SenderTransactionCandidate>,
+        work: QualifiedSenderRecovery<'_>,
+        cached_proofs: BTreeMap<FixedBytes<32>, (u64, PreTransactionPoiMap)>,
+    ) {
+        if let Some(replacement) = replacement {
+            track_sender_candidate(&mut self.report, &replacement);
+            self.process_unshields(work.into_unshield_inputs(replacement, cached_proofs))
+                .await;
+        } else {
+            self.report.expected_candidates.remove(&work.candidate_id);
+        }
+    }
+
+    /// Drop attempts for unshields no candidate still carries, and return the report.
+    fn finish(self) -> SenderCandidateRecoveryReport {
+        let Self {
+            request,
+            unshield_attempts,
+            report,
+            live_unshields,
+            ..
+        } = self;
+        unshield_attempts.retain(&live_unshields);
+        debug!(
+            chain_id = request.cfg.chain.chain_id,
+            materialized = report.materialized,
+            retired_locally_valid = report.retired_locally_valid,
+            awaiting_public_txid_data = report.awaiting_public_txid_data,
+            awaiting_poi_data = report.awaiting_poi_data,
+            retrying = report.retrying,
+            needs_attention = report.needs_attention,
+            covered_by_pending_contexts = report.covered_by_pending_contexts,
+            stale_revision_skips = report.stale_revision_skips,
+            unshield_awaiting_validation = report.unshield_awaiting_validation,
+            unshields_validated = report.unshields_validated,
+            expected_candidates = report.expected_candidates.len(),
+            "sender candidate recovery scan complete"
+        );
+        report
+    }
+}
+
+/// The candidate's output count for report counters, at least one.
+fn sender_candidate_output_count(candidate: &SenderTransactionCandidate) -> u64 {
+    u64::try_from(candidate.outputs.len())
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 fn record_covered_sender_candidate(
