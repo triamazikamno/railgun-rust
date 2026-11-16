@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::wallet::saved_poi_compatibility::saved_pending_context_is_compatible;
+use crate::wallet::saved_poi_compatibility::{
+    corpus_valid_blinded_commitments, saved_pending_context_is_compatible,
+};
 use crate::wallet::{
     BlindedCommitmentData, DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, FixedBytes, Note,
     OutputPoiRecoveryRequest, PendingOutputPoiContextRecord, PoiStatus, PoiStatusReader,
@@ -221,15 +223,16 @@ async fn locally_valid_sender_candidate_outputs(
     request: &OutputPoiRecoveryRequest<'_>,
     candidate: &SenderTransactionCandidate,
 ) -> BTreeSet<FixedBytes<32>> {
-    if !request.poi_runtime.is_indexed_artifacts()
-        || request.active_list_keys.is_empty()
-        || !request
-            .public_data_plane
-            .poi_corpus_ready_for_lists(
-                PublicPoiCorpusKey::wallet_default(request.cfg.chain.chain_id),
-                request.active_list_keys,
-            )
-            .await
+    if !request.poi_runtime.is_indexed_artifacts() || request.active_list_keys.is_empty() {
+        return BTreeSet::new();
+    }
+    if !request
+        .public_data_plane
+        .poi_corpus_ready_for_lists(
+            PublicPoiCorpusKey::wallet_default(request.cfg.chain.chain_id),
+            request.active_list_keys,
+        )
+        .await
     {
         return BTreeSet::new();
     }
@@ -262,38 +265,20 @@ async fn locally_valid_sender_candidate_outputs(
         return BTreeSet::new();
     };
     let _revision_fence = corpus.revision_read_fence().await;
-    let Ok(statuses) = corpus
-        .status_reader()
-        .pois_per_list(
-            DEFAULT_TXID_VERSION,
-            EVM_CHAIN_TYPE,
-            request.cfg.chain.chain_id,
-            request.active_list_keys,
-            &output_data,
-        )
-        .await
-    else {
-        return BTreeSet::new();
-    };
-    output_data
-        .iter()
-        .filter(|data| {
-            statuses
-                .get(&data.blinded_commitment)
-                .is_some_and(|per_list| {
-                    request
-                        .active_list_keys
-                        .iter()
-                        .all(|list_key| per_list.get(list_key) == Some(&PoiStatus::Valid))
-                })
-        })
-        .map(|data| data.blinded_commitment)
-        .collect()
+    corpus_valid_blinded_commitments(
+        &corpus,
+        request.cfg.chain.chain_id,
+        request.active_list_keys,
+        &output_data,
+    )
+    .await
+    .unwrap_or_default()
 }
 
+/// Whether `context` covers the candidate's `output`: compatible with the active lists, not
+/// terminal, for the candidate's chain and wallet, observed at the output in the candidate's
+/// source transaction, and holding a proof on every active list.
 pub(super) fn pending_context_covers_sender_output(
-    chain_id: u64,
-    wallet_id: &str,
     candidate: &SenderTransactionCandidate,
     output: &crate::SenderTransactionCandidateOutput,
     active_list_keys: &[FixedBytes<32>],
@@ -301,10 +286,18 @@ pub(super) fn pending_context_covers_sender_output(
 ) -> bool {
     if !saved_pending_context_is_compatible(context, active_list_keys)
         || context.terminal_error.is_some()
-        || context.chain_id != chain_id
-        || context.wallet_id != wallet_id
-        || context.output_commitment != output.commitment
     {
+        return false;
+    }
+    if (
+        context.chain_id,
+        context.wallet_id.as_str(),
+        context.output_commitment,
+    ) != (
+        candidate.chain_id,
+        candidate.wallet_id.as_str(),
+        output.commitment,
+    ) {
         return false;
     }
     let Some(note) = output.note.as_ref() else {
@@ -316,18 +309,33 @@ pub(super) fn pending_context_covers_sender_output(
     let Some(observation) = context.observation.as_ref() else {
         return false;
     };
-    observation.output_tree == u64::from(output.tree)
-        && observation.output_position == output.position
-        && observation.tx_hash == candidate.source.tx_hash
-        && observation.block_number == candidate.source.block_number
-        && observation.block_timestamp == candidate.source.block_timestamp
-        && active_list_keys.iter().all(|list_key| {
-            context.list_keys().contains(list_key)
-                && context
-                    .pre_transaction_pois_per_txid_leaf_per_list
-                    .get(list_key)
-                    .is_some_and(|pois| !pois.is_empty())
-        })
+    (
+        observation.output_tree,
+        observation.output_position,
+        observation.tx_hash,
+        observation.block_number,
+        observation.block_timestamp,
+    ) == (
+        u64::from(output.tree),
+        output.position,
+        candidate.source.tx_hash,
+        candidate.source.block_number,
+        candidate.source.block_timestamp,
+    ) && pending_context_has_list_proofs(context, active_list_keys)
+}
+
+/// Whether `context` names every active list and holds a proof for each.
+fn pending_context_has_list_proofs(
+    context: &PendingOutputPoiContextRecord,
+    active_list_keys: &[FixedBytes<32>],
+) -> bool {
+    active_list_keys.iter().all(|list_key| {
+        context.list_keys().contains(list_key)
+            && context
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .get(list_key)
+                .is_some_and(|pois| !pois.is_empty())
+    })
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -365,13 +373,16 @@ pub(super) async fn sender_candidate_coverage(
             &request.cfg.scan_keys,
         )
         .is_none()
-        || !sender_candidate_still_current(
-            request.authority,
-            request.cache_store,
-            request.cfg,
-            candidate,
-        )
-        .await
+    {
+        return None;
+    }
+    if !sender_candidate_still_current(
+        request.authority,
+        request.cache_store,
+        request.cfg,
+        candidate,
+    )
+    .await
     {
         return None;
     }
@@ -404,8 +415,6 @@ pub(super) async fn sender_candidate_coverage(
             .flatten()
             .is_some_and(|context| {
                 pending_context_covers_sender_output(
-                    request.cfg.chain.chain_id,
-                    request.cfg.cache_key.as_str(),
                     candidate,
                     output,
                     request.active_list_keys,

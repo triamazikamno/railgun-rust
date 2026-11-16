@@ -453,8 +453,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
     };
 
     assert!(pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
@@ -472,8 +470,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
         BTreeMap::from([(FixedBytes::from([0x88; 32]), old_proof)]),
     )]);
     assert!(!pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
@@ -482,8 +478,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
     context.pre_transaction_pois_per_txid_leaf_per_list = current_material;
     context.observation.as_mut().expect("observation").tx_hash = FixedBytes::from([0xaa; 32]);
     assert!(!pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
@@ -496,8 +490,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
         .expect("observation")
         .block_number += 1;
     assert!(!pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
@@ -510,8 +502,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
         .block_number = candidate.source.block_number;
     context.output_npk = FixedBytes::from([0x99; 32]);
     assert!(!pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
@@ -520,8 +510,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
     context.output_npk = FixedBytes::from(note.npk.to_be_bytes::<32>());
     context.observation = None;
     assert!(!pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
@@ -536,8 +524,6 @@ fn pending_context_coverage_requires_current_observation_and_retained_pois() {
     });
     context.pre_transaction_pois_per_txid_leaf_per_list.clear();
     assert!(!pending_context_covers_sender_output(
-        candidate.chain_id,
-        candidate.wallet_id.as_str(),
         &candidate,
         output,
         &[list_key],
