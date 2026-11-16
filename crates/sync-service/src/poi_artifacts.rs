@@ -1897,16 +1897,16 @@ pub(crate) fn persist_prepared_corpus(
             updated_at: 0,
         }
     };
-    persist_corpus_record_monotonic(
+    CorpusRebase {
         db,
-        PreparedPoiCorpus::new(record, cache)?,
-        Some(publication.publisher_pubkey),
+        publisher_pubkey: Some(publication.publisher_pubkey),
         expected_base,
-        starting_head.as_ref(),
-        cache_generation,
-        Some((publication.publisher_pubkey, publication.sequence)),
-        Some(publication.manifest_body_hash),
-    )
+        starting_head: starting_head.as_ref(),
+        expected_generation: cache_generation,
+        expected_publisher: Some((publication.publisher_pubkey, publication.sequence)),
+        expected_manifest_hash: Some(publication.manifest_body_hash),
+    }
+    .persist_monotonic(PreparedPoiCorpus::new(record, cache)?)
 }
 
 const fn expected_base_current_root(expected: ExpectedPoiCorpusBase) -> Option<FixedBytes<32>> {
@@ -2325,183 +2325,272 @@ fn encode_blocked_shields_snapshot(
     Ok(payload)
 }
 
-fn persist_corpus_record_monotonic(
-    db: &DbStore,
-    prepared: PreparedPoiCorpus,
+/// The durable journal state a corpus base rebase must find, and what its commit checks.
+struct CorpusRebase<'a> {
+    db: &'a DbStore,
     publisher_pubkey: Option<FixedBytes<32>>,
     expected_base: ExpectedPoiCorpusBase,
-    starting_head: Option<&PoiCorpusJournalHeadRecord>,
+    starting_head: Option<&'a PoiCorpusJournalHeadRecord>,
     expected_generation: u64,
     expected_publisher: Option<(FixedBytes<32>, u64)>,
     expected_manifest_hash: Option<FixedBytes<32>>,
-) -> Result<PersistCorpusResult, PoiArtifactError> {
-    let PreparedPoiCorpus {
-        record: mut candidate,
-        cache: candidate_cache,
-        serialization_elapsed,
-    } = prepared;
-    let candidate_identity = PoiCacheIdentity::new(
+}
+
+/// The durable corpus a rebase replaces and the journal state its commit expects.
+struct RebaseBase {
+    existing: Option<PersistedPoiArtifactCache>,
+    state: ExpectedPoiCorpusJournalState,
+}
+
+impl CorpusRebase<'_> {
+    /// Rebases the durable journal onto `prepared` when the durable corpus is
+    /// still the expected base and the candidate does not move backward.
+    fn persist_monotonic(
+        &self,
+        prepared: PreparedPoiCorpus,
+    ) -> Result<PersistCorpusResult, PoiArtifactError> {
+        let PreparedPoiCorpus {
+            record: mut candidate,
+            cache: candidate_cache,
+            serialization_elapsed,
+        } = prepared;
+        let candidate_identity = matching_cache_identity(&candidate, &candidate_cache)?;
+        let prepared_validation_started = Instant::now();
+        validate_materialized_corpus_payload(&candidate, &candidate_cache)?;
+        let prepared_validation_elapsed = prepared_validation_started.elapsed();
+        let existing_validation_started = Instant::now();
+        let Some(RebaseBase { existing, state }) =
+            self.inspect_base(&candidate, &candidate_identity, &candidate_cache)?
+        else {
+            return Ok(PersistCorpusResult::Stale);
+        };
+        if let Some(existing) = existing {
+            let Some(continued) = continue_from_existing(candidate, &candidate_cache, existing)?
+            else {
+                return Ok(PersistCorpusResult::Stale);
+            };
+            candidate = continued;
+        }
+        let existing_validation_elapsed = existing_validation_started.elapsed();
+        let final_validation_started = Instant::now();
+        validate_materialized_corpus(&candidate, &candidate_cache, self.publisher_pubkey)?;
+        let final_validation_elapsed = final_validation_started.elapsed();
+        let source = candidate.source;
+        let chain_id = candidate.chain_id;
+        let current_tip_index = candidate.current_tip_index;
+        let payload_bytes = candidate.cache_payload.len();
+        let transaction_started = Instant::now();
+        let outcome = self.db.rebase_poi_corpus_journal_if_current(
+            candidate,
+            candidate_cache.progress().next_event_index,
+            candidate_cache.progress().next_leaf_index,
+            PoiCorpusJournalCommitCondition {
+                expected_generation: self.expected_generation,
+                expected_publisher: self.expected_publisher,
+                expected_manifest_hash: self.expected_manifest_hash,
+                expected_state: state,
+            },
+        )?;
+        let transaction_elapsed = transaction_started.elapsed();
+        let (journal_revision, retired_delta_count, retired_delta_payload_bytes) =
+            applied_rebase_stats(&outcome);
+        debug!(
+            ?source,
+            chain_id,
+            current_tip_index,
+            payload_bytes,
+            ?journal_revision,
+            ?retired_delta_count,
+            ?retired_delta_payload_bytes,
+            serialization_elapsed_ms = serialization_elapsed.as_millis(),
+            prepared_validation_elapsed_ms = prepared_validation_elapsed.as_millis(),
+            existing_validation_elapsed_ms = existing_validation_elapsed.as_millis(),
+            final_validation_elapsed_ms = final_validation_elapsed.as_millis(),
+            transaction_elapsed_ms = transaction_elapsed.as_millis(),
+            "PPOI corpus base rebase stages complete"
+        );
+        self.commit_result(outcome, candidate_cache)
+    }
+
+    /// The durable corpus the rebase replaces, or `None` when it is no longer
+    /// the expected base. A corrupt journal is replaced only when it is safe to.
+    fn inspect_base(
+        &self,
+        candidate: &PoiArtifactCacheRecord,
+        identity: &PoiCacheIdentity,
+        cache: &PoiCache,
+    ) -> Result<Option<RebaseBase>, PoiArtifactError> {
+        let base = match inspect_persisted_cache_with_publisher(
+            self.db,
+            identity,
+            self.publisher_pubkey,
+        )? {
+            PersistedPoiCorpusInspection::Missing => {
+                if self.expected_base != ExpectedPoiCorpusBase::NoValidCorpus {
+                    return Ok(None);
+                }
+                RebaseBase {
+                    existing: None,
+                    state: ExpectedPoiCorpusJournalState::NoValidBase,
+                }
+            }
+            PersistedPoiCorpusInspection::Valid(existing) => {
+                let observed = existing.expected_base();
+                if observed != self.expected_base {
+                    return Ok(None);
+                }
+                RebaseBase {
+                    existing: Some(*existing),
+                    state: observed.into_db_state(),
+                }
+            }
+            PersistedPoiCorpusInspection::Corrupt {
+                replacement_token,
+                error,
+            } => {
+                if !self.corrupt_journal_repairable(replacement_token, identity, cache)? {
+                    return Ok(None);
+                }
+                warn!(?error, key = %candidate.key(), "replacing corrupt durable PPOI corpus journal");
+                RebaseBase {
+                    existing: None,
+                    state: ExpectedPoiCorpusJournalState::Corrupt { replacement_token },
+                }
+            }
+        };
+        Ok(Some(base))
+    }
+
+    fn corrupt_journal_repairable(
+        &self,
+        replacement_token: PoiCorpusJournalCorruptionToken,
+        identity: &PoiCacheIdentity,
+        cache: &PoiCache,
+    ) -> Result<bool, PoiArtifactError> {
+        match self.expected_base {
+            ExpectedPoiCorpusBase::Corrupt {
+                replacement_token: expected_token,
+            } => Ok(self.starting_head.is_none() && expected_token == replacement_token),
+            _ => artifact_candidate_can_repair_corrupt_journal(
+                self.db,
+                identity,
+                cache,
+                self.expected_base,
+                self.starting_head,
+                self.expected_generation,
+            ),
+        }
+    }
+
+    /// Maps the rebase commit outcome to the persist result.
+    fn commit_result(
+        &self,
+        outcome: PoiCorpusJournalCommitOutcome,
+        cache: PoiCache,
+    ) -> Result<PersistCorpusResult, PoiArtifactError> {
+        match outcome {
+            PoiCorpusJournalCommitOutcome::Applied(commit) => Ok(PersistCorpusResult::Applied(
+                Box::new(PersistedPoiArtifactCache {
+                    record: commit.head.corpus.clone(),
+                    cache,
+                    cache_generation: self.expected_generation,
+                    journal_head: Some(commit.head.clone()),
+                    compaction_recommended: false,
+                }),
+            )),
+            PoiCorpusJournalCommitOutcome::CorpusConflict => Ok(PersistCorpusResult::Stale),
+            PoiCorpusJournalCommitOutcome::GenerationConflict { actual } => {
+                Err(PoiArtifactError::StalePublicCacheGeneration {
+                    expected: actual,
+                    actual: self.expected_generation,
+                })
+            }
+            PoiCorpusJournalCommitOutcome::PublisherSequenceConflict { actual } => {
+                if actual.is_some_and(|sequence| {
+                    self.expected_publisher
+                        .is_some_and(|(_, expected)| sequence > expected)
+                }) {
+                    Ok(PersistCorpusResult::Stale)
+                } else {
+                    Err(PoiArtifactError::UnobservedManifestSequence {
+                        candidate: self.expected_publisher.map_or(0, |(_, sequence)| sequence),
+                    })
+                }
+            }
+            PoiCorpusJournalCommitOutcome::PublisherManifestConflict { .. } => {
+                Ok(PersistCorpusResult::Stale)
+            }
+            PoiCorpusJournalCommitOutcome::CompactionRequired => {
+                Err(PoiArtifactError::Persistence {
+                    reason: "base rebase unexpectedly requires compaction".to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// The identity the candidate record names, when its cache has that identity.
+fn matching_cache_identity(
+    candidate: &PoiArtifactCacheRecord,
+    cache: &PoiCache,
+) -> Result<PoiCacheIdentity, PoiArtifactError> {
+    let identity = PoiCacheIdentity::new(
         candidate.chain_type,
         candidate.chain_id,
         candidate.txid_version.clone(),
         candidate.list_key,
     );
-    if candidate_cache.identity() != &candidate_identity {
+    if cache.identity() != &identity {
         return Err(PoiArtifactError::PersistedIdentityMismatch);
     }
-    let prepared_validation_started = Instant::now();
-    validate_materialized_corpus_payload(&candidate, &candidate_cache)?;
-    let prepared_validation_elapsed = prepared_validation_started.elapsed();
-    let existing_validation_started = Instant::now();
-    let (existing, commit_expected_state) = match inspect_persisted_cache_with_publisher(
-        db,
-        &candidate_identity,
-        publisher_pubkey,
-    )? {
-        PersistedPoiCorpusInspection::Missing => {
-            if expected_base != ExpectedPoiCorpusBase::NoValidCorpus {
-                return Ok(PersistCorpusResult::Stale);
-            }
-            (None, ExpectedPoiCorpusJournalState::NoValidBase)
-        }
-        PersistedPoiCorpusInspection::Valid(existing) => {
-            let observed = existing.expected_base();
-            if observed != expected_base {
-                return Ok(PersistCorpusResult::Stale);
-            }
-            (Some(*existing), observed.into_db_state())
-        }
-        PersistedPoiCorpusInspection::Corrupt {
-            replacement_token,
-            error,
-        } => {
-            let can_repair = match expected_base {
-                ExpectedPoiCorpusBase::Corrupt {
-                    replacement_token: expected_token,
-                } => starting_head.is_none() && expected_token == replacement_token,
-                _ => artifact_candidate_can_repair_corrupt_journal(
-                    db,
-                    &candidate_identity,
-                    &candidate_cache,
-                    expected_base,
-                    starting_head,
-                    expected_generation,
-                )?,
-            };
-            if !can_repair {
-                return Ok(PersistCorpusResult::Stale);
-            }
-            warn!(?error, key = %candidate.key(), "replacing corrupt durable PPOI corpus journal");
-            (
-                None,
-                ExpectedPoiCorpusJournalState::Corrupt { replacement_token },
-            )
-        }
-    };
-    if let Some(existing) = existing {
-        if existing.record.current_tip_index > candidate.current_tip_index {
-            return Ok(PersistCorpusResult::Stale);
-        }
-        validate_candidate_event_prefix(
-            &existing.cache,
-            &candidate_cache,
-            existing.record.current_tip_index,
-            existing.record.current_tip_root,
-            candidate.current_tip_index,
-        )?;
-        if matches!(candidate.source, PoiCacheRecordSource::PublicRpc) {
-            merge_public_rpc_provenance(&mut candidate, existing.record);
-        } else if let Some((list_key, from_index)) = list_signed_range(&existing.record.validation)
-        {
-            candidate.validation = extend_validation_with_list_ranges(
-                candidate.validation,
-                &PoiCorpusValidationRecord::ListSignedRanges {
-                    list_key,
-                    from_index,
-                },
-            );
-            candidate.source = PoiCacheRecordSource::PublicRpc;
-        }
-    }
-    let existing_validation_elapsed = existing_validation_started.elapsed();
-    let final_validation_started = Instant::now();
-    validate_materialized_corpus(&candidate, &candidate_cache, publisher_pubkey)?;
-    let final_validation_elapsed = final_validation_started.elapsed();
-    let source = candidate.source;
-    let chain_id = candidate.chain_id;
-    let current_tip_index = candidate.current_tip_index;
-    let payload_bytes = candidate.cache_payload.len();
-    let transaction_started = Instant::now();
-    let outcome = db.rebase_poi_corpus_journal_if_current(
-        candidate,
-        candidate_cache.progress().next_event_index,
-        candidate_cache.progress().next_leaf_index,
-        PoiCorpusJournalCommitCondition {
-            expected_generation,
-            expected_publisher,
-            expected_manifest_hash,
-            expected_state: commit_expected_state,
-        },
-    )?;
-    let transaction_elapsed = transaction_started.elapsed();
-    let (journal_revision, retired_delta_count, retired_delta_payload_bytes) = match &outcome {
+    Ok(identity)
+}
+
+/// The journal revision and retired delta count and bytes of an applied rebase.
+fn applied_rebase_stats(
+    outcome: &PoiCorpusJournalCommitOutcome,
+) -> (Option<u64>, Option<u32>, Option<u64>) {
+    match outcome {
         PoiCorpusJournalCommitOutcome::Applied(commit) => (
             Some(commit.head.revision),
             Some(commit.retired_delta_count),
             Some(commit.retired_delta_payload_bytes),
         ),
         _ => (None, None, None),
-    };
-    debug!(
-        ?source,
-        chain_id,
-        current_tip_index,
-        payload_bytes,
-        ?journal_revision,
-        ?retired_delta_count,
-        ?retired_delta_payload_bytes,
-        serialization_elapsed_ms = serialization_elapsed.as_millis(),
-        prepared_validation_elapsed_ms = prepared_validation_elapsed.as_millis(),
-        existing_validation_elapsed_ms = existing_validation_elapsed.as_millis(),
-        final_validation_elapsed_ms = final_validation_elapsed.as_millis(),
-        transaction_elapsed_ms = transaction_elapsed.as_millis(),
-        "PPOI corpus base rebase stages complete"
-    );
-    match outcome {
-        PoiCorpusJournalCommitOutcome::Applied(commit) => Ok(PersistCorpusResult::Applied(
-            Box::new(PersistedPoiArtifactCache {
-                record: commit.head.corpus.clone(),
-                cache: candidate_cache,
-                cache_generation: expected_generation,
-                journal_head: Some(commit.head.clone()),
-                compaction_recommended: false,
-            }),
-        )),
-        PoiCorpusJournalCommitOutcome::CorpusConflict => Ok(PersistCorpusResult::Stale),
-        PoiCorpusJournalCommitOutcome::GenerationConflict { actual } => {
-            Err(PoiArtifactError::StalePublicCacheGeneration {
-                expected: actual,
-                actual: expected_generation,
-            })
-        }
-        PoiCorpusJournalCommitOutcome::PublisherSequenceConflict { actual } => {
-            if actual.is_some_and(|sequence| {
-                expected_publisher.is_some_and(|(_, expected)| sequence > expected)
-            }) {
-                Ok(PersistCorpusResult::Stale)
-            } else {
-                Err(PoiArtifactError::UnobservedManifestSequence {
-                    candidate: expected_publisher.map_or(0, |(_, sequence)| sequence),
-                })
-            }
-        }
-        PoiCorpusJournalCommitOutcome::PublisherManifestConflict { .. } => {
-            Ok(PersistCorpusResult::Stale)
-        }
-        PoiCorpusJournalCommitOutcome::CompactionRequired => Err(PoiArtifactError::Persistence {
-            reason: "base rebase unexpectedly requires compaction".to_string(),
-        }),
     }
+}
+
+/// The candidate continued from the existing durable corpus: its events must
+/// extend the existing ones, and it inherits the existing public-range
+/// provenance. `None` when the existing corpus is ahead of the candidate.
+fn continue_from_existing(
+    mut candidate: PoiArtifactCacheRecord,
+    candidate_cache: &PoiCache,
+    existing: PersistedPoiArtifactCache,
+) -> Result<Option<PoiArtifactCacheRecord>, PoiArtifactError> {
+    if existing.record.current_tip_index > candidate.current_tip_index {
+        return Ok(None);
+    }
+    validate_candidate_event_prefix(
+        &existing.cache,
+        candidate_cache,
+        existing.record.current_tip_index,
+        existing.record.current_tip_root,
+        candidate.current_tip_index,
+    )?;
+    if matches!(candidate.source, PoiCacheRecordSource::PublicRpc) {
+        merge_public_rpc_provenance(&mut candidate, existing.record);
+    } else if let Some((list_key, from_index)) = list_signed_range(&existing.record.validation) {
+        candidate.validation = extend_validation_with_list_ranges(
+            candidate.validation,
+            &PoiCorpusValidationRecord::ListSignedRanges {
+                list_key,
+                from_index,
+            },
+        );
+        candidate.source = PoiCacheRecordSource::PublicRpc;
+    }
+    Ok(Some(candidate))
 }
 
 fn artifact_candidate_can_repair_corrupt_journal(
