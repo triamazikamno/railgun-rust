@@ -6,16 +6,16 @@ use super::{
     ExpectedWalletOutput, FixedBytes, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OutputPoiRecoveryAction, OwnedPoiPrivateDelta, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
     PendingOutputPoiContextRecord, PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt,
-    PendingOutputPoiRole, PendingOutputPoiSubject, PendingOutputPoiSubmissionKind,
-    PendingOutputPoiSubmissionPass, PendingOutputPoiSubmissionPassState,
-    PendingOutputPoiSubmissionPlan, PoiPrivateApplyOutcome, PublicPoiCorpusKey,
+    PendingOutputPoiRole, PendingOutputPoiSubject, PendingOutputPoiSubmissionPass,
+    PendingOutputPoiSubmissionPassState, PendingOutputPoiSubmissionPlan,
+    PendingOutputPoiSubmissionPredicate, PoiPrivateApplyOutcome, PublicPoiCorpusKey,
     RecoveredOutgoingSubmissionDelta, RecoveredOutgoingSubmissionSibling, TransactProofRoute,
     WalletCacheError, WalletConfig, WalletPrivateRemoteError, WalletPrivateRemoteStale, WalletUtxo,
     apply_poi_private_delta, current_pending_output_poi_subject, debug, expected_recovery_matches,
     expected_recovery_state, hold_expected_poi_corpus_revision,
-    pending_output_poi_context_fingerprint, pending_output_poi_submission_plan_current,
-    pending_output_poi_submit_identity, recoverable_pending_submission_list_keys,
-    saved_pending_context_matches_public_transaction, transact_proof_route, warn,
+    pending_output_poi_context_fingerprint, pending_output_poi_submit_identity,
+    recoverable_pending_submission_list_keys, saved_pending_context_matches_public_transaction,
+    transact_proof_route, warn,
 };
 
 struct RecoveredOutgoingSubmissionMember {
@@ -300,8 +300,8 @@ impl PendingOutputPoiSubmissionPass<'_> {
             force_submission_retry,
             retry_submitted = group.members.iter().any(|member| {
                 matches!(
-                    member.plan.kind,
-                    PendingOutputPoiSubmissionKind::RetrySubmitted
+                    member.plan.predicate,
+                    PendingOutputPoiSubmissionPredicate::RetrySubmitted
                 )
             }),
             "pending output POI retry-submitted group due"
@@ -553,7 +553,6 @@ impl PendingOutputPoiSubmissionPass<'_> {
     ) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
         let Self {
             authority,
-            public_data_plane,
             cache_store,
             cfg,
             active_list_keys,
@@ -663,17 +662,10 @@ impl PendingOutputPoiSubmissionPass<'_> {
                 }
                 continue;
             }
-            match pending_output_poi_submission_plan_current(
-                authority,
-                public_data_plane,
-                cache_store,
-                cfg,
-                active_list_keys,
-                &member.record,
-                &member.subject,
-                &member.plan,
-            )
-            .await?
+            match self
+                .preflight(&member.record, &member.subject, &member.plan)
+                .run()
+                .await?
             {
                 PendingOutputPoiPreflight::Ready => {}
                 not_ready => return Ok(not_ready),

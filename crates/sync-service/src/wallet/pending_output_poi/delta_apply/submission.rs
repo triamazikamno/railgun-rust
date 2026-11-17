@@ -10,7 +10,7 @@ use crate::wallet::pending_output_poi::{
     BTreeMap, ExpectedPoiStatus, ExpectedRecordState, ExpectedWalletOutput, FixedBytes,
     OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, OutputRecoveryDelta,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
-    PendingOutputPoiSubject, PendingOutputPoiSubjectMatch, PendingOutputPoiSubmissionKind,
+    PendingOutputPoiSubject, PendingOutputPoiSubjectMatch, PendingOutputPoiSubmissionPredicate,
     PendingSubmissionDelta, PoiPrivateApplyOutcome, PoiPrivateRows,
     RecoveredOutgoingSubmissionDelta, RecoveredOutgoingSubmissionSibling, WalletCacheError,
     WalletCacheStore, WalletConfig, WalletPrivateMutationPermit, WalletUtxo,
@@ -423,7 +423,7 @@ impl RecoveredOutgoingCheck<'_> {
         expected_recovery_matches(&sibling.plan.expected_recovery, Some(recovery))
             && recovery.status != OutputPoiRecoveryStatus::Valid
             && recovery.source_tx_hash == observation.tx_hash
-            && (sibling.plan.kind != PendingOutputPoiSubmissionKind::RetrySubmitted
+            && (sibling.plan.predicate != PendingOutputPoiSubmissionPredicate::RetrySubmitted
                 || recovery.submission_retry_allowed(self.now, sibling.plan.force_submission_retry))
     }
 }

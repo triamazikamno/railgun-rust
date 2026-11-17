@@ -3,9 +3,9 @@
 use crate::wallet::{
     PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingContextTerminalDelta,
     PendingOutputPoiPreflight, PendingOutputPoiRemoteAttempt, PendingOutputPoiSubject,
-    PendingOutputPoiSubmissionPlan, PendingSubmissionDelta, TransactProofRoute, WalletCacheError,
-    current_pending_output_poi_subject, pending_output_poi_context_fingerprint,
-    pending_output_poi_submission_plan_current, preflight_and_remote_submit_pending_output_poi,
+    PendingOutputPoiSubmissionPlan, PendingOutputPoiSubmissionPreflight, PendingSubmissionDelta,
+    TransactProofRoute, WalletCacheError, current_pending_output_poi_subject,
+    pending_output_poi_context_fingerprint, preflight_and_remote_submit_pending_output_poi,
 };
 use std::collections::BTreeSet;
 
@@ -165,28 +165,7 @@ pub(in crate::wallet) async fn force_resubmit_pending_output_poi_context(
         poi_lists = plan.list_keys().len(),
         "force-resubmitting matching pending output POI context"
     );
-    let Ok(attempt) = preflight_and_remote_submit_pending_output_poi(
-        authority,
-        public_data_plane,
-        cache_store,
-        cfg,
-        active_list_keys,
-        record,
-        &observation,
-        &subject,
-        &plan,
-        private_poi,
-        route,
-    )
-    .await
-    else {
-        warn!(
-            chain_id = cfg.chain.chain_id,
-            "forced pending output POI preflight/submit failed"
-        );
-        return None;
-    };
-    ForcedAttempt {
+    let forced = ForcedAttempt {
         authority,
         public_data_plane,
         db,
@@ -198,9 +177,22 @@ pub(in crate::wallet) async fn force_resubmit_pending_output_poi_context(
         plan,
         expected_context_fingerprint,
         now,
-    }
-    .record(&attempt)
-    .await;
+    };
+    let Ok(attempt) = preflight_and_remote_submit_pending_output_poi(
+        &forced.preflight(),
+        &observation,
+        private_poi,
+        route,
+    )
+    .await
+    else {
+        warn!(
+            chain_id = cfg.chain.chain_id,
+            "forced pending output POI preflight/submit failed"
+        );
+        return None;
+    };
+    forced.record(&attempt).await;
     Some(attempt)
 }
 
@@ -300,19 +292,23 @@ impl ForcedAttempt<'_> {
     /// Whether the submission plan is still ready against current wallet and public state.
     async fn plan_still_ready(&self) -> bool {
         matches!(
-            pending_output_poi_submission_plan_current(
-                self.authority,
-                self.public_data_plane,
-                self.cache_store,
-                self.cfg,
-                self.active_list_keys,
-                self.record,
-                &self.subject,
-                &self.plan,
-            )
-            .await,
+            self.preflight().run().await,
             Ok(PendingOutputPoiPreflight::Ready)
         )
+    }
+
+    /// The preflight for this attempt's subject and plan.
+    const fn preflight(&self) -> PendingOutputPoiSubmissionPreflight<'_> {
+        PendingOutputPoiSubmissionPreflight {
+            authority: self.authority,
+            public_data_plane: self.public_data_plane,
+            cache_store: self.cache_store,
+            cfg: self.cfg,
+            active_list_keys: self.active_list_keys,
+            expected: self.record,
+            subject: &self.subject,
+            plan: &self.plan,
+        }
     }
 
     /// Persists the submission result; submitted list keys are merged only on success.

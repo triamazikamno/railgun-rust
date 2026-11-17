@@ -1552,16 +1552,17 @@ async fn wallet_reset_rewinds_external_pending_observation_for_canonical_replay(
 
     let authority = WalletPrivateMutationAuthority::new(&handle, 1, &cancel);
     assert_eq!(
-        pending_output_poi_submission_plan_current(
-            &authority,
-            &test_public_data_plane(&db),
-            db.as_ref(),
-            &cfg,
-            &[list_key],
-            &stale_context,
-            &stale_subject,
-            &stale_plan,
-        )
+        PendingOutputPoiSubmissionPreflight {
+            authority: &authority,
+            public_data_plane: &test_public_data_plane(&db),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            active_list_keys: &[list_key],
+            expected: &stale_context,
+            subject: &stale_subject,
+            plan: &stale_plan,
+        }
+        .run()
         .await
         .expect("stale submission preflight"),
         PendingOutputPoiPreflight::NotCurrent,
@@ -1644,16 +1645,17 @@ async fn wallet_reset_rewinds_external_pending_observation_for_canonical_replay(
         expected_recovery_state(None).expect("absent recovery state"),
     );
     assert_eq!(
-        pending_output_poi_submission_plan_current(
-            &authority,
-            &test_public_data_plane(&db),
-            db.as_ref(),
-            &cfg,
-            &[list_key],
-            &canonical,
-            &canonical_subject,
-            &canonical_plan,
-        )
+        PendingOutputPoiSubmissionPreflight {
+            authority: &authority,
+            public_data_plane: &test_public_data_plane(&db),
+            cache_store: db.as_ref(),
+            cfg: &cfg,
+            active_list_keys: &[list_key],
+            expected: &canonical,
+            subject: &canonical_subject,
+            plan: &canonical_plan,
+        }
+        .run()
         .await
         .expect("canonical submission preflight"),
         PendingOutputPoiPreflight::Ready

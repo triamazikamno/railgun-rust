@@ -52,8 +52,8 @@ use crate::wallet::handle::{
     PendingOutputPoiSubject, WalletPendingOverlayRequest, WalletPrivateViewTicket,
 };
 use crate::wallet::pending_output_poi::{
-    PendingOutputPoiPreflight, PendingOutputPoiSubmissionPlan, current_pending_output_poi_subject,
-    expected_recovery_state, pending_output_poi_submission_plan_current,
+    PendingOutputPoiPreflight, PendingOutputPoiSubmissionPlan, PendingOutputPoiSubmissionPreflight,
+    current_pending_output_poi_subject, expected_recovery_state,
     pending_output_poi_submit_identity,
 };
 use crate::wallet::{EVM_CHAIN_TYPE, WalletActorLifecycle};

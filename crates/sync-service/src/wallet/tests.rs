@@ -48,9 +48,9 @@ use super::{
     OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
     OutputPoiRecoveryRequest, OutputPoiRecoveryRun, OutputRecoveryDelta, OwnedPoiPrivateDelta,
     PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubject,
-    PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmitter,
-    PendingOutputPoiValidationEvidence, PendingSubmissionDelta, PoiMaintenanceController,
-    PoiPrivateApplyOutcome, PoiStatusReader, PoiStatusRefreshDelta,
+    PendingOutputPoiSubmissionPredicate, PendingOutputPoiSubmissionPreflight,
+    PendingOutputPoiSubmitter, PendingOutputPoiValidationEvidence, PendingSubmissionDelta,
+    PoiMaintenanceController, PoiPrivateApplyOutcome, PoiStatusReader, PoiStatusRefreshDelta,
     RecoveredOutgoingSubmissionDelta, RecoveredOutgoingSubmissionSibling,
     SenderCandidateMaterializationDelta, VerifiedValidDelta, WALLET_POI_STATUS_BATCH_SIZE,
     WalletActorLifecycleCell, WalletHandle, WalletLiveMetadataFlush, WalletObservationPublisher,
@@ -9383,15 +9383,17 @@ async fn external_submission_rejects_scan_replacement_before_remote_transport() 
     );
 
     let attempt = preflight_and_remote_submit_pending_output_poi(
-        &authority,
-        &test_public_data_plane_with_poi_service(&store),
-        &cache_store,
-        &cfg,
-        &[list_key],
-        &pending,
+        &PendingOutputPoiSubmissionPreflight {
+            authority: &authority,
+            public_data_plane: &test_public_data_plane_with_poi_service(&store),
+            cache_store: &cache_store,
+            cfg: &cfg,
+            active_list_keys: &[list_key],
+            expected: &pending,
+            subject: &subject,
+            plan: &plan,
+        },
         &observation,
-        &subject,
-        &plan,
         &private_poi,
         &mut None,
     )
@@ -12042,15 +12044,17 @@ async fn multi_proof_submit_revalidates_between_remote_calls() {
     let active_lists = [list_a, list_b];
 
     let attempt = preflight_and_remote_submit_pending_output_poi(
-        &authority,
-        &test_public_data_plane_with_poi_service(&store),
-        store.as_ref(),
-        &cfg,
-        &active_lists,
-        &pending,
+        &PendingOutputPoiSubmissionPreflight {
+            authority: &authority,
+            public_data_plane: &test_public_data_plane_with_poi_service(&store),
+            cache_store: store.as_ref(),
+            cfg: &cfg,
+            active_list_keys: &active_lists,
+            expected: &pending,
+            subject: &subject,
+            plan: &plan,
+        },
         &observation,
-        &subject,
-        &plan,
         &private_poi,
         &mut None,
     )

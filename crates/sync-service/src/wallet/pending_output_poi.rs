@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use crate::chain::PendingOutputPoiSubmitIntent;
+use broadcaster_core::transact::PreTxPoi;
 use poi::error::PoiRpcError;
+use serde::Serialize;
 
 use super::{
     BTreeMap, BlindedCommitmentData, CancellationToken, ChainPublicDataPlane,
@@ -34,11 +36,17 @@ use super::{
 
 mod delta_apply;
 mod recovered_outgoing;
+mod subject;
 mod tentative;
 mod verification;
 mod workflow_status;
 
 use delta_apply::apply_poi_private_delta_inline;
+use subject::{PendingOutputPoiSubjectMatch, pending_output_poi_subject_matches_snapshot};
+pub(super) use subject::{
+    PendingOutputPoiSubmitIdentity, current_pending_output_poi_subject,
+    pending_output_poi_context_matches_wallet_utxo, pending_output_poi_submit_identity,
+};
 pub(super) use tentative::{
     PendingOutputPoiTentativeAttemptKey, PendingOutputPoiTentativeCandidate,
     PendingOutputPoiTentativeLocalStatus, PendingOutputPoiTentativeSubmissionResult,
@@ -193,14 +201,10 @@ pub(super) fn pending_output_poi_handoff_context(
     {
         return None;
     }
-    Some(SingleCommitmentProofContext {
-        txid_version: record.txid_version.clone(),
-        railgun_txid: record.railgun_txid,
-        utxo_tree_in: record.utxo_tree_in,
-        commitment: record.output_commitment,
-        npk: record.output_npk,
-        pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
-    })
+    Some(single_commitment_proof_context(
+        record,
+        pre_transaction_pois,
+    ))
 }
 
 pub(super) fn pending_output_poi_rewind_state_updates(
@@ -254,17 +258,56 @@ pub(super) async fn submit_observed_pending_output_pois_inner(
     private_poi: &WalletPrivatePoiClients,
     force_submission_retry: bool,
 ) -> Result<usize, WalletCacheError> {
-    submit_observed_pending_output_pois_impl(
+    let chain_id = cfg.chain.chain_id;
+    let records = cache_store.list_pending_output_poi_contexts(chain_id, &cfg.cache_key)?;
+    let now = now_epoch_secs();
+    debug!(
+        chain_id,
+        records = records.len(),
+        force_submission_retry,
+        "pending output POI retry-submitted scan started"
+    );
+    let forced_txids = private_poi.deferred_forced_txids();
+    let pass = PendingOutputPoiSubmissionPass {
         authority,
         public_data_plane,
-        cfg,
-        active_list_keys,
         db,
         cache_store,
+        cfg,
+        active_list_keys,
         private_poi,
+        records: &records,
+        forced_txids: &forced_txids,
         force_submission_retry,
-    )
-    .await
+        now,
+    };
+    let mut state = PendingOutputPoiSubmissionPassState::default();
+    let order = private_poi.submission_order_by_key(records.iter().collect::<Vec<_>>(), |record| {
+        record.railgun_txid
+    });
+    for record in order {
+        if state.deferred_txids.contains(&record.railgun_txid) {
+            continue;
+        }
+        if state
+            .route
+            .as_ref()
+            .is_some_and(|current| current.railgun_txid() != record.railgun_txid)
+        {
+            state.route = None;
+        }
+        // A forced submission deferred by an earlier pass is still forced the same way.
+        let step =
+            if forced_txids.get(&record.railgun_txid) == Some(&DeferredForceKind::ForceMatching) {
+                pass.resubmit_forced(&mut state, record).await
+            } else {
+                pass.submit_record(&mut state, record).await?
+            };
+        if step.is_break() {
+            break;
+        }
+    }
+    Ok(state.submitted_contexts)
 }
 
 /// Preflight result for generation-scoped remote pending-output POI submit.
@@ -297,33 +340,41 @@ pub(super) enum PendingOutputPoiRemoteAttempt {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingOutputPoiSubmissionKind {
-    Missing,
-    RetrySubmitted,
-    /// User/API force-resubmit of matching contexts (no recovery-retry gate).
-    ForceMatching,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingOutputPoiSubmissionPlan {
-    kind: PendingOutputPoiSubmissionKind,
+    /// Which lists the plan targets. `ForceMatching` is a user/API force-resubmit of
+    /// matching contexts, with no recovery-retry gate.
+    predicate: PendingOutputPoiSubmissionPredicate,
     list_keys: Vec<FixedBytes<32>>,
     expected_recovery: ExpectedRecordState,
     force_submission_retry: bool,
 }
 
 impl PendingOutputPoiSubmissionPlan {
+    const fn new(
+        predicate: PendingOutputPoiSubmissionPredicate,
+        list_keys: Vec<FixedBytes<32>>,
+        expected_recovery: ExpectedRecordState,
+        force_submission_retry: bool,
+    ) -> Self {
+        Self {
+            predicate,
+            list_keys,
+            expected_recovery,
+            force_submission_retry,
+        }
+    }
+
     const fn missing(
         list_keys: Vec<FixedBytes<32>>,
         expected_recovery: ExpectedRecordState,
     ) -> Self {
-        Self {
-            kind: PendingOutputPoiSubmissionKind::Missing,
+        Self::new(
+            PendingOutputPoiSubmissionPredicate::Missing,
             list_keys,
             expected_recovery,
-            force_submission_retry: false,
-        }
+            false,
+        )
     }
 
     const fn retry_submitted(
@@ -331,12 +382,12 @@ impl PendingOutputPoiSubmissionPlan {
         expected_recovery: ExpectedRecordState,
         force_submission_retry: bool,
     ) -> Self {
-        Self {
-            kind: PendingOutputPoiSubmissionKind::RetrySubmitted,
+        Self::new(
+            PendingOutputPoiSubmissionPredicate::RetrySubmitted,
             list_keys,
             expected_recovery,
             force_submission_retry,
-        }
+        )
     }
 
     /// Force-resubmit plan: active list keys already on the context (submitted or not).
@@ -344,12 +395,12 @@ impl PendingOutputPoiSubmissionPlan {
         list_keys: Vec<FixedBytes<32>>,
         expected_recovery: ExpectedRecordState,
     ) -> Self {
-        Self {
-            kind: PendingOutputPoiSubmissionKind::ForceMatching,
+        Self::new(
+            PendingOutputPoiSubmissionPredicate::ForceMatching,
             list_keys,
             expected_recovery,
-            force_submission_retry: true,
-        }
+            true,
+        )
     }
 
     pub(super) fn retain_current_recoverable(
@@ -375,24 +426,16 @@ impl PendingOutputPoiSubmissionPlan {
     }
 
     pub(super) const fn predicate(&self) -> PendingOutputPoiSubmissionPredicate {
-        match self.kind {
-            PendingOutputPoiSubmissionKind::Missing => PendingOutputPoiSubmissionPredicate::Missing,
-            PendingOutputPoiSubmissionKind::RetrySubmitted => {
-                PendingOutputPoiSubmissionPredicate::RetrySubmitted
-            }
-            PendingOutputPoiSubmissionKind::ForceMatching => {
-                PendingOutputPoiSubmissionPredicate::ForceMatching
-            }
-        }
+        self.predicate
     }
 
     const fn submit_intent(&self) -> PendingOutputPoiSubmitIntent {
-        match self.kind {
-            PendingOutputPoiSubmissionKind::Missing => PendingOutputPoiSubmitIntent::Missing,
-            PendingOutputPoiSubmissionKind::RetrySubmitted => {
+        match self.predicate {
+            PendingOutputPoiSubmissionPredicate::Missing => PendingOutputPoiSubmitIntent::Missing,
+            PendingOutputPoiSubmissionPredicate::RetrySubmitted => {
                 PendingOutputPoiSubmitIntent::RetrySubmitted
             }
-            PendingOutputPoiSubmissionKind::ForceMatching => {
+            PendingOutputPoiSubmissionPredicate::ForceMatching => {
                 PendingOutputPoiSubmitIntent::ForceMatching
             }
         }
@@ -400,7 +443,10 @@ impl PendingOutputPoiSubmissionPlan {
 
     /// How a deferral of this plan stays forced for later passes, if at all.
     const fn deferred_force_kind(&self) -> Option<DeferredForceKind> {
-        if matches!(self.kind, PendingOutputPoiSubmissionKind::ForceMatching) {
+        if matches!(
+            self.predicate,
+            PendingOutputPoiSubmissionPredicate::ForceMatching
+        ) {
             Some(DeferredForceKind::ForceMatching)
         } else if self.force_submission_retry {
             Some(DeferredForceKind::RetrySubmitted)
@@ -540,15 +586,8 @@ impl PendingOutputPoiSubmissionPass<'_> {
             return Ok(ControlFlow::Continue(()));
         };
         let remote_attempt = preflight_and_remote_submit_pending_output_poi(
-            self.authority,
-            self.public_data_plane,
-            self.cache_store,
-            self.cfg,
-            self.active_list_keys,
-            record,
+            &self.preflight(record, &subject, &plan),
             observation,
-            &subject,
-            &plan,
             self.private_poi,
             &mut state.route,
         )
@@ -598,7 +637,10 @@ impl PendingOutputPoiSubmissionPass<'_> {
         debug!(
             chain_id = self.cfg.chain.chain_id,
             force_submission_retry,
-            retry_submitted = matches!(plan.kind, PendingOutputPoiSubmissionKind::RetrySubmitted),
+            retry_submitted = matches!(
+                plan.predicate,
+                PendingOutputPoiSubmissionPredicate::RetrySubmitted
+            ),
             "pending output POI submission due"
         );
         Some((subject, plan))
@@ -755,68 +797,6 @@ impl StandardAttempt<'_> {
     }
 }
 
-async fn submit_observed_pending_output_pois_impl(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    db: &DbStore,
-    cache_store: &dyn WalletCacheStore,
-    private_poi: &WalletPrivatePoiClients,
-    force_submission_retry: bool,
-) -> Result<usize, WalletCacheError> {
-    let chain_id = cfg.chain.chain_id;
-    let records = cache_store.list_pending_output_poi_contexts(chain_id, &cfg.cache_key)?;
-    let now = now_epoch_secs();
-    debug!(
-        chain_id,
-        records = records.len(),
-        force_submission_retry,
-        "pending output POI retry-submitted scan started"
-    );
-    let forced_txids = private_poi.deferred_forced_txids();
-    let pass = PendingOutputPoiSubmissionPass {
-        authority,
-        public_data_plane,
-        db,
-        cache_store,
-        cfg,
-        active_list_keys,
-        private_poi,
-        records: &records,
-        forced_txids: &forced_txids,
-        force_submission_retry,
-        now,
-    };
-    let mut state = PendingOutputPoiSubmissionPassState::default();
-    let order = private_poi.submission_order_by_key(records.iter().collect::<Vec<_>>(), |record| {
-        record.railgun_txid
-    });
-    for record in order {
-        if state.deferred_txids.contains(&record.railgun_txid) {
-            continue;
-        }
-        if state
-            .route
-            .as_ref()
-            .is_some_and(|current| current.railgun_txid() != record.railgun_txid)
-        {
-            state.route = None;
-        }
-        // A forced submission deferred by an earlier pass is still forced the same way.
-        let step =
-            if forced_txids.get(&record.railgun_txid) == Some(&DeferredForceKind::ForceMatching) {
-                pass.resubmit_forced(&mut state, record).await
-            } else {
-                pass.submit_record(&mut state, record).await?
-            };
-        if step.is_break() {
-            break;
-        }
-    }
-    Ok(state.submitted_contexts)
-}
-
 /// The pass's route for `record`'s transaction, reserved on its first
 /// transact proof and reused by its later records. `None` when deferred.
 async fn transact_proof_route<'a>(
@@ -846,7 +826,7 @@ async fn transact_proof_route<'a>(
 /// One pending output context's proofs on their way to the POI gateway; the
 /// preflight re-checks each send.
 struct GatewaySubmission<'a> {
-    preflight: &'a SubmissionPreflight<'a>,
+    preflight: &'a PendingOutputPoiSubmissionPreflight<'a>,
     private_poi: &'a WalletPrivatePoiClients,
     observation: &'a PendingOutputPoiObservation,
 }
@@ -872,7 +852,7 @@ impl GatewaySubmission<'_> {
         txid_merkleroot_index: u64,
         route: &mut Option<TransactProofRoute>,
     ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
-        let SubmissionPreflight {
+        let PendingOutputPoiSubmissionPreflight {
             cfg,
             expected: record,
             plan,
@@ -926,7 +906,7 @@ impl GatewaySubmission<'_> {
         &self,
         context: SingleCommitmentProofContext,
     ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
-        let SubmissionPreflight {
+        let PendingOutputPoiSubmissionPreflight {
             cfg,
             expected: record,
             plan,
@@ -1051,23 +1031,26 @@ fn expected_pending_context_matches(
     expected: &ExpectedRecordState,
     current: Option<&PendingOutputPoiContextRecord>,
 ) -> bool {
-    match (expected, current) {
-        (ExpectedRecordState::Absent, None) => true,
-        (ExpectedRecordState::Present(expected), Some(current)) => {
-            pending_output_poi_context_fingerprint(current).as_ref() == Some(expected)
-        }
-        _ => false,
-    }
+    expected_record_matches(expected, current)
 }
 
 fn expected_recovery_matches(
     expected: &ExpectedRecordState,
     current: Option<&OutputPoiRecoveryRecord>,
 ) -> bool {
+    expected_record_matches(expected, current)
+}
+
+/// Whether `current` is still the record `expected` saw: both absent, or a
+/// present record whose fingerprint is unchanged.
+fn expected_record_matches<T: Serialize>(
+    expected: &ExpectedRecordState,
+    current: Option<&T>,
+) -> bool {
     match (expected, current) {
         (ExpectedRecordState::Absent, None) => true,
         (ExpectedRecordState::Present(expected), Some(current)) => {
-            output_poi_recovery_fingerprint(current).as_ref() == Some(expected)
+            record_fingerprint(current).as_ref() == Some(expected)
         }
         _ => false,
     }
@@ -1157,9 +1140,17 @@ pub(super) async fn apply_owned_poi_private_delta_on_actor(
     cfg: &WalletConfig,
     delta: OwnedPoiPrivateDelta,
 ) -> Result<PoiPrivateApplyOutcome, WalletCacheError> {
-    let authority = WalletPrivateMutationAuthority::new(handle, reset_generation, cancel);
-    let active_list_keys = default_active_poi_list_keys();
-    apply_poi_private_delta_inline(&authority, db, cache_store, cfg, &active_list_keys, delta).await
+    apply_owned_poi_private_delta_on_actor_with_active_lists(
+        handle,
+        cancel,
+        reset_generation,
+        db,
+        cache_store,
+        cfg,
+        &default_active_poi_list_keys(),
+        delta,
+    )
+    .await
 }
 
 /// Actor-turn apply using the actor's current active-list configuration.
@@ -1196,192 +1187,20 @@ async fn hold_expected_poi_corpus_revision(
     Ok(Some(revision_fence))
 }
 
-pub(super) struct PendingOutputPoiSubmitIdentity {
-    pub(super) derived_blinded_commitment: FixedBytes<32>,
+/// Borrowed inputs of one submission-plan preflight. Building one checks nothing;
+/// [`Self::run`] checks the plan each time it is called.
+pub(super) struct PendingOutputPoiSubmissionPreflight<'a> {
+    pub(super) authority: &'a WalletPrivateMutationAuthority<'a>,
+    pub(super) public_data_plane: &'a ChainPublicDataPlane,
+    pub(super) cache_store: &'a dyn WalletCacheStore,
+    pub(super) cfg: &'a WalletConfig,
+    pub(super) active_list_keys: &'a [FixedBytes<32>],
+    pub(super) expected: &'a PendingOutputPoiContextRecord,
+    pub(super) subject: &'a PendingOutputPoiSubject,
+    pub(super) plan: &'a PendingOutputPoiSubmissionPlan,
 }
 
-pub(super) fn pending_output_poi_submit_identity(
-    record: &PendingOutputPoiContextRecord,
-    observation: &PendingOutputPoiObservation,
-) -> Option<PendingOutputPoiSubmitIdentity> {
-    let output_tree = u32::try_from(observation.output_tree).ok()?;
-    record.txid_leaf_hash()?;
-    Some(PendingOutputPoiSubmitIdentity {
-        derived_blinded_commitment: UtxoPoiMetadata::blinded_commitment_for(
-            record.output_commitment,
-            record.output_npk,
-            output_tree,
-            observation.output_position,
-        ),
-    })
-}
-
-pub(super) fn pending_output_poi_context_matches_wallet_utxo(
-    cfg: &WalletConfig,
-    wallet_utxo: &WalletUtxo,
-    record: &PendingOutputPoiContextRecord,
-) -> bool {
-    if record.chain_id != cfg.chain.chain_id
-        || record.wallet_id != cfg.cache_key.as_str()
-        || record.output_commitment != wallet_utxo.utxo.poi.commitment
-    {
-        return false;
-    }
-    let Some(observation) = record.observation.as_ref() else {
-        return false;
-    };
-    if observation.output_tree != u64::from(wallet_utxo.utxo.tree)
-        || observation.output_position != wallet_utxo.utxo.position
-        || observation.tx_hash != wallet_utxo.utxo.source.tx_hash
-    {
-        return false;
-    }
-    pending_output_poi_submit_identity(record, observation).is_some_and(|identity| {
-        identity.derived_blinded_commitment == wallet_utxo.utxo.poi.blinded_commitment
-    })
-}
-
-enum PendingOutputPoiSubjectMatch {
-    Owned(Box<WalletUtxo>),
-    External,
-}
-
-impl PendingOutputPoiSubjectMatch {
-    const fn poi(&self) -> Option<&UtxoPoiMetadata> {
-        match self {
-            Self::Owned(output) => Some(&output.utxo.poi),
-            Self::External => None,
-        }
-    }
-}
-
-fn pending_output_poi_subject_matches_snapshot(
-    cfg: &WalletConfig,
-    snapshot: &[WalletUtxo],
-    record: &PendingOutputPoiContextRecord,
-    subject: &PendingOutputPoiSubject,
-) -> Option<PendingOutputPoiSubjectMatch> {
-    if record.chain_id != cfg.chain.chain_id || record.wallet_id != cfg.cache_key.as_str() {
-        return None;
-    }
-    let observation = record.observation.as_ref()?;
-    let identity = pending_output_poi_submit_identity(record, observation)?;
-    match subject {
-        PendingOutputPoiSubject::Owned(expected_output) => snapshot
-            .iter()
-            .find(|output| {
-                expected_output.matches(output)
-                    && pending_output_poi_context_matches_wallet_utxo(cfg, output, record)
-            })
-            .cloned()
-            .map(Box::new)
-            .map(PendingOutputPoiSubjectMatch::Owned),
-        PendingOutputPoiSubject::External {
-            output_commitment,
-            derived_blinded_commitment,
-        } => {
-            if !matches!(
-                record.output_role,
-                PendingOutputPoiRole::Recipient
-                    | PendingOutputPoiRole::BroadcasterFee
-                    | PendingOutputPoiRole::RecoveredOutgoing
-            ) || record.output_commitment != *output_commitment
-                || identity.derived_blinded_commitment != *derived_blinded_commitment
-                || snapshot.iter().any(|output| {
-                    !output.is_spent() && output.utxo.poi.commitment == record.output_commitment
-                })
-            {
-                return None;
-            }
-            Some(PendingOutputPoiSubjectMatch::External)
-        }
-    }
-}
-
-pub(super) async fn current_pending_output_poi_subject(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    cfg: &WalletConfig,
-    record: &PendingOutputPoiContextRecord,
-) -> Option<(PendingOutputPoiSubject, Option<WalletUtxo>)> {
-    if authority.revalidate().is_err()
-        || authority.chain_id() != cfg.chain.chain_id
-        || authority.wallet_id() != &cfg.cache_key
-        || record.chain_id != cfg.chain.chain_id
-        || record.wallet_id != cfg.cache_key.as_str()
-    {
-        return None;
-    }
-    let observation = record.observation.as_ref()?;
-    let identity = pending_output_poi_submit_identity(record, observation)?;
-    let snapshot = authority.wallet_utxos().await.ok()?;
-    let matching_output = snapshot.iter().find(|output| {
-        !output.is_spent() && pending_output_poi_context_matches_wallet_utxo(cfg, output, record)
-    });
-    let result = if let Some(output) = matching_output {
-        (
-            PendingOutputPoiSubject::Owned(ExpectedWalletOutput::new(output)),
-            Some(output.clone()),
-        )
-    } else {
-        if !matches!(
-            record.output_role,
-            PendingOutputPoiRole::Recipient
-                | PendingOutputPoiRole::BroadcasterFee
-                | PendingOutputPoiRole::RecoveredOutgoing
-        ) || snapshot.iter().any(|output| {
-            !output.is_spent() && output.utxo.poi.commitment == record.output_commitment
-        }) {
-            return None;
-        }
-        (
-            PendingOutputPoiSubject::External {
-                output_commitment: record.output_commitment,
-                derived_blinded_commitment: identity.derived_blinded_commitment,
-            },
-            None,
-        )
-    };
-    authority.revalidate().is_ok().then_some(result)
-}
-
-/// Sole preflight gate before remote pending-output POI disclosure.
-pub(super) async fn pending_output_poi_submission_plan_current(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    expected: &PendingOutputPoiContextRecord,
-    subject: &PendingOutputPoiSubject,
-    plan: &PendingOutputPoiSubmissionPlan,
-) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
-    SubmissionPreflight {
-        authority,
-        public_data_plane,
-        cache_store,
-        cfg,
-        active_list_keys,
-        expected,
-        subject,
-        plan,
-    }
-    .run()
-    .await
-}
-
-/// Borrowed inputs of one submission-plan preflight.
-struct SubmissionPreflight<'a> {
-    authority: &'a WalletPrivateMutationAuthority<'a>,
-    public_data_plane: &'a ChainPublicDataPlane,
-    cache_store: &'a dyn WalletCacheStore,
-    cfg: &'a WalletConfig,
-    active_list_keys: &'a [FixedBytes<32>],
-    expected: &'a PendingOutputPoiContextRecord,
-    subject: &'a PendingOutputPoiSubject,
-    plan: &'a PendingOutputPoiSubmissionPlan,
-}
-
-impl SubmissionPreflight<'_> {
+impl PendingOutputPoiSubmissionPreflight<'_> {
     /// Whether every preflight stage still passes.
     async fn ready(&self) -> Result<bool, WalletCacheError> {
         Ok(matches!(
@@ -1390,8 +1209,9 @@ impl SubmissionPreflight<'_> {
         ))
     }
 
-    /// Runs every preflight stage in order and returns the first verdict that is not `Ready`.
-    async fn run(&self) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
+    /// Sole preflight gate before remote pending-output POI disclosure. Runs every
+    /// preflight stage in order and returns the first verdict that is not `Ready`.
+    pub(super) async fn run(&self) -> Result<PendingOutputPoiPreflight, WalletCacheError> {
         if self.authority.revalidate().is_err() {
             debug!(
                 chain_id = self.cfg.chain.chain_id,
@@ -1514,8 +1334,8 @@ impl SubmissionPreflight<'_> {
         current_recovery: Option<&OutputPoiRecoveryRecord>,
     ) -> bool {
         let plan = self.plan;
-        match plan.kind {
-            PendingOutputPoiSubmissionKind::Missing => {
+        match plan.predicate {
+            PendingOutputPoiSubmissionPredicate::Missing => {
                 let mut current_missing = current.missing_list_keys();
                 current_missing.retain(|list_key| self.active_list_keys.contains(list_key));
                 if plan
@@ -1530,7 +1350,7 @@ impl SubmissionPreflight<'_> {
                     return false;
                 }
             }
-            PendingOutputPoiSubmissionKind::RetrySubmitted => {
+            PendingOutputPoiSubmissionPredicate::RetrySubmitted => {
                 let current_list_keys = current.list_keys();
                 if plan.list_keys.iter().any(|list_key| {
                     !current_list_keys.contains(list_key)
@@ -1552,7 +1372,7 @@ impl SubmissionPreflight<'_> {
                     return false;
                 }
             }
-            PendingOutputPoiSubmissionKind::ForceMatching => {
+            PendingOutputPoiSubmissionPredicate::ForceMatching => {
                 let current_list_keys = current.list_keys();
                 if plan
                     .list_keys
@@ -1662,46 +1482,47 @@ impl PendingOutputPoiSubmissionPass<'_> {
         subject: &PendingOutputPoiSubject,
         plan: &PendingOutputPoiSubmissionPlan,
     ) -> Result<bool, WalletCacheError> {
-        let Self {
-            authority,
-            public_data_plane,
-            cache_store,
-            cfg,
-            active_list_keys,
-            ..
-        } = *self;
         Ok(matches!(
-            pending_output_poi_submission_plan_current(
-                authority,
-                public_data_plane,
-                cache_store,
-                cfg,
-                active_list_keys,
-                expected,
-                subject,
-                plan,
-            )
-            .await?,
+            self.preflight(expected, subject, plan).run().await?,
             PendingOutputPoiPreflight::Ready
         ))
+    }
+
+    /// The preflight for submitting `plan` on `expected` in this pass.
+    const fn preflight<'p>(
+        &'p self,
+        expected: &'p PendingOutputPoiContextRecord,
+        subject: &'p PendingOutputPoiSubject,
+        plan: &'p PendingOutputPoiSubmissionPlan,
+    ) -> PendingOutputPoiSubmissionPreflight<'p> {
+        PendingOutputPoiSubmissionPreflight {
+            authority: self.authority,
+            public_data_plane: self.public_data_plane,
+            cache_store: self.cache_store,
+            cfg: self.cfg,
+            active_list_keys: self.active_list_keys,
+            expected,
+            subject,
+            plan,
+        }
     }
 }
 
 /// Sole production choke point for remote pending-output POI submission:
 /// preflight → build context → remote await. Durable apply remains caller's postflight.
 pub(super) async fn preflight_and_remote_submit_pending_output_poi(
-    authority: &WalletPrivateMutationAuthority<'_>,
-    public_data_plane: &ChainPublicDataPlane,
-    cache_store: &dyn WalletCacheStore,
-    cfg: &WalletConfig,
-    active_list_keys: &[FixedBytes<32>],
-    record: &PendingOutputPoiContextRecord,
+    preflight: &PendingOutputPoiSubmissionPreflight<'_>,
     observation: &PendingOutputPoiObservation,
-    subject: &PendingOutputPoiSubject,
-    plan: &PendingOutputPoiSubmissionPlan,
     private_poi: &WalletPrivatePoiClients,
     route: &mut Option<TransactProofRoute>,
 ) -> Result<PendingOutputPoiRemoteAttempt, WalletCacheError> {
+    let PendingOutputPoiSubmissionPreflight {
+        public_data_plane,
+        cfg,
+        expected: record,
+        plan,
+        ..
+    } = *preflight;
     if record.observation.as_ref() != Some(observation)
         || !saved_pending_context_matches_public_transaction(
             public_data_plane,
@@ -1712,16 +1533,6 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
     {
         return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
     }
-    let preflight = SubmissionPreflight {
-        authority,
-        public_data_plane,
-        cache_store,
-        cfg,
-        active_list_keys,
-        expected: record,
-        subject,
-        plan,
-    };
     match preflight.run().await? {
         PendingOutputPoiPreflight::Ready => {}
         PendingOutputPoiPreflight::NotCurrent => {
@@ -1743,22 +1554,15 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
         );
         return Ok(PendingOutputPoiRemoteAttempt::NotCurrent);
     }
-    let context = SingleCommitmentProofContext {
-        txid_version: record.txid_version.clone(),
-        railgun_txid: record.railgun_txid,
-        utxo_tree_in: record.utxo_tree_in,
-        commitment: record.output_commitment,
-        npk: record.output_npk,
-        pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
-    };
+    let context = single_commitment_proof_context(record, pre_transaction_pois);
     debug!(
         chain_id = cfg.chain.chain_id,
         pre_tx_poi_lists = context.pre_transaction_pois_per_txid_leaf_per_list.len(),
-        plan_kind = ?plan.kind,
+        plan_kind = ?plan.predicate,
         "submitting pending output POI context"
     );
     GatewaySubmission {
-        preflight: &preflight,
+        preflight,
         private_poi,
         observation,
     }
@@ -1766,32 +1570,54 @@ pub(super) async fn preflight_and_remote_submit_pending_output_poi(
     .await
 }
 
+/// The record's single-commitment proof context over its selected
+/// pre-transaction POIs.
+fn single_commitment_proof_context(
+    record: &PendingOutputPoiContextRecord,
+    pre_transaction_pois: BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
+) -> SingleCommitmentProofContext {
+    SingleCommitmentProofContext {
+        txid_version: record.txid_version.clone(),
+        railgun_txid: record.railgun_txid,
+        utxo_tree_in: record.utxo_tree_in,
+        commitment: record.output_commitment,
+        npk: record.output_npk,
+        pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
+    }
+}
+
 pub(super) fn pending_output_poi_context_fingerprint(
     record: &PendingOutputPoiContextRecord,
 ) -> Option<Vec<u8>> {
-    rmp_serde::to_vec(record).ok()
+    record_fingerprint(record)
 }
 
 fn output_poi_recovery_fingerprint(record: &OutputPoiRecoveryRecord) -> Option<Vec<u8>> {
+    record_fingerprint(record)
+}
+
+/// The record's rmp-serde bytes, which predecessor checks compare.
+fn record_fingerprint<T: Serialize>(record: &T) -> Option<Vec<u8>> {
     rmp_serde::to_vec(record).ok()
 }
 
 pub(super) fn expected_pending_context_state(
     record: Option<&PendingOutputPoiContextRecord>,
 ) -> Option<ExpectedRecordState> {
-    match record {
-        Some(record) => {
-            pending_output_poi_context_fingerprint(record).map(ExpectedRecordState::Present)
-        }
-        None => Some(ExpectedRecordState::Absent),
-    }
+    expected_record_state(record)
 }
 
 pub(super) fn expected_recovery_state(
     record: Option<&OutputPoiRecoveryRecord>,
 ) -> Option<ExpectedRecordState> {
+    expected_record_state(record)
+}
+
+/// The expected state of an optional record. `None` when a present record
+/// can't be fingerprinted.
+fn expected_record_state<T: Serialize>(record: Option<&T>) -> Option<ExpectedRecordState> {
     match record {
-        Some(record) => output_poi_recovery_fingerprint(record).map(ExpectedRecordState::Present),
+        Some(record) => record_fingerprint(record).map(ExpectedRecordState::Present),
         None => Some(ExpectedRecordState::Absent),
     }
 }
