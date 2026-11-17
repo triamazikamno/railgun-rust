@@ -22,13 +22,16 @@ use url::Url;
 use crate::types::IndexedArtifactSourceConfig;
 
 mod artifact;
+mod checkpoints;
 mod index;
 mod lookup;
 mod manifest;
 mod paths;
 mod proof;
 mod sync;
+mod sync_session;
 mod types;
+mod validated;
 
 use index::{rebuild_index_for_manifest, update_index_for_page, write_blob_file};
 use lookup::{find_target_row, read_tree_leaves};
