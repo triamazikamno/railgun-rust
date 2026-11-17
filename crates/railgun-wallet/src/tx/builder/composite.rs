@@ -1,12 +1,9 @@
 //! Composite unshield plans: several unshield legs in one batch, executed
 //! directly against the Railgun contract or through a Relay Adapt contract.
 
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::sol_types::SolCall;
+use alloy::primitives::{Address, FixedBytes, U256};
 
-use broadcaster_core::contracts::railgun::{
-    ActionData, RelayAdapt7702, RelayAdapt7702ActionData, Transaction, relayCall, transactCall,
-};
+use broadcaster_core::contracts::railgun::ActionData;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::MerkleForest;
@@ -19,16 +16,13 @@ use super::super::{
     BroadcasterFeeOutput, BuildError, CompositeAdapter, CompositeExecution, CompositePlanShape,
     CompositePrivateOutputRole, CompositePrivateOutputRoleKind, CompositeUnshieldLeg,
     CompositeUnshieldLegMetadata, CompositeUnshieldPlan, CompositeUnshieldPlannedOutput,
-    CompositeUnshieldRequest, InputWitness, MAX_BATCH_TRANSACTIONS, TransactionBuilder,
-    TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, UnshieldRequest,
+    CompositeUnshieldRequest, MAX_BATCH_TRANSACTIONS, TransactionBuilder, UnshieldRequest,
 };
+use super::batch::{BatchPlanner, ProvenBatch};
 use super::outputs::{
     FeeOnlyOutputs, UnshieldOutputs, build_fee_only_outputs, build_unshield_outputs,
 };
-use super::plan::{
-    InputWitnessProofCache, SpendAllocation, TransactionPlanBuilder, TransactionProver,
-    UnprovenTransactionPlan, prove_transaction_plans, spend_allocations,
-};
+use super::plan::{SpendAllocation, TransactionProver, spend_allocations};
 use super::rand_array;
 use super::selection::{
     BatchUtxoSelection, UtxoSelection, remove_selected_utxos,
@@ -104,7 +98,7 @@ impl TransactionBuilder {
         let routing = self.composite_routing(&request)?;
         let mut remaining_utxos = utxos.to_vec();
         let mut build = CompositeUnshieldBuild::new(
-            CompositePlanner::new(self, viewing, signer, forest, routing.execution),
+            BatchPlanner::new(self, viewing, signer, forest, routing.execution),
             &request,
         );
 
@@ -190,115 +184,10 @@ pub(super) struct CompositeRouting {
     pub(super) uses_relay_adapt: bool,
 }
 
-/// The transactions of one composite batch in build order, sharing an input
-/// witness cache and an execution target.
-pub(super) struct CompositePlanner<'a, S: RailgunSpendSigner> {
-    builder: &'a TransactionBuilder,
-    pub(super) viewing: &'a ViewingKeyData,
-    signer: &'a S,
-    forest: &'a MerkleForest,
-    pub(super) execution: CompositeExecution,
-    pub(super) input_witness_cache: InputWitnessProofCache<'a>,
-    pub(super) unproven_plans: Vec<UnprovenTransactionPlan>,
-}
-
-pub(super) struct ProvenComposite {
-    pub(super) call: TransactionCall,
-    pub(super) inputs: Vec<InputWitness>,
-    pub(super) outputs: Vec<Note>,
-    pub(super) chunks: Vec<TransactionPlanChunk>,
-}
-
-impl<'a, S: RailgunSpendSigner> CompositePlanner<'a, S> {
-    pub(super) fn new(
-        builder: &'a TransactionBuilder,
-        viewing: &'a ViewingKeyData,
-        signer: &'a S,
-        forest: &'a MerkleForest,
-        execution: CompositeExecution,
-    ) -> Self {
-        Self {
-            builder,
-            viewing,
-            signer,
-            forest,
-            execution,
-            input_witness_cache: InputWitnessProofCache::new(forest),
-            unproven_plans: Vec::new(),
-        }
-    }
-
-    pub(super) fn plan_builder(
-        &self,
-        utxos: Vec<Utxo>,
-        token_address: Address,
-    ) -> Result<TransactionPlanBuilder<'a, S>, BuildError> {
-        TransactionPlanBuilder::new(
-            self.builder,
-            self.viewing,
-            self.signer,
-            self.forest,
-            utxos,
-            token_address,
-        )
-    }
-
-    /// Points every transaction at the adapter and binds it to the relay action.
-    pub(super) fn bind_adapt_params(&mut self, action_data: &ActionData) {
-        debug_assert!(action_data.requireSuccess);
-        let transactions = self
-            .unproven_plans
-            .iter()
-            .map(|plan| &plan.transaction)
-            .collect::<Vec<_>>();
-        let adapt_params = match self.execution {
-            CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
-            _ => action_data.adapt_params(&transactions),
-        };
-        for plan in &mut self.unproven_plans {
-            plan.transaction.boundParams.adaptContract = self.execution.account();
-            plan.transaction.boundParams.adaptParams = adapt_params;
-        }
-    }
-
-    /// Proves every transaction, then encodes the batch call for the execution target.
-    pub(super) async fn prove<P: TransactionProver>(
-        self,
-        prover: &P,
-        verify_proof: bool,
-        action_data: Option<&ActionData>,
-    ) -> Result<ProvenComposite, BuildError> {
-        let proven_plans =
-            prove_transaction_plans(self.unproven_plans, self.signer, prover, verify_proof).await?;
-        let mut transactions = Vec::with_capacity(proven_plans.len());
-        let mut chunks = Vec::with_capacity(proven_plans.len());
-        for proven in proven_plans {
-            transactions.push(proven.transaction);
-            chunks.push(proven.chunk);
-        }
-
-        let call = composite_call(self.execution, transactions, action_data)?;
-        let inputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.inputs.clone())
-            .collect::<Vec<_>>();
-        let outputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.outputs.clone())
-            .collect::<Vec<_>>();
-        Ok(ProvenComposite {
-            call,
-            inputs,
-            outputs,
-            chunks,
-        })
-    }
-}
-
 /// A composite unshield plan's outputs and leg metadata, recorded as its
 /// transactions are built.
 struct CompositeUnshieldBuild<'a, S: RailgunSpendSigner> {
-    planner: CompositePlanner<'a, S>,
+    planner: BatchPlanner<'a, S>,
     request: &'a CompositeUnshieldRequest,
     receiver: AddressData,
     broadcaster_fee_note: Option<Note>,
@@ -308,7 +197,7 @@ struct CompositeUnshieldBuild<'a, S: RailgunSpendSigner> {
 }
 
 impl<'a, S: RailgunSpendSigner> CompositeUnshieldBuild<'a, S> {
-    fn new(planner: CompositePlanner<'a, S>, request: &'a CompositeUnshieldRequest) -> Self {
+    fn new(planner: BatchPlanner<'a, S>, request: &'a CompositeUnshieldRequest) -> Self {
         let receiver = planner.viewing.address_data();
         let leg_metadata = request
             .legs
@@ -470,7 +359,7 @@ impl<'a, S: RailgunSpendSigner> CompositeUnshieldBuild<'a, S> {
         routing: CompositeRouting,
         action_data: Option<ActionData>,
     ) -> Result<CompositeUnshieldPlan, BuildError> {
-        let ProvenComposite {
+        let ProvenBatch {
             call,
             inputs,
             outputs,
@@ -751,40 +640,4 @@ fn composite_build_leg_order(
     }
     order.extend((0..leg_count).filter(|index| Some(*index) != embedded_fee_leg_index));
     order
-}
-
-fn composite_call(
-    execution: CompositeExecution,
-    transactions: Vec<Transaction>,
-    action_data: Option<&ActionData>,
-) -> Result<TransactionCall, BuildError> {
-    let data = match (execution, action_data) {
-        (CompositeExecution::Direct(_), None) => transactCall {
-            _transactions: transactions,
-        }
-        .abi_encode(),
-        (CompositeExecution::RelayAdapt(_), Some(actions)) => relayCall {
-            _transactions: transactions,
-            _actionData: actions.clone(),
-        }
-        .abi_encode(),
-        (CompositeExecution::Executor(context), Some(actions)) if actions.requireSuccess => {
-            RelayAdapt7702::executeCall {
-                _transactions: transactions,
-                _actionData: RelayAdapt7702ActionData {
-                    requireSuccess: true,
-                    minGasLimit: actions.minGasLimit,
-                    calls: actions.calls.clone(),
-                },
-                _nonce: context.execution_nonce,
-                _signature: Bytes::new(),
-            }
-            .abi_encode()
-        }
-        _ => return Err(BuildError::InvalidExecutorCall),
-    };
-    Ok(TransactionCall {
-        to: execution.account(),
-        data: data.into(),
-    })
 }

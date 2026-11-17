@@ -20,10 +20,8 @@ use super::super::{
     MixedPrivateOutputSource, MixedPrivatePlannedOutput, MixedPublicPlannedOutput,
     SelectedInputIdentity, SendRequest, TransactionBuilder, TransactionShape, UnshieldRequest,
 };
-use super::composite::{
-    CompositePlanner, CompositeRouting, ProvenComposite,
-    select_composite_leg_selections_with_policy,
-};
+use super::batch::{BatchPlanner, ProvenBatch};
+use super::composite::{CompositeRouting, select_composite_leg_selections_with_policy};
 use super::outputs::{SendOutputs, UnshieldOutputs, build_send_outputs, build_unshield_outputs};
 use super::plan::{SpendAllocation, TransactionProver, UnprovenTransactionPlan, spend_allocations};
 use super::rand_array;
@@ -195,7 +193,7 @@ impl TransactionBuilder {
         } = self.select_mixed_private_action_plan(utxos, &request)?;
         let execution = preview.shape.execution;
         let mut build = MixedActionBuild::new(
-            CompositePlanner::new(self, viewing, signer, forest, execution),
+            BatchPlanner::new(self, viewing, signer, forest, execution),
             &request,
         );
 
@@ -243,7 +241,7 @@ fn mixed_action_data(
 /// A mixed private action's planned outputs, recorded as its transactions are
 /// built.
 struct MixedActionBuild<'a, S: RailgunSpendSigner> {
-    planner: CompositePlanner<'a, S>,
+    planner: BatchPlanner<'a, S>,
     request: &'a MixedPrivateActionRequest,
     sender: AddressData,
     private_outputs: Vec<MixedPrivatePlannedOutput>,
@@ -251,7 +249,7 @@ struct MixedActionBuild<'a, S: RailgunSpendSigner> {
 }
 
 impl<'a, S: RailgunSpendSigner> MixedActionBuild<'a, S> {
-    fn new(planner: CompositePlanner<'a, S>, request: &'a MixedPrivateActionRequest) -> Self {
+    fn new(planner: BatchPlanner<'a, S>, request: &'a MixedPrivateActionRequest) -> Self {
         let sender = planner.viewing.address_data();
         Self {
             planner,
@@ -461,7 +459,7 @@ impl<'a, S: RailgunSpendSigner> MixedActionBuild<'a, S> {
         preview: MixedPrivateActionPreview,
         action_data: Option<ActionData>,
     ) -> Result<MixedPrivateActionPlan, BuildError> {
-        let ProvenComposite {
+        let ProvenBatch {
             call,
             inputs,
             outputs,

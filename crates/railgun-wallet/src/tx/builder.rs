@@ -30,6 +30,7 @@ use selection::{
     select_fee_utxos,
 };
 
+mod batch;
 mod composite;
 mod mixed;
 mod outputs;
