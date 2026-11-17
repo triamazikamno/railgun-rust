@@ -40,17 +40,18 @@ use crate::tx::{
     generate_pre_transaction_pois, insert_pre_transaction_poi, poi_circuit_variant,
 };
 
+use super::composite::select_composite_leg_selections;
 use super::outputs::{build_fee_only_outputs, build_send_outputs, build_unshield_outputs};
 use super::plan::{
     BoundParamsExt, InputWitnessProofCache, TransactionPlanBuilder, TransactionProver,
 };
+use super::select_utxos;
 use super::{
     max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
     send_selection_info, send_selection_info_with_broadcaster_fee,
     send_selection_info_with_broadcaster_fee_token,
     send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
 };
-use super::{select_composite_leg_selections, select_utxos};
 
 struct MockSpendSigner {
     signed_msg: Cell<Option<U256>>,
