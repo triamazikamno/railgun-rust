@@ -21,7 +21,8 @@ use super::super::{
     SelectedInputIdentity, SendRequest, TransactionBuilder, TransactionShape, UnshieldRequest,
 };
 use super::composite::{
-    CompositePlanner, ProvenComposite, select_composite_leg_selections_with_policy,
+    CompositePlanner, CompositeRouting, ProvenComposite,
+    select_composite_leg_selections_with_policy,
 };
 use super::outputs::{SendOutputs, UnshieldOutputs, build_send_outputs, build_unshield_outputs};
 use super::plan::{SpendAllocation, TransactionProver, UnprovenTransactionPlan, spend_allocations};
@@ -50,105 +51,13 @@ impl TransactionBuilder {
         utxos: &[Utxo],
         request: &MixedPrivateActionRequest,
     ) -> Result<MixedPrivateActionSelectionPlan, BuildError> {
-        if request.private_sends.is_empty() && request.public_unshields.is_empty() {
-            return Err(BuildError::EmptyMixedPrivateActionRequest);
-        }
-        if !request.executor_calls.is_empty() {
-            if !matches!(request.adapter, Some(CompositeAdapter::Executor(_))) {
-                return Err(BuildError::InvalidExecutorContext);
-            }
-            if request.relay_actions.is_some() {
-                return Err(BuildError::ConflictingExecutorActions);
-            }
-        }
-        let has_relay_adapt_leg = request
-            .public_unshields
-            .iter()
-            .any(|leg| leg.recipient.uses_relay_adapt());
-        let relay_call_count = request.executor_calls.len()
-            + request
-                .relay_actions
-                .as_ref()
-                .map_or(0, |actions| actions.calls.len());
-        if has_relay_adapt_leg && relay_call_count == 0 {
-            return Err(BuildError::MissingCompositeRelayActions);
-        }
-        // Executor plans always settle through `execute`, even with no calls, so the
-        // executor signature also binds fee-only setup plans.
-        let uses_relay_adapt = has_relay_adapt_leg
-            || relay_call_count > 0
-            || matches!(request.adapter, Some(CompositeAdapter::Executor(_)));
-        let execution = self.composite_execution(uses_relay_adapt, request.adapter)?;
-        let candidate_utxos = request.rebuild.as_ref().map_or_else(
-            || Ok(utxos.to_vec()),
-            |constraint| resolve_pinned_utxos(utxos, &constraint.selected_inputs),
-        )?;
-        let selection_legs = request
-            .public_unshields
-            .iter()
-            .copied()
-            .chain(
-                request
-                    .private_sends
-                    .iter()
-                    .map(|send| CompositeUnshieldLeg {
-                        token_address: send.token_address,
-                        amount: send.amount,
-                        recipient: CompositeUnshieldRecipient::Public(Address::ZERO),
-                        role: CompositeUnshieldLegRole::Other,
-                    }),
-            )
-            .collect::<Vec<_>>();
-        let spend_up_to_by_leg = std::iter::repeat_n(false, request.public_unshields.len())
-            .chain(std::iter::repeat_n(
-                request.spend_up_to,
-                request.private_sends.len(),
-            ))
-            .collect::<Vec<_>>();
-        let (selections, _) = select_composite_leg_selections_with_policy(
-            &candidate_utxos,
-            &selection_legs,
-            None,
-            &spend_up_to_by_leg,
-            0,
-        )
-        .map_err(|error| match (request.rebuild.is_some(), error) {
-            (true, BuildError::InsufficientBalance(max)) => {
-                BuildError::PinnedInputsInsufficient(max)
-            }
-            (_, other) => other,
-        })?;
-
-        // Build order: private sends, then public unshields.
-        let mut transactions = Vec::new();
-        for (send_index, send) in request.private_sends.iter().enumerate() {
-            let selection = &selections[request.public_unshields.len() + send_index];
-            let allocations = spend_allocations(
-                selection,
-                send.amount,
-                U256::ZERO,
-                None,
-                request.spend_up_to,
-            )?;
-            transactions.extend(selection.chunks.iter().zip(allocations).map(
-                |(chunk, allocation)| TransactionShape {
-                    input_count: chunk.utxos.len(),
-                    output_count: 1 + usize::from(!allocation.change.is_zero()),
-                    has_unshield: false,
-                },
-            ));
-        }
-        for (unshield_index, leg) in request.public_unshields.iter().enumerate() {
-            let selection = &selections[unshield_index];
-            let allocations = spend_allocations(selection, leg.amount, U256::ZERO, None, false)?;
-            transactions.extend(selection.chunks.iter().zip(allocations).map(
-                |(chunk, allocation)| TransactionShape {
-                    input_count: chunk.utxos.len(),
-                    output_count: 1 + usize::from(!allocation.change.is_zero()),
-                    has_unshield: true,
-                },
-            ));
-        }
+        let CompositeRouting {
+            execution,
+            relay_call_count,
+            uses_relay_adapt,
+        } = self.mixed_routing(request)?;
+        let selections = select_mixed_legs(utxos, request)?;
+        let transactions = mixed_transaction_shapes(request, &selections)?;
         let public_output_count = transactions
             .iter()
             .filter(|transaction| transaction.has_unshield)
@@ -200,6 +109,39 @@ impl TransactionBuilder {
                 shape,
                 transactions,
             },
+        })
+    }
+
+    fn mixed_routing(
+        &self,
+        request: &MixedPrivateActionRequest,
+    ) -> Result<CompositeRouting, BuildError> {
+        if request.private_sends.is_empty() && request.public_unshields.is_empty() {
+            return Err(BuildError::EmptyMixedPrivateActionRequest);
+        }
+        validate_executor_calls(request)?;
+        let has_relay_adapt_leg = request
+            .public_unshields
+            .iter()
+            .any(|leg| leg.recipient.uses_relay_adapt());
+        let relay_call_count = request.executor_calls.len()
+            + request
+                .relay_actions
+                .as_ref()
+                .map_or(0, |actions| actions.calls.len());
+        if has_relay_adapt_leg && relay_call_count == 0 {
+            return Err(BuildError::MissingCompositeRelayActions);
+        }
+        // Executor plans always settle through `execute`, even with no calls, so the
+        // executor signature also binds fee-only setup plans.
+        let uses_relay_adapt = has_relay_adapt_leg
+            || relay_call_count > 0
+            || matches!(request.adapter, Some(CompositeAdapter::Executor(_)));
+        let execution = self.composite_execution(uses_relay_adapt, request.adapter)?;
+        Ok(CompositeRouting {
+            execution,
+            relay_call_count,
+            uses_relay_adapt,
         })
     }
 
@@ -540,6 +482,111 @@ impl<'a, S: RailgunSpendSigner> MixedActionBuild<'a, S> {
             shape: preview.shape,
         })
     }
+}
+
+/// Executor calls need an executor adapter and cannot be combined with relay actions.
+const fn validate_executor_calls(request: &MixedPrivateActionRequest) -> Result<(), BuildError> {
+    if request.executor_calls.is_empty() {
+        return Ok(());
+    }
+    if !matches!(request.adapter, Some(CompositeAdapter::Executor(_))) {
+        return Err(BuildError::InvalidExecutorContext);
+    }
+    if request.relay_actions.is_some() {
+        return Err(BuildError::ConflictingExecutorActions);
+    }
+    Ok(())
+}
+
+/// One batch selection per leg, public unshields first and then private sends,
+/// taken from the pinned inputs when rebuilding.
+fn select_mixed_legs(
+    utxos: &[Utxo],
+    request: &MixedPrivateActionRequest,
+) -> Result<Vec<BatchUtxoSelection>, BuildError> {
+    let candidate_utxos = request.rebuild.as_ref().map_or_else(
+        || Ok(utxos.to_vec()),
+        |constraint| resolve_pinned_utxos(utxos, &constraint.selected_inputs),
+    )?;
+    let selection_legs = request
+        .public_unshields
+        .iter()
+        .copied()
+        .chain(
+            request
+                .private_sends
+                .iter()
+                .map(|send| CompositeUnshieldLeg {
+                    token_address: send.token_address,
+                    amount: send.amount,
+                    recipient: CompositeUnshieldRecipient::Public(Address::ZERO),
+                    role: CompositeUnshieldLegRole::Other,
+                }),
+        )
+        .collect::<Vec<_>>();
+    let spend_up_to_by_leg = std::iter::repeat_n(false, request.public_unshields.len())
+        .chain(std::iter::repeat_n(
+            request.spend_up_to,
+            request.private_sends.len(),
+        ))
+        .collect::<Vec<_>>();
+    let (selections, _) = select_composite_leg_selections_with_policy(
+        &candidate_utxos,
+        &selection_legs,
+        None,
+        &spend_up_to_by_leg,
+        0,
+    )
+    .map_err(|error| match (request.rebuild.is_some(), error) {
+        (true, BuildError::InsufficientBalance(max)) => BuildError::PinnedInputsInsufficient(max),
+        (_, other) => other,
+    })?;
+    Ok(selections)
+}
+
+fn mixed_transaction_shapes(
+    request: &MixedPrivateActionRequest,
+    selections: &[BatchUtxoSelection],
+) -> Result<Vec<TransactionShape>, BuildError> {
+    // Build order: private sends, then public unshields.
+    let mut transactions = Vec::new();
+    for (send_index, send) in request.private_sends.iter().enumerate() {
+        let selection = &selections[request.public_unshields.len() + send_index];
+        let allocations = spend_allocations(
+            selection,
+            send.amount,
+            U256::ZERO,
+            None,
+            request.spend_up_to,
+        )?;
+        transactions.extend(
+            selection
+                .chunks
+                .iter()
+                .zip(allocations)
+                .map(|(chunk, allocation)| TransactionShape {
+                    input_count: chunk.utxos.len(),
+                    output_count: 1 + usize::from(!allocation.change.is_zero()),
+                    has_unshield: false,
+                }),
+        );
+    }
+    for (unshield_index, leg) in request.public_unshields.iter().enumerate() {
+        let selection = &selections[unshield_index];
+        let allocations = spend_allocations(selection, leg.amount, U256::ZERO, None, false)?;
+        transactions.extend(
+            selection
+                .chunks
+                .iter()
+                .zip(allocations)
+                .map(|(chunk, allocation)| TransactionShape {
+                    input_count: chunk.utxos.len(),
+                    output_count: 1 + usize::from(!allocation.change.is_zero()),
+                    has_unshield: true,
+                }),
+        );
+    }
+    Ok(transactions)
 }
 
 fn resolve_pinned_utxos(

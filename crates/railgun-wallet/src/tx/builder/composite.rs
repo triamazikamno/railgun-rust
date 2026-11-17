@@ -184,10 +184,10 @@ impl TransactionBuilder {
 
 /// Where a composite batch settles, and whether it needs relay actions.
 #[derive(Clone, Copy)]
-struct CompositeRouting {
-    execution: CompositeExecution,
-    relay_call_count: usize,
-    uses_relay_adapt: bool,
+pub(super) struct CompositeRouting {
+    pub(super) execution: CompositeExecution,
+    pub(super) relay_call_count: usize,
+    pub(super) uses_relay_adapt: bool,
 }
 
 /// The transactions of one composite batch in build order, sharing an input
