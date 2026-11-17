@@ -7,31 +7,32 @@ use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::{
     ActionData, RelayAdapt7702, RelayAdapt7702ActionData, Transaction, relayCall, transactCall,
 };
-use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::MerkleForest;
 
 use crate::keys::{RailgunSpendSigner, WalletKeys};
+use crate::notes::Note;
 use crate::prover::ProverService;
 
 use super::super::{
     BroadcasterFeeOutput, BuildError, CompositeAdapter, CompositeExecution, CompositePlanShape,
     CompositePrivateOutputRole, CompositePrivateOutputRoleKind, CompositeUnshieldLeg,
     CompositeUnshieldLegMetadata, CompositeUnshieldPlan, CompositeUnshieldPlannedOutput,
-    CompositeUnshieldRequest, MAX_BATCH_TRANSACTIONS, TransactionBuilder, TransactionCall,
-    UNRELAYED_ADAPT_PARAMS, UnshieldRequest,
+    CompositeUnshieldRequest, InputWitness, MAX_BATCH_TRANSACTIONS, TransactionBuilder,
+    TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS, UnshieldRequest,
 };
 use super::outputs::{
     FeeOnlyOutputs, UnshieldOutputs, build_fee_only_outputs, build_unshield_outputs,
 };
 use super::plan::{
-    InputWitnessProofCache, TransactionPlanBuilder, TransactionProver, prove_transaction_plans,
-    spend_allocations,
+    InputWitnessProofCache, SpendAllocation, TransactionPlanBuilder, TransactionProver,
+    UnprovenTransactionPlan, prove_transaction_plans, spend_allocations,
 };
 use super::rand_array;
 use super::selection::{
-    BatchUtxoSelection, remove_selected_utxos, select_batched_utxo_candidates_with_limit,
-    select_batched_utxos_with_limit, select_fee_utxos,
+    BatchUtxoSelection, UtxoSelection, remove_selected_utxos,
+    select_batched_utxo_candidates_with_limit, select_batched_utxos_with_limit, select_fee_utxos,
 };
 
 impl TransactionBuilder {
@@ -100,6 +101,62 @@ impl TransactionBuilder {
         request: CompositeUnshieldRequest,
         prover: &P,
     ) -> Result<CompositeUnshieldPlan, BuildError> {
+        let routing = self.composite_routing(&request)?;
+        let mut remaining_utxos = utxos.to_vec();
+        let mut build = CompositeUnshieldBuild::new(
+            CompositePlanner::new(self, viewing, signer, forest, routing.execution),
+            &request,
+        );
+
+        let embedded_fee = request.broadcaster_fee.filter(|fee| {
+            request
+                .legs
+                .iter()
+                .any(|leg| leg.token_address == fee.token_address)
+        });
+        if embedded_fee.is_none()
+            && let Some(fee) = request.broadcaster_fee
+        {
+            let fee_selection = select_fee_utxos(&remaining_utxos, fee.token_address, fee.amount)?;
+            remove_selected_utxos(&mut remaining_utxos, &fee_selection.utxos);
+            build.push_separate_fee(fee, fee_selection)?;
+        }
+
+        let (leg_selections, embedded_fee_leg_index) = select_composite_leg_selections(
+            &remaining_utxos,
+            &request.legs,
+            embedded_fee,
+            request.spend_up_to,
+            build.planner.unproven_plans.len(),
+        )?;
+        for leg_index in composite_build_leg_order(request.legs.len(), embedded_fee_leg_index) {
+            let leg_fee = embedded_fee
+                .and_then(|fee| (embedded_fee_leg_index == Some(leg_index)).then_some(fee));
+            build.push_leg(leg_index, &leg_selections[leg_index], leg_fee)?;
+        }
+
+        let action_data = if routing.uses_relay_adapt {
+            let actions = request
+                .relay_actions
+                .clone()
+                .ok_or(BuildError::MissingCompositeRelayActions)?;
+            let action_data = actions.action_data(
+                routing.execution.account(),
+                FixedBytes::<31>::from(rand_array()),
+            )?;
+            build.planner.bind_adapt_params(&action_data);
+            Some(action_data)
+        } else {
+            None
+        };
+
+        build.finish(prover, routing, action_data).await
+    }
+
+    fn composite_routing(
+        &self,
+        request: &CompositeUnshieldRequest,
+    ) -> Result<CompositeRouting, BuildError> {
         if request.legs.is_empty() {
             return Err(BuildError::EmptyCompositeUnshieldRequest);
         }
@@ -117,14 +174,143 @@ impl TransactionBuilder {
         }
         let uses_relay_adapt = has_relay_adapt_leg || relay_call_count > 0;
         let execution = self.composite_execution(uses_relay_adapt, request.adapter)?;
-        let mut remaining_utxos = utxos.to_vec();
-        let mut input_witness_cache = InputWitnessProofCache::new(forest);
-        let receiver = viewing.address_data();
-        let mut unproven_plans = Vec::new();
-        let mut broadcaster_fee_note = None;
-        let mut unshield_outputs = Vec::new();
-        let mut private_output_roles = Vec::new();
-        let mut leg_metadata = request
+        Ok(CompositeRouting {
+            execution,
+            relay_call_count,
+            uses_relay_adapt,
+        })
+    }
+}
+
+/// Where a composite batch settles, and whether it needs relay actions.
+#[derive(Clone, Copy)]
+struct CompositeRouting {
+    execution: CompositeExecution,
+    relay_call_count: usize,
+    uses_relay_adapt: bool,
+}
+
+/// The transactions of one composite batch in build order, sharing an input
+/// witness cache and an execution target.
+struct CompositePlanner<'a, S: RailgunSpendSigner> {
+    builder: &'a TransactionBuilder,
+    viewing: &'a ViewingKeyData,
+    signer: &'a S,
+    forest: &'a MerkleForest,
+    execution: CompositeExecution,
+    input_witness_cache: InputWitnessProofCache<'a>,
+    unproven_plans: Vec<UnprovenTransactionPlan>,
+}
+
+struct ProvenComposite {
+    call: TransactionCall,
+    inputs: Vec<InputWitness>,
+    outputs: Vec<Note>,
+    chunks: Vec<TransactionPlanChunk>,
+}
+
+impl<'a, S: RailgunSpendSigner> CompositePlanner<'a, S> {
+    fn new(
+        builder: &'a TransactionBuilder,
+        viewing: &'a ViewingKeyData,
+        signer: &'a S,
+        forest: &'a MerkleForest,
+        execution: CompositeExecution,
+    ) -> Self {
+        Self {
+            builder,
+            viewing,
+            signer,
+            forest,
+            execution,
+            input_witness_cache: InputWitnessProofCache::new(forest),
+            unproven_plans: Vec::new(),
+        }
+    }
+
+    fn plan_builder(
+        &self,
+        utxos: Vec<Utxo>,
+        token_address: Address,
+    ) -> Result<TransactionPlanBuilder<'a, S>, BuildError> {
+        TransactionPlanBuilder::new(
+            self.builder,
+            self.viewing,
+            self.signer,
+            self.forest,
+            utxos,
+            token_address,
+        )
+    }
+
+    /// Points every transaction at the adapter and binds it to the relay action.
+    fn bind_adapt_params(&mut self, action_data: &ActionData) {
+        debug_assert!(action_data.requireSuccess);
+        let transactions = self
+            .unproven_plans
+            .iter()
+            .map(|plan| &plan.transaction)
+            .collect::<Vec<_>>();
+        let adapt_params = match self.execution {
+            CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
+            _ => action_data.adapt_params(&transactions),
+        };
+        for plan in &mut self.unproven_plans {
+            plan.transaction.boundParams.adaptContract = self.execution.account();
+            plan.transaction.boundParams.adaptParams = adapt_params;
+        }
+    }
+
+    /// Proves every transaction, then encodes the batch call for the execution target.
+    async fn prove<P: TransactionProver>(
+        self,
+        prover: &P,
+        verify_proof: bool,
+        action_data: Option<&ActionData>,
+    ) -> Result<ProvenComposite, BuildError> {
+        let proven_plans =
+            prove_transaction_plans(self.unproven_plans, self.signer, prover, verify_proof).await?;
+        let mut transactions = Vec::with_capacity(proven_plans.len());
+        let mut chunks = Vec::with_capacity(proven_plans.len());
+        for proven in proven_plans {
+            transactions.push(proven.transaction);
+            chunks.push(proven.chunk);
+        }
+
+        let call = composite_call(self.execution, transactions, action_data)?;
+        let inputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.inputs.clone())
+            .collect::<Vec<_>>();
+        let outputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.outputs.clone())
+            .collect::<Vec<_>>();
+        Ok(ProvenComposite {
+            call,
+            inputs,
+            outputs,
+            chunks,
+        })
+    }
+}
+
+/// A composite unshield plan's outputs and leg metadata, recorded as its
+/// transactions are built.
+struct CompositeUnshieldBuild<'a, S: RailgunSpendSigner> {
+    planner: CompositePlanner<'a, S>,
+    request: &'a CompositeUnshieldRequest,
+    receiver: AddressData,
+    broadcaster_fee_note: Option<Note>,
+    unshield_outputs: Vec<CompositeUnshieldPlannedOutput>,
+    private_output_roles: Vec<CompositePrivateOutputRole>,
+    leg_metadata: Vec<CompositeUnshieldLegMetadata>,
+}
+
+impl<'a, S: RailgunSpendSigner> CompositeUnshieldBuild<'a, S> {
+    fn new(planner: CompositePlanner<'a, S>, request: &'a CompositeUnshieldRequest) -> Self {
+        let receiver = planner.viewing.address_data();
+        let leg_metadata = request
             .legs
             .iter()
             .enumerate()
@@ -137,208 +323,170 @@ impl TransactionBuilder {
                 transaction_indices: Vec::new(),
             })
             .collect::<Vec<_>>();
-
-        let embedded_fee = request.broadcaster_fee.filter(|fee| {
-            request
-                .legs
-                .iter()
-                .any(|leg| leg.token_address == fee.token_address)
-        });
-        if embedded_fee.is_none()
-            && let Some(fee) = request.broadcaster_fee
-        {
-            let fee_selection = select_fee_utxos(&remaining_utxos, fee.token_address, fee.amount)?;
-            remove_selected_utxos(&mut remaining_utxos, &fee_selection.utxos);
-            let fee_change = fee_selection.total - fee.amount;
-            let fee_plan_builder = TransactionPlanBuilder::new(
-                self,
-                viewing,
-                signer,
-                forest,
-                fee_selection.utxos,
-                fee.token_address,
-            )?;
-            let FeeOnlyOutputs {
-                outputs,
-                commitment_ciphertext,
-                broadcaster_fee_note: fee_note,
-                change_note,
-            } = build_fee_only_outputs(fee, fee_change, &receiver, &viewing.viewing_private_key)?;
-            private_output_roles.push(CompositePrivateOutputRole {
-                chunk_index: 0,
-                output_index: 0,
-                role: CompositePrivateOutputRoleKind::BroadcasterFee,
-                token_address: fee.token_address,
-            });
-            if change_note.is_some() {
-                private_output_roles.push(CompositePrivateOutputRole {
-                    chunk_index: 0,
-                    output_index: 1,
-                    role: CompositePrivateOutputRoleKind::Change,
-                    token_address: fee.token_address,
-                });
-            }
-            broadcaster_fee_note = Some(fee_note);
-            unproven_plans.push(fee_plan_builder.build_unproven_fee_only(
-                fee.token_address,
-                request.min_gas_price,
-                outputs,
-                commitment_ciphertext,
-                Some(&mut input_witness_cache),
-            )?);
+        Self {
+            planner,
+            request,
+            receiver,
+            broadcaster_fee_note: None,
+            unshield_outputs: Vec::new(),
+            private_output_roles: Vec::new(),
+            leg_metadata,
         }
+    }
 
-        let (leg_selections, embedded_fee_leg_index) = select_composite_leg_selections(
-            &remaining_utxos,
-            &request.legs,
-            embedded_fee,
-            request.spend_up_to,
-            unproven_plans.len(),
+    /// Adds the fee-only transaction for a broadcaster fee in a token no leg spends.
+    fn push_separate_fee(
+        &mut self,
+        fee: BroadcasterFeeOutput,
+        fee_selection: UtxoSelection,
+    ) -> Result<(), BuildError> {
+        let fee_change = fee_selection.total - fee.amount;
+        let fee_plan_builder = self
+            .planner
+            .plan_builder(fee_selection.utxos, fee.token_address)?;
+        let FeeOnlyOutputs {
+            outputs,
+            commitment_ciphertext,
+            broadcaster_fee_note: fee_note,
+            change_note,
+        } = build_fee_only_outputs(
+            fee,
+            fee_change,
+            &self.receiver,
+            &self.planner.viewing.viewing_private_key,
         )?;
-        for leg_index in composite_build_leg_order(request.legs.len(), embedded_fee_leg_index) {
-            let leg = request.legs[leg_index];
-            let selection = &leg_selections[leg_index];
-            let leg_fee = embedded_fee
-                .and_then(|fee| (embedded_fee_leg_index == Some(leg_index)).then_some(fee));
-            let allocations = spend_allocations(
-                selection,
-                leg.amount,
-                leg_fee.map_or(U256::ZERO, |fee| fee.amount),
-                leg_fee,
-                request.spend_up_to,
-            )?;
-            let unshield_to = leg.recipient.unshield_to(execution.account());
+        self.push_private_output_roles(
+            0,
+            Some(fee),
+            change_note.is_some().then_some(fee.token_address),
+        );
+        self.broadcaster_fee_note = Some(fee_note);
+        self.planner
+            .unproven_plans
+            .push(fee_plan_builder.build_unproven_fee_only(
+                fee.token_address,
+                self.request.min_gas_price,
+                outputs,
+                commitment_ciphertext,
+                Some(&mut self.planner.input_witness_cache),
+            )?);
+        Ok(())
+    }
 
-            for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
-                let transaction_index = unproven_plans.len();
-                let plan_builder = TransactionPlanBuilder::new(
-                    self,
-                    viewing,
-                    signer,
-                    forest,
-                    chunk.utxos,
-                    leg.token_address,
-                )?;
-                let UnshieldOutputs {
-                    outputs,
-                    commitment_ciphertext,
-                    broadcaster_fee_note: chunk_fee_note,
-                    unshield_note,
-                    unshield_output_index: output_index,
-                    change_note,
-                } = build_unshield_outputs(
-                    leg.token_address,
-                    allocation.amount,
-                    unshield_to,
-                    allocation.change,
-                    &receiver,
-                    allocation.fee,
-                    &viewing.viewing_private_key,
-                )?;
-                if let Some(fee) = allocation.fee {
-                    private_output_roles.push(CompositePrivateOutputRole {
-                        chunk_index: transaction_index,
-                        output_index: 0,
-                        role: CompositePrivateOutputRoleKind::BroadcasterFee,
-                        token_address: fee.token_address,
-                    });
-                }
-                if let Some(note) = chunk_fee_note {
-                    broadcaster_fee_note.get_or_insert(note);
-                }
-                if change_note.is_some() {
-                    private_output_roles.push(CompositePrivateOutputRole {
-                        chunk_index: transaction_index,
-                        output_index: usize::from(allocation.fee.is_some()),
-                        role: CompositePrivateOutputRoleKind::Change,
-                        token_address: leg.token_address,
-                    });
-                }
+    fn push_leg(
+        &mut self,
+        leg_index: usize,
+        selection: &BatchUtxoSelection,
+        leg_fee: Option<BroadcasterFeeOutput>,
+    ) -> Result<(), BuildError> {
+        let leg = self.request.legs[leg_index];
+        let allocations = spend_allocations(
+            selection,
+            leg.amount,
+            leg_fee.map_or(U256::ZERO, |fee| fee.amount),
+            leg_fee,
+            self.request.spend_up_to,
+        )?;
+        for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
+            self.push_leg_chunk(leg_index, chunk, allocation)?;
+        }
+        Ok(())
+    }
 
-                unshield_outputs.push(CompositeUnshieldPlannedOutput {
-                    leg_index,
-                    transaction_index,
-                    output_index,
-                    token_address: leg.token_address,
-                    amount: allocation.amount,
-                    recipient: leg.recipient,
-                    role: leg.role,
-                    note: unshield_note.clone(),
-                });
-                leg_metadata[leg_index]
-                    .transaction_indices
-                    .push(transaction_index);
-
-                let unshield_request = UnshieldRequest {
-                    token_address: leg.token_address,
-                    amount: allocation.amount,
-                    recipient: unshield_to,
-                    verify_proof: request.verify_proof,
-                    spend_up_to: request.spend_up_to,
-                    broadcaster_fee: allocation.fee,
-                    min_gas_price: request.min_gas_price,
-                };
-                unproven_plans.push(plan_builder.build_unproven_unshield(
-                    unshield_request,
-                    outputs,
-                    commitment_ciphertext,
-                    &unshield_note,
-                    Some(&mut input_witness_cache),
-                )?);
-            }
+    fn push_leg_chunk(
+        &mut self,
+        leg_index: usize,
+        chunk: UtxoSelection,
+        allocation: SpendAllocation,
+    ) -> Result<(), BuildError> {
+        let leg = self.request.legs[leg_index];
+        let unshield_to = leg.recipient.unshield_to(self.planner.execution.account());
+        let transaction_index = self.planner.unproven_plans.len();
+        let plan_builder = self.planner.plan_builder(chunk.utxos, leg.token_address)?;
+        let UnshieldOutputs {
+            outputs,
+            commitment_ciphertext,
+            broadcaster_fee_note: chunk_fee_note,
+            unshield_note,
+            unshield_output_index: output_index,
+            change_note,
+        } = build_unshield_outputs(
+            leg.token_address,
+            allocation.amount,
+            unshield_to,
+            allocation.change,
+            &self.receiver,
+            allocation.fee,
+            &self.planner.viewing.viewing_private_key,
+        )?;
+        self.push_private_output_roles(
+            transaction_index,
+            allocation.fee,
+            change_note.is_some().then_some(leg.token_address),
+        );
+        if let Some(note) = chunk_fee_note {
+            self.broadcaster_fee_note.get_or_insert(note);
         }
 
-        let action_data = if uses_relay_adapt {
-            let actions = request
-                .relay_actions
-                .clone()
-                .ok_or(BuildError::MissingCompositeRelayActions)?;
-            let action_data =
-                actions.action_data(execution.account(), FixedBytes::<31>::from(rand_array()))?;
-            debug_assert!(action_data.requireSuccess);
-            let transactions = unproven_plans
-                .iter()
-                .map(|plan| &plan.transaction)
-                .collect::<Vec<_>>();
-            let adapt_params = match execution {
-                CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
-                _ => action_data.adapt_params(&transactions),
-            };
-            for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = execution.account();
-                plan.transaction.boundParams.adaptParams = adapt_params;
-            }
-            Some(action_data)
-        } else {
-            None
+        self.unshield_outputs.push(CompositeUnshieldPlannedOutput {
+            leg_index,
+            transaction_index,
+            output_index,
+            token_address: leg.token_address,
+            amount: allocation.amount,
+            recipient: leg.recipient,
+            role: leg.role,
+            note: unshield_note.clone(),
+        });
+        self.leg_metadata[leg_index]
+            .transaction_indices
+            .push(transaction_index);
+
+        let unshield_request = UnshieldRequest {
+            token_address: leg.token_address,
+            amount: allocation.amount,
+            recipient: unshield_to,
+            verify_proof: self.request.verify_proof,
+            spend_up_to: self.request.spend_up_to,
+            broadcaster_fee: allocation.fee,
+            min_gas_price: self.request.min_gas_price,
         };
+        self.planner
+            .unproven_plans
+            .push(plan_builder.build_unproven_unshield(
+                unshield_request,
+                outputs,
+                commitment_ciphertext,
+                &unshield_note,
+                Some(&mut self.planner.input_witness_cache),
+            )?);
+        Ok(())
+    }
 
-        let proven_plans =
-            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
-        let mut transactions = Vec::with_capacity(proven_plans.len());
-        let mut chunks = Vec::with_capacity(proven_plans.len());
-        for proven in proven_plans {
-            transactions.push(proven.transaction);
-            chunks.push(proven.chunk);
-        }
-
-        let call = composite_call(execution, transactions, action_data.as_ref())?;
-        let inputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.inputs.clone())
-            .collect::<Vec<_>>();
-        let outputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.outputs.clone())
-            .collect::<Vec<_>>();
+    /// Proves the batch and assembles the plan from the recorded outputs.
+    async fn finish<P: TransactionProver>(
+        self,
+        prover: &P,
+        routing: CompositeRouting,
+        action_data: Option<ActionData>,
+    ) -> Result<CompositeUnshieldPlan, BuildError> {
+        let ProvenComposite {
+            call,
+            inputs,
+            outputs,
+            chunks,
+        } = self
+            .planner
+            .prove(prover, self.request.verify_proof, action_data.as_ref())
+            .await?;
         let shape = CompositePlanShape {
-            execution,
+            execution: routing.execution,
             transaction_count: chunks.len(),
             input_count: inputs.len(),
-            private_output_count: private_output_roles.len(),
-            public_output_count: unshield_outputs.len(),
-            relay_call_count,
-            uses_relay_adapt,
+            private_output_count: self.private_output_roles.len(),
+            public_output_count: self.unshield_outputs.len(),
+            relay_call_count: routing.relay_call_count,
+            uses_relay_adapt: routing.uses_relay_adapt,
         };
 
         Ok(CompositeUnshieldPlan {
@@ -346,13 +494,39 @@ impl TransactionBuilder {
             inputs,
             outputs,
             chunks,
-            broadcaster_fee_note,
-            unshield_outputs,
-            leg_metadata,
-            private_output_roles,
+            broadcaster_fee_note: self.broadcaster_fee_note,
+            unshield_outputs: self.unshield_outputs,
+            leg_metadata: self.leg_metadata,
+            private_output_roles: self.private_output_roles,
             action_data,
             shape,
         })
+    }
+
+    /// Records a transaction's broadcaster fee output (first, when present) and
+    /// its change output (next, when present).
+    fn push_private_output_roles(
+        &mut self,
+        chunk_index: usize,
+        fee: Option<BroadcasterFeeOutput>,
+        change_token: Option<Address>,
+    ) {
+        if let Some(fee) = fee {
+            self.private_output_roles.push(CompositePrivateOutputRole {
+                chunk_index,
+                output_index: 0,
+                role: CompositePrivateOutputRoleKind::BroadcasterFee,
+                token_address: fee.token_address,
+            });
+        }
+        if let Some(token_address) = change_token {
+            self.private_output_roles.push(CompositePrivateOutputRole {
+                chunk_index,
+                output_index: usize::from(fee.is_some()),
+                role: CompositePrivateOutputRoleKind::Change,
+                token_address,
+            });
+        }
     }
 }
 
