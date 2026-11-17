@@ -105,7 +105,9 @@ impl CheckpointCatalog {
         require_format_version(self.format_version)?;
         validate_catalog_limits(0, 0, usize_to_u64(self.chunks.len())?)?;
         if self.chunks.is_empty() {
-            if self.row_count != 0 || self.range.is_some() || self.checkpoint_root.is_some() {
+            let has_aggregate =
+                self.row_count != 0 || self.range.is_some() || self.checkpoint_root.is_some();
+            if has_aggregate {
                 return Err(Error::InvalidCheckpointAggregate);
             }
             return Ok(());
@@ -114,6 +116,24 @@ impl CheckpointCatalog {
             return Err(Error::InvalidCheckpointAggregate);
         }
 
+        let (total_rows, last) = self.validate_chunks()?;
+        validate_aggregate(self.range, self.row_count, self.checkpoint_root)?;
+        let aggregate_matches = total_rows == self.row_count
+            && self.range
+                == Some(EventRange {
+                    start_index: 0,
+                    end_index: last.range.end_index,
+                })
+            && self.checkpoint_root == Some(last.end_root);
+        if !aggregate_matches {
+            return Err(Error::InvalidCheckpointAggregate);
+        }
+        Ok(())
+    }
+
+    /// Checks every chunk and the chain between them. Returns the summed row
+    /// count and the last chunk.
+    fn validate_chunks(&self) -> Result<(u64, &EventArtifactDescriptor), Error> {
         let mut total_rows = 0_u64;
         let mut previous: Option<&EventArtifactDescriptor> = None;
         for (index, chunk) in self.chunks.iter().enumerate() {
@@ -137,18 +157,7 @@ impl CheckpointCatalog {
             previous = Some(chunk);
         }
         let last = previous.ok_or(Error::InvalidCheckpointAggregate)?;
-        validate_aggregate(self.range, self.row_count, self.checkpoint_root)?;
-        if total_rows != self.row_count
-            || self.range
-                != Some(EventRange {
-                    start_index: 0,
-                    end_index: last.range.end_index,
-                })
-            || self.checkpoint_root != Some(last.end_root)
-        {
-            return Err(Error::InvalidCheckpointAggregate);
-        }
-        Ok(())
+        Ok((total_rows, last))
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
@@ -198,7 +207,10 @@ fn validate_aggregate(
         return Ok(());
     }
     let aggregate = range.ok_or(Error::InvalidCheckpointAggregate)?;
-    if aggregate.start_index != 0 || aggregate.row_count()? != row_count || root.is_none() {
+    if aggregate.start_index != 0 {
+        return Err(Error::InvalidCheckpointAggregate);
+    }
+    if aggregate.row_count()? != row_count || root.is_none() {
         return Err(Error::InvalidCheckpointAggregate);
     }
     Ok(())

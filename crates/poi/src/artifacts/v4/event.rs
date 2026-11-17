@@ -270,26 +270,7 @@ impl EventArtifact {
                 actual: actual_byte_size,
             });
         }
-        let event_capacity = usize::try_from(row_count).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut events = Vec::with_capacity(event_capacity);
-        for offset in 0..row_count {
-            let offset_usize = usize::try_from(offset).map_err(|_| Error::ArithmeticOverflow)?;
-            let record_offset = header_len
-                .checked_add(
-                    offset_usize
-                        .checked_mul(EVENT_RECORD_BYTES)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?;
-            events.push(SnapshotEvent {
-                event_index: start_index
-                    .checked_add(offset)
-                    .ok_or(Error::ArithmeticOverflow)?,
-                blinded_commitment: read_bytes(bytes, record_offset)?,
-                signature: read_bytes(bytes, record_offset + 32)?,
-                event_type: event_type_from_discriminant(bytes[record_offset + 96])?,
-            });
-        }
+        let events = read_event_records(bytes, header_len, start_index, row_count)?;
         let txid_version = std::str::from_utf8(&bytes[147..header_len])
             .map_err(Error::TxidVersionUtf8)?
             .to_string();
@@ -336,6 +317,36 @@ const fn validate_checkpoint_range(range: EventRange, row_count: u64) -> Result<
         return Err(Error::InvalidCheckpointChunk);
     }
     Ok(())
+}
+
+/// Decodes the `row_count` fixed-size event records that follow the header.
+fn read_event_records(
+    bytes: &[u8],
+    header_len: usize,
+    start_index: u64,
+    row_count: u64,
+) -> Result<Vec<SnapshotEvent>, Error> {
+    let event_capacity = usize::try_from(row_count).map_err(|_| Error::ArithmeticOverflow)?;
+    let mut events = Vec::with_capacity(event_capacity);
+    for offset in 0..row_count {
+        let offset_usize = usize::try_from(offset).map_err(|_| Error::ArithmeticOverflow)?;
+        let record_offset = header_len
+            .checked_add(
+                offset_usize
+                    .checked_mul(EVENT_RECORD_BYTES)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        events.push(SnapshotEvent {
+            event_index: start_index
+                .checked_add(offset)
+                .ok_or(Error::ArithmeticOverflow)?,
+            blinded_commitment: read_bytes(bytes, record_offset)?,
+            signature: read_bytes(bytes, record_offset + 32)?,
+            event_type: event_type_from_discriminant(bytes[record_offset + 96])?,
+        });
+    }
+    Ok(events)
 }
 
 pub(super) fn require_contiguous(

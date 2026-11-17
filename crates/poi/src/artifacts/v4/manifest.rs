@@ -43,17 +43,7 @@ impl ManifestEntry {
         }
 
         if self.event_count == 0 {
-            if self.current_tip_index.is_some()
-                || self.current_root.is_some()
-                || self.checkpoint_catalog.row_count != 0
-                || self.checkpoint_catalog.range.is_some()
-                || self.checkpoint_catalog.checkpoint_root.is_some()
-                || self.current_tail.is_some()
-                || !self.retained_bridges.is_empty()
-            {
-                return Err(Error::InvalidEmptyGraph);
-            }
-            return Ok(());
+            return self.validate_empty_graph();
         }
 
         let expected_tip = self
@@ -69,51 +59,83 @@ impl ManifestEntry {
 
         let checkpoint_count = self.checkpoint_catalog.row_count;
         let current_root = self.current_root.ok_or(Error::InvalidNonemptyGraph)?;
+        self.validate_checkpoint_state(checkpoint_count)?;
+        self.validate_current_tail(checkpoint_count, expected_tip, current_root)
+    }
+
+    /// An entry without events carries no tip, checkpoint, tail or bridges.
+    const fn validate_empty_graph(&self) -> Result<(), Error> {
+        let has_graph_state = self.current_tip_index.is_some()
+            || self.current_root.is_some()
+            || self.checkpoint_catalog.row_count != 0
+            || self.checkpoint_catalog.range.is_some()
+            || self.checkpoint_catalog.checkpoint_root.is_some()
+            || self.current_tail.is_some()
+            || !self.retained_bridges.is_empty();
+        if has_graph_state {
+            return Err(Error::InvalidEmptyGraph);
+        }
+        Ok(())
+    }
+
+    /// Checkpoints cover events `0..checkpoint_count`, and the retained bridges
+    /// end at the checkpoint root.
+    fn validate_checkpoint_state(&self, checkpoint_count: u64) -> Result<(), Error> {
         match checkpoint_count {
             0 => {
-                if self.checkpoint_catalog.range.is_some()
+                let has_checkpoint_state = self.checkpoint_catalog.range.is_some()
                     || self.checkpoint_catalog.checkpoint_root.is_some()
-                    || !self.retained_bridges.is_empty()
-                {
+                    || !self.retained_bridges.is_empty();
+                if has_checkpoint_state {
                     return Err(Error::InvalidEmptyCheckpoint);
                 }
             }
             count => {
                 let expected_end = count.checked_sub(1).ok_or(Error::ArithmeticOverflow)?;
-                if self.checkpoint_catalog.range
-                    != Some(EventRange {
+                let aggregate_matches = self.checkpoint_catalog.range
+                    == Some(EventRange {
                         start_index: 0,
                         end_index: expected_end,
                     })
-                    || self.checkpoint_catalog.checkpoint_root.is_none()
-                {
+                    && self.checkpoint_catalog.checkpoint_root.is_some();
+                if !aggregate_matches {
                     return Err(Error::InvalidCheckpointAggregate);
                 }
                 self.validate_bridge_chain()?;
             }
         }
+        Ok(())
+    }
 
+    /// Events past the checkpoints form the current tail, which runs from the
+    /// checkpoint root to the current root.
+    fn validate_current_tail(
+        &self,
+        checkpoint_count: u64,
+        expected_tip: u64,
+        current_root: FixedBytes<32>,
+    ) -> Result<(), Error> {
         if checkpoint_count == self.event_count {
             if self.current_tail.is_some()
                 || self.checkpoint_catalog.checkpoint_root != Some(current_root)
             {
                 return Err(Error::InvalidCurrentTail);
             }
-        } else {
-            let tail = self
-                .current_tail
-                .as_ref()
-                .ok_or(Error::InvalidCurrentTail)?;
-            tail.validate()?;
-            require_scope(&self.scope, &tail.scope)?;
-            if tail.kind != EventArtifactKind::CurrentTail
-                || tail.range.start_index != checkpoint_count
-                || tail.range.end_index != expected_tip
-                || tail.end_root != current_root
-                || tail.start_root != self.checkpoint_catalog.checkpoint_root
-            {
-                return Err(Error::InvalidCurrentTail);
-            }
+            return Ok(());
+        }
+        let tail = self
+            .current_tail
+            .as_ref()
+            .ok_or(Error::InvalidCurrentTail)?;
+        tail.validate()?;
+        require_scope(&self.scope, &tail.scope)?;
+        let tail_matches = tail.kind == EventArtifactKind::CurrentTail
+            && tail.range.start_index == checkpoint_count
+            && tail.range.end_index == expected_tip
+            && tail.end_root == current_root
+            && tail.start_root == self.checkpoint_catalog.checkpoint_root;
+        if !tail_matches {
+            return Err(Error::InvalidCurrentTail);
         }
         Ok(())
     }
