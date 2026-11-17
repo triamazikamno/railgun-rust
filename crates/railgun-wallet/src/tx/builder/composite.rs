@@ -1,7 +1,7 @@
 //! Composite unshield plans: several unshield legs in one batch, executed
 //! directly against the Railgun contract or through a Relay Adapt contract.
 
-use alloy::primitives::{Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::sol_types::SolCall;
 
 use broadcaster_core::contracts::railgun::{
@@ -380,118 +380,161 @@ pub(super) fn select_composite_leg_selections_with_policy(
     spend_up_to_by_leg: &[bool],
     used_transaction_count: usize,
 ) -> Result<(Vec<BatchUtxoSelection>, Option<usize>), BuildError> {
-    let mut selections = Vec::with_capacity(legs.len());
-    let mut embedded_fee_leg_index = None;
-    select_composite_leg_selections_inner(
-        utxos,
+    let mut search = LegSelectionSearch {
         legs,
         embedded_fee,
         spend_up_to_by_leg,
-        0,
-        used_transaction_count,
-        &mut selections,
-        &mut embedded_fee_leg_index,
-    )?;
-    Ok((selections, embedded_fee_leg_index))
+        selections: Vec::with_capacity(legs.len()),
+        embedded_fee_leg_index: None,
+    };
+    search.search(utxos, 0, used_transaction_count)?;
+    Ok((search.selections, search.embedded_fee_leg_index))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn select_composite_leg_selections_inner(
-    utxos: &[Utxo],
-    legs: &[CompositeUnshieldLeg],
+/// Backtracking search for one batch selection per leg, with the embedded fee
+/// carried by the first leg in its token that can fit it.
+struct LegSelectionSearch<'a> {
+    legs: &'a [CompositeUnshieldLeg],
     embedded_fee: Option<BroadcasterFeeOutput>,
-    spend_up_to_by_leg: &[bool],
-    leg_index: usize,
-    used_transaction_count: usize,
-    selections: &mut Vec<BatchUtxoSelection>,
-    embedded_fee_leg_index: &mut Option<usize>,
-) -> Result<(), BuildError> {
-    let Some(leg) = legs.get(leg_index).copied() else {
-        if embedded_fee.is_some() && embedded_fee_leg_index.is_none() {
-            return Err(BuildError::InsufficientBalance(U256::ZERO));
-        }
-        return Ok(());
-    };
-    let spend_up_to = spend_up_to_by_leg.get(leg_index).copied().unwrap_or(false);
-    let remaining_slots = MAX_BATCH_TRANSACTIONS.saturating_sub(used_transaction_count);
-    if remaining_slots == 0 {
-        return Err(BuildError::TooManyBatchTransactions {
-            requested: used_transaction_count + 1,
-            max: MAX_BATCH_TRANSACTIONS,
-        });
-    }
+    spend_up_to_by_leg: &'a [bool],
+    selections: Vec<BatchUtxoSelection>,
+    embedded_fee_leg_index: Option<usize>,
+}
 
-    let mut last_error = None;
-    let fee_options = leg_fee_options(leg, embedded_fee, *embedded_fee_leg_index);
-    for leg_fee in fee_options {
-        let first_base_output_count = 1 + usize::from(leg_fee.is_some());
-        let target_amount = leg.amount + leg_fee.map_or(U256::ZERO, |fee| fee.amount);
-        let candidates = match select_batched_utxo_candidates_with_limit(
-            utxos,
-            leg.token_address,
-            target_amount,
-            spend_up_to,
-            first_base_output_count,
-            1,
-            remaining_slots,
-        ) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                if remaining_slots < MAX_BATCH_TRANSACTIONS
-                    && let Ok(required) = select_batched_utxos_with_limit(
-                        utxos,
-                        leg.token_address,
-                        target_amount,
-                        spend_up_to,
-                        first_base_output_count,
-                        1,
-                        MAX_BATCH_TRANSACTIONS,
-                    )
-                    && required.chunks.len() > remaining_slots
-                {
-                    retain_preferred_selection_error(
-                        &mut last_error,
-                        BuildError::TooManyBatchTransactions {
-                            requested: used_transaction_count + required.chunks.len(),
-                            max: MAX_BATCH_TRANSACTIONS,
-                        },
-                    );
+impl LegSelectionSearch<'_> {
+    fn search(
+        &mut self,
+        utxos: &[Utxo],
+        leg_index: usize,
+        used_transaction_count: usize,
+    ) -> Result<(), BuildError> {
+        let Some(leg) = self.legs.get(leg_index).copied() else {
+            return self.require_fee_placed();
+        };
+        let spend_up_to = self
+            .spend_up_to_by_leg
+            .get(leg_index)
+            .copied()
+            .unwrap_or(false);
+        let remaining_slots = MAX_BATCH_TRANSACTIONS.saturating_sub(used_transaction_count);
+        if remaining_slots == 0 {
+            return Err(BuildError::TooManyBatchTransactions {
+                requested: used_transaction_count + 1,
+                max: MAX_BATCH_TRANSACTIONS,
+            });
+        }
+
+        let mut last_error = None;
+        let fee_options = leg_fee_options(leg, self.embedded_fee, self.embedded_fee_leg_index);
+        for leg_fee in fee_options {
+            let target = LegTarget {
+                token_address: leg.token_address,
+                first_base_output_count: 1 + usize::from(leg_fee.is_some()),
+                target_amount: leg.amount + leg_fee.map_or(U256::ZERO, |fee| fee.amount),
+                spend_up_to,
+            };
+            let candidates = match target.candidates(utxos, remaining_slots) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    let error = target
+                        .batch_limit_error(utxos, remaining_slots, used_transaction_count)
+                        .unwrap_or(error);
+                    retain_preferred_selection_error(&mut last_error, error);
                     continue;
                 }
-                retain_preferred_selection_error(&mut last_error, error);
-                continue;
-            }
-        };
+            };
 
-        for candidate in candidates {
-            let mut remaining_utxos = utxos.to_vec();
-            for chunk in &candidate.chunks {
-                remove_selected_utxos(&mut remaining_utxos, &chunk.utxos);
+            for candidate in candidates {
+                let remaining_utxos = utxos_without_selection(utxos, &candidate);
+                let previous_fee_leg_index = self.embedded_fee_leg_index;
+                if leg_fee.is_some() {
+                    self.embedded_fee_leg_index = Some(leg_index);
+                }
+                self.selections.push(candidate.clone());
+                match self.search(
+                    &remaining_utxos,
+                    leg_index + 1,
+                    used_transaction_count + candidate.chunks.len(),
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => retain_preferred_selection_error(&mut last_error, error),
+                }
+                self.selections.pop();
+                self.embedded_fee_leg_index = previous_fee_leg_index;
             }
-            let previous_fee_leg_index = *embedded_fee_leg_index;
-            if leg_fee.is_some() {
-                *embedded_fee_leg_index = Some(leg_index);
-            }
-            selections.push(candidate.clone());
-            match select_composite_leg_selections_inner(
-                &remaining_utxos,
-                legs,
-                embedded_fee,
-                spend_up_to_by_leg,
-                leg_index + 1,
-                used_transaction_count + candidate.chunks.len(),
-                selections,
-                embedded_fee_leg_index,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(error) => retain_preferred_selection_error(&mut last_error, error),
-            }
-            selections.pop();
-            *embedded_fee_leg_index = previous_fee_leg_index;
         }
+
+        Err(last_error.unwrap_or(BuildError::InsufficientBalance(U256::ZERO)))
     }
 
-    Err(last_error.unwrap_or(BuildError::InsufficientBalance(U256::ZERO)))
+    /// Every leg has a selection; an embedded fee must have found a leg to carry it.
+    const fn require_fee_placed(&self) -> Result<(), BuildError> {
+        if self.embedded_fee.is_some() && self.embedded_fee_leg_index.is_none() {
+            return Err(BuildError::InsufficientBalance(U256::ZERO));
+        }
+        Ok(())
+    }
+}
+
+fn utxos_without_selection(utxos: &[Utxo], selection: &BatchUtxoSelection) -> Vec<Utxo> {
+    let mut remaining_utxos = utxos.to_vec();
+    for chunk in &selection.chunks {
+        remove_selected_utxos(&mut remaining_utxos, &chunk.utxos);
+    }
+    remaining_utxos
+}
+
+/// What one leg must select: its amount plus any embedded fee it carries.
+struct LegTarget {
+    token_address: Address,
+    first_base_output_count: usize,
+    target_amount: U256,
+    spend_up_to: bool,
+}
+
+impl LegTarget {
+    fn candidates(
+        &self,
+        utxos: &[Utxo],
+        max_transactions: usize,
+    ) -> Result<Vec<BatchUtxoSelection>, BuildError> {
+        select_batched_utxo_candidates_with_limit(
+            utxos,
+            self.token_address,
+            self.target_amount,
+            self.spend_up_to,
+            self.first_base_output_count,
+            1,
+            max_transactions,
+        )
+    }
+
+    /// When earlier legs used batch slots, reports `TooManyBatchTransactions` if
+    /// this leg would fit a full batch but not the slots left.
+    fn batch_limit_error(
+        &self,
+        utxos: &[Utxo],
+        remaining_slots: usize,
+        used_transaction_count: usize,
+    ) -> Option<BuildError> {
+        if remaining_slots >= MAX_BATCH_TRANSACTIONS {
+            return None;
+        }
+        let required = select_batched_utxos_with_limit(
+            utxos,
+            self.token_address,
+            self.target_amount,
+            self.spend_up_to,
+            self.first_base_output_count,
+            1,
+            MAX_BATCH_TRANSACTIONS,
+        )
+        .ok()?;
+        (required.chunks.len() > remaining_slots).then(|| BuildError::TooManyBatchTransactions {
+            requested: used_transaction_count + required.chunks.len(),
+            max: MAX_BATCH_TRANSACTIONS,
+        })
+    }
 }
 
 fn retain_preferred_selection_error(current: &mut Option<BuildError>, candidate: BuildError) {
@@ -516,13 +559,12 @@ fn leg_fee_options(
     embedded_fee: Option<BroadcasterFeeOutput>,
     embedded_fee_leg_index: Option<usize>,
 ) -> Vec<Option<BroadcasterFeeOutput>> {
-    if let Some(fee) = embedded_fee
-        && embedded_fee_leg_index.is_none()
-        && leg.token_address == fee.token_address
+    match embedded_fee
+        .filter(|fee| embedded_fee_leg_index.is_none() && leg.token_address == fee.token_address)
     {
-        return vec![Some(fee), None];
+        Some(fee) => vec![Some(fee), None],
+        None => vec![None],
     }
-    vec![None]
 }
 
 fn composite_build_leg_order(
