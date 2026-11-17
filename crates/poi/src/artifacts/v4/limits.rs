@@ -22,23 +22,22 @@ pub struct RetrievalLimits {
 impl RetrievalLimits {
     pub fn for_event(descriptor: &EventArtifactDescriptor) -> Result<Self, Error> {
         descriptor.validate()?;
-        Ok(Self {
-            response_bytes: checked_car_response_limit(descriptor.artifact.byte_size)?,
-            car_block_count: ARTIFACT_CAR_MAX_BLOCKS,
-            reconstructed_bytes: descriptor.artifact.byte_size,
-            decoded_bytes: descriptor.artifact.byte_size,
-            record_count: descriptor.row_count,
-        })
+        Self::for_artifact(descriptor.artifact.byte_size, descriptor.row_count)
     }
 
     pub fn for_catalog(descriptor: &CheckpointCatalogDescriptor) -> Result<Self, Error> {
         descriptor.validate()?;
+        Self::for_artifact(descriptor.artifact.byte_size, descriptor.chunk_count)
+    }
+
+    /// The budget for fetching one artifact of `byte_size` bytes over CAR.
+    fn for_artifact(byte_size: u64, record_count: u64) -> Result<Self, Error> {
         Ok(Self {
-            response_bytes: checked_car_response_limit(descriptor.artifact.byte_size)?,
+            response_bytes: checked_car_response_limit(byte_size)?,
             car_block_count: ARTIFACT_CAR_MAX_BLOCKS,
-            reconstructed_bytes: descriptor.artifact.byte_size,
-            decoded_bytes: descriptor.artifact.byte_size,
-            record_count: descriptor.chunk_count,
+            reconstructed_bytes: byte_size,
+            decoded_bytes: byte_size,
+            record_count,
         })
     }
 

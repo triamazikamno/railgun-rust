@@ -220,18 +220,20 @@ impl Manifest {
 
     fn canonical_body_bytes_envelope(&self) -> Result<Vec<u8>, Error> {
         require_format_version(self.format_version)?;
-        let mut entries = self.entries.clone();
-        entries.sort_by(|left, right| left.scope.cmp(&right.scope));
-        let bytes = serde_json::to_vec(&ManifestBody {
+        serialize_manifest(&ManifestBody {
             format_version: self.format_version,
             issued_at_ms: self.issued_at_ms,
             sequence: self.sequence,
             publisher_pubkey: self.publisher_pubkey,
-            entries,
+            entries: self.sorted_entries(),
         })
-        .map_err(Error::Json)?;
-        require_manifest_size(usize_to_u64(bytes.len())?)?;
-        Ok(bytes)
+    }
+
+    /// The entries in canonical order: by scope, keeping equal scopes in place.
+    fn sorted_entries(&self) -> Vec<ManifestEntry> {
+        let mut entries = self.entries.clone();
+        entries.sort_by(|left, right| left.scope.cmp(&right.scope));
+        entries
     }
 
     pub fn signing_message(&self) -> Result<Vec<u8>, Error> {
@@ -289,19 +291,14 @@ impl Manifest {
 
     fn to_bytes_envelope(&self) -> Result<Vec<u8>, Error> {
         require_format_version(self.format_version)?;
-        let mut entries = self.entries.clone();
-        entries.sort_by(|left, right| left.scope.cmp(&right.scope));
-        let bytes = serde_json::to_vec(&ManifestWire {
+        serialize_manifest(&ManifestWire {
             format_version: self.format_version,
             issued_at_ms: self.issued_at_ms,
             sequence: self.sequence,
             publisher_pubkey: self.publisher_pubkey,
-            entries,
+            entries: self.sorted_entries(),
             publisher_signature: self.publisher_signature,
         })
-        .map_err(Error::Json)?;
-        require_manifest_size(usize_to_u64(bytes.len())?)?;
-        Ok(bytes)
     }
 
     pub fn publication_id(&self) -> Result<PublicationId, Error> {
@@ -344,6 +341,13 @@ impl Manifest {
         manifest.validate()?;
         Ok(manifest)
     }
+}
+
+/// Serializes a manifest representation and enforces the manifest byte limit.
+fn serialize_manifest(value: &impl Serialize) -> Result<Vec<u8>, Error> {
+    let bytes = serde_json::to_vec(value).map_err(Error::Json)?;
+    require_manifest_size(usize_to_u64(bytes.len())?)?;
+    Ok(bytes)
 }
 
 fn signing_message_from_body(body: &[u8]) -> Result<Vec<u8>, Error> {
