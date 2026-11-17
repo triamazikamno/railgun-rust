@@ -68,106 +68,109 @@ impl TxidPublicCache<'_> {
         latest: TxidPublicLatestValidated,
         indexed_artifact_source: Option<&IndexedArtifactSourceConfig>,
     ) -> Result<Option<artifact::TxidPublicArtifactMaintenance>, TxidPublicCacheError> {
-        let (artifact_from_index, force_validated_refresh, read_scope) = {
-            let permit = self.begin_write().await;
-            let read_scope = permit.scope();
-            let cache = permit.cache();
-            let mut manifest = cache.load_or_new_manifest()?;
-            let progress_reconciled = manifest.reconcile_validated_progress_for_latest(latest);
-            let local_status = manifest.local_latest_status(permit.db(), latest)?;
-            let mut markers_changed = false;
-            if progress_reconciled && local_status == TxidPublicLocalLatestStatus::Satisfied {
-                manifest.commit_latest_validated_if_supported(permit.db(), latest)?;
-            }
-            if local_status == TxidPublicLocalLatestStatus::NeedsValidatedRefresh {
-                markers_changed = manifest.clear_validated_markers_for_latest(latest);
-            }
-            if progress_reconciled || markers_changed {
-                manifest.write_to(&permit)?;
-            }
-            let force_validated_refresh = local_status
-                == TxidPublicLocalLatestStatus::NeedsValidatedRefresh
-                || (progress_reconciled && manifest.validated_cached_txid_index.is_none());
-            let artifact_provenance_required =
-                indexed_artifact_source.is_some() && endpoint.is_none();
-            if local_status == TxidPublicLocalLatestStatus::Satisfied
-                && (!artifact_provenance_required || manifest.artifact_covers_latest(latest))
-            {
-                if progress_reconciled
-                    || !manifest.latest_validated_matches(latest)
-                    || !manifest.latest_checkpoint_matches(latest)
-                {
-                    manifest.commit_latest_validated_if_supported(permit.db(), latest)?;
-                    rebuild_index_for_manifest(&manifest, &permit)?;
-                    manifest.write_to(&permit)?;
-                }
-                debug!(
-                    chain_id = self.key.chain_id,
-                    txid_version = self.key.txid_version,
-                    latest_validated_txid_index = latest.txid_index,
-                    "TXID public cache already covers latest validated range"
-                );
-                return Ok(None);
-            }
-            (
-                if force_validated_refresh && manifest.artifact_cached_txid_index.is_none() {
-                    0
-                } else {
-                    manifest.artifact_fetch_start_index(latest, local_status)
-                },
-                force_validated_refresh,
-                read_scope,
-            )
+        let artifact_provenance_required = indexed_artifact_source.is_some() && endpoint.is_none();
+        let Some(start) = self
+            .prepare_artifact_sync(latest, artifact_provenance_required)
+            .await?
+        else {
+            return Ok(None);
         };
-        let artifact_fetch = match indexed_artifact_source {
-            Some(config) => match self.artifact_source(config, http_client) {
-                Ok(source) => match source
-                    .fetch_current_chunks(self, artifact_from_index, Some(latest.txid_index))
-                    .await
-                {
-                    Ok(plan) => Some((source, plan)),
-                    Err(_err) if endpoint.is_some() => {
-                        warn!(
-                            chain_id = self.key.chain_id,
-                            txid_version = self.key.txid_version,
-                            category = "artifact_source_unavailable",
-                            "TXID public cache artifact source unavailable; continuing with the configured source"
-                        );
-                        None
-                    }
-                    Err(err) => return Err(err),
-                },
-                Err(_err) if endpoint.is_some() => {
-                    warn!(
-                        chain_id = self.key.chain_id,
-                        txid_version = self.key.txid_version,
-                        category = "artifact_source_unavailable",
-                        "TXID public cache artifact source unavailable; continuing with the configured source"
-                    );
-                    None
-                }
-                Err(err) => return Err(err),
-            },
+        let fetched = match indexed_artifact_source {
+            Some(config) => Some(
+                self.fetch_artifact_plan(
+                    config,
+                    http_client,
+                    start.from_index,
+                    Some(latest.txid_index),
+                )
+                .await,
+            ),
             None => None,
         };
-        let artifact_chunk_refs = artifact_fetch
-            .as_ref()
-            .map(|(_source, plan)| plan.required.as_slice());
+        let artifact_plan = match fetched {
+            Some(Ok(plan)) => Some(plan),
+            Some(Err(_err)) if endpoint.is_some() => {
+                warn!(
+                    chain_id = self.key.chain_id,
+                    txid_version = self.key.txid_version,
+                    category = "artifact_source_unavailable",
+                    "TXID public cache artifact source unavailable; continuing with the configured source"
+                );
+                None
+            }
+            Some(Err(err)) => return Err(err),
+            None => None,
+        };
 
         self.sync_inner(
             endpoint,
             http_client,
             latest,
-            artifact_chunk_refs,
-            force_validated_refresh,
-            read_scope,
+            artifact_plan.as_ref().map(|plan| plan.required.as_slice()),
+            start.force_validated_refresh,
+            start.read_scope,
             indexed_artifact_source.is_some(),
-            Some(artifact_from_index),
+            Some(start.from_index),
         )
         .await?;
-        Ok(artifact_fetch.map(|(_source, plan)| {
-            artifact::TxidPublicArtifactMaintenance::new(plan.stable_current, read_scope)
+        Ok(artifact_plan.map(|plan| {
+            artifact::TxidPublicArtifactMaintenance::new(plan.stable_current, start.read_scope)
         }))
+    }
+
+    /// Reconciles the manifest with `latest` under a write permit, which is
+    /// released before returning so the artifact fetch runs without it. Returns
+    /// `None` when the cache already covers `latest`.
+    async fn prepare_artifact_sync(
+        &self,
+        latest: TxidPublicLatestValidated,
+        artifact_provenance_required: bool,
+    ) -> Result<Option<ArtifactSyncStart>, TxidPublicCacheError> {
+        let permit = self.begin_write().await;
+        let read_scope = permit.scope();
+        let cache = permit.cache();
+        let mut manifest = cache.load_or_new_manifest()?;
+        let (progress_reconciled, local_status) =
+            manifest.reconcile_markers_with_latest(&permit, latest)?;
+        let force_validated_refresh = local_status
+            == TxidPublicLocalLatestStatus::NeedsValidatedRefresh
+            || (progress_reconciled && manifest.validated_cached_txid_index.is_none());
+        let already_covered = local_status == TxidPublicLocalLatestStatus::Satisfied
+            && (!artifact_provenance_required || manifest.artifact_covers_latest(latest));
+        if already_covered {
+            manifest.commit_covered_latest(&permit, latest, progress_reconciled)?;
+            debug!(
+                chain_id = self.key.chain_id,
+                txid_version = self.key.txid_version,
+                latest_validated_txid_index = latest.txid_index,
+                "TXID public cache already covers latest validated range"
+            );
+            return Ok(None);
+        }
+        let from_index = if force_validated_refresh && manifest.artifact_cached_txid_index.is_none()
+        {
+            0
+        } else {
+            manifest.artifact_fetch_start_index(latest, local_status)
+        };
+        Ok(Some(ArtifactSyncStart {
+            from_index,
+            force_validated_refresh,
+            read_scope,
+        }))
+    }
+
+    /// Builds the artifact source and fetches the chunks from `from_index` on.
+    async fn fetch_artifact_plan(
+        &self,
+        config: &IndexedArtifactSourceConfig,
+        http_client: Option<&reqwest::Client>,
+        from_index: u64,
+        to_index: Option<u64>,
+    ) -> Result<artifact::TxidPublicArtifactChunkPlan, TxidPublicCacheError> {
+        self.artifact_source(config, http_client)?
+            .fetch_current_chunks(self, from_index, to_index)
+            .await
     }
 
     async fn sync_inner(
@@ -436,79 +439,15 @@ impl TxidPublicCache<'_> {
     ) -> Result<(u64, Option<artifact::TxidPublicArtifactMaintenance>), TxidPublicCacheError> {
         let mut maintenance_after_graphql = None;
         if let Some(config) = indexed_artifact_source {
-            let (read_scope, from_index, artifact_marker) = {
-                let permit = self.begin_write().await;
-                let read_scope = permit.scope();
-                let manifest = permit.cache().load_or_new_manifest()?;
-                let artifact_marker = manifest.artifact_cached_txid_index;
-                let from_index = artifact_marker.map_or(0, |index| index.saturating_add(1));
-                (read_scope, from_index, artifact_marker)
-            };
-            let source = match self.artifact_source(config, http_client) {
-                Ok(source) => Some(source),
-                Err(_err) if endpoint.is_some() => {
-                    warn!(
-                        chain_id = self.key.chain_id,
-                        txid_version = self.key.txid_version,
-                        category = "artifact_source_unavailable",
-                        "TXID public cache background artifact source unavailable; falling back to GraphQL"
-                    );
-                    None
+            match self
+                .background_artifact_sync(config, endpoint.is_some(), http_client)
+                .await?
+            {
+                BackgroundArtifactSync::Done(applied_rows, maintenance) => {
+                    return Ok((applied_rows, Some(maintenance)));
                 }
-                Err(err) => return Err(err),
-            };
-            if let Some(source) = source {
-                match source.fetch_current_chunks(self, from_index, None).await {
-                    Ok(plan) if !plan.required.is_empty() => {
-                        let maintenance = artifact::TxidPublicArtifactMaintenance::new(
-                            plan.stable_current,
-                            read_scope,
-                        );
-                        match self
-                            .apply_artifact_chunks_only(&plan.required, from_index, read_scope)
-                            .await
-                        {
-                            Ok(applied_rows) if applied_rows > 0 => {
-                                return Ok((applied_rows, Some(maintenance)));
-                            }
-                            Ok(_) if endpoint.is_none() || artifact_marker.is_some() => {
-                                return Ok((0, Some(maintenance)));
-                            }
-                            Ok(_) => {
-                                maintenance_after_graphql = Some(maintenance);
-                            }
-                            Err(err) if endpoint.is_some() => {
-                                warn!(
-                                    ?err,
-                                    chain_id = self.key.chain_id,
-                                    txid_version = self.key.txid_version,
-                                    category = "artifact_source_unavailable",
-                                    "TXID public cache background artifact apply unavailable; falling back to GraphQL"
-                                );
-                                maintenance_after_graphql = Some(maintenance);
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    Ok(plan) => {
-                        let maintenance = artifact::TxidPublicArtifactMaintenance::new(
-                            plan.stable_current,
-                            read_scope,
-                        );
-                        if endpoint.is_none() || artifact_marker.is_some() {
-                            return Ok((0, Some(maintenance)));
-                        }
-                        maintenance_after_graphql = Some(maintenance);
-                    }
-                    Err(_err) if endpoint.is_some() => {
-                        warn!(
-                            chain_id = self.key.chain_id,
-                            txid_version = self.key.txid_version,
-                            category = "artifact_source_unavailable",
-                            "TXID public cache background artifact source unavailable; falling back to GraphQL"
-                        );
-                    }
-                    Err(err) => return Err(err),
+                BackgroundArtifactSync::FallBackToGraphql(maintenance) => {
+                    maintenance_after_graphql = maintenance;
                 }
             }
         }
@@ -518,6 +457,73 @@ impl TxidPublicCache<'_> {
             None => 0,
         };
         Ok((fetched_rows, maintenance_after_graphql))
+    }
+
+    /// Applies the artifact chunks past the cached artifact marker. GraphQL
+    /// continues the sync when an endpoint is configured and the artifacts
+    /// added nothing to a cache that had no artifact marker yet, or failed.
+    async fn background_artifact_sync(
+        &self,
+        config: &IndexedArtifactSourceConfig,
+        endpoint_available: bool,
+        http_client: Option<&reqwest::Client>,
+    ) -> Result<BackgroundArtifactSync, TxidPublicCacheError> {
+        let (read_scope, from_index, artifact_marker) = {
+            let permit = self.begin_write().await;
+            let read_scope = permit.scope();
+            let manifest = permit.cache().load_or_new_manifest()?;
+            let artifact_marker = manifest.artifact_cached_txid_index;
+            let from_index = artifact_marker.map_or(0, |index| index.saturating_add(1));
+            (read_scope, from_index, artifact_marker)
+        };
+        let plan = match self
+            .fetch_artifact_plan(config, http_client, from_index, None)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(_err) if endpoint_available => {
+                warn!(
+                    chain_id = self.key.chain_id,
+                    txid_version = self.key.txid_version,
+                    category = "artifact_source_unavailable",
+                    "TXID public cache background artifact source unavailable; falling back to GraphQL"
+                );
+                return Ok(BackgroundArtifactSync::FallBackToGraphql(None));
+            }
+            Err(err) => return Err(err),
+        };
+        let maintenance =
+            artifact::TxidPublicArtifactMaintenance::new(plan.stable_current, read_scope);
+        let graphql_needed = endpoint_available && artifact_marker.is_none();
+        if plan.required.is_empty() {
+            return Ok(BackgroundArtifactSync::without_progress(
+                maintenance,
+                graphql_needed,
+            ));
+        }
+        match self
+            .apply_artifact_chunks_only(&plan.required, from_index, read_scope)
+            .await
+        {
+            Ok(applied_rows) if applied_rows > 0 => {
+                Ok(BackgroundArtifactSync::Done(applied_rows, maintenance))
+            }
+            Ok(_) => Ok(BackgroundArtifactSync::without_progress(
+                maintenance,
+                graphql_needed,
+            )),
+            Err(err) if endpoint_available => {
+                warn!(
+                    ?err,
+                    chain_id = self.key.chain_id,
+                    txid_version = self.key.txid_version,
+                    category = "artifact_source_unavailable",
+                    "TXID public cache background artifact apply unavailable; falling back to GraphQL"
+                );
+                Ok(BackgroundArtifactSync::FallBackToGraphql(Some(maintenance)))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub(crate) fn cached_latest_validated(
@@ -621,7 +627,78 @@ impl TxidPublicCache<'_> {
     }
 }
 
+/// Where a foreground artifact sync starts, decided under the write permit.
+struct ArtifactSyncStart {
+    from_index: u64,
+    force_validated_refresh: bool,
+    read_scope: TxidPublicCacheReadScope,
+}
+
+/// What the background artifact pass leaves for the GraphQL pass.
+enum BackgroundArtifactSync {
+    /// The artifacts finished this sync; GraphQL is skipped.
+    Done(u64, artifact::TxidPublicArtifactMaintenance),
+    /// GraphQL runs next; the maintenance, if any, is scheduled after it.
+    FallBackToGraphql(Option<artifact::TxidPublicArtifactMaintenance>),
+}
+
+impl BackgroundArtifactSync {
+    /// The outcome when the artifacts added no rows: GraphQL continues only if it
+    /// is needed.
+    const fn without_progress(
+        maintenance: artifact::TxidPublicArtifactMaintenance,
+        graphql_needed: bool,
+    ) -> Self {
+        if graphql_needed {
+            Self::FallBackToGraphql(Some(maintenance))
+        } else {
+            Self::Done(0, maintenance)
+        }
+    }
+}
+
 impl TxidPublicCacheManifest {
+    /// Reconciles the validated markers with `latest`, clears them when local
+    /// rows need a validated refresh, and writes the manifest if either changed.
+    fn reconcile_markers_with_latest(
+        &mut self,
+        permit: &TxidPublicCacheWritePermit<'_>,
+        latest: TxidPublicLatestValidated,
+    ) -> Result<(bool, TxidPublicLocalLatestStatus), TxidPublicCacheError> {
+        let progress_reconciled = self.reconcile_validated_progress_for_latest(latest);
+        let local_status = self.local_latest_status(permit.db(), latest)?;
+        let mut markers_changed = false;
+        if progress_reconciled && local_status == TxidPublicLocalLatestStatus::Satisfied {
+            self.commit_latest_validated_if_supported(permit.db(), latest)?;
+        }
+        if local_status == TxidPublicLocalLatestStatus::NeedsValidatedRefresh {
+            markers_changed = self.clear_validated_markers_for_latest(latest);
+        }
+        if progress_reconciled || markers_changed {
+            self.write_to(permit)?;
+        }
+        Ok((progress_reconciled, local_status))
+    }
+
+    /// Local rows already cover `latest`: commits its markers again, with the
+    /// index rebuilt, when progress was reconciled or the markers disagree.
+    fn commit_covered_latest(
+        &mut self,
+        permit: &TxidPublicCacheWritePermit<'_>,
+        latest: TxidPublicLatestValidated,
+        progress_reconciled: bool,
+    ) -> Result<(), TxidPublicCacheError> {
+        let markers_stale = progress_reconciled
+            || !self.latest_validated_matches(latest)
+            || !self.latest_checkpoint_matches(latest);
+        if markers_stale {
+            self.commit_latest_validated_if_supported(permit.db(), latest)?;
+            rebuild_index_for_manifest(self, permit)?;
+            self.write_to(permit)?;
+        }
+        Ok(())
+    }
+
     fn apply_artifact_chunks_with_progress_guard(
         &mut self,
         permit: &TxidPublicCacheWritePermit<'_>,
