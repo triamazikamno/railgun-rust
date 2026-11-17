@@ -192,25 +192,25 @@ struct CompositeRouting {
 
 /// The transactions of one composite batch in build order, sharing an input
 /// witness cache and an execution target.
-struct CompositePlanner<'a, S: RailgunSpendSigner> {
+pub(super) struct CompositePlanner<'a, S: RailgunSpendSigner> {
     builder: &'a TransactionBuilder,
-    viewing: &'a ViewingKeyData,
+    pub(super) viewing: &'a ViewingKeyData,
     signer: &'a S,
     forest: &'a MerkleForest,
-    execution: CompositeExecution,
-    input_witness_cache: InputWitnessProofCache<'a>,
-    unproven_plans: Vec<UnprovenTransactionPlan>,
+    pub(super) execution: CompositeExecution,
+    pub(super) input_witness_cache: InputWitnessProofCache<'a>,
+    pub(super) unproven_plans: Vec<UnprovenTransactionPlan>,
 }
 
-struct ProvenComposite {
-    call: TransactionCall,
-    inputs: Vec<InputWitness>,
-    outputs: Vec<Note>,
-    chunks: Vec<TransactionPlanChunk>,
+pub(super) struct ProvenComposite {
+    pub(super) call: TransactionCall,
+    pub(super) inputs: Vec<InputWitness>,
+    pub(super) outputs: Vec<Note>,
+    pub(super) chunks: Vec<TransactionPlanChunk>,
 }
 
 impl<'a, S: RailgunSpendSigner> CompositePlanner<'a, S> {
-    fn new(
+    pub(super) fn new(
         builder: &'a TransactionBuilder,
         viewing: &'a ViewingKeyData,
         signer: &'a S,
@@ -228,7 +228,7 @@ impl<'a, S: RailgunSpendSigner> CompositePlanner<'a, S> {
         }
     }
 
-    fn plan_builder(
+    pub(super) fn plan_builder(
         &self,
         utxos: Vec<Utxo>,
         token_address: Address,
@@ -244,7 +244,7 @@ impl<'a, S: RailgunSpendSigner> CompositePlanner<'a, S> {
     }
 
     /// Points every transaction at the adapter and binds it to the relay action.
-    fn bind_adapt_params(&mut self, action_data: &ActionData) {
+    pub(super) fn bind_adapt_params(&mut self, action_data: &ActionData) {
         debug_assert!(action_data.requireSuccess);
         let transactions = self
             .unproven_plans
@@ -262,7 +262,7 @@ impl<'a, S: RailgunSpendSigner> CompositePlanner<'a, S> {
     }
 
     /// Proves every transaction, then encodes the batch call for the execution target.
-    async fn prove<P: TransactionProver>(
+    pub(super) async fn prove<P: TransactionProver>(
         self,
         prover: &P,
         verify_proof: bool,
@@ -753,7 +753,7 @@ fn composite_build_leg_order(
     order
 }
 
-pub(super) fn composite_call(
+fn composite_call(
     execution: CompositeExecution,
     transactions: Vec<Transaction>,
     action_data: Option<&ActionData>,

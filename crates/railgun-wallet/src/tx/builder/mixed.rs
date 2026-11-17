@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use alloy::primitives::{Address, FixedBytes, U256};
 
 use broadcaster_core::contracts::railgun::ActionData;
-use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::MerkleForest;
 
@@ -18,17 +18,15 @@ use super::super::{
     CompositeUnshieldLegRole, CompositeUnshieldRecipient, MixedPrivateActionPlan,
     MixedPrivateActionPreview, MixedPrivateActionRequest, MixedPrivateOutputRole,
     MixedPrivateOutputSource, MixedPrivatePlannedOutput, MixedPublicPlannedOutput,
-    SelectedInputIdentity, SendRequest, TransactionBuilder, TransactionShape,
-    UNRELAYED_ADAPT_PARAMS, UnshieldRequest,
+    SelectedInputIdentity, SendRequest, TransactionBuilder, TransactionShape, UnshieldRequest,
 };
-use super::composite::{composite_call, select_composite_leg_selections_with_policy};
+use super::composite::{
+    CompositePlanner, ProvenComposite, select_composite_leg_selections_with_policy,
+};
 use super::outputs::{SendOutputs, UnshieldOutputs, build_send_outputs, build_unshield_outputs};
-use super::plan::{
-    InputWitnessProofCache, TransactionPlanBuilder, TransactionProver, UnprovenTransactionPlan,
-    prove_transaction_plans, spend_allocations,
-};
+use super::plan::{SpendAllocation, TransactionProver, UnprovenTransactionPlan, spend_allocations};
 use super::rand_array;
-use super::selection::BatchUtxoSelection;
+use super::selection::{BatchUtxoSelection, UtxoSelection};
 
 struct MixedPrivateActionSelectionPlan {
     selections: Vec<BatchUtxoSelection>,
@@ -253,169 +251,251 @@ impl TransactionBuilder {
             selections,
             preview,
         } = self.select_mixed_private_action_plan(utxos, &request)?;
-        let relay_call_count = preview.shape.relay_call_count;
-        let uses_relay_adapt = preview.shape.uses_relay_adapt;
         let execution = preview.shape.execution;
+        let mut build = MixedActionBuild::new(
+            CompositePlanner::new(self, viewing, signer, forest, execution),
+            &request,
+        );
 
-        let sender = viewing.address_data();
-        let mut input_witness_cache = InputWitnessProofCache::new(forest);
-        let mut unproven_plans = Vec::new();
-        let mut private_outputs = Vec::new();
-        let mut public_outputs = Vec::new();
+        // Selections hold public unshields first; transactions build sends first.
+        let (unshield_selections, send_selections) =
+            selections.split_at(request.public_unshields.len());
+        for (send_index, selection) in send_selections.iter().enumerate() {
+            build.push_send(send_index, selection)?;
+        }
+        for (unshield_index, selection) in unshield_selections.iter().enumerate() {
+            build.push_unshield(unshield_index, selection)?;
+        }
+        build.debug_assert_matches(&preview);
 
-        for (send_index, send) in request.private_sends.iter().copied().enumerate() {
-            let selection = &selections[request.public_unshields.len() + send_index];
-            let allocations = spend_allocations(
-                selection,
-                send.amount,
-                U256::ZERO,
-                None,
-                request.spend_up_to,
-            )?;
-            let send_request = SendRequest {
+        let action_data = if preview.shape.uses_relay_adapt {
+            let action_data = mixed_action_data(&request, execution)?;
+            build.planner.bind_adapt_params(&action_data);
+            Some(action_data)
+        } else {
+            None
+        };
+
+        build.finish(prover, preview, action_data).await
+    }
+}
+
+fn mixed_action_data(
+    request: &MixedPrivateActionRequest,
+    execution: CompositeExecution,
+) -> Result<ActionData, BuildError> {
+    match (request.relay_actions.as_ref(), execution) {
+        (Some(relay_actions), _) => {
+            relay_actions.action_data(execution.account(), FixedBytes::<31>::from(rand_array()))
+        }
+        (None, CompositeExecution::Executor(_)) => Ok(ActionData {
+            random: FixedBytes::<31>::from(rand_array()),
+            requireSuccess: true,
+            minGasLimit: U256::ZERO,
+            calls: request.executor_calls.clone(),
+        }),
+        (None, _) => Err(BuildError::MissingCompositeRelayActions),
+    }
+}
+
+/// A mixed private action's planned outputs, recorded as its transactions are
+/// built.
+struct MixedActionBuild<'a, S: RailgunSpendSigner> {
+    planner: CompositePlanner<'a, S>,
+    request: &'a MixedPrivateActionRequest,
+    sender: AddressData,
+    private_outputs: Vec<MixedPrivatePlannedOutput>,
+    public_outputs: Vec<MixedPublicPlannedOutput>,
+}
+
+impl<'a, S: RailgunSpendSigner> MixedActionBuild<'a, S> {
+    fn new(planner: CompositePlanner<'a, S>, request: &'a MixedPrivateActionRequest) -> Self {
+        let sender = planner.viewing.address_data();
+        Self {
+            planner,
+            request,
+            sender,
+            private_outputs: Vec::new(),
+            public_outputs: Vec::new(),
+        }
+    }
+
+    fn push_send(
+        &mut self,
+        send_index: usize,
+        selection: &BatchUtxoSelection,
+    ) -> Result<(), BuildError> {
+        let send = self.request.private_sends[send_index];
+        let allocations = spend_allocations(
+            selection,
+            send.amount,
+            U256::ZERO,
+            None,
+            self.request.spend_up_to,
+        )?;
+        for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
+            self.push_send_chunk(send_index, chunk, allocation)?;
+        }
+        Ok(())
+    }
+
+    fn push_send_chunk(
+        &mut self,
+        send_index: usize,
+        chunk: UtxoSelection,
+        allocation: SpendAllocation,
+    ) -> Result<(), BuildError> {
+        let send = self.request.private_sends[send_index];
+        let transaction_index = self.planner.unproven_plans.len();
+        let plan_builder = self.planner.plan_builder(chunk.utxos, send.token_address)?;
+        let SendOutputs {
+            outputs,
+            commitment_ciphertext,
+            broadcaster_fee_note: _,
+            recipient_note,
+            change_note,
+        } = build_send_outputs(
+            send.token_address,
+            allocation.amount,
+            allocation.change,
+            &self.sender,
+            &send.recipient,
+            None,
+            &self.planner.viewing.viewing_private_key,
+        )?;
+        self.private_outputs.push(MixedPrivatePlannedOutput {
+            source: MixedPrivateOutputSource::Send(send_index),
+            transaction_index,
+            output_index: 0,
+            token_address: send.token_address,
+            amount: allocation.amount,
+            role: MixedPrivateOutputRole::Recipient(send.role),
+            note: recipient_note,
+        });
+        if let Some(change_note) = change_note {
+            self.private_outputs.push(MixedPrivatePlannedOutput {
+                source: MixedPrivateOutputSource::Send(send_index),
+                transaction_index,
+                output_index: 1,
                 token_address: send.token_address,
-                amount: send.amount,
-                recipient: send.recipient,
-                verify_proof: request.verify_proof,
-                spend_up_to: request.spend_up_to,
-                broadcaster_fee: None,
-                min_gas_price: request.min_gas_price,
-            };
-
-            for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
-                let transaction_index = unproven_plans.len();
-                let plan_builder = TransactionPlanBuilder::new(
-                    self,
-                    viewing,
-                    signer,
-                    forest,
-                    chunk.utxos,
-                    send.token_address,
-                )?;
-                let SendOutputs {
-                    outputs,
-                    commitment_ciphertext,
-                    broadcaster_fee_note: _,
-                    recipient_note,
-                    change_note,
-                } = build_send_outputs(
-                    send.token_address,
-                    allocation.amount,
-                    allocation.change,
-                    &sender,
-                    &send.recipient,
-                    None,
-                    &viewing.viewing_private_key,
-                )?;
-                private_outputs.push(MixedPrivatePlannedOutput {
-                    source: MixedPrivateOutputSource::Send(send_index),
-                    transaction_index,
-                    output_index: 0,
-                    token_address: send.token_address,
-                    amount: allocation.amount,
-                    role: MixedPrivateOutputRole::Recipient(send.role),
-                    note: recipient_note,
-                });
-                if let Some(change_note) = change_note {
-                    private_outputs.push(MixedPrivatePlannedOutput {
-                        source: MixedPrivateOutputSource::Send(send_index),
-                        transaction_index,
-                        output_index: 1,
-                        token_address: send.token_address,
-                        amount: allocation.change,
-                        role: MixedPrivateOutputRole::Change,
-                        note: change_note,
-                    });
-                }
-                unproven_plans.push(plan_builder.build_unproven_send(
-                    &send_request,
-                    outputs,
-                    commitment_ciphertext,
-                    Some(&mut input_witness_cache),
-                )?);
-            }
+                amount: allocation.change,
+                role: MixedPrivateOutputRole::Change,
+                note: change_note,
+            });
         }
+        let send_request = SendRequest {
+            token_address: send.token_address,
+            amount: send.amount,
+            recipient: send.recipient,
+            verify_proof: self.request.verify_proof,
+            spend_up_to: self.request.spend_up_to,
+            broadcaster_fee: None,
+            min_gas_price: self.request.min_gas_price,
+        };
+        self.planner
+            .unproven_plans
+            .push(plan_builder.build_unproven_send(
+                &send_request,
+                outputs,
+                commitment_ciphertext,
+                Some(&mut self.planner.input_witness_cache),
+            )?);
+        Ok(())
+    }
 
-        for (unshield_index, leg) in request.public_unshields.iter().copied().enumerate() {
-            let selection = &selections[unshield_index];
-            let allocations = spend_allocations(selection, leg.amount, U256::ZERO, None, false)?;
-            let unshield_to = leg.recipient.unshield_to(execution.account());
-
-            for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
-                let transaction_index = unproven_plans.len();
-                let plan_builder = TransactionPlanBuilder::new(
-                    self,
-                    viewing,
-                    signer,
-                    forest,
-                    chunk.utxos,
-                    leg.token_address,
-                )?;
-                let UnshieldOutputs {
-                    outputs,
-                    commitment_ciphertext,
-                    broadcaster_fee_note: _,
-                    unshield_note,
-                    unshield_output_index,
-                    change_note,
-                } = build_unshield_outputs(
-                    leg.token_address,
-                    allocation.amount,
-                    unshield_to,
-                    allocation.change,
-                    &sender,
-                    None,
-                    &viewing.viewing_private_key,
-                )?;
-                if let Some(change_note) = change_note {
-                    private_outputs.push(MixedPrivatePlannedOutput {
-                        source: MixedPrivateOutputSource::PublicUnshield(unshield_index),
-                        transaction_index,
-                        output_index: 0,
-                        token_address: leg.token_address,
-                        amount: allocation.change,
-                        role: MixedPrivateOutputRole::Change,
-                        note: change_note,
-                    });
-                }
-                public_outputs.push(MixedPublicPlannedOutput {
-                    unshield_index,
-                    transaction_index,
-                    output_index: unshield_output_index,
-                    token_address: leg.token_address,
-                    amount: allocation.amount,
-                    recipient: leg.recipient,
-                    role: leg.role,
-                    note: unshield_note.clone(),
-                });
-                let unshield_request = UnshieldRequest {
-                    token_address: leg.token_address,
-                    amount: allocation.amount,
-                    recipient: unshield_to,
-                    verify_proof: request.verify_proof,
-                    spend_up_to: request.spend_up_to,
-                    broadcaster_fee: None,
-                    min_gas_price: request.min_gas_price,
-                };
-                unproven_plans.push(plan_builder.build_unproven_unshield(
-                    unshield_request,
-                    outputs,
-                    commitment_ciphertext,
-                    &unshield_note,
-                    Some(&mut input_witness_cache),
-                )?);
-            }
+    fn push_unshield(
+        &mut self,
+        unshield_index: usize,
+        selection: &BatchUtxoSelection,
+    ) -> Result<(), BuildError> {
+        let leg = self.request.public_unshields[unshield_index];
+        let allocations = spend_allocations(selection, leg.amount, U256::ZERO, None, false)?;
+        for (chunk, allocation) in selection.chunks.iter().cloned().zip(allocations) {
+            self.push_unshield_chunk(unshield_index, chunk, allocation)?;
         }
+        Ok(())
+    }
 
-        let actual_selected_inputs = selected_input_identities_from_unproven(&unproven_plans);
+    fn push_unshield_chunk(
+        &mut self,
+        unshield_index: usize,
+        chunk: UtxoSelection,
+        allocation: SpendAllocation,
+    ) -> Result<(), BuildError> {
+        let leg = self.request.public_unshields[unshield_index];
+        let unshield_to = leg.recipient.unshield_to(self.planner.execution.account());
+        let transaction_index = self.planner.unproven_plans.len();
+        let plan_builder = self.planner.plan_builder(chunk.utxos, leg.token_address)?;
+        let UnshieldOutputs {
+            outputs,
+            commitment_ciphertext,
+            broadcaster_fee_note: _,
+            unshield_note,
+            unshield_output_index,
+            change_note,
+        } = build_unshield_outputs(
+            leg.token_address,
+            allocation.amount,
+            unshield_to,
+            allocation.change,
+            &self.sender,
+            None,
+            &self.planner.viewing.viewing_private_key,
+        )?;
+        if let Some(change_note) = change_note {
+            self.private_outputs.push(MixedPrivatePlannedOutput {
+                source: MixedPrivateOutputSource::PublicUnshield(unshield_index),
+                transaction_index,
+                output_index: 0,
+                token_address: leg.token_address,
+                amount: allocation.change,
+                role: MixedPrivateOutputRole::Change,
+                note: change_note,
+            });
+        }
+        self.public_outputs.push(MixedPublicPlannedOutput {
+            unshield_index,
+            transaction_index,
+            output_index: unshield_output_index,
+            token_address: leg.token_address,
+            amount: allocation.amount,
+            recipient: leg.recipient,
+            role: leg.role,
+            note: unshield_note.clone(),
+        });
+        let unshield_request = UnshieldRequest {
+            token_address: leg.token_address,
+            amount: allocation.amount,
+            recipient: unshield_to,
+            verify_proof: self.request.verify_proof,
+            spend_up_to: self.request.spend_up_to,
+            broadcaster_fee: None,
+            min_gas_price: self.request.min_gas_price,
+        };
+        self.planner
+            .unproven_plans
+            .push(plan_builder.build_unproven_unshield(
+                unshield_request,
+                outputs,
+                commitment_ciphertext,
+                &unshield_note,
+                Some(&mut self.planner.input_witness_cache),
+            )?);
+        Ok(())
+    }
+
+    /// The built transactions must match what the proofless preview promised.
+    fn debug_assert_matches(&self, preview: &MixedPrivateActionPreview) {
+        let unproven_plans = &self.planner.unproven_plans;
+        let actual_selected_inputs = selected_input_identities_from_unproven(unproven_plans);
         let actual_shape = CompositePlanShape {
-            execution,
+            execution: preview.shape.execution,
             transaction_count: unproven_plans.len(),
             input_count: actual_selected_inputs.len(),
-            private_output_count: private_outputs.len(),
-            public_output_count: public_outputs.len(),
-            relay_call_count,
-            uses_relay_adapt,
+            private_output_count: self.private_outputs.len(),
+            public_output_count: self.public_outputs.len(),
+            relay_call_count: preview.shape.relay_call_count,
+            uses_relay_adapt: preview.shape.uses_relay_adapt,
         };
         debug_assert_eq!(actual_selected_inputs, preview.selected_inputs);
         debug_assert_eq!(actual_shape, preview.shape);
@@ -430,67 +510,34 @@ impl TransactionBuilder {
                 .collect::<Vec<_>>(),
             preview.transactions
         );
-        let selected_inputs = preview.selected_inputs;
-        let shape = preview.shape;
+    }
 
-        let action_data = if uses_relay_adapt {
-            let action_data = match (request.relay_actions.as_ref(), execution) {
-                (Some(relay_actions), _) => relay_actions
-                    .action_data(execution.account(), FixedBytes::<31>::from(rand_array()))?,
-                (None, CompositeExecution::Executor(_)) => ActionData {
-                    random: FixedBytes::<31>::from(rand_array()),
-                    requireSuccess: true,
-                    minGasLimit: U256::ZERO,
-                    calls: request.executor_calls.clone(),
-                },
-                (None, _) => return Err(BuildError::MissingCompositeRelayActions),
-            };
-            debug_assert!(action_data.requireSuccess);
-            let transactions = unproven_plans
-                .iter()
-                .map(|plan| &plan.transaction)
-                .collect::<Vec<_>>();
-            let adapt_params = match execution {
-                CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
-                _ => action_data.adapt_params(&transactions),
-            };
-            for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = execution.account();
-                plan.transaction.boundParams.adaptParams = adapt_params;
-            }
-            Some(action_data)
-        } else {
-            None
-        };
-
-        let proven_plans =
-            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
-        let mut transactions = Vec::with_capacity(proven_plans.len());
-        let mut chunks = Vec::with_capacity(proven_plans.len());
-        for proven in proven_plans {
-            transactions.push(proven.transaction);
-            chunks.push(proven.chunk);
-        }
-        let call = composite_call(execution, transactions, action_data.as_ref())?;
-        let inputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.inputs.clone())
-            .collect::<Vec<_>>();
-        let outputs = chunks
-            .iter()
-            .flat_map(|chunk| chunk.outputs.clone())
-            .collect::<Vec<_>>();
-
+    /// Proves the batch and assembles the plan with the preview's inputs and shape.
+    async fn finish<P: TransactionProver>(
+        self,
+        prover: &P,
+        preview: MixedPrivateActionPreview,
+        action_data: Option<ActionData>,
+    ) -> Result<MixedPrivateActionPlan, BuildError> {
+        let ProvenComposite {
+            call,
+            inputs,
+            outputs,
+            chunks,
+        } = self
+            .planner
+            .prove(prover, self.request.verify_proof, action_data.as_ref())
+            .await?;
         Ok(MixedPrivateActionPlan {
             call,
             inputs,
             outputs,
             chunks,
-            private_outputs,
-            public_outputs,
+            private_outputs: self.private_outputs,
+            public_outputs: self.public_outputs,
             action_data,
-            selected_inputs,
-            shape,
+            selected_inputs: preview.selected_inputs,
+            shape: preview.shape,
         })
     }
 }
