@@ -56,12 +56,14 @@ pub(crate) async fn spawn_wallet_worker(
     let mut prepared = prepare_wallet_worker(
         services,
         cfg,
-        actor_id,
-        live_rx,
-        backfill_rx,
-        cancel,
-        initial_utxos,
-        initial_last_scanned,
+        WalletWorkerStart {
+            actor_id,
+            live_rx,
+            backfill_rx,
+            cancel,
+            initial_utxos,
+            initial_last_scanned,
+        },
     )
     .await?;
     let worker = prepared.take_worker();

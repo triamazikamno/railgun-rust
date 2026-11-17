@@ -105,12 +105,14 @@ async fn prepared_restored_replay_waits_for_activation_before_backfill_admission
             poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         cfg.clone(),
-        1,
-        live_rx,
-        backfill_event_rx,
-        cancel.clone(),
-        Vec::new(),
-        79,
+        WalletWorkerStart {
+            actor_id: 1,
+            live_rx,
+            backfill_rx: backfill_event_rx,
+            cancel: cancel.clone(),
+            initial_utxos: Vec::new(),
+            initial_last_scanned: 79,
+        },
     )
     .await
     .expect("prepare restored wallet worker");
@@ -541,12 +543,14 @@ async fn dropping_prepared_wallet_worker_retires_unregistered_actor() {
             poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         wallet_config(),
-        1,
-        live_rx,
-        backfill_rx,
-        cancel.clone(),
-        Vec::new(),
-        0,
+        WalletWorkerStart {
+            actor_id: 1,
+            live_rx,
+            backfill_rx,
+            cancel: cancel.clone(),
+            initial_utxos: Vec::new(),
+            initial_last_scanned: 0,
+        },
     )
     .await
     .expect("prepare wallet worker");
@@ -741,12 +745,14 @@ async fn wallet_actor_panic_aborts_tracked_poi_jobs_before_supervisor_completes(
             poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         wallet_config(),
-        1,
-        live_rx,
-        backfill_rx,
-        cancel,
-        Vec::new(),
-        0,
+        WalletWorkerStart {
+            actor_id: 1,
+            live_rx,
+            backfill_rx,
+            cancel,
+            initial_utxos: Vec::new(),
+            initial_last_scanned: 0,
+        },
     )
     .await
     .expect("prepare wallet worker");

@@ -211,12 +211,14 @@ impl ChainService {
                     poi_submitter: self.poi_submitter.clone(),
                 },
                 cfg.clone(),
-                actor_id,
-                live_rx,
-                backfill_rx,
-                cancel.clone(),
-                initial_utxos,
-                last_scanned,
+                crate::wallet::WalletWorkerStart {
+                    actor_id,
+                    live_rx,
+                    backfill_rx,
+                    cancel: cancel.clone(),
+                    initial_utxos,
+                    initial_last_scanned: last_scanned,
+                },
             )
             .await?;
 

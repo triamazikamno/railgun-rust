@@ -1264,12 +1264,14 @@ async fn wallet_reset_commit_publishes_retained_ppoi_submissions_with_current_vi
             poi_submitter: ChainPoiSubmitterHandle::detached_for_test(),
         },
         cfg.clone(),
-        1,
-        live_rx,
-        backfill_rx,
-        cancel.clone(),
-        vec![test_wallet_utxo(105, 7)],
-        120,
+        WalletWorkerStart {
+            actor_id: 1,
+            live_rx,
+            backfill_rx,
+            cancel: cancel.clone(),
+            initial_utxos: vec![test_wallet_utxo(105, 7)],
+            initial_last_scanned: 120,
+        },
     )
     .await
     .expect("prepare wallet worker");

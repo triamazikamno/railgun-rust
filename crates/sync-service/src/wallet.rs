@@ -159,7 +159,9 @@ pub(crate) use delta::pending_overlay_from_delta;
 pub use handle::WalletHandle;
 pub(crate) use persist::{WalletWorkerServices, wallet_poi_status_client};
 pub use poi_sources::LocalPoiMerkleProofSource;
-pub(crate) use worker::{PreparedWalletWorker, prepare_wallet_worker, wallet_cache_store};
+pub(crate) use worker::{
+    PreparedWalletWorker, WalletWorkerStart, prepare_wallet_worker, wallet_cache_store,
+};
 
 #[cfg(test)]
 mod tests;
