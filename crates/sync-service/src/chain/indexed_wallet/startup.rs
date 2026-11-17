@@ -1,7 +1,7 @@
 //! Startup-sync block-range helpers and startup event delivery.
 
 use super::{
-    BackfillEvent, CancellationToken, Future, WalletBackfillApplyResult,
+    BackfillEvent, CancellationToken, Future, WalletBackfillApplyResult, WalletBackfillDriver,
     WalletBackfillFinishResult, WalletBackfillStartResult, WalletHandle, WalletScanApply,
     WalletStartupSyncError, debug, mpsc,
 };
@@ -132,25 +132,7 @@ pub(in crate::chain) async fn send_wallet_startup_events(
         let result = if let Some(driver) = driver.as_ref() {
             driver.apply(cache_key, apply).await
         } else {
-            let target_block = apply.to_block;
-            match handle
-                .start_backfill(cache_key, sender, progress, target_block)
-                .await
-            {
-                WalletBackfillStartResult::Accepted { grant, .. } => {
-                    let driver = grant.activate();
-                    let result = driver.apply(cache_key, apply).await;
-                    driver.retire(cache_key).await;
-                    result
-                }
-                WalletBackfillStartResult::Rejected {
-                    committed_to,
-                    reason,
-                } => WalletBackfillApplyResult::Rejected {
-                    committed_to,
-                    reason,
-                },
-            }
+            apply_with_one_shot_driver(handle, cache_key, sender, progress, apply).await
         };
         match result {
             WalletBackfillApplyResult::Committed { .. }
@@ -164,27 +146,61 @@ pub(in crate::chain) async fn send_wallet_startup_events(
             }
         }
     }
-    if let Some(last_block) = done_block
-        && !matches!(
-            driver
-                .as_ref()
-                .expect("startup done block has an active driver")
-                .finish(cache_key, last_block)
-                .await,
-            WalletBackfillFinishResult::Ready { .. }
-        )
+    finish_startup_driver(cache_key, driver, done_block).await
+}
+
+/// Applies one batch through a driver of its own: starts it, applies the
+/// batch and retires it. A rejected start reports as a rejected apply.
+async fn apply_with_one_shot_driver(
+    handle: &WalletHandle,
+    cache_key: &str,
+    sender: &mpsc::Sender<BackfillEvent>,
+    progress: crate::types::WalletSchedulableProgress,
+    apply: WalletScanApply,
+) -> WalletBackfillApplyResult {
+    let target_block = apply.to_block;
+    match handle
+        .start_backfill(cache_key, sender, progress, target_block)
+        .await
     {
-        debug!(cache_key, last_block, "wallet startup finish rejected");
-        if let Some(driver) = driver.take() {
+        WalletBackfillStartResult::Accepted { grant, .. } => {
+            let driver = grant.activate();
+            let result = driver.apply(cache_key, apply).await;
+            driver.retire(cache_key).await;
+            result
+        }
+        WalletBackfillStartResult::Rejected {
+            committed_to,
+            reason,
+        } => WalletBackfillApplyResult::Rejected {
+            committed_to,
+            reason,
+        },
+    }
+}
+
+/// Finishes the batch driver at `done_block` and retires it if the finish
+/// is rejected. Without a done block, retires the driver if one was opened.
+/// A finished driver is dropped without being retired.
+async fn finish_startup_driver(
+    cache_key: &str,
+    driver: Option<WalletBackfillDriver>,
+    done_block: Option<u64>,
+) -> bool {
+    let Some(last_block) = done_block else {
+        if let Some(driver) = driver {
             driver.retire(cache_key).await;
         }
-        return false;
+        return true;
+    };
+    let driver = driver.expect("startup done block has an active driver");
+    if matches!(
+        driver.finish(cache_key, last_block).await,
+        WalletBackfillFinishResult::Ready { .. }
+    ) {
+        return true;
     }
-    if done_block.is_none()
-        && target_block > 0
-        && let Some(driver) = driver.take()
-    {
-        driver.retire(cache_key).await;
-    }
-    true
+    debug!(cache_key, last_block, "wallet startup finish rejected");
+    driver.retire(cache_key).await;
+    false
 }

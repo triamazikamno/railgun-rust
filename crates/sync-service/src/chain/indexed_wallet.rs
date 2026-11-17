@@ -7,9 +7,9 @@ use super::{
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
     IndexedWalletPageKind, Instant, PublicScanReadScope, PublicScanSource, QuickSyncClient,
     SyncError, SyncProgressSender, SyncProgressStage, SyncProgressUpdate, UtxoSource,
-    WalletBackfillApplyResult, WalletBackfillFinishResult, WalletBackfillStartResult, WalletHandle,
-    WalletScanApply, WalletScanInputRows, WalletStartupSyncError, artifact_chunk_progress, debug,
-    info, mpsc, send_sync_progress,
+    WalletBackfillApplyResult, WalletBackfillDriver, WalletBackfillFinishResult,
+    WalletBackfillStartResult, WalletHandle, WalletScanApply, WalletScanInputRows,
+    WalletStartupSyncError, artifact_chunk_progress, debug, info, mpsc, send_sync_progress,
 };
 
 use crate::indexed_artifacts::IndexedArtifactManifestError;

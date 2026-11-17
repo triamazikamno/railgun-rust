@@ -9,8 +9,9 @@ use super::{
 };
 
 use crate::indexed_artifacts::{
-    ChainType, IndexedArtifactManifestError, IndexedArtifactRangeKind, IndexedDatasetKind,
-    VerifiedIndexedArtifactChunk, decode_indexed_artifact_chunk,
+    ChainType, IndexedArtifactChunkEnvelopeHeader, IndexedArtifactManifestError,
+    IndexedArtifactRangeKind, IndexedDatasetKind, VerifiedIndexedArtifactChunk,
+    decode_indexed_artifact_chunk,
 };
 use alloy::primitives::{FixedBytes as AlloyFixedBytes, U256};
 use alloy::sol_types::SolValue;
@@ -58,35 +59,10 @@ impl IndexedWalletPage {
     ) -> Result<Self, SyncError> {
         let envelope =
             decode_indexed_artifact_chunk(chunk).map_err(|err| wallet_artifact_error(&err))?;
-        if envelope.header.dataset_kind != IndexedDatasetKind::WalletScan {
-            return Err(wallet_artifact_format(
-                "chunk is not a wallet_scan artifact",
-            ));
-        }
-        if envelope.header.scope.chain_type != ChainType::Evm {
-            return Err(wallet_artifact_format("chunk is not an EVM chain artifact"));
-        }
-        if envelope.header.range.kind != IndexedArtifactRangeKind::Block {
-            return Err(wallet_artifact_format(
-                "wallet_scan range is not block scoped",
-            ));
-        }
+        validate_wallet_scan_header(&envelope.header)?;
 
         let chunk_bounds = WalletScanChunkBounds::try_from(&chunk.descriptor)?;
-        let checkpoint_block = chunk_bounds.checkpoint_block();
-        let mut page = Self {
-            transact_commitments: Vec::new(),
-            shield_commitments: Vec::new(),
-            legacy_encrypted_commitments: Vec::new(),
-            legacy_generated_commitments: Vec::new(),
-            nullifiers: Vec::new(),
-            checkpoint_block,
-            transact_rows: 0,
-            shield_rows: 0,
-            legacy_encrypted_rows: 0,
-            legacy_generated_rows: 0,
-            nullifier_rows: 0,
-        };
+        let mut page = Self::empty(chunk_bounds.checkpoint_block());
 
         let mut row_count = 0_usize;
         for section in &envelope.header.sections {
@@ -95,45 +71,9 @@ impl IndexedWalletPage {
                 .map_err(IndexedArtifactManifestError::from)
                 .map_err(|err| wallet_artifact_error(&err))?;
             let mut cursor = WalletScanArtifactCursor::new(payload);
-            match section.section_id {
-                WALLET_TRANSACT_SECTION_ID => {
-                    let (rows, decoded_rows) = cursor.read_transact_rows(chunk_bounds, bounds)?;
-                    page.transact_rows = rows.len();
-                    page.transact_commitments = rows;
-                    row_count = row_count.saturating_add(decoded_rows);
-                }
-                WALLET_SHIELD_SECTION_ID => {
-                    let (rows, decoded_rows) = cursor.read_shield_rows(chunk_bounds, bounds)?;
-                    page.shield_rows = rows.len();
-                    page.shield_commitments = rows;
-                    row_count = row_count.saturating_add(decoded_rows);
-                }
-                WALLET_NULLIFIER_SECTION_ID => {
-                    let (rows, decoded_rows) = cursor.read_nullifier_rows(chunk_bounds, bounds)?;
-                    page.nullifier_rows = rows.len();
-                    page.nullifiers = rows;
-                    row_count = row_count.saturating_add(decoded_rows);
-                }
-                WALLET_LEGACY_ENCRYPTED_SECTION_ID => {
-                    let (rows, decoded_rows) =
-                        cursor.read_legacy_encrypted_rows(chunk_bounds, bounds)?;
-                    page.legacy_encrypted_rows = rows.len();
-                    page.legacy_encrypted_commitments = rows;
-                    row_count = row_count.saturating_add(decoded_rows);
-                }
-                WALLET_LEGACY_GENERATED_SECTION_ID => {
-                    let (rows, decoded_rows) =
-                        cursor.read_legacy_generated_rows(chunk_bounds, bounds)?;
-                    page.legacy_generated_rows = rows.len();
-                    page.legacy_generated_commitments = rows;
-                    row_count = row_count.saturating_add(decoded_rows);
-                }
-                other => {
-                    return Err(wallet_artifact_format(format!(
-                        "unknown wallet_scan section id {other}"
-                    )));
-                }
-            }
+            let decoded_rows =
+                page.decode_section(section.section_id, &mut cursor, chunk_bounds, bounds)?;
+            row_count = row_count.saturating_add(decoded_rows);
             cursor.expect_eof("wallet_scan section")?;
         }
 
@@ -145,6 +85,73 @@ impl IndexedWalletPage {
         }
         Ok(page)
     }
+
+    /// Decodes one section into its rows on this page and returns how many
+    /// rows the section encoded, including rows outside `bounds`.
+    fn decode_section(
+        &mut self,
+        section_id: u16,
+        cursor: &mut WalletScanArtifactCursor<'_>,
+        chunk_bounds: WalletScanChunkBounds,
+        bounds: Option<WalletScanRowBounds>,
+    ) -> Result<usize, SyncError> {
+        match section_id {
+            WALLET_TRANSACT_SECTION_ID => {
+                let (rows, decoded_rows) = cursor.read_transact_rows(chunk_bounds, bounds)?;
+                self.transact_rows = rows.len();
+                self.transact_commitments = rows;
+                Ok(decoded_rows)
+            }
+            WALLET_SHIELD_SECTION_ID => {
+                let (rows, decoded_rows) = cursor.read_shield_rows(chunk_bounds, bounds)?;
+                self.shield_rows = rows.len();
+                self.shield_commitments = rows;
+                Ok(decoded_rows)
+            }
+            WALLET_NULLIFIER_SECTION_ID => {
+                let (rows, decoded_rows) = cursor.read_nullifier_rows(chunk_bounds, bounds)?;
+                self.nullifier_rows = rows.len();
+                self.nullifiers = rows;
+                Ok(decoded_rows)
+            }
+            WALLET_LEGACY_ENCRYPTED_SECTION_ID => {
+                let (rows, decoded_rows) =
+                    cursor.read_legacy_encrypted_rows(chunk_bounds, bounds)?;
+                self.legacy_encrypted_rows = rows.len();
+                self.legacy_encrypted_commitments = rows;
+                Ok(decoded_rows)
+            }
+            WALLET_LEGACY_GENERATED_SECTION_ID => {
+                let (rows, decoded_rows) =
+                    cursor.read_legacy_generated_rows(chunk_bounds, bounds)?;
+                self.legacy_generated_rows = rows.len();
+                self.legacy_generated_commitments = rows;
+                Ok(decoded_rows)
+            }
+            other => Err(wallet_artifact_format(format!(
+                "unknown wallet_scan section id {other}"
+            ))),
+        }
+    }
+}
+
+fn validate_wallet_scan_header(
+    header: &IndexedArtifactChunkEnvelopeHeader,
+) -> Result<(), SyncError> {
+    if header.dataset_kind != IndexedDatasetKind::WalletScan {
+        return Err(wallet_artifact_format(
+            "chunk is not a wallet_scan artifact",
+        ));
+    }
+    if header.scope.chain_type != ChainType::Evm {
+        return Err(wallet_artifact_format("chunk is not an EVM chain artifact"));
+    }
+    if header.range.kind != IndexedArtifactRangeKind::Block {
+        return Err(wallet_artifact_format(
+            "wallet_scan range is not block scoped",
+        ));
+    }
+    Ok(())
 }
 
 impl TryFrom<&VerifiedIndexedArtifactChunk> for IndexedWalletPage {

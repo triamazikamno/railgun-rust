@@ -2,7 +2,9 @@
 
 use super::{SyncError, UtxoSource, wallet_artifact_format};
 
-use crate::indexed_artifacts::{IndexedArtifactDescriptor, IndexedArtifactStreamCoverage};
+use crate::indexed_artifacts::{
+    IndexedArtifactDescriptor, IndexedArtifactRange, IndexedArtifactStreamCoverage,
+};
 
 #[derive(Default)]
 pub(super) struct WalletScanArtifactCoverage {
@@ -122,7 +124,8 @@ impl TryFrom<&IndexedArtifactStreamCoverage> for WalletScanCoverageRange {
     type Error = SyncError;
 
     fn try_from(coverage: &IndexedArtifactStreamCoverage) -> Result<Self, Self::Error> {
-        let checkpoint_block = wallet_scan_coverage_checkpoint_block(coverage)?;
+        let checkpoint_block =
+            wallet_scan_checkpoint_block("coverage", coverage.checkpoint_block, &coverage.range)?;
         Ok(Self {
             start: coverage.range.start,
             end: coverage.range.end,
@@ -142,7 +145,11 @@ impl TryFrom<&IndexedArtifactDescriptor> for WalletScanChunkBounds {
     type Error = SyncError;
 
     fn try_from(descriptor: &IndexedArtifactDescriptor) -> Result<Self, Self::Error> {
-        let checkpoint_block = wallet_scan_descriptor_checkpoint_block(descriptor, "chunk")?;
+        let checkpoint_block = wallet_scan_checkpoint_block(
+            "chunk",
+            descriptor.metadata.checkpoint_block,
+            &descriptor.range,
+        )?;
         Ok(Self {
             range_start: descriptor.range.start,
             range_end: descriptor.range.end,
@@ -173,43 +180,24 @@ impl WalletScanChunkBounds {
     }
 }
 
-fn wallet_scan_descriptor_checkpoint_block(
-    descriptor: &IndexedArtifactDescriptor,
-    descriptor_kind: &str,
+/// The checkpoint block, defaulting to the range end, which must lie within
+/// `range`. `kind` names the checkpoint's owner in the error.
+fn wallet_scan_checkpoint_block(
+    kind: &str,
+    checkpoint_block: Option<u64>,
+    range: &IndexedArtifactRange,
 ) -> Result<u64, SyncError> {
-    let checkpoint_block = descriptor
-        .metadata
-        .checkpoint_block
-        .unwrap_or(descriptor.range.end);
-    if checkpoint_block > descriptor.range.end {
+    let checkpoint_block = checkpoint_block.unwrap_or(range.end);
+    if checkpoint_block > range.end {
         return Err(wallet_artifact_format(format!(
-            "wallet_scan {descriptor_kind} checkpoint block {checkpoint_block} exceeds range end {}",
-            descriptor.range.end
+            "wallet_scan {kind} checkpoint block {checkpoint_block} exceeds range end {}",
+            range.end
         )));
     }
-    if checkpoint_block < descriptor.range.start {
+    if checkpoint_block < range.start {
         return Err(wallet_artifact_format(format!(
-            "wallet_scan {descriptor_kind} checkpoint block {checkpoint_block} is before range start {}",
-            descriptor.range.start
-        )));
-    }
-    Ok(checkpoint_block)
-}
-
-fn wallet_scan_coverage_checkpoint_block(
-    coverage: &IndexedArtifactStreamCoverage,
-) -> Result<u64, SyncError> {
-    let checkpoint_block = coverage.checkpoint_block.unwrap_or(coverage.range.end);
-    if checkpoint_block > coverage.range.end {
-        return Err(wallet_artifact_format(format!(
-            "wallet_scan coverage checkpoint block {checkpoint_block} exceeds range end {}",
-            coverage.range.end
-        )));
-    }
-    if checkpoint_block < coverage.range.start {
-        return Err(wallet_artifact_format(format!(
-            "wallet_scan coverage checkpoint block {checkpoint_block} is before range start {}",
-            coverage.range.start
+            "wallet_scan {kind} checkpoint block {checkpoint_block} is before range start {}",
+            range.start
         )));
     }
     Ok(checkpoint_block)
