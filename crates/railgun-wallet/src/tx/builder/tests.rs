@@ -40,9 +40,9 @@ use crate::tx::{
     generate_pre_transaction_pois, insert_pre_transaction_poi, poi_circuit_variant,
 };
 
-use super::{
-    BoundParamsExt, TransactionPlanBuilder, build_fee_only_outputs, build_send_outputs,
-    build_unshield_outputs, select_composite_leg_selections, select_utxos,
+use super::outputs::{build_fee_only_outputs, build_send_outputs, build_unshield_outputs};
+use super::plan::{
+    BoundParamsExt, InputWitnessProofCache, TransactionPlanBuilder, TransactionProver,
 };
 use super::{
     max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
@@ -50,6 +50,7 @@ use super::{
     send_selection_info_with_broadcaster_fee_token,
     send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
 };
+use super::{select_composite_leg_selections, select_utxos};
 
 struct MockSpendSigner {
     signed_msg: Cell<Option<U256>>,
@@ -70,7 +71,7 @@ impl RailgunSpendSigner for MockSpendSigner {
 struct MockTransactionProver;
 
 #[async_trait]
-impl super::TransactionProver for MockTransactionProver {
+impl TransactionProver for MockTransactionProver {
     async fn prove_unshield(
         &self,
         _public_inputs: &PublicInputs,
@@ -97,7 +98,7 @@ impl RecordingTransactionProver {
 }
 
 #[async_trait]
-impl super::TransactionProver for RecordingTransactionProver {
+impl TransactionProver for RecordingTransactionProver {
     async fn prove_unshield(
         &self,
         public_inputs: &PublicInputs,
@@ -219,7 +220,7 @@ fn input_witness_cache_uses_sparse_proofs_for_small_forests() {
     ];
     let forest = forest_for_utxos(&utxos);
     let expected_root = forest.roots()[&0];
-    let mut cache = super::InputWitnessProofCache::new(&forest);
+    let mut cache = InputWitnessProofCache::new(&forest);
 
     let proof = cache.prove(0, 0).expect("sparse proof");
 
