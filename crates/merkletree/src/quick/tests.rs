@@ -1,0 +1,381 @@
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::num::NonZeroUsize;
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
+
+use alloy::primitives::FixedBytes;
+use alloy::uint;
+use url::Url;
+
+use super::{QuickSyncClient, QuickSyncConfig, run_quick_sync, run_quick_sync_into};
+use crate::errors::SyncError;
+use crate::tree::{MerkleForest, MerkleTreeUpdate};
+
+struct MockGraphql {
+    url: Url,
+    requests: Receiver<String>,
+}
+
+fn spawn_graphql(responses: Vec<&'static str>) -> MockGraphql {
+    spawn_graphql_with_status(responses.into_iter().map(|body| (200, body)).collect())
+}
+
+fn spawn_graphql_with_status(responses: Vec<(u16, &'static str)>) -> MockGraphql {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    //noinspection HttpUrlsUsage
+    let url = Url::parse(&format!(
+        "http://{}/graphql",
+        listener.local_addr().unwrap()
+    ))
+    .expect("mock url");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for (status, response) in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let body = read_http_body(&mut stream);
+            tx.send(body).expect("send request body");
+            let reply = format!(
+                "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            stream.write_all(reply.as_bytes()).expect("write response");
+        }
+    });
+    MockGraphql { url, requests: rx }
+}
+
+fn read_http_body(stream: &mut std::net::TcpStream) -> String {
+    let mut reader = BufReader::new(stream);
+    let mut content_length = 0_usize;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read request header");
+        assert!(read > 0, "connection closed before request headers");
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().expect("parse content length");
+        }
+    }
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body).expect("read request body");
+    String::from_utf8_lossy(&body).to_string()
+}
+
+#[tokio::test]
+async fn fetch_squid_height_reads_status_height() {
+    let mock = spawn_graphql(vec![r#"{"data":{"squidStatus":{"height":"123"}}}"#]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let height = client.fetch_squid_height().await.expect("height");
+
+    assert_eq!(height, 123);
+    let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.contains("squidStatus"));
+}
+
+#[tokio::test]
+async fn public_txid_page_rejects_offset_above_graphql_int_limit() {
+    //noinspection HttpUrlsUsage
+    let client =
+        QuickSyncClient::new(Url::parse("http://127.0.0.1:1/graphql").expect("unused mock URL"));
+
+    let err = client
+        .fetch_public_txid_page(i32::MAX as u64 + 1, NonZeroUsize::new(1).expect("non-zero"))
+        .await
+        .expect_err("oversized offset should fail before request");
+
+    assert!(matches!(
+        err,
+        SyncError::UnexpectedFormat(message)
+            if message.contains("exceeds GraphQL Int max")
+    ));
+}
+
+#[tokio::test]
+async fn indexed_wallet_probe_accepts_supported_endpoint() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"squidStatus":{"height":"456"},"transactCommitments":[],"shieldCommitments":[],"nullifiers":[],"legacyEncryptedCommitments":[],"legacyGeneratedCommitments":[]}}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let probe = client.probe_indexed_wallet_support().await.expect("probe");
+
+    assert_eq!(probe.height, 456);
+    let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.contains("transactCommitments"));
+    assert!(request.contains("shieldCommitments"));
+    assert!(request.contains("nullifiers"));
+    assert!(request.contains("legacyEncryptedCommitments"));
+    assert!(request.contains("legacyGeneratedCommitments"));
+    assert!(request.contains("iv"));
+    assert!(request.contains("tag"));
+    assert!(request.contains("data"));
+}
+
+#[tokio::test]
+async fn indexed_wallet_probe_rejects_graphql_errors() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":null,"errors":[{"message":"Cannot query field transactCommitments"}]}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let err = client
+        .probe_indexed_wallet_support()
+        .await
+        .expect_err("probe should fail");
+
+    assert!(err.to_string().contains("graphql errors"));
+}
+
+#[tokio::test]
+async fn http_status_errors_include_response_body() {
+    let mock = spawn_graphql_with_status(vec![(
+        400,
+        r#"{"errors":[{"message":"bad wallet query"}]}"#,
+    )]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let err = client
+        .probe_indexed_wallet_support()
+        .await
+        .expect_err("probe should fail");
+    let message = err.to_string();
+
+    assert!(message.contains("status 400"));
+    assert!(message.contains("bad wallet query"));
+    let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.contains("transactCommitments"));
+    assert!(mock.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn transient_graphql_status_is_retried() {
+    let mock = spawn_graphql_with_status(vec![
+        (502, "error code: 502"),
+        (200, r#"{"data":{"squidStatus":{"height":"789"}}}"#),
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let height = client.fetch_squid_height().await.expect("height");
+
+    assert_eq!(height, 789);
+    let first = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    let second = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(first.contains("squidStatus"));
+    assert!(second.contains("squidStatus"));
+    assert!(mock.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn transact_commitments_parse_nested_ciphertext() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"transactCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"hash":"5","ciphertext":{"ciphertext":{"iv":"0x11111111111111111111111111111111","tag":"0x22222222222222222222222222222222","data":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]},"blindedSenderViewingKey":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","memo":"0x"}}]}}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let rows = client
+        .fetch_transact_commitments(1, 20, NonZeroUsize::new(10).unwrap())
+        .await
+        .expect("transact rows");
+
+    assert_eq!(rows.len(), 1);
+    let mut expected_iv_tag = [0u8; 32];
+    expected_iv_tag[..16].fill(0x11);
+    expected_iv_tag[16..].fill(0x22);
+    assert_eq!(
+        rows[0].ciphertext.ciphertext[0],
+        FixedBytes::from(expected_iv_tag)
+    );
+    assert_eq!(
+        rows[0].ciphertext.ciphertext[1],
+        FixedBytes::from([0x33; 32])
+    );
+}
+
+#[tokio::test]
+async fn malformed_nested_ciphertext_is_rejected() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"transactCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"hash":"5","ciphertext":{"ciphertext":{"iv":"0x11111111111111111111111111111111","tag":"0x22222222222222222222222222222222","data":["0x3333333333333333333333333333333333333333333333333333333333333333"]},"blindedSenderViewingKey":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","memo":"0x"}}]}}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let err = client
+        .fetch_transact_commitments(1, 20, NonZeroUsize::new(10).unwrap())
+        .await
+        .expect_err("ciphertext should fail");
+
+    assert!(
+        err.to_string()
+            .contains("expected 3 ciphertext data blocks")
+    );
+}
+
+#[tokio::test]
+async fn shield_commitments_parse_token_type_enum() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"shieldCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"preimage":{"npk":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","token":{"tokenType":"ERC20","tokenAddress":"0x0000000000000000000000000000000000000000","tokenSubID":"0x00"},"value":"5"},"shieldKey":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","encryptedBundle":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]}]}}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let rows = client
+        .fetch_shield_commitments(1, 20, NonZeroUsize::new(10).unwrap())
+        .await
+        .expect("shield rows");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].preimage().token.tokenType, 0);
+}
+
+#[tokio::test]
+async fn indexed_wallet_page_fetches_all_streams_in_one_request() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"transactCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"hash":"5","ciphertext":{"ciphertext":{"iv":"0x11111111111111111111111111111111","tag":"0x22222222222222222222222222222222","data":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]},"blindedSenderViewingKey":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","memo":"0x"}}],"shieldCommitments":[{"id":"0x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"13","blockTimestamp":"1700000013","treeNumber":0,"treePosition":3,"preimage":{"npk":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","token":{"tokenType":"ERC20","tokenAddress":"0x0000000000000000000000000000000000000000","tokenSubID":"0x00"},"value":"5"},"shieldKey":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","encryptedBundle":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]}],"nullifiers":[{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"14","blockTimestamp":"1700000014","treeNumber":0,"nullifier":"0x01"}]}}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let page = client
+        .fetch_indexed_wallet_page(1, 20, NonZeroUsize::new(10).unwrap())
+        .await
+        .expect("wallet page");
+
+    assert_eq!(page.transact_commitments.len(), 1);
+    assert_eq!(page.shield_commitments.len(), 1);
+    assert_eq!(page.nullifiers.len(), 1);
+    let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.contains("query IndexedWalletPage"));
+    assert!(request.contains("transactCommitments"));
+    assert!(request.contains("shieldCommitments"));
+    assert!(request.contains("nullifiers"));
+    assert!(!request.contains("legacyEncryptedCommitments"));
+    assert!(!request.contains("legacyGeneratedCommitments"));
+    assert!(mock.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn indexed_legacy_wallet_page_fetches_only_legacy_streams() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"legacyEncryptedCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"hash":"5","ciphertext":{"ciphertext":{"iv":"0x11111111111111111111111111111111","tag":"0x22222222222222222222222222222222","data":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]},"ephemeralKeys":["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],"memo":[]}}],"legacyGeneratedCommitments":[{"id":"0x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"13","blockTimestamp":"1700000013","treeNumber":0,"treePosition":3,"hash":"5","preimage":{"npk":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","token":{"tokenType":"ERC20","tokenAddress":"0x0000000000000000000000000000000000000000","tokenSubID":"0x00"},"value":"5"},"encryptedRandom":["0x28d5de9f22849ef69dc3639a947c7ce151ade418a2cf331d5e8b7348f4c065","0x44444444444444444444444444444444"]}],"nullifiers":[{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"14","blockTimestamp":"1700000014","treeNumber":0,"nullifier":"0x01"}]}}"#,
+    ]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let page = client
+        .fetch_indexed_legacy_wallet_page(1, 20, NonZeroUsize::new(10).unwrap())
+        .await
+        .expect("legacy wallet page");
+
+    assert_eq!(page.legacy_encrypted_commitments.len(), 1);
+    assert_eq!(page.legacy_generated_commitments.len(), 1);
+    assert_eq!(page.nullifiers.len(), 1);
+    let mut expected_random = [0_u8; 32];
+    expected_random[1..].copy_from_slice(&[
+        0x28, 0xd5, 0xde, 0x9f, 0x22, 0x84, 0x9e, 0xf6, 0x9d, 0xc3, 0x63, 0x9a, 0x94, 0x7c, 0x7c,
+        0xe1, 0x51, 0xad, 0xe4, 0x18, 0xa2, 0xcf, 0x33, 0x1d, 0x5e, 0x8b, 0x73, 0x48, 0xf4, 0xc0,
+        0x65,
+    ]);
+    assert_eq!(
+        page.legacy_generated_commitments[0].encrypted_random.0,
+        FixedBytes::from(expected_random)
+    );
+    let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.contains("query IndexedLegacyWalletPage"));
+    assert!(request.contains("legacyEncryptedCommitments"));
+    assert!(request.contains("legacyGeneratedCommitments"));
+    assert!(request.contains("nullifiers"));
+    assert!(!request.contains("transactCommitments"));
+    assert!(!request.contains("shieldCommitments"));
+    assert!(mock.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn commitment_quick_sync_does_not_fetch_non_forest_entities() {
+    let mock = spawn_graphql(vec![r#"{"data":{"commitments":[]}}"#]);
+    let result = run_quick_sync(QuickSyncConfig {
+        endpoint: mock.url,
+        start_block: 10,
+        end_block: Some(25),
+        page_size: NonZeroUsize::new(10).unwrap(),
+        http_client: None,
+    })
+    .await
+    .expect("quick sync");
+
+    assert_eq!(result.progress.latest_commitment_block, 25);
+    assert_eq!(result.progress.nullifiers, 0);
+    assert_eq!(result.progress.unshields, 0);
+    let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(request.contains("commitments"));
+    assert!(!request.contains("unshields"));
+    assert!(!request.contains("nullifiers"));
+}
+
+#[tokio::test]
+async fn quick_sync_into_advances_existing_forest_to_target() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"commitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","treeNumber":"0","treePosition":"2","batchStartTreePosition":"2","blockNumber":"12","hash":"5"}]}}"#,
+    ]);
+    let mut forest = MerkleForest::new();
+    forest
+        .insert_leaf(MerkleTreeUpdate {
+            tree_number: 0,
+            tree_position: 1,
+            hash: uint!(4_U256),
+        })
+        .expect("insert existing leaf");
+
+    let progress = run_quick_sync_into(
+        &mut forest,
+        QuickSyncConfig {
+            endpoint: mock.url,
+            start_block: 11,
+            end_block: Some(20),
+            page_size: NonZeroUsize::new(10).unwrap(),
+            http_client: None,
+        },
+    )
+    .await
+    .expect("quick sync into forest");
+
+    assert_eq!(progress.latest_commitment_block, 20);
+    assert_eq!(forest.leaf_at(0, 1), Some(uint!(4_U256)));
+    assert_eq!(forest.leaf_at(0, 2), Some(uint!(5_U256)));
+}
+
+#[tokio::test]
+async fn quick_sync_refetches_full_page_target_block_before_advancing() {
+    let mock = spawn_graphql(vec![
+        r#"{"data":{"commitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","treeNumber":"0","treePosition":"0","batchStartTreePosition":"0","blockNumber":"19","hash":"5"},{"id":"0x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222","treeNumber":"0","treePosition":"1","batchStartTreePosition":"1","blockNumber":"19","hash":"6"},{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","treeNumber":"0","treePosition":"2","batchStartTreePosition":"2","blockNumber":"20","hash":"7"}]}}"#,
+        r#"{"data":{"commitments":[{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","treeNumber":"0","treePosition":"2","batchStartTreePosition":"2","blockNumber":"20","hash":"7"},{"id":"0x44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444","treeNumber":"0","treePosition":"3","batchStartTreePosition":"3","blockNumber":"20","hash":"8"}]}}"#,
+    ]);
+    let mut forest = MerkleForest::new();
+
+    let progress = run_quick_sync_into(
+        &mut forest,
+        QuickSyncConfig {
+            endpoint: mock.url,
+            start_block: 19,
+            end_block: Some(20),
+            page_size: NonZeroUsize::new(3).unwrap(),
+            http_client: None,
+        },
+    )
+    .await
+    .expect("quick sync should refetch target block");
+
+    assert_eq!(progress.latest_commitment_block, 20);
+    assert_eq!(progress.commitments, 4);
+    assert_eq!(forest.leaf_at(0, 0), Some(uint!(5_U256)));
+    assert_eq!(forest.leaf_at(0, 1), Some(uint!(6_U256)));
+    assert_eq!(forest.leaf_at(0, 2), Some(uint!(7_U256)));
+    assert_eq!(forest.leaf_at(0, 3), Some(uint!(8_U256)));
+    let first_request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    let second_request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(first_request.contains(r#""blockNumber":"19""#));
+    assert!(second_request.contains(r#""blockNumber":"20""#));
+    assert!(mock.requests.try_recv().is_err());
+}
