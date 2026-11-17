@@ -96,7 +96,7 @@ impl<'a, S: RailgunSpendSigner> BatchPlanner<'a, S> {
 
     /// Proves every planned transaction, returning the transactions and their
     /// chunks in build order. The witness cache stays with the planner.
-    async fn prove_and_split<P: TransactionProver>(
+    pub(super) async fn prove_and_split<P: TransactionProver>(
         &mut self,
         prover: &P,
         verify_proof: bool,
