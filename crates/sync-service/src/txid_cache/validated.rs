@@ -3,8 +3,8 @@
 
 use super::{
     DbStore, DenseMerkleTree, ErrorKind, FixedBytes, TREE_LEAF_COUNT, TxidPublicCacheError,
-    TxidPublicCacheManifest, TxidPublicCheckpointSource, TxidPublicLatestValidated,
-    read_tree_leaves,
+    TxidPublicCacheManifest, TxidPublicCacheRow, TxidPublicCheckpointSource,
+    TxidPublicLatestValidated, read_tree_leaves,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,15 +140,10 @@ impl TxidPublicCacheManifest {
             || self
                 .validated_cached_txid_index
                 .is_some_and(|index| index > latest.txid_index)
-            || (self.latest_validated_txid_index == Some(latest.txid_index)
-                && self.latest_validated_merkleroot != latest.merkleroot
-                && latest.merkleroot.is_some());
+            || self.latest_root_conflicts(latest);
         if rollback_required {
             self.checkpoints.clear();
-            if self.latest_validated_txid_index == Some(latest.txid_index)
-                && self.latest_validated_merkleroot != latest.merkleroot
-                && latest.merkleroot.is_some()
-            {
+            if self.latest_root_conflicts(latest) {
                 if let Some(artifact_bound) = self
                     .artifact_cached_txid_index
                     .filter(|bound| *bound < latest.txid_index)
@@ -167,6 +162,14 @@ impl TxidPublicCacheManifest {
             return true;
         }
         false
+    }
+
+    /// The latest marker is at `latest`'s index but records a different root
+    /// from the one `latest` supplies.
+    fn latest_root_conflicts(&self, latest: TxidPublicLatestValidated) -> bool {
+        self.latest_validated_txid_index == Some(latest.txid_index)
+            && self.latest_validated_merkleroot != latest.merkleroot
+            && latest.merkleroot.is_some()
     }
 
     pub(super) fn local_latest_status(
@@ -239,21 +242,9 @@ impl TxidPublicCacheManifest {
                     "page row count mismatch".to_string(),
                 ));
             }
-            for row in page.rows {
-                if row.txid_index < expected_index {
-                    continue;
-                }
-                if row.txid_index != expected_index {
-                    return Err(TxidPublicCacheError::MissingLeaf {
-                        index: expected_index,
-                    });
-                }
-                if row.txid_index == txid_index {
-                    return Ok(());
-                }
-                expected_index = expected_index.checked_add(1).ok_or_else(|| {
-                    TxidPublicCacheError::MetadataMismatch("txid index overflow".to_string())
-                })?;
+            match scan_contiguous_rows(page.rows, expected_index, txid_index)? {
+                RowScan::ReachedTarget => return Ok(()),
+                RowScan::Exhausted(next_index) => expected_index = next_index,
             }
         }
         Err(TxidPublicCacheError::MissingLeaf {
@@ -281,4 +272,38 @@ impl TxidPublicCacheManifest {
         self.artifact_cached_txid_index
             .map_or(0, |index| index.saturating_add(1))
     }
+}
+
+/// Where one page left the contiguity scan.
+enum RowScan {
+    /// A row at the target index was reached.
+    ReachedTarget,
+    /// The page ran out; the scan continues at this index.
+    Exhausted(u64),
+}
+
+/// Checks that `rows` continue contiguously from `expected_index` towards
+/// `target`, skipping rows an earlier page already covered.
+fn scan_contiguous_rows(
+    rows: Vec<TxidPublicCacheRow>,
+    mut expected_index: u64,
+    target: u64,
+) -> Result<RowScan, TxidPublicCacheError> {
+    for row in rows {
+        if row.txid_index < expected_index {
+            continue;
+        }
+        if row.txid_index != expected_index {
+            return Err(TxidPublicCacheError::MissingLeaf {
+                index: expected_index,
+            });
+        }
+        if row.txid_index == target {
+            return Ok(RowScan::ReachedTarget);
+        }
+        expected_index = expected_index.checked_add(1).ok_or_else(|| {
+            TxidPublicCacheError::MetadataMismatch("txid index overflow".to_string())
+        })?;
+    }
+    Ok(RowScan::Exhausted(expected_index))
 }

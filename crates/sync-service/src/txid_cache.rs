@@ -29,6 +29,7 @@ mod manifest;
 mod paths;
 mod proof;
 mod sync;
+mod sync_session;
 mod types;
 mod validated;
 
