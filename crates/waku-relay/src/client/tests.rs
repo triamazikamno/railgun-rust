@@ -1,8 +1,8 @@
 use super::{
     CACHE_SIZE, Client, ClientConfig, ClientError, DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID,
-    HistoryFuture, NWAKU_MAX_POLL_BYTES, RelayMessageOutcome, StoreHistory, add_tor_doh_fallback,
-    forward_messages, handle_relay_message, is_fee_content_topic, poll_nwaku_messages,
-    relay_shard_pubsub_path, relay_sink_is_closed, wait_for_relay_sink_closed,
+    HistoryFuture, NWAKU_MAX_POLL_BYTES, NwakuMessagesPoll, RelayForwarder, RelayMessageOutcome,
+    StoreHistory, add_tor_doh_fallback, handle_relay_message, is_fee_content_topic,
+    poll_nwaku_messages, relay_shard_pubsub_path, relay_sink_is_closed, wait_for_relay_sink_closed,
 };
 use lru::LruCache;
 use std::io::{Read, Write};
@@ -31,15 +31,9 @@ fn spawn_forwarding(
     sink_tx: mpsc::Sender<WakuMessage>,
     store: StoreHistory,
 ) {
-    tokio::spawn(forward_messages(
-        fleet_rx,
-        sink_tx,
-        vec![FEE_TOPIC.to_string()],
-        None,
-        reqwest::Client::new(),
-        Duration::from_secs(1),
-        Some(store),
-    ));
+    tokio::spawn(
+        RelayForwarder::new(sink_tx, vec![FEE_TOPIC.to_string()], None, Some(store)).run(fleet_rx),
+    );
 }
 
 #[tokio::test]
@@ -624,35 +618,19 @@ async fn oversized_nwaku_poll_is_rejected_and_next_poll_succeeds() {
         );
         let _ = stream.write_all(response.as_bytes());
     });
-    let http = reqwest::Client::new();
+    let nwaku = NwakuMessagesPoll {
+        url,
+        http: reqwest::Client::new(),
+        request_timeout: Duration::from_secs(10),
+    };
     let topics = [FEE_TOPIC.to_string()];
     let mut cache = LruCache::new(CACHE_SIZE);
     let (sink_tx, mut sink_rx) = mpsc::channel(8);
 
-    assert!(
-        poll_nwaku_messages(
-            &http,
-            &url,
-            Duration::from_secs(10),
-            &topics,
-            &mut cache,
-            &sink_tx
-        )
-        .await
-    );
+    assert!(poll_nwaku_messages(&nwaku, &topics, &mut cache, &sink_tx).await);
     assert!(sink_rx.try_recv().is_err());
 
-    assert!(
-        poll_nwaku_messages(
-            &http,
-            &url,
-            Duration::from_secs(10),
-            &topics,
-            &mut cache,
-            &sink_tx
-        )
-        .await
-    );
+    assert!(poll_nwaku_messages(&nwaku, &topics, &mut cache, &sink_tx).await);
     assert_eq!(sink_rx.try_recv(), Ok(fee_message(2)));
     server.join().expect("nwaku endpoint thread exits");
 }

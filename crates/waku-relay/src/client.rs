@@ -5,6 +5,7 @@ use base64::engine::general_purpose;
 use lru::LruCache;
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -219,12 +220,47 @@ async fn observe_backup_peers(node: Arc<WakuNode>, peers: Vec<DiscoveredPeer>) {
 type HistoryFuture =
     Pin<Box<dyn Future<Output = (PeerId, Result<Vec<WakuMessage>, WakuError>)> + Send>>;
 
-/// Store history inputs for [`forward_messages`].
+/// Store history inputs for [`RelayForwarder`].
 struct StoreHistory {
     lookback: Duration,
     peer_rx: Option<broadcast::Receiver<PeerId>>,
     list_peers: Box<dyn Fn() -> Vec<PeerId> + Send>,
     query: Box<dyn FnMut(PeerId) -> HistoryFuture + Send>,
+}
+
+impl StoreHistory {
+    /// Queries each of the fleet's Store peers for the last `lookback` of messages on
+    /// `content_topics`.
+    fn for_fleet(
+        waku_fleet: &Arc<WakuNode>,
+        pubsub_path: &str,
+        content_topics: &[String],
+        lookback: Duration,
+    ) -> Self {
+        let peer_rx = waku_fleet.subscribe_store_peers();
+        let list_fleet = Arc::clone(waku_fleet);
+        let query_fleet = Arc::clone(waku_fleet);
+        let pubsub_path = pubsub_path.to_owned();
+        let content_topics = content_topics.to_vec();
+        Self {
+            lookback,
+            peer_rx: Some(peer_rx),
+            list_peers: Box::new(move || list_fleet.store_peers()),
+            query: Box::new(move |peer_id: PeerId| -> HistoryFuture {
+                let end = now_nanos();
+                let start = end.saturating_sub(duration_nanos(lookback));
+                let query = StoreQueryOptions {
+                    pubsub_topic: pubsub_path.clone(),
+                    content_topics: content_topics.clone(),
+                    time_start: Some(start),
+                    time_end: Some(end),
+                    pagination_limit: Some(FEE_HISTORY_PAGE_LIMIT),
+                };
+                let fleet = Arc::clone(&query_fleet);
+                Box::pin(async move { (peer_id, fleet.store_query_peer(peer_id, query).await) })
+            }),
+        }
+    }
 }
 
 /// Queues `peer_id` unless it is already queued, in flight or queried.
@@ -249,63 +285,23 @@ fn queue_store_peer(
     true
 }
 
-/// Forwards one Store peer's history; returns `false` once the sink is closed.
-fn forward_store_messages(
-    cache: &mut LruCache<u64, ()>,
-    sink_tx: &mpsc::Sender<WakuMessage>,
-    content_topics: &[String],
-    peer_id: PeerId,
-    messages: Vec<WakuMessage>,
-    lookback: Duration,
-) -> bool {
-    let returned = messages.len();
-    let mut matching_topics = 0usize;
-    let mut delivered = 0usize;
-    let mut deduped = 0usize;
-    let mut dropped = 0usize;
-    for msg in messages {
-        if !content_topics.contains(&msg.content_topic) {
-            continue;
-        }
-        matching_topics += 1;
-        tracing::debug!(
-            %peer_id,
-            msg.content_topic,
-            hash = msg.hash_key(),
-            "received historical message from store peer"
-        );
-        match handle_relay_message(cache, sink_tx, msg) {
-            RelayMessageOutcome::Delivered => delivered += 1,
-            RelayMessageOutcome::Duplicate => deduped += 1,
-            RelayMessageOutcome::Dropped => dropped += 1,
-            RelayMessageOutcome::SinkClosed => return false,
-        }
-    }
-    tracing::debug!(
-        %peer_id,
-        returned,
-        matching_topics,
-        delivered,
-        deduped,
-        dropped,
-        lookback_secs = lookback.as_secs(),
-        "queried historical fee messages from store peer"
-    );
-    true
+/// nwaku's REST endpoint for the subscription's relayed messages.
+struct NwakuMessagesPoll {
+    url: String,
+    http: reqwest::Client,
+    request_timeout: Duration,
 }
 
 /// Polls nwaku once; returns `false` once the sink is closed.
 async fn poll_nwaku_messages(
-    http: &reqwest::Client,
-    url: &str,
-    nwaku_request_timeout: Duration,
+    nwaku: &NwakuMessagesPoll,
     content_topics: &[String],
     cache: &mut LruCache<u64, ()>,
     sink_tx: &mpsc::Sender<WakuMessage>,
 ) -> bool {
     let response = tokio::select! {
         () = wait_for_relay_sink_closed(sink_tx) => return false,
-        response = nwaku_request(http.get(url), nwaku_request_timeout).send() => response.and_then(reqwest::Response::error_for_status),
+        response = nwaku_request(nwaku.http.get(nwaku.url.as_str()), nwaku.request_timeout).send() => response.and_then(reqwest::Response::error_for_status),
     };
     match response {
         Ok(resp) => {
@@ -363,112 +359,251 @@ async fn poll_nwaku_messages(
     true
 }
 
+/// The running Store query's result; pending forever when no query runs.
+async fn running_store_query(
+    history: &mut Option<HistoryFuture>,
+) -> (PeerId, Result<Vec<WakuMessage>, WakuError>) {
+    match history.as_mut() {
+        Some(query) => query.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next Store peer notification; pending forever without a notification channel.
+async fn next_store_peer_notification(
+    store: &mut Option<StoreHistory>,
+) -> Result<PeerId, broadcast::error::RecvError> {
+    match store.as_mut().and_then(|store| store.peer_rx.as_mut()) {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Forwards fleet, nwaku and Store history messages into `sink_tx` through one dedup cache.
 ///
 /// Store peers are queried one at a time, and live messages keep flowing while a query runs.
-async fn forward_messages(
-    mut fleet_rx: mpsc::Receiver<WakuMessage>,
+struct RelayForwarder {
     sink_tx: mpsc::Sender<WakuMessage>,
     content_topics: Vec<String>,
-    nwaku_messages_url: Option<String>,
-    http: reqwest::Client,
-    nwaku_request_timeout: Duration,
-    mut store: Option<StoreHistory>,
-) {
-    let mut cache = LruCache::new(CACHE_SIZE);
-    let mut tick = tokio::time::interval(Duration::from_secs(2));
-    let mut pending_store_peers: VecDeque<PeerId> = store
-        .as_ref()
-        .map(|store| (store.list_peers)().into())
-        .unwrap_or_default();
-    let mut successfully_queried_store_peers = HashSet::new();
-    let mut history: Option<HistoryFuture> = None;
-    let mut in_flight = None;
-    loop {
-        if relay_sink_is_closed(&sink_tx) {
-            tracing::debug!("relay sink is closed, breaking...");
+    nwaku: Option<NwakuMessagesPoll>,
+    store: Option<StoreHistory>,
+    cache: LruCache<u64, ()>,
+    pending_store_peers: VecDeque<PeerId>,
+    successfully_queried_store_peers: HashSet<PeerId>,
+    history: Option<HistoryFuture>,
+    in_flight: Option<(PeerId, bool)>,
+}
+
+impl RelayForwarder {
+    fn new(
+        sink_tx: mpsc::Sender<WakuMessage>,
+        content_topics: Vec<String>,
+        nwaku: Option<NwakuMessagesPoll>,
+        store: Option<StoreHistory>,
+    ) -> Self {
+        Self {
+            sink_tx,
+            content_topics,
+            nwaku,
+            store,
+            cache: LruCache::new(CACHE_SIZE),
+            pending_store_peers: VecDeque::new(),
+            successfully_queried_store_peers: HashSet::new(),
+            history: None,
+            in_flight: None,
+        }
+    }
+
+    /// Forwards until the sink or the fleet subscription closes. The Store peers known at
+    /// start are listed here, in the forwarding task.
+    async fn run(mut self, mut fleet_rx: mpsc::Receiver<WakuMessage>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        self.pending_store_peers = self
+            .store
+            .as_ref()
+            .map(|store| (store.list_peers)().into())
+            .unwrap_or_default();
+        loop {
+            if relay_sink_is_closed(&self.sink_tx) {
+                tracing::debug!("relay sink is closed, breaking...");
+                return;
+            }
+            self.start_next_store_query();
+
+            let sink_tx = &self.sink_tx;
+            let history = &mut self.history;
+            let store = &mut self.store;
+            let flow = tokio::select! {
+                () = wait_for_relay_sink_closed(sink_tx) => return,
+                _ = tick.tick(), if self.nwaku.is_some() => self.poll_nwaku().await,
+                msg = fleet_rx.recv() => self.forward_fleet_message(msg),
+                (peer_id, result) = running_store_query(history), if history.is_some() => self.finish_store_query(peer_id, result),
+                notification = next_store_peer_notification(store), if store.as_ref().is_some_and(|store| store.peer_rx.is_some()) => {
+                    self.queue_notified_store_peers(&notification);
+                    ControlFlow::Continue(())
+                }
+            };
+            if flow.is_break() {
+                return;
+            }
+        }
+    }
+
+    /// Starts a query of the next pending Store peer not yet queried, unless one is running.
+    fn start_next_store_query(&mut self) {
+        if self.history.is_some() {
             return;
         }
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        while let Some(peer_id) = self.pending_store_peers.pop_front() {
+            if !self.successfully_queried_store_peers.contains(&peer_id) {
+                self.history = Some((store.query)(peer_id));
+                self.in_flight = Some((peer_id, false));
+                break;
+            }
+        }
+    }
 
-        if history.is_none()
-            && let Some(store) = store.as_mut()
-        {
-            while let Some(peer_id) = pending_store_peers.pop_front() {
-                if !successfully_queried_store_peers.contains(&peer_id) {
-                    history = Some((store.query)(peer_id));
-                    in_flight = Some((peer_id, false));
-                    break;
+    async fn poll_nwaku(&mut self) -> ControlFlow<()> {
+        let Some(nwaku) = &self.nwaku else {
+            return ControlFlow::Continue(());
+        };
+        if poll_nwaku_messages(nwaku, &self.content_topics, &mut self.cache, &self.sink_tx).await {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    }
+
+    fn forward_fleet_message(&mut self, msg: Option<WakuMessage>) -> ControlFlow<()> {
+        let Some(msg) = msg else {
+            tracing::warn!("fleet subscription channel closed");
+            return ControlFlow::Break(());
+        };
+        tracing::trace!(
+            msg.content_topic,
+            hash = msg.hash_key(),
+            "received message from fleet"
+        );
+        if matches!(
+            handle_relay_message(&mut self.cache, &self.sink_tx, msg),
+            RelayMessageOutcome::SinkClosed
+        ) {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Records a finished Store query: forwards its history, or re-queues a failed peer that
+    /// was notified while its query ran.
+    fn finish_store_query(
+        &mut self,
+        peer_id: PeerId,
+        result: Result<Vec<WakuMessage>, WakuError>,
+    ) -> ControlFlow<()> {
+        self.history = None;
+        let notified = self.in_flight.take().is_some_and(|(_, notified)| notified);
+        match result {
+            Ok(messages) => {
+                self.successfully_queried_store_peers.insert(peer_id);
+                if !self.forward_store_messages(peer_id, messages) {
+                    return ControlFlow::Break(());
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%peer_id, %error, "failed to query historical fee messages from store peer");
+                if notified
+                    && queue_store_peer(
+                        &mut self.pending_store_peers,
+                        &mut None,
+                        &self.successfully_queried_store_peers,
+                        peer_id,
+                    )
+                {
+                    tracing::debug!(%peer_id, "re-queueing store peer notified during its failed query");
                 }
             }
         }
+        ControlFlow::Continue(())
+    }
 
-        tokio::select! {
-            () = wait_for_relay_sink_closed(&sink_tx) => return,
-            _ = tick.tick(), if nwaku_messages_url.is_some() => {
-                let Some(url) = &nwaku_messages_url else { continue };
-                if !poll_nwaku_messages(&http, url, nwaku_request_timeout, &content_topics, &mut cache, &sink_tx).await {
-                    return;
+    /// Forwards one Store peer's history; returns `false` once the sink is closed.
+    fn forward_store_messages(&mut self, peer_id: PeerId, messages: Vec<WakuMessage>) -> bool {
+        let lookback = self
+            .store
+            .as_ref()
+            .map_or(Duration::ZERO, |store| store.lookback);
+        let returned = messages.len();
+        let mut matching_topics = 0usize;
+        let mut delivered = 0usize;
+        let mut deduped = 0usize;
+        let mut dropped = 0usize;
+        for msg in messages {
+            if !self.content_topics.contains(&msg.content_topic) {
+                continue;
+            }
+            matching_topics += 1;
+            tracing::debug!(
+                %peer_id,
+                msg.content_topic,
+                hash = msg.hash_key(),
+                "received historical message from store peer"
+            );
+            match handle_relay_message(&mut self.cache, &self.sink_tx, msg) {
+                RelayMessageOutcome::Delivered => delivered += 1,
+                RelayMessageOutcome::Duplicate => deduped += 1,
+                RelayMessageOutcome::Dropped => dropped += 1,
+                RelayMessageOutcome::SinkClosed => return false,
+            }
+        }
+        tracing::debug!(
+            %peer_id,
+            returned,
+            matching_topics,
+            delivered,
+            deduped,
+            dropped,
+            lookback_secs = lookback.as_secs(),
+            "queried historical fee messages from store peer"
+        );
+        true
+    }
+
+    /// Queues a notified Store peer, or every listed peer after missed notifications.
+    fn queue_notified_store_peers(
+        &mut self,
+        notification: &Result<PeerId, broadcast::error::RecvError>,
+    ) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        match *notification {
+            Ok(peer_id) => {
+                if queue_store_peer(
+                    &mut self.pending_store_peers,
+                    &mut self.in_flight,
+                    &self.successfully_queried_store_peers,
+                    peer_id,
+                ) {
+                    tracing::debug!(%peer_id, "queueing store peer for fee history query");
                 }
             }
-            msg = fleet_rx.recv() => {
-                if let Some(msg) = msg {
-                    tracing::trace!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
-                    if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
-                        return;
-                    }
-                } else {
-                    tracing::warn!("fleet subscription channel closed");
-                    break;
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "missed store peer notifications");
+                for peer_id in (store.list_peers)() {
+                    queue_store_peer(
+                        &mut self.pending_store_peers,
+                        &mut self.in_flight,
+                        &self.successfully_queried_store_peers,
+                        peer_id,
+                    );
                 }
             }
-            (peer_id, result) = async {
-                match history.as_mut() {
-                    Some(query) => query.await,
-                    None => std::future::pending().await,
-                }
-            }, if history.is_some() => {
-                history = None;
-                let notified = in_flight.take().is_some_and(|(_, notified)| notified);
-                match result {
-                    Ok(messages) => {
-                        successfully_queried_store_peers.insert(peer_id);
-                        let lookback = store.as_ref().map_or(Duration::ZERO, |store| store.lookback);
-                        if !forward_store_messages(&mut cache, &sink_tx, &content_topics, peer_id, messages, lookback) {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%peer_id, %error, "failed to query historical fee messages from store peer");
-                        if notified && queue_store_peer(&mut pending_store_peers, &mut None, &successfully_queried_store_peers, peer_id) {
-                            tracing::debug!(%peer_id, "re-queueing store peer notified during its failed query");
-                        }
-                    }
-                }
-            }
-            notification = async {
-                match store.as_mut().and_then(|store| store.peer_rx.as_mut()) {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if store.as_ref().is_some_and(|store| store.peer_rx.is_some()) => {
-                let Some(store) = store.as_mut() else { continue };
-                match notification {
-                    Ok(peer_id) => {
-                        if queue_store_peer(&mut pending_store_peers, &mut in_flight, &successfully_queried_store_peers, peer_id) {
-                            tracing::debug!(%peer_id, "queueing store peer for fee history query");
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "missed store peer notifications");
-                        for peer_id in (store.list_peers)() {
-                            queue_store_peer(&mut pending_store_peers, &mut in_flight, &successfully_queried_store_peers, peer_id);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("store peer notification channel closed");
-                        store.peer_rx = None;
-                    }
-                }
+            Err(broadcast::error::RecvError::Closed) => {
+                tracing::warn!("store peer notification channel closed");
+                store.peer_rx = None;
             }
         }
     }
@@ -778,36 +913,16 @@ impl Client {
 
         if self.nwaku_url.is_some() || history_lookback.is_some() {
             let (sink_tx, sink_rx) = mpsc::channel(1024);
-            let nwaku_messages_url = self.nwaku_url.as_ref().map(|nwaku_url| {
+            let nwaku = self.nwaku_url.as_ref().map(|nwaku_url| {
                 let encoded_pubsub_path = urlencoding::encode(&self.pubsub_path);
-                format!("{nwaku_url}/relay/v1/messages/{encoded_pubsub_path}")
+                NwakuMessagesPoll {
+                    url: format!("{nwaku_url}/relay/v1/messages/{encoded_pubsub_path}"),
+                    http: self.http_client.clone(),
+                    request_timeout: self.nwaku_request_timeout,
+                }
             });
             let store = history_lookback.map(|lookback| {
-                let peer_rx = waku_fleet.subscribe_store_peers();
-                let list_fleet = Arc::clone(waku_fleet);
-                let query_fleet = Arc::clone(waku_fleet);
-                let pubsub_path = self.pubsub_path.clone();
-                let content_topics = content_topics.clone();
-                StoreHistory {
-                    lookback,
-                    peer_rx: Some(peer_rx),
-                    list_peers: Box::new(move || list_fleet.store_peers()),
-                    query: Box::new(move |peer_id: PeerId| -> HistoryFuture {
-                        let end = now_nanos();
-                        let start = end.saturating_sub(duration_nanos(lookback));
-                        let query = StoreQueryOptions {
-                            pubsub_topic: pubsub_path.clone(),
-                            content_topics: content_topics.clone(),
-                            time_start: Some(start),
-                            time_end: Some(end),
-                            pagination_limit: Some(FEE_HISTORY_PAGE_LIMIT),
-                        };
-                        let fleet = Arc::clone(&query_fleet);
-                        Box::pin(
-                            async move { (peer_id, fleet.store_query_peer(peer_id, query).await) },
-                        )
-                    }),
-                }
+                StoreHistory::for_fleet(waku_fleet, &self.pubsub_path, &content_topics, lookback)
             });
             let mut tasks = self.tasks.lock().await;
             // `shutdown` signals before taking this lock, so a task registered here is joined.
@@ -815,15 +930,9 @@ impl Client {
                 return Err(ClientError::Disabled("Waku node was shut down".to_string()));
             }
             tasks.retain(|task| !task.is_finished());
-            tasks.push(tokio::spawn(forward_messages(
-                rx,
-                sink_tx,
-                content_topics,
-                nwaku_messages_url,
-                self.http_client.clone(),
-                self.nwaku_request_timeout,
-                store,
-            )));
+            tasks.push(tokio::spawn(
+                RelayForwarder::new(sink_tx, content_topics, nwaku, store).run(rx),
+            ));
             drop(tasks);
             rx = sink_rx;
         }
@@ -988,18 +1097,17 @@ fn configured_shard_id(cfg: &ClientConfig) -> u32 {
 }
 
 fn add_tor_doh_fallback(config: &mut WakuConfig, fallback_endpoints_configured: bool) {
-    if !fallback_endpoints_configured
-        && config.discovery.doh_endpoint != DEFAULT_CLEARNET_DOH_ENDPOINT
-        && !config
-            .discovery
-            .doh_fallback_endpoints
-            .iter()
-            .any(|endpoint| endpoint == DEFAULT_CLEARNET_DOH_ENDPOINT)
+    if fallback_endpoints_configured
+        || config.discovery.doh_endpoint == DEFAULT_CLEARNET_DOH_ENDPOINT
     {
-        config
-            .discovery
-            .doh_fallback_endpoints
-            .push(DEFAULT_CLEARNET_DOH_ENDPOINT.to_string());
+        return;
+    }
+    let fallbacks = &mut config.discovery.doh_fallback_endpoints;
+    if !fallbacks
+        .iter()
+        .any(|endpoint| endpoint == DEFAULT_CLEARNET_DOH_ENDPOINT)
+    {
+        fallbacks.push(DEFAULT_CLEARNET_DOH_ENDPOINT.to_string());
     }
 }
 

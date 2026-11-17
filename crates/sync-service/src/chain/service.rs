@@ -1,4 +1,4 @@
-use super::poi_submitter::ChainPoiSubmitterDriver;
+use super::poi_submitter::{ChainPoiSubmitterDriver, ChainPoiSubmitterHandle};
 use super::workers::read_head_bounded;
 use super::{
     Arc, AtomicBool, AtomicU64, BackfillEvent, BackfillRequest, CancellationToken, ChainConfig,
@@ -215,27 +215,14 @@ impl ChainService {
         rpc_http_client: Option<reqwest::Client>,
         poi_submission_scheduler: Arc<PoiSubmissionScheduler>,
     ) -> Result<PreparedChainService, ChainError> {
-        if chain.sync.archive_until_block > 0
-            && chain.archive_rpc_url.is_none()
-            && chain.deployment.deployment_block <= chain.sync.archive_until_block
-        {
-            warn!(
-                chain_id = chain.deployment.chain_id,
-                archive_until_block = chain.sync.archive_until_block,
-                "archive RPC URL not configured; using regular RPC providers for archive-range fallback"
-            );
-        }
+        warn_if_archive_rpc_missing(&chain);
         let archive_provider = chain
             .build_archive_provider(rpc_http_client.as_ref())
             .await?;
 
         let rpcs = chain.rpcs.clone();
-        let fallback_rpc = rpcs
-            .random_provider()
-            .ok_or_else(|| ChainError::NoHealthyRpc)?;
-        let (rpc, initial_head, initial_safe_head) = fetch_initial_head(&chain, rpcs.as_ref())
-            .await
-            .unwrap_or((fallback_rpc, 0, 0));
+        let (rpc, initial_head, initial_safe_head) =
+            fetch_initial_head(&chain, rpcs.as_ref()).await?;
 
         let (forest, last_processed, snapshot_path, last_anchor) = db
             .load_or_initialize_forest(
@@ -252,40 +239,13 @@ impl ChainService {
         let (live_log_tx, _live_log_rx) = broadcast::channel(64);
         let (backfill_tx, backfill_rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
-        let mut public_data_plane =
-            ChainPublicDataPlane::new(Arc::clone(&db), Arc::new(AtomicU64::new(0)))
-                .with_runtime_lease(runtime_lease);
-        if let GlobalPoiPolicy::IndexedArtifacts {
-            artifact_source,
-            rpc_url,
-            ..
-        } = &poi_policy
-        {
-            let poi_artifact_persistence = public_data_plane.poi_artifact_persistence();
-            let poi_cache_service = crate::poi_cache::PoiCacheService::new_with_persistence(
-                Arc::clone(&db),
-                chain.deployment.chain_id,
-                artifact_source.clone(),
-                Some(chain.http_client.clone()),
-                poi_artifact_persistence,
-            )?
-            .with_poi_rpc_url(rpc_url.clone());
-            public_data_plane =
-                public_data_plane.with_poi_cache_service(Arc::new(poi_cache_service));
-        }
-        let poi_submission_routing = chain.poi_submission_routes.clone().map(|provider| {
-            PoiSubmissionRouting::new(
-                poi_submission_scheduler,
-                provider,
-                poi_policy.rpc_url().clone(),
-            )
-        });
-        let (poi_submitter, poi_submitter_driver) = ChainPoiSubmitterDriver::for_chain(
-            chain.deployment.chain_id,
+        let public_data_plane =
+            new_chain_public_data_plane(&db, &chain, &poi_policy, runtime_lease)?;
+        let (poi_submitter, poi_submitter_driver) = new_chain_poi_submitter(
+            &chain,
             &poi_policy,
-            &chain.http_client,
             &public_data_plane,
-            poi_submission_routing,
+            poi_submission_scheduler,
         );
         let service = Arc::new(Self {
             chain,
@@ -442,15 +402,7 @@ impl ChainService {
         // The submitter exits on cancel alone, aborting its sends and corpus
         // refresh, so awaiting it first cannot wait on the data-plane
         // shutdown, and no refresh it started overlaps that shutdown.
-        let poi_submitter_task = self
-            .poi_submitter_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(task) = poi_submitter_task
-            && let Err(err) = task.await
-            && !err.is_cancelled()
-        {
+        if join_shutdown_task(&self.poi_submitter_task).await.is_some() {
             warn!(
                 chain_id = self.chain.deployment.chain_id,
                 "chain PPOI submitter failed during shutdown"
@@ -458,14 +410,9 @@ impl ChainService {
         }
         // The loop drops an in-flight sync on cancel, and its service clone
         // keeps the data plane, and with it the runtime lease, alive.
-        let txid_public_cache_task = self
-            .txid_public_cache_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(task) = txid_public_cache_task
-            && let Err(err) = task.await
-            && !err.is_cancelled()
+        if join_shutdown_task(&self.txid_public_cache_task)
+            .await
+            .is_some()
         {
             warn!(
                 chain_id = self.chain.deployment.chain_id,
@@ -507,16 +454,87 @@ pub(super) async fn await_live_log_task_shutdown(
     live_log_task: &std::sync::Mutex<Option<JoinHandle<()>>>,
     chain_id: u64,
 ) {
-    let live_log_task = live_log_task
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(task) = live_log_task
-        && let Err(err) = task.await
-        && !err.is_cancelled()
-    {
+    if let Some(err) = join_shutdown_task(live_log_task).await {
         warn!(?err, chain_id, "live log worker failed during shutdown");
     }
+}
+
+/// Takes the task out of its slot and awaits it; returns its failure unless it was cancelled.
+/// The slot's lock is released before the await.
+async fn join_shutdown_task(
+    slot: &std::sync::Mutex<Option<JoinHandle<()>>>,
+) -> Option<tokio::task::JoinError> {
+    let task = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()?;
+    task.await.err().filter(|err| !err.is_cancelled())
+}
+
+fn warn_if_archive_rpc_missing(chain: &ChainConfig) {
+    if chain.sync.archive_until_block == 0 || chain.archive_rpc_url.is_some() {
+        return;
+    }
+    if chain.deployment.deployment_block <= chain.sync.archive_until_block {
+        warn!(
+            chain_id = chain.deployment.chain_id,
+            archive_until_block = chain.sync.archive_until_block,
+            "archive RPC URL not configured; using regular RPC providers for archive-range fallback"
+        );
+    }
+}
+
+/// The chain's public data plane, with a POI cache service when POIs come from indexed
+/// artifacts.
+fn new_chain_public_data_plane(
+    db: &Arc<DbStore>,
+    chain: &ChainConfig,
+    poi_policy: &GlobalPoiPolicy,
+    runtime_lease: DbRuntimeLease,
+) -> Result<ChainPublicDataPlane, ChainError> {
+    let public_data_plane = ChainPublicDataPlane::new(Arc::clone(db), Arc::new(AtomicU64::new(0)))
+        .with_runtime_lease(runtime_lease);
+    let GlobalPoiPolicy::IndexedArtifacts {
+        artifact_source,
+        rpc_url,
+        ..
+    } = poi_policy
+    else {
+        return Ok(public_data_plane);
+    };
+    let poi_artifact_persistence = public_data_plane.poi_artifact_persistence();
+    let poi_cache_service = crate::poi_cache::PoiCacheService::new_with_persistence(
+        Arc::clone(db),
+        chain.deployment.chain_id,
+        artifact_source.clone(),
+        Some(chain.http_client.clone()),
+        poi_artifact_persistence,
+    )?
+    .with_poi_rpc_url(rpc_url.clone());
+    Ok(public_data_plane.with_poi_cache_service(Arc::new(poi_cache_service)))
+}
+
+/// The chain's PPOI submitter, routed per transaction when the chain has submission routes.
+fn new_chain_poi_submitter(
+    chain: &ChainConfig,
+    poi_policy: &GlobalPoiPolicy,
+    public_data_plane: &ChainPublicDataPlane,
+    poi_submission_scheduler: Arc<PoiSubmissionScheduler>,
+) -> (ChainPoiSubmitterHandle, ChainPoiSubmitterDriver) {
+    let poi_submission_routing = chain.poi_submission_routes.clone().map(|provider| {
+        PoiSubmissionRouting::new(
+            poi_submission_scheduler,
+            provider,
+            poi_policy.rpc_url().clone(),
+        )
+    });
+    ChainPoiSubmitterDriver::for_chain(
+        chain.deployment.chain_id,
+        poi_policy,
+        &chain.http_client,
+        public_data_plane,
+        poi_submission_routing,
+    )
 }
 
 pub(super) async fn wait_for_wallet_ready(
@@ -565,19 +583,24 @@ pub(super) async fn wait_for_startup_sync_target(
     }
 }
 
+/// The provider that answered with the initial head, the head and the safe head. With no
+/// answer, a random provider and zero heads, so the chain starts without a safe head.
 async fn fetch_initial_head(
     chain: &ChainConfig,
     rpcs: &QueryRpcPool,
-) -> Option<(ProviderHandle, u64, u64)> {
+) -> Result<(ProviderHandle, u64, u64), ChainError> {
+    let fallback_rpc = rpcs
+        .random_provider()
+        .ok_or_else(|| ChainError::NoHealthyRpc)?;
     let Some((rpc, head)) = read_head_bounded(rpcs).await else {
         warn!(
             chain_id = chain.deployment.chain_id,
             "no rpc provider returned the initial block number; starting without a safe head"
         );
-        return None;
+        return Ok((fallback_rpc, 0, 0));
     };
     let safe_head = head
         .saturating_sub(chain.finality_depth)
         .max(chain.deployment.deployment_block);
-    Some((rpc, head, safe_head))
+    Ok((rpc, head, safe_head))
 }
