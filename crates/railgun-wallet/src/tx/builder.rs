@@ -22,7 +22,8 @@ use outputs::{
     build_unshield_outputs,
 };
 use plan::{
-    InputWitnessProofCache, TransactionPlanBuilder, prove_transaction_plans, spend_allocations,
+    InputWitnessProofCache, TransactionPlanBuilder, TransactionProver, prove_transaction_plans,
+    spend_allocations,
 };
 use selection::{
     BatchUtxoSelection, UtxoSelection, select_batched_utxos, select_batched_utxos_with_limit,
@@ -85,6 +86,19 @@ impl TransactionBuilder {
         request: UnshieldRequest,
         prover: &ProverService,
     ) -> Result<UnshieldPlan, BuildError> {
+        self.build_unshield_plan_inner(viewing, signer, forest, utxos, request, prover)
+            .await
+    }
+
+    async fn build_unshield_plan_inner<P: TransactionProver>(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: UnshieldRequest,
+        prover: &P,
+    ) -> Result<UnshieldPlan, BuildError> {
         if let Some(fee) = request.different_token_broadcaster_fee() {
             let fee_selection = select_fee_utxos(utxos, fee.token_address, fee.amount)?;
             let action_selection = select_batched_utxos_with_limit(
@@ -146,6 +160,19 @@ impl TransactionBuilder {
         request: SendRequest,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
+        self.build_send_plan_inner(viewing, signer, forest, utxos, &request, prover)
+            .await
+    }
+
+    async fn build_send_plan_inner<P: TransactionProver>(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: &SendRequest,
+        prover: &P,
+    ) -> Result<SendPlan, BuildError> {
         if let Some(fee) = request.different_token_broadcaster_fee() {
             let fee_selection = select_fee_utxos(utxos, fee.token_address, fee.amount)?;
             let action_selection = select_batched_utxos_with_limit(
@@ -164,7 +191,7 @@ impl TransactionBuilder {
                     forest,
                     fee_selection,
                     action_selection,
-                    &request,
+                    request,
                     fee,
                     prover,
                 )
@@ -180,12 +207,12 @@ impl TransactionBuilder {
             1,
         )?;
 
-        self.build_send_batch_with_signer(viewing, signer, forest, selection, &request, prover)
+        self.build_send_batch_with_signer(viewing, signer, forest, selection, request, prover)
             .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_unshield_batch_with_separate_fee_token(
+    async fn build_unshield_batch_with_separate_fee_token<P: TransactionProver>(
         &self,
         viewing: &ViewingKeyData,
         signer: &impl RailgunSpendSigner,
@@ -194,7 +221,7 @@ impl TransactionBuilder {
         action_selection: BatchUtxoSelection,
         request: UnshieldRequest,
         fee: BroadcasterFeeOutput,
-        prover: &ProverService,
+        prover: &P,
     ) -> Result<UnshieldPlan, BuildError> {
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
         let receiver = viewing.address_data();
@@ -320,7 +347,7 @@ impl TransactionBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_send_batch_with_separate_fee_token(
+    async fn build_send_batch_with_separate_fee_token<P: TransactionProver>(
         &self,
         viewing: &ViewingKeyData,
         signer: &impl RailgunSpendSigner,
@@ -329,7 +356,7 @@ impl TransactionBuilder {
         action_selection: BatchUtxoSelection,
         request: &SendRequest,
         fee: BroadcasterFeeOutput,
-        prover: &ProverService,
+        prover: &P,
     ) -> Result<SendPlan, BuildError> {
         let total_started = Instant::now();
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
@@ -488,14 +515,14 @@ impl TransactionBuilder {
         })
     }
 
-    async fn build_unshield_batch_with_signer(
+    async fn build_unshield_batch_with_signer<P: TransactionProver>(
         &self,
         viewing: &ViewingKeyData,
         signer: &impl RailgunSpendSigner,
         forest: &MerkleForest,
         selection: BatchUtxoSelection,
         request: UnshieldRequest,
-        prover: &ProverService,
+        prover: &P,
     ) -> Result<UnshieldPlan, BuildError> {
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
         let allocations = spend_allocations(
@@ -605,14 +632,14 @@ impl TransactionBuilder {
         })
     }
 
-    async fn build_send_batch_with_signer(
+    async fn build_send_batch_with_signer<P: TransactionProver>(
         &self,
         viewing: &ViewingKeyData,
         signer: &impl RailgunSpendSigner,
         forest: &MerkleForest,
         selection: BatchUtxoSelection,
         request: &SendRequest,
-        prover: &ProverService,
+        prover: &P,
     ) -> Result<SendPlan, BuildError> {
         let total_started = Instant::now();
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
