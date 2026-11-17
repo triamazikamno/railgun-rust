@@ -425,11 +425,11 @@ async fn txid_public_later_artifact_chunk_preserves_earlier_checkpoint() {
 fn txid_public_completed_checkpoint_candidates_are_boundary_only_and_ascending() {
     let through = TREE_LEAF_COUNT * 2 + 17;
     assert_eq!(
-        super::sync::checkpoint_candidate_indexes(through, false),
+        super::checkpoints::checkpoint_candidate_indexes(through, false),
         vec![TREE_LEAF_COUNT - 1, TREE_LEAF_COUNT * 2 - 1, through]
     );
     assert_eq!(
-        super::sync::checkpoint_candidate_indexes(through, true),
+        super::checkpoints::checkpoint_candidate_indexes(through, true),
         vec![TREE_LEAF_COUNT - 1, TREE_LEAF_COUNT * 2 - 1]
     );
 }
