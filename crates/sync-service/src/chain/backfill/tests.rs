@@ -480,6 +480,39 @@ async fn parallel_log_fetch_stops_when_narrowing_exceeds_request_budget() {
 }
 
 #[tokio::test]
+async fn parallel_log_fetch_ends_with_a_rejected_page_uncounted() {
+    let server = spawn_rpc_handler(log_rpc_handler(2000, vec![1010, 1150, 1290], |_, _| None));
+    let chain = pool_chain_config([server.url.clone()]);
+
+    let mut offered = Vec::new();
+    let (result, stats) = chain
+        .fetch_logs_in_parallel(
+            1001,
+            1300,
+            FOREST_RPC_PARALLELISM,
+            &LogRequestBudget::new(FOREST_RPC_REQUEST_BUDGET),
+            &CancellationToken::new(),
+            |page| {
+                offered.push(page.to_block);
+                if page.to_block == 1200 {
+                    Err(ChainError::Shutdown)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(ChainError::Shutdown)), "{result:?}");
+    assert_eq!(
+        offered,
+        vec![1100, 1200],
+        "no page follows the rejected one"
+    );
+    assert_eq!(stats.delivered_pages, 1);
+}
+
+#[tokio::test]
 async fn cancelled_parallel_log_fetch_issues_no_further_requests() {
     let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
     let (release_first, first_gate) = std::sync::mpsc::channel::<()>();
