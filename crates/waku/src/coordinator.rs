@@ -9,7 +9,7 @@ use crate::protocols;
 use crate::tasks::TaskWaiter;
 use crate::transport::{FilterPushEvent, ReqId, TransportCmd, TransportEvent};
 use crate::types::OpId;
-use libp2p::request_response::OutboundFailure;
+use libp2p::request_response::{OutboundFailure, ResponseChannel};
 use libp2p::swarm::DialError;
 use libp2p::{Multiaddr, PeerId};
 use lru::LruCache;
@@ -22,6 +22,23 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
+
+const LOG_TARGET: &str = module_path!();
+
+mod filter;
+mod peer_book;
+mod peer_exchange;
+
+pub use filter::SubId;
+use filter::{FilterBatch, FilterOp, FilterState, Subscription, build_filter_request};
+pub use peer_book::PeerBook;
+#[cfg(test)]
+use peer_book::{MAX_ADDRS_PER_PEER, MAX_LEARNED_PEERS, PeerState};
+use peer_book::{
+    PeerSource, apply_addr_policy, insert_peer, merge_addrs, record_dial_failure,
+    remap_wrong_peer_id, retain_dns_peers,
+};
+use peer_exchange::PeerExchangeState;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerStats {
@@ -109,268 +126,6 @@ impl StoreQueryOptions {
     }
 }
 
-const MAX_LEARNED_PEERS: usize = 256;
-const MAX_ADDRS_PER_PEER: usize = 16;
-
-/// Where a peer book entry came from, weakest first.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum PeerSource {
-    #[default]
-    Learned,
-    Dns {
-        last_round: u64,
-    },
-    Configured,
-}
-
-impl PeerSource {
-    const fn upgraded(self, incoming: Self) -> Self {
-        match (self, incoming) {
-            (_, Self::Configured) | (Self::Learned, Self::Dns { .. }) => incoming,
-            (Self::Dns { last_round: old }, Self::Dns { last_round: new }) => Self::Dns {
-                last_round: if new > old { new } else { old },
-            },
-            (current, _) => current,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct PeerState {
-    source: PeerSource,
-    addrs: Vec<Multiaddr>,
-    connected: bool,
-    supports_lightpush_v3: bool,
-    supports_peer_exchange: bool,
-    supports_filter: bool,
-    supports_store: bool,
-    dial_failures: u32,
-    next_dial_at: Option<Instant>,
-    last_peer_exchange_at: Option<Instant>,
-}
-
-#[derive(Debug, Default)]
-pub struct PeerBook {
-    peers: HashMap<PeerId, PeerState>,
-    connected: HashSet<PeerId>,
-    dialing: HashSet<PeerId>,
-}
-
-impl PeerBook {
-    /// Get statistics about the current peer state.
-    #[must_use]
-    pub fn get_stats(&self) -> PeerStats {
-        let connected_peers: Vec<PeerId> = self.connected.iter().copied().collect();
-        let lightpush_capable = self
-            .connected
-            .iter()
-            .filter(|p| self.peers.get(p).is_some_and(|s| s.supports_lightpush_v3))
-            .count();
-        let peer_exchange_capable = self
-            .connected
-            .iter()
-            .filter(|p| self.peers.get(p).is_some_and(|s| s.supports_peer_exchange))
-            .count();
-
-        PeerStats {
-            connected_peers,
-            known_peers: self.peers.len(),
-            dialing_count: self.dialing.len(),
-            lightpush_capable,
-            peer_exchange_capable,
-        }
-    }
-
-    /// Get the list of currently connected peers.
-    #[must_use]
-    pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.connected.iter().copied().collect()
-    }
-
-    #[must_use]
-    pub fn num_connections(&self) -> usize {
-        self.connected.len() + self.dialing.len()
-    }
-
-    /// Build a read-only snapshot of every known peer's state.
-    #[must_use]
-    pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
-        self.peers
-            .iter()
-            .map(|(peer_id, state)| PeerSnapshot {
-                peer_id: *peer_id,
-                addrs: state.addrs.clone(),
-                connected: self.connected.contains(peer_id),
-                dialing: self.dialing.contains(peer_id),
-                supports_lightpush_v3: state.supports_lightpush_v3,
-                supports_peer_exchange: state.supports_peer_exchange,
-                supports_filter: state.supports_filter,
-                dial_failures: state.dial_failures,
-            })
-            .collect()
-    }
-
-    /// Whether connected peers cover both `LightPush` v3 and Filter, possibly on different peers.
-    fn ready(&self) -> bool {
-        let any_connected = |supports: fn(&PeerState) -> bool| {
-            self.connected
-                .iter()
-                .any(|peer_id| self.peers.get(peer_id).is_some_and(supports))
-        };
-        any_connected(|state| state.supports_lightpush_v3)
-            && any_connected(|state| state.supports_filter)
-    }
-}
-
-fn record_dial_failure(state: &mut PeerState, now: Instant) {
-    state.dial_failures = state.dial_failures.saturating_add(1);
-    let pow = state.dial_failures.min(8);
-    let backoff = Duration::from_secs(1 << pow);
-    state.next_dial_at = Some(now + backoff);
-}
-
-fn apply_addr_policy(tor: bool, addrs: &mut Vec<Multiaddr>) {
-    if tor {
-        retain_tor_safe_addrs(addrs);
-    } else {
-        addrs.sort();
-    }
-}
-
-/// Keeps the most recently announced addresses, then sorts them by the address policy.
-fn merge_addrs(addrs: &mut Vec<Multiaddr>, announced: Vec<Multiaddr>, tor: bool) {
-    let mut merged = Vec::with_capacity(MAX_ADDRS_PER_PEER);
-    for addr in announced.into_iter().chain(std::mem::take(addrs)) {
-        if merged.len() == MAX_ADDRS_PER_PEER {
-            break;
-        }
-        if !merged.contains(&addr) {
-            merged.push(addr);
-        }
-    }
-    apply_addr_policy(tor, &mut merged);
-    *addrs = merged;
-}
-
-fn is_idle(book: &PeerBook, peer_id: &PeerId) -> bool {
-    !book.connected.contains(peer_id) && !book.dialing.contains(peer_id)
-}
-
-/// Evicts idle learned peers without addresses, then those with the most dial failures, until
-/// fewer than `MAX_LEARNED_PEERS` remain or nothing is eligible. Returns the learned count.
-fn evict_idle_learned_peers(book: &mut PeerBook) -> usize {
-    let mut learned = book
-        .peers
-        .values()
-        .filter(|state| state.source == PeerSource::Learned)
-        .count();
-    while learned >= MAX_LEARNED_PEERS {
-        let victim = book
-            .peers
-            .iter()
-            .filter(|(peer_id, state)| {
-                state.source == PeerSource::Learned && is_idle(book, peer_id)
-            })
-            .max_by_key(|(_, state)| (state.addrs.is_empty(), state.dial_failures))
-            .filter(|(_, state)| state.addrs.is_empty() || state.dial_failures > 0)
-            .map(|(peer_id, _)| *peer_id);
-        let Some(victim) = victim else { break };
-        book.peers.remove(&victim);
-        learned -= 1;
-    }
-    learned
-}
-
-/// Adds or updates a peer. A new learned peer needs a free learned slot. Returns whether the
-/// peer is in the book afterwards.
-fn insert_peer(
-    book: &mut PeerBook,
-    peer_id: PeerId,
-    addrs: Vec<Multiaddr>,
-    source: PeerSource,
-    tor: bool,
-) -> bool {
-    if let Some(state) = book.peers.get_mut(&peer_id) {
-        state.source = state.source.upgraded(source);
-        merge_addrs(&mut state.addrs, addrs, tor);
-        return true;
-    }
-    if source == PeerSource::Learned && evict_idle_learned_peers(book) >= MAX_LEARNED_PEERS {
-        debug!(%peer_id, "learned peer limit reached, dropping peer");
-        return false;
-    }
-    let mut state = PeerState {
-        source,
-        ..PeerState::default()
-    };
-    merge_addrs(&mut state.addrs, addrs, tor);
-    book.peers.insert(peer_id, state);
-    true
-}
-
-/// Removes the least recently discovered idle DNS peers until at most `bound` remain.
-fn retain_dns_peers(book: &mut PeerBook, bound: usize) {
-    let dns = book
-        .peers
-        .values()
-        .filter(|state| matches!(state.source, PeerSource::Dns { .. }))
-        .count();
-    if dns <= bound {
-        return;
-    }
-    let mut idle = book
-        .peers
-        .iter()
-        .filter_map(|(peer_id, state)| match state.source {
-            PeerSource::Dns { last_round } if is_idle(book, peer_id) => {
-                Some((last_round, *peer_id))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    idle.sort_unstable_by_key(|(last_round, _)| *last_round);
-    for (_, peer_id) in idle.into_iter().take(dns - bound) {
-        book.peers.remove(&peer_id);
-    }
-}
-
-fn remap_wrong_peer_id(
-    book: &mut PeerBook,
-    expected_peer_id: PeerId,
-    obtained_peer_id: PeerId,
-    address: &Multiaddr,
-    now: Instant,
-    tor: bool,
-) {
-    let dialed_addr = without_trailing_peer_id(address);
-    let expected_exhausted = book.peers.get_mut(&expected_peer_id).is_some_and(|state| {
-        state
-            .addrs
-            .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
-        record_dial_failure(state, now);
-        state.source == PeerSource::Learned && state.addrs.is_empty()
-    });
-    if expected_exhausted && is_idle(book, &expected_peer_id) {
-        book.peers.remove(&expected_peer_id);
-    }
-
-    let remapped_addr = with_peer_id(address, obtained_peer_id);
-    if let Some(state) = book.peers.get_mut(&obtained_peer_id) {
-        state
-            .addrs
-            .retain(|addr| without_trailing_peer_id(addr) != dialed_addr);
-        merge_addrs(&mut state.addrs, vec![remapped_addr], tor);
-    } else {
-        insert_peer(
-            book,
-            obtained_peer_id,
-            vec![remapped_addr],
-            PeerSource::Learned,
-            tor,
-        );
-    }
-}
-
 #[derive(Debug)]
 struct ResponseBatch<T> {
     expected: usize,
@@ -408,88 +163,6 @@ fn record_lightpush_result(
 }
 
 #[derive(Debug)]
-struct PeerExchangeOp {
-    remaining_rounds: usize,
-    current_batch: Option<usize>,
-    deadline: Instant,
-}
-
-#[derive(Debug, Default)]
-struct PeerExchangeState {
-    pending: HashMap<ReqId, usize>,
-    ops: HashMap<usize, ResponseBatch<Vec<u8>>>,
-    next_batch_id: usize,
-    round_ops: HashMap<OpId, PeerExchangeOp>,
-    waiters: HashMap<OpId, oneshot::Sender<()>>,
-}
-
-/// Unique identifier for a filter subscription.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct SubId(u64);
-
-impl SubId {
-    fn next(counter: &AtomicU64) -> Self {
-        Self(counter.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-/// A single filter subscription.
-#[derive(Debug)]
-struct Subscription {
-    pubsub_topic: String,
-    content_topics: Vec<String>,
-    sender: mpsc::Sender<proto::WakuMessage>,
-    dropped_since_log: u64,
-    last_drop_log: Option<Instant>,
-}
-
-#[derive(Debug)]
-enum FilterOp {
-    Subscribe { sub_id: SubId },
-    Unsubscribe { sub_id: SubId, batch_id: u64 },
-    UnsubscribeAll { pubsub_topic: String, batch_id: u64 },
-    SubscribeOnPeer { sub_id: SubId },
-}
-
-#[derive(Debug)]
-struct FilterBatch {
-    expected: usize,
-    finished: usize,
-    succeeded: bool,
-    waiter: oneshot::Sender<Result<(), WakuError>>,
-    last_error: Option<WakuError>,
-}
-
-#[derive(Debug)]
-struct FilterState {
-    /// Active subscriptions by ID.
-    subscriptions: HashMap<SubId, Subscription>,
-    /// Pending outbound requests.
-    pending: HashMap<ReqId, FilterOp>,
-    /// Dedup cache: hash of (`content_topic`, `payload`).
-    dedup_cache: LruCache<u64, ()>,
-    /// Next subscription ID counter.
-    next_sub_id: AtomicU64,
-    /// Next batch ID counter.
-    next_batch_id: AtomicU64,
-    /// Pending unsubscribe batches.
-    batches: HashMap<u64, FilterBatch>,
-}
-
-impl Default for FilterState {
-    fn default() -> Self {
-        Self {
-            subscriptions: HashMap::default(),
-            pending: HashMap::default(),
-            dedup_cache: LruCache::new(NonZeroUsize::new(DEDUP_CACHE_SIZE).unwrap()),
-            next_sub_id: AtomicU64::default(),
-            next_batch_id: AtomicU64::default(),
-            batches: HashMap::default(),
-        }
-    }
-}
-
-#[derive(Debug)]
 struct StorePending {
     waiter: oneshot::Sender<Result<protocols::store::StoreQueryPage, WakuError>>,
     deadline: Instant,
@@ -508,7 +181,6 @@ struct OpTracker {
     store: Mutex<StoreState>,
 }
 
-const DEDUP_CACHE_SIZE: usize = 500;
 const STORE_PEER_EVENT_CAPACITY: usize = 64;
 
 impl OpTracker {
@@ -524,19 +196,6 @@ impl OpTracker {
 
     fn next_req_id(&self) -> ReqId {
         self.next_req_id.fetch_add(1, Ordering::Relaxed)
-    }
-}
-
-fn build_filter_request(
-    filter_type: proto::filter::filter_subscribe_request::FilterSubscribeType,
-    pubsub_topic: String,
-    content_topics: Vec<String>,
-) -> proto::filter::FilterSubscribeRequest {
-    proto::filter::FilterSubscribeRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        filter_subscribe_type: filter_type as i32,
-        pubsub_topic: Some(pubsub_topic),
-        content_topics,
     }
 }
 
@@ -654,13 +313,22 @@ impl NodeInner {
         let mut in_flight = 0;
 
         for (peer_id, state) in &book.peers {
-            if book.num_connections() + in_flight >= self.config.connection_cap
-                || state.connected
-                || book.dialing.contains(peer_id)
-                || state.next_dial_at.is_some_and(|next| next > now)
-                || state.addrs.is_empty()
-                || in_flight >= self.config.dial_concurrency
-            {
+            if book.num_connections() + in_flight >= self.config.connection_cap {
+                continue;
+            }
+            if state.connected {
+                continue;
+            }
+            if book.dialing.contains(peer_id) {
+                continue;
+            }
+            if state.next_dial_at.is_some_and(|next| next > now) {
+                continue;
+            }
+            if state.addrs.is_empty() {
+                continue;
+            }
+            if in_flight >= self.config.dial_concurrency {
                 continue;
             }
 
@@ -691,30 +359,6 @@ impl NodeInner {
             .collect();
         *self.dns_records.write() = records;
         self.apply_discovered_peers(peers, PeerSource::Dns { last_round: round })
-    }
-
-    async fn peer_exchange_rounds(&self, rounds: usize) -> Result<(), WakuError> {
-        if rounds == 0 {
-            return Ok(());
-        }
-
-        let op_id = OpId::next(&self.op_counter);
-        let (tx, rx) = oneshot::channel();
-
-        {
-            let mut px = self.ops.peer_exchange.lock().await;
-            px.waiters.insert(op_id, tx);
-
-            let op = PeerExchangeOp {
-                remaining_rounds: rounds,
-                current_batch: None,
-                deadline: Instant::now() + self.config.request_timeout,
-            };
-            px.round_ops.insert(op_id, op);
-        }
-
-        self.start_peer_exchange_round(op_id).await;
-        rx.await.map_err(|_| WakuError::Cancelled)
     }
 
     fn apply_discovered_peers(
@@ -831,61 +475,6 @@ impl NodeInner {
         self.discovery_wake.notify_one();
         if connected_peers.is_empty() {
             self.maybe_dial();
-        }
-    }
-
-    async fn run_peer_exchange_loop(self: Arc<Self>) {
-        let mut shutdown = self.shutdown_tx.subscribe();
-        loop {
-            let connected = self.peer_book.read().connected.len();
-            let interval = if connected < self.discovery_config.peer_exchange_bootstrap_peers {
-                self.discovery_config.peer_exchange_bootstrap_interval
-            } else {
-                self.discovery_config.peer_exchange_interval
-            };
-
-            if connected == 0 {
-                debug!("skipping peer exchange: no connected peers");
-                if sleep_or_shutdown(interval, &mut shutdown).await {
-                    debug!("peer exchange loop shutting down");
-                    break;
-                }
-                continue;
-            }
-
-            if connected >= self.config.connection_cap {
-                debug!("skipping peer exchange: connection cap reached");
-                if sleep_or_shutdown(interval, &mut shutdown).await {
-                    debug!("peer exchange loop shutting down");
-                    break;
-                }
-                continue;
-            }
-
-            debug!(connected, "performing peer exchange");
-            let result = tokio::select! {
-                result = self.peer_exchange_rounds(self.discovery_config.peer_exchange_rounds) => result,
-                should_shutdown = shutdown_changed_or_requested(&mut shutdown) => {
-                    if should_shutdown {
-                        debug!("peer exchange loop shutting down");
-                        break;
-                    }
-                    continue;
-                }
-            };
-            match result {
-                Ok(()) => {}
-                Err(WakuError::Cancelled) => warn!("peer exchange cancelled"),
-                Err(error) => {
-                    error!(?error, "peer exchange failed, stopping loop");
-                    break;
-                }
-            }
-
-            if sleep_or_shutdown(interval, &mut shutdown).await {
-                debug!("peer exchange loop shutting down");
-                break;
-            }
         }
     }
 
@@ -1053,125 +642,24 @@ impl NodeInner {
     async fn handle_transport_event(&self, ev: TransportEvent) {
         match ev {
             TransportEvent::ConnectionEstablished { peer_id } => {
-                debug!(%peer_id, "connected");
-                let supports_store = {
-                    let mut book = self.peer_book.write();
-                    book.connected.insert(peer_id);
-                    book.dialing.remove(&peer_id);
-                    let state = book.peers.entry(peer_id).or_default();
-                    state.connected = true;
-                    if state.dial_failures > 5
-                        && state.next_dial_at.is_some_and(|t| t <= Instant::now())
-                    {
-                        state.dial_failures = state.dial_failures.saturating_sub(1);
-                    }
-                    state.supports_store
-                };
-                self.peer_capabilities_changed.notify_waiters();
-                if supports_store {
-                    debug!(%peer_id, "connected peer supports store");
-                    let _ = self.store_peer_tx.send(peer_id);
-                }
-                self.maybe_dial();
+                self.handle_connection_established(peer_id);
             }
             TransportEvent::ConnectionClosed { peer_id } => {
-                debug!(%peer_id, "disconnected");
-                let suppress_backoff = self.session_refresh_disconnects.write().remove(&peer_id);
-                {
-                    let mut book = self.peer_book.write();
-                    book.connected.remove(&peer_id);
-                    if !suppress_backoff {
-                        book.dialing.remove(&peer_id);
-                    }
-                    if let Some(state) = book.peers.get_mut(&peer_id) {
-                        state.connected = false;
-                        if suppress_backoff {
-                            state.next_dial_at = None;
-                        } else {
-                            record_dial_failure(state, Instant::now());
-                        }
-                    }
-                }
-                self.peer_capabilities_changed.notify_waiters();
-                self.maybe_dial();
+                self.handle_connection_closed(peer_id);
             }
             TransportEvent::DialError { peer_id, error } => {
-                debug!(%peer_id, ?error, "dial error");
-                let now = Instant::now();
-                let mut book = self.peer_book.write();
-                book.dialing.remove(&peer_id);
-                if let DialError::WrongPeerId { obtained, address } = error {
-                    debug!(
-                        expected_peer_id=%peer_id,
-                        obtained_peer_id=%obtained,
-                        %address,
-                        "remapping stale peer address to authenticated peer id"
-                    );
-                    remap_wrong_peer_id(
-                        &mut book,
-                        peer_id,
-                        obtained,
-                        &address,
-                        now,
-                        self.uses_tor_profile(),
-                    );
-                } else if let Some(state) = book.peers.get_mut(&peer_id) {
-                    record_dial_failure(state, now);
-                }
+                self.handle_dial_error(peer_id, error);
             }
             TransportEvent::IdentifyReceived {
                 peer_id,
                 protocols,
-                mut addrs,
+                addrs,
             } => {
-                trace!(%peer_id, ?addrs, ?protocols, "received identify");
-                self.apply_addr_policy(&mut addrs);
-                let supports_lightpush = protocols
-                    .iter()
-                    .any(|p| p == protocols::lightpush::LIGHTPUSH_V3_CODEC);
-                let supports_px = protocols
-                    .iter()
-                    .any(|p| p == protocols::peer_exchange::PEER_EXCHANGE_CODEC);
-                let supports_filter = protocols
-                    .iter()
-                    .any(|p| p == protocols::filter::FILTER_SUBSCRIBE_CODEC);
-                let supports_store = protocols
-                    .iter()
-                    .any(|p| p == protocols::store::STORE_QUERY_CODEC);
-
-                let became_store_capable = {
-                    let mut book = self.peer_book.write();
-                    let entry = book.peers.entry(peer_id).or_default();
-                    let became_store_capable =
-                        supports_store && entry.connected && !entry.supports_store;
-                    entry.supports_lightpush_v3 = supports_lightpush;
-                    entry.supports_peer_exchange = supports_px;
-                    entry.supports_filter = supports_filter;
-                    entry.supports_store = supports_store;
-                    merge_addrs(&mut entry.addrs, addrs, self.uses_tor_profile());
-                    became_store_capable
-                };
-                self.peer_capabilities_changed.notify_waiters();
-
-                if became_store_capable {
-                    debug!(%peer_id, "peer supports store");
-                    let _ = self.store_peer_tx.send(peer_id);
-                }
-
-                // Resubscribe to filter on reconnect if peer supports filter
-                if supports_filter {
-                    self.subscribe_on_peer(peer_id).await;
-                }
+                self.handle_identify_received(peer_id, &protocols, addrs)
+                    .await;
             }
             TransportEvent::MetadataRequest { peer_id, channel } => {
-                debug!(%peer_id, "received metadata request");
-                let response = self.metadata_response.clone();
-                if let Err(error) = self
-                    .transport_tx
-                    .try_send(TransportCmd::SendMetadataResponse { channel, response })
-                {
-                    error!(%error, "failed to send metadata response command");
-                }
+                self.handle_metadata_request(peer_id, channel);
             }
             TransportEvent::LightPushResponse {
                 req_id,
@@ -1195,6 +683,134 @@ impl NodeInner {
             TransportEvent::StoreQueryResponse { req_id, result } => {
                 self.handle_store_query_response(req_id, result).await;
             }
+        }
+    }
+
+    fn handle_connection_established(&self, peer_id: PeerId) {
+        debug!(%peer_id, "connected");
+        let supports_store = {
+            let mut book = self.peer_book.write();
+            book.connected.insert(peer_id);
+            book.dialing.remove(&peer_id);
+            let state = book.peers.entry(peer_id).or_default();
+            state.connected = true;
+            if state.dial_failures > 5 && state.next_dial_at.is_some_and(|t| t <= Instant::now()) {
+                state.dial_failures = state.dial_failures.saturating_sub(1);
+            }
+            state.supports_store
+        };
+        self.peer_capabilities_changed.notify_waiters();
+        if supports_store {
+            debug!(%peer_id, "connected peer supports store");
+            let _ = self.store_peer_tx.send(peer_id);
+        }
+        self.maybe_dial();
+    }
+
+    fn handle_connection_closed(&self, peer_id: PeerId) {
+        debug!(%peer_id, "disconnected");
+        let suppress_backoff = self.session_refresh_disconnects.write().remove(&peer_id);
+        {
+            let mut book = self.peer_book.write();
+            book.connected.remove(&peer_id);
+            if !suppress_backoff {
+                book.dialing.remove(&peer_id);
+            }
+            if let Some(state) = book.peers.get_mut(&peer_id) {
+                state.connected = false;
+                if suppress_backoff {
+                    state.next_dial_at = None;
+                } else {
+                    record_dial_failure(state, Instant::now());
+                }
+            }
+        }
+        self.peer_capabilities_changed.notify_waiters();
+        self.maybe_dial();
+    }
+
+    fn handle_dial_error(&self, peer_id: PeerId, error: DialError) {
+        debug!(%peer_id, ?error, "dial error");
+        let now = Instant::now();
+        let mut book = self.peer_book.write();
+        book.dialing.remove(&peer_id);
+        if let DialError::WrongPeerId { obtained, address } = error {
+            debug!(
+                expected_peer_id=%peer_id,
+                obtained_peer_id=%obtained,
+                %address,
+                "remapping stale peer address to authenticated peer id"
+            );
+            remap_wrong_peer_id(
+                &mut book,
+                peer_id,
+                obtained,
+                &address,
+                now,
+                self.uses_tor_profile(),
+            );
+        } else if let Some(state) = book.peers.get_mut(&peer_id) {
+            record_dial_failure(state, now);
+        }
+    }
+
+    async fn handle_identify_received(
+        &self,
+        peer_id: PeerId,
+        protocols: &[String],
+        mut addrs: Vec<Multiaddr>,
+    ) {
+        trace!(%peer_id, ?addrs, ?protocols, "received identify");
+        self.apply_addr_policy(&mut addrs);
+        let supports_lightpush = protocols
+            .iter()
+            .any(|p| p == protocols::lightpush::LIGHTPUSH_V3_CODEC);
+        let supports_px = protocols
+            .iter()
+            .any(|p| p == protocols::peer_exchange::PEER_EXCHANGE_CODEC);
+        let supports_filter = protocols
+            .iter()
+            .any(|p| p == protocols::filter::FILTER_SUBSCRIBE_CODEC);
+        let supports_store = protocols
+            .iter()
+            .any(|p| p == protocols::store::STORE_QUERY_CODEC);
+
+        let became_store_capable = {
+            let mut book = self.peer_book.write();
+            let entry = book.peers.entry(peer_id).or_default();
+            let became_store_capable = supports_store && entry.connected && !entry.supports_store;
+            entry.supports_lightpush_v3 = supports_lightpush;
+            entry.supports_peer_exchange = supports_px;
+            entry.supports_filter = supports_filter;
+            entry.supports_store = supports_store;
+            merge_addrs(&mut entry.addrs, addrs, self.uses_tor_profile());
+            became_store_capable
+        };
+        self.peer_capabilities_changed.notify_waiters();
+
+        if became_store_capable {
+            debug!(%peer_id, "peer supports store");
+            let _ = self.store_peer_tx.send(peer_id);
+        }
+
+        // Resubscribe to filter on reconnect if peer supports filter
+        if supports_filter {
+            self.subscribe_on_peer(peer_id).await;
+        }
+    }
+
+    fn handle_metadata_request(
+        &self,
+        peer_id: PeerId,
+        channel: ResponseChannel<proto::metadata::WakuMetadataResponse>,
+    ) {
+        debug!(%peer_id, "received metadata request");
+        let response = self.metadata_response.clone();
+        if let Err(error) = self
+            .transport_tx
+            .try_send(TransportCmd::SendMetadataResponse { channel, response })
+        {
+            error!(%error, "failed to send metadata response command");
         }
     }
 
@@ -1245,380 +861,6 @@ impl NodeInner {
         }
     }
 
-    async fn start_peer_exchange_round(&self, op_id: OpId) {
-        {
-            let mut px = self.ops.peer_exchange.lock().await;
-            let Some(op) = px.round_ops.get_mut(&op_id) else {
-                return;
-            };
-
-            if op.remaining_rounds == 0 {
-                px.round_ops.remove(&op_id);
-                if let Some(tx) = px.waiters.remove(&op_id)
-                    && tx.send(()).is_err()
-                {
-                    debug!(?op_id, "peer exchange receiver dropped");
-                }
-                return;
-            }
-        }
-
-        let now = Instant::now();
-        let peers: Vec<PeerId> = {
-            let book = self.peer_book.read();
-            book.connected
-                .iter()
-                .filter_map(|peer_id| {
-                    let state = book.peers.get(peer_id)?;
-                    if !state.supports_peer_exchange {
-                        return None;
-                    }
-                    if state
-                        .last_peer_exchange_at
-                        .is_some_and(|last| now.duration_since(last) < self.peer_exchange_cooldown)
-                    {
-                        return None;
-                    }
-                    Some(*peer_id)
-                })
-                .collect()
-        };
-
-        let mut sent_peers = Vec::new();
-        {
-            let mut px = self.ops.peer_exchange.lock().await;
-            {
-                let Some(op) = px.round_ops.get_mut(&op_id) else {
-                    return;
-                };
-
-                if peers.is_empty() {
-                    op.remaining_rounds = 0;
-                    px.round_ops.remove(&op_id);
-                    if let Some(tx) = px.waiters.remove(&op_id)
-                        && tx.send(()).is_err()
-                    {
-                        debug!(?op_id, "peer exchange receiver dropped");
-                    }
-                    return;
-                }
-            }
-
-            let batch_id = px.next_batch_id;
-            px.next_batch_id += 1;
-
-            let Some(op) = px.round_ops.get_mut(&op_id) else {
-                return;
-            };
-            op.current_batch = Some(batch_id);
-            op.deadline = Instant::now() + self.config.request_timeout;
-
-            let mut expected = 0;
-            for peer in peers {
-                let req_id = self.ops.next_req_id();
-                let request = proto::peer_exchange::PeerExchangeRpc {
-                    query: Some(proto::peer_exchange::PeerExchangeQuery {
-                        num_peers: Some(self.config.peer_exchange_peers_per_query),
-                    }),
-                    response: None,
-                };
-
-                let cmd = TransportCmd::SendPeerExchange {
-                    req_id,
-                    peer_id: peer,
-                    request,
-                };
-                if self.transport_tx.try_send(cmd).is_ok() {
-                    px.pending.insert(req_id, batch_id);
-                    expected += 1;
-                    sent_peers.push(peer);
-                }
-            }
-
-            let batch = ResponseBatch {
-                expected,
-                finished: 0,
-                results: Vec::new(),
-                deadline: Instant::now() + self.config.request_timeout,
-            };
-            px.ops.insert(batch_id, batch);
-        }
-
-        if !sent_peers.is_empty() {
-            let mut book = self.peer_book.write();
-            for peer_id in sent_peers {
-                if let Some(state) = book.peers.get_mut(&peer_id) {
-                    state.last_peer_exchange_at = Some(now);
-                }
-            }
-        }
-    }
-
-    async fn handle_peer_exchange_response(
-        &self,
-        req_id: ReqId,
-        result: Result<proto::peer_exchange::PeerExchangeRpc, OutboundFailure>,
-    ) {
-        let (batch_id, enrs) = {
-            let mut px = self.ops.peer_exchange.lock().await;
-            let Some(batch_id) = px.pending.remove(&req_id) else {
-                return;
-            };
-            let Some(batch) = px.ops.get_mut(&batch_id) else {
-                return;
-            };
-
-            batch.finished += 1;
-            if let Ok(response) = result
-                && let Some(resp) = response.response
-            {
-                let records = resp.peer_infos.len();
-                if u64::try_from(records)
-                    .is_ok_and(|records| records <= self.config.peer_exchange_peers_per_query)
-                {
-                    batch
-                        .results
-                        .extend(resp.peer_infos.into_iter().filter_map(|p| p.enr));
-                } else {
-                    debug!(
-                        records,
-                        "discarding peer exchange response with too many records"
-                    );
-                }
-            }
-
-            if batch.finished < batch.expected {
-                return;
-            }
-
-            let Some(batch) = px.ops.remove(&batch_id) else {
-                return;
-            };
-            (batch_id, batch.results)
-        };
-
-        self.finish_peer_exchange_batch(batch_id, enrs).await;
-    }
-
-    async fn finish_peer_exchange_batch(&self, batch_id: usize, enrs: Vec<Vec<u8>>) {
-        let peers = enrs
-            .into_iter()
-            .filter_map(|enr| discovery::enr::decode_enr_rlp(&enr).ok())
-            .collect();
-        self.apply_discovered_peers(peers, PeerSource::Learned);
-
-        let op_id = {
-            let mut px = self.ops.peer_exchange.lock().await;
-            let op_id = px
-                .round_ops
-                .iter()
-                .find_map(|(op_id, op)| (op.current_batch == Some(batch_id)).then_some(*op_id));
-
-            let Some(op_id) = op_id else { return };
-
-            if let Some(op) = px.round_ops.get_mut(&op_id) {
-                op.remaining_rounds = op.remaining_rounds.saturating_sub(1);
-                op.current_batch = None;
-            }
-
-            op_id
-        };
-
-        self.start_peer_exchange_round(op_id).await;
-    }
-
-    async fn send_filter_request(
-        &self,
-        req_id: ReqId,
-        peer_id: PeerId,
-        request: proto::filter::FilterSubscribeRequest,
-        op: FilterOp,
-    ) -> Result<(), WakuError> {
-        let cmd = TransportCmd::SendFilterSubscribe {
-            req_id,
-            peer_id,
-            request,
-        };
-        if self.transport_tx.try_send(cmd).is_err() {
-            return Err(WakuError::ChannelFull);
-        }
-
-        let mut filter = self.ops.filter.lock().await;
-        filter.pending.insert(req_id, op);
-        Ok(())
-    }
-
-    fn update_filter_batch<F>(
-        filter: &mut FilterState,
-        batch_id: u64,
-        result_status: Result<(), WakuError>,
-        on_success: F,
-    ) where
-        F: FnOnce(&mut FilterState),
-    {
-        let mut finalize_success = false;
-        let mut finalize_failure = false;
-
-        if let Some(batch) = filter.batches.get_mut(&batch_id) {
-            batch.finished += 1;
-            match result_status {
-                Ok(()) => {
-                    if !batch.succeeded {
-                        batch.succeeded = true;
-                        finalize_success = true;
-                    }
-                }
-                Err(error) => {
-                    batch.last_error = Some(error);
-                    if batch.finished >= batch.expected && !batch.succeeded {
-                        finalize_failure = true;
-                    }
-                }
-            }
-
-            if batch.finished >= batch.expected && !batch.succeeded {
-                finalize_failure = true;
-            }
-        }
-
-        if (finalize_success || finalize_failure)
-            && let Some(batch) = filter.batches.remove(&batch_id)
-        {
-            let outcome = if finalize_success {
-                on_success(filter);
-                Ok(())
-            } else {
-                Err(batch.last_error.unwrap_or(WakuError::FilterRequestFailed))
-            };
-            if let Err(err) = batch.waiter.send(outcome) {
-                debug!(?err, batch_id = %batch_id, "failed to send filter batch outcome");
-            }
-        }
-    }
-
-    async fn handle_filter_subscribe_response(
-        &self,
-        req_id: ReqId,
-        peer_id: PeerId,
-        result: Result<proto::filter::FilterSubscribeResponse, OutboundFailure>,
-    ) {
-        let mut filter = self.ops.filter.lock().await;
-        let Some(op) = filter.pending.remove(&req_id) else {
-            return;
-        };
-
-        let result_status = match &result {
-            Ok(response) if response.status_code == 200 => Ok(()),
-            Ok(response) => Err(WakuError::FilterSubscribeFailed {
-                status_code: response.status_code,
-                status_desc: response.status_desc.clone(),
-            }),
-            Err(error) => {
-                debug!(%peer_id, ?error, "filter subscribe failed");
-                Err(WakuError::FilterRequestFailed)
-            }
-        };
-
-        match op {
-            FilterOp::Subscribe { sub_id } => match result_status {
-                Ok(()) => {
-                    debug!(%peer_id, ?sub_id, "filter subscribe succeeded");
-                }
-                Err(error) => {
-                    warn!(%peer_id, ?sub_id, ?error, "filter subscribe failed");
-                }
-            },
-            FilterOp::Unsubscribe { sub_id, batch_id } => {
-                Self::update_filter_batch(&mut filter, batch_id, result_status, |filter| {
-                    filter.subscriptions.remove(&sub_id);
-                });
-            }
-            FilterOp::UnsubscribeAll {
-                pubsub_topic,
-                batch_id,
-            } => {
-                Self::update_filter_batch(&mut filter, batch_id, result_status, |filter| {
-                    filter
-                        .subscriptions
-                        .retain(|_, sub| sub.pubsub_topic != pubsub_topic);
-                });
-            }
-            FilterOp::SubscribeOnPeer { sub_id } => match result_status {
-                Ok(()) => {
-                    debug!(%peer_id, ?sub_id, "filter subscribe (peer) succeeded");
-                }
-                Err(error) => {
-                    debug!(%peer_id, ?sub_id, ?error, "filter subscribe (peer) failed");
-                }
-            },
-        }
-    }
-
-    async fn handle_filter_push(&self, peer_id: PeerId, push: proto::filter::MessagePush) {
-        let Some(message) = push.waku_message else {
-            debug!(%peer_id, "received filter push without message");
-            return;
-        };
-
-        let hash = message.hash_key();
-
-        let mut filter = self.ops.filter.lock().await;
-
-        if filter.dedup_cache.contains(&hash) {
-            trace!(%peer_id, "duplicate filter push, ignoring");
-            return;
-        }
-        filter.dedup_cache.put(hash, ());
-
-        // Route to matching subscriptions
-        let Some(pubsub_topic) = push.pubsub_topic.as_deref() else {
-            debug!(%peer_id, "received filter push without pubsub topic");
-            return;
-        };
-        let content_topic = &message.content_topic;
-
-        let mut closed = Vec::new();
-        for (sub_id, sub) in &mut filter.subscriptions {
-            if sub.pubsub_topic != pubsub_topic {
-                continue;
-            }
-
-            if !sub.content_topics.iter().any(|ct| ct == content_topic) {
-                continue;
-            }
-
-            match sub.sender.try_send(message.clone()) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    sub.dropped_since_log = sub.dropped_since_log.saturating_add(1);
-                    let now = Instant::now();
-                    if sub
-                        .last_drop_log
-                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30))
-                    {
-                        debug!(
-                            %peer_id,
-                            ?sub_id,
-                            pubsub_topic,
-                            content_topic,
-                            dropped = sub.dropped_since_log,
-                            "filter subscription capacity exhausted; dropping messages"
-                        );
-                        sub.dropped_since_log = 0;
-                        sub.last_drop_log = Some(now);
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    closed.push(*sub_id);
-                }
-            }
-        }
-        for sub_id in closed {
-            filter.subscriptions.remove(&sub_id);
-            debug!(?sub_id, "removed closed filter subscription");
-        }
-    }
-
     async fn handle_store_query_response(
         &self,
         req_id: ReqId,
@@ -1635,55 +877,6 @@ impl NodeInner {
         });
         if let Err(error) = pending.waiter.send(result) {
             debug!(?req_id, ?error, "store query receiver dropped");
-        }
-    }
-
-    async fn send_subscribe_request(
-        &self,
-        peer_id: PeerId,
-        sub_id: SubId,
-        pubsub_topic: String,
-        content_topics: Vec<String>,
-    ) {
-        let req_id = self.ops.next_req_id();
-        let request = build_filter_request(
-            proto::filter::filter_subscribe_request::FilterSubscribeType::Subscribe,
-            pubsub_topic,
-            content_topics,
-        );
-
-        if let Err(error) = self
-            .send_filter_request(
-                req_id,
-                peer_id,
-                request,
-                FilterOp::SubscribeOnPeer { sub_id },
-            )
-            .await
-        {
-            warn!(%peer_id, ?sub_id, ?error, "failed to send filter subscribe request");
-        }
-    }
-
-    async fn subscribe_on_peer(&self, peer_id: PeerId) {
-        let subs_to_send: Vec<(SubId, String, Vec<String>)> = {
-            let filter = self.ops.filter.lock().await;
-            filter
-                .subscriptions
-                .iter()
-                .map(|(id, sub)| (*id, sub.pubsub_topic.clone(), sub.content_topics.clone()))
-                .collect()
-        };
-
-        if subs_to_send.is_empty() {
-            return;
-        }
-
-        debug!(%peer_id, count = subs_to_send.len(), "subscribing filter subscriptions on peer");
-
-        for (sub_id, pubsub_topic, content_topics) in subs_to_send {
-            self.send_subscribe_request(peer_id, sub_id, pubsub_topic, content_topics)
-                .await;
         }
     }
 }
