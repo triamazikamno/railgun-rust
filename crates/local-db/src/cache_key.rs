@@ -50,13 +50,13 @@ impl FromStr for WalletCacheKey {
     type Err = WalletCacheKeyError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty()
+        let non_canonical = value.is_empty()
             || !value.len().is_multiple_of(2)
             || value
                 .bytes()
                 .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            || hex::decode(value).is_err()
-        {
+            || hex::decode(value).is_err();
+        if non_canonical {
             return Err(WalletCacheKeyError);
         }
         Ok(Self(value.to_owned()))

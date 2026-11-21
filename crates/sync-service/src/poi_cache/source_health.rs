@@ -52,7 +52,9 @@ impl PoiSourceHealth {
     }
 
     pub(super) fn attempt_plan(&self, corpus_ready: bool) -> PoiListAttemptPlan {
-        if !corpus_ready && !self.force_rpc_probe && !self.rpc_recently_healthy() {
+        let prefer_artifact =
+            !corpus_ready && !self.force_rpc_probe && !self.rpc_recently_healthy();
+        if prefer_artifact {
             return PoiListAttemptPlan {
                 use_artifact: true,
                 artifact_after_rpc_failure: false,

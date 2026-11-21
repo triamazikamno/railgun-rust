@@ -76,10 +76,10 @@ impl WalletActorLifecycleCell {
             {
                 inner.state = WalletActorLifecycle::Stopping;
             }
-            if !inner.state.allows_terminal_shutdown_publish()
+            let publish_blocked = !inner.state.allows_terminal_shutdown_publish()
                 || inner.terminal_shutdown_published
-                || !is_current
-            {
+                || !is_current;
+            if publish_blocked {
                 return false;
             }
             inner.terminal_shutdown_published = true;

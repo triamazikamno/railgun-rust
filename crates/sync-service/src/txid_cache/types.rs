@@ -279,12 +279,12 @@ impl TxidPublicCachePage {
         &self,
         key: TxidPublicCacheKey<'_>,
     ) -> Result<(), TxidPublicCacheError> {
-        if self.format_version != TXID_CACHE_FORMAT_VERSION
+        let identity_mismatch = self.format_version != TXID_CACHE_FORMAT_VERSION
             || self.chain_type != key.chain_type
             || self.chain_id != key.chain_id
             || self.railgun_contract != key.railgun_contract
-            || self.txid_version != key.txid_version
-        {
+            || self.txid_version != key.txid_version;
+        if identity_mismatch {
             return Err(TxidPublicCacheError::MetadataMismatch(
                 "page cache identity mismatch".to_string(),
             ));

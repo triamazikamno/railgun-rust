@@ -260,13 +260,15 @@ impl TxidPublicCacheManifest {
         if self.checkpoints.is_empty() && self.artifact_cached_txid_index.is_some() {
             return 0;
         }
-        if local_status == TxidPublicLocalLatestStatus::NeedsValidatedRefresh
-            || self
-                .latest_validated_txid_index
-                .is_some_and(|index| index > latest.txid_index)
+        if local_status == TxidPublicLocalLatestStatus::NeedsValidatedRefresh {
+            return 0;
+        }
+        let validated_tip_conflicts = self
+            .latest_validated_txid_index
+            .is_some_and(|index| index > latest.txid_index)
             || (self.latest_validated_txid_index == Some(latest.txid_index)
-                && self.latest_validated_merkleroot != latest.merkleroot)
-        {
+                && self.latest_validated_merkleroot != latest.merkleroot);
+        if validated_tip_conflicts {
             return 0;
         }
         self.artifact_cached_txid_index

@@ -44,10 +44,10 @@ impl BlockedShieldsDescriptor {
         self.artifact.verify_bytes(bytes)?;
         let artifact = BlockedShieldsArtifact::read(bytes)?;
         let row_count = usize_to_u64(artifact.blocked_shields.len())?;
-        if artifact.format_version != self.format_version
+        let body_mismatch = artifact.format_version != self.format_version
             || artifact.scope != self.scope
-            || row_count != self.row_count
-        {
+            || row_count != self.row_count;
+        if body_mismatch {
             return Err(Error::DescriptorBodyMismatch);
         }
         artifact.verify_signatures()?;
