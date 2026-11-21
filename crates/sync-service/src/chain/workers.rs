@@ -87,6 +87,6 @@ pub(super) fn spawn_txid_public_cache_loop(
                 }
             }
         }
-        .instrument(tracing::info_span!("txid_public_cache", chain_id)),
+        .instrument(tracing::error_span!("txid_public_cache", chain_id)),
     ))
 }

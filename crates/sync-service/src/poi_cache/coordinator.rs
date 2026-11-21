@@ -79,7 +79,7 @@ pub(super) fn spawn_chain_poi_cache_coordinator(
             run_chain_poi_cache_coordinator(task, initialized_tx).await;
             let _ = stopped_tx.send(true);
         }
-        .instrument(tracing::info_span!("poi_artifact_cache", chain_id)),
+        .instrument(tracing::error_span!("poi_artifact_cache", chain_id)),
     );
 }
 

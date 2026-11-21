@@ -40,7 +40,7 @@ pub(in crate::chain) fn spawn_pending_tip_loop(
                 }
             }
         }
-        .instrument(tracing::info_span!("pending_tip", chain_id)),
+        .instrument(tracing::error_span!("pending_tip", chain_id)),
     );
 }
 

@@ -246,7 +246,7 @@ pub(in crate::chain) fn spawn_wallet_lag_fallback_loop(
                 }
             }
         }
-        .instrument(tracing::info_span!("wallet_lag_fallback", chain_id)),
+        .instrument(tracing::error_span!("wallet_lag_fallback", chain_id)),
     );
 }
 

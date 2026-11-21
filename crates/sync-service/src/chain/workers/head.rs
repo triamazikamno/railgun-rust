@@ -173,6 +173,6 @@ pub(in crate::chain) fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<
                 }
             }
         }
-        .instrument(tracing::info_span!("sync_head", chain_id)),
+        .instrument(tracing::error_span!("sync_head", chain_id)),
     );
 }

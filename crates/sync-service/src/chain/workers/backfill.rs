@@ -84,6 +84,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
     safe_head_rx: watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
+    let chain_id = service.chain.deployment.chain_id;
     let backfill_loop = BackfillLoop {
         service,
         backfill_rx,
@@ -96,7 +97,7 @@ pub(in crate::chain) fn spawn_backfill_loop(
     tokio::spawn(
         backfill_loop
             .run()
-            .instrument(tracing::info_span!("sync_backfill")),
+            .instrument(tracing::error_span!("sync_backfill", chain_id)),
     );
 }
 

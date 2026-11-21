@@ -51,6 +51,7 @@ pub(in crate::chain) fn spawn_live_log_loop(
     snapshot_path: PathBuf,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
+    let chain_id = service.chain.deployment.chain_id;
     let sources = IndexedForestSources::of(&service.chain);
     let stall =
         ForestStallTracker::new(wallet_tail_fallback_stale_timeout(service.chain.block_time));
@@ -67,7 +68,11 @@ pub(in crate::chain) fn spawn_live_log_loop(
         attempt: None,
         pending: None,
     };
-    tokio::spawn(live_loop.run().instrument(tracing::info_span!("sync_live")))
+    tokio::spawn(
+        live_loop
+            .run()
+            .instrument(tracing::error_span!("sync_live", chain_id)),
+    )
 }
 
 impl LiveLogLoop {

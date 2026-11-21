@@ -365,7 +365,7 @@ fn spawn_wallet_actor(start: WalletActorStart) -> JoinHandle<()> {
     let worker_cache_key = start.cfg.cache_key.clone();
     let supervisor_poi_jobs = start.poi_jobs.clone();
     let actor_worker =
-        tokio::spawn(run_wallet_actor(start).instrument(tracing::info_span!("wallet", chain_id)));
+        tokio::spawn(run_wallet_actor(start).instrument(tracing::error_span!("wallet", chain_id)));
     tokio::spawn(async move {
         if let Err(err) = actor_worker.await {
             warn!(?err, cache_key = %worker_cache_key, "wallet worker task failed");
