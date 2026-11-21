@@ -28,8 +28,8 @@ pub struct Payload {
     pub signature: Vec<u8>,
 }
 
+/// Unknown fields are ignored.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct Body {
     pub fees: HashMap<Address, U256>,
@@ -157,6 +157,13 @@ mod tests {
             .decode_and_verify()
             .expect("decoded tampered payload");
         assert!(!verified);
+    }
+
+    #[test]
+    fn body_ignores_broadcaster_custom_fields() {
+        let wire = r#"{"fees":{"0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c":"0xff59ee833b30000"},"feeExpiration":1795270342905,"feesID":"61cc703d6340a153dc6d5089c2a75ceae4eb75d92cc346f232931c03d8d266fd","railgunAddress":"0zk1qy08nqrftxezyxdegx6ca055tr65f2hf3u24j9urx04e5fnzepv6nrv7j6fe3z53luvr6qkgtjukzmkcp856gs5a6wzdd3pnesr9r6ljvym9l3a4fcepgkvek3f","identifier":"ophis-56","availableWallets":1,"version":"8.0.0","relayAdapt":"0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd","relayAdapt7702":"0xa2BFd382c54bb33DF6A13f21acd8770dc1e67D4D","requiredPOIListKeys":[],"reliability":0.75,"ophisPaymentProtocol":"ophis.prepaid.v1"}"#;
+        let body: Body = serde_json::from_str(wire).expect("body with custom field");
+        assert_eq!(body.identifier.as_deref(), Some("ophis-56"));
     }
 
     #[test]
