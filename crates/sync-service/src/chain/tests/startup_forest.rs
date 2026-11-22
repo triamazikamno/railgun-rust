@@ -640,6 +640,7 @@ async fn headless_chain_start_skips_forest_catch_up_and_live_loop_rewinds_first(
             max_manifest_age: None,
             concurrency: 1,
             max_in_flight_bytes: 1024 * 1024,
+            amount_statistics_ipns_name: None,
         }),
     );
     chain.sync.quick_sync_endpoint =
@@ -1213,6 +1214,7 @@ fn commitment_artifact_source_controlled(
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
+        amount_statistics_ipns_name: None,
     };
     (
         TestArtifactSource {
@@ -1279,7 +1281,7 @@ fn rpc_transact_log(contract: Address, block_number: u64, tree_position: u64) ->
 
 /// Writes a one-leaf forest snapshot at `block`, with `hash` in its forest
 /// metadata, and returns the forest, the snapshot path, and its bytes.
-fn seed_loaded_forest(
+pub(super) fn seed_loaded_forest(
     db: &DbStore,
     chain: &ChainConfig,
     block: u64,

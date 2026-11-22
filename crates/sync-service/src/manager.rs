@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 
 use alloy::primitives::Address;
 use futures::future::join_all;
@@ -9,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use local_db::DbStore;
 
+use crate::amount_statistics::AmountStatisticsStatus;
 use crate::chain::{
     ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, PreparedChainService,
     PublicDataPlaneError,
@@ -485,6 +487,22 @@ impl SyncManager {
             .chains
             .get(chain)
             .map(|service| service.handle())
+    }
+
+    /// The running chain's amount-statistics status at `now`, or `None` when the chain is not
+    /// running. Makes no request.
+    #[must_use]
+    pub fn amount_statistics_status(
+        &self,
+        chain: &ChainKey,
+        now: SystemTime,
+    ) -> Option<AmountStatisticsStatus> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .chains
+            .get(chain)
+            .map(|service| service.amount_statistics_status(now))
     }
 
     pub async fn wallet_handle(&self, chain: &ChainKey, cache_key: &str) -> Option<WalletHandle> {

@@ -315,6 +315,7 @@ pub struct PublicSyncCacheReset {
     pub wallet_scan_artifact_chunk_entries_removed: u64,
     pub txid_blob_entries_removed: u64,
     pub poi_artifact_checkpoint_chunk_entries_removed: u64,
+    pub amount_statistics_entries_removed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -510,6 +511,10 @@ impl ChainPublicDataPlane {
     pub(crate) fn with_runtime_lease(mut self, runtime_lease: DbRuntimeLease) -> Self {
         self.runtime_lease = Some(runtime_lease);
         self
+    }
+
+    pub(crate) fn runtime_lease(&self) -> Option<DbRuntimeLease> {
+        self.runtime_lease.clone()
     }
 
     pub(crate) fn poi_artifact_persistence(&self) -> PoiArtifactPersistenceHandle {
@@ -737,6 +742,7 @@ impl ChainPublicDataPlane {
             txid_blob_entries_removed: persisted.txid_blob_entries_removed,
             poi_artifact_checkpoint_chunk_entries_removed: persisted
                 .poi_artifact_checkpoint_chunk_entries_removed,
+            amount_statistics_entries_removed: persisted.amount_statistics_entries_removed,
         })
     }
 

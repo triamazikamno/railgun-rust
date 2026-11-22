@@ -9,6 +9,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod amount_statistics;
+
+pub use amount_statistics::*;
+
 pub const INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION: u16 = 1;
 pub const INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION: u16 = 1;
 pub const INDEXED_ARTIFACT_CHUNK_FORMAT_VERSION: u16 = 2;
@@ -1723,7 +1727,7 @@ fn validate_decoded_envelope_size(actual: usize, maximum: u64) -> Result<(), Chu
     Ok(())
 }
 
-fn decompress_bytes_with_limit(
+pub(crate) fn decompress_bytes_with_limit(
     bytes: &[u8],
     compression: CompressionAlgorithm,
     maximum_decoded_bytes: u64,

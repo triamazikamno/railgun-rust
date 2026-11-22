@@ -177,6 +177,7 @@ pub(super) fn wallet_artifact_source_for_chunks(
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
+        amount_statistics_ipns_name: None,
     };
     (
         TestArtifactSource {

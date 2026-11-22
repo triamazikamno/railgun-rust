@@ -9,6 +9,7 @@ use local_db::{
 };
 
 use super::*;
+use crate::amount_statistics::AMOUNT_STATISTICS_TABLE;
 use crate::manager::SyncManager;
 use crate::txid_cache::TXID_CACHE_BLOB_KIND;
 use crate::types::GlobalPoiPolicy;
@@ -83,6 +84,7 @@ async fn offline_reset_clears_public_caches_and_preserves_unrelated_data() {
     db.put_wallet_utxo(&wallet_key, "balance-row", b"encrypted-balance")
         .expect("seed wallet-private balance row");
     db.write_app_tables(|tables| {
+        tables.insert(AMOUNT_STATISTICS_TABLE, "statistics-scope", b"statistics")?;
         tables.insert(APP_SETTINGS, "wallet-settings", b"settings")?;
         tables.insert(DESKTOP_WALLET_VAULT, "wallet-key", b"encrypted-key")
     })
@@ -95,7 +97,13 @@ async fn offline_reset_clears_public_caches_and_preserves_unrelated_data() {
     assert_eq!(report.txid_blob_entries_removed, 1);
     assert_eq!(report.wallet_scan_artifact_chunk_entries_removed, 1);
     assert_eq!(report.poi_artifact_checkpoint_chunk_entries_removed, 1);
-    assert_eq!(report.total_removed_entries(), 3);
+    assert_eq!(report.amount_statistics_entries_removed, 1);
+    assert_eq!(report.total_removed_entries(), 4);
+    assert!(
+        db.read_app_tables(|tables| tables.get(AMOUNT_STATISTICS_TABLE, "statistics-scope"))
+            .expect("read amount statistics")
+            .is_none()
+    );
     assert!(
         db.get_blob_meta(TXID_CACHE_BLOB_KIND, "txid-page")
             .expect("read TXID metadata")

@@ -801,7 +801,7 @@ impl SendRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnshieldSelectionInfo {
     pub total: U256,
     pub input_count: usize,
@@ -809,6 +809,19 @@ pub struct UnshieldSelectionInfo {
     pub private_output_count: usize,
     pub public_output_count: usize,
     pub max_spendable: U256,
+    /// One entry per transaction that publishes an unshield, in batch order.
+    /// Private sends and fee-only transactions have none.
+    pub planned_unshields: Vec<PlannedUnshield>,
+}
+
+/// The unshield one payment transaction publishes: its value leaves the pool
+/// and `change` returns to the wallet as a private note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedUnshield {
+    pub tree: u32,
+    pub inputs: Vec<SelectedInputIdentity>,
+    pub value: U256,
+    pub change: U256,
 }
 
 #[derive(Debug, Clone)]

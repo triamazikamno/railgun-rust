@@ -1,4 +1,9 @@
+use super::startup_forest::seed_loaded_forest;
 use super::*;
+use crate::amount_statistics::AmountStatisticsStatus;
+use crate::indexed_artifacts::tests::{
+    ManifestGateway, config as indexed_artifact_test_config, ipns_name, test_ipns_keypair,
+};
 
 #[tokio::test]
 async fn wallet_startup_reuses_recent_rows_before_short_tail_hedge() {
@@ -112,6 +117,83 @@ async fn wallet_startup_replays_empty_coverage_endpoint_hash_to_checkpoint() {
     assert_eq!(checkpoint.last_scanned_block, 110);
     assert_eq!(checkpoint.last_scanned_block_hash, Some([0x44; 32]));
 
+    service.unregister_all_wallets().await;
+    service.shutdown().await;
+    drop(service);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn stalled_amount_statistics_refresh_leaves_wallet_readiness_unchanged() {
+    let scope = test_scope();
+    let rpc = JsonRpcServer::spawn_handler(log_range_rpc_handler(Vec::new(), 110, |_, _, _| None));
+    // Knows no path. It holds its first request, the chain's statistics IPNS resolution, past
+    // the readiness deadline below, and answers any later request with 404.
+    let gateway = ManifestGateway::spawn(HashMap::new(), 1);
+    let statistics_name = ipns_name(&test_ipns_keypair());
+    let mut artifacts = indexed_artifact_test_config([7; 32], None);
+    artifacts.gateway_urls = vec![gateway.url.clone()];
+    artifacts.amount_statistics_ipns_name = Some(statistics_name.clone());
+    let rpcs = Arc::new(QueryRpcPool::new(
+        vec![rpc.url.clone()],
+        Duration::from_secs(1),
+    ));
+    let mut chain = test_chain_config(&scope, rpcs, Some(artifacts));
+    // Keeps the chain loops idle after their first pass.
+    chain.sync.poll_interval = Duration::from_mins(1);
+    let (root_dir, db) = open_forest_db("wallet-startup-stalled-amount-statistics");
+    // A forest at the safe head, so chain start runs no forest catch-up.
+    seed_loaded_forest(&db, &chain, 110, [0x11; 32]);
+    let lease = crate::runtime_admission::DbRuntimeLease::acquire(
+        &db,
+        crate::runtime_admission::DbRuntimeOwnerKind::SyncManager,
+    )
+    .expect("runtime lease");
+    let service = ChainService::prepare(
+        Arc::clone(&db),
+        chain,
+        test_proxy_poi_policy(),
+        lease,
+        None,
+        crate::poi_submission::test_support::seeded_scheduler(0),
+    )
+    .await
+    .expect("chain start")
+    .activate();
+    tokio::time::timeout(Duration::from_secs(5), gateway.wait_for_requests(1))
+        .await
+        .expect("statistics refresh starts with the chain");
+    assert_eq!(
+        gateway.request_paths()[0],
+        format!("/ipns/{statistics_name}?format=ipns-record")
+    );
+    service
+        .public_data_plane
+        .record_recent_public_scan_rows(PublicScanRows {
+            range: PublicScanRange::new(101, 110),
+            source: PublicScanSource::Rpc,
+            to_block_hash: Some([0x11; 32]),
+            rows: WalletScanInputRows::default(),
+            epoch: service.public_data_plane.current_epoch(),
+        })
+        .await
+        .expect("record empty public coverage");
+    let mut cfg = test_wallet_config(&scope, rpc.url.clone());
+    cfg.start_block = Some(101);
+    cfg.sync_to_block = Some(110);
+
+    let mut handle = service.register_wallet(cfg).await.expect("register wallet");
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_until_ready())
+        .await
+        .expect("wallet ready while statistics stall")
+        .expect("wallet readiness succeeded");
+
+    assert_eq!(handle.last_scanned(), Some(110));
+    assert_eq!(
+        service.amount_statistics_status(SystemTime::now()),
+        AmountStatisticsStatus::NotYetAvailable
+    );
     service.unregister_all_wallets().await;
     service.shutdown().await;
     drop(service);

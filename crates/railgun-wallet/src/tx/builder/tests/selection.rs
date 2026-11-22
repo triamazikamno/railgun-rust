@@ -609,3 +609,115 @@ fn exact_only_selection_finds_repeated_value_match_within_budget() {
     assert_eq!(info.transaction_count, 1);
     assert_eq!(info.input_count, 13);
 }
+
+fn planned_unshield(tree: u32, position: u64, value: u64, change: u64) -> PlannedUnshield {
+    PlannedUnshield {
+        tree,
+        inputs: vec![SelectedInputIdentity { tree, position }],
+        value: U256::from(value),
+        change: U256::from(change),
+    }
+}
+
+#[test]
+fn planned_unshields_charge_same_token_fee_to_first_transaction() {
+    let token = Address::from([0xd4; 20]);
+    let utxos = vec![test_utxo(token, 600, 0, 0), test_utxo(token, 600, 1, 0)];
+
+    let info = unshield_selection_info_with_broadcaster_fee(
+        &utxos,
+        token,
+        uint!(900_U256),
+        uint!(100_U256),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(info.transaction_count, 2);
+    assert_eq!(
+        info.planned_unshields,
+        vec![
+            planned_unshield(0, 0, 500, 0),
+            planned_unshield(1, 0, 400, 200)
+        ]
+    );
+
+    // The fee consumes the whole first chunk, which the builder rejects. No first chunk is larger
+    // than the fee, so nothing is spendable.
+    let utxos = vec![test_utxo(token, 100, 0, 0), test_utxo(token, 70, 1, 0)];
+    let error = unshield_selection_info_with_broadcaster_fee(
+        &utxos,
+        token,
+        uint!(50_U256),
+        uint!(100_U256),
+        false,
+    )
+    .unwrap_err();
+    assert!(matches!(error, BuildError::InsufficientBalance(max) if max.is_zero()));
+}
+
+#[test]
+fn same_token_fee_preview_reports_amount_the_largest_first_chunk_pays() {
+    // 115 + 3 needs change, which leaves room for only eleven inputs, so selection falls back to
+    // chunks of 110 and 10 and the fee consumes the first. All twelve notes pay 115 + 5 exactly.
+    let token = Address::from([0xd8; 20]);
+    let utxos = (0..12)
+        .map(|position| test_utxo(token, 10, 0, position))
+        .collect::<Vec<_>>();
+
+    let error = unshield_selection_info_with_broadcaster_fee(
+        &utxos,
+        token,
+        uint!(3_U256),
+        uint!(115_U256),
+        false,
+    )
+    .unwrap_err();
+    assert!(matches!(error, BuildError::InsufficientBalance(max) if max == uint!(5_U256)));
+
+    let info = unshield_selection_info_with_broadcaster_fee(
+        &utxos,
+        token,
+        uint!(5_U256),
+        uint!(115_U256),
+        false,
+    )
+    .expect("all twelve notes pay the fee and the maximum");
+    assert_eq!(info.transaction_count, 1);
+}
+
+#[test]
+fn planned_unshields_follow_per_tree_chunks() {
+    let token = Address::from([0xd5; 20]);
+    let utxos = vec![test_utxo(token, 600, 0, 0), test_utxo(token, 600, 1, 0)];
+
+    let info = unshield_selection_info(&utxos, token, uint!(1000_U256), false).unwrap();
+
+    assert_eq!(
+        info.planned_unshields,
+        vec![
+            planned_unshield(0, 0, 600, 0),
+            planned_unshield(1, 0, 400, 200)
+        ]
+    );
+}
+
+#[test]
+fn planned_unshields_skip_different_token_fee_transaction() {
+    let token = Address::from([0xd6; 20]);
+    let fee_token = Address::from([0xd7; 20]);
+    let utxos = vec![test_utxo(fee_token, 5, 0, 0), test_utxo(token, 10, 0, 1)];
+
+    let info = unshield_selection_info_with_broadcaster_fee_token(
+        &utxos,
+        token,
+        fee_token,
+        uint!(7_U256),
+        uint!(3_U256),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(info.transaction_count, 2);
+    assert_eq!(info.planned_unshields, vec![planned_unshield(0, 1, 7, 3)]);
+}

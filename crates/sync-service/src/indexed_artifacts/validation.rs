@@ -213,7 +213,7 @@ fn validate_catalog_descriptor_aggregate(
     Ok(())
 }
 
-const fn validate_manifest_sequence(
+pub(crate) const fn validate_manifest_sequence(
     sequence: u64,
     last_accepted_sequence: Option<u64>,
 ) -> Result<(), IndexedArtifactManifestError> {
@@ -228,7 +228,7 @@ const fn validate_manifest_sequence(
     Ok(())
 }
 
-fn validate_manifest_freshness(
+pub(crate) fn validate_manifest_freshness(
     sequence: u64,
     issued_at_ms: u64,
     last_accepted_sequence: Option<u64>,

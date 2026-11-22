@@ -390,6 +390,7 @@ async fn output_poi_source_block_rows_never_queries_squid_or_rpc() {
             max_manifest_age: None,
             concurrency: 1,
             max_in_flight_bytes: 1024 * 1024,
+            amount_statistics_ipns_name: None,
         });
         let mut chain = test_chain_config(&scope, rpcs, artifact_config);
         chain.sync.quick_sync_endpoint =

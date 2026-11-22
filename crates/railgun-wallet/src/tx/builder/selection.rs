@@ -6,8 +6,8 @@ use alloy::uint;
 use broadcaster_core::utxo::Utxo;
 
 use super::super::{
-    BuildError, MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS,
-    UnshieldSelectionInfo,
+    BuildError, MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, PlannedUnshield,
+    SelectedInputIdentity, UnshieldSelectionInfo,
 };
 
 const MAX_ALTERNATE_BATCH_CANDIDATES: usize = 1024;
@@ -102,7 +102,8 @@ pub fn unshield_selection_info(
 ) -> Result<UnshieldSelectionInfo, BuildError> {
     let max_spendable = max_batch_spendable(utxos, token_address, 1, 1);
     let selection = select_batched_utxos(utxos, token_address, amount, spend_up_to, 1, 1)?;
-    let shape = batch_shape(&selection, amount, U256::ZERO, false, false);
+    let shape = batch_shape(&selection, amount, U256::ZERO, false, false)
+        .ok_or(BuildError::InsufficientBalance(max_spendable))?;
     Ok(UnshieldSelectionInfo {
         total: selection.total,
         input_count: selection.input_count(),
@@ -110,6 +111,7 @@ pub fn unshield_selection_info(
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
         max_spendable,
+        planned_unshields: shape.planned_unshields,
     })
 }
 
@@ -121,18 +123,14 @@ pub fn unshield_selection_info_with_broadcaster_fee(
     spend_up_to: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
     let target_amount = amount + fee_amount;
-    let max_total = max_batch_spendable(utxos, token_address, 2, 1);
-    let max_spendable = if max_total > fee_amount {
-        max_total - fee_amount
-    } else {
-        U256::ZERO
-    };
+    let max_spendable = max_spendable_after_first_chunk_fee(utxos, token_address, fee_amount);
     let selection = select_batched_utxos(utxos, token_address, target_amount, spend_up_to, 2, 1)
         .map_err(|error| match error {
             BuildError::InsufficientBalance(_) => BuildError::InsufficientBalance(max_spendable),
             other => other,
         })?;
-    let shape = batch_shape(&selection, amount, fee_amount, true, false);
+    let shape = batch_shape(&selection, amount, fee_amount, true, false)
+        .ok_or(BuildError::InsufficientBalance(max_spendable))?;
     Ok(UnshieldSelectionInfo {
         total: selection.total,
         input_count: selection.input_count(),
@@ -140,6 +138,7 @@ pub fn unshield_selection_info_with_broadcaster_fee(
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
         max_spendable,
+        planned_unshields: shape.planned_unshields,
     })
 }
 
@@ -208,7 +207,8 @@ pub fn send_selection_info(
 ) -> Result<UnshieldSelectionInfo, BuildError> {
     let max_spendable = max_batch_spendable(utxos, token_address, 1, 1);
     let selection = select_batched_utxos(utxos, token_address, amount, spend_up_to, 1, 1)?;
-    let shape = batch_shape(&selection, amount, U256::ZERO, false, true);
+    let shape = batch_shape(&selection, amount, U256::ZERO, false, true)
+        .ok_or(BuildError::InsufficientBalance(max_spendable))?;
     Ok(UnshieldSelectionInfo {
         total: selection.total,
         input_count: selection.input_count(),
@@ -216,6 +216,7 @@ pub fn send_selection_info(
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
         max_spendable,
+        planned_unshields: shape.planned_unshields,
     })
 }
 
@@ -227,18 +228,14 @@ pub fn send_selection_info_with_broadcaster_fee(
     spend_up_to: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
     let target_amount = amount + fee_amount;
-    let max_total = max_batch_spendable(utxos, token_address, 2, 1);
-    let max_spendable = if max_total > fee_amount {
-        max_total - fee_amount
-    } else {
-        U256::ZERO
-    };
+    let max_spendable = max_spendable_after_first_chunk_fee(utxos, token_address, fee_amount);
     let selection = select_batched_utxos(utxos, token_address, target_amount, spend_up_to, 2, 1)
         .map_err(|error| match error {
             BuildError::InsufficientBalance(_) => BuildError::InsufficientBalance(max_spendable),
             other => other,
         })?;
-    let shape = batch_shape(&selection, amount, fee_amount, true, true);
+    let shape = batch_shape(&selection, amount, fee_amount, true, true)
+        .ok_or(BuildError::InsufficientBalance(max_spendable))?;
     Ok(UnshieldSelectionInfo {
         total: selection.total,
         input_count: selection.input_count(),
@@ -246,6 +243,7 @@ pub fn send_selection_info_with_broadcaster_fee(
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
         max_spendable,
+        planned_unshields: shape.planned_unshields,
     })
 }
 
@@ -288,28 +286,15 @@ fn different_token_broadcaster_fee_selection_info(
     send: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
     let fee_selection = select_fee_utxos(utxos, fee_token_address, fee_amount)?;
-    let max_spendable =
-        max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
-    let selection = select_batched_utxos_with_limit(
+    selection_info_after_separate_fee(
         utxos,
         token_address,
         amount,
         spend_up_to,
-        1,
-        1,
-        MAX_BATCH_TRANSACTIONS - 1,
-    )?;
-    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, send);
-    let fee_private_outputs = 1 + usize::from(fee_selection.total > fee_amount);
-
-    Ok(UnshieldSelectionInfo {
-        total: selection.total,
-        input_count: fee_selection.utxos.len() + selection.input_count(),
-        transaction_count: 1 + action_shape.transaction_count,
-        private_output_count: fee_private_outputs + action_shape.private_output_count,
-        public_output_count: action_shape.public_output_count,
-        max_spendable,
-    })
+        send,
+        fee_selection.utxos.len(),
+        1 + usize::from(fee_selection.total > fee_amount),
+    )
 }
 
 pub fn send_selection_info_with_separate_broadcaster_fee_seed(
@@ -342,6 +327,19 @@ fn separate_broadcaster_fee_seed_selection_info(
         return Err(BuildError::InsufficientFeeTokenBalance(U256::ZERO));
     }
 
+    selection_info_after_separate_fee(utxos, token_address, amount, spend_up_to, send, 1, 2)
+}
+
+/// Selection info for a payment batch that a fee-only transaction precedes.
+fn selection_info_after_separate_fee(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+    send: bool,
+    fee_input_count: usize,
+    fee_private_output_count: usize,
+) -> Result<UnshieldSelectionInfo, BuildError> {
     let max_spendable =
         max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
     let selection = select_batched_utxos_with_limit(
@@ -353,57 +351,93 @@ fn separate_broadcaster_fee_seed_selection_info(
         1,
         MAX_BATCH_TRANSACTIONS - 1,
     )?;
-    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, send);
+    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, send)
+        .ok_or(BuildError::InsufficientBalance(max_spendable))?;
 
     Ok(UnshieldSelectionInfo {
         total: selection.total,
-        input_count: 1 + selection.input_count(),
+        input_count: fee_input_count + selection.input_count(),
         transaction_count: 1 + action_shape.transaction_count,
-        private_output_count: 2 + action_shape.private_output_count,
+        private_output_count: fee_private_output_count + action_shape.private_output_count,
         public_output_count: action_shape.public_output_count,
         max_spendable,
+        planned_unshields: action_shape.planned_unshields,
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BatchShape {
     transaction_count: usize,
     private_output_count: usize,
     public_output_count: usize,
+    planned_unshields: Vec<PlannedUnshield>,
 }
 
+/// `None` when the builder's `spend_allocations` would reject a chunk: the fee consumes the
+/// whole first chunk, or a chunk has nothing left to pay out.
 fn batch_shape(
     selection: &BatchUtxoSelection,
     amount: U256,
     fee_amount: U256,
     has_fee_output: bool,
     send: bool,
-) -> BatchShape {
+) -> Option<BatchShape> {
     let mut remaining = selection.total.saturating_sub(fee_amount).min(amount);
     let mut private_output_count = 0;
     let mut public_output_count = 0;
+    let mut planned_unshields = Vec::new();
 
     for (index, chunk) in selection.chunks.iter().enumerate() {
         let chunk_fee = if index == 0 { fee_amount } else { U256::ZERO };
-        let spendable = chunk.total.saturating_sub(chunk_fee);
+        if chunk.total <= chunk_fee {
+            return None;
+        }
+        let spendable = chunk.total - chunk_fee;
         let amount_out = spendable.min(remaining);
-        let change = spendable.saturating_sub(amount_out);
+        if amount_out.is_zero() {
+            return None;
+        }
+        let change = spendable - amount_out;
 
         if send {
             private_output_count += 1 + usize::from(index == 0 && has_fee_output);
         } else {
             private_output_count += usize::from(index == 0 && has_fee_output);
             public_output_count += 1;
+            planned_unshields.push(PlannedUnshield {
+                // Every chunk spends notes of exactly one tree.
+                tree: chunk.utxos.first().map_or(0, |utxo| utxo.tree),
+                inputs: chunk
+                    .utxos
+                    .iter()
+                    .map(SelectedInputIdentity::from_utxo)
+                    .collect(),
+                value: amount_out,
+                change,
+            });
         }
         private_output_count += usize::from(!change.is_zero());
         remaining = remaining.saturating_sub(amount_out);
     }
 
-    BatchShape {
+    Some(BatchShape {
         transaction_count: selection.chunks.len(),
         private_output_count,
         public_output_count,
-    }
+        planned_unshields,
+    })
+}
+
+/// Fee-adjusted maximum of a batch whose first transaction also pays `fee_amount`. Zero when even
+/// the largest first chunk cannot cover the fee and a positive payment, which the builder needs.
+fn max_spendable_after_first_chunk_fee(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_amount: U256,
+) -> U256 {
+    max_batch_selection(utxos, token_address, 2, 1, MAX_BATCH_TRANSACTIONS)
+        .filter(|selection| selection.chunks[0].total > fee_amount)
+        .map_or(U256::ZERO, |selection| selection.total - fee_amount)
 }
 
 #[must_use]

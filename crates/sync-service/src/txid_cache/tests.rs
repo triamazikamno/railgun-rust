@@ -479,6 +479,7 @@ fn unavailable_artifact_source() -> IndexedArtifactSourceConfig {
         max_manifest_age: None,
         concurrency: 4,
         max_in_flight_bytes: 64 * 1024 * 1024,
+        amount_statistics_ipns_name: None,
     }
 }
 
@@ -532,6 +533,7 @@ fn signed_artifact_source(
         max_manifest_age: None,
         concurrency: 4,
         max_in_flight_bytes: 64 * 1024 * 1024,
+        amount_statistics_ipns_name: None,
     };
     (config, server)
 }

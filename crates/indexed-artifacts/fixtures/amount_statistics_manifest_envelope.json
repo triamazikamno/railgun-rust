@@ -1,0 +1,8 @@
+{
+  "body": "{\"format_version\":1,\"issued_at_ms\":1700000000000,\"sequence\":42,\"publisher\":{\"key_algorithm\":\"ed25519\",\"public_key\":\"0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c\"},\"chains\":[{\"scope\":{\"chain_type\":\"evm\",\"chain_id\":1,\"railgun_contract\":\"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"covered_block\":{\"number\":21000000,\"hash\":\"0x1111111111111111111111111111111111111111111111111111111111111111\",\"timestamp\":1699999988},\"snapshot\":{\"cid\":\"bafkreiethereumamountstatistics\",\"sha256\":\"0x2222222222222222222222222222222222222222222222222222222222222222\",\"byte_size\":1234,\"encoding_version\":1,\"compression\":\"zstd\"}},{\"scope\":{\"chain_type\":\"evm\",\"chain_id\":137,\"railgun_contract\":\"0xcccccccccccccccccccccccccccccccccccccccc\"},\"covered_block\":{\"number\":65000000,\"hash\":\"0x3333333333333333333333333333333333333333333333333333333333333333\",\"timestamp\":1699999996},\"snapshot\":{\"cid\":\"bafkreipolygonamountstatistics\",\"sha256\":\"0x4444444444444444444444444444444444444444444444444444444444444444\",\"byte_size\":5678,\"encoding_version\":1,\"compression\":\"zstd\"}}]}",
+  "publisher": {
+    "key_algorithm": "ed25519",
+    "public_key": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+  },
+  "signature": "0xa312d8fecc4c42f8cfe36ee5655b6718b2b7c345153e38c3cf116069041e7aab9f6ed9e1320e28c0e05ea1fca073fd7b34adbe08083cee0dd20ad2064d848d04"
+}

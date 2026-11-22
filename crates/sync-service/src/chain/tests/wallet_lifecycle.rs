@@ -315,6 +315,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         txid_public_cache_task: std::sync::Mutex::new(None),
+        amount_statistics: crate::amount_statistics::ChainAmountStatistics::default(),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
         public_data_plane,

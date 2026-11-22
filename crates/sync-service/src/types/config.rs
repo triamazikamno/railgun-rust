@@ -103,6 +103,9 @@ pub struct IndexedArtifactSourceConfig {
     pub max_manifest_age: Option<Duration>,
     pub concurrency: usize,
     pub max_in_flight_bytes: u64,
+    /// IPNS name of the amount-statistics manifest, signed by `trusted_publisher_pubkey` and
+    /// fetched through these gateways. `None` makes no amount-statistics request.
+    pub amount_statistics_ipns_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

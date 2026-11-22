@@ -95,6 +95,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         txid_public_cache_task: std::sync::Mutex::new(None),
+        amount_statistics: crate::amount_statistics::ChainAmountStatistics::default(),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
         public_data_plane: public_data_plane.clone(),
@@ -289,6 +290,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
         anchor_last: std::sync::atomic::AtomicU64::new(0),
         txid_public_cache_started: std::sync::atomic::AtomicBool::new(false),
         txid_public_cache_task: std::sync::Mutex::new(None),
+        amount_statistics: crate::amount_statistics::ChainAmountStatistics::default(),
         wallet_actor_next: std::sync::atomic::AtomicU64::new(1),
         wallet_reset_intent_next: std::sync::atomic::AtomicU64::new(1),
         public_data_plane: public_data_plane.clone(),
@@ -1647,6 +1649,7 @@ fn blocked_wallet_optional_maintenance_fixture(
         max_manifest_age: None,
         concurrency: 1,
         max_in_flight_bytes: 1024 * 1024,
+        amount_statistics_ipns_name: None,
     };
     let artifact_source = TestArtifactSource {
         config,

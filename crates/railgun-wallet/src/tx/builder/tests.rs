@@ -32,8 +32,8 @@ use crate::tx::{
     CompositeUnshieldRecipient, CompositeUnshieldRequest, ExecutorContext, InputWitness,
     MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint,
     MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource, MixedPrivateSend,
-    MixedPrivateSendRole, PoiCircuitVariant, PoiMerkleProofSource, PostTransactionPoiData,
-    PostTransactionPoiGenerationRequest, PreTransactionPoiError,
+    MixedPrivateSendRole, PlannedUnshield, PoiCircuitVariant, PoiMerkleProofSource,
+    PostTransactionPoiData, PostTransactionPoiGenerationRequest, PreTransactionPoiError,
     PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, SelectedInputIdentity,
     SendPlan, SendRequest, TransactionBuilder, TransactionCall, TransactionPlanChunk,
     UNRELAYED_ADAPT_PARAMS, UnshieldPlan, UnshieldRequest, compute_railgun_txid_from_public_inputs,
@@ -52,6 +52,8 @@ use super::{
     send_selection_info, send_selection_info_with_broadcaster_fee,
     send_selection_info_with_broadcaster_fee_token,
     send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
+    unshield_selection_info_with_broadcaster_fee,
+    unshield_selection_info_with_broadcaster_fee_token,
 };
 
 struct MockSpendSigner {

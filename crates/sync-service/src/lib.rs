@@ -1,3 +1,4 @@
+mod amount_statistics;
 mod chain;
 pub mod indexed_artifacts;
 mod manager;
@@ -24,6 +25,12 @@ pub(crate) mod txid_cache;
 pub mod types;
 mod wallet;
 
+pub use amount_statistics::{
+    AMOUNT_STATISTICS_MAX_AGE, AMOUNT_STATISTICS_REFRESH_INTERVAL, AmountStatisticsCoveredBlock,
+    AmountStatisticsSnapshot, AmountStatisticsStatus, RepeatedShieldAmount, RepeatedUnshieldAmount,
+    ShieldValueBucketCount, TokenAmountStatistics, TreeShieldAmountCount, TreeShieldValueBuckets,
+    amount_value_bucket,
+};
 pub use chain::{
     ChainError, ChainHandle, ChainPublicSyncCacheReset, ChainService, LocalPoiQueryUnavailable,
     LocalPoiRootValidation, LocalPoiStatusLookup, PoiArtifactCacheRetry, PublicCoverageAnswer,

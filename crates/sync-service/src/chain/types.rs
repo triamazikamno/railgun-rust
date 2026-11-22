@@ -12,6 +12,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use super::poi_submitter::ChainPoiSubmitterHandle;
+use crate::amount_statistics::ChainAmountStatistics;
 use crate::wallet::WalletIndexedCatchUpLease;
 
 pub(super) const EVM_CHAIN_TYPE: u8 = 0;
@@ -485,6 +486,7 @@ pub struct ChainService {
     pub(super) anchor_last: AtomicU64,
     pub(super) txid_public_cache_started: AtomicBool,
     pub(super) txid_public_cache_task: StdMutex<Option<JoinHandle<()>>>,
+    pub(super) amount_statistics: ChainAmountStatistics,
     pub(super) wallet_actor_next: AtomicU64,
     pub(super) wallet_reset_intent_next: AtomicU64,
     pub(super) public_data_plane: ChainPublicDataPlane,

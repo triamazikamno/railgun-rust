@@ -62,6 +62,7 @@ use validation::validate_catalog_descriptor_for_expansion;
 pub use validation::{
     decode_indexed_artifact_chunk, validate_manifest, verify_catalog_bytes, verify_chunk_bytes,
 };
+pub(crate) use validation::{validate_manifest_freshness, validate_manifest_sequence};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedIndexedArtifactChunk {
@@ -547,4 +548,4 @@ impl IndexedArtifactManifestClient {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

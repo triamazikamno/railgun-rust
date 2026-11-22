@@ -16,6 +16,7 @@ use super::{
     spawn_wallet_lag_fallback_loop, wait_or_cancel, wallet_backfill_from_block,
     wallet_remote_target_before_cached_suffix, wallet_sync_target, warn, watch,
 };
+use crate::amount_statistics::{AmountStatisticsStatus, ChainAmountStatistics};
 use crate::poi_submission::{PoiSubmissionRouting, PoiSubmissionScheduler};
 use crate::runtime_admission::DbRuntimeLease;
 
@@ -135,6 +136,13 @@ impl PreparedChainService {
             cancel.clone(),
         );
         spawn_wallet_lag_fallback_loop(Arc::clone(&service), safe_head_rx.clone(), cancel.clone());
+        // Starts with the chain, not with a wallet, and shares no state with wallet sync.
+        service.amount_statistics.spawn_refresh(
+            Arc::clone(&service.db),
+            service.chain.http_client.clone(),
+            cancel.clone(),
+            service.public_data_plane.runtime_lease(),
+        );
         spawn_backfill_loop(
             Arc::clone(&service),
             backfill_rx,
@@ -247,6 +255,7 @@ impl ChainService {
             &public_data_plane,
             poi_submission_scheduler,
         );
+        let amount_statistics = ChainAmountStatistics::for_chain(&chain);
         let service = Arc::new(Self {
             chain,
             poi_policy,
@@ -267,6 +276,7 @@ impl ChainService {
             anchor_last: AtomicU64::new(last_anchor),
             txid_public_cache_started: AtomicBool::new(false),
             txid_public_cache_task: std::sync::Mutex::new(None),
+            amount_statistics,
             wallet_actor_next: AtomicU64::new(1),
             wallet_reset_intent_next: AtomicU64::new(1),
             public_data_plane,
@@ -296,6 +306,13 @@ impl ChainService {
             forest_last_rx: self.forest_last_tx.subscribe(),
             live_log_rx: self.live_log_tx.subscribe(),
         }
+    }
+
+    /// Whether this chain's amount statistics can be used at `now`, or why not. Reads the
+    /// held snapshot only and never makes a request.
+    #[must_use]
+    pub fn amount_statistics_status(&self, now: std::time::SystemTime) -> AmountStatisticsStatus {
+        self.amount_statistics.status(now)
     }
 
     pub async fn wallet_handle(&self, cache_key: &str) -> Option<WalletHandle> {
@@ -417,6 +434,17 @@ impl ChainService {
             warn!(
                 chain_id = self.chain.deployment.chain_id,
                 "TXID public cache loop failed during shutdown"
+            );
+        }
+        // Joined before the data plane releases the runtime lease, since the loop writes to the
+        // public cache.
+        if join_shutdown_task(self.amount_statistics.task())
+            .await
+            .is_some()
+        {
+            warn!(
+                chain_id = self.chain.deployment.chain_id,
+                "amount statistics refresh failed during shutdown"
             );
         }
         self.public_data_plane.shutdown().await;

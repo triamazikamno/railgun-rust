@@ -1567,11 +1567,11 @@ fn responses_for_descriptors(
         .collect()
 }
 
-fn raw_cid(bytes: &[u8]) -> Cid {
+pub(crate) fn raw_cid(bytes: &[u8]) -> Cid {
     Cid::new_v1(RAW_CODEC, Code::Sha2_256.digest(bytes))
 }
 
-fn car_bytes(root: Cid, blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn car_bytes(root: Cid, blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
     let header = car_header(root);
     let mut car = Vec::new();
     write_varint(header.len(), &mut car);
@@ -1703,13 +1703,13 @@ impl ChunkServer {
 
 /// Serves `routes` on every connection and records each request path. The
 /// first `stalled` connections get no response until the client drops them.
-struct ManifestGateway {
-    url: Url,
+pub(crate) struct ManifestGateway {
+    pub(crate) url: Url,
     requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl ManifestGateway {
-    fn spawn(routes: HashMap<String, Vec<u8>>, stalled: usize) -> Self {
+    pub(crate) fn spawn(routes: HashMap<String, Vec<u8>>, stalled: usize) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
         let url = Url::parse(&format!(
             "http://{}",
@@ -1744,15 +1744,15 @@ impl ManifestGateway {
         Self { url, requests }
     }
 
-    fn request_paths(&self) -> Vec<String> {
+    pub(crate) fn request_paths(&self) -> Vec<String> {
         self.requests.lock().expect("requests lock").clone()
     }
 
-    fn request_count(&self) -> usize {
+    pub(crate) fn request_count(&self) -> usize {
         self.requests.lock().expect("requests lock").len()
     }
 
-    async fn wait_for_requests(&self, count: usize) {
+    pub(crate) async fn wait_for_requests(&self, count: usize) {
         while self.request_count() < count {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1864,7 +1864,7 @@ fn spawn_chunk_fetch_with_stalled_preferred_gateway(
 }
 
 /// Yields until `condition` holds, without letting paused time advance.
-async fn yield_until(what: &str, mut condition: impl FnMut() -> bool) {
+pub(crate) async fn yield_until(what: &str, mut condition: impl FnMut() -> bool) {
     for _ in 0..100_000 {
         if condition() {
             return;
@@ -1986,16 +1986,16 @@ fn read_request_path(stream: &mut std::net::TcpStream) -> String {
         .to_string()
 }
 
-fn test_ipns_keypair() -> Keypair {
+pub(crate) fn test_ipns_keypair() -> Keypair {
     Keypair::ed25519_from_bytes([9_u8; 32]).expect("test keypair")
 }
 
-fn ipns_name(keypair: &Keypair) -> String {
+pub(crate) fn ipns_name(keypair: &Keypair) -> String {
     let peer_id = keypair.public().to_peer_id();
     Cid::new_v1(LIBP2P_KEY_CODEC, *peer_id.as_ref()).to_string()
 }
 
-fn ipns_record(keypair: &Keypair, value: String, sequence: u64) -> Vec<u8> {
+pub(crate) fn ipns_record(keypair: &Keypair, value: String, sequence: u64) -> Vec<u8> {
     rust_ipns::Record::new(
         keypair,
         value,
@@ -2008,7 +2008,7 @@ fn ipns_record(keypair: &Keypair, value: String, sequence: u64) -> Vec<u8> {
     .expect("encoded IPNS record")
 }
 
-fn scope() -> ChainScope {
+pub(crate) fn scope() -> ChainScope {
     ChainScope {
         chain_type: ChainType::Evm,
         chain_id: 1,
@@ -2018,7 +2018,10 @@ fn scope() -> ChainScope {
     }
 }
 
-fn config(pubkey: [u8; 32], max_manifest_age: Option<Duration>) -> IndexedArtifactSourceConfig {
+pub(crate) fn config(
+    pubkey: [u8; 32],
+    max_manifest_age: Option<Duration>,
+) -> IndexedArtifactSourceConfig {
     IndexedArtifactSourceConfig {
         trusted_publisher_pubkey: FixedBytes::from(pubkey),
         manifest_source: IndexedArtifactManifestSource::Cid("bafymanifest".to_string()),
@@ -2028,6 +2031,7 @@ fn config(pubkey: [u8; 32], max_manifest_age: Option<Duration>) -> IndexedArtifa
         max_manifest_age,
         concurrency: 6,
         max_in_flight_bytes: 64 * 1024 * 1024,
+        amount_statistics_ipns_name: None,
     }
 }
 

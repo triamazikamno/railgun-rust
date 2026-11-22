@@ -7,6 +7,7 @@ use std::sync::{Arc, LazyLock};
 use local_db::DbStore;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
+use crate::amount_statistics::clear_amount_statistics;
 use crate::poi_artifacts::{
     POI_V4_RAW_CHUNK_BLOB_KIND, RawChunkCacheResetFailure, clear_poi_artifact_cache_for_reset,
     reset_raw_chunk_cache,
@@ -43,6 +44,7 @@ pub enum PersistedPublicSyncCacheKind {
     WalletScanArtifactChunks,
     PoiArtifactCheckpointChunks,
     PoiCorpus,
+    AmountStatistics,
 }
 
 impl fmt::Display for PersistedPublicSyncCacheKind {
@@ -52,6 +54,7 @@ impl fmt::Display for PersistedPublicSyncCacheKind {
             Self::WalletScanArtifactChunks => "wallet-scan artifact chunk cache",
             Self::PoiArtifactCheckpointChunks => "POI artifact checkpoint chunk cache",
             Self::PoiCorpus => "POI corpus",
+            Self::AmountStatistics => "amount statistics cache",
         })
     }
 }
@@ -100,6 +103,7 @@ pub struct PersistedPublicSyncCacheResetReport {
     pub wallet_scan_artifact_chunk_entries_removed: u64,
     pub txid_blob_entries_removed: u64,
     pub poi_artifact_checkpoint_chunk_entries_removed: u64,
+    pub amount_statistics_entries_removed: u64,
 }
 
 impl PersistedPublicSyncCacheResetReport {
@@ -108,6 +112,7 @@ impl PersistedPublicSyncCacheResetReport {
         self.wallet_scan_artifact_chunk_entries_removed
             .saturating_add(self.txid_blob_entries_removed)
             .saturating_add(self.poi_artifact_checkpoint_chunk_entries_removed)
+            .saturating_add(self.amount_statistics_entries_removed)
     }
 
     const fn record_txid_reset(&mut self, reset: crate::txid_cache::TxidPublicCacheReset) {
@@ -124,6 +129,13 @@ impl PersistedPublicSyncCacheResetReport {
 /// This API is intended for maintenance while chain services are not active. The active manager
 /// acquires every public-data-plane commit fence before using the same operation; a single data
 /// plane acquires its own fence. Materialized POI serving corpora are deliberately excluded.
+///
+/// Amount-statistics refreshes run outside that fence. The reset removes the stored statistics
+/// row but does not invalidate a running chain session's held snapshot, whose status still follows
+/// the normal freshness rules, and an in-flight refresh or a newer manifest naming the held
+/// snapshot may store that verified snapshot again. The row is also the statistics rollback floor,
+/// so a session started after the reset accepts any correctly signed manifest, as a fresh install
+/// does; the six-hour covered-block limit still applies.
 pub async fn reset_persisted_public_sync_caches(
     db: &DbStore,
 ) -> Result<PersistedPublicSyncCacheResetReport, PersistedPublicSyncCacheResetError> {
@@ -156,6 +168,13 @@ pub async fn reset_persisted_public_sync_caches(
         Err(failure) => return Err(poi_chunk_reset_error(failure, report)),
     };
     report.poi_artifact_checkpoint_chunk_entries_removed = poi_chunks;
+    report.amount_statistics_entries_removed = clear_amount_statistics(db).map_err(|error| {
+        PersistedPublicSyncCacheResetError::new(
+            PersistedPublicSyncCacheKind::AmountStatistics,
+            error,
+            report,
+        )
+    })?;
     Ok(report)
 }
 
