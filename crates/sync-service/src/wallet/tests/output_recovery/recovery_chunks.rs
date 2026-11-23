@@ -173,6 +173,7 @@ async fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_
             &sender,
             &broadcaster,
             &scan_keys.viewing_private_key,
+            railgun_wallet::NoteOutputType::BroadcasterFee,
         )
         .expect("encrypt fee note"),
     );
@@ -182,6 +183,7 @@ async fn output_poi_recovery_chunk_uses_cached_calldata_only_for_missing_output_
             &sender,
             &sender,
             &scan_keys.viewing_private_key,
+            railgun_wallet::NoteOutputType::Change,
         )
         .expect("encrypt change note"),
     );

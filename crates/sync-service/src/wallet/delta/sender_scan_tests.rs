@@ -10,7 +10,9 @@ use railgun_wallet::scan::{
     IndexedTransactCommitmentInput, SenderScanOutput, parse_indexed_wallet_delta,
     parse_wallet_delta_from_logs,
 };
-use railgun_wallet::{Note, NoteCiphertext, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
+use railgun_wallet::{
+    Note, NoteCiphertext, NoteOutputType, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo,
+};
 
 use super::sender_scan_candidate_inputs;
 
@@ -40,6 +42,7 @@ fn sender_output(
         &keys.address_data(),
         &receiver.address_data(),
         &keys.viewing_private_key,
+        NoteOutputType::Transfer,
     )
     .expect("encrypt sender output")
     .into();
@@ -160,6 +163,7 @@ fn rpc_and_indexed_sender_candidates_are_identical() {
         &keys.address_data(),
         &receiver.address_data(),
         &keys.viewing_private_key,
+        NoteOutputType::Transfer,
     )
     .expect("encrypt sender output")
     .into();

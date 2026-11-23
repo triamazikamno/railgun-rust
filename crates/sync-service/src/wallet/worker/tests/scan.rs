@@ -14,6 +14,7 @@ fn sender_scan_output(sender: &ViewingKeyData, source: UtxoSource) -> SenderScan
         &sender.address_data(),
         &receiver.address_data(),
         &sender.viewing_private_key,
+        railgun_wallet::NoteOutputType::Transfer,
     )
     .expect("encrypt sender output")
     .into();

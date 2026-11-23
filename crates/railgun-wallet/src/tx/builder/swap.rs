@@ -17,6 +17,8 @@ use broadcaster_core::contracts::railgun::{
 };
 use broadcaster_core::utxo::Utxo;
 
+use crate::notes::ANNOTATION_DATA_LEN;
+
 use super::super::{
     BuildError, CompositeAdapter, CompositeUnshieldLeg, CompositeUnshieldRecipient,
     MAX_BATCH_TRANSACTIONS, MixedPrivateActionPreview, MixedPrivateActionRequest,
@@ -75,8 +77,8 @@ pub enum SwapAmountCheck {
 /// `transactions` and makes `pre_hook_calls` from `executor`.
 ///
 /// Encodes the pre-hook, and the post-hook when the template has one, with
-/// zero-filled transactions of the same shapes and 65-byte signatures. Commitment ciphertexts are sized with the empty
-/// `annotationData` and `memo` the wallet emits. The result equals the real
+/// zero-filled transactions of the same shapes and 65-byte signatures. Commitment ciphertexts are sized with the
+/// 62-byte `annotationData` and empty `memo` the wallet emits. The result equals the real
 /// document length when the real gas limits have as many decimal digits as the
 /// template's upper bounds, and exceeds it otherwise.
 pub fn estimate_swap_app_data_len(
@@ -130,7 +132,7 @@ fn placeholder_transaction(shape: &TransactionShape) -> Transaction {
         ciphertext: [FixedBytes::ZERO; 4],
         blindedSenderViewingKey: FixedBytes::ZERO,
         blindedReceiverViewingKey: FixedBytes::ZERO,
-        annotationData: Bytes::new(),
+        annotationData: Bytes::from([0_u8; ANNOTATION_DATA_LEN]),
         memo: Bytes::new(),
     };
     let ciphertext_count = shape

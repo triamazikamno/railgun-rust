@@ -19,7 +19,7 @@ use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleProof};
 
 use crate::keys::RailgunSpendSigner;
-use crate::notes::{Note, NoteCiphertext};
+use crate::notes::{Note, NoteCiphertext, NoteOutputType};
 use crate::prover::{ProverError, ProverService};
 
 use super::super::{
@@ -484,6 +484,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             &receiver,
             &receiver,
             &self.viewing.viewing_private_key,
+            NoteOutputType::Change,
         )?;
 
         let outputs = vec![output];

@@ -129,6 +129,7 @@ fn send_outputs_create_recipient_and_change_notes() {
         &recipient,
         None,
         &sender_viewing.viewing_private_key,
+        NoteOutputType::Transfer,
     )
     .expect("send outputs");
 
@@ -161,6 +162,7 @@ fn send_outputs_omit_change_for_exact_send() {
         &recipient,
         None,
         &sender_viewing.viewing_private_key,
+        NoteOutputType::Transfer,
     )
     .expect("send outputs");
 
@@ -188,6 +190,7 @@ fn send_outputs_put_broadcaster_fee_note_first() {
             amount: uint!(2_U256),
         }),
         &sender_viewing.viewing_private_key,
+        NoteOutputType::Transfer,
     )
     .expect("send outputs");
 

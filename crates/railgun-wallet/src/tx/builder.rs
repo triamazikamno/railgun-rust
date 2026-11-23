@@ -10,7 +10,7 @@ use broadcaster_core::utxo::Utxo;
 use merkletree::tree::MerkleForest;
 
 use crate::keys::{RailgunSpendSigner, WalletKeys};
-use crate::notes::Note;
+use crate::notes::{Note, NoteOutputType};
 use crate::prover::ProverService;
 
 use super::{
@@ -497,6 +497,7 @@ impl<'a, S: RailgunSpendSigner> PaymentBatch<'a, S> {
             &request.recipient,
             allocation.fee,
             &self.planner.viewing.viewing_private_key,
+            NoteOutputType::Transfer,
         )?;
         let outputs_ms = outputs_started.elapsed().as_millis();
         self.record_chunk_notes(chunk_fee_note, chunk_change_note);

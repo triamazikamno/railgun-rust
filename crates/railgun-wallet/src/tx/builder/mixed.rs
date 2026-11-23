@@ -11,14 +11,16 @@ use broadcaster_core::utxo::Utxo;
 use merkletree::tree::MerkleForest;
 
 use crate::keys::{RailgunSpendSigner, WalletKeys};
+use crate::notes::NoteOutputType;
 use crate::prover::ProverService;
 
 use super::super::{
     BuildError, CompositeAdapter, CompositeExecution, CompositePlanShape, CompositeUnshieldLeg,
     CompositeUnshieldLegRole, CompositeUnshieldRecipient, MixedPrivateActionPlan,
     MixedPrivateActionPreview, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    MixedPrivateOutputSource, MixedPrivatePlannedOutput, MixedPublicPlannedOutput,
-    SelectedInputIdentity, SendRequest, TransactionBuilder, TransactionShape, UnshieldRequest,
+    MixedPrivateOutputSource, MixedPrivatePlannedOutput, MixedPrivateSendRole,
+    MixedPublicPlannedOutput, SelectedInputIdentity, SendRequest, TransactionBuilder,
+    TransactionShape, UnshieldRequest,
 };
 use super::batch::{BatchPlanner, ProvenBatch};
 use super::composite::{CompositeRouting, select_composite_leg_selections_with_policy};
@@ -302,6 +304,11 @@ impl<'a, S: RailgunSpendSigner> MixedActionBuild<'a, S> {
             &send.recipient,
             None,
             &self.planner.viewing.viewing_private_key,
+            if send.role == MixedPrivateSendRole::BroadcasterFee {
+                NoteOutputType::BroadcasterFee
+            } else {
+                NoteOutputType::Transfer
+            },
         )?;
         self.private_outputs.push(MixedPrivatePlannedOutput {
             source: MixedPrivateOutputSource::Send(send_index),

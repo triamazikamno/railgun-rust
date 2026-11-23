@@ -306,6 +306,7 @@ pub(super) async fn seed_migration_source_block(
             &group.cfg.scan_keys.address_data(),
             &recipient.viewing.address_data(),
             &group.cfg.scan_keys.viewing_private_key,
+            railgun_wallet::NoteOutputType::Transfer,
         )
         .expect("encrypt sender-recoverable external output"),
     );

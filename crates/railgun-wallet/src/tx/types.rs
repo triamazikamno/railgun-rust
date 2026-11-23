@@ -488,6 +488,9 @@ pub struct CompositeUnshieldRequest {
 pub enum MixedPrivateSendRole {
     Primary,
     Other,
+    /// A private send that pays a broadcaster fee; its note is annotated as a
+    /// broadcaster fee.
+    BroadcasterFee,
 }
 
 #[derive(Debug, Clone, Copy)]

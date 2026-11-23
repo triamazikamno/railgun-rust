@@ -625,6 +625,7 @@ async fn partial_unshield_fixture(
             &cfg.scan_keys.address_data(),
             &receiver.address_data(),
             &cfg.scan_keys.viewing_private_key,
+            railgun_wallet::NoteOutputType::Transfer,
         )
         .expect("encrypt sender output")
         .into(),

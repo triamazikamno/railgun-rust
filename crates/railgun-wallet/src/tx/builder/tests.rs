@@ -24,6 +24,7 @@ use merkletree::tree::{MerkleForest, MerkleProof, MerkleTreeUpdate};
 
 use crate::artifacts::ArtifactSource;
 use crate::keys::{RailgunSpendSigner, WalletKeys};
+use crate::notes::NoteOutputType;
 use crate::prover::{ProverError, ProverService};
 use crate::tx::{
     BroadcasterFeeOutput, BuildError, CompositeAdapter, CompositeExecution,

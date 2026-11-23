@@ -11,7 +11,7 @@ use railgun_wallet::scan::{
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
     WalletLogDelta, parse_indexed_wallet_delta,
 };
-use railgun_wallet::{NoteCiphertext, UtxoSource, ViewingKeyData};
+use railgun_wallet::{NoteCiphertext, NoteOutputType, UtxoSource, ViewingKeyData};
 
 fn scan_keys(seed: u8) -> ViewingKeyData {
     ViewingKeyData::from_spending_public_key(
@@ -56,9 +56,14 @@ fn indexed_transact_commitment_decrypts_wallet_utxo() {
         uint!(42_U256),
         [9u8; 16],
     );
-    let ciphertext =
-        NoteCiphertext::try_from_note(&note, &address, &address, &keys.viewing_private_key)
-            .expect("encrypt note");
+    let ciphertext = NoteCiphertext::try_from_note(
+        &note,
+        &address,
+        &address,
+        &keys.viewing_private_key,
+        NoteOutputType::Change,
+    )
+    .expect("encrypt note");
     let input = IndexedTransactCommitmentInput {
         tree_number: 2,
         tree_position: 11,
@@ -100,9 +105,14 @@ fn indexed_transact_commitment_ignores_undecryptable_utxo() {
         uint!(42_U256),
         [9u8; 16],
     );
-    let ciphertext =
-        NoteCiphertext::try_from_note(&note, &address, &address, &keys.viewing_private_key)
-            .expect("encrypt note");
+    let ciphertext = NoteCiphertext::try_from_note(
+        &note,
+        &address,
+        &address,
+        &keys.viewing_private_key,
+        NoteOutputType::Change,
+    )
+    .expect("encrypt note");
     let input = IndexedTransactCommitmentInput {
         tree_number: 2,
         tree_position: 11,

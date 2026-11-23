@@ -4,7 +4,7 @@
 use alloy::primitives::{Address, U256};
 use broadcaster_core::crypto::railgun::AddressData;
 
-use crate::notes::{Note, NoteCiphertext};
+use crate::notes::{Note, NoteCiphertext, NoteOutputType};
 
 use super::super::{BroadcasterFeeOutput, BuildError};
 use super::rand_array;
@@ -49,8 +49,13 @@ fn push_broadcaster_fee_output(
         fee.amount,
         rand_array(),
     );
-    let ciphertext =
-        NoteCiphertext::try_from_note(&note, sender, &fee.recipient, sender_viewing_private_key)?;
+    let ciphertext = NoteCiphertext::try_from_note(
+        &note,
+        sender,
+        &fee.recipient,
+        sender_viewing_private_key,
+        NoteOutputType::BroadcasterFee,
+    )?;
     outputs.push(note.clone());
     commitment_ciphertext.push(ciphertext);
     Ok(Some(note))
@@ -82,8 +87,13 @@ pub(super) fn build_fee_only_outputs(
             change,
             rand_array(),
         );
-        let ciphertext =
-            NoteCiphertext::try_from_note(&note, sender, sender, sender_viewing_private_key)?;
+        let ciphertext = NoteCiphertext::try_from_note(
+            &note,
+            sender,
+            sender,
+            sender_viewing_private_key,
+            NoteOutputType::Change,
+        )?;
         outputs.push(note.clone());
         commitment_ciphertext.push(ciphertext);
         Some(note)
@@ -125,8 +135,13 @@ pub(super) fn build_unshield_outputs(
             change,
             rand_array(),
         );
-        let ciphertext =
-            NoteCiphertext::try_from_note(&note, receiver, receiver, sender_viewing_private_key)?;
+        let ciphertext = NoteCiphertext::try_from_note(
+            &note,
+            receiver,
+            receiver,
+            sender_viewing_private_key,
+            NoteOutputType::Change,
+        )?;
         outputs.push(note.clone());
         commitment_ciphertext.push(ciphertext);
         Some(note)
@@ -154,6 +169,7 @@ pub(super) fn build_send_outputs(
     recipient: &AddressData,
     broadcaster_fee: Option<BroadcasterFeeOutput>,
     sender_viewing_private_key: &[u8; 32],
+    recipient_output_type: NoteOutputType,
 ) -> Result<SendOutputs, BuildError> {
     let mut outputs = Vec::with_capacity(1 + usize::from(broadcaster_fee.is_some()) + 1);
     let mut commitment_ciphertext = Vec::with_capacity(outputs.capacity());
@@ -176,6 +192,7 @@ pub(super) fn build_send_outputs(
         sender,
         recipient,
         sender_viewing_private_key,
+        recipient_output_type,
     )?;
     outputs.push(recipient_note.clone());
     commitment_ciphertext.push(recipient_ciphertext);
@@ -189,8 +206,13 @@ pub(super) fn build_send_outputs(
             change,
             rand_array(),
         );
-        let ciphertext =
-            NoteCiphertext::try_from_note(&note, sender, sender, sender_viewing_private_key)?;
+        let ciphertext = NoteCiphertext::try_from_note(
+            &note,
+            sender,
+            sender,
+            sender_viewing_private_key,
+            NoteOutputType::Change,
+        )?;
         outputs.push(note.clone());
         commitment_ciphertext.push(ciphertext);
         Some(note)

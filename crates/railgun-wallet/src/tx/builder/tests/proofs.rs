@@ -245,6 +245,7 @@ fn unproven_send_uses_proof_root_from_dirty_forest() {
         &recipient,
         None,
         &sender.viewing_private_key,
+        NoteOutputType::Transfer,
     )
     .expect("send outputs");
     let builder = TransactionBuilder {

@@ -6,6 +6,9 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
     use broadcaster_core::contracts::railgun::{Call, TokenData, shieldCall};
     use broadcaster_core::contracts::shield::build_shield_request;
 
+    use crate::keys::note_blinding_keys;
+    use crate::notes::{ANNOTATION_DATA_LEN, decrypt_annotation_data};
+
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let signer = PrivateKeySigner::from_bytes(&FixedBytes::from([0x47; 32])).unwrap();
@@ -45,7 +48,7 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
             token_address: fee_token,
             amount: U256::from(10),
             recipient: broadcaster,
-            role: MixedPrivateSendRole::Other,
+            role: MixedPrivateSendRole::BroadcasterFee,
         }],
         public_unshields: Vec::new(),
         relay_actions: None,
@@ -74,7 +77,7 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
     assert_eq!(plan.private_outputs[0].token_address, fee_token);
     assert_eq!(
         plan.private_outputs[0].role,
-        MixedPrivateOutputRole::Recipient(MixedPrivateSendRole::Other)
+        MixedPrivateOutputRole::Recipient(MixedPrivateSendRole::BroadcasterFee)
     );
     assert_eq!(plan.private_outputs[1].amount, U256::from(80));
     assert_eq!(plan.private_outputs[1].role, MixedPrivateOutputRole::Change);
@@ -97,6 +100,28 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
         prover.bound_params_hashes(),
         vec![decoded._transactions[0].boundParams.hash()]
     );
+    let sender = wallet.viewing.address_data();
+    for (index, receiver, output_type) in [
+        (0, &broadcaster, NoteOutputType::BroadcasterFee),
+        (1, &sender, NoteOutputType::Change),
+    ] {
+        let ciphertext = &decoded._transactions[0].boundParams.commitmentCiphertext[index];
+        assert_eq!(ciphertext.annotationData.len(), ANNOTATION_DATA_LEN);
+        let (annotated_type, sender_random) = decrypt_annotation_data(
+            &wallet.viewing.viewing_private_key,
+            &ciphertext.annotationData,
+        );
+        assert_eq!(annotated_type, output_type as u8);
+        let (blinded_sender, blinded_receiver) = note_blinding_keys(
+            &sender.viewing_public_key,
+            &receiver.viewing_public_key,
+            plan.private_outputs[index].note.random,
+            sender_random,
+        )
+        .unwrap();
+        assert_eq!(ciphertext.blindedSenderViewingKey.0, blinded_sender);
+        assert_eq!(ciphertext.blindedReceiverViewingKey.0, blinded_receiver);
+    }
 
     // Setup: no executor calls, only the private fee.
     let mut setup = request.clone();
