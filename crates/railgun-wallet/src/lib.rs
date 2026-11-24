@@ -1,4 +1,5 @@
 pub mod artifacts;
+mod atomic_file;
 pub mod keys;
 pub mod notes;
 pub mod prover;

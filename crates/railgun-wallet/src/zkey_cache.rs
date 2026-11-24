@@ -12,6 +12,8 @@ use local_db::{DbError, DbStore, ZkeyMeta};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::atomic_file::write_atomic;
+
 const ZKEY_CACHE_MAGIC: &[u8; 8] = b"RZKCACHE";
 const ZKEY_CACHE_VERSION: u32 = 1;
 const ZKEY_CACHE_FORMAT_VERSION: u32 = 3;
@@ -100,17 +102,16 @@ impl ZkeyCacheDbExt for DbStore {
         let file_name = format!("{variant}.ark");
         let relative = Self::relative_blob_path("zkey", &file_name);
         let path = self.resolve_path(&relative);
-        let tmp_path = path.with_extension("tmp");
 
-        {
-            let mut file = File::create(&tmp_path)?;
+        // Older builds wrote through `<variant>.tmp`; reclaim one an interrupted write left.
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
+        write_atomic(&path, |file| {
             file.write_all(ZKEY_CACHE_MAGIC)?;
             file.write_u32::<LittleEndian>(ZKEY_CACHE_VERSION)?;
-            proving_key.serialize_uncompressed(&mut file)?;
-            write_matrices(&mut file, matrices)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, &path)?;
+            proving_key.serialize_uncompressed(&mut *file)?;
+            write_matrices(file, matrices)?;
+            Ok::<(), ZkeyCacheError>(())
+        })?;
         let mut file = File::open(&path)?;
         let cache_hash = reader_sha256(&mut file)?;
 

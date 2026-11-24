@@ -1,5 +1,4 @@
 use std::fmt;
-use std::fs::File;
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +8,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wasmer::{Module, Store};
 use zeroize::Zeroizing;
+
+use crate::atomic_file::write_atomic;
 
 const WASM_MODULE_CACHE_KIND: &str = "wasm-module";
 const WASM_MODULE_CACHE_MAGIC: &[u8; 8] = b"RWMODCCH";
@@ -217,7 +218,6 @@ fn write_wasm_module_cache(
     let file_name = format!("{cache_id}.wasmer");
     let relative = DbStore::relative_blob_path(WASM_MODULE_CACHE_KIND, &file_name);
     let path = db.resolve_path(&relative);
-    let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
     let serialized = module
         .serialize()
         .map_err(|err| WasmModuleCacheError::Serialize(err.to_string()))?;
@@ -230,12 +230,7 @@ fn write_wasm_module_cache(
         .into_bytes()
         .into();
 
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&cache_bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &path)?;
+    write_atomic(&path, |file| file.write_all(&cache_bytes))?;
 
     let now = now_epoch_secs();
     let created_at = db

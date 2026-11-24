@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy::hex;
 use alloy::primitives::FixedBytes;
@@ -35,10 +34,6 @@ const ARTIFACT_CIDS_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/resources/metadata/artifact-cids.json"
 ));
-
-/// Keeps temp file names distinct when several provers and the eager cache build write the same
-/// artifact in one process.
-static ARTIFACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum ArtifactError {
@@ -507,27 +502,12 @@ fn write_if_needed(path: &Path, data: &[u8], force: bool) -> Result<(), Artifact
     if path.exists() && !force {
         return Ok(());
     }
-    write_atomic(path, data).map_err(|source| ArtifactError::ArtifactFile {
-        path: path.to_path_buf(),
-        source,
+    crate::atomic_file::write_atomic(path, |file| file.write_all(data)).map_err(|source| {
+        ArtifactError::ArtifactFile {
+            path: path.to_path_buf(),
+            source,
+        }
     })
-}
-
-/// Writes through a synced temp file and a rename, because the reuse fast paths only check that
-/// an artifact exists and would keep a file truncated by an interrupted write forever.
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-    let nonce = ARTIFACT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_path = path.with_file_name(format!(".{file_name}.{}-{nonce}.tmp", std::process::id()));
-    // A file already at this name was left by a dead process with the same pid, so truncate it.
-    let mut file = File::create(&temp_path)?;
-    let result = file.write_all(data).and_then(|()| file.sync_all());
-    drop(file);
-    let result = result.and_then(|()| fs::rename(&temp_path, path));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
 }
 
 #[cfg(test)]
