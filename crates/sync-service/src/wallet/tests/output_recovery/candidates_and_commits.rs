@@ -384,7 +384,11 @@ async fn output_poi_recovery_commit_round_trip_does_not_hold_the_corpus_fence() 
     cfg.scan_keys = ViewingKeyData::from_spending_public_key([7_u8; 32], spending_public_key);
     cfg.cache_key = test_cache_key("corpus-fence-cycle");
     cfg.spending_public_key = Some(spending_public_key);
-    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(
+        &ArtifactSource::default(),
+        &db,
+        None,
+    ));
 
     let mut input = test_wallet_utxo(0);
     let mut output = test_wallet_utxo(8);

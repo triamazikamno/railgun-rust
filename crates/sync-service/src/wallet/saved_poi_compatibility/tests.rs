@@ -1367,7 +1367,8 @@ async fn exact_spend_recovery_regenerates_previous_external_proof_and_submits_cu
         .poi
         .statuses
         .insert(newly_active_list, PoiStatus::Valid);
-    group.cfg.poi_recovery_prover = Some(ProverService::with_capacity_db(&artifacts, 1, None));
+    group.cfg.poi_recovery_prover =
+        Some(ProverService::with_capacity_db(&artifacts, 1, None, None));
     seed_migration_group(&store, &group);
     let mut handle = test_wallet_handle(vec![group.input.clone()]);
     handle.cache_key = group.cfg.cache_key.clone();

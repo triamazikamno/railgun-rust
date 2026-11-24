@@ -46,6 +46,7 @@ wasmer = { version = "6.1", features = ["singlepass"] }
 wasmer-compiler-singlepass = "6.1"
 tokio = { workspace = true, features = ["sync"] }
 rayon = { workspace = true }
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -184,7 +184,7 @@ async fn prove_current_ppoi_shapes() {
     for shape in [3, 13] {
         verify_provisioned_files(&source, &poi_variant_name(shape, shape), &hashes);
     }
-    let service = ProverService::with_capacity_db(&source, 1, None);
+    let service = ProverService::with_capacity_db(&source, 1, None, None);
     let verifier = Prover::new().expect("prepare embedded verification keys");
     for (private_output_count, has_unshield, filename) in [
         (1, false, "ppoi_3x3.json"),

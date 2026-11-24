@@ -156,7 +156,7 @@ fn sample_post_txid_data(
 async fn pre_transaction_poi_generation_uses_configured_proof_source() {
     let chunk = sample_chunk(11, 1, 1, false);
     let source = FailingLocalPoiProofSource::default();
-    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None, None);
     let err = generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
         chunks: &[chunk],
         chain_type: 0,
@@ -178,7 +178,7 @@ async fn pre_transaction_poi_generation_uses_configured_proof_source() {
 async fn pre_transaction_poi_generation_batches_merkle_proof_source_by_list() {
     let chunks = [sample_chunk(11, 1, 1, false), sample_chunk(12, 1, 1, false)];
     let source = FailingLocalPoiProofSource::default();
-    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None, None);
     let err = generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
         chunks: &chunks,
         chain_type: 0,
@@ -202,7 +202,7 @@ async fn post_transaction_poi_generation_uses_configured_proof_source() {
     let chunk = sample_chunk(12, 1, 1, false);
     let txid_data = sample_post_txid_data(&chunk, uint!(5_U256));
     let source = FailingLocalPoiProofSource::default();
-    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None);
+    let prover = ProverService::with_capacity_db(&ArtifactSource::default(), 1, None, None);
     let err = generate_post_transaction_pois(PostTransactionPoiGenerationRequest {
         chunk: &chunk,
         txid_data: &txid_data,

@@ -34,7 +34,11 @@ async fn sender_candidate_batch_refreshes_validated_txid_coverage_once() {
         .expect("persist candidate");
     }
     cfg.spending_public_key = Some([U256::ZERO; 2]);
-    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(
+        &ArtifactSource::default(),
+        &db,
+        None,
+    ));
 
     let mut poi_cache = PoiCache::new(PoiCacheIdentity::new(
         EVM_CHAIN_TYPE,
@@ -622,7 +626,11 @@ async fn partial_outer_txid_coverage_refreshes_before_candidate_attention() {
         })
         .expect("open db"),
     );
-    cfg.poi_recovery_prover = Some(ProverService::new_with_db(&ArtifactSource::default(), &db));
+    cfg.poi_recovery_prover = Some(ProverService::new_with_db(
+        &ArtifactSource::default(),
+        &db,
+        None,
+    ));
     db.put_opaque_wallet_private_row(
         &candidate.namespace(),
         WalletPrivateRecordKind::SenderTransactionCandidate,

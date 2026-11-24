@@ -22,7 +22,9 @@ use wasmer::Store;
 
 use crate::artifacts::{ArtifactError, ArtifactSource, poi_variant_name, variant_name};
 use crate::tx::{PoiProofInputs, PrivateInputs, PublicInputs};
-use crate::wasm_module_cache::{load_or_compile_wasm_module, wasm_module_cache_exists};
+use crate::wasm_module_cache::{
+    WasmModuleCacheKey, load_or_compile_wasm_module, wasm_module_cache_exists,
+};
 use crate::zkey_cache::{load_or_parse_zkey, zkey_cache_exists};
 use broadcaster_core::contracts::railgun::{G1Point, G2Point, SnarkProof};
 use broadcaster_core::crypto::ark_utils::prime_field_to_u256;
@@ -399,6 +401,9 @@ pub struct ProverCacheBuildReport {
     pub succeeded_variants: usize,
     pub failed_variants: usize,
     pub elapsed_ms: u128,
+    /// True when the build had a database and cache key, so native circuit modules were compiled
+    /// for the module cache. Cache write failures are logged, not reported, like zkey cache writes.
+    pub native_module_cache_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -493,6 +498,7 @@ fn select_eager_cache_variants(
 
 struct ProverBlockingContext<'a> {
     db_store: Option<&'a DbStore>,
+    cache_key: Option<&'a WasmModuleCacheKey>,
     cache_lock: &'a Mutex<()>,
     queue_wait_elapsed_ms: u128,
 }
@@ -504,6 +510,7 @@ impl ProverService {
             source,
             DEFAULT_PROVER_QUEUE,
             open_db(DbConfig::default()).as_ref(),
+            None,
         )
     }
 
@@ -513,24 +520,37 @@ impl ProverService {
             source,
             DEFAULT_PROVER_QUEUE,
             open_db(DbConfig { root_dir: db_dir }).as_ref(),
+            None,
         )
     }
 
     #[must_use]
-    pub fn new_with_db(source: &ArtifactSource, db: &Arc<DbStore>) -> Self {
-        Self::with_capacity_db(source, DEFAULT_PROVER_QUEUE, Some(db))
+    pub fn new_with_db(
+        source: &ArtifactSource,
+        db: &Arc<DbStore>,
+        cache_key: Option<&Arc<WasmModuleCacheKey>>,
+    ) -> Self {
+        Self::with_capacity_db(source, DEFAULT_PROVER_QUEUE, Some(db), cache_key)
     }
 
     #[must_use]
     pub fn with_capacity(source: &ArtifactSource, queue_size: usize) -> Self {
-        Self::with_capacity_db(source, queue_size, open_db(DbConfig::default()).as_ref())
+        Self::with_capacity_db(
+            source,
+            queue_size,
+            open_db(DbConfig::default()).as_ref(),
+            None,
+        )
     }
 
+    /// `cache_key` authenticates the compiled wasm module cache. Without it, circuit modules
+    /// are compiled in memory for each proof and never read from or written to `db_store`.
     #[must_use]
     pub fn with_capacity_db(
         source: &ArtifactSource,
         queue_size: usize,
         db_store: Option<&Arc<DbStore>>,
+        cache_key: Option<&Arc<WasmModuleCacheKey>>,
     ) -> Self {
         let worker_count = default_prover_worker_count();
         let cache_lock = Arc::new(Mutex::new(()));
@@ -542,6 +562,7 @@ impl ProverService {
                 worker_index,
                 source.clone(),
                 db_store.cloned(),
+                cache_key.cloned(),
                 receiver,
                 Arc::clone(&cache_lock),
             );
@@ -616,6 +637,7 @@ fn spawn_prover_worker(
     worker_index: usize,
     source: ArtifactSource,
     db_store: Option<Arc<DbStore>>,
+    cache_key: Option<Arc<WasmModuleCacheKey>>,
     mut receiver: mpsc::Receiver<ProverJob>,
     cache_lock: Arc<Mutex<()>>,
 ) {
@@ -661,6 +683,7 @@ fn spawn_prover_worker(
                             verify_proof,
                             &ProverBlockingContext {
                                 db_store: db_store.as_deref(),
+                                cache_key: cache_key.as_deref(),
                                 cache_lock: &cache_lock,
                                 queue_wait_elapsed_ms,
                             },
@@ -709,6 +732,7 @@ fn spawn_prover_worker(
                             verify_proof,
                             &ProverBlockingContext {
                                 db_store: db_store.as_deref(),
+                                cache_key: cache_key.as_deref(),
                                 cache_lock: &cache_lock,
                                 queue_wait_elapsed_ms,
                             },
@@ -787,13 +811,17 @@ fn open_db(config: DbConfig) -> Option<Arc<DbStore>> {
 pub async fn build_prover_cache(
     source: &ArtifactSource,
     db_store: Option<Arc<DbStore>>,
+    cache_key: Option<Arc<WasmModuleCacheKey>>,
 ) -> Result<ProverCacheBuildReport, ProverError> {
-    build_prover_cache_with_progress(source, db_store, |_| {}).await
+    build_prover_cache_with_progress(source, db_store, cache_key, |_| {}).await
 }
 
+/// Without `cache_key`, artifacts are downloaded and proving keys cached, but native circuit
+/// modules are not compiled.
 pub async fn build_prover_cache_with_progress(
     source: &ArtifactSource,
     db_store: Option<Arc<DbStore>>,
+    cache_key: Option<Arc<WasmModuleCacheKey>>,
     mut on_progress: impl FnMut(ProverCacheBuildProgress),
 ) -> Result<ProverCacheBuildReport, ProverError> {
     let started = Instant::now();
@@ -827,7 +855,8 @@ pub async fn build_prover_cache_with_progress(
         progress.current_variant = Some(variant.variant.clone());
         progress.current_variant_is_poi = Some(variant.poi_shape.is_some());
         on_progress(progress.clone());
-        match build_prover_variant_cache(source, db_store.clone(), variant).await {
+        match build_prover_variant_cache(source, db_store.clone(), cache_key.clone(), variant).await
+        {
             Ok(()) => {
                 succeeded_variants += 1;
                 progress.succeeded_variants = succeeded_variants;
@@ -860,6 +889,7 @@ pub async fn build_prover_cache_with_progress(
         succeeded_variants,
         failed_variants,
         elapsed_ms: started.elapsed().as_millis(),
+        native_module_cache_enabled: db_store.is_some() && cache_key.is_some(),
     };
     info!(
         railgun_variants = report.railgun_variants,
@@ -868,6 +898,7 @@ pub async fn build_prover_cache_with_progress(
         succeeded_variants = report.succeeded_variants,
         failed_variants = report.failed_variants,
         elapsed_ms = report.elapsed_ms,
+        native_module_cache_enabled = report.native_module_cache_enabled,
         "prover cache build complete"
     );
     Ok(report)
@@ -876,6 +907,7 @@ pub async fn build_prover_cache_with_progress(
 async fn build_prover_variant_cache(
     source: &ArtifactSource,
     db_store: Option<Arc<DbStore>>,
+    cache_key: Option<Arc<WasmModuleCacheKey>>,
     variant: &ProverCacheVariant,
 ) -> Result<(), ProverError> {
     let started = Instant::now();
@@ -886,7 +918,13 @@ async fn build_prover_variant_cache(
         poi_shape: variant.poi_shape,
     };
     tokio::task::spawn_blocking(move || {
-        build_prover_variant_cache_blocking(&source, db_store.as_deref(), &variant, started)
+        build_prover_variant_cache_blocking(
+            &source,
+            db_store.as_deref(),
+            cache_key.as_deref(),
+            &variant,
+            started,
+        )
     })
     .await
     .map_err(|error| ProverError::WorkerPanic(error.to_string()))?
@@ -895,6 +933,7 @@ async fn build_prover_variant_cache(
 fn build_prover_variant_cache_blocking(
     source: &ArtifactSource,
     db_store: Option<&DbStore>,
+    cache_key: Option<&WasmModuleCacheKey>,
     variant: &ProverCacheVariant,
     started: Instant,
 ) -> Result<(), ProverError> {
@@ -904,6 +943,7 @@ fn build_prover_variant_cache_blocking(
         path: paths.wasm.clone(),
         source,
     })?;
+    source.validate_wasm(&variant.variant, &wasm)?;
     let wasm_read_elapsed_ms = wasm_read_started.elapsed().as_millis();
 
     let zkey_started = Instant::now();
@@ -935,14 +975,23 @@ fn build_prover_variant_cache_blocking(
             poi_witness_compiler_name(max_inputs, max_outputs)
         });
     let module_cache_hit = match db_store {
-        Some(db) => wasm_module_cache_exists(db, &variant.variant, compiler, &wasm)
+        Some(db) => wasm_module_cache_exists(db, cache_key, &variant.variant, compiler, &wasm)
             .map_err(|err| ProverError::WasmModule(err.to_string()))?,
         None => false,
     };
-    if !module_cache_hit {
+    // Without both a key and a database the module cannot be cached, so compiling is wasted.
+    let module_cache_enabled = db_store.is_some() && cache_key.is_some();
+    if module_cache_enabled && !module_cache_hit {
         drop(
-            load_or_compile_wasm_module(db_store, &store, &variant.variant, compiler, &wasm)
-                .map_err(|err| ProverError::WasmModule(err.to_string()))?,
+            load_or_compile_wasm_module(
+                db_store,
+                cache_key,
+                &store,
+                &variant.variant,
+                compiler,
+                &wasm,
+            )
+            .map_err(|err| ProverError::WasmModule(err.to_string()))?,
         );
     }
     let module_elapsed_ms = module_started.elapsed().as_millis();
@@ -953,6 +1002,7 @@ fn build_prover_variant_cache_blocking(
         wasm_read_elapsed_ms,
         zkey_elapsed_ms,
         zkey_cache_hit,
+        module_cache_enabled,
         module_elapsed_ms,
         module_cache_hit,
         elapsed_ms = started.elapsed().as_millis(),
@@ -998,8 +1048,15 @@ fn prove_unshield_blocking(
     let module_started = Instant::now();
     let mut store = Store::default();
     let cached_module = with_cache_lock(context.cache_lock, || {
-        load_or_compile_wasm_module(context.db_store, &store, &variant, "default", &wasm)
-            .map_err(|err| ProverError::WasmModule(err.to_string()))
+        load_or_compile_wasm_module(
+            context.db_store,
+            context.cache_key,
+            &store,
+            &variant,
+            "default",
+            &wasm,
+        )
+        .map_err(|err| ProverError::WasmModule(err.to_string()))
     })?;
     let module_cache_hit = cached_module.cache_hit;
     let module = cached_module.module;
@@ -1107,8 +1164,15 @@ fn prove_poi_blocking(
     let mut store = poi_witness_store(max_inputs, max_outputs);
     let compiler = poi_witness_compiler_name(max_inputs, max_outputs);
     let cached_module = with_cache_lock(context.cache_lock, || {
-        load_or_compile_wasm_module(context.db_store, &store, &variant, compiler, &wasm)
-            .map_err(|err| ProverError::WasmModule(err.to_string()))
+        load_or_compile_wasm_module(
+            context.db_store,
+            context.cache_key,
+            &store,
+            &variant,
+            compiler,
+            &wasm,
+        )
+        .map_err(|err| ProverError::WasmModule(err.to_string()))
     })?;
     let module_cache_hit = cached_module.cache_hit;
     let module = cached_module.module;
@@ -1264,9 +1328,9 @@ fn public_inputs_from_witness(witness: &[Fr], count: usize) -> Vec<Fr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactError, MERKLE_ZERO_VALUE, PoiProofInputs, PoiWitnessInputs, ProverError,
-        ark_proof_to_snarkjs, poi_witness_compiler_name, select_eager_cache_variants,
-        with_cache_lock,
+        ArtifactError, MERKLE_ZERO_VALUE, PoiProofInputs, PoiWitnessInputs, ProverCacheVariant,
+        ProverError, ark_proof_to_snarkjs, build_prover_variant_cache_blocking,
+        poi_witness_compiler_name, select_eager_cache_variants, with_cache_lock,
     };
     use alloy::primitives::U256;
     use alloy::uint;
@@ -1393,6 +1457,38 @@ mod tests {
             panic!("cache panic");
         });
         assert!(with_cache_lock(&lock, || Ok::<_, ProverError>(())).is_ok());
+    }
+
+    #[test]
+    fn keyless_eager_build_rejects_truncated_wasm() {
+        let dir = std::env::temp_dir().join(format!(
+            "railgun-eager-truncated-wasm-{}",
+            std::process::id()
+        ));
+        let source = ArtifactSource::default().with_cache_dir(dir.clone());
+        let variant = ProverCacheVariant {
+            variant: "01x02".into(),
+            poi_shape: None,
+        };
+        let paths = source.artifact_paths(&variant.variant);
+        std::fs::create_dir_all(paths.wasm.parent().expect("artifact dir"))
+            .expect("create artifact dir");
+        std::fs::write(&paths.wasm, b"\0asm truncated").expect("write wasm");
+        std::fs::write(&paths.zkey, b"zkey").expect("write zkey");
+
+        let result = build_prover_variant_cache_blocking(
+            &source,
+            None,
+            None,
+            &variant,
+            std::time::Instant::now(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            result,
+            Err(ProverError::Artifact(ArtifactError::HashMismatch { .. }))
+        ));
     }
 
     #[test]

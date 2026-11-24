@@ -23,3 +23,4 @@ pub use tx::{
     PrivateInputs, PublicInputs, SendPlan, TransactPlan, TransactionBuilder, TransactionCall,
     UnshieldPlan, generate_pre_transaction_pois, poi_circuit_variant,
 };
+pub use wasm_module_cache::WasmModuleCacheKey;
