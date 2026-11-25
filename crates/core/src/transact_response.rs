@@ -21,7 +21,7 @@ pub enum ResponseError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecryptedTransactResponse {
-    TxHash(String),
+    TxHash(TxHash),
     Error(String),
 }
 
@@ -85,7 +85,7 @@ struct JsonRpcEncryptedResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TransactResponsePayload {
-    tx_hash: Option<String>,
+    tx_hash: Option<TxHash>,
     error: Option<String>,
 }
 
@@ -124,4 +124,20 @@ fn build_transact_response_message(
     };
 
     Ok(serde_json::to_vec(&msg)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_hash_tx_hash_fails_to_decode() {
+        let key = [7u8; 32];
+        let payload = serde_json::json!({ "txHash": "0x12345é6789abcdef", "error": "boom" });
+        let msg = build_transact_response_message(None, &key, &payload).unwrap();
+
+        let result = DecryptedTransactResponse::try_decrypt_message(&key, &msg);
+
+        assert!(matches!(result, Err(ResponseError::Json(_))));
+    }
 }
