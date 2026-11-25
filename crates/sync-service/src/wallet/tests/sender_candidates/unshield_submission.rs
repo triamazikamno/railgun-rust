@@ -717,8 +717,8 @@ async fn partial_unshield_fixture(
 
     let txid_transaction = IndexedRailgunTransaction {
         id: "public_broadcaster_partial_unshield".to_string(),
-        block_number: U256::from(spend_source.block_number),
-        block_timestamp: U256::from(spend_source.block_timestamp),
+        block_number: U64::from(spend_source.block_number),
+        block_timestamp: U64::from(spend_source.block_timestamp),
         transaction_hash: spend_source.tx_hash,
         merkle_root: FixedBytes::from([0x22; 32]),
         nullifiers: vec![input_nullifier],

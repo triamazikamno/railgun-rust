@@ -1,6 +1,6 @@
 use std::fmt;
 
-use alloy::primitives::{Address, Bytes, FixedBytes, U64, U256, Uint};
+use alloy::primitives::{Address, Bytes, FixedBytes, U32, U64, U256, Uint};
 use alloy::sol_types::SolValue;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -18,13 +18,13 @@ pub(crate) struct Commitment {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_64")]
     pub id: FixedBytes<64>,
     #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
+    pub tree_number: U32,
     #[serde(rename = "treePosition")]
-    pub tree_position: U256,
+    pub tree_position: U64,
     #[serde(rename = "batchStartTreePosition")]
-    pub batch_start_tree_position: U256,
+    pub batch_start_tree_position: U64,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     pub hash: U256,
 }
 
@@ -36,13 +36,13 @@ pub struct IndexedTransactCommitment {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     #[serde(rename = "blockTimestamp")]
-    pub block_timestamp: U256,
+    pub block_timestamp: U64,
     #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
+    pub tree_number: U32,
     #[serde(rename = "treePosition")]
-    pub tree_position: U256,
+    pub tree_position: U64,
     pub hash: U256,
     pub ciphertext: IndexedCommitmentCiphertext,
 }
@@ -55,13 +55,13 @@ pub struct IndexedLegacyEncryptedCommitment {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     #[serde(rename = "blockTimestamp")]
-    pub block_timestamp: U256,
+    pub block_timestamp: U64,
     #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
+    pub tree_number: U32,
     #[serde(rename = "treePosition")]
-    pub tree_position: U256,
+    pub tree_position: U64,
     pub hash: U256,
     pub ciphertext: IndexedLegacyCommitmentCiphertext,
 }
@@ -87,13 +87,13 @@ pub struct IndexedLegacyGeneratedCommitment {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     #[serde(rename = "blockTimestamp")]
-    pub block_timestamp: U256,
+    pub block_timestamp: U64,
     #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
+    pub tree_number: U32,
     #[serde(rename = "treePosition")]
-    pub tree_position: U256,
+    pub tree_position: U64,
     pub hash: U256,
     pub preimage: IndexedLegacyCommitmentPreimage,
     #[serde(
@@ -128,13 +128,13 @@ pub struct IndexedShieldCommitment {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     #[serde(rename = "blockTimestamp")]
-    pub block_timestamp: U256,
+    pub block_timestamp: U64,
     #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
+    pub tree_number: U32,
     #[serde(rename = "treePosition")]
-    pub tree_position: U256,
+    pub tree_position: U64,
     pub preimage: IndexedCommitmentPreimage,
     #[serde(rename = "shieldKey")]
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
@@ -164,14 +164,14 @@ pub struct IndexedCommitmentPreimage {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub npk: FixedBytes<32>,
     pub token: IndexedTokenData,
-    pub value: U256,
+    pub value: Uint<120, 2>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexedLegacyCommitmentPreimage {
     pub npk: U256,
     pub token: IndexedTokenData,
-    pub value: U256,
+    pub value: Uint<120, 2>,
 }
 
 impl From<IndexedLegacyCommitmentPreimage> for LegacyCommitmentPreimage {
@@ -179,7 +179,7 @@ impl From<IndexedLegacyCommitmentPreimage> for LegacyCommitmentPreimage {
         Self {
             npk: value.npk,
             token: value.token.into(),
-            value: Uint::<120, 2>::from(value.value.to::<u128>()),
+            value: value.value,
         }
     }
 }
@@ -189,7 +189,7 @@ impl From<IndexedCommitmentPreimage> for CommitmentPreimage {
         Self {
             npk: value.npk,
             token: value.token.into(),
-            value: Uint::<120, 2>::from(value.value.to::<u128>()),
+            value: value.value,
         }
     }
 }
@@ -463,11 +463,11 @@ pub struct IndexedNullifier {
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     #[serde(rename = "blockTimestamp")]
-    pub block_timestamp: U256,
+    pub block_timestamp: U64,
     #[serde(rename = "treeNumber")]
-    pub tree_number: U256,
+    pub tree_number: U32,
     pub nullifier: U256,
 }
 
@@ -475,9 +475,9 @@ pub struct IndexedNullifier {
 pub struct IndexedRailgunTransaction {
     pub id: String,
     #[serde(rename = "blockNumber")]
-    pub block_number: U256,
+    pub block_number: U64,
     #[serde(rename = "blockTimestamp")]
-    pub block_timestamp: U256,
+    pub block_timestamp: U64,
     #[serde(rename = "transactionHash")]
     #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
     pub transaction_hash: FixedBytes<32>,
@@ -667,7 +667,7 @@ mod tests {
         }))
         .expect("deserialize indexed nullifier");
 
-        assert_eq!(item.block_number, uint!(123_U256));
-        assert_eq!(item.block_timestamp, uint!(1_700_000_123_U256));
+        assert_eq!(item.block_number, uint!(123_U64));
+        assert_eq!(item.block_timestamp, uint!(1_700_000_123_U64));
     }
 }

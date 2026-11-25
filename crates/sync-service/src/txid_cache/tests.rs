@@ -106,8 +106,8 @@ fn indexed_transaction(
 ) -> IndexedRailgunTransaction {
     IndexedRailgunTransaction {
         id: format!("0x{tx_hash_byte:04x}"),
-        block_number: U256::from(12),
-        block_timestamp: U256::from(1_700_000_012_u64),
+        block_number: U64::from(12),
+        block_timestamp: U64::from(1_700_000_012_u64),
         transaction_hash: FixedBytes::from([tx_hash_byte; 32]),
         merkle_root: FixedBytes::from([0x55; 32]),
         nullifiers: vec![U256::from(nullifier)],

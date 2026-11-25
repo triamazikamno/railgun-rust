@@ -232,11 +232,11 @@ async fn shield_commitments_parse_token_type_enum() {
     assert_eq!(rows[0].preimage().token.tokenType, 0);
 }
 
+const INDEXED_WALLET_PAGE: &str = r#"{"data":{"transactCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"hash":"5","ciphertext":{"ciphertext":{"iv":"0x11111111111111111111111111111111","tag":"0x22222222222222222222222222222222","data":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]},"blindedSenderViewingKey":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","memo":"0x"}}],"shieldCommitments":[{"id":"0x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"13","blockTimestamp":"1700000013","treeNumber":0,"treePosition":3,"preimage":{"npk":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","token":{"tokenType":"ERC20","tokenAddress":"0x0000000000000000000000000000000000000000","tokenSubID":"0x00"},"value":"5"},"shieldKey":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","encryptedBundle":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]}],"nullifiers":[{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"14","blockTimestamp":"1700000014","treeNumber":0,"nullifier":"0x01"}]}}"#;
+
 #[tokio::test]
 async fn indexed_wallet_page_fetches_all_streams_in_one_request() {
-    let mock = spawn_graphql(vec![
-        r#"{"data":{"transactCommitments":[{"id":"0x11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"12","blockTimestamp":"1700000012","treeNumber":0,"treePosition":2,"hash":"5","ciphertext":{"ciphertext":{"iv":"0x11111111111111111111111111111111","tag":"0x22222222222222222222222222222222","data":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]},"blindedSenderViewingKey":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","memo":"0x"}}],"shieldCommitments":[{"id":"0x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"13","blockTimestamp":"1700000013","treeNumber":0,"treePosition":3,"preimage":{"npk":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","token":{"tokenType":"ERC20","tokenAddress":"0x0000000000000000000000000000000000000000","tokenSubID":"0x00"},"value":"5"},"shieldKey":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","encryptedBundle":["0x3333333333333333333333333333333333333333333333333333333333333333","0x4444444444444444444444444444444444444444444444444444444444444444","0x5555555555555555555555555555555555555555555555555555555555555555"]}],"nullifiers":[{"id":"0x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333","transactionHash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","blockNumber":"14","blockTimestamp":"1700000014","treeNumber":0,"nullifier":"0x01"}]}}"#,
-    ]);
+    let mock = spawn_graphql(vec![INDEXED_WALLET_PAGE]);
     let client = QuickSyncClient::new(mock.url);
 
     let page = client
@@ -255,6 +255,26 @@ async fn indexed_wallet_page_fetches_all_streams_in_one_request() {
     assert!(!request.contains("legacyEncryptedCommitments"));
     assert!(!request.contains("legacyGeneratedCommitments"));
     assert!(mock.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn indexed_wallet_page_rejects_shield_value_above_uint120() {
+    // 2^120, one above the largest uint120; the fixture's only `"value"` is the shield preimage.
+    let body: &'static str = INDEXED_WALLET_PAGE
+        .replace(
+            r#""value":"5""#,
+            r#""value":"1329227995784915872903807060280344576""#,
+        )
+        .leak();
+    let mock = spawn_graphql(vec![body]);
+    let client = QuickSyncClient::new(mock.url);
+
+    let err = client
+        .fetch_indexed_wallet_page(1, 20, NonZeroUsize::new(10).unwrap())
+        .await
+        .expect_err("2^120 shield value should fail decoding");
+
+    assert!(matches!(err, SyncError::UnexpectedFormat(_)));
 }
 
 #[tokio::test]

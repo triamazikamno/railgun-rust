@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Bytes, FixedBytes, U256};
+use alloy::primitives::{Bytes, FixedBytes, U64, U256};
 use alloy::sol_types::{Error as SolError, SolEvent};
 use alloy_rpc_types_eth::Log;
 use thiserror::Error;
@@ -651,11 +651,7 @@ impl IndexedLegacyGeneratedCommitmentInput {
     }
 }
 
-fn indexed_source(
-    tx_hash: FixedBytes<32>,
-    block_number: U256,
-    block_timestamp: U256,
-) -> UtxoSource {
+fn indexed_source(tx_hash: FixedBytes<32>, block_number: U64, block_timestamp: U64) -> UtxoSource {
     UtxoSource {
         tx_hash,
         block_number: block_number.to(),

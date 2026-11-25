@@ -286,8 +286,8 @@ async fn locally_valid_sender_candidate_retires_without_public_or_remote_effects
     // Retirement needs public qualification: one artifact-bounded TXID row without an unshield.
     let txid_transaction = IndexedRailgunTransaction {
         id: "local_retirement".to_string(),
-        block_number: U256::from(candidate.source.block_number),
-        block_timestamp: U256::from(candidate.source.block_timestamp),
+        block_number: U64::from(candidate.source.block_number),
+        block_timestamp: U64::from(candidate.source.block_timestamp),
         transaction_hash: candidate.source.tx_hash,
         merkle_root: FixedBytes::from([0x22; 32]),
         nullifiers: vec![input.utxo.nullifier(cfg.scan_keys.nullifying_key)],

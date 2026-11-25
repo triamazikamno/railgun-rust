@@ -253,8 +253,8 @@ async fn public_cache_txid_recovery_uses_artifact_bound_before_latest_refresh() 
     };
     let txid_transaction = IndexedRailgunTransaction {
         id: "artifact_bound".to_string(),
-        block_number: U256::from(1_u64),
-        block_timestamp: U256::from(1_700_000_001_u64),
+        block_number: U64::from(1_u64),
+        block_timestamp: U64::from(1_700_000_001_u64),
         transaction_hash: FixedBytes::from([0x11; 32]),
         merkle_root: FixedBytes::from([0x22; 32]),
         nullifiers: vec![U256::from(1_u64)],

@@ -828,7 +828,7 @@ pub(crate) struct SquidStatusData {
 
 #[derive(Debug, Deserialize)]
 struct SquidStatus {
-    height: alloy::primitives::U256,
+    height: alloy::primitives::U64,
 }
 
 #[derive(Debug, Deserialize)]
