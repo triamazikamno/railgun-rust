@@ -201,7 +201,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
             Err(err) => {
                 warn!(
                     chain_id = cfg.chain.chain_id,
-                    target_txid_index = recovery_chunk.target_txid_index,
                     failure_category = "latest_validated_lookup_failed",
                     "output POI recovery TXID data failed"
                 );
@@ -227,7 +226,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
                     } else {
                         warn!(
                             chain_id = cfg.chain.chain_id,
-                            target_txid_index = recovery_chunk.target_txid_index,
                             proof_source = "cache",
                             failure_category = txid_public_cache_failure_category(&err),
                             "output POI recovery TXID data failed"
@@ -263,7 +261,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
                         Err(err) => {
                             warn!(
                                 chain_id = cfg.chain.chain_id,
-                                target_txid_index = recovery_chunk.target_txid_index,
                                 proof_source = "after_refresh",
                                 failure_category = txid_public_cache_failure_category(&err),
                                 "output POI recovery TXID data failed"
@@ -281,7 +278,6 @@ pub(in crate::wallet) async fn recovered_output_txid_data_from_public_cache(
                     } else {
                         warn!(
                             chain_id = cfg.chain.chain_id,
-                            target_txid_index = recovery_chunk.target_txid_index,
                             failure_category = "cache_refresh_failed",
                             "output POI recovery TXID data failed"
                         );
