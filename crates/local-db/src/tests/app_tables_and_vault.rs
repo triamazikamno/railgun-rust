@@ -43,6 +43,35 @@ fn app_tables_read_empty_before_first_write_and_round_trip() {
 }
 
 #[test]
+fn app_table_write_can_request_compaction() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    assert!(
+        !store
+            .wallet_private_compaction_requested()
+            .expect("read compaction marker")
+    );
+
+    store
+        .write_app_tables(|tables| {
+            tables.insert(AppTable::new("test_app_table"), "key", b"value")?;
+            tables.request_compaction()
+        })
+        .expect("write app table and request compaction");
+    assert!(
+        store
+            .wallet_private_compaction_requested()
+            .expect("read compaction marker")
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
 fn reserved_app_table_name_fails_and_persists_nothing() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {

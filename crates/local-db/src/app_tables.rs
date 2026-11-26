@@ -5,7 +5,10 @@ use redb::{
     WriteTransaction,
 };
 
-use super::{ByteTableDefinition, DbError, DbStore, LOCAL_DB_TABLES, list_table_prefix};
+use super::{
+    ByteTableDefinition, DbError, DbStore, LOCAL_DB_TABLES, META_TABLE,
+    WALLET_PRIVATE_COMPACTION_REQUESTED_KEY, list_table_prefix,
+};
 
 /// A byte table owned by an application rather than by `local-db`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,6 +100,13 @@ impl<'txn> AppTableWriter<'txn> {
     pub fn remove(&mut self, table: AppTable, key: &str) -> Result<bool, DbError> {
         let mut table = self.open(table)?;
         Ok(table.remove(key)?.is_some())
+    }
+
+    /// Asks the next cold open to compact the database file; commits with this transaction.
+    pub fn request_compaction(&mut self) -> Result<(), DbError> {
+        let mut table = self.txn.open_table(META_TABLE)?;
+        table.insert(WALLET_PRIVATE_COMPACTION_REQUESTED_KEY, &[1_u8][..])?;
+        Ok(())
     }
 
     fn open(&self, table: AppTable) -> Result<Table<'txn, &'static str, &'static [u8]>, DbError> {
