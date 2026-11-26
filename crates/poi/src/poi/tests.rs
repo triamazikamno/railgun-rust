@@ -1,9 +1,10 @@
 use super::{
     BlindedCommitmentData, DEFAULT_ACTIVE_POI_LIST_KEY_HEX, DEFAULT_WALLET_POI_RPC_URL,
-    PoiEventType, PoiMerkleProof, PoiMerkletreeLeavesResponse, PoiRpcClient, PoiStatus,
-    PoiSyncedListEvent, SignedBlockedShield, SignedPoiEvent, SingleCommitmentProofContext,
-    ValidatedRailgunTxidStatus, decode_json_rpc_ack_response, decode_json_rpc_response,
-    default_active_poi_list_key, encode_u256_bare, railgun_txid_leaf_hash,
+    POI_RPC_MAX_RESPONSE_BYTES, PoiEventType, PoiMerkleProof, PoiMerkletreeLeavesResponse,
+    PoiRpcClient, PoiStatus, PoiSyncedListEvent, SignedBlockedShield, SignedPoiEvent,
+    SingleCommitmentProofContext, ValidatedRailgunTxidStatus, decode_json_rpc_ack_response,
+    decode_json_rpc_response, default_active_poi_list_key, encode_u256_bare,
+    railgun_txid_leaf_hash,
 };
 use crate::error::{PoiRpcError, PoiRpcTransportPhase};
 use alloy::{
@@ -27,13 +28,17 @@ fn endpoint_with_sentinel(mut url: Url) -> Url {
     url
 }
 
-fn spawn_rpc_response(status: u16, body: &'static str, declared_len: Option<usize>) -> Url {
+fn spawn_rpc_response(status: u16, body: &str, declared_len: Option<usize>) -> Url {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind RPC server");
     let url = Url::parse(&format!(
         "http://{}",
         listener.local_addr().expect("RPC server address")
     ))
     .expect("RPC server URL");
+    let response = format!(
+        "HTTP/1.1 {status} TEST\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        declared_len.unwrap_or(body.len())
+    );
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept RPC request");
         let mut request = Vec::new();
@@ -48,10 +53,6 @@ fn spawn_rpc_response(status: u16, body: &'static str, declared_len: Option<usiz
                 break;
             }
         }
-        let response = format!(
-            "HTTP/1.1 {status} TEST\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            declared_len.unwrap_or(body.len())
-        );
         stream
             .write_all(response.as_bytes())
             .expect("write RPC response");
@@ -141,6 +142,18 @@ async fn rpc_transport_errors_strip_endpoint_and_remote_body() {
     );
     assert_rpc_error_safe(&body_error, &["endpoint-sentinel"]);
 
+    let large_body = format!(
+        "large-body-sentinel{}",
+        " ".repeat(POI_RPC_MAX_RESPONSE_BYTES)
+    );
+    let large_client = PoiRpcClient::new(spawn_rpc_response(200, &large_body, None));
+    let large_error = large_client
+        .send_request::<_, bool>("test_large", ())
+        .await
+        .expect_err("oversized body error");
+    assert!(matches!(&large_error, PoiRpcError::ResponseTooLarge));
+    assert_rpc_error_safe(&large_error, &["endpoint-sentinel", "large-body-sentinel"]);
+
     let timeout_client =
         PoiRpcClient::new(spawn_stalled_rpc()).with_request_timeout(Duration::from_millis(20));
     let timeout_error = timeout_client
@@ -149,6 +162,16 @@ async fn rpc_transport_errors_strip_endpoint_and_remote_body() {
         .expect_err("timeout error");
     assert!(timeout_error.is_timeout());
     assert_rpc_error_safe(&timeout_error, &["endpoint-sentinel"]);
+}
+
+#[tokio::test]
+async fn rpc_response_decodes_with_leading_bom() {
+    let client = PoiRpcClient::new(spawn_rpc_response(200, "\u{feff}{\"result\":true}", None));
+    let result = client
+        .send_request::<_, bool>("test_bom", ())
+        .await
+        .expect("BOM-prefixed response");
+    assert!(result);
 }
 
 #[test]

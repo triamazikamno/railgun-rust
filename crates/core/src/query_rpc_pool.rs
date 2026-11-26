@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use alloy::providers::{Provider, ProviderBuilder};
 use alloy_provider::DynProvider;
 use rand::prelude::IndexedRandom;
 use url::Url;
+
+use crate::provider::connect_reqwest_capped;
 
 #[derive(Clone)]
 pub struct ProviderHandle {
@@ -78,21 +79,15 @@ pub struct QueryRpcPool {
 impl QueryRpcPool {
     #[must_use]
     pub fn new(urls: Vec<Url>, cooldown: Duration) -> Self {
-        let providers: Vec<ProviderEntry> = urls
-            .into_iter()
-            .map(|url| ProviderEntry {
-                provider: ProviderBuilder::new().connect_http(url.clone()).erased(),
-                url,
-            })
-            .collect();
-        Self {
-            admissions: Mutex::new(Admissions::admitted(providers.len())),
-            providers,
+        let mut pool = Self::with_http_clients(
+            urls.into_iter()
+                .map(|url| (url, reqwest::Client::new()))
+                .collect(),
             cooldown,
-            cooldowns: Mutex::new(HashMap::new()),
-            http_client: None,
-            log_spans: Mutex::new(HashMap::new()),
-        }
+        );
+        // Only pools given a caller's client report one.
+        pool.http_client = None;
+        pool
     }
 
     /// Creates a pool that routes all RPC traffic through the given
@@ -116,9 +111,7 @@ impl QueryRpcPool {
         let providers: Vec<ProviderEntry> = endpoints
             .into_iter()
             .map(|(url, client)| ProviderEntry {
-                provider: ProviderBuilder::new()
-                    .connect_reqwest(client, url.clone())
-                    .erased(),
+                provider: connect_reqwest_capped(client, url.clone()),
                 url,
             })
             .collect();
@@ -316,6 +309,8 @@ impl QueryRpcPool {
 
 #[cfg(test)]
 mod tests {
+    use alloy::providers::Provider;
+
     use super::*;
 
     fn test_pool() -> QueryRpcPool {

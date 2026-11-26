@@ -29,6 +29,12 @@ const SQUID_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
 const SQUID_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SQUID_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Largest decompressed response body accepted. A full 10,000-row wallet page
+/// is about 23 MB, so 64 MiB leaves room while bounding memory.
+#[cfg(not(test))]
+const SQUID_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const SQUID_MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub(crate) const COMMITMENTS_QUERY: &str = r"
 query Commitments($blockNumber: BigInt = 0, $limit: Int = 10000) {
@@ -653,6 +659,7 @@ where
 
 /// Reads the body chunk by chunk, failing when no bytes arrive for
 /// `SQUID_BODY_IDLE_TIMEOUT`; a slow body that keeps arriving completes.
+/// Fails once the body would exceed `SQUID_MAX_BODY_BYTES`.
 async fn read_body_with_idle_timeout(mut response: Response) -> Result<Vec<u8>, GraphPostError> {
     let mut body = Vec::new();
     while let Some(chunk) = timeout(SQUID_BODY_IDLE_TIMEOUT, response.chunk())
@@ -662,6 +669,9 @@ async fn read_body_with_idle_timeout(mut response: Response) -> Result<Vec<u8>, 
         })?
         .map_err(GraphPostError::ReadBody)?
     {
+        if body.len().saturating_add(chunk.len()) > SQUID_MAX_BODY_BYTES {
+            return Err(GraphPostError::BodyTooLarge);
+        }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
@@ -683,6 +693,8 @@ pub enum GraphPostError {
     Request(reqwest::Error),
     #[error("read graphql response failed: {0}")]
     ReadBody(reqwest::Error),
+    #[error("graphql response body too large")]
+    BodyTooLarge,
     #[error("graphql response {phase} timed out")]
     Timeout { phase: GraphTimeoutPhase },
     #[error("graphql request failed with status {status}: {body}")]
@@ -726,7 +738,7 @@ impl GraphPostError {
                     | StatusCode::SERVICE_UNAVAILABLE
                     | StatusCode::GATEWAY_TIMEOUT
             ),
-            Self::Json(_) | Self::Graphql(_) | Self::MissingData => false,
+            Self::BodyTooLarge | Self::Json(_) | Self::Graphql(_) | Self::MissingData => false,
         }
     }
 
@@ -738,6 +750,7 @@ impl GraphPostError {
             Self::Request(error) if error.is_connect() => "connect",
             Self::Request(_) => "request",
             Self::ReadBody(_) => "read_body",
+            Self::BodyTooLarge => "too_large",
             Self::Timeout {
                 phase: GraphTimeoutPhase::Headers,
             } => "timeout_headers",
@@ -759,7 +772,8 @@ impl From<GraphPostError> for SyncError {
                 Self::Request(error)
             }
             GraphPostError::MissingData => Self::MissingData,
-            GraphPostError::Timeout { .. }
+            GraphPostError::BodyTooLarge
+            | GraphPostError::Timeout { .. }
             | GraphPostError::HttpStatus { .. }
             | GraphPostError::Json(_)
             | GraphPostError::Graphql(_) => Self::UnexpectedFormat(error.to_string()),

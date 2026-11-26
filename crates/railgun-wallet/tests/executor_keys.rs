@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
-use alloy::signers::local::MnemonicBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use coins_bip32::{ecdsa::SigningKey, xkeys::XPriv};
 use railgun_wallet::keys::{KeyError, derive_executor_signer};
 use serde::Deserialize;
 
@@ -31,13 +32,11 @@ fn executor_derivation_matches_sdk_with_passphrases_and_separate_account_namespa
             derive_executor_signer(&seed, vector.wallet_index, vector.chain_id, vector.index)
                 .expect("executor signer");
         assert_eq!(signer.address(), vector.address);
-        let ordinary = MnemonicBuilder::english()
-            .phrase(fixture.mnemonic.as_str())
-            .password(vector.passphrase.as_str())
-            .index(vector.index)
-            .expect("ordinary path")
-            .build()
-            .expect("ordinary signer");
+        let ordinary = XPriv::root_from_seed(&seed, None)
+            .and_then(|root| root.derive_path(format!("m/44'/60'/0'/0/{}", vector.index).as_str()))
+            .expect("ordinary path");
+        let ordinary: &SigningKey = ordinary.as_ref();
+        let ordinary = PrivateKeySigner::from_signing_key(ordinary.clone());
         assert_ne!(signer.address(), ordinary.address());
     }
     let seed = mnemonic.to_seed("");

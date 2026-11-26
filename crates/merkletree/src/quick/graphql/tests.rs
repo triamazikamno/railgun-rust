@@ -9,8 +9,8 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use super::{
-    EmptyVariables, GraphPostError, GraphTimeoutPhase, SQUID_BODY_IDLE_TIMEOUT, post_graphql_data,
-    post_graphql_data_once,
+    EmptyVariables, GraphPostError, GraphTimeoutPhase, SQUID_BODY_IDLE_TIMEOUT,
+    SQUID_MAX_BODY_BYTES, post_graphql_data, post_graphql_data_once,
 };
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +237,45 @@ async fn post_graphql_data_once_completes_body_that_keeps_arriving() {
 
     assert!(data.ok);
     assert!(started.elapsed() > SQUID_BODY_IDLE_TIMEOUT);
+    server.join().expect("server thread should finish");
+}
+
+#[tokio::test]
+async fn post_graphql_data_once_rejects_body_over_cap() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let endpoint = url::Url::parse(&format!(
+        "http://{}/graphql",
+        listener.local_addr().expect("read test server address")
+    ))
+    .expect("parse test server URL");
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(StdDuration::from_secs(5)))
+            .expect("set read timeout");
+        read_http_request(&mut stream);
+        let body = " ".repeat(SQUID_MAX_BODY_BYTES + 1);
+        stream
+            .write_all(format!("{}{body}", json_response_head(body.len())).as_bytes())
+            .expect("write oversized response");
+    });
+
+    let client = Client::builder().no_proxy().build().expect("build client");
+    let error = post_graphql_data_once::<TestData, _>(
+        &client,
+        &endpoint,
+        "query Test { ok }",
+        &EmptyVariables {},
+    )
+    .await
+    .expect_err("oversized body should be rejected");
+
+    assert!(
+        matches!(error, GraphPostError::BodyTooLarge),
+        "unexpected error: {error}"
+    );
+    assert!(!error.is_retryable());
     server.join().expect("server thread should finish");
 }
 

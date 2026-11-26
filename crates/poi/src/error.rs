@@ -63,6 +63,8 @@ pub enum PoiRpcError {
     },
     #[error("POI RPC HTTP {status}")]
     HttpStatus { status: reqwest::StatusCode },
+    #[error("POI RPC response body too large")]
+    ResponseTooLarge,
     #[error("POI RPC JSON decode failed: {0}")]
     JsonDecode(#[source] serde_json::Error),
     #[error("POI RPC response missing result")]

@@ -364,16 +364,23 @@ impl ChainError {
     }
 
     /// Classifies an `eth_getLogs` rejection caused by a provider's range limit.
-    ///
-    /// JSON-RPC has no standard code for these rejections, and Alloy exposes
-    /// only the error payload's code and message. This adapter therefore
+    /// A response over the HTTP transport's size cap counts as a result-size
+    /// limit.
+    pub(crate) fn log_range_limit(&self) -> Option<LogRangeLimit> {
+        match self {
+            Self::Rpc(TransportError::ErrorResp(resp)) => Self::range_limit_message(&resp.message),
+            Self::Rpc(err) if broadcaster_core::provider::is_response_size_limit(err) => {
+                Some(LogRangeLimit::ResultSize)
+            }
+            _ => None,
+        }
+    }
+
+    /// JSON-RPC has no standard code for range-limit rejections, and Alloy
+    /// exposes only the error payload's code and message. This adapter therefore
     /// matches the observed message shapes narrowly; anything else stays
     /// unclassified and keeps the existing error handling.
-    pub(crate) fn log_range_limit(&self) -> Option<LogRangeLimit> {
-        let Self::Rpc(TransportError::ErrorResp(resp)) = self else {
-            return None;
-        };
-        let message = resp.message.as_ref();
+    fn range_limit_message(message: &str) -> Option<LogRangeLimit> {
         let block_span = |count: &str| LogRangeLimit::BlockSpan {
             max_blocks: leading_block_count(count),
         };

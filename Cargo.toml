@@ -21,7 +21,7 @@ rust-version = "1.91"
 [workspace.dependencies]
 aes = "0.8"
 aes-gcm = "0.10"
-alloy = { version = "2", features = ["serde", "signer-mnemonic"] }
+alloy = { version = "2.6.1", features = ["serde", "signer-local"] }
 alloy-primitives = { version = "1.6", features = ["serde"] }
 alloy-provider = "2"
 alloy-rpc-types-eth = "2"

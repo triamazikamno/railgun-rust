@@ -263,6 +263,9 @@ const POI_MERKLE_PROOFS_METHOD: &str = "ppoi_merkle_proofs";
 const POI_EVENTS_METHOD: &str = "ppoi_poi_events";
 const POI_MERKLETREE_LEAVES_METHOD: &str = "ppoi_poi_merkletree_leaves";
 const POI_BLOCKED_SHIELDS_METHOD: &str = "ppoi_blocked_shields";
+/// Largest decompressed response body accepted; timeouts alone don't bound
+/// memory. Event, leaf and blocked-shield pages stay well under 1 MiB.
+const POI_RPC_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct JsonRpcReq<T> {
@@ -831,7 +834,7 @@ impl PoiRpcClient {
             params,
         };
 
-        let resp = self
+        let mut resp = self
             .http
             .post(self.base_url.expose_url().clone())
             .timeout(self.request_timeout)
@@ -845,24 +848,28 @@ impl PoiRpcClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.map_err(|source| PoiRpcError::Post {
-                phase: PoiRpcTransportPhase::ResponseBody,
-                source: source.without_url(),
-            })?;
             debug!(
                 method,
                 %status,
-                response_bytes = body.len(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "POI RPC request failed"
             );
             return Err(PoiRpcError::HttpStatus { status });
         }
 
-        let body = resp.text().await.map_err(|source| PoiRpcError::Post {
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|source| PoiRpcError::Post {
             phase: PoiRpcTransportPhase::ResponseBody,
             source: source.without_url(),
-        })?;
+        })? {
+            if body.len().saturating_add(chunk.len()) > POI_RPC_MAX_RESPONSE_BYTES {
+                return Err(PoiRpcError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        // Like reqwest's `text()`, drop a leading UTF-8 BOM, which serde_json rejects.
+        let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&body);
+        let body = String::from_utf8_lossy(body).into_owned();
         debug!(
             method,
             response_bytes = body.len(),
