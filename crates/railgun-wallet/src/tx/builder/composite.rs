@@ -1,5 +1,5 @@
 //! Composite unshield plans: several unshield legs in one batch, executed
-//! directly against the Railgun contract or through a Relay Adapt contract.
+//! directly against the Railgun contract or through an executor.
 
 use alloy::primitives::{Address, FixedBytes, U256};
 
@@ -38,10 +38,6 @@ impl TransactionBuilder {
         match (uses_adapter, adapter) {
             (false, None) => Ok(CompositeExecution::Direct(self.railgun_contract)),
             (true, None) => Err(BuildError::MissingCompositeAdapter),
-            (true, Some(CompositeAdapter::RelayAdapt(contract))) => {
-                Ok(CompositeExecution::RelayAdapt(contract))
-            }
-            (false, Some(CompositeAdapter::RelayAdapt(_))) => Err(BuildError::UnusedRelayAdapt),
             (true, Some(CompositeAdapter::Executor(context)))
                 if self.chain_type == 0 && context.chain_id == self.chain_id =>
             {

@@ -5,7 +5,7 @@ use alloy::primitives::{Address, Bytes};
 use alloy::sol_types::SolCall;
 
 use broadcaster_core::contracts::railgun::{
-    ActionData, RelayAdapt7702, RelayAdapt7702ActionData, Transaction, relayCall, transactCall,
+    ActionData, RelayAdapt7702, RelayAdapt7702ActionData, Transaction, transactCall,
 };
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::utxo::Utxo;
@@ -76,21 +76,13 @@ impl<'a, S: RailgunSpendSigner> BatchPlanner<'a, S> {
         )
     }
 
-    /// Points every transaction at the adapter and binds it to the relay action.
+    /// Points every transaction at the executor. The executor signature binds the
+    /// action, so adapt params stay unrelayed.
     pub(super) fn bind_adapt_params(&mut self, action_data: &ActionData) {
         debug_assert!(action_data.requireSuccess);
-        let transactions = self
-            .unproven_plans
-            .iter()
-            .map(|plan| &plan.transaction)
-            .collect::<Vec<_>>();
-        let adapt_params = match self.execution {
-            CompositeExecution::Executor(_) => UNRELAYED_ADAPT_PARAMS,
-            _ => action_data.adapt_params(&transactions),
-        };
         for plan in &mut self.unproven_plans {
             plan.transaction.boundParams.adaptContract = self.execution.account();
-            plan.transaction.boundParams.adaptParams = adapt_params;
+            plan.transaction.boundParams.adaptParams = UNRELAYED_ADAPT_PARAMS;
         }
     }
 
@@ -151,11 +143,6 @@ fn composite_call(
     let data = match (execution, action_data) {
         (CompositeExecution::Direct(_), None) => transactCall {
             _transactions: transactions,
-        }
-        .abi_encode(),
-        (CompositeExecution::RelayAdapt(_), Some(actions)) => relayCall {
-            _transactions: transactions,
-            _actionData: actions.clone(),
         }
         .abi_encode(),
         (CompositeExecution::Executor(context), Some(actions)) if actions.requireSuccess => {

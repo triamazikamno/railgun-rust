@@ -34,7 +34,7 @@ async fn composite_unshield_rejects_relay_adapt_leg_without_actions() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let request = CompositeUnshieldRequest {
-        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
+        adapter: Some(CompositeAdapter::Executor(TEST_EXECUTOR_CONTEXT)),
         legs: vec![CompositeUnshieldLeg {
             token_address: Address::from([0x83; 20]),
             amount: uint!(1_U256),
@@ -94,9 +94,9 @@ async fn composite_and_mixed_reject_mismatched_adapter_before_signing() {
             amount: uint!(5_U256),
         }],
     };
-    let relay_adapt = Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT));
+    let executor = Some(CompositeAdapter::Executor(TEST_EXECUTOR_CONTEXT));
 
-    for (leg, adapter) in [(relay_leg, None), (direct_leg, relay_adapt)] {
+    for (leg, adapter) in [(relay_leg, None), (direct_leg, executor)] {
         let uses_relay = leg.recipient.uses_relay_adapt();
         let actions = uses_relay.then(|| relay_actions.clone());
         let composite = CompositeUnshieldRequest {
@@ -107,17 +107,6 @@ async fn composite_and_mixed_reject_mismatched_adapter_before_signing() {
             min_gas_price: 0,
             verify_proof: false,
             spend_up_to: false,
-        };
-        let mixed = MixedPrivateActionRequest {
-            adapter,
-            executor_calls: Vec::new(),
-            private_sends: Vec::new(),
-            public_unshields: vec![leg],
-            relay_actions: actions,
-            min_gas_price: 0,
-            verify_proof: false,
-            spend_up_to: false,
-            rebuild: None,
         };
         let composite_error = builder
             .build_composite_unshield_plan_inner(
@@ -130,6 +119,26 @@ async fn composite_and_mixed_reject_mismatched_adapter_before_signing() {
             )
             .await
             .expect_err("mismatched composite adapter");
+        assert!(matches!(
+            (uses_relay, composite_error),
+            (true, BuildError::MissingCompositeAdapter)
+                | (false, BuildError::InvalidExecutorContext)
+        ));
+        // A mixed plan settles through a named executor even when no leg needs one.
+        if !uses_relay {
+            continue;
+        }
+        let mixed = MixedPrivateActionRequest {
+            adapter,
+            executor_calls: Vec::new(),
+            private_sends: Vec::new(),
+            public_unshields: vec![leg],
+            relay_actions: actions,
+            min_gas_price: 0,
+            verify_proof: false,
+            spend_up_to: false,
+            rebuild: None,
+        };
         let mixed_error = builder
             .build_mixed_private_action_plan_inner(
                 &wallet.viewing,
@@ -141,12 +150,7 @@ async fn composite_and_mixed_reject_mismatched_adapter_before_signing() {
             )
             .await
             .expect_err("mismatched mixed adapter");
-        for error in [composite_error, mixed_error] {
-            assert!(matches!(
-                (uses_relay, error),
-                (true, BuildError::MissingCompositeAdapter) | (false, BuildError::UnusedRelayAdapt)
-            ));
-        }
+        assert!(matches!(mixed_error, BuildError::MissingCompositeAdapter));
     }
     assert!(signer.signed_msg.get().is_none());
     assert_eq!(prover.bound_params_hashes(), [] as [U256; 0]);
@@ -157,7 +161,7 @@ async fn composite_unshield_rejects_relay_adapt_leg_with_empty_actions() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let request = CompositeUnshieldRequest {
-        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
+        adapter: Some(CompositeAdapter::Executor(TEST_EXECUTOR_CONTEXT)),
         legs: vec![CompositeUnshieldLeg {
             token_address: Address::from([0x84; 20]),
             amount: uint!(1_U256),
@@ -197,7 +201,7 @@ async fn composite_unshield_rejects_zero_amount_relay_actions() {
     let utxos = vec![wallet_test_utxo(&wallet, token, 1, 0, 0)];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
+        adapter: Some(CompositeAdapter::Executor(TEST_EXECUTOR_CONTEXT)),
         legs: vec![CompositeUnshieldLeg {
             token_address: token,
             amount: uint!(1_U256),

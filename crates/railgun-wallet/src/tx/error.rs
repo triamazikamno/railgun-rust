@@ -31,8 +31,6 @@ pub enum BuildError {
     MissingCompositeRelayActions,
     #[error("composite plan needs an adapter but the request names none")]
     MissingCompositeAdapter,
-    #[error("request names a RelayAdapt contract but the plan needs no adapter")]
-    UnusedRelayAdapt,
     #[error("executor context does not match the chain or adapter operation")]
     InvalidExecutorContext,
     #[error("executor calls cannot be combined with RelayAdapt helper actions")]

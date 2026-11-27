@@ -281,7 +281,7 @@ async fn executor_fee_less_unshield_plan_sends_exact_amount_to_executor() {
         U256::from(3)
     );
 
-    let decoded = decode_adapter_plan(&plan.call, Some(context));
+    let decoded = decode_adapter_plan(&plan.call, context);
     assert_eq!(plan.call.to, context.executor);
     assert!(decoded._actionData.requireSuccess);
     assert_eq!(decoded._actionData.calls.abi_encode(), calls.abi_encode());

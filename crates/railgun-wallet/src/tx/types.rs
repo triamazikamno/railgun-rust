@@ -104,7 +104,6 @@ impl ExecutorContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeExecution {
     Direct(Address),
-    RelayAdapt(Address),
     Executor(ExecutorContext),
 }
 
@@ -112,7 +111,7 @@ impl CompositeExecution {
     #[must_use]
     pub const fn account(self) -> Address {
         match self {
-            Self::Direct(account) | Self::RelayAdapt(account) => account,
+            Self::Direct(account) => account,
             Self::Executor(context) => context.executor,
         }
     }
@@ -121,7 +120,6 @@ impl CompositeExecution {
 /// The adapter a composite request settles through when its plan needs one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeAdapter {
-    RelayAdapt(Address),
     Executor(ExecutorContext),
 }
 

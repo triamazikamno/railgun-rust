@@ -4,8 +4,9 @@ use super::{
     parse_transact_calldata, railgun_txid_leaf_hash, try_decrypt_transact_request,
 };
 use crate::contracts::railgun::{
-    BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702,
-    RelayAdapt7702ActionData, SnarkProof, TokenData, Transaction, executeCall, transactCall,
+    ActionData, BoundParams, CommitmentCiphertext, CommitmentPreimage, RelayAdapt7702,
+    RelayAdapt7702ActionData, SnarkProof, TokenData, Transaction, executeCall, relayCall,
+    transactCall,
 };
 use crate::crypto::aes_gcm::encrypt_in_place_16b_iv;
 use crate::crypto::railgun::{ViewingKeyData, derive_viewing_public_key};
@@ -253,7 +254,7 @@ fn parse_transact_extracts_all_inner_transaction_metadata() {
 }
 
 #[test]
-fn parse_transact_decodes_relay_adapt_7702_execute_wrapper() {
+fn parse_transact_decodes_legacy_relay_and_relay_adapt_7702_execute_wrappers() {
     let viewing_key_data = sample_viewing_key_data();
     let (_, transaction, _, fee_commitment, _) = sample_transaction_and_params(None);
     let historical = executeCall {
@@ -271,14 +272,28 @@ fn parse_transact_decodes_relay_adapt_7702_execute_wrapper() {
         _nonce: uint!(9_U256),
         _signature: historical._signature.clone(),
     };
-    for calldata in [historical.abi_encode(), current.abi_encode()] {
+    // Other SDK wallets still send legacy `relay` requests, and history holds them.
+    let legacy = relayCall {
+        _transactions: historical._transactions.clone(),
+        _actionData: ActionData {
+            random: FixedBytes::ZERO,
+            requireSuccess: true,
+            minGasLimit: uint!(123_U256),
+            calls: vec![],
+        },
+    };
+    for calldata in [
+        legacy.abi_encode(),
+        historical.abi_encode(),
+        current.abi_encode(),
+    ] {
         let parsed = parse_transact_calldata(
             &calldata,
             &viewing_key_data.viewing_private_key,
             viewing_key_data.master_public_key,
             None,
         )
-        .expect("parse current or historical 7702 execute calldata");
+        .expect("parse legacy relay or 7702 execute calldata");
 
         let action_data = parsed.action_data.expect("action data");
         assert_eq!(parsed.fee_commitment, fee_commitment);

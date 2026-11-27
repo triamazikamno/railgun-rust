@@ -83,169 +83,158 @@ async fn direct_composite_unshield_uses_transact_and_preserves_fee_output_role()
 async fn relay_composite_binds_action_data_and_uses_exact_actions() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
-    for use_executor in [false, true] {
-        let executor_signer = PrivateKeySigner::from_bytes(&FixedBytes::from([0x42; 32])).unwrap();
-        let executor = use_executor.then_some(ExecutorContext {
-            chain_id: builder.chain_id,
-            executor: executor_signer.address(),
-            delegate: Address::from([0x43; 20]),
-            execution_nonce: U256::from(9),
-        });
-        let execution_account = executor.map_or(TEST_RELAY_ADAPT, |context| context.executor);
-        let adapter = Some(executor.map_or(
-            CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT),
-            CompositeAdapter::Executor,
-        ));
-        let primary_token = Address::from([0x71; 20]);
-        let wrapped_native = Address::from([0x72; 20]);
-        let recipient = Address::from([0x73; 20]);
-        let utxos = vec![
-            wallet_test_utxo(&wallet, primary_token, 10, 0, 0),
-            wallet_test_utxo(&wallet, wrapped_native, 8, 0, 1),
-        ];
-        let forest = forest_for_utxos(&utxos);
-        let request = CompositeUnshieldRequest {
-            adapter,
-            legs: vec![
-                CompositeUnshieldLeg {
-                    token_address: primary_token,
-                    amount: uint!(10_U256),
-                    recipient: CompositeUnshieldRecipient::Public(recipient),
-                    role: CompositeUnshieldLegRole::Primary,
+    let executor_signer = PrivateKeySigner::from_bytes(&FixedBytes::from([0x42; 32])).unwrap();
+    let context = ExecutorContext {
+        chain_id: builder.chain_id,
+        executor: executor_signer.address(),
+        delegate: Address::from([0x43; 20]),
+        execution_nonce: U256::from(9),
+    };
+    let execution_account = context.executor;
+    let primary_token = Address::from([0x71; 20]);
+    let wrapped_native = Address::from([0x72; 20]);
+    let recipient = Address::from([0x73; 20]);
+    let utxos = vec![
+        wallet_test_utxo(&wallet, primary_token, 10, 0, 0),
+        wallet_test_utxo(&wallet, wrapped_native, 8, 0, 1),
+    ];
+    let forest = forest_for_utxos(&utxos);
+    let request = CompositeUnshieldRequest {
+        adapter: Some(CompositeAdapter::Executor(context)),
+        legs: vec![
+            CompositeUnshieldLeg {
+                token_address: primary_token,
+                amount: uint!(10_U256),
+                recipient: CompositeUnshieldRecipient::Public(recipient),
+                role: CompositeUnshieldLegRole::Primary,
+            },
+            CompositeUnshieldLeg {
+                token_address: wrapped_native,
+                amount: uint!(8_U256),
+                recipient: CompositeUnshieldRecipient::RelayAdapt,
+                role: CompositeUnshieldLegRole::NativeTopUp,
+            },
+        ],
+        relay_actions: Some(CompositeRelayActions {
+            min_gas_limit: uint!(123_U256),
+            calls: vec![
+                CompositeRelayAction::UnwrapBase {
+                    amount: uint!(3_U256),
                 },
-                CompositeUnshieldLeg {
-                    token_address: wrapped_native,
-                    amount: uint!(8_U256),
-                    recipient: CompositeUnshieldRecipient::RelayAdapt,
-                    role: CompositeUnshieldLegRole::NativeTopUp,
+                CompositeRelayAction::Transfer {
+                    token: CompositeRelayActionToken::BaseNative,
+                    recipient,
+                    amount: uint!(3_U256),
+                },
+                CompositeRelayAction::Transfer {
+                    token: CompositeRelayActionToken::Erc20(wrapped_native),
+                    recipient,
+                    amount: uint!(5_U256),
                 },
             ],
-            relay_actions: Some(CompositeRelayActions {
-                min_gas_limit: uint!(123_U256),
-                calls: vec![
-                    CompositeRelayAction::UnwrapBase {
-                        amount: uint!(3_U256),
-                    },
-                    CompositeRelayAction::Transfer {
-                        token: CompositeRelayActionToken::BaseNative,
-                        recipient,
-                        amount: uint!(3_U256),
-                    },
-                    CompositeRelayAction::Transfer {
-                        token: CompositeRelayActionToken::Erc20(wrapped_native),
-                        recipient,
-                        amount: uint!(5_U256),
-                    },
-                ],
-            }),
-            broadcaster_fee: None,
-            min_gas_price: 0,
-            verify_proof: false,
-            spend_up_to: false,
-        };
+        }),
+        broadcaster_fee: None,
+        min_gas_price: 0,
+        verify_proof: false,
+        spend_up_to: false,
+    };
 
-        let prover = RecordingTransactionProver::default();
-        let plan = builder
-            .build_composite_unshield_plan_inner(
-                &wallet.viewing,
-                &wallet,
-                &forest,
-                &utxos,
-                request,
-                &prover,
-            )
-            .await
-            .expect("relay composite plan");
-        let decoded = decode_adapter_plan(&plan.call, executor);
-        let action_data = plan.action_data.as_ref().expect("action data");
+    let prover = RecordingTransactionProver::default();
+    let plan = builder
+        .build_composite_unshield_plan_inner(
+            &wallet.viewing,
+            &wallet,
+            &forest,
+            &utxos,
+            request,
+            &prover,
+        )
+        .await
+        .expect("relay composite plan");
+    let decoded = decode_adapter_plan(&plan.call, context);
+    let action_data = plan.action_data.as_ref().expect("action data");
 
-        assert_eq!(plan.call.to, execution_account);
-        assert_eq!(plan.shape.transaction_count, 2);
-        assert_eq!(plan.shape.relay_call_count, 3);
-        assert!(plan.shape.uses_relay_adapt);
-        assert!(decoded._actionData.requireSuccess);
-        assert!(action_data.requireSuccess);
-        assert_eq!(decoded._actionData.minGasLimit, uint!(123_U256));
-        assert_eq!(decoded._actionData.calls.len(), 3);
-        assert_eq!(
-            decoded._actionData.calls[0].data,
-            ActionData::unwrap_base_call(execution_account, uint!(3_U256)).data
-        );
-        assert_eq!(
-            decoded._actionData.calls[1].data,
-            ActionData::transfer_call(
-                execution_account,
-                vec![TokenTransfer::base_native(recipient, uint!(3_U256))],
-            )
-            .data
-        );
-        assert_eq!(
-            decoded._actionData.calls[2].data,
-            ActionData::transfer_call(
-                execution_account,
-                vec![TokenTransfer::erc20(
-                    wrapped_native,
-                    recipient,
-                    uint!(5_U256)
-                )],
-            )
-            .data
-        );
-        for transaction in &decoded._transactions {
-            assert_eq!(transaction.boundParams.adaptContract, execution_account);
-            assert_eq!(
-                transaction.boundParams.adaptParams == UNRELAYED_ADAPT_PARAMS,
-                executor.is_some()
-            );
-        }
-
-        let mut recorded = prover.bound_params_hashes();
-        recorded.sort_unstable();
-        let mut encoded = decoded
-            ._transactions
-            .iter()
-            .map(|tx| tx.boundParams.hash())
-            .collect::<Vec<_>>();
-        encoded.sort_unstable();
-        assert_eq!(recorded, encoded);
-        assert!(
-            decoded
-                ._actionData
-                .calls
-                .iter()
-                .all(|call| call.to == execution_account)
-        );
-        if let Some(context) = executor {
-            assert_eq!(
-                decoded._transactions[1].unshieldPreimage.npk,
-                context.executor.into_word()
-            );
-            let digest = context
-                .signing_hash(&plan.call)
-                .expect("prepared execution digest");
-            let signature = executor_signer
-                .sign_hash_sync(&digest)
-                .expect("public test signature");
-            let signed = context
-                .authorize_call(&plan.call, signature)
-                .expect("authorized executor call");
-            let signed = RelayAdapt7702::executeCall::abi_decode(&signed.data).unwrap();
-            assert!(!signed._signature.is_empty());
-            let mut stale = context;
-            stale.execution_nonce += U256::ONE;
-            assert!(stale.signing_hash(&plan.call).is_err());
-            let mut changed = RelayAdapt7702::executeCall::abi_decode(&plan.call.data).unwrap();
-            changed._actionData.calls[0].value += U256::ONE;
-            let changed = TransactionCall {
-                to: context.executor,
-                data: changed.abi_encode().into(),
-            };
-            assert!(matches!(
-                context.authorize_call(&changed, signature),
-                Err(BuildError::InvalidExecutorSignature)
-            ));
-        }
+    assert_eq!(plan.call.to, execution_account);
+    assert_eq!(plan.shape.transaction_count, 2);
+    assert_eq!(plan.shape.relay_call_count, 3);
+    assert!(plan.shape.uses_relay_adapt);
+    assert!(decoded._actionData.requireSuccess);
+    assert!(action_data.requireSuccess);
+    assert_eq!(decoded._actionData.minGasLimit, uint!(123_U256));
+    assert_eq!(decoded._actionData.calls.len(), 3);
+    assert_eq!(
+        decoded._actionData.calls[0].data,
+        ActionData::unwrap_base_call(execution_account, uint!(3_U256)).data
+    );
+    assert_eq!(
+        decoded._actionData.calls[1].data,
+        ActionData::transfer_call(
+            execution_account,
+            vec![TokenTransfer::base_native(recipient, uint!(3_U256))],
+        )
+        .data
+    );
+    assert_eq!(
+        decoded._actionData.calls[2].data,
+        ActionData::transfer_call(
+            execution_account,
+            vec![TokenTransfer::erc20(
+                wrapped_native,
+                recipient,
+                uint!(5_U256)
+            )],
+        )
+        .data
+    );
+    for transaction in &decoded._transactions {
+        assert_eq!(transaction.boundParams.adaptContract, execution_account);
+        assert_eq!(transaction.boundParams.adaptParams, UNRELAYED_ADAPT_PARAMS);
     }
+
+    let mut recorded = prover.bound_params_hashes();
+    recorded.sort_unstable();
+    let mut encoded = decoded
+        ._transactions
+        .iter()
+        .map(|tx| tx.boundParams.hash())
+        .collect::<Vec<_>>();
+    encoded.sort_unstable();
+    assert_eq!(recorded, encoded);
+    assert!(
+        decoded
+            ._actionData
+            .calls
+            .iter()
+            .all(|call| call.to == execution_account)
+    );
+    assert_eq!(
+        decoded._transactions[1].unshieldPreimage.npk,
+        context.executor.into_word()
+    );
+    let digest = context
+        .signing_hash(&plan.call)
+        .expect("prepared execution digest");
+    let signature = executor_signer
+        .sign_hash_sync(&digest)
+        .expect("public test signature");
+    let signed = context
+        .authorize_call(&plan.call, signature)
+        .expect("authorized executor call");
+    let signed = RelayAdapt7702::executeCall::abi_decode(&signed.data).unwrap();
+    assert!(!signed._signature.is_empty());
+    let mut stale = context;
+    stale.execution_nonce += U256::ONE;
+    assert!(stale.signing_hash(&plan.call).is_err());
+    let mut changed = RelayAdapt7702::executeCall::abi_decode(&plan.call.data).unwrap();
+    changed._actionData.calls[0].value += U256::ONE;
+    let changed = TransactionCall {
+        to: context.executor,
+        data: changed.abi_encode().into(),
+    };
+    assert!(matches!(
+        context.authorize_call(&changed, signature),
+        Err(BuildError::InvalidExecutorSignature)
+    ));
 }
 
 #[tokio::test]
@@ -262,7 +251,7 @@ async fn relay_composite_with_later_fee_leg_keeps_fee_transaction_first() {
     ];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
+        adapter: Some(CompositeAdapter::Executor(TEST_EXECUTOR_CONTEXT)),
         legs: vec![
             CompositeUnshieldLeg {
                 token_address: primary_token,
@@ -311,7 +300,7 @@ async fn relay_composite_with_later_fee_leg_keeps_fee_transaction_first() {
         )
         .await
         .expect("relay composite plan");
-    let decoded = relayCall::abi_decode(&plan.call.data).expect("decode relay call");
+    let decoded = decode_adapter_plan(&plan.call, TEST_EXECUTOR_CONTEXT);
     let fee_role = plan
         .private_output_roles
         .iter()

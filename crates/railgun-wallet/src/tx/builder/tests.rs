@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use poi::poi::PoiMerkleProof;
 
 use broadcaster_core::contracts::railgun::{
-    ActionData, BoundParams, RelayAdapt7702, SnarkProof, TokenTransfer, relayCall, transactCall,
+    ActionData, BoundParams, RelayAdapt7702, SnarkProof, TokenTransfer, transactCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::ViewingKeyData;
@@ -223,7 +223,13 @@ fn test_wallet() -> WalletKeys {
     .expect("valid mnemonic")
 }
 
-const TEST_RELAY_ADAPT: Address = Address::repeat_byte(0x52);
+// On `test_transaction_builder`'s chain.
+const TEST_EXECUTOR_CONTEXT: ExecutorContext = ExecutorContext {
+    chain_id: 1,
+    executor: Address::repeat_byte(0x52),
+    delegate: Address::repeat_byte(0x53),
+    execution_nonce: U256::ZERO,
+};
 
 fn test_transaction_builder() -> TransactionBuilder {
     TransactionBuilder {
@@ -237,24 +243,14 @@ fn sample_address_data(seed: u8) -> ViewingKeyData {
     ViewingKeyData::from_spending_public_key([seed; 32], [U256::from(seed), U256::from(seed + 1)])
 }
 
-fn decode_adapter_plan(call: &TransactionCall, executor: Option<ExecutorContext>) -> relayCall {
-    if let Some(context) = executor {
-        let decoded =
-            RelayAdapt7702::executeCall::abi_decode(&call.data).expect("executor execute");
-        assert_eq!(decoded._nonce, context.execution_nonce);
-        assert!(decoded._signature.is_empty());
-        relayCall {
-            _transactions: decoded._transactions,
-            _actionData: ActionData {
-                random: FixedBytes::ZERO,
-                requireSuccess: decoded._actionData.requireSuccess,
-                minGasLimit: decoded._actionData.minGasLimit,
-                calls: decoded._actionData.calls,
-            },
-        }
-    } else {
-        relayCall::abi_decode(&call.data).expect("legacy relay")
-    }
+fn decode_adapter_plan(
+    call: &TransactionCall,
+    context: ExecutorContext,
+) -> RelayAdapt7702::executeCall {
+    let decoded = RelayAdapt7702::executeCall::abi_decode(&call.data).expect("executor execute");
+    assert_eq!(decoded._nonce, context.execution_nonce);
+    assert!(decoded._signature.is_empty());
+    decoded
 }
 
 mod composite;
